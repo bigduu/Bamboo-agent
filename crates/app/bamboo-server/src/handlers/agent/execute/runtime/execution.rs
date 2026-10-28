@@ -169,7 +169,7 @@ impl SpawnAgentExecution {
         self,
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) {
-        spawn_agent_execution_with_inputs(self, inputs, None, Default::default());
+        spawn_agent_execution_with_inputs(self, inputs, None, Default::default(), false);
     }
 
     pub(crate) fn spawn_with_native_inputs(
@@ -177,7 +177,7 @@ impl SpawnAgentExecution {
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
         native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
     ) {
-        spawn_agent_execution_with_inputs(self, inputs, native_binding, Default::default());
+        spawn_agent_execution_with_inputs(self, inputs, native_binding, Default::default(), false);
     }
 
     pub(crate) fn spawn_with_native_inputs_and_retry(
@@ -185,8 +185,15 @@ impl SpawnAgentExecution {
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
         native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
         upstream_retry: bamboo_llm::retry::UpstreamRetry,
+        live_bootstrap_resume: bool,
     ) {
-        spawn_agent_execution_with_inputs(self, inputs, native_binding, upstream_retry);
+        spawn_agent_execution_with_inputs(
+            self,
+            inputs,
+            native_binding,
+            upstream_retry,
+            live_bootstrap_resume,
+        );
     }
 }
 
@@ -195,6 +202,7 @@ fn spawn_agent_execution_with_inputs(
     inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
     upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    live_bootstrap_resume: bool,
 ) {
     let session_model_ref = session_effective_model_ref(&args.session);
     let provider_override = match (session_model_ref.as_ref(), args.provider_override.take()) {
@@ -220,12 +228,25 @@ fn spawn_agent_execution_with_inputs(
             return;
         }
     }
+    let live_retry = (live_bootstrap_resume && !args.is_child_session)
+        .then(|| {
+            crate::app_state::live_retry::bind(
+                args.state.as_ref(),
+                &args.execution_reservation,
+                &args.session,
+            )
+        })
+        .flatten();
     let (agent, tools) = native_binding.unwrap_or_else(|| {
         (
             args.state.agent.clone(),
             tools_for_execution(args.state.as_ref(), args.is_child_session),
         )
     });
+    let agent = match live_retry {
+        Some(host) => Arc::new(agent.with_live_bootstrap_host(host)),
+        None => agent,
+    };
     let tools_override = Some(tools);
 
     let selected_skill_ids = session_state::selected_skill_ids_for_session(&args.session);

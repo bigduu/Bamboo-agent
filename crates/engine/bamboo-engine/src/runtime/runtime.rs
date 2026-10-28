@@ -54,6 +54,7 @@ pub struct AgentRuntime {
     pub(crate) workspace_execution_host:
         Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
+    pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
     pub attachment_reader: Arc<dyn AttachmentReader>,
@@ -250,6 +251,7 @@ impl AgentRuntimeBuilder {
                 .persistence
                 .ok_or_else(|| format_missing("persistence"))?,
             session_inbox: self.session_inbox,
+            live_bootstrap_host: None,
             activation_router: self.activation_router,
             session_messenger: self.session_messenger,
             attachment_reader: self
@@ -1018,6 +1020,7 @@ impl AgentRuntime {
             storage: Some(self.storage.clone()),
             persistence: Some(self.persistence.clone()),
             session_inbox: self.session_inbox.clone(),
+            live_bootstrap_host: self.live_bootstrap_host.clone(),
             session_activation_notifications,
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),

@@ -79,7 +79,11 @@ pub(crate) async fn cancel_exact_run(state: &web::Data<AppState>, id: &str, run_
         return false;
     };
     match runner.status {
-        AgentStatus::Pending | AgentStatus::Running => runner.cancel_token.cancel(),
+        AgentStatus::Pending | AgentStatus::Running => {
+            state
+                .live_retry
+                .cancel_and_token(id, run_id, &runner.cancel_token)
+        }
         AgentStatus::Cancelled => return true,
         _ => return false,
     }
@@ -126,9 +130,20 @@ async fn cancel_running_runner(
         return RunnerCancelOutcome::NotActive;
     };
 
+    // Pending remains non-cancellable for the legacy unqualified Stop path,
+    // except for the retained, exact owner of a fresh-input sync handoff.
+    // The registry includes the interval while that owner is being taken.
+    if matches!(runner.status, AgentStatus::Pending)
+        && !state.fresh_sync.is_current_owner(session_id, &runner.run_id)
+    {
+        return RunnerCancelOutcome::NotActive;
+    }
+
     match runner.status {
-        AgentStatus::Running => {
-            runner.cancel_token.cancel();
+        AgentStatus::Pending | AgentStatus::Running => {
+            state
+                .live_retry
+                .cancel_and_token(session_id, &runner.run_id, &runner.cancel_token);
             tracing::info!("[{}] Runner cancellation triggered", session_id);
             RunnerCancelOutcome::Triggered {
                 run_id: runner.run_id.clone(),

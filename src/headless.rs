@@ -503,6 +503,8 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             // path.
             run_budget: None,
             upstream_retry: None,
+            // Headless runs cannot offer an interactive same-run continuation.
+            live_bootstrap_resume: false,
         }),
     )
     .await;

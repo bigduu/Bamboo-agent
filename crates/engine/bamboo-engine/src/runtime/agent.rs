@@ -84,6 +84,18 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Bind a live-bootstrap Host to this execution only. The Host must retain
+    /// its exact runner and writer; this method does not create authority.
+    #[doc(hidden)]
+    pub fn with_live_bootstrap_host(
+        &self,
+        host: Arc<dyn crate::runtime::config::LiveBootstrapHost>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.live_bootstrap_host = Some(host);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Install the registered SDK adapter on this execution's runtime only.
     #[doc(hidden)]
     pub fn with_sdk_skill_execution_host(

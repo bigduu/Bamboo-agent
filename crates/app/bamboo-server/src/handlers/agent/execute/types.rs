@@ -151,6 +151,10 @@ pub struct ExecuteRequest {
     /// Omission keeps finite automatic retries; Stop cancels continuous retries.
     #[serde(default)]
     pub upstream_retry: Option<bamboo_llm::retry::UpstreamRetry>,
+    /// Opt into a nonterminal live bootstrap offer for this interactive Root.
+    /// Omission keeps the existing finite failure behavior.
+    #[serde(default)]
+    pub live_bootstrap_resume: bool,
 }
 
 #[cfg(test)]

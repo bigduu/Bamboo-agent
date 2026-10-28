@@ -20,6 +20,61 @@ pub struct RootActorRuntimeWrite {
     pub conversation_generation: crate::ConversationGenerationObservation,
 }
 
+/// Process-local storage result. It is not serializable and is not itself a grant.
+/// The Host must retain the exact returned value; an HTTP caller supplies only
+/// a selector, never this object. Concrete storage checks its own private type.
+#[derive(Clone)]
+pub struct LiveBootstrapProof {
+    storage_value: std::sync::Arc<dyn std::any::Any + Send + Sync>,
+    gate: crate::AdmissionGate,
+}
+
+impl LiveBootstrapProof {
+    /// Storage adapter hook. Confirm must downcast to the adapter's private
+    /// type and independently revalidate its bound execution and state.
+    #[doc(hidden)]
+    pub fn from_storage<T: std::any::Any + Send + Sync>(
+        value: T,
+        gate: crate::AdmissionGate,
+    ) -> Self {
+        Self {
+            storage_value: std::sync::Arc::new(value),
+            gate,
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn storage_ref<T: std::any::Any + Send + Sync>(&self) -> Option<&T> {
+        self.storage_value.downcast_ref::<T>()
+    }
+
+    /// Match an execution-owned producer offer to the exact capture gate.
+    pub fn matches_gate(&self, gate: &crate::AdmissionGate) -> bool {
+        self.gate.same_instance(gate)
+    }
+
+    /// Cancel this exact proof's decision, not a separately supplied gate.
+    pub fn cancel_if_pending(&self) {
+        self.gate.cancel_if_pending();
+    }
+
+    /// Observation only; confirmation must still commit under its real locks.
+    pub fn is_cancelled(&self) -> bool {
+        self.gate.is_cancelled()
+    }
+
+    /// Observation only. The producer may check this after the decision
+    /// callback has returned; never call it from inside the gate callback.
+    pub fn is_committed(&self) -> bool {
+        self.gate.is_committed()
+    }
+
+    #[doc(hidden)]
+    pub fn storage_gate(&self) -> crate::AdmissionGate {
+        self.gate.clone()
+    }
+}
+
 /// Target-only transport disposal, issued by the actual registered owner.
 /// `binding` identifies bytes to retire; it is NOT a retained Supervisor grant.
 /// The callback must retain a closed exact owner and never notify or activate.
@@ -265,6 +320,35 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "storage backend does not support fenced Root runtime events",
+        ))
+    }
+
+    /// Checkpoint and confirm are separately fenced operations. The default
+    /// never emulates either using a read followed by an ordinary save.
+    async fn checkpoint_root_live_bootstrap(
+        &self,
+        _owner: &RootActorRuntimeWrite,
+        _session: &Session,
+        _inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+        _gate: crate::AdmissionGate,
+        _publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<LiveBootstrapProof> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "live bootstrap checkpoint unsupported",
+        ))
+    }
+
+    async fn confirm_root_live_bootstrap(
+        &self,
+        _owner: &RootActorRuntimeWrite,
+        _proof: &LiveBootstrapProof,
+        _inbox: std::sync::Arc<dyn crate::SessionInboxPort>,
+        _publish: RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "live bootstrap confirmation unsupported",
         ))
     }
 

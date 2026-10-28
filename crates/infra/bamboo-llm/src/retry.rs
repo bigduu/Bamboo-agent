@@ -35,12 +35,14 @@ use tokio::time::Instant;
 use crate::provider::LLMError;
 
 mod diagnostics;
+mod live_bootstrap;
 mod policy;
 pub use diagnostics::{
     public_request_diagnostic, recent_initial_request_diagnostics,
     record_stream_timeout_diagnostic, InitialRequestDiagnostic, RequestStopReason,
 };
 use diagnostics::{AttemptObservation, CancellationObservation};
+pub use live_bootstrap::{LiveBootstrapOffer, LIVE_BOOTSTRAP_OFFER_TTL};
 use policy::continuous_request_retries;
 pub use policy::{
     initial_request_limits, upstream_retry_defaults, with_upstream_retry, InitialRequestLimits,
@@ -62,9 +64,36 @@ pub struct InitialHttpRetryObserver {
     budget_managed: AtomicBool,
     active_request_policies: AtomicU32,
     terminal_diagnostic: Mutex<Option<bamboo_domain::LlmRequestDiagnostic>>,
+    live_offer: Mutex<Option<tokio::sync::oneshot::Sender<LiveBootstrapOffer>>>,
 }
 
 impl InitialHttpRetryObserver {
+    /// The engine creates this once for an execution with a bound Host. Only
+    /// the actual Anthropic request can fill its one-shot receiver.
+    pub fn with_live_bootstrap() -> (
+        Arc<Self>,
+        tokio::sync::oneshot::Receiver<LiveBootstrapOffer>,
+    ) {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let observer = Arc::new(Self::default());
+        if let Ok(mut slot) = observer.live_offer.lock() {
+            *slot = Some(sender);
+        }
+        (observer, receiver)
+    }
+
+    fn has_live_offer_receiver(&self) -> bool {
+        self.live_offer
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|sender| !sender.is_closed()))
+            .unwrap_or(false)
+    }
+
+    fn take_live_offer_sender(&self) -> Option<tokio::sync::oneshot::Sender<LiveBootstrapOffer>> {
+        self.live_offer.lock().ok().and_then(|mut slot| slot.take())
+    }
+
     /// Whether the provider owns a bounded request policy for this bootstrap.
     pub fn request_budget_managed(&self) -> bool {
         self.budget_managed.load(Ordering::Relaxed)
@@ -191,6 +220,7 @@ where
         config,
         provider,
         continuous,
+        0,
         || async {
             let started = Instant::now();
             if deadline.is_some_and(|deadline| started >= deadline) {
@@ -502,6 +532,7 @@ where
         config,
         provider,
         false,
+        0,
         || async {
             match build().send().await {
                 Ok(response) => {
@@ -569,6 +600,7 @@ async fn retry_initial_request<T, F, Fut, D>(
     config: &RetryConfig,
     provider: &str,
     allow_continuous: bool,
+    initial_index: u32,
     attempt: F,
     decide: D,
 ) -> T
@@ -583,7 +615,7 @@ where
         config.max_attempts.max(1)
     };
     let continuous = allow_continuous && !work_request_budget_active();
-    let mut index: u32 = 0;
+    let mut index: u32 = initial_index;
     loop {
         let mut outcome = attempt().await;
         let decision = if !outcome.retry {
@@ -659,6 +691,9 @@ pub(crate) struct InitialRequestBudget {
     diagnostic_id: uuid::Uuid,
     session_hash: Option<String>,
     latest: Mutex<Option<AttemptObservation>>,
+    live_continuous: AtomicBool,
+    live_candidate: Mutex<Option<live_bootstrap::Candidate>>,
+    deferred_terminal: Mutex<Option<AttemptObservation>>,
 }
 
 impl InitialRequestBudget {
@@ -678,6 +713,65 @@ impl InitialRequestBudget {
             diagnostic_id: uuid::Uuid::new_v4(),
             session_hash: None,
             latest: Mutex::new(None),
+            live_continuous: AtomicBool::new(false),
+            live_candidate: Mutex::new(None),
+            deferred_terminal: Mutex::new(None),
+        }
+    }
+
+    fn is_continuous(&self) -> bool {
+        self.continuous || self.live_continuous.load(Ordering::Acquire)
+    }
+
+    fn clear_live_candidate(&self) {
+        if let Ok(mut candidate) = self.live_candidate.lock() {
+            *candidate = None;
+        }
+    }
+
+    fn record_live_candidate(&self, retry_after: Option<Duration>) {
+        if self.is_continuous() || work_request_budget_active() {
+            return;
+        }
+        let Some(not_before) = Instant::now().checked_add(retry_after.unwrap_or_default()) else {
+            return;
+        };
+        if let Ok(mut candidate) = self.live_candidate.lock() {
+            *candidate = Some(live_bootstrap::Candidate { not_before });
+        }
+    }
+
+    fn can_defer_terminal(&self, stop: RequestStopReason) -> bool {
+        if self.is_continuous()
+            || work_request_budget_active()
+            || !matches!(
+                stop,
+                RequestStopReason::AttemptsExhausted
+                    | RequestStopReason::TimeBudgetExhausted
+                    | RequestStopReason::RetryDelayExceedsBudget
+            )
+        {
+            return false;
+        }
+        let candidate = self
+            .live_candidate
+            .lock()
+            .ok()
+            .is_some_and(|value| value.is_some());
+        candidate
+            && INITIAL_HTTP_RETRY_OBSERVER
+                .try_with(|observer| observer.has_live_offer_receiver())
+                .unwrap_or(false)
+    }
+
+    fn flush_deferred_terminal(&self) {
+        let observation = self
+            .deferred_terminal
+            .lock()
+            .ok()
+            .and_then(|mut value| value.take());
+        if let Some(observation) = observation {
+            self.record(observation);
         }
     }
 
@@ -689,9 +783,10 @@ impl InitialRequestBudget {
     ) -> RetryAttempt<Result<InitialResponse, LLMError>> {
         let mut observation = observation;
         let stop = stop.or_else(|| {
-            if !self.continuous && Instant::now() >= self.deadline {
+            if !self.is_continuous() && Instant::now() >= self.deadline {
                 Some(RequestStopReason::TimeBudgetExhausted)
-            } else if !self.continuous && self.attempts.load(Ordering::Relaxed) >= self.max_attempts
+            } else if !self.is_continuous()
+                && self.attempts.load(Ordering::Relaxed) >= self.max_attempts
             {
                 Some(RequestStopReason::AttemptsExhausted)
             } else {
@@ -709,7 +804,7 @@ impl InitialRequestBudget {
                 .status
                 .and_then(|s| StatusCode::from_u16(s).ok()),
             retry_after,
-            deadline: (!self.continuous).then_some(self.deadline),
+            deadline: (!self.is_continuous()).then_some(self.deadline),
             observation: Some(observation),
         }
     }
@@ -827,13 +922,66 @@ where
         budget,
         completed: false,
     };
-    let result = retry_initial_request(
+    let mut result = drive_anthropic_initial(config, budget, &build).await;
+    let candidate = budget.live_candidate.lock().ok().and_then(|value| *value);
+    let deferred = budget
+        .deferred_terminal
+        .lock()
+        .ok()
+        .is_some_and(|value| value.is_some());
+    if deferred {
+        let sender = INITIAL_HTTP_RETRY_OBSERVER
+            .try_with(|observer| observer.take_live_offer_sender())
+            .ok()
+            .flatten();
+        let accepted = match (sender, candidate) {
+            (Some(sender), Some(candidate)) => {
+                live_bootstrap::offer_and_wait(
+                    sender,
+                    candidate,
+                    budget.attempts.load(Ordering::Acquire),
+                    config,
+                )
+                .await
+            }
+            _ => false,
+        };
+        if accepted {
+            if let Ok(mut observation) = budget.deferred_terminal.lock() {
+                *observation = None;
+            }
+            budget.live_continuous.store(true, Ordering::Release);
+            result = drive_anthropic_initial(config, budget, &build).await;
+        } else {
+            budget.flush_deferred_terminal();
+        }
+    }
+    cancellation.completed = true;
+    result
+}
+
+async fn drive_anthropic_initial<F>(
+    config: &RetryConfig,
+    budget: &InitialRequestBudget,
+    build: &F,
+) -> Result<InitialResponse, LLMError>
+where
+    F: Fn() -> RequestBuilder,
+{
+    let initial_index = if budget.live_continuous.load(Ordering::Acquire) {
+        budget.attempts.load(Ordering::Relaxed)
+    } else {
+        0
+    };
+    retry_initial_request(
         config,
         "Anthropic",
-        budget.continuous,
+        budget.is_continuous(),
+        initial_index,
         || async {
+            budget.clear_live_candidate();
             let attempt_started = Instant::now();
-            if !budget.continuous && attempt_started >= budget.deadline {
+            if !budget.is_continuous() && attempt_started >= budget.deadline {
                 return budget.failure(
                     budget.observation(
                         attempt_started,
@@ -848,7 +996,7 @@ where
             if budget
                 .attempts
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |attempts| {
-                    (budget.continuous || attempts < budget.max_attempts)
+                    (budget.is_continuous() || attempts < budget.max_attempts)
                         .then_some(attempts.saturating_add(1))
                 })
                 .is_err()
@@ -865,7 +1013,7 @@ where
                 );
             }
             budget.record(budget.observation(attempt_started, "send_headers", "none", None));
-            let attempt_deadline = if budget.continuous {
+            let attempt_deadline = if budget.is_continuous() {
                 attempt_started + budget.attempt_timeout
             } else {
                 budget
@@ -875,6 +1023,7 @@ where
             let sent = tokio::time::timeout_at(attempt_deadline, build().send()).await;
             let mut response = match sent {
                 Err(_) => {
+                    budget.record_live_candidate(None);
                     return budget.failure(
                         budget.observation(
                             attempt_started,
@@ -903,13 +1052,20 @@ where
             };
             let status = response.status();
             let retry_after = parse_retry_after_with_date(&response);
+            let retry_after_known = !response
+                .headers()
+                .contains_key(reqwest::header::RETRY_AFTER)
+                || retry_after.is_some();
+            if is_retryable_status(status) && retry_after_known {
+                budget.record_live_candidate(retry_after);
+            }
             let error_body = if !status.is_success() && !is_retryable_status(status) {
                 let mut observation =
                     budget.observation(attempt_started, "error_body", "none", Some(status));
                 observation.diagnostic.event = "classify_error_body";
                 budget.record(observation);
                 match tokio::time::timeout_at(
-                    if budget.continuous {
+                    if budget.is_continuous() {
                         attempt_deadline
                     } else {
                         budget.deadline
@@ -923,7 +1079,7 @@ where
                         let (failure, stop) = if result.is_err() {
                             (
                                 "upstream error body deadline exceeded",
-                                if budget.continuous {
+                                if budget.is_continuous() {
                                     RequestStopReason::UnclassifiedErrorBody
                                 } else {
                                     RequestStopReason::TimeBudgetExhausted
@@ -966,7 +1122,7 @@ where
                         Some(status),
                     ),
                     // Fallback invocations share this absolute attempt count.
-                    (!budget.continuous
+                    (!budget.is_continuous()
                         && budget.attempts.load(Ordering::Relaxed) >= budget.max_attempts)
                         .then_some(RequestStopReason::AttemptsExhausted),
                     retry_after,
@@ -985,10 +1141,12 @@ where
         },
         |outcome, decision| budget.decide(outcome, decision),
     )
-    .await;
-    cancellation.completed = true;
-    result
+    .await
 }
+
+#[cfg(test)]
+#[path = "retry/live_bootstrap_tests.rs"]
+mod live_bootstrap_tests;
 
 #[cfg(test)]
 #[path = "retry/continuous_tests.rs"]

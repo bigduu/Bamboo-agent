@@ -196,25 +196,25 @@ impl InitialRequestBudget {
                 session_hash: self.session_hash.clone(),
                 run_id: None,
                 attempt: self.attempts.load(Ordering::Relaxed),
-                attempt_limit: (!self.continuous).then_some(self.max_attempts),
-                retry_mode: self.continuous.then_some("until_cancelled"),
+                attempt_limit: (!self.is_continuous()).then_some(self.max_attempts),
+                retry_mode: self.is_continuous().then_some("until_cancelled"),
                 event: "attempt_start",
                 phase,
                 failure,
                 status: status.map(|s| s.as_u16()),
                 attempt_timeout_ms: millis(self.attempt_timeout),
-                total_budget_ms: (!self.continuous)
+                total_budget_ms: (!self.is_continuous())
                     .then(|| millis(self.deadline.saturating_duration_since(self.started))),
                 attempt_elapsed_ms: 0,
                 total_elapsed_ms: 0,
-                remaining_budget_ms: (!self.continuous).then_some(0),
+                remaining_budget_ms: (!self.is_continuous()).then_some(0),
                 retry_delay_ms: None,
                 stop_reason: None,
                 upstream_outcome: "unknown",
             },
             request_started: self.started,
             attempt_started,
-            deadline: (!self.continuous).then_some(self.deadline),
+            deadline: (!self.is_continuous()).then_some(self.deadline),
         }
     }
 
@@ -289,6 +289,19 @@ impl InitialRequestBudget {
             }
         }
         observation.refresh();
+        if let Some(stop) = observation.diagnostic.stop_reason {
+            if self.can_defer_terminal(stop) {
+                if let Ok(mut deferred) = self.deferred_terminal.lock() {
+                    *deferred = Some(observation.clone());
+                    let mut waiting = observation;
+                    waiting.diagnostic.event = "retry_waiting";
+                    waiting.diagnostic.stop_reason = None;
+                    waiting.diagnostic.error_id = None;
+                    self.record(waiting);
+                    return;
+                }
+            }
+        }
         self.record(observation.clone());
         if matches!(decision, RetryDecision::Retry(_)) {
             observation.diagnostic.phase = "backoff";

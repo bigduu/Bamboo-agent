@@ -1311,6 +1311,60 @@ fn persist_request_render_metadata(session: &mut Session, render: &RequestRender
     }
 }
 
+// Bound only the optional recovery snapshot. Ordinary Session handling and
+// attachment limits are unchanged. Serialize into a counting sink before any
+// clone so an oversized transcript never creates a second large allocation.
+fn live_bootstrap_snapshot(session: &Session) -> Option<Session> {
+    const MAX_BYTES: usize = 4 * 1024 * 1024;
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .filter(|size| *size <= MAX_BYTES)
+                .ok_or_else(|| std::io::Error::other("live bootstrap snapshot too large"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    fn skipped(session: &Session) -> Option<Count> {
+        let mut count = Count(0);
+        let mut add = |bytes: usize| {
+            count.0 = count
+                .0
+                .checked_add(bytes)
+                .filter(|size| *size <= MAX_BYTES)?;
+            Some(())
+        };
+        if let Some(value) = &session.force_manual_compression {
+            add(value.len())?;
+        }
+        if let Some((model, _)) = &session.resolved_token_budget {
+            add(model.len())?;
+        }
+        if let Some(runtime) = &session.agent_runtime_state {
+            for id in runtime
+                .children
+                .active_ids
+                .iter()
+                .chain(&runtime.children.completed_ids)
+            {
+                add(id.len())?;
+                add(std::mem::size_of::<String>())?;
+            }
+        }
+        Some(count)
+    }
+    let mut compact = skipped(session)?;
+    serde_json::to_writer(&mut compact, session).ok()?;
+    let mut pretty = skipped(session)?;
+    serde_json::to_writer_pretty(&mut pretty, session).ok()?;
+    Some(session.clone())
+}
+
 pub(super) async fn execute_llm_stream(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1491,6 +1545,36 @@ pub(super) async fn execute_llm_stream(
         required_tool,
     );
     let tool_schemas = wire_schemas.as_ref();
+    // Freeze the already-reconciled request's Session before the following
+    // diagnostic-only mutations. The final IR, schemas and options below are
+    // then retained by the very same pinned provider future; no retry may
+    // rebuild them from this snapshot.
+    let live_bootstrap = match (
+        config.live_bootstrap_host.as_ref(),
+        config.persistence.as_ref(),
+        config.session_inbox.as_ref(),
+    ) {
+        (Some(host), Some(persistence), Some(inbox)) => persistence
+            .root_actor_writer()
+            .filter(|owner| {
+                owner.fence.actor_id == session.id
+                    && owner.created_at == session.created_at
+                    && session.kind == bamboo_domain::SessionKind::Root
+                    && session.authority_identity.is_ordinary()
+            })
+            .and_then(|owner| {
+                live_bootstrap_snapshot(session).map(|snapshot| {
+                    (
+                        host.clone(),
+                        persistence.clone(),
+                        inbox.clone(),
+                        owner,
+                        snapshot,
+                    )
+                })
+            }),
+        _ => None,
+    };
     // Side-channel diagnostic: record whether the cacheable stable prefix drifted
     // from the previous round (esp. shrinks, which drop cached content). Never
     // affects what is sent below.
@@ -1575,9 +1659,18 @@ pub(super) async fn execute_llm_stream(
     // not an LLM request. The same span remains alive through stream consumption.
     let observation =
         bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
-    let http_retry_observer = Arc::new(bamboo_llm::retry::InitialHttpRetryObserver::default());
-    let stream = observation
-        .scope(bamboo_llm::retry::with_upstream_retry(
+    let (http_retry_observer, live_offer) = if live_bootstrap.is_some() {
+        let (observer, receiver) =
+            bamboo_llm::retry::InitialHttpRetryObserver::with_live_bootstrap();
+        (observer, Some(receiver))
+    } else {
+        (
+            Arc::new(bamboo_llm::retry::InitialHttpRetryObserver::default()),
+            None,
+        )
+    };
+    let bootstrap_result = {
+        let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
             crate::runtime::stream::handler::await_stream_bootstrap_observed(
                 llm.chat_stream_ir(
@@ -1592,47 +1685,83 @@ pub(super) async fn execute_llm_stream(
                 &timeout_context,
                 http_retry_observer.clone(),
             ),
-        ))
-        .await
-        .and_then(|result| {
-            result.map_err(|error| {
-                if matches!(error, bamboo_llm::provider::LLMError::RequestFailed(_)) {
-                    if let Some(diagnostic) = http_retry_observer
-                        .terminal_diagnostic()
-                        .filter(|d| d.matches_error_message(&error.to_string()))
-                    {
-                        // The existing terminal Session checkpoint carries this
-                        // safe receipt. No provider error text enters the DTO.
-                        session.record_llm_request_diagnostic(diagnostic);
+        ));
+        tokio::pin!(bootstrap);
+        let mut live_guard: Option<Box<dyn Send>> = None;
+        let result = match (live_bootstrap, live_offer) {
+            (Some((host, persistence, inbox, owner, snapshot)), Some(receiver)) => {
+                tokio::select! {
+                    biased;
+                    _ = cancel_token.cancelled() => Err(AgentError::Cancelled),
+                    result = &mut bootstrap => result,
+                    received = receiver => {
+                        if let Ok(offer) = received {
+                            let checkpoint = tokio::select! {
+                                biased;
+                                _ = cancel_token.cancelled() => Err(std::io::Error::other("run cancelled")),
+                                result = persistence.checkpoint_live_bootstrap(&snapshot, inbox.clone(), offer.gate()) => result,
+                            };
+                            if let Ok(proof) = checkpoint {
+                                if offer.matches_proof(&proof) && !cancel_token.is_cancelled() {
+                                    let registered = tokio::select! {
+                                        biased;
+                                        _ = cancel_token.cancelled() => Err(std::io::Error::other("run cancelled")),
+                                        result = host.register(owner, proof, persistence, inbox, offer) => result,
+                                    };
+                                    if let Ok(guard) = registered {
+                                        live_guard = Some(guard);
+                                    }
+                                }
+                            }
+                        }
+                        bootstrap.await
                     }
                 }
-                if matches!(
-                    error,
-                    bamboo_llm::provider::LLMError::RequestFailed(_)
-                        | bamboo_llm::provider::LLMError::Auth(_)
-                ) {
-                    // Authentication types outrank text in an upstream body:
-                    // even overflow-looking text cannot authorize another call.
-                    return AgentError::LLMNonRetryable(error.to_string());
+            }
+            _ => bootstrap.await,
+        };
+        drop(live_guard);
+        result
+    };
+    let stream = bootstrap_result.and_then(|result| {
+        result.map_err(|error| {
+            if matches!(error, bamboo_llm::provider::LLMError::RequestFailed(_)) {
+                if let Some(diagnostic) = http_retry_observer
+                    .terminal_diagnostic()
+                    .filter(|d| d.matches_error_message(&error.to_string()))
+                {
+                    // The existing terminal Session checkpoint carries this
+                    // safe receipt. No provider error text enters the DTO.
+                    session.record_llm_request_diagnostic(diagnostic);
                 }
-                // Request or response body errors can happen after request
-                // bytes were sent. Their source text must not trigger model
-                // context recovery that replays the request.
-                let body_failure = is_http_body_failure(&error);
-                let message = format_provider_error(error);
-                if body_failure {
-                    AgentError::LLMNonRetryable(message)
-                } else if is_llm_overflow_error(&message) {
-                    AgentError::LLMOverflow(message)
-                } else if http_retry_observer.request_budget_managed() {
-                    // Terminal auth, request-validation and transport failures
-                    // must not reset the same provider-owned request budget.
-                    AgentError::LLMNonRetryable(message)
-                } else {
-                    AgentError::LLM(message)
-                }
-            })
-        });
+            }
+            if matches!(
+                error,
+                bamboo_llm::provider::LLMError::RequestFailed(_)
+                    | bamboo_llm::provider::LLMError::Auth(_)
+            ) {
+                // Authentication types outrank text in an upstream body:
+                // even overflow-looking text cannot authorize another call.
+                return AgentError::LLMNonRetryable(error.to_string());
+            }
+            // Request or response body errors can happen after request
+            // bytes were sent. Their source text must not trigger model
+            // context recovery that replays the request.
+            let body_failure = is_http_body_failure(&error);
+            let message = format_provider_error(error);
+            if body_failure {
+                AgentError::LLMNonRetryable(message)
+            } else if is_llm_overflow_error(&message) {
+                AgentError::LLMOverflow(message)
+            } else if http_retry_observer.request_budget_managed() {
+                // Terminal auth, request-validation and transport failures
+                // must not reset the same provider-owned request budget.
+                AgentError::LLMNonRetryable(message)
+            } else {
+                AgentError::LLM(message)
+            }
+        })
+    });
     let stream = match stream {
         Ok(stream) => stream,
         Err(error) => {

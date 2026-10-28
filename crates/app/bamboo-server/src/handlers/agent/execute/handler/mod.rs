@@ -43,6 +43,13 @@ pub async fn handler(
         Ok(selected) => selected,
         Err(response) => return *response,
     };
+    let continuation = match continuation_selector(&http_request, &req) {
+        Ok(continuation) => continuation,
+        Err(response) => return response,
+    };
+    if continuation.is_some() && selected.is_some() {
+        return bad_request_error_response("A continuation cannot select a new input receipt");
+    }
     let target = format!("POST /api/v1/execute/{session_id}");
     let prepared = match if let Some(receipt) = selected.as_ref() {
         crate::app_state::mutation_idempotency::prepare(
@@ -51,21 +58,117 @@ pub async fn handler(
             &target,
             &serde_json::json!({"request": &*req, "input": {"message_id": receipt.receipt.id.as_str(), "ingress_seq": receipt.receipt.generation, "session_created_at": receipt.created_at}}),
         )
+    } else if let Some(run_id) = continuation.as_ref() {
+        crate::app_state::mutation_idempotency::prepare(
+            &http_request,
+            "execute",
+            &target,
+            &serde_json::json!({"request": &*req, "continue_run_id": run_id}),
+        )
     } else {
         crate::app_state::mutation_idempotency::prepare(&http_request, "execute", &target, &*req)
     } {
         Ok(prepared) => prepared,
         Err(response) => return *response,
     };
-    let Some(prepared) = prepared else {
-        return handle_execute(state, session_id, req).await;
-    };
     let store = state.mutation_idempotency.clone();
-    store
-        .execute(prepared, || {
-            handle_execute_inner(state, session_id, req, selected)
-        })
+    let operation = || async move {
+        if let Some(run_id) = continuation {
+            continue_live_retry(&state, &session_id, &run_id).await
+        } else {
+            handle_execute_inner(state, session_id, req, selected).await
+        }
+    };
+    match prepared {
+        Some(prepared) => store.execute(prepared, operation).await,
+        None => operation().await,
+    }
+}
+
+// A continuation selects a still-live run; it cannot replace any of the
+// model, provider, policy, or input parameters already captured by that run.
+fn continuation_selector(
+    http: &HttpRequest,
+    req: &ExecuteRequest,
+) -> Result<Option<String>, HttpResponse> {
+    let values = http.headers().get_all("Bamboo-Run-Id");
+    if values.count() == 0 {
+        return Ok(None);
+    }
+    let run = http
+        .headers()
+        .get("Bamboo-Run-Id")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| {
+            !value.is_empty() && value.len() <= 128 && value.bytes().all(|b| b.is_ascii_graphic())
+        });
+    if http.headers().get_all("Bamboo-Run-Id").count() != 1 || run.is_none() {
+        return Err(bad_request_error_response("Invalid Bamboo-Run-Id"));
+    }
+    if !matches!(
+        req.upstream_retry,
+        Some(bamboo_llm::retry::UpstreamRetry::UntilCancelled)
+    ) || req.model.is_some()
+        || req.provider.is_some()
+        || req.model_ref.is_some()
+        || req.skill_mode.is_some()
+        || req.reasoning_effort.is_some()
+        || req.client_sync.is_some()
+        || req.no_human_approver
+        || req.run_budget.is_some()
+        || req.live_bootstrap_resume
+    {
+        return Err(bad_request_error_response(
+            "A continuation requires only upstream_retry.mode=until_cancelled",
+        ));
+    }
+    Ok(run.map(str::to_owned))
+}
+
+async fn continue_live_retry(
+    state: &web::Data<AppState>,
+    session_id: &str,
+    run_id: &str,
+) -> HttpResponse {
+    use crate::app_state::live_retry::ContinueResult;
+    match state.live_retry.confirm(&state.agent_runners, session_id, run_id).await {
+        ContinueResult::Continuing => HttpResponse::Ok().json(serde_json::json!({
+            "session_id": session_id, "run_id": run_id, "status": "retry_continuing",
+            "events_url": format!("/api/v1/events/{session_id}")
+        })),
+        ContinueResult::NotPrepared => continuous_retry_resume_not_prepared(session_id),
+        ContinueResult::OutcomeUncertain => HttpResponse::Conflict().json(serde_json::json!({
+            "session_id": session_id, "run_id": run_id,
+            "error": {"type": "api_error", "code": "retry_resume_outcome_uncertain",
+                "message": "The continuation outcome is uncertain. Follow the original run before retrying."}
+        })),
+    }
+}
+
+/// Nonterminal waiting observation for a live producer offer.
+pub async fn retry_waiting_handler(
+    state: web::Data<AppState>,
+    http: HttpRequest,
+    path: web::Path<String>,
+) -> HttpResponse {
+    let session_id = path.into_inner();
+    if let Err(error) =
+        crate::handlers::agent::tickets::require_supervisor_owner(&state, &http, &session_id).await
+    {
+        return crate::handlers::agent::tickets::TicketHttpError::from(error).error_response();
+    }
+    match state
+        .live_retry
+        .waiting(&state.agent_runners, &session_id)
         .await
+    {
+        Some(waiting) => HttpResponse::Ok().json(serde_json::json!({
+            "session_id": session_id, "run_id": waiting.run_id, "status": "retry_waiting",
+            "expires_in_ms": waiting.expires_in_ms, "confirming": waiting.confirming,
+        })),
+        None => HttpResponse::Ok()
+            .json(serde_json::json!({"session_id": session_id, "status": "unavailable"})),
+    }
 }
 
 /// Execute a session for in-process callers that do not cross the HTTP
@@ -77,6 +180,14 @@ pub async fn handle_execute(
     req: web::Json<ExecuteRequest>,
 ) -> HttpResponse {
     handle_execute_inner(state, session_id, req, None).await
+}
+
+struct RestoredFreshAdmission {
+    inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
+    witness: Option<crate::app_state::fresh_sync::FreshSyncWitness>,
+    generate_title: bool,
+    native_main: bool,
+    live_bootstrap_resume: bool,
 }
 
 async fn handle_execute_inner(
@@ -108,11 +219,38 @@ async fn handle_execute_inner(
     // Bind rejection rollback to the exact turn observed by this request. A
     // delayed failure from turn A must never poison a newer turn B.
     drop(startup_lock);
-    let selected_reservation = match selected.as_ref() {
-        Some(receipt) => receipt::reserve(&state, &session_id, receipt)
-            .await
-            .map(Some),
-        None => state.reserve_root_chat_for_execute(&session_id).await,
+    // A resync handoff contains the original non-clonable reservation and
+    // freshly admitted input. Never recreate it from history or a receipt.
+    let handoff = if selected.is_none() {
+        state.fresh_sync.take(state.get_ref(), &session_id).await
+    } else {
+        None
+    };
+    let mut restored = None;
+    let selected_reservation = if let Some(handoff) = handoff {
+        let crate::app_state::fresh_sync::FreshSyncHandoff {
+            reservation,
+            inputs,
+            witness,
+            generate_title,
+            native_main,
+            live_bootstrap_resume,
+        } = handoff;
+        restored = Some(RestoredFreshAdmission {
+            inputs,
+            witness,
+            generate_title,
+            native_main,
+            live_bootstrap_resume,
+        });
+        Ok(Some(reservation))
+    } else {
+        match selected.as_ref() {
+            Some(receipt) => receipt::reserve(&state, &session_id, receipt)
+                .await
+                .map(Some),
+            None => state.reserve_root_chat_for_execute(&session_id).await,
+        }
     };
     let mut admission_reservation = match selected_reservation {
         Ok(reservation) => reservation,
@@ -127,6 +265,7 @@ async fn handle_execute_inner(
         req,
         &mut startup_guard,
         &mut admission_reservation,
+        restored,
     )
     .await;
     // Await exact cleanup on every non-spawn return. The reservation's own
@@ -141,16 +280,109 @@ async fn handle_reserved_execute(
     req: web::Json<ExecuteRequest>,
     startup_guard: &mut crate::handlers::agent::events::ExecuteStartupGuard,
     admission_reservation: &mut Option<SessionExecutionReservation>,
+    restored: Option<RestoredFreshAdmission>,
 ) -> HttpResponse {
-    let admission = match state
-        .admit_chat_for_execute_with_http_reservation(&session_id, admission_reservation)
-        .await
-    {
-        Ok(admission) => admission,
-        Err(response) => return *response,
+    let restored_owner = restored.is_some();
+    // A sync correction reuses this owner; preserve the opt-in selected on
+    // its first request so the later provider future can publish its offer.
+    let live_bootstrap_resume = req.live_bootstrap_resume
+        || restored
+            .as_ref()
+            .is_some_and(|handoff| handoff.live_bootstrap_resume);
+    let admission = if restored_owner {
+        None
+    } else {
+        Some(
+            match state
+                .admit_chat_for_execute_with_http_reservation(
+                    &session_id,
+                    admission_reservation,
+                    matches!(
+                        req.upstream_retry,
+                        Some(bamboo_llm::retry::UpstreamRetry::UntilCancelled)
+                    ),
+                )
+                .await
+            {
+                Ok(admission) => admission,
+                Err(response) => return *response,
+            },
+        )
     };
-    let untrusted_inputs = admission.inputs;
-    let native_main = admission.native_main;
+    if admission
+        .as_ref()
+        .is_some_and(|admission| admission.retry_unprepared)
+    {
+        // No execution can start here. Preserve the existing sync contract
+        // before reporting the absent continuation: a cached view must not
+        // mask a newer canonical session, and a stale client must be told to
+        // reload instead of being given a misleading recovery response.
+        let canonical = match state.storage.load_session(&session_id).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return HttpResponse::NotFound().json(serde_json::json!({
+                    "session_id": session_id,
+                    "error": crate::error::error_value("Session not found"),
+                }));
+            }
+            Err(_) => {
+                return internal_server_error_response(
+                    "Could not verify the session before continuous retry",
+                );
+            }
+        };
+        let snapshot =
+            bamboo_engine::session_app::types::ServerExecuteSnapshot::from_session(&canonical);
+        let cached = state.load_session(&session_id).await;
+        if !cached.as_ref().is_some_and(|session| {
+            session.created_at == canonical.created_at
+                && bamboo_engine::session_app::types::ServerExecuteSnapshot::from_session(session)
+                    == snapshot
+        }) {
+            return continuous_retry_state_changed(&session_id);
+        }
+        let client_sync = req.client_sync.as_ref().map(|sync| {
+            bamboo_engine::session_app::types::ExecuteClientSync {
+                client_message_count: sync.client_message_count,
+                client_last_message_id: sync.client_last_message_id.clone(),
+                client_has_pending_question: sync.client_has_pending_question,
+                client_pending_question_tool_call_id: sync
+                    .client_pending_question_tool_call_id
+                    .clone(),
+            }
+        });
+        if let Some(reason) = bamboo_engine::session_app::execute::evaluate_client_sync(
+            client_sync.as_ref(),
+            &snapshot,
+        ) {
+            state
+                .metrics_service
+                .collector()
+                .execute_sync_mismatch(reason.as_str(), chrono::Utc::now());
+            return completed_response(
+                &session_id,
+                server_snapshot_to_sync_info(&snapshot, Some(reason)),
+            );
+        }
+        return continuous_retry_resume_not_prepared(&session_id);
+    }
+    let (mut untrusted_inputs, mut fresh_sync, generate_title, native_main) =
+        if let Some(restored) = restored {
+            (
+                restored.inputs,
+                restored.witness,
+                restored.generate_title,
+                restored.native_main,
+            )
+        } else {
+            let admission = admission.expect("new admission exists");
+            (
+                admission.inputs,
+                admission.fresh_sync,
+                admission.generate_title,
+                admission.native_main,
+            )
+        };
     let startup_turn_id = state
         .storage
         .load_session(&session_id)
@@ -346,7 +578,7 @@ async fn handle_reserved_execute(
                     startup_turn_id: startup_turn_id.clone(),
                     untrusted_inputs,
                     native_main,
-                    generate_title: admission.generate_title,
+                    generate_title,
                     effective_model,
                     effective_reasoning_effort,
                     model_source,
@@ -355,6 +587,7 @@ async fn handle_reserved_execute(
                     no_human_approver: req.no_human_approver,
                     run_budget: req.run_budget,
                     upstream_retry: req.upstream_retry.unwrap_or_default(),
+                    live_bootstrap_resume,
                 },
                 config: &config,
                 config_snapshot: &config_snapshot,
@@ -375,6 +608,136 @@ async fn handle_reserved_execute(
         bamboo_engine::session_app::types::ExecutePreparationOutcome::NoPendingMessage {
             server_snapshot,
         } => {
+            // The per-run HTTP retry policy is not a recovery authorization.
+            // Recheck the durable conversation and exact live runner before
+            // describing a no-pending outcome to an opt-in retry caller.
+            if matches!(
+                req.upstream_retry,
+                Some(bamboo_llm::retry::UpstreamRetry::UntilCancelled)
+            ) {
+                // Inbox is read before Main, matching the existing terminal
+                // protocol: a consumer checkpoints its User before its ACK.
+                let backlog = match state.session_inbox.inspect(&session_id).await {
+                    Ok(backlog) => backlog,
+                    Err(_) => {
+                        // Inbox inspection can fail because the canonical
+                        // session was deleted after an older snapshot was cached.
+                        // Preserve the inbox-before-main ordering on success.
+                        if matches!(state.storage.load_session(&session_id).await, Ok(None)) {
+                            return HttpResponse::NotFound().json(serde_json::json!({
+                                "session_id": session_id,
+                                "error": crate::error::error_value("Session not found"),
+                            }));
+                        }
+                        return internal_server_error_response(
+                            "Could not verify pending work before continuous retry",
+                        );
+                    }
+                };
+                let latest = match state.storage.load_session(&session_id).await {
+                    Ok(Some(latest)) => latest,
+                    Ok(None) => {
+                        return HttpResponse::NotFound().json(serde_json::json!({
+                            "session_id": session_id,
+                            "error": crate::error::error_value("Session not found"),
+                        }));
+                    }
+                    Err(_) => {
+                        return internal_server_error_response(
+                            "Could not verify whether the previous run can be resumed",
+                        );
+                    }
+                };
+                let latest_snapshot =
+                    bamboo_engine::session_app::types::ServerExecuteSnapshot::from_session(&latest);
+                // The earlier client sync check used the cached snapshot. A
+                // changed durable snapshot cannot inherit its need_sync=false.
+                if latest_snapshot != server_snapshot {
+                    return continuous_retry_state_changed(&session_id);
+                }
+                let (active_runner, runner_busy, runner_failed) = {
+                    let runners = state.agent_runners.read().await;
+                    runners
+                        .get(&session_id)
+                        .map_or((None, false, false), |runner| {
+                            let resetting = runner.root_reset_admission_reserved();
+                            let running =
+                                matches!(runner.status, crate::app_state::AgentStatus::Running);
+                            let pending =
+                                matches!(runner.status, crate::app_state::AgentStatus::Pending);
+                            let failed = matches!(
+                                runner.status,
+                                crate::app_state::AgentStatus::Error(_)
+                                    | crate::app_state::AgentStatus::Cancelled
+                            );
+                            (
+                                (!resetting && running).then(|| runner.run_id.clone()),
+                                resetting || running || pending,
+                                failed,
+                            )
+                        })
+                };
+                if let Some(run_id) = active_runner.as_ref() {
+                    let owned_by_this_request = admission_reservation
+                        .as_ref()
+                        .is_some_and(|reservation| reservation.run_id() == run_id.as_str());
+                    if !owned_by_this_request
+                        && state
+                            .session_activation_router
+                            .current_run_id(&session_id)
+                            .await
+                            .as_deref()
+                            == Some(run_id.as_str())
+                    {
+                        return already_running_response(
+                            &session_id,
+                            build_sync_info_from_session(&latest),
+                            Some(run_id.clone()),
+                        );
+                    }
+                }
+                let last_run_status = latest.last_run_status();
+                let runtime_wait = latest.agent_runtime_state.as_ref().is_some_and(|runtime| {
+                    runtime.waiting_for_children.is_some()
+                        || runtime.waiting_for_bash.is_some()
+                        || matches!(
+                            runtime.status,
+                            bamboo_domain::AgentStatusState::Initializing
+                                | bamboo_domain::AgentStatusState::Running
+                                | bamboo_domain::AgentStatusState::Suspended
+                                | bamboo_domain::AgentStatusState::Finalizing
+                        )
+                        || (last_run_status.as_deref() == Some("completed")
+                            && matches!(
+                                runtime.status,
+                                bamboo_domain::AgentStatusState::Failed
+                                    | bamboo_domain::AgentStatusState::Cancelled
+                            ))
+                });
+                let changed_or_busy = runner_busy
+                    || (last_run_status.as_deref() == Some("completed") && runner_failed)
+                    || latest_snapshot.has_pending_user_message
+                    || latest_snapshot.has_pending_question
+                    || backlog.activation_pending()
+                    || latest.metadata.contains_key("chat.queued_ingress.v1")
+                    || latest.has_pending_injected_messages()
+                    || runtime_wait
+                    || latest.metadata.contains_key("runtime.suspend_reason")
+                    || matches!(
+                        last_run_status.as_deref(),
+                        Some("pending" | "running" | "suspended")
+                    );
+                if changed_or_busy {
+                    return continuous_retry_state_changed(&session_id);
+                }
+                if last_run_status.as_deref() != Some("completed") {
+                    return continuous_retry_resume_not_prepared(&session_id);
+                }
+                return completed_response(
+                    &session_id,
+                    server_snapshot_to_sync_info(&latest_snapshot, None),
+                );
+            }
             tracing::debug!(
                 "[{}] No pending user message, returning completed status",
                 session_id
@@ -387,6 +750,35 @@ async fn handle_reserved_execute(
             reason,
             server_snapshot,
         } => {
+            // Retain the same owner only when this request actually admitted
+            // fresh work, or recovered that very owner from an earlier sync.
+            let needs_handoff = fresh_sync.is_some()
+                && (restored_owner
+                    || live_bootstrap_resume
+                    || matches!(
+                        req.upstream_retry,
+                        Some(bamboo_llm::retry::UpstreamRetry::UntilCancelled)
+                    ));
+            if needs_handoff
+                && !state
+                    .fresh_sync
+                    .park(
+                        state.get_ref(),
+                        admission_reservation,
+                        &mut untrusted_inputs,
+                        &mut fresh_sync,
+                        generate_title,
+                        native_main,
+                        live_bootstrap_resume,
+                    )
+                    .await
+            {
+                return HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "session_id": session_id,
+                    "error": {"type": "api_error", "code": "retry_input_handoff_unavailable",
+                        "message": "The new message is preserved, but its execution handoff could not be retained."}
+                }));
+            }
             tracing::debug!(
                 "[{}] Execute SyncMismatch (reason={:?}); returning completed/need_sync without starting a runner",
                 session_id,
@@ -426,6 +818,28 @@ async fn handle_reserved_execute(
             bad_request_error_response(error)
         }
     }
+}
+
+fn continuous_retry_resume_not_prepared(session_id: &str) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "session_id": session_id,
+        "error": {
+            "message": "Continuous retry did not start because no safe resume was prepared for this conversation. The conversation was preserved.",
+            "type": "api_error",
+            "code": "retry_resume_not_prepared"
+        }
+    }))
+}
+
+fn continuous_retry_state_changed(session_id: &str) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "session_id": session_id,
+        "error": {
+            "message": "Continuous retry did not start because the session has pending or changed work. Refresh the session before retrying.",
+            "type": "api_error",
+            "code": "retry_state_changed"
+        }
+    }))
 }
 
 fn resolve_requested_provider<'a>(

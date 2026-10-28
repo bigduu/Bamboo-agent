@@ -851,6 +851,22 @@ fn copy_checked_request(
     Ok(request)
 }
 
+/// Host-only continuation of one still-live Anthropic bootstrap. The offer is
+/// produced by the provider and cannot be reconstructed from HTTP/history.
+#[async_trait::async_trait]
+pub trait LiveBootstrapHost: Send + Sync {
+    /// The returned lifetime removes this exact offer when the provider future
+    /// ends. Implementations must bind owner, persistence and offer gate.
+    async fn register(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        proof: bamboo_domain::LiveBootstrapProof,
+        persistence: Arc<dyn RuntimeSessionPersistence>,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        offer: bamboo_llm::retry::LiveBootstrapOffer,
+    ) -> std::io::Result<Box<dyn Send>>;
+}
+
 /// Configuration for the agent loop.
 ///
 /// # One-config-per-run invariant (#44)
@@ -910,6 +926,7 @@ pub struct AgentLoopConfig {
     pub(crate) guidance_active_run_id: Option<String>,
     /// Durable logical-session inbox admitted at safe round boundaries.
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
+    pub(crate) live_bootstrap_host: Option<Arc<dyn LiveBootstrapHost>>,
     /// Active-owner wake generation. The loop consumes this at the same safe
     /// boundary where it drains SessionInbox; it never interrupts an in-flight
     /// provider/tool operation.
@@ -1138,6 +1155,7 @@ impl Default for AgentLoopConfig {
             persistence: None,
             guidance_active_run_id: None,
             session_inbox: None,
+            live_bootstrap_host: None,
             session_activation_notifications: None,
             attachment_reader: None,
             metrics_collector: None,

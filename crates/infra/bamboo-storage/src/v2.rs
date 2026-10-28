@@ -112,6 +112,8 @@ mod root_actor_input_tests;
 mod root_actor_runtime;
 #[cfg(test)]
 mod root_birth_tests;
+#[cfg(test)]
+mod root_live_bootstrap_tests;
 mod scoped_loop_control;
 #[cfg(test)]
 mod scoped_loop_control_tests;
@@ -7448,6 +7450,29 @@ impl Storage for SessionStoreV2 {
         publish: bamboo_domain::storage::RootActorRuntimeEventPublisher,
     ) -> io::Result<()> {
         self.publish_root_actor_runtime_event_impl(owner, publish)
+            .await
+    }
+
+    async fn checkpoint_root_live_bootstrap(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        gate: bamboo_domain::AdmissionGate,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<bamboo_domain::LiveBootstrapProof> {
+        self.checkpoint_root_live_bootstrap_impl(owner, session, inbox, gate, publish)
+            .await
+    }
+
+    async fn confirm_root_live_bootstrap(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        proof: &bamboo_domain::LiveBootstrapProof,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        self.confirm_root_live_bootstrap_impl(owner, proof, inbox, publish)
             .await
     }
 
