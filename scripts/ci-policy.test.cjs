@@ -261,7 +261,7 @@ legacyTest("legacy release matrices retain their original crate and server cover
   assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
 })
 
-test("one feature executor preserves default configurations and complete explicit additive case ownership", () => {
+test("feature shards preserve default configurations and complete explicit additive case ownership", () => {
   const { selectedPackages, sourceFeatureHash, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, cargoArguments } = require('./run-feature-tests.cjs')
   const result = spawnSync('cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
   assert.equal(result.status, 0, result.stderr)
@@ -290,12 +290,12 @@ test("one feature executor preserves default configurations and complete explici
     assert.ok(packages.some(owner => owner.name === context.package))
     assert.ok(!cargoArguments({ name: context.package }, context, true).includes('--all-features'))
   }
-  assert.match(job('feature-tests'), /target\/feature-tests/u)
-  assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
+  assert.match(job('feature-shards'), /target\/feature-tests/u)
+  assert.match(job('feature-shards'), /run: node scripts\/run-feature-tests.cjs/u)
 })
 
-test("the feature executor bounds debug artifacts and records capacity without changing release profiles", () => {
-  const feature = job("feature-tests")
+test("feature shards bound debug artifacts and record capacity without changing release profiles", () => {
+  const feature = job("feature-shards")
   assert.match(feature, /^    timeout-minutes: 90$/mu)
   for (const profile of ["DEV", "TEST"]) {
     const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
@@ -493,7 +493,7 @@ test("Observer API-only Clippy has one owner for the union of both runtime paths
 function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {
-      "feature-tests": "The canonical isolated-default and explicit-feature test executor",
+      "feature-shards": "The canonical isolated-default and explicit-feature test shards",
       "quick-checks": "Small synthetic workflow/controller policy fixtures",
       test: "Pinned legacy release policy fixtures; feature mode is admission only",
       "test-crates": "Pinned legacy release Unit acceptance until source cutover",
@@ -559,7 +559,7 @@ function assertLinuxTestOwnership(definitions) {
         assert.match(block, /^    if: >-\n      needs.validation-source.outputs.full == 'true' &&\n/mu)
         assert.doesNotMatch(block, /outputs\.feature|base_ref == 'dev'/u)
       }
-      if (file === "ci.yml" && id === "feature-tests") {
+      if (file === "ci.yml" && id === "feature-shards") {
         assert.equal([...block.matchAll(/run: node scripts\/run-feature-tests\.cjs$/gmu)].length, 1)
         assert.doesNotMatch(block, /cargo test/u)
         const paths = [...block.matchAll(/\bscripts\/[a-zA-Z0-9_./-]+\.(?:cjs|mjs|js|py|sh)/gu)].map(match => match[0])
@@ -1784,7 +1784,7 @@ test("feature Node suites keep full Quick coverage and only exact native behavio
     assert.doesNotMatch(step, /\bif:|continue-on-error:|\|\|/u)
     assert.ok(native.indexOf(step) < native.indexOf("Run fixed native ownership"), "Node failures cannot be hidden after Cargo")
   }
-  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-tests")
+  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-shards")
   verify(quick, native, linux)
   for (const script of scripts) {
     assert.throws(() => verify(quick.replace(` scripts/${script}`, ""), native, linux))
@@ -1839,11 +1839,12 @@ test("native Node selection uses the real runner and preserves failures before r
   assert.equal(run({ status: 0, stdout: nativeTap() }, nativeNode.FILES.slice(1)), 1)
 })
 
-test("standalone native Windows is manual and feature CI owns automatic acceptance", () => {
+test("native Windows acceptance remains available by manual dispatch", () => {
   const header = actorWindowsWorkflow.split("\njobs:\n")[0]
   assert.match(header, /on:\n  workflow_dispatch:/u)
   assert.doesNotMatch(header, /pull_request:|push:/u)
   assert.match(job("native-feature-tests"), /run: node scripts\/native-test-owner\.cjs/u)
+  assert.match(job("native-feature-tests"), /github.event_name == 'workflow_dispatch'/u)
 })
 
 const assertActorWindowsAcceptance = (source, controller = actorWindowsController) => {

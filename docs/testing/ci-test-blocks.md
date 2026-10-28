@@ -1,15 +1,20 @@
 # Feature Unit and E2E execution
 
-Every feature PR to dev uses one physical Linux executor and one owned
-target/feature-tests directory. The controller selects existing Cargo
+Feature code PRs to dev use seven independently rerunnable Linux package shards,
+each with its own target/feature-tests directory. The controller selects existing Cargo
 default-members plus the recorder; analytics and unrelated example packages
 stay outside acceptance.
 
-Each package runs independently with its default features. Cargo's default
+Each package belongs to exactly one shard and runs with its default features. Cargo's default
 target selection covers library/binary Unit cases, integration E2E cases and
 doctests once. Do not combine the selected packages into one Cargo command:
 workspace feature unification can enable test utilities in production-default
 dependencies. Unit/E2E are logical target groups, not separate build jobs.
+
+The same shard owns each package's additive cases, serial selections and SSH
+fixture. Dependencies may be compiled in more than one isolated runner; the
+workflow does not run a separate workspace build or repeat a test selection.
+Root and docs Markdown-only PRs run Quick Checks without product compilation.
 
 The default infrastructure context must compile and execute the telemetry
 feature-unavailable regression. Tickets retain the direct production publication
@@ -66,18 +71,18 @@ advertise 14 GB SSD storage. A full cold hosted run must establish that the
 suite fits; a tiny executor fixture or cache hit does not prove capacity.
 
 Ordinary Linux orchestration, scoped-context and recorder cases already belong
-to this executor. All agents use the same ownership path. Policy rejects new
+to these shards. All agents use the same ownership path. Policy rejects new
 ordinary Linux PR Cargo-test producers, including tests hidden behind supported
 repository wrappers. Native OS, containment boundaries, explicit manual
 diagnostics and pinned legacy routes retain named scoped exceptions.
 
-Mac/Windows TLS and recorder jobs still compile common code in separate jobs.
+Mac/Windows TLS and recorder diagnostics run only on manual dispatch.
 The macOS TLS guard deliberately uses a dev profile for compact-unwind checks.
 Native consolidation needs one owner/target per OS and compatible configuration;
 this slice does not establish ecosystem-wide zero duplicate compilation.
 
 Required Test rejects failed, missing, cancelled or skipped selected results.
-E2E Tests reports the same executor result without another runtime pass. Repair
+E2E Tests reports the same shard results without another runtime pass. Repair
 failures in the feature branch before dev admission. Keep original attempt and
 source evidence when rerunning a failed job.
 

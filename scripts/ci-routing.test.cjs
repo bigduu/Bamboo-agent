@@ -20,7 +20,7 @@ function script(step) {
   assert.ok(match);
   return match[1].split("\n").map(line => line.replace(/^          /, "")).join("\n");
 }
-const featureJobs = ["quick-checks", "feature-tests", "native-feature-tests", "browser-runtime-tests", "msrv", "lint", "docs", "security", "deny"];
+const featureJobs = ["quick-checks", "feature-shards", "native-feature-tests", "browser-runtime-tests", "msrv", "lint", "docs", "security", "deny"];
 function assertRouting(source) {
   const header = source.split("\njobs:\n")[0];
   assert.match(header, /pull_request:\n    branches: \[ dev, main \]/);
@@ -29,11 +29,12 @@ function assertRouting(source) {
   for (const id of featureJobs) {
     const block = job(source, id);
     assert.match(block, /^    needs: validation-source$/m);
-    assert.match(block, /^    if: needs.validation-source.outputs.feature == 'true'$/m);
+    assert.match(block, /^    if: needs.validation-source.outputs.feature == 'true'/m);
+    if (!["quick-checks", "native-feature-tests"].includes(id)) assert.match(block, /needs.validation-source.outputs.docs_only == 'false'/);
     assert.doesNotMatch(block, /continue-on-error:/);
   }
   assert.deepEqual([...source.matchAll(/^  ([a-z][a-z0-9-]*):$/gm)].map(row => row[1]).sort(),
-    ["validation-source", "promotion-source", "test", "e2e-test", ...featureJobs].sort());
+    ["validation-source", "promotion-source", "test", "e2e-test", "feature-tests", ...featureJobs].sort());
   assert.match(job(source, "promotion-source"), /if: github.event_name == 'pull_request' && github.base_ref == 'main'/);
   assert.doesNotMatch(job(source, "promotion-source"), /actions\/checkout|cargo |node |contents: write/);
   for (const id of ["test", "e2e-test"]) {
@@ -46,7 +47,12 @@ function assertRouting(source) {
   assert.equal((source.match(/run: cargo fmt --all -- --check/g) || []).length, 1);
   assert.equal((source.match(/run: node scripts\/run-feature-tests.cjs/g) || []).length, 1);
   assert.equal((source.match(/run: node scripts\/native-test-owner.cjs/g) || []).length, 1);
+  assert.match(job(source, "native-feature-tests"), /github.event_name == 'workflow_dispatch'/);
   assert.match(job(source, "native-feature-tests"), /os: \[windows-2025, macos-latest\]/);
+  const shards = job(source, "feature-shards");
+  assert.match(shards, /fail-fast: false\n      matrix:\n        shard: \[agent, server, packages-0, packages-1, packages-2, packages-3, packages-4\]/);
+  assert.match(shards, /BAMBOO_FEATURE_SHARD: \$\{\{ matrix.shard \}\}/);
+  assert.match(job(source, "feature-tests"), /test "\$SHARDS_RESULT" = success/);
   assert.match(job(source, "msrv"), /cargo check --locked --workspace --all-targets --all-features/);
   assert.match(job(source, "lint"), /cargo clippy --all-features --/);
   assert.match(job(source, "security"), /cargo audit --deny warnings/);
@@ -70,7 +76,7 @@ test("feature CI owns tests and quality once; main has only read-only promotion"
     ["  workflow_dispatch:", "  push:\n    branches: [main]\n  workflow_dispatch:"],
     ["needs.validation-source.outputs.feature == 'true'", "always()"],
     ["run: node scripts/run-feature-tests.cjs", "run: cargo test"],
-    ["os: [windows-2025, macos-latest]", "os: [windows-2025]"],
+    ["shard: [agent, server, packages-0, packages-1, packages-2, packages-3, packages-4]", "shard: [agent]"],
     ["shard: [host, profile, shared, other]", "shard: [host, profile, shared]"],
     ["run: cargo fmt --all -- --check", "run: true"],
   ]) assert.throws(() => assertRouting(ci.replace(before, after)));
@@ -145,19 +151,59 @@ test("feature source controller preserves the official log and rejects main or r
   ]) { const result = run(overrides); assert.notEqual(result.status, 0); assert.equal(result.output, ""); }
 });
 
+test("documentation routing uses the actual merge and never skips embedded Markdown", t => {
+  const { documentationOnly } = require("./ci-change-scope.cjs");
+  assert.equal(documentationOnly(["README.md", "docs/nested/guide.md"]), true);
+  for (const files of [[], ["crates/infra/builtin/explorer.md"], ["docs/guide.md", "src/main.rs"], [".github/workflows/ci.yml"], ["docs/tool.sh"]]) {
+    assert.equal(documentationOnly(files), false);
+  }
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-ci-scope-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const git = (...args) => {
+    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" });
+    assert.equal(result.status, 0, result.stderr); return result.stdout.trim();
+  };
+  git("init", "-q", "-b", "main");
+  git("config", "user.name", "CI fixture"); git("config", "user.email", "ci@example.invalid");
+  fs.writeFileSync(path.join(directory, "README.md"), "base\n");
+  fs.writeFileSync(path.join(directory, "source.rs"), "source\n");
+  fs.mkdirSync(path.join(directory, "docs"));
+  git("add", "."); git("commit", "-qm", "base"); const base = git("rev-parse", "HEAD");
+  git("checkout", "-qb", "docs-only"); fs.writeFileSync(path.join(directory, "README.md"), "docs\n");
+  git("commit", "-qam", "docs"); git("checkout", "-q", "main"); git("merge", "--no-ff", "-qm", "docs merge", "docs-only");
+  const firstMerge = git("rev-parse", "HEAD");
+  const classify = (before, after) => spawnSync(process.execPath, [path.resolve("scripts/ci-change-scope.cjs"), before, after], { cwd: directory, encoding: "utf8" });
+  assert.equal(classify(base, firstMerge).stdout.trim(), "true");
+  git("checkout", "-qb", "renamed-source"); git("mv", "source.rs", "docs/source.md");
+  git("commit", "-qm", "rename source"); git("checkout", "-q", "main"); git("merge", "--no-ff", "-qm", "rename merge", "renamed-source");
+  const secondMerge = git("rev-parse", "HEAD");
+  assert.equal(classify(firstMerge, secondMerge).stdout.trim(), "false");
+  assert.notEqual(classify(base, secondMerge).status, 0);
+});
+
 test("required feature summaries reject every unsuccessful selected owner", () => {
-  const defaults = { SOURCE_RESULT: "success", FEATURE_VALIDATION: "true", GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev" };
+  const defaults = { SOURCE_RESULT: "success", FEATURE_VALIDATION: "true", DOCS_ONLY: "false", NATIVE_REQUESTED: "false", GITHUB_EVENT_NAME: "pull_request", GITHUB_BASE_REF: "dev" };
   const fields = ["QUICK_RESULT", "FEATURE_RESULT", "NATIVE_RESULT", "BROWSER_RESULT", "LINT_RESULT", "MSRV_RESULT", "DOCS_RESULT", "SECURITY_RESULT", "DENY_RESULT"];
   for (const field of fields) defaults[field] = "success";
+  defaults.NATIVE_RESULT = "skipped";
   const run = (id, overrides = {}) => spawnSync("bash", ["-c", script(job(ci, id))], { encoding: "utf8", env: { ...process.env, ...defaults, ...overrides } });
   assert.equal(run("test").status, 0);
   assert.equal(run("test", { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "" }).status, 0);
-  for (const field of ["SOURCE_RESULT", ...fields]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) {
+  assert.equal(run("test", { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", NATIVE_REQUESTED: "true", NATIVE_RESULT: "success" }).status, 0);
+  assert.notEqual(run("test", { GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "", NATIVE_REQUESTED: "true" }).status, 0);
+  for (const field of ["SOURCE_RESULT", ...fields.filter(field => field !== "NATIVE_RESULT")]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) {
     assert.notEqual(run("test", { [field]: value }).status, 0, `${field}:${value}`);
   }
+  for (const value of ["failure", "cancelled", "success", "", "unknown"]) assert.notEqual(run("test", { NATIVE_RESULT: value }).status, 0);
+  const documentation = Object.fromEntries(fields.filter(field => field !== "QUICK_RESULT").map(field => [field, "skipped"]));
+  assert.equal(run("test", { ...documentation, DOCS_ONLY: "true" }).status, 0);
+  assert.equal(run("e2e-test", { ...documentation, DOCS_ONLY: "true" }).status, 0);
+  assert.notEqual(run("test", { ...documentation, DOCS_ONLY: "true", FEATURE_RESULT: "failure" }).status, 0);
+  assert.notEqual(run("test", { ...documentation, DOCS_ONLY: "true", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "" }).status, 0);
   for (const overrides of [{ FEATURE_VALIDATION: "false" }, { GITHUB_BASE_REF: "main" }, { GITHUB_EVENT_NAME: "push" }]) assert.notEqual(run("test", overrides).status, 0);
   assert.equal(run("e2e-test").status, 0);
-  for (const field of ["FEATURE_RESULT", "NATIVE_RESULT", "BROWSER_RESULT"]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run("e2e-test", { [field]: value }).status, 0);
+  for (const field of ["FEATURE_RESULT", "BROWSER_RESULT"]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run("e2e-test", { [field]: value }).status, 0);
+  for (const value of ["failure", "cancelled", "success", "", "unknown"]) assert.notEqual(run("e2e-test", { NATIVE_RESULT: value }).status, 0);
 });
 
 test("standalone duplicate acceptances are manual and unique isolation and CodeQL remain on feature", () => {
