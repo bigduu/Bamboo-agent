@@ -63,7 +63,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // plus five fresh-input server regressions; none match the serial exclusions.
 // Feature cfg expressions, 31 default owners, four contexts and 19 explicit
 // additive cases remain unchanged. Default catalogs own retry and Stop tests.
-const FEATURE_SOURCE_SHA256 = "def74a37d747739e571ef5d61130f521be31a5ec7b0bf988c661160a34781cf4";
+// The test-utils-gated engine semaphore helper is used by the default
+// reloadable-provider test in server-other via the server's dev dependency.
+// Gold router and reload cases belong to existing server default shards;
+// registry proof cases remain in the default bamboo-llm package owner.
+const FEATURE_SOURCE_SHA256 = "b1608fecedae2969893fbb19b1391c46d4cefdba19be403bd52832d1d226cf39";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
