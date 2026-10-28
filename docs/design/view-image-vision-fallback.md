@@ -79,7 +79,7 @@ the real startup path. With configured auxiliary Vision, the main provider
 receives a retained reference and the original image message is preserved;
 without configuration the historical-image follow-up is rejected. Reference
 tests also cover retained inline/attachment images and reject forged
-cross-session or malformed references before a reader is used. The loop test
+cross-session or malformed references before any attachment or file is read. The loop test
 `vision_nonvision_upload_and_history_followup_use_only_requested_reference_fallback`
 checks new and historical inline/attachment images, no raw images for the
 main model, and one auxiliary request after an explicit ViewImage call.
