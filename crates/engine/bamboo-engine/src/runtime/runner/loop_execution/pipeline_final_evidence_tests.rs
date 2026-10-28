@@ -503,7 +503,7 @@ async fn routing_contract_final_evidence_preserves_cancel_and_budget_before_rout
         if cancelled {
             cancel.cancel();
         }
-        let result = super::final_answer::check(
+        let result = super::super::final_answer::check(
             &mut session,
             &mut state.runtime_state,
             &mut answer,
@@ -555,7 +555,7 @@ async fn routing_contract_final_evidence_rejection_does_not_wait_for_busy_slot()
     let mut answer = Message::assistant(CANDIDATE, None);
     let result = tokio::time::timeout(
         Duration::from_millis(500),
-        super::final_answer::check(
+        super::super::final_answer::check(
             &mut session,
             &mut state.runtime_state,
             &mut answer,

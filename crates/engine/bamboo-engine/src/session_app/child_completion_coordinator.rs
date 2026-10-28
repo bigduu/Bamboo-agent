@@ -4159,7 +4159,7 @@ mod tests {
     // not itself run a full child/parent session.
     #[tokio::test]
     async fn child_resume_legacy_memory_rejects_cached_route_during_publication() {
-        use bamboo_llm::{LLMError, LLMStream};
+        use bamboo_llm::LLMError;
         use futures::StreamExt;
         use serde_json::json;
         use wiremock::matchers::{method, path};
