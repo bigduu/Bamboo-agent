@@ -1,0 +1,126 @@
+name: Recover frozen crate release
+
+on:
+  workflow_dispatch:
+    inputs:
+      expected_controller_sha:
+        description: Exact reviewed controller on protected Dev; source, version and reservation are fixed
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  checks: read
+  pull-requests: read
+
+concurrency:
+  group: bamboo-crate-publication
+  queue: max
+  cancel-in-progress: false
+
+jobs:
+  recover:
+    name: Recover frozen crate originals
+    if: github.repository == 'bigduu/Bamboo-agent' && github.ref == 'refs/heads/dev' && github.ref_protected
+    runs-on: ubuntu-latest
+    environment: bamboo-release
+    timeout-minutes: 120
+    env:
+      EXPECTED_CONTROLLER_SHA: ${{ inputs.expected_controller_sha }}
+      TARGET_VERSION: '2026.10.19'
+      FRONTEND_PACKAGE: '@bigduu/lotus-next'
+      FRONTEND_VERSION: '2026.10.24'
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Require the exact protected Dev controller before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = bigduu/Bamboo-agent
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_REF" = refs/heads/dev
+          test "$GITHUB_REF_TYPE" = branch
+          test "$GITHUB_REF_PROTECTED" = true
+          [[ "$EXPECTED_CONTROLLER_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_SHA" = "$EXPECTED_CONTROLLER_SHA"
+          test "$GITHUB_WORKFLOW_SHA" = "$EXPECTED_CONTROLLER_SHA"
+          test "$GITHUB_WORKFLOW_REF" = bigduu/Bamboo-agent/.github/workflows/recover-frozen-crate-release.yml@refs/heads/dev
+
+      - name: Check out the reviewed controller independently
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: controller
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out only the original frozen product
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: 4786b7db862cabbebce49e288da62b284ccf5b72
+          path: product
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require clean separate controller and product checkouts
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git -C controller rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git -C controller status --porcelain --untracked-files=all)"
+          test "$(git -C product rev-parse HEAD)" = 4786b7db862cabbebce49e288da62b284ccf5b72
+          test -z "$(git -C product status --porcelain --untracked-files=all)"
+
+      - name: Set up the recovery controller runtime
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+
+      - name: Set up the original lock verifier runtime
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Read only the original failure and source authority
+        working-directory: product
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node ../controller/scripts/crate-release-frozen-recovery.cjs authorize
+
+      - name: Authenticate and restore the original sealed frontend locally
+        working-directory: product
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+        run: node ../controller/scripts/crate-release-frozen-recovery.cjs restore
+
+      - name: Install the isolated Cargo publication entrypoint
+        working-directory: product
+        run: node ../controller/scripts/release-cargo-sandbox.cjs install
+
+      - name: Temporarily stamp only the frozen product manifests
+        working-directory: product
+        run: python3 scripts/crate-release-lock.py stamp 2026.10.19
+
+      - name: Refresh the temporary lock and preserve every external dependency
+        working-directory: product
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo metadata --format-version 1 > /dev/null
+          python3 scripts/crate-release-lock.py
+
+      - name: Recover missing crate originals and verify the draft checkpoint
+        # The controller authenticates the remote readback before returning:
+        # recovery2371.completed=true, no pending, draft=true, receipt.completed=false,
+        # and publisherRunId=40613036533. Native publication stays in the original run.
+        working-directory: product
+        env:
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
+          BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
+        run: node ../controller/scripts/crate-release-frozen-recovery.cjs publish

@@ -64,6 +64,46 @@ original archive and signed checksum cannot be confirmed, stop for recovery;
 do not rebuild it. A product fix goes through a feature branch and a new `dev`
 acceptance before a new release cut.
 
+### Fixed v2026.10.19 crate recovery
+
+Issue #2371 handles only publisher [40613036533/attempt 1](https://github.com/bigduu/Bamboo-agent/actions/runs/40613036533), frozen source
+`4786b7db862cabbebce49e288da62b284ccf5b72`, version `2026.10.19` and draft
+Release `426156779`. The server upload failed with an indeterminate transport or
+response error after its archive and signed checksum were retained. Preserve all
+27 crate originals/checksums, the sealed `@bigduu/lotus-next@2026.10.24` frontend
+and all three successful native attempt-1 artifacts. A missing registry response
+does not authorize repackaging an existing original.
+
+After normal protected-Dev review and CI admission, select the exact reviewed
+controller commit and use the single-input recovery workflow:
+
+```bash
+gh workflow run recover-frozen-crate-release.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+The workflow checks out controller and product separately, preserving its real
+runner/run/attempt identity. Read-only authorization rechecks the original source,
+failure, reservation, registry and artifacts. Authenticated restoration writes
+only the original sealed frontend locally; it does not download npm or repack it.
+The existing Cargo sandbox then owns metadata and verification compilation after
+temporary version stamping and the original external-lock check. Release and
+registry write credentials are mapped only to the final publish step.
+
+The controller reuses the retained server archive, or verifies its existing
+registry version. Only `bamboo-client-core`, `bamboo-tui` and `bamboo-agent` may be
+compiled for the first time, after proving they never began in the original run.
+Each verified original is persisted before its signed checksum and registry
+upload. Unknown, changed, pending or missing prior originals stop recovery.
+
+Success requires authenticated remote readback of `recovery2371.completed=true`
+with no pending write, while the Release remains draft, `receipt.completed=false`
+and `publisherRunId=40613036533`. This workflow does not allocate a version,
+retag, publish native assets or finalize the Release. Once that readback passes,
+retry the original publisher's failed crate job and its dependent finalizer;
+they reuse the three successful native attempt-1 outputs. Do not rerun all jobs
+or treat a local/policy check as completed production recovery.
+
 ## Main and consumers
 
 Promote the release only after its required artifacts are published and checked.

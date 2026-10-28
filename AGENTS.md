@@ -152,3 +152,20 @@ dev advancement does not change it. Promote only the exact published source to
 main. A needed product repair gets a feature branch, passing tests and dev
 admission, then a fresh cut. Existing frozen release/recovery contracts remain
 unchanged during the explicitly documented cutover dependency.
+
+For the fixed `v2026.10.19` infrastructure failure, #2371 adds the manual
+`recover-frozen-crate-release.yml` controller. It requires the exact reviewed
+protected-Dev controller and keeps product source
+`4786b7db862cabbebce49e288da62b284ccf5b72`, draft `426156779` and original
+publisher `40613036533`/attempt 1. Preserve its 27 signed crate originals, sealed
+frontend and three native artifacts. Only the proven unstarted client-core,
+TUI and agent packages may receive their first verification compile; retained or
+ambiguous originals cannot be rebuilt. Restore uses read-only GitHub access and
+signing-key verification; only publish receives release/registry write credentials.
+The recovery leaves the Release draft, `receipt.completed=false` and the original
+publisher ID, and verifies `recovery2371.completed=true` with no pending write.
+It performs no native build, finalization or version allocation. After authenticated
+readback, resume the original publisher's failed crate job and its finalizer using
+the attempt-1 native outputs. Keep the recovery run's real `GITHUB_*` identity;
+never impersonate the original run. See the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261019-crate-recovery).
+Reviewed source alone does not establish a successful recovery or publication.
