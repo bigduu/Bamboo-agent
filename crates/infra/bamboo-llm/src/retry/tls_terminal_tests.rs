@@ -446,7 +446,7 @@ async fn synthetic_dns_failure(transient: bool) {
             UpstreamRetry::UntilCancelled,
             send_provider_request(&config, "synthetic-dns", || {
                 attempts.fetch_add(1, Ordering::SeqCst);
-                client.get("http://synthetic.invalid/")
+                client.get("https://synthetic.invalid/")
             }),
         ),
     )
