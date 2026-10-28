@@ -17,6 +17,18 @@ workflow that runs an already-owned selection. Different platform or feature
 configurations can require distinct outputs. A cache hit alone is not a test
 result.
 
+Ubuntu Quick Checks run the complete Supervisor, Lotus artifact and release
+frontend policy Node suites once. Windows and macOS run only nine system cases:
+bounded file reading, canonical artifact paths, four process/listener binding
+cases, actual archive staging/preservation and both LF/CRLF Git/Bash guards.
+macOS checks real process ownership with `ps/lsof`; Windows checks the explicit
+unsupported-process-binding refusal instead of claiming native Host acceptance.
+The native runner selects their exact names with Node's built-in test runner and
+requires all nine successful executions with no failed, cancelled, skipped or
+todo cases. A renamed, missing or duplicated case fails the job. Platform-free
+protocol, manifest/hash and release-selection policies stay in Ubuntu Quick;
+the existing native Rust acceptance still runs separately.
+
 `frontend-acceptance.yml` checks the embedded frontend package, build scripts and
 server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E
