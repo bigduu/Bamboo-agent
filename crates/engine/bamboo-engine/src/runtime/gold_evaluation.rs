@@ -90,7 +90,7 @@ impl std::fmt::Display for GoldEvaluationError {
 }
 
 impl GoldEvaluationError {
-    fn into_agent_error(self) -> AgentError {
+    pub(crate) fn into_agent_error(self) -> AgentError {
         match self {
             Self::Routing(error) | Self::Evaluation(error) => error,
         }

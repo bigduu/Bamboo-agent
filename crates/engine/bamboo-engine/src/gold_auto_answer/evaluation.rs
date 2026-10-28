@@ -102,6 +102,7 @@ pub(crate) async fn evaluate_gold_state_with_target(
         acquire_dispatch_guard,
     )
     .await
+    .map_err(crate::runtime::gold_evaluation::GoldEvaluationError::into_agent_error)
 }
 
 pub(crate) async fn evaluate_gold_auto_answer_question(
