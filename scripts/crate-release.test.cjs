@@ -2149,3 +2149,34 @@ test('2371 frontend verification and upload classification never substitute byte
     CARGO_REGISTRY_TOKEN: secret, BAMBOO_RELEASE_SIGNING_KEY: secret, GH_TOKEN: secret } })
   assert.equal(child.status, 0); assert.equal(child.stdout.includes(secret), false)
 })
+
+test('2371 workflow controller guard admits only the exact protected Dev dispatch', () => {
+  const workflow = fs.readFileSync('.github/workflows/recover-frozen-crate-release.yml', 'utf8')
+  const marker = '      - name: Require the exact protected Dev controller before checkout\n'
+  assert.equal(workflow.split(marker).length, 2, 'Require one controller guard')
+  const block = workflow.split(marker)[1].split('\n      - name:')[0]
+  assert.equal(block.split('        run: |\n').length, 2, 'Require one guard script')
+  const script = block.split('        run: |\n')[1].replace(/^          /gm, '')
+  const sha = 'a'.repeat(40)
+  const env = { PATH: process.env.PATH, EXPECTED_CONTROLLER_SHA: sha,
+    GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/heads/dev', GITHUB_REF_TYPE: 'branch', GITHUB_REF_PROTECTED: 'true',
+    GITHUB_SHA: sha, GITHUB_WORKFLOW_SHA: sha,
+    GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/recover-frozen-crate-release.yml@refs/heads/dev' }
+  for (const [name, change, accepted] of [
+    ['exact Dev', {}, true],
+    ['foreign repository', { GITHUB_REPOSITORY: 'other/Bamboo-agent' }, false],
+    ['Main', { GITHUB_REF: 'refs/heads/main' }, false],
+    ['unprotected', { GITHUB_REF_PROTECTED: 'false' }, false],
+    ['automatic event', { GITHUB_EVENT_NAME: 'push' }, false],
+    ['moving controller', { GITHUB_SHA: 'b'.repeat(40) }, false],
+    ['workflow drift', { GITHUB_WORKFLOW_SHA: 'b'.repeat(40) }, false],
+    ['wrong workflow', { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/dev' }, false],
+    ['malformed SHA', { EXPECTED_CONTROLLER_SHA: '$(exit 0)' }, false],
+    ['uppercase', { EXPECTED_CONTROLLER_SHA: 'A'.repeat(40) }, false],
+    ['newline', { EXPECTED_CONTROLLER_SHA: sha + '\n' }, false],
+  ]) {
+    const result = spawnSync('bash', ['-c', script], { env: { ...env, ...change }, encoding: 'utf8' })
+    assert.equal(result.status === 0, accepted, name)
+  }
+})
