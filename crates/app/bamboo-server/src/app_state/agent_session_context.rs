@@ -80,8 +80,8 @@ impl AgentSessionContext for AppState {
         config: &Config,
         target: &ProviderModelRef,
     ) -> Result<Option<Arc<dyn LLMProvider>>, LLMError> {
-        self.provider_registry
-            .provider_for_configured_model(config, target)
+        self.provider_router
+            .route_with_config(config, target)
             .map(Some)
     }
 

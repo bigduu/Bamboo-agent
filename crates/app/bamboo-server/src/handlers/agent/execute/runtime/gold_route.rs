@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use bamboo_domain::ProviderModelRef;
 use bamboo_engine::config::GoldTargetResolver;
-use bamboo_llm::{LLMProvider, ProviderRegistry};
+use bamboo_llm::{provider_registry::ManagedProviderOrigin, LLMProvider};
 
 use crate::app_state::AppState;
 
@@ -11,18 +11,18 @@ pub(super) fn make_gold_target_resolver(
     state: &AppState,
     provider_name: &str,
     provider_override: Option<&Arc<dyn LLMProvider>>,
-    provider_override_managed_registry: Option<&Arc<ProviderRegistry>>,
+    provider_override_managed_registry: Option<&Arc<ManagedProviderOrigin>>,
 ) -> Option<GoldTargetResolver> {
     // A session route selected by the Host has the actual registry handle.
     // Leave SDK/injected registries and unbound default providers unchanged.
     let expected = provider_override?.clone();
-    let registry = provider_override_managed_registry?.clone();
+    let origin = provider_override_managed_registry?.clone();
     let config = state.config.clone();
     let provider_name = provider_name.to_string();
     Some(Arc::new(move |model, delegate| {
-        bamboo_llm::gold_admission::guarded_gold_target(
+        bamboo_llm::gold_admission::guarded_gold_target_with_origin(
             config.clone(),
-            registry.clone(),
+            origin.clone(),
             ProviderModelRef::new(provider_name.as_str(), model),
             expected.clone(),
             delegate,
@@ -34,7 +34,7 @@ pub(super) fn make_gold_target_resolver(
 mod tests {
     use super::*;
     use bamboo_agent_core::{Message, ToolSchema};
-    use bamboo_llm::{LLMError, LLMStream};
+    use bamboo_llm::{LLMError, LLMStream, ProviderRegistry};
     use std::collections::HashMap;
 
     struct UnusedInjectedProvider;
@@ -90,7 +90,6 @@ mod tests {
         let main = ProviderModelRef::new("chat-a", "main-a");
         let (selected, managed_source) = state.provider_router.route_with_origin(&main).unwrap();
         let managed_source = managed_source.expect("selected route is managed");
-        assert!(Arc::ptr_eq(&managed_source, &actual_registry));
         let resolve =
             make_gold_target_resolver(&state, "chat-a", Some(&selected), Some(&managed_source))
                 .expect("a previously managed run must keep its guard");

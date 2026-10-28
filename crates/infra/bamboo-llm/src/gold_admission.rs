@@ -7,6 +7,7 @@ use std::sync::{
 };
 
 use crate::provider::{LLMError, LLMProvider, LLMRequestOptions, ProviderModelInfo, Result};
+use crate::provider_registry::ManagedProviderOrigin;
 use crate::{LLMStream, PromptIR, ProviderRegistry, ProviderVisibleToolFootprint};
 use async_trait::async_trait;
 use bamboo_domain::{CapabilityLoadingMode, Message, ProviderModelRef, ToolSchema};
@@ -25,7 +26,7 @@ pub fn guarded_gold_target(
 ) -> Arc<dyn LLMProvider> {
     Arc::new(GuardedGoldProvider {
         config,
-        registry,
+        binding: GoldGuardBinding::StrictRegistry(registry),
         target,
         expected,
         delegate,
@@ -33,11 +34,36 @@ pub fn guarded_gold_target(
     })
 }
 
+/// Host-only guard bound to the same managed factory inputs as the selected run.
+/// A later identical registry rebuild preserves the original dispatch handle.
+#[doc(hidden)]
+pub fn guarded_gold_target_with_origin(
+    config: Arc<RwLock<bamboo_config::Config>>,
+    origin: Arc<ManagedProviderOrigin>,
+    target: ProviderModelRef,
+    expected: Arc<dyn LLMProvider>,
+    delegate: Arc<dyn LLMProvider>,
+) -> Arc<dyn LLMProvider> {
+    Arc::new(GuardedGoldProvider {
+        config,
+        binding: GoldGuardBinding::ManagedOrigin(origin),
+        target,
+        expected,
+        delegate,
+        dispatch_refused: AtomicBool::new(false),
+    })
+}
+
+enum GoldGuardBinding {
+    StrictRegistry(Arc<ProviderRegistry>),
+    ManagedOrigin(Arc<ManagedProviderOrigin>),
+}
+
 /// Created once per evaluation, so the refusal marker cannot be confused with
 /// another request or with a subsequent configuration change.
 struct GuardedGoldProvider {
     config: Arc<RwLock<bamboo_config::Config>>,
-    registry: Arc<ProviderRegistry>,
+    binding: GoldGuardBinding,
     target: ProviderModelRef,
     expected: Arc<dyn LLMProvider>,
     delegate: Arc<dyn LLMProvider>,
@@ -50,18 +76,24 @@ impl GuardedGoldProvider {
         let config = self.config.try_read().map_err(|_| {
             LLMError::Api("Live configuration is busy while selecting a Gold route".into())
         })?;
-        let (current, managed) = self
-            .registry
-            .provider_for_configured_model_with_origin(&config, &self.target)?;
-        if !managed {
-            return Err(LLMError::Api(
-                "Gold provider is no longer config-managed".into(),
-            ));
-        }
-        if !Arc::ptr_eq(&current, expected) {
-            return Err(LLMError::Api(
-                "Gold provider generation changed during this run".into(),
-            ));
+        match &self.binding {
+            GoldGuardBinding::ManagedOrigin(origin) => {
+                origin.validate_gold_target(&config, &self.target, expected)?;
+            }
+            GoldGuardBinding::StrictRegistry(registry) => {
+                let (current, managed) =
+                    registry.provider_for_configured_model_with_origin(&config, &self.target)?;
+                if !managed {
+                    return Err(LLMError::Api(
+                        "Gold provider is no longer config-managed".into(),
+                    ));
+                }
+                if !Arc::ptr_eq(&current, expected) {
+                    return Err(LLMError::Api(
+                        "Gold provider generation changed during this run".into(),
+                    ));
+                }
+            }
         }
         if let Some(error) = expected.known_pre_dispatch_error() {
             return Err(error);

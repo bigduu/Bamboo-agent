@@ -182,7 +182,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
             model_ref.provider = resolved_provider_name.clone();
             persist_model_ref(&mut session, &model_ref);
         }
-        let (provider_override, provider_override_is_managed) = match self
+        let (provider_override, provider_override_managed_registry) = match self
             .0
             .provider_registry
             .get_with_origin(&resolved_provider_name)
@@ -198,8 +198,6 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 return;
             }
         };
-        let provider_override_managed_registry =
-            provider_override_is_managed.then(|| self.0.provider_registry.clone());
         let resolved_provider_type = resolve_provider_type(
             &config_snapshot,
             &resolved_provider_name,

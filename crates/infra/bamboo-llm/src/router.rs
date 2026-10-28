@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bamboo_domain::ProviderModelRef;
 
 use crate::provider::{LLMError, LLMProvider};
-use crate::provider_registry::ProviderRegistry;
+use crate::provider_registry::{ManagedProviderOrigin, ProviderRegistry};
 
 /// Given a [`ProviderModelRef`], resolve the correct [`LLMProvider`].
 pub struct ProviderModelRouter {
@@ -22,15 +22,25 @@ impl ProviderModelRouter {
         self.registry.provider_for_model(target)
     }
 
+    /// Route through this router's actual registry while checking the caller's
+    /// live configuration against a managed provider generation.
+    #[doc(hidden)]
+    pub fn route_with_config(
+        &self,
+        config: &bamboo_config::Config,
+        target: &ProviderModelRef,
+    ) -> Result<Arc<dyn LLMProvider>, LLMError> {
+        self.registry.provider_for_configured_model(config, target)
+    }
+
     /// Select the same route as `route` and retain its managed source registry.
     /// Unmanaged selections retain the embedder's existing behavior.
     #[doc(hidden)]
     pub fn route_with_origin(
         &self,
         target: &ProviderModelRef,
-    ) -> Result<(Arc<dyn LLMProvider>, Option<Arc<ProviderRegistry>>), LLMError> {
-        let (provider, managed) = self.registry.provider_for_model_with_origin(target)?;
-        Ok((provider, managed.then(|| self.registry.clone())))
+    ) -> Result<(Arc<dyn LLMProvider>, Option<Arc<ManagedProviderOrigin>>), LLMError> {
+        self.registry.provider_for_model_with_origin(target)
     }
 
     /// Resolve the canonical provider type for a given model reference.

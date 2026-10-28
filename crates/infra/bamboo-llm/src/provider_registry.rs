@@ -57,7 +57,128 @@ enum RegistryOrigin {
 
 struct Binding([u8; 32]);
 
+/// Opaque proof of the provider factory inputs used for one managed run.
+/// It retains only the registry's HMAC key/tag and the selected handle, never
+/// a credential value. Do not serialize, format or log this object.
+#[doc(hidden)]
+pub struct ManagedProviderOrigin {
+    registry: Arc<ProviderRegistry>,
+    provider_id: String,
+    key: ring::hmac::Key,
+    original_binding: Option<[u8; 32]>,
+    selected: Arc<dyn LLMProvider>,
+}
+
+impl ManagedProviderOrigin {
+    pub(crate) fn validate_gold_target(
+        &self,
+        config: &Config,
+        target: &bamboo_domain::ProviderModelRef,
+        expected: &Arc<dyn LLMProvider>,
+    ) -> Result<(), LLMError> {
+        if target.provider != self.provider_id || !Arc::ptr_eq(&self.selected, expected) {
+            return Err(LLMError::Api(
+                "Gold provider differs from the selected run target".into(),
+            ));
+        }
+        let state = self.registry.state.read().recover_poison();
+        if !matches!(&state.origin, RegistryOrigin::Managed { .. }) {
+            return Err(LLMError::Api(
+                "Gold provider is no longer config-managed".into(),
+            ));
+        }
+        // Verify the exact live provider/model and current factory generation
+        // before comparing the factory inputs to the run's original proof.
+        let current = ProviderRegistry::configured_model_in_snapshot(&state, config, target)?;
+        let original = self.original_binding.as_ref().ok_or_else(stale_binding)?;
+        // The original concrete handle keeps the existing same-generation
+        // contract, including providers whose credentials may be dynamic.
+        if Arc::ptr_eq(&current, expected) {
+            return Ok(());
+        }
+        // A newly built handle needs a stronger proof. In particular, an
+        // unchanged template or Copilot configuration does not establish an
+        // unchanged credential at request time.
+        if !gold_factory_identity_is_static(config, &self.provider_id) {
+            return Err(LLMError::Api(
+                "Gold provider identity cannot be proven stable across reload".into(),
+            ));
+        }
+        let current =
+            configured_binding(config, &self.provider_id, &self.key)?.ok_or_else(stale_binding)?;
+        if !bool::from(original.as_slice().ct_eq(current.0.as_slice())) {
+            return Err(stale_binding());
+        }
+        Ok(())
+    }
+}
+
+// This is intentionally narrower than provider support: it controls only the
+// cross-generation reuse of an already selected Host Gold provider. The
+// original delegate keeps its already-built HTTP client and proxy matcher.
+fn gold_factory_identity_is_static(config: &Config, id: &str) -> bool {
+    fn static_extra(extra: &std::collections::BTreeMap<String, serde_json::Value>) -> bool {
+        !extra
+            .get(bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY)
+            .is_some_and(|value| value.as_bool() != Some(false))
+            && !extra.contains_key("request_overrides")
+    }
+    if let Some(instance) = config.provider_instances.get(id) {
+        return matches!(
+            instance.provider_type.as_str(),
+            "openai" | "anthropic" | "gemini" | "bodhi"
+        ) && instance.request_overrides.is_none()
+            && !bamboo_config::provider_instance_api_key_from_env(instance)
+            && static_extra(&instance.extra);
+    }
+    if config.has_provider_instances() && config.effective_default_provider() != id {
+        return false;
+    }
+    let providers = config.providers();
+    match id {
+        "openai" => providers.openai.as_ref().is_some_and(|entry| {
+            !entry.api_key_from_env
+                && entry.request_overrides.is_none()
+                && static_extra(&entry.extra)
+        }),
+        "anthropic" => providers.anthropic.as_ref().is_some_and(|entry| {
+            !entry.api_key_from_env
+                && entry.request_overrides.is_none()
+                && static_extra(&entry.extra)
+        }),
+        "gemini" => providers.gemini.as_ref().is_some_and(|entry| {
+            !entry.api_key_from_env
+                && entry.request_overrides.is_none()
+                && static_extra(&entry.extra)
+        }),
+        "bodhi" => providers
+            .bodhi
+            .as_ref()
+            .is_some_and(|entry| static_extra(&entry.extra)),
+        _ => false,
+    }
+}
+
 impl ProviderRegistry {
+    fn managed_origin_for_snapshot(
+        self: &Arc<Self>,
+        state: &RegistryState,
+        name: &str,
+        selected: &Arc<dyn LLMProvider>,
+    ) -> Option<Arc<ManagedProviderOrigin>> {
+        let RegistryOrigin::Managed { key, bindings } = &state.origin else {
+            return None;
+        };
+        Some(Arc::new(ManagedProviderOrigin {
+            registry: self.clone(),
+            provider_id: name.to_owned(),
+            key: key.clone(),
+            // Missing binding is still managed and fails closed on use.
+            original_binding: bindings.get(name).map(|binding| binding.0),
+            selected: selected.clone(),
+        }))
+    }
+
     /// Create a registry from a pre-built provider map.
     ///
     /// Used by tests and higher-level orchestration that manages
@@ -227,15 +348,13 @@ impl ProviderRegistry {
     /// Select the existing model route and its origin from the same generation.
     #[doc(hidden)]
     pub fn provider_for_model_with_origin(
-        &self,
+        self: &Arc<Self>,
         target: &bamboo_domain::ProviderModelRef,
-    ) -> Result<(Arc<dyn LLMProvider>, bool), LLMError> {
+    ) -> Result<(Arc<dyn LLMProvider>, Option<Arc<ManagedProviderOrigin>>), LLMError> {
         let state = self.state.read().recover_poison();
         let provider = Self::provider_for_model_in_snapshot(&state, target)?;
-        Ok((
-            provider,
-            matches!(&state.origin, RegistryOrigin::Managed { .. }),
-        ))
+        let origin = self.managed_origin_for_snapshot(&state, &target.provider, &provider);
+        Ok((provider, origin))
     }
 
     fn provider_for_model_in_snapshot(
@@ -566,13 +685,14 @@ impl ProviderRegistry {
 
     /// The same unvalidated `get` route and origin, from one generation.
     #[doc(hidden)]
-    pub fn get_with_origin(&self, name: &str) -> Option<(Arc<dyn LLMProvider>, bool)> {
+    pub fn get_with_origin(
+        self: &Arc<Self>,
+        name: &str,
+    ) -> Option<(Arc<dyn LLMProvider>, Option<Arc<ManagedProviderOrigin>>)> {
         let state = self.state.read().recover_poison();
         let provider = state.providers.get(name)?.clone();
-        Some((
-            provider,
-            matches!(&state.origin, RegistryOrigin::Managed { .. }),
-        ))
+        let origin = self.managed_origin_for_snapshot(&state, name, &provider);
+        Some((provider, origin))
     }
 
     /// Get the default provider (the one configured as `config.provider`).
@@ -972,6 +1092,311 @@ mod tests {
         assert!(rebuilt
             .provider_for_configured_model(changed, &target)
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn managed_gold_origin_proof_survives_only_equivalent_factory_reload() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = managed_config();
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let target = bamboo_domain::ProviderModelRef::new("relay", "fast");
+        let (selected, origin) = registry.provider_for_model_with_origin(&target).unwrap();
+        let origin = origin.expect("managed origin captured with the selected handle");
+        assert!(origin
+            .validate_gold_target(&config, &target, &selected)
+            .is_ok());
+
+        registry
+            .reload_from_config(&config, temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let rebuilt = registry.get("relay").unwrap();
+        assert!(
+            !Arc::ptr_eq(&selected, &rebuilt),
+            "a new factory handle was built"
+        );
+        assert!(
+            origin
+                .validate_gold_target(&config, &target, &selected)
+                .is_ok(),
+            "unchanged factory inputs retain the original run target"
+        );
+        assert!(
+            origin
+                .validate_gold_target(&config, &target, &rebuilt)
+                .is_err(),
+            "a proof cannot be substituted for a different selected handle"
+        );
+        assert!(
+            origin
+                .validate_gold_target(
+                    &config,
+                    &bamboo_domain::ProviderModelRef::new("another-id", "fast"),
+                    &selected,
+                )
+                .is_err(),
+            "a proof is tied to one exact provider id"
+        );
+
+        for change in [
+            "credential",
+            "endpoint",
+            "model_revoked",
+            "model_changed",
+            "provider_missing",
+        ] {
+            let mut changed = config.clone();
+            match change {
+                "credential" => {
+                    changed.provider_instances.get_mut("relay").unwrap().api_key =
+                        "synthetic-key-b".into()
+                }
+                "endpoint" => {
+                    changed
+                        .provider_instances
+                        .get_mut("relay")
+                        .unwrap()
+                        .base_url = Some("http://127.0.0.1:32102".into())
+                }
+                "model_revoked" => {
+                    changed
+                        .provider_instances
+                        .get_mut("relay")
+                        .unwrap()
+                        .extra
+                        .insert("runtime_models".into(), serde_json::json!(["chat"]));
+                }
+                "model_changed" => {
+                    changed
+                        .provider_instances
+                        .get_mut("relay")
+                        .unwrap()
+                        .extra
+                        .insert(
+                            "runtime_models".into(),
+                            serde_json::json!(["chat", "other-fast"]),
+                        );
+                }
+                "provider_missing" => {
+                    changed.provider_instances.remove("relay");
+                }
+                _ => unreachable!(),
+            }
+            if change != "provider_missing" {
+                registry
+                    .reload_from_config(&changed, temp.path().to_path_buf())
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                origin
+                    .validate_gold_target(&changed, &target, &selected)
+                    .is_err(),
+                "the original run must not use {change} as an equivalent target"
+            );
+            registry
+                .reload_from_config(&config, temp.path().to_path_buf())
+                .await
+                .unwrap();
+        }
+
+        // Arbitrary replacement invalidates the registry's managed binding;
+        // it remains managed so a missing proof must not become an SDK bypass.
+        registry.insert("relay".into(), selected.clone());
+        let (unbound, missing_origin) = registry.get_with_origin("relay").unwrap();
+        let missing_origin = missing_origin.expect("origin remains managed");
+        assert!(Arc::ptr_eq(&unbound, &selected));
+        assert!(missing_origin
+            .validate_gold_target(&config, &target, &unbound)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn dynamic_host_gold_identity_is_not_reused_across_generations() {
+        use crate::provider::LLMStream;
+        use bamboo_domain::{Message, ToolSchema};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SyntheticDynamicProvider {
+            account: Arc<AtomicUsize>,
+            calls: Arc<AtomicUsize>,
+            observed: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for SyntheticDynamicProvider {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.observed
+                    .store(self.account.load(Ordering::SeqCst), Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        fn synthetic_managed(config: &Config, provider: Arc<dyn LLMProvider>) -> ProviderRegistry {
+            let key = ring::hmac::Key::generate(
+                ring::hmac::HMAC_SHA256,
+                &ring::rand::SystemRandom::new(),
+            )
+            .unwrap();
+            let binding = configured_binding(config, "relay", &key).unwrap().unwrap();
+            ProviderRegistry {
+                state: RwLock::new(RegistryState {
+                    providers: HashMap::from([("relay".into(), provider)]),
+                    metadata: HashMap::new(),
+                    default_provider: "relay".into(),
+                    runtime_models: Some(HashMap::from([(
+                        "relay".into(),
+                        vec!["chat".into(), "fast".into()],
+                    )])),
+                    origin: RegistryOrigin::Managed {
+                        key,
+                        bindings: HashMap::from([("relay".into(), binding)]),
+                    },
+                }),
+            }
+        }
+
+        for scenario in [
+            "copilot_auth",
+            "env_header",
+            "env_key_marker",
+            "unknown_env_marker",
+        ] {
+            let mut config = managed_config();
+            let instance = config.provider_instances.get_mut("relay").unwrap();
+            match scenario {
+                "copilot_auth" => instance.provider_type = "copilot".into(),
+                "env_header" => {
+                    instance.request_overrides = Some(serde_json::from_value(serde_json::json!({
+                        "common": {"headers": {"Authorization": {"type":"env_ref", "name":"SYNTHETIC_KEY"}}}
+                    })).unwrap());
+                }
+                "env_key_marker" => {
+                    instance.extra.insert(
+                        bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY.into(),
+                        serde_json::json!(true),
+                    );
+                }
+                "unknown_env_marker" => {
+                    instance.extra.insert(
+                        bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY.into(),
+                        serde_json::json!("unknown"),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            let account = Arc::new(AtomicUsize::new(1));
+            let old_calls = Arc::new(AtomicUsize::new(0));
+            let old_observed = Arc::new(AtomicUsize::new(0));
+            let old: Arc<dyn LLMProvider> = Arc::new(SyntheticDynamicProvider {
+                account: account.clone(),
+                calls: old_calls.clone(),
+                observed: old_observed.clone(),
+            });
+            let registry = Arc::new(synthetic_managed(&config, old));
+            let target = bamboo_domain::ProviderModelRef::new("relay", "fast");
+            let (selected, origin) = registry.provider_for_model_with_origin(&target).unwrap();
+            let origin = origin.expect("selected synthetic route is managed");
+            let guard = crate::gold_admission::guarded_gold_target_with_origin(
+                Arc::new(tokio::sync::RwLock::new(config.clone())),
+                origin,
+                target,
+                selected.clone(),
+                selected.clone(),
+            );
+            assert!(
+                guard.known_pre_dispatch_error().is_none(),
+                "same handle remains usable: {scenario}"
+            );
+            let mut baseline = guard.chat_stream(&[], &[], None, "fast").await.unwrap();
+            assert!(futures::StreamExt::next(&mut baseline).await.is_none());
+            assert_eq!(old_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(old_observed.load(Ordering::SeqCst), 1);
+
+            account.store(2, Ordering::SeqCst);
+            let new_calls = Arc::new(AtomicUsize::new(0));
+            let replacement: Arc<dyn LLMProvider> = Arc::new(SyntheticDynamicProvider {
+                account: account.clone(),
+                calls: new_calls.clone(),
+                observed: Arc::new(AtomicUsize::new(0)),
+            });
+            registry.replace_with(synthetic_managed(&config, replacement));
+            assert!(
+                guard.known_pre_dispatch_error().is_some(),
+                "cross-generation dynamic identity must fail: {scenario}"
+            );
+            assert!(guard.chat_stream(&[], &[], None, "fast").await.is_err());
+            assert_eq!(
+                old_calls.load(Ordering::SeqCst),
+                1,
+                "old dynamic account must not be called again: {scenario}"
+            );
+            assert_eq!(
+                new_calls.load(Ordering::SeqCst),
+                0,
+                "must not switch to replacement: {scenario}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_and_instance_env_key_markers_are_not_cross_generation_proofs() {
+        let mut instance = managed_config();
+        for kind in ["openai", "anthropic", "gemini", "bodhi"] {
+            instance
+                .provider_instances
+                .get_mut("relay")
+                .unwrap()
+                .provider_type = kind.into();
+            assert!(
+                gold_factory_identity_is_static(&instance, "relay"),
+                "static {kind}"
+            );
+        }
+        instance
+            .provider_instances
+            .get_mut("relay")
+            .unwrap()
+            .provider_type = "unknown".into();
+        assert!(!gold_factory_identity_is_static(&instance, "relay"));
+        instance
+            .provider_instances
+            .get_mut("relay")
+            .unwrap()
+            .provider_type = "openai".into();
+        instance
+            .provider_instances
+            .get_mut("relay")
+            .unwrap()
+            .extra
+            .insert(
+                bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY.into(),
+                serde_json::json!(true),
+            );
+        assert!(!gold_factory_identity_is_static(&instance, "relay"));
+
+        let mut legacy = Config::default();
+        let mut openai = test_openai_config();
+        openai.api_key_from_env = true;
+        legacy.providers_mut().openai = Some(openai);
+        assert!(!gold_factory_identity_is_static(&legacy, "openai"));
+        legacy
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .api_key_from_env = false;
+        assert!(gold_factory_identity_is_static(&legacy, "openai"));
     }
 
     #[tokio::test]

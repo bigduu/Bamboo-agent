@@ -41,8 +41,9 @@ pub(crate) struct SpawnAgentExecution {
     /// the roster.
     pub(crate) provider_name: String,
     pub(crate) provider_override: Option<Arc<dyn LLMProvider>>,
-    /// The registry that selected this managed override, captured with the handle.
-    pub(crate) provider_override_managed_registry: Option<Arc<bamboo_llm::ProviderRegistry>>,
+    /// Opaque managed-origin proof captured with the selected provider handle.
+    pub(crate) provider_override_managed_registry:
+        Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
     /// Cohesive primary + auxiliary model/provider selection.
     pub(crate) model_roster: ModelRoster,
     pub(crate) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
