@@ -10,7 +10,8 @@ use crate::runtime::goal_state::{
 };
 use crate::runtime::gold_evaluation::{
     apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold_with_dispatch,
-    execute_async_gold_evaluation, AsyncGoldEvaluationRequest, GoldEvaluationResult,
+    execute_async_gold_evaluation_with_terminal, AsyncGoldEvaluationRequest, GoldEvaluationResult,
+    GoldEvaluationTerminal,
 };
 use crate::runtime::runner::loop_execution::startup::{
     InFlightGoldEvaluation, LoopRunState, QueuedEvaluation,
@@ -456,6 +457,8 @@ fn spawn_gold_evaluation_request(
     let session_id = state.session_id.clone();
     let event_tx = event_tx.clone();
     let request_for_spawn = request.clone();
+    let terminal_claimed = Arc::new(GoldEvaluationTerminal::default());
+    let task_terminal_claimed = terminal_claimed.clone();
     // Thread the run's cancel token into the detached eval. A cancel makes the
     // `select!` resolve to `None` at the first await point, dropping the in-flight
     // LLM request future so a cancelled run stops the wasted spend instead of
@@ -466,11 +469,12 @@ fn spawn_gold_evaluation_request(
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => None,
-            result = execute_async_gold_evaluation(
+            result = execute_async_gold_evaluation_with_terminal(
                 request_for_spawn,
                 llm,
                 event_tx,
                 configured_limit,
+                task_terminal_claimed,
             ) => Some(result),
         }
     });
@@ -483,6 +487,7 @@ fn spawn_gold_evaluation_request(
 
     state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
         request,
+        terminal_claimed,
         join_handle,
     });
 }

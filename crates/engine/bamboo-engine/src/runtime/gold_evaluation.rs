@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, GoldCheckpoint, GoldConfidence, GoldDecision};
@@ -8,7 +11,7 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_llm::{LLMProvider, LLMRequestOptions};
 use chrono::Utc;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::GoldConfig;
@@ -153,11 +156,31 @@ pub(crate) fn build_async_gold_evaluation_request(
     }))
 }
 
+// The standalone test helper owns its own claim. The real runner shares it
+// with its InFlight state so run cleanup cannot emit a second terminal event.
+#[cfg(test)]
 pub(crate) async fn execute_async_gold_evaluation(
     request: AsyncGoldEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
     event_tx: mpsc::Sender<AgentEvent>,
     configured_limit: usize,
+) -> Result<AsyncGoldEvaluationResult, AgentError> {
+    execute_async_gold_evaluation_with_terminal(
+        request,
+        llm,
+        event_tx,
+        configured_limit,
+        Arc::new(GoldEvaluationTerminal::default()),
+    )
+    .await
+}
+
+pub(crate) async fn execute_async_gold_evaluation_with_terminal(
+    request: AsyncGoldEvaluationRequest,
+    llm: Arc<dyn LLMProvider>,
+    event_tx: mpsc::Sender<AgentEvent>,
+    configured_limit: usize,
+    terminal_claimed: Arc<GoldEvaluationTerminal>,
 ) -> Result<AsyncGoldEvaluationResult, AgentError> {
     let budget_provider = llm.clone();
     let budget_model = request.model_name.clone();
@@ -169,7 +192,7 @@ pub(crate) async fn execute_async_gold_evaluation(
         )
         .await
     };
-    let evaluation_result = match evaluate_gold_with_dispatch(
+    let evaluation_result = match evaluate_gold_with_dispatch_and_terminal(
         &request.session_snapshot,
         request.task_context_snapshot.as_ref(),
         &request.gold_config,
@@ -184,6 +207,7 @@ pub(crate) async fn execute_async_gold_evaluation(
             iteration: request.round_number as u32,
         },
         acquire_dispatch_guard,
+        Some(terminal_claimed.as_ref()),
     )
     .await
     {
@@ -235,6 +259,76 @@ pub(crate) async fn evaluate_gold_with_dispatch<G, Fut>(
     llm: Arc<dyn LLMProvider>,
     frame: &GoldEvalFrame<'_>,
     acquire_dispatch_guard: Fut,
+) -> Result<GoldEvaluationResult, GoldEvaluationError>
+where
+    Fut: std::future::Future<Output = G>,
+{
+    evaluate_gold_with_dispatch_and_terminal(
+        session,
+        task_context,
+        config,
+        llm,
+        frame,
+        acquire_dispatch_guard,
+        None,
+    )
+    .await
+}
+
+// One claim is shared by an async Gold evaluator and its cleanup. The
+// notification lets a losing sender stop waiting for channel capacity.
+#[derive(Default)]
+pub(crate) struct GoldEvaluationTerminal {
+    claimed: AtomicBool,
+    published: Notify,
+}
+
+pub(crate) async fn emit_gold_cancelled_once(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    terminal: &GoldEvaluationTerminal,
+    session_id: &str,
+    reason: &str,
+) {
+    // Register before checking the flag so a concurrent publication cannot be
+    // missed between the check and polling the notification.
+    let published = terminal.published.notified();
+    tokio::pin!(published);
+    published.as_mut().enable();
+    if terminal.claimed.load(Ordering::Acquire) {
+        return;
+    }
+    let permit = tokio::select! {
+        biased;
+        _ = &mut published => return,
+        result = event_tx.reserve() => match result {
+            Ok(permit) => permit,
+            Err(_) => return,
+        },
+    };
+    let event = AgentEvent::GoldEvaluationCancelled {
+        session_id: session_id.to_string(),
+        reason: reason.to_string(),
+    };
+    if terminal
+        .claimed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // Enqueue and notify are synchronous after the claim: an aborted task
+        // cannot yield in between them. This is not a consumer acknowledgement.
+        permit.send(event);
+        terminal.published.notify_waiters();
+    }
+}
+
+async fn evaluate_gold_with_dispatch_and_terminal<G, Fut>(
+    session: &Session,
+    task_context: Option<&TaskLoopContext>,
+    config: &GoldConfig,
+    llm: Arc<dyn LLMProvider>,
+    frame: &GoldEvalFrame<'_>,
+    acquire_dispatch_guard: Fut,
+    terminal_claimed: Option<&GoldEvaluationTerminal>,
 ) -> Result<GoldEvaluationResult, GoldEvaluationError>
 where
     Fut: std::future::Future<Output = G>,
@@ -297,12 +391,17 @@ where
             // No provider request was dispatched. Free the scarce slot before
             // waiting for a potentially backpressured event consumer.
             drop(_dispatch_guard);
-            let _ = event_tx
-                .send(AgentEvent::GoldEvaluationCancelled {
-                    session_id: session_id.to_string(),
-                    reason: "route_rejected".to_string(),
-                })
-                .await;
+            if let Some(terminal_claimed) = terminal_claimed {
+                emit_gold_cancelled_once(event_tx, terminal_claimed, session_id, "route_rejected")
+                    .await;
+            } else {
+                let _ = event_tx
+                    .send(AgentEvent::GoldEvaluationCancelled {
+                        session_id: session_id.to_string(),
+                        reason: "route_rejected".to_string(),
+                    })
+                    .await;
+            }
             return Err(GoldEvaluationError::Routing(AgentError::LLM(
                 error.to_string(),
             )));
@@ -721,6 +820,128 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[tokio::test]
+    async fn gold_terminal_wakes_losing_sender_without_another_channel_slot() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(AgentEvent::Token {
+                content: "occupy".into(),
+            })
+            .await
+            .unwrap();
+        let terminal = GoldEvaluationTerminal::default();
+        let mut route = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "route_rejected",
+        ));
+        let mut cleanup = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "run_cancelled",
+        ));
+        // Poll both to Pending while the same one-slot channel is full.
+        assert!(futures::poll!(route.as_mut()).is_pending());
+        assert!(futures::poll!(cleanup.as_mut()).is_pending());
+        assert!(!terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(event_rx.try_recv(), Ok(AgentEvent::Token { .. })));
+
+        // Both must return while the one terminal event still fills the only
+        // channel slot. The losing reservation cannot wait for another drain.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(route, cleanup);
+        })
+        .await
+        .expect("the losing terminal sender must be notified");
+        assert!(terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationCancelled { ref session_id, ref reason })
+                if session_id == "synthetic-session"
+                    && (reason == "route_rejected" || reason == "run_cancelled")
+        ));
+        assert!(event_rx.try_recv().is_err(), "exactly one terminal event");
+    }
+
+    #[tokio::test]
+    async fn gold_terminal_closed_channel_never_claims_a_terminal() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(AgentEvent::Token {
+                content: "occupy".into(),
+            })
+            .await
+            .unwrap();
+        let terminal = GoldEvaluationTerminal::default();
+        let mut route = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "route_rejected",
+        ));
+        let mut cleanup = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "run_cancelled",
+        ));
+        assert!(futures::poll!(route.as_mut()).is_pending());
+        assert!(futures::poll!(cleanup.as_mut()).is_pending());
+        event_rx.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(route, cleanup);
+        })
+        .await
+        .expect("closed channel must unblock both reservations");
+        assert!(!terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(event_rx.try_recv(), Ok(AgentEvent::Token { .. })));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no terminal could be enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn gold_terminal_cancelled_waiter_leaves_claim_available_for_cleanup() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(AgentEvent::Token {
+                content: "occupy".into(),
+            })
+            .await
+            .unwrap();
+        let terminal = GoldEvaluationTerminal::default();
+        let mut route = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "route_rejected",
+        ));
+        let mut cleanup = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "run_cancelled",
+        ));
+        assert!(futures::poll!(route.as_mut()).is_pending());
+        assert!(futures::poll!(cleanup.as_mut()).is_pending());
+        drop(route);
+        assert!(!terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(event_rx.try_recv(), Ok(AgentEvent::Token { .. })));
+        tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup must claim the released slot");
+        assert!(terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationCancelled { ref session_id, ref reason })
+                if session_id == "synthetic-session" && reason == "run_cancelled"
+        ));
+        assert!(event_rx.try_recv().is_err(), "exactly one terminal event");
     }
 
     #[tokio::test]

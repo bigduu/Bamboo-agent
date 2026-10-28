@@ -1,5 +1,7 @@
 use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
-use crate::runtime::gold_evaluation::{AsyncGoldEvaluationRequest, AsyncGoldEvaluationResult};
+use crate::runtime::gold_evaluation::{
+    AsyncGoldEvaluationRequest, AsyncGoldEvaluationResult, GoldEvaluationTerminal,
+};
 use crate::runtime::runner::task_lifecycle::{
     AsyncTaskEvaluationRequest, AsyncTaskEvaluationResult,
 };
@@ -56,6 +58,8 @@ pub(super) struct InFlightTaskEvaluation {
 
 pub(super) struct InFlightGoldEvaluation {
     pub(super) request: AsyncGoldEvaluationRequest,
+    /// Shared with the async evaluator to claim one cancellation event.
+    pub(super) terminal_claimed: Arc<GoldEvaluationTerminal>,
     // None is run cancellation; Err is a known local routing refusal, which
     // must never be harvested as a successful evaluator result.
     pub(super) join_handle: tokio::task::JoinHandle<

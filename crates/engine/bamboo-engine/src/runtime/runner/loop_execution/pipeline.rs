@@ -2080,7 +2080,7 @@ async fn abort_in_flight_evaluations(
 ) {
     let mut task_was_cancelled = false;
     let mut task_generation = None;
-    let mut gold_was_cancelled = false;
+    let mut gold_cancelled_terminal = None;
     if let Some(in_flight) = state.task_evaluation.in_flight.take() {
         task_generation = Some(in_flight.request.based_on_task_context_version);
         let was_finished = in_flight.join_handle.is_finished();
@@ -2148,6 +2148,7 @@ async fn abort_in_flight_evaluations(
         }
     }
     if let Some(in_flight) = state.gold_evaluation.in_flight.take() {
+        let terminal_claimed = in_flight.terminal_claimed.clone();
         let was_finished = in_flight.join_handle.is_finished();
         if !was_finished {
             in_flight.join_handle.abort();
@@ -2166,8 +2167,8 @@ async fn abort_in_flight_evaluations(
                     error
                 );
             }
-            Ok(None) => gold_was_cancelled = true,
-            Err(error) if error.is_cancelled() => gold_was_cancelled = true,
+            Ok(None) => gold_cancelled_terminal = Some(terminal_claimed),
+            Err(error) if error.is_cancelled() => gold_cancelled_terminal = Some(terminal_claimed),
             Err(error) => {
                 tracing::warn!(
                     "[{}] Async Gold evaluation join failed during cleanup for round {}: {}",
@@ -2198,13 +2199,14 @@ async fn abort_in_flight_evaluations(
             })
             .await;
     }
-    if gold_was_cancelled {
-        let _ = event_tx
-            .send(AgentEvent::GoldEvaluationCancelled {
-                session_id: state.session_id.clone(),
-                reason: reason.to_string(),
-            })
-            .await;
+    if let Some(terminal_claimed) = gold_cancelled_terminal {
+        crate::runtime::gold_evaluation::emit_gold_cancelled_once(
+            event_tx,
+            &terminal_claimed,
+            &state.session_id,
+            reason,
+        )
+        .await;
     }
 }
 
@@ -13432,6 +13434,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+                terminal_claimed: Arc::new(
+                    crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+                ),
                 request: previous_gold,
                 join_handle: tokio::spawn(async { None }),
             });
@@ -14081,6 +14086,159 @@ mod tests {
         }
     }
 
+    // The real evaluator runs under a real LocalTaskResources relay. The test
+    // holds the handoff after the evaluator returns so cleanup deterministically
+    // sees the same pending relay state as a delayed relay on another worker.
+    #[tokio::test]
+    async fn scoped_gold_route_rejection_and_cleanup_emit_one_terminal() {
+        use crate::app_context::model_routing_test_support::CaptureProvider;
+        use crate::runtime::gold_evaluation::{
+            execute_async_gold_evaluation_with_terminal, AsyncGoldEvaluationRequest,
+            GoldEvaluationTerminal,
+        };
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, ProviderRegistry};
+        use tokio::sync::oneshot;
+
+        let session_id = "scoped-gold-relay-race";
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = "gold-a".into();
+        config.default_provider_instance = Some("gold-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.insert(
+            "gold-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true,
+                "api_key":"synthetic-only", "base_url":"http://127.0.0.1:1",
+                "model":"main-model", "runtime_models":["main-model", "explicit-gold"]
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let target = ProviderModelRef::new("gold-a", "explicit-gold");
+        let (selected, origin) = registry.provider_for_model_with_origin(&target).unwrap();
+        let live = Arc::new(RwLock::new(config));
+        let capture = Arc::new(CaptureProvider::default());
+        let guard = bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            live.clone(),
+            origin.unwrap(),
+            target,
+            selected,
+            capture.clone(),
+        );
+        let held =
+            crate::runtime::runner::auxiliary_budget::acquire(&guard, "explicit-gold", 1).await;
+        let request = AsyncGoldEvaluationRequest {
+            session_id: session_id.into(),
+            round_number: 1,
+            model_name: "explicit-gold".into(),
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::default(),
+            reasoning_effort: None,
+            checkpoint: GoldCheckpoint::PostRound,
+            session_snapshot: Session::new(session_id, "main-model"),
+            task_context_snapshot: None,
+            gold_config: crate::runtime::config::GoldConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (returned_tx, returned_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let resources = bamboo_tools::LocalTaskResources::new(session_id, "test-run", Utc::now());
+        let eval_request = request.clone();
+        let eval_provider = guard.clone();
+        let eval_tx = tx.clone();
+        let terminal_claimed = Arc::new(GoldEvaluationTerminal::default());
+        let eval_terminal_claimed = terminal_claimed.clone();
+        let join_handle = resources
+            .scope(async move {
+                bamboo_tools::local_task_resources::spawn_cancellable(async move {
+                    let outcome = execute_async_gold_evaluation_with_terminal(
+                        eval_request,
+                        eval_provider,
+                        eval_tx,
+                        1,
+                        eval_terminal_claimed,
+                    )
+                    .await;
+                    let _ = returned_tx.send(outcome.is_err());
+                    // The owner sees a pending scoped relay while this test gate
+                    // holds the completed evaluation result before handoff.
+                    let _ = release_rx.await;
+                    Some(outcome)
+                })
+            })
+            .await;
+        let mut state = e2e_loop_state(session_id);
+        state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+            request,
+            terminal_claimed,
+            join_handle,
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(started, AgentEvent::GoldEvaluationStarted { .. }));
+        live.write()
+            .await
+            .provider_instances
+            .get_mut("gold-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["main-model"]));
+        drop(held);
+        let refused = tokio::time::timeout(Duration::from_secs(5), returned_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refused && guard.local_dispatch_refused());
+        assert!(!state
+            .gold_evaluation
+            .in_flight
+            .as_ref()
+            .unwrap()
+            .join_handle
+            .is_finished());
+
+        // Simulate the owning run terminating while its scoped relay has not
+        // finished reporting the already locally refused evaluation.
+        super::abort_in_flight_evaluations(&mut state, &tx, "run_cancelled").await;
+        drop(release_tx);
+        resources.close_and_drain().await.unwrap();
+        assert!(
+            capture.requests.lock().unwrap().is_empty(),
+            "no provider dispatch"
+        );
+        let mut reasons = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::GoldEvaluationCancelled { reason, .. } => reasons.push(reason),
+                AgentEvent::GoldEvaluationCompleted { .. } => panic!("refusal is not a verdict"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reasons.len(),
+            1,
+            "one Gold terminal even when relay and cleanup race: {reasons:?}"
+        );
+        assert!(matches!(
+            reasons[0].as_str(),
+            "route_rejected" | "run_cancelled"
+        ));
+    }
+
     #[tokio::test]
     async fn cleanup_harvests_finished_gold_evaluation_without_false_cancellation() {
         let session_id = "gold-eval-finished-before-cleanup";
@@ -14131,6 +14289,9 @@ mod tests {
         .await
         .expect("completed event");
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request,
             join_handle: tokio::spawn(async move { Some(Ok(result)) }),
         });
@@ -14345,6 +14506,9 @@ mod tests {
             gold_config: crate::runtime::config::GoldConfig::default(),
         };
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request: request.clone(),
             join_handle: tokio::spawn(std::future::pending()),
         });
@@ -14379,6 +14543,9 @@ mod tests {
         // same post-loop suspension finalizer (`runtime.suspend_reason` selects
         // this reason). Exercise that seam with another blocked request.
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request: request.clone(),
             join_handle: tokio::spawn(std::future::pending()),
         });
@@ -15343,6 +15510,9 @@ mod tests {
                 .unwrap()
                 .unwrap();
             state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+                terminal_claimed: Arc::new(
+                    crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+                ),
                 request: previous_gold,
                 join_handle: tokio::spawn(async { None }),
             });
@@ -15647,6 +15817,9 @@ mod tests {
         .unwrap()
         .unwrap();
         state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request: previous,
             join_handle: tokio::spawn(async { None }),
         });
