@@ -354,20 +354,30 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     // failures. Stop when TLS hides the cause rather than retrying a permanent
     // trust or hostname failure forever. Ordinary typed network errors and
     // the separate headers timeout remain eligible for retry below.
+    let retryable_io = |io: &std::io::Error| {
+        matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::TimedOut
+                | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::WouldBlock
+        )
+    };
     let mut tls_source = err.source();
+    let mut known_transient_connect_io = false;
     let mut opaque_connect_io = false;
     while let Some(cause) = tls_source {
         if cause.downcast_ref::<native_tls::Error>().is_some() {
             return false;
         }
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            opaque_connect_io |= matches!(
-                io.kind(),
-                std::io::ErrorKind::Other
-                    | std::io::ErrorKind::InvalidData
-                    | std::io::ErrorKind::InvalidInput
-                    | std::io::ErrorKind::PermissionDenied
-            );
+            known_transient_connect_io |= retryable_io(io);
+            opaque_connect_io |= !retryable_io(io);
         }
         tls_source = cause.source();
     }
@@ -376,25 +386,14 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     }
     if err.is_connect() {
         // Rustls certificate errors can arrive as opaque io::Error::Other.
-        // Unknown or invalid connect errors are not evidence of a transient
-        // network fault and must not cause an unbounded retry.
-        return !opaque_connect_io;
+        // Require positive evidence of a transient connection error before
+        // retrying; unknown resolver or TLS errors can be permanent.
+        return known_transient_connect_io && !opaque_connect_io;
     }
     let mut source = err.source();
     while let Some(cause) = source {
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            if matches!(
-                io.kind(),
-                std::io::ErrorKind::ConnectionRefused
-                    | std::io::ErrorKind::ConnectionReset
-                    | std::io::ErrorKind::ConnectionAborted
-                    | std::io::ErrorKind::NotConnected
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::UnexpectedEof
-                    | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::Interrupted
-                    | std::io::ErrorKind::WouldBlock
-            ) {
+            if retryable_io(io) {
                 return true;
             }
         }
