@@ -321,8 +321,12 @@ pub async fn checkpoint_ticket_result(
     ) {
         return Ok(None);
     }
-    let (binding, _) =
-        verified_scope_binding(storage, &dispatch.binding.supervisor_session_id).await?;
+    let (binding, _) = verified_scope_binding_for_service(
+        storage,
+        service,
+        &dispatch.binding.supervisor_session_id,
+    )
+    .await?;
     let snapshot = service.published()?.1;
     let assignment = snapshot
         .assignments

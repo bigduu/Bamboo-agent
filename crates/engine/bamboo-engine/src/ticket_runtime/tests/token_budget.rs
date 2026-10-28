@@ -594,14 +594,34 @@ async fn token_budget_unknown_model_and_revoked_root_block_before_provider() {
         .chat_stream(&[], &[], Some(41), "fixture-model")
         .await
         .is_err());
-    let mut root = f
-        .storage
-        .load_root_authority(&f.supervisor.id)
+    // A valid historical service in another canonical namespace cannot lend
+    // its binding to this Native ancestry, even when the Supervisor id matches.
+    let foreign_storage = SessionStoreV2::new(f.dir.path().join("foreign-host"))
         .await
-        .unwrap()
         .unwrap();
-    root.set_root_orchestration_only(false).unwrap();
-    f.storage.save_session(&root).await.unwrap();
+    let bootstrap = foreign_storage
+        .get_or_create_default_supervisor("fixture-model")
+        .await
+        .unwrap();
+    let (mut foreign_binding, _) = verified_scope_binding(&foreign_storage, &bootstrap.session_id)
+        .await
+        .unwrap();
+    foreign_binding.binding_revision = 7;
+    assert_eq!(
+        foreign_binding.supervisor_session_id,
+        f.spec.binding.supervisor_session_id
+    );
+    assert_ne!(foreign_binding.scope_id, f.spec.binding.scope_id);
+    let foreign = Arc::new(
+        TicketService::open(f.dir.path().join("foreign-tickets"), foreign_binding).unwrap(),
+    );
+    match NativeWorkTokenBudget::capture(Some(foreign), f.storage.clone(), &f.child).await {
+        Err(Error::ScopeDenied(reason)) => assert_eq!(reason, "Supervisor scope binding changed"),
+        _ => panic!("a foreign historical scope cannot authorize Native capture"),
+    }
+    // Thinking mode is not a Supervisor permission epoch. Genuine loss of
+    // canonical Root authority must still close the retained provider.
+    f.storage.delete_session(&f.supervisor.id).await.unwrap();
     assert!(decorated
         .chat_stream(&[], &[], None, "fixture-model")
         .await

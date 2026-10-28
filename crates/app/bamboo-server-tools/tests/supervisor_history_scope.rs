@@ -6,7 +6,7 @@ use serde_json::json;
 use std::sync::Arc;
 
 #[tokio::test]
-async fn supervisor_history_refuses_unattached_independent_root() {
+async fn supervisor_history_reads_current_user_root_without_attachment() {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(
         SessionStoreV2::new(home.path().to_path_buf())
@@ -24,13 +24,18 @@ async fn supervisor_history_refuses_unattached_independent_root() {
         .unwrap();
     let mut target = Session::new("unattached-root", "model");
     target.set_project_id_meta("outside-project");
-    target.add_message(Message::user("must not escape explicit management scope"));
+    target.add_message(Message::user(
+        "current-user history without manual attachment",
+    ));
     store.save_session(&target).await.unwrap();
     let tool = SessionInspectorTool::new(store.clone(), store.clone());
     let mut ctx = ToolCtx::none("scoped-read");
     ctx.session_id = Some(Arc::from(supervisor.id.as_str()));
     ctx.executing_supervisor =
         ExecutingSupervisorObservation::capture_from_executing_session(&supervisor);
+    ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+        &supervisor,
+    )));
     let result = tool
         .invoke(
             json!({"action":"read_messages", "session_id":target.id,"limit":2}),
@@ -38,13 +43,13 @@ async fn supervisor_history_refuses_unattached_independent_root() {
         )
         .await;
     assert!(
-        result.is_err(),
-        "Supervisor read escaped its explicit attach scope"
+        result.is_ok(),
+        "canonical current-user history needs no manual attachment"
     );
 }
 
 #[tokio::test]
-async fn supervisor_history_scoped_readback_survives_modes_and_restart_and_denies_invalid_links() {
+async fn supervisor_history_current_user_readback_survives_modes_restart_and_legacy_detach() {
     use bamboo_domain::{
         SupervisorManagementMutation, SupervisorManagementRequest, SupervisorReference,
     };
@@ -109,6 +114,9 @@ async fn supervisor_history_scoped_readback_survives_modes_and_restart_and_denie
             ctx.session_id = Some(Arc::from(supervisor.id.as_str()));
             ctx.executing_supervisor =
                 ExecutingSupervisorObservation::capture_from_executing_session(&supervisor);
+            ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                &supervisor,
+            )));
             ctx
         };
         let args =
@@ -160,7 +168,7 @@ async fn supervisor_history_scoped_readback_survives_modes_and_restart_and_denie
             })
             .await
             .unwrap();
-        assert!(tool.invoke(args.clone(), context()).await.is_err());
+        assert!(tool.invoke(args.clone(), context()).await.is_ok());
         assert_eq!(
             serde_json::to_value(store.load_session(&target.id).await.unwrap()).unwrap(),
             before
@@ -178,7 +186,8 @@ async fn supervisor_history_scoped_readback_survives_modes_and_restart_and_denie
 }
 
 #[tokio::test]
-async fn supervisor_history_denies_changed_target_scope_and_corrupt_authority_without_writes() {
+async fn supervisor_history_default_domain_observes_current_target_but_rejects_invalid_authority_without_writes(
+) {
     use bamboo_domain::{
         SupervisorManagementMutation as Mutation, SupervisorManagementRequest, SupervisorReference,
     };
@@ -294,13 +303,18 @@ async fn supervisor_history_denies_changed_target_scope_and_corrupt_authority_wi
         }));
         ctx.executing_supervisor =
             ExecutingSupervisorObservation::capture_from_executing_session(&supervisor);
-        assert!(
-            tool.invoke(
+        ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+            &supervisor,
+        )));
+        let result = tool
+            .invoke(
                 json!({"action":"read_messages","session_id":target.id,"limit":1}),
-                ctx
+                ctx,
             )
-            .await
-            .is_err(),
+            .await;
+        assert_eq!(
+            result.is_err(),
+            matches!(scenario, "target-proof" | "supervisor-proof" | "caller"),
             "{scenario}"
         );
         assert_eq!(

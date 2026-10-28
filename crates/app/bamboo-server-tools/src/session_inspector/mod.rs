@@ -156,10 +156,10 @@ impl Tool for SessionInspectorTool {
                 "Read-only search and bounded exact-turn retrieval over the current Bamboo Session's own stored messages, including compressed history. Scope is derived from trusted runtime context; no Session ID or compressed-state recovery is accepted from the caller. Use search_current, then read_around or read_current; raw Session history is transcript authority while memory is selective and may be stale."
             }
             SessionHistoryAccess::Full => {
-                "Read-only viewer over local session history. A Supervisor can list only its explicitly authorized targets with a small limit and cursor, inspect bounded persisted progress, or read_messages/get_meta for an attached Root. Directory queries match target IDs or Projects; stale cursors require a new first page. Inspect reports session-scoped persisted evidence, never verified live or input-specific completion. Ordinary legacy viewers retain current-Session search/paging, local history listing and same-tree export_context. This viewer has no runtime control. Send follow-up through session_message(action=send) and its separately installed Host authority; a directory entry does not grant sending rights."
+                "Read-only history and discovery. A canonical Supervisor can list all Sessions in the application's current-user domain with bounded pages/cursors, inspect persisted progress, and read bounded Root/Child history without Project authorization or attachment. Directory entries and inspect include current_user_target: preserve it as target_ref for a later followup; the final sender separately checks caller and target lifetime/generation/ancestry. Query matches IDs or Projects; stale cursors require a fresh page. Persisted progress is not verified live or input-specific completion. Ordinary viewers retain current-Session paging/search and their existing same-tree or finite Host rights. This viewer has no execution or file authority."
             }
             SessionHistoryAccess::HostRouted => {
-                "Read-only discovery through explicitly installed Host Session scopes. list returns metadata-only pages and inspect returns bounded persisted progress, never live/input-specific completion or full peer history. Scoped export_context/read_context return immutable status/brief observations through fixed revision/file selectors with the independent ReadContextView right (or original managed Supervisor authority). Scope is revalidated at the canonical read; IDs, Projects and cursors grant nothing. Use session_history_current or search_current/read_current/read_around for filtered current-Session history. Ordinary callers cannot read another Session's raw history, compressed cache or global search. Only an original real Supervisor with never-installed Host scope retains its existing managed read_messages/get_meta; installed/stale/revoked/unsupported scope never falls back. This tool attaches no history, sends no input and grants no create/send authority."
+                "Read-only Session discovery. A canonical Supervisor uses the current-user domain resolver regardless of legacy Project lists, attachments or old finite Host scope; its original identity and source generation are checked on every operation. Other callers retain explicitly installed Host scopes: list/inspect provide bounded metadata/progress, and export_context/read_context require their independent ReadContextView right and fixed selectors. Revoked/unsupported ordinary scopes never fall back to broader access. IDs, Projects and cursors grant nothing. Use current-Session paging/search for current history. This tool attaches no history, sends no input and grants no raw file or execution authority."
             }
             SessionHistoryAccess::Authorized => {
                 "Read-only discovery of explicitly Host-authorized Sessions. list returns metadata-only pages (limit <=20, query matches target ID/Project); reuse the returned cursor with the same query and limit. inspect returns bounded persisted progress and a visible assistant excerpt, never verified live or input-specific completion. Caller identity and grants come from the installed Host adapter. Missing/stale authority is a blocker; this surface never falls back to all local Sessions, attaches history or sends work. Use session_message(action=send) with its own Host authority for delivery; this listing is not a sending grant."
@@ -485,7 +485,7 @@ impl Tool for SessionInspectorTool {
         let guarded_self =
             self.access == SessionHistoryAccess::SelfOnly && ctx.executing_caller.is_some();
         let mut legacy_supervisor_history = false;
-        if routed || guarded_self {
+        if routed || guarded_self || ctx.executing_supervisor_for(caller_session_id).is_some() {
             host_discovery::validate_original_caller(self.storage.as_ref(), &ctx).await?;
         }
         if routed {
@@ -580,7 +580,7 @@ impl Tool for SessionInspectorTool {
                 SessionInspectorArgs::ReadMessages { session_id, .. }
                 | SessionInspectorArgs::GetMeta { session_id } => session_id,
                 _ => return Err(ToolError::InvalidArguments(
-                    "Supervisor history supports authorized list/inspect and bounded read_messages/get_meta for its own Session or an explicitly attached Root; use session_history_current for current-turn paging".into(),
+                    "Supervisor history supports current-user list/inspect and bounded read_messages/get_meta for its own Session or ordinary Root/Child targets; use session_history_current for current-turn paging".into(),
                 )),
             };
             let session = self

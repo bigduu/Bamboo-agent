@@ -220,6 +220,8 @@ pub struct FileSessionInbox {
     limits: SessionInboxLimits,
     #[cfg(any(test, feature = "test-utils"))]
     observer_cursor_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(any(test, feature = "test-utils"))]
+    observer_fault_failure: Arc<std::sync::atomic::AtomicBool>,
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
     operation_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
@@ -260,6 +262,8 @@ impl FileSessionInbox {
             limits,
             #[cfg(any(test, feature = "test-utils"))]
             observer_cursor_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-utils"))]
+            observer_fault_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             scoped_runtime: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -326,6 +330,72 @@ impl FileSessionInbox {
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         Ok(receipt)
+    }
+
+    /// Only the canonical terminal diagnostic can enter the original parent
+    /// Maildir. A real receipt precedes its protected reported checkpoint.
+    pub async fn deliver_supervisor_observer_fault(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        observer_id: &str,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        let authority = match self
+            .sessions
+            .begin_observer_fault(supervisor, observer_id, now)
+            .await
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                self.sessions
+                    .record_observer_fault_delivery_failure(supervisor, observer_id, now)
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                return Err(SessionInboxError::Storage(error.to_string()));
+            }
+        };
+        let result = self
+            .deliver_with_lifecycle_held_state(
+                &authority.envelope,
+                InboxAuthority::Observer {
+                    _guard: Arc::clone(&authority),
+                },
+                None,
+                Some(SessionInboxActivationIntent::new(
+                    SessionActivationPolicy::RespectSpecificWait,
+                )),
+            )
+            .await;
+        let receipt = match result {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                self.sessions
+                    .finish_observer_fault(&authority, None, now)
+                    .await
+                    .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+                return Err(error);
+            }
+        };
+        #[cfg(any(test, feature = "test-utils"))]
+        if self
+            .observer_fault_failure
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(SessionInboxError::Storage(
+                "injected interruption after parent diagnostic receipt".into(),
+            ));
+        }
+        self.sessions
+            .finish_observer_fault(&authority, Some(&receipt.delivery), now)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        Ok(receipt)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn interrupt_next_observer_fault_checkpoint_for_testing(&self) {
+        self.observer_fault_failure
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Deterministic crash boundary for real-Maildir integration fixtures. It
@@ -1396,7 +1466,7 @@ impl FileSessionInbox {
         let observer_notice = matches!(&envelope.source,
             SessionMessageSource::Runtime { subsystem } if subsystem == "supervisor_observation")
             || matches!(&envelope.body, bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction)
-                if instruction.instruction == "observer_view_available_v1");
+                if matches!(instruction.instruction.as_str(),"observer_view_available_v1"|"observer_subscription_fault_v1"));
         if observer_notice && !matches!(&authority, InboxAuthority::Observer { .. }) {
             return Err(SessionInboxError::InvalidClaim(
                 "Observer notice requires canonical integrated admission".into(),
@@ -2527,6 +2597,7 @@ impl SessionInboxPort for FileSessionInbox {
     async fn deliver_supervisor_followup(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,
+        target_created_at: chrono::DateTime<Utc>,
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         if envelope.source
@@ -2541,9 +2612,17 @@ impl SessionInboxPort for FileSessionInbox {
         }
         let authority = self
             .sessions
-            .lock_supervisor_followup(supervisor, &envelope.target_session_id)
+            .lock_current_user_target(supervisor, &envelope.target_session_id)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        // The legacy operation ID omits birth. Retain the caller's original
+        // observation under the same physical guards before receipt lookup;
+        // neither a fresh ID lookup nor a new empty Inbox may retarget it.
+        if authority.target.created_at != target_created_at {
+            return Err(SessionInboxError::InvalidClaim(
+                "Supervisor followup target lifetime changed".into(),
+            ));
+        }
         #[cfg(test)]
         if let Some((entered, release)) = &self.followup_authority_pause {
             entered.notify_one();
@@ -2554,7 +2633,94 @@ impl SessionInboxPort for FileSessionInbox {
         // operation lock, semantic receipt and Maildir transaction as deliver.
         self.deliver_with_lifecycle_held(
             envelope,
-            InboxAuthority::Supervisor { _guard: authority },
+            InboxAuthority::CurrentSupervisor {
+                _guard: Box::new(authority),
+            },
+            None,
+            Some(SessionInboxActivationIntent::new(
+                SessionActivationPolicy::RespectSpecificWait,
+            )),
+        )
+        .await
+    }
+
+    async fn deliver_supervisor_current_user_followup(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
+        let operation = envelope
+            .correlation_id
+            .as_deref()
+            .ok_or_else(|| invalid("current-user followup operation is missing"))?;
+        bamboo_domain::SessionMessageId::parse(operation)
+            .map_err(|error| invalid(&error.to_string()))?;
+        let text = match &envelope.body {
+            bamboo_domain::SessionMessageBody::Content(content)
+                if content.parts.is_empty() && content.skill_request.is_none() =>
+            {
+                &content.text
+            }
+            _ => return Err(invalid("current-user followup requires bounded text")),
+        };
+        if caller.session_id != supervisor.session_id
+            || caller.authority_identity
+                != (bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: supervisor.incarnation_id,
+                })
+            || envelope.source
+                != (SessionMessageSource::Session {
+                    session_id: caller.session_id.clone(),
+                })
+            || envelope.target_session_id != target.session_id
+            || envelope.id
+                != bamboo_domain::supervisor_current_user_message_id(supervisor, target, operation)
+            || envelope.kind != bamboo_domain::SessionMessageKind::PeerMessage
+            || envelope.thread_id.is_some()
+            || envelope.in_reply_to.is_some()
+            || envelope.attempt.is_some()
+            || text.trim().is_empty()
+            || text.contains('\0')
+            || text.len() > bamboo_domain::MAX_SESSION_PEER_MESSAGE_BYTES
+        {
+            return Err(invalid(
+                "current-user followup identity or envelope mismatch",
+            ));
+        }
+        // Respect an installed finite Host send capability, or retain the
+        // never-installed namespace. This fence outlives every started writer.
+        let send_scope = self
+            .sessions
+            .retain_current_user_send_scope(caller)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let mut authority = self
+            .sessions
+            .lock_current_user_target(supervisor, &target.session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        if !caller.matches_session(&authority.source) || *target != authority.reference {
+            return Err(invalid(
+                "current-user original caller or target lifetime changed",
+            ));
+        }
+        self.sessions
+            .validate_current_user_send_scope(&send_scope, &authority)
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        authority._send_scope = Some(send_scope);
+        #[cfg(test)]
+        if let Some((entered, release)) = &self.followup_authority_pause {
+            entered.notify_one();
+            release.notified().await;
+        }
+        self.deliver_with_lifecycle_held(
+            envelope,
+            InboxAuthority::CurrentSupervisor {
+                _guard: Box::new(authority),
+            },
             None,
             Some(SessionInboxActivationIntent::new(
                 SessionActivationPolicy::RespectSpecificWait,
@@ -2782,6 +2948,7 @@ impl SessionInboxPort for FileSessionInbox {
         &self,
         caller: &bamboo_domain::SessionCallerReference,
         supervisor: &bamboo_domain::SupervisorReference,
+        target_created_at: chrono::DateTime<Utc>,
         envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         if envelope.source
@@ -2796,7 +2963,12 @@ impl SessionInboxPort for FileSessionInbox {
         }
         let authority = self
             .sessions
-            .lock_unscoped_supervisor_delivery(caller, supervisor, &envelope.target_session_id)
+            .lock_unscoped_supervisor_delivery(
+                caller,
+                supervisor,
+                &envelope.target_session_id,
+                target_created_at,
+            )
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         self.deliver_with_lifecycle_held(

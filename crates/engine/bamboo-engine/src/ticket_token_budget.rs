@@ -104,9 +104,13 @@ impl NativeWorkTokenBudget {
                 // mode. Keep the capability, so configuring limits during the
                 // run still revalidates fresh Root/Work authority per call.
                 let binding = if published.execution_budget.is_some() || dispatch.is_some() {
-                    ticket_runtime::verified_scope_binding(storage.as_ref(), &canonical.id)
-                        .await?
-                        .0
+                    ticket_runtime::verified_scope_binding_for_service(
+                        storage.as_ref(),
+                        &service,
+                        &canonical.id,
+                    )
+                    .await?
+                    .0
                 } else {
                     published.binding.clone()
                 };
@@ -138,8 +142,9 @@ impl NativeWorkTokenBudget {
     }
 
     async fn authority(&self) -> Result<Authority> {
-        let (binding, _) = ticket_runtime::verified_scope_binding(
+        let (binding, _) = ticket_runtime::verified_scope_binding_for_service(
             self.storage.as_ref(),
+            &self.service,
             &self.binding.supervisor_session_id,
         )
         .await?;
