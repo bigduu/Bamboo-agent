@@ -13,7 +13,9 @@ use crate::app_state::AppState;
 use crate::permission_audit::record_bamboo_runtime_permission_metadata;
 use crate::tools::ToolSurface;
 use bamboo_engine::model_areas::resolve_global_area_models;
-use bamboo_engine::model_config_helper::{resolve_planning_model, resolve_search_model};
+use bamboo_engine::model_config_helper::{
+    resolve_fast_model_for_runner, resolve_planning_model, resolve_search_model,
+};
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 
 use bamboo_engine::config::GoldConfig;
@@ -107,14 +109,22 @@ pub(crate) fn make_auxiliary_model_resolver(
         // Auxiliary models are global (config-derived), never session-bound.
         let areas =
             resolve_global_area_models(&config_snapshot, &provider_name, &provider_registry);
+        // Fast is admitted against the live config under its read guard. A
+        // cached snapshot cannot establish whether this account is still valid.
+        let (fast_model_name, fast_model_provider) = match config.try_read() {
+            Ok(guard) => {
+                resolve_fast_model_for_runner(Some(&guard), &provider_name, &provider_registry)
+            }
+            Err(_) => resolve_fast_model_for_runner(None, &provider_name, &provider_registry),
+        };
         let resolved_planning =
             resolve_planning_model(&config_snapshot, &provider_name, &provider_registry);
         let resolved_search =
             resolve_search_model(&config_snapshot, &provider_name, &provider_registry);
 
         AuxiliaryModelConfig {
-            fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
-            fast_model_provider: areas.fast.map(|m| m.provider),
+            fast_model_name,
+            fast_model_provider,
             background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
             planning_model_name: resolved_planning.as_ref().map(|m| m.model_name.clone()),
             search_model_name: resolved_search.as_ref().map(|m| m.model_name.clone()),

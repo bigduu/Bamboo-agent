@@ -567,6 +567,109 @@ pub fn try_resolve_background_model(
     )
 }
 
+// A failed Fast selection must not look like an absent role at runner call
+// sites: the runner otherwise falls back to the main account. Keep this
+// provider local to that execution path, not the public global role resolver.
+struct RejectedFastProvider {
+    error: FastRouteError,
+}
+
+enum FastRouteError {
+    Auth(String),
+    Api(String),
+    Other(String),
+}
+
+impl FastRouteError {
+    fn from_llm_error(error: LLMError) -> Self {
+        match error {
+            LLMError::Auth(message) => Self::Auth(message),
+            LLMError::Api(message) => Self::Api(message),
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn to_llm_error(&self) -> LLMError {
+        match self {
+            Self::Auth(message) => LLMError::Auth(message.clone()),
+            Self::Api(message) => LLMError::Api(message.clone()),
+            Self::Other(message) => LLMError::RequestFailed(message.clone()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl bamboo_llm::LLMProvider for RejectedFastProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[bamboo_agent_core::Message],
+        _tools: &[bamboo_agent_core::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<bamboo_llm::LLMStream, LLMError> {
+        Err(self.error.to_llm_error())
+    }
+
+    async fn vision_support_override(&self, _model: &str) -> Option<bool> {
+        Some(false)
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, LLMError> {
+        Err(self.error.to_llm_error())
+    }
+}
+
+/// Resolve the Fast name and provider for a runner's auxiliary evaluations.
+///
+/// `None` config represents a busy live configuration lock, not an unset
+/// role, and therefore fails closed. An absent role retains the existing
+/// `(None, None)` fallback contract. A rejected role gets a provider that
+/// returns its admission error without accessing any network or other account.
+/// Callers must pass an authoritative configuration guard, not a cached clone.
+#[doc(hidden)]
+pub fn resolve_fast_model_for_runner(
+    config: Option<&Config>,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> (Option<String>, Option<Arc<dyn bamboo_llm::LLMProvider>>) {
+    let Some(config) = config else {
+        let error = LLMError::Api(
+            "Live configuration is unavailable while selecting a Fast evaluation route".into(),
+        );
+        return (
+            None,
+            Some(Arc::new(RejectedFastProvider {
+                error: FastRouteError::from_llm_error(error),
+            })),
+        );
+    };
+
+    match try_resolve_fast_model(config, provider_name, provider_registry) {
+        Ok(Some(model)) => (Some(model.model_name), Some(model.provider)),
+        Ok(None) => (None, None),
+        Err(error) => {
+            let model_name = config
+                .defaults
+                .as_ref()
+                .map(|defaults| {
+                    defaults
+                        .fast
+                        .as_ref()
+                        .unwrap_or(&defaults.chat)
+                        .model
+                        .clone()
+                })
+                .or_else(|| get_fast_model_for_provider(config, provider_name));
+            (
+                model_name,
+                Some(Arc::new(RejectedFastProvider {
+                    error: FastRouteError::from_llm_error(error),
+                })),
+            )
+        }
+    }
+}
+
 /// Resolve the fast model for lightweight tasks like title generation.
 pub fn resolve_fast_model(
     config: &Config,

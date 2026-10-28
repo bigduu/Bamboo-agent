@@ -512,8 +512,6 @@ mod provider_selection_tests {
         }
     }
 
-    use crate::app_context::AgentSessionContext;
-
     async fn make_gold_target_stale(
         state: &crate::app_context::model_routing_test_support::RoutingContext,
         change: &str,
