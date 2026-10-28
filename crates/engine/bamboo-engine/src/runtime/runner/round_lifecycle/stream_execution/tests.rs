@@ -5693,15 +5693,24 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
                 .build()
                 .unwrap();
             self.sends.fetch_add(1, Ordering::SeqCst);
-            let response = client
+            let mut response = client
                 .post(&self.url)
                 .body("synthetic request")
                 .send()
                 .await?;
+            let mut prefix = Vec::new();
+            while prefix.len() < b"synthetic-prefix".len() {
+                let chunk = response
+                    .chunk()
+                    .await?
+                    .expect("response prefix must arrive");
+                prefix.extend_from_slice(&chunk);
+            }
+            assert_eq!(prefix, b"synthetic-prefix");
             let error = response
-                .bytes()
+                .chunk()
                 .await
-                .expect_err("partial response body must fail");
+                .expect_err("stalled response body must fail");
             let mut source: Option<&(dyn Error + 'static)> = Some(&error);
             let mut body_error = false;
             while let Some(cause) = source {
@@ -5777,7 +5786,13 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
     .await
     .expect("synthetic response should not hang");
     server.abort();
-    let _ = server.await;
+    let server_error = server
+        .await
+        .expect_err("synthetic server should remain pending");
+    assert!(
+        server_error.is_cancelled(),
+        "synthetic server failed: {server_error}"
+    );
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert_eq!(sends.load(Ordering::SeqCst), 1);
     assert_eq!(received.load(Ordering::SeqCst), 1);
