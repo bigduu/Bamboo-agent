@@ -173,7 +173,26 @@ async function fixture(t) {
       async evaluate(code) { const state = await call('state'); return (await call('eval', { expected_epoch: state.page_epoch, expected_url: state.url, code })).value; },
       async close() { if (child.exitCode === null && child.signalCode === null) await call('close'); return within(exit, 'host close'); },
       async disconnect() { child.stdin.end(); return within(exit, 'host exit after stdin EOF'); },
-      async disconnectOutput() { child.stdout.destroy(); return within(exit, 'host exit after stdout disconnect'); },
+      async disconnectOutput() {
+        const readerClosed = once(child.stdout, 'close');
+        child.stdout.destroy();
+        await within(readerClosed, 'output reader close');
+        // Closing a pipe reader does not itself deliver EPIPE to the writer.
+        // An invalid v1 envelope produces an error reply without checkpointing
+        // first, even when Chromium stops producing screencast frames.
+        let inputError;
+        child.stdin.on('error', error => { inputError = error; });
+        if (child.exitCode === null && child.signalCode === null && !child.stdin.destroyed) {
+          const writeError = await within(new Promise(resolve => {
+            child.stdin.write('{"id":0,"action":"state"}\n', resolve);
+          }), 'EPIPE trigger write');
+          // A frame may have already hit EPIPE and closed the host's input.
+          if (writeError && !['EPIPE', 'ERR_STREAM_DESTROYED'].includes(writeError.code)) throw writeError;
+        }
+        const result = await within(exit, 'host exit after stdout disconnect');
+        if (inputError && !['EPIPE', 'ERR_STREAM_DESTROYED'].includes(inputError.code)) throw inputError;
+        return result;
+      },
       async kill() { if (child.exitCode === null && child.signalCode === null) {
         // Only this newly spawned, detached child's process group is signalled.
         if (process.platform === 'win32') child.kill('SIGKILL'); else process.kill(-child.pid, 'SIGKILL');
