@@ -26,19 +26,28 @@ fn identity() -> &'static TestIdentity {
         // root, so generate a short-lived identity instead of expiring a
         // committed fixture. The CI environments already require openssl.
         let dir = tempfile::tempdir().expect("temporary certificate directory");
-        let config = dir.path().join("cert.cnf");
-        let pem = dir.path().join("cert.pem");
+        let config = dir.path().join("root.cnf");
+        let leaf_config = dir.path().join("leaf.cnf");
+        let root = dir.path().join("root.pem");
+        let root_key = dir.path().join("root-key.pem");
+        let leaf = dir.path().join("leaf.pem");
+        let csr = dir.path().join("leaf.csr");
         let cert = dir.path().join("cert.der");
         let key_pem = dir.path().join("key.pem");
         let key = dir.path().join("key.der");
         fs::write(
             &config,
             "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3_req\n\
-             [dn]\nCN=synthetic.invalid\n\
+             [dn]\nCN=Synthetic Root\n\
              [v3_req]\nbasicConstraints=critical,CA:TRUE\n\
-             keyUsage=critical,digitalSignature,keyCertSign\n\
-             extendedKeyUsage=serverAuth\nsubjectAltName=DNS:synthetic.invalid\n\
-             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n",
+             keyUsage=critical,keyCertSign,cRLSign\nsubjectKeyIdentifier=hash\n",
+        )
+        .unwrap();
+        fs::write(
+            &leaf_config,
+            "basicConstraints=critical,CA:FALSE\n\
+             keyUsage=critical,digitalSignature,keyEncipherment\n\
+             extendedKeyUsage=serverAuth\nsubjectAltName=DNS:synthetic.invalid\n",
         )
         .unwrap();
         let run = |command: &mut Command| {
@@ -57,12 +66,29 @@ fn identity() -> &'static TestIdentity {
             ])
             .arg(&config)
             .args(["-extensions", "v3_req", "-keyout"])
+            .arg(&root_key)
+            .arg("-out")
+            .arg(&root));
+        run(Command::new("openssl")
+            .args(["req", "-new", "-newkey", "rsa:2048", "-nodes", "-keyout"])
             .arg(&key_pem)
             .arg("-out")
-            .arg(&pem));
+            .arg(&csr)
+            .args(["-subj", "/CN=synthetic.invalid"]));
+        run(Command::new("openssl")
+            .args(["x509", "-req", "-in"])
+            .arg(&csr)
+            .arg("-CA")
+            .arg(&root)
+            .arg("-CAkey")
+            .arg(&root_key)
+            .args(["-CAcreateserial", "-days", "1", "-sha256", "-extfile"])
+            .arg(&leaf_config)
+            .arg("-out")
+            .arg(&leaf));
         run(Command::new("openssl")
             .args(["x509", "-in"])
-            .arg(&pem)
+            .arg(&leaf)
             .args(["-outform", "DER", "-out"])
             .arg(&cert));
         run(Command::new("openssl")
@@ -72,7 +98,7 @@ fn identity() -> &'static TestIdentity {
             .arg(&key));
         TestIdentity {
             cert: fs::read(cert).unwrap(),
-            root_pem: fs::read(pem).unwrap(),
+            root_pem: fs::read(root).unwrap(),
             key: fs::read(key).unwrap(),
         }
     })
@@ -147,6 +173,19 @@ async fn peer(reset_handshake: bool) -> LocalPeer {
 fn client(peer: &LocalPeer, trust: bool) -> reqwest::Client {
     let mut builder = reqwest::Client::builder()
         .no_proxy()
+        .resolve("synthetic.invalid", peer.addr);
+    if trust {
+        builder = builder
+            .add_root_certificate(reqwest::Certificate::from_pem(&identity().root_pem).unwrap());
+    }
+    builder.build().unwrap()
+}
+
+fn rustls_client(peer: &LocalPeer, trust: bool) -> reqwest::Client {
+    let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .tls_backend_rustls()
         .resolve("synthetic.invalid", peer.addr);
     if trust {
         builder = builder
@@ -261,6 +300,81 @@ async fn opaque_handshake_failure_stops_instead_of_guessing_it_is_transient() {
     let error = result.unwrap().err().expect("TLS failure must be returned");
     assert_native_tls_error(error);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
+}
+
+async fn rustls_certificate_failure(trust: bool, host: &str) {
+    let peer = peer(false).await;
+    let client = rustls_client(&peer, trust);
+    let url = format!("https://{}:{}/", host, peer.addr.port());
+    let config = retry_config();
+    let attempts = AtomicUsize::new(0);
+    let result = tokio::time::timeout(
+        Duration::from_millis(900),
+        with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            send_provider_request(&config, "synthetic-rustls", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                client.get(&url)
+            }),
+        ),
+    )
+    .await;
+    let error = result
+        .expect("Rustls certificate failure kept retrying")
+        .err()
+        .expect("Rustls certificate failure must be returned");
+    let LLMError::Http(error) = error else {
+        panic!("expected a Rustls request transport error");
+    };
+    let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+    let mut found = false;
+    while let Some(cause) = source {
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            if io
+                .get_ref()
+                .is_some_and(|inner| inner.is::<tokio_rustls::rustls::Error>())
+            {
+                found = true;
+            }
+        }
+        source = cause.source();
+    }
+    assert!(
+        found,
+        "expected a Rustls error inside the request error chain"
+    );
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn rustls_untrusted_certificate_is_terminal() {
+    rustls_certificate_failure(false, "synthetic.invalid").await;
+}
+
+#[tokio::test]
+async fn rustls_hostname_mismatch_is_terminal() {
+    rustls_certificate_failure(true, "127.0.0.1").await;
+}
+
+#[tokio::test]
+async fn rustls_trusted_matching_certificate_succeeds() {
+    let peer = peer(false).await;
+    let client = rustls_client(&peer, true);
+    let url = format!("https://synthetic.invalid:{}/", peer.addr.port());
+    let config = retry_config();
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            send_provider_request(&config, "synthetic-rustls", || client.get(&url)),
+        ),
+    )
+    .await
+    .expect("trusted Rustls peer should respond")
+    .expect("trusted matching Rustls certificate should be accepted");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
 }
 
