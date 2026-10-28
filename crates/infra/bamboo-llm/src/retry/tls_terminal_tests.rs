@@ -411,6 +411,72 @@ async fn anthropic_consumer_stops_on_untrusted_certificate() {
     assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
 }
 
+struct SyntheticResolver {
+    transient: bool,
+    calls: Arc<AtomicUsize>,
+}
+
+impl reqwest::dns::Resolve for SyntheticResolver {
+    fn resolve(&self, _: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let error: Box<dyn Error + Send + Sync> = if self.transient {
+            Box::new(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))
+        } else {
+            Box::new(std::fmt::Error)
+        };
+        Box::pin(async move { Err(error) })
+    }
+}
+
+async fn synthetic_dns_failure(transient: bool) {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let resolver = SyntheticResolver {
+        transient,
+        calls: calls.clone(),
+    };
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .dns_resolver(Arc::new(resolver))
+        .build()
+        .unwrap();
+    let config = retry_config();
+    let attempts = AtomicUsize::new(0);
+    let result = tokio::time::timeout(
+        Duration::from_millis(900),
+        with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            send_provider_request(&config, "synthetic-dns", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                client.get("http://synthetic.invalid/")
+            }),
+        ),
+    )
+    .await;
+    if transient {
+        assert!(result.is_err(), "typed transient error should retry");
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert!(calls.load(Ordering::SeqCst) >= 2);
+    } else {
+        let result = result.expect("unknown resolver failure kept retrying");
+        let LLMError::Http(error) = result.err().expect("resolver must fail") else {
+            panic!("expected resolver transport error");
+        };
+        assert!(error.is_connect());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn dns_unknown_permanent_error_is_terminal() {
+    synthetic_dns_failure(false).await;
+}
+
+#[tokio::test]
+async fn dns_explicit_transient_error_remains_retryable() {
+    synthetic_dns_failure(true).await;
+}
+
 #[tokio::test]
 async fn plain_tcp_reset_before_headers_remains_retryable() {
     let peer = peer(true).await;
