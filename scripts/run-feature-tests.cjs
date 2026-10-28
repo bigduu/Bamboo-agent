@@ -67,10 +67,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // reloadable-provider test in server-other via the server's dev dependency.
 // Gold router and reload cases belong to existing server default shards;
 // registry proof cases remain in the default bamboo-llm package owner.
-// Legacy background compression and per-run isolation are default engine tests
-// in packages-3. Host lock coverage is server-execute; Schedule and Connect
-// resolver coverage is server-other. No additive feature cases changed.
-const FEATURE_SOURCE_SHA256 = "faba841095e2ad0dc076e4e8961f8d571e76a895db45176a81ffdf1996c83677";
+// Legacy background, resume summary and per-run isolation are default engine
+// tests in packages-3. Host lock coverage is server-execute; Schedule and
+// Connect resolver coverage is server-other. No additive feature cases changed.
+const FEATURE_SOURCE_SHA256 = "82f664e3867601e822783dacb0bbfae5ce302a94c9b9a76ea3fb820df3b03dd0";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
