@@ -10,6 +10,41 @@ const os = require('node:os');
 const path = require('node:path');
 const { test } = require('node:test');
 
+// Fixture synchronization must fail with the blocked operation instead of
+// leaving the feature shard silent until its 30-minute job limit.
+async function within(promise, label, timeoutMs = 30000) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs); }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function cleanupFixture(children, server, root) {
+  const failures = [];
+  for (const client of [...children]) {
+    try {
+      await client.close();
+    } catch (error) {
+      failures.push(error);
+      try { await client.kill(); } catch (killError) { failures.push(killError); }
+    }
+  }
+  try {
+    server.closeAllConnections();
+    await within(new Promise(resolve => server.close(resolve)), 'synthetic server close');
+  } catch (error) {
+    failures.push(error);
+  }
+  if (children.size) failures.push(new Error(`${children.size} owned host(s) have not exited`));
+  if (failures.length) throw new AggregateError(failures, `profile fixture cleanup failed; retained ${root}`);
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 // All browser state in this file belongs to this synthetic origin and these
 // disposable profiles. Never attach an installed browser or copy its cookies.
 const fixtureHtml = `<!doctype html><title>Isolated profile fixture</title><a id="download" href="/download">Synthetic download</a><script>
@@ -97,11 +132,7 @@ async function fixture(t) {
   });
   server.listen(0, '127.0.0.1'); await once(server, 'listening');
   const url = `http://127.0.0.1:${server.address().port}/`;
-  t.after(async () => {
-    for (const client of children) await client.close().catch(() => client.kill());
-    server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
-    fs.rmSync(root, { recursive: true, force: true });
-  });
+  t.after(() => cleanupFixture(children, server, root));
   const profile = id => {
     const directory = path.join(root, createHash('sha256').update(id).digest('hex'));
     if (!fs.existsSync(directory)) fs.mkdirSync(directory, { mode: 0o700 });
@@ -140,25 +171,48 @@ async function fixture(t) {
       call, exit,
       async visit() { const state = await call('state'); return call('navigate', { expected_epoch: state.page_epoch, url }); },
       async evaluate(code) { const state = await call('state'); return (await call('eval', { expected_epoch: state.page_epoch, expected_url: state.url, code })).value; },
-      async close() { if (child.exitCode !== null || child.signalCode !== null) return exit; await call('close'); return exit; },
-      async disconnect() { child.stdin.end(); return exit; },
-      async disconnectOutput() { child.stdout.destroy(); return exit; },
+      async close() { if (child.exitCode === null && child.signalCode === null) await call('close'); return within(exit, 'host close'); },
+      async disconnect() { child.stdin.end(); return within(exit, 'host exit after stdin EOF'); },
+      async disconnectOutput() { child.stdout.destroy(); return within(exit, 'host exit after stdout disconnect'); },
       async kill() { if (child.exitCode === null && child.signalCode === null) {
         // Only this newly spawned, detached child's process group is signalled.
         if (process.platform === 'win32') child.kill('SIGKILL'); else process.kill(-child.pid, 'SIGKILL');
-      } return exit; },
+      } return within(exit, 'host exit after forced retirement'); },
     };
     children.add(client); return client;
   };
-  return { root, profile, start, cleared, async releaseClear() { await gateReady; clearGate.end('release synthetic logout'); } };
+  return { root, profile, start, cleared, async releaseClear() { await within(gateReady, 'synthetic clear gate'); clearGate.end('release synthetic logout'); } };
 }
+
+test('fixture synchronization deadlines report the blocked operation', async () => {
+  await assert.rejects(within(new Promise(() => {}), 'synthetic gate', 10), /synthetic gate timed out after 10ms/);
+});
+
+test('fixture cleanup retains profiles if an owned host exit is unconfirmed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-profile-cleanup-test-'));
+  const sentinel = path.join(root, 'sentinel'); fs.writeFileSync(sentinel, 'retained');
+  const server = http.createServer(); server.listen(0, '127.0.0.1'); await once(server, 'listening');
+  let secondClosed = false;
+  const children = new Set();
+  const first = { async close() { throw new Error('close failed'); }, async kill() { throw new Error('exit unconfirmed'); } };
+  const second = { async close() { secondClosed = true; children.delete(second); }, async kill() { throw new Error('unexpected kill'); } };
+  children.add(first); children.add(second);
+  try {
+    await assert.rejects(cleanupFixture(children, server, root), /profile fixture cleanup failed; retained/);
+    assert.equal(secondClosed, true);
+    assert.equal(server.listening, false);
+    assert.equal(fs.readFileSync(sentinel, 'utf8'), 'retained');
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test('stdout EPIPE alone finishes a streaming profile and its final logout checkpoint', async t => {
   const f = await fixture(t); const directory = f.profile('streaming-chat');
   const browser = f.start(directory); await browser.visit(); await browser.evaluate('window.seed()');
   await browser.evaluate(`setInterval(() => { document.body.style.backgroundColor = Date.now() % 2 ? 'red' : 'blue'; }, 16);
     void fetch('/clear-gate').then(() => fetch('/clear-cookies')).then(() => fetch('/clear-observed')); true`);
-  await f.releaseClear(); assert.equal(await f.cleared, true);
+  await f.releaseClear(); assert.equal(await within(f.cleared, 'synthetic clear observation'), true);
   const checkpoint = path.join(directory, '.bamboo-session-cookies-v1.json');
   assert.equal(JSON.parse(fs.readFileSync(checkpoint)).cookies.some(cookie => cookie.name === 'fixture-session'), true,
     'the fixture must lose its output reader before the background checkpoint');
