@@ -32,10 +32,11 @@ fn configured_target(
                     .map(|(_, instance)| instance.clone())
             })
     };
+    // A saved Vision role explicitly authorizes this exact auxiliary target.
+    // The primary-chat rollout flag must not hide that selection.
     let configured_role = config
         .defaults
         .as_ref()
-        .filter(|_| config.features.provider_model_ref)
         .and_then(|defaults| defaults.vision.clone());
     let target = if let Some(target) = configured_role {
         target
