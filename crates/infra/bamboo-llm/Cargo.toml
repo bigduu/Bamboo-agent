@@ -30,6 +30,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 
 [dev-dependencies]
+socket2 = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tempfile = "3"
 http = "1"
 wiremock = "0.6"

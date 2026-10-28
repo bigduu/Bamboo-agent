@@ -964,6 +964,10 @@ mod continuous_tests;
 mod connector_tests;
 
 #[cfg(test)]
+#[path = "retry/tls_terminal_tests.rs"]
+mod tls_terminal_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
