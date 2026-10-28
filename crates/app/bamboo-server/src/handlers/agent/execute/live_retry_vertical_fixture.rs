@@ -94,6 +94,7 @@ enum LiveVerticalCase {
     StopWaiting,
     StopAfterContinue,
     StopDuringConfirm,
+    GateCancelledBeforeResult,
     RejectConfirmation,
     HeadersTimeout,
 }
@@ -323,6 +324,56 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         1,
         "exactly one initial request before decision"
     );
+
+    if case == LiveVerticalCase::GateCancelledBeforeResult {
+        let gate = state.live_retry.pause_confirmations_for_test();
+        let request = || {
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request()
+        };
+        let winner = test::call_service(&app, request());
+        let verify = async {
+            tokio::time::timeout(Duration::from_secs(5), gate.claimed.notified())
+                .await
+                .unwrap();
+            assert!(state.live_retry.cancel_claimed_gate_for_test(id, &run_id));
+            let follower = test::call_service(&app, request()).await;
+            assert_eq!(follower.status(), StatusCode::CONFLICT);
+            let body: serde_json::Value = test::read_body_json(follower).await;
+            assert_eq!(body["error"]["code"], "retry_resume_outcome_uncertain");
+            assert_eq!(body["run_id"], run_id);
+            let stop = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/stop/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(stop.status(), StatusCode::OK);
+        };
+        let (winner, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            futures::join!(winner, verify)
+        })
+        .await
+        .expect("cancelled gate must not strand confirmation");
+        assert_eq!(winner.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = test::read_body_json(winner).await;
+        assert_eq!(body["error"]["code"], "retry_resume_outcome_uncertain");
+        assert_eq!(state.live_retry.active_payloads_for_test(), 0);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_http.len()
+        );
+        assert_eq!(tools.0.load(Ordering::SeqCst), before_tool);
+        tokio::time::timeout(Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        return;
+    }
 
     if case == LiveVerticalCase::StopDuringConfirm {
         let gate = state.live_retry.pause_confirmations_for_test();
@@ -662,6 +713,16 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         let first: serde_json::Value = test::read_body_json(first).await;
         assert_eq!(first["run_id"], run_id);
         assert_eq!(first["status"], "retry_continuing");
+        let keyed_request = |run: &str| {
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run))
+                .insert_header(("Idempotency-Key", "live-retry-confirm-key"))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request()
+        };
+        let keyed = test::call_service(&app, keyed_request(&run_id)).await;
+        assert_eq!(keyed.status(), StatusCode::OK);
         let stop = test::call_service(
             &app,
             test::TestRequest::post()
@@ -672,6 +733,15 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         .await;
         assert_eq!(stop.status(), StatusCode::OK);
         wait_for_owned_terminal_with_cancellation(&state, id, &run_id, &mut events, true).await;
+        let replay = test::call_service(&app, keyed_request(&run_id)).await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let replay: serde_json::Value = test::read_body_json(replay).await;
+        assert_eq!(replay["error"]["code"], "retry_resume_outcome_uncertain");
+        assert_eq!(replay["run_id"], run_id);
+        let mismatch = test::call_service(&app, keyed_request("different-run")).await;
+        assert_eq!(mismatch.status(), StatusCode::CONFLICT);
+        let mismatch: serde_json::Value = test::read_body_json(mismatch).await;
+        assert_eq!(mismatch["error"]["code"], "idempotency_key_conflict");
         assert_eq!(
             server.received_requests().await.unwrap().len(),
             before_http.len()
@@ -791,6 +861,12 @@ async fn live_retry_http_stop_after_confirmation_reports_continuous_mode() {
 #[actix_web::test]
 async fn live_retry_http_rejected_callback_cannot_deadlock() {
     run_live_retry_vertical(LiveVerticalCase::RejectConfirmation).await;
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn live_retry_http_cancelled_claim_is_uncertain_before_result_publication() {
+    run_live_retry_vertical(LiveVerticalCase::GateCancelledBeforeResult).await;
 }
 
 #[cfg(unix)]

@@ -72,6 +72,7 @@ pub async fn handler(
         Err(response) => return *response,
     };
     let store = state.mutation_idempotency.clone();
+    let revalidate = continuation.is_some();
     let operation = || async move {
         if let Some(run_id) = continuation {
             continue_live_retry(&state, &session_id, &run_id).await
@@ -80,6 +81,7 @@ pub async fn handler(
         }
     };
     match prepared {
+        Some(prepared) if revalidate => store.execute_revalidating(prepared, operation).await,
         Some(prepared) => store.execute(prepared, operation).await,
         None => operation().await,
     }

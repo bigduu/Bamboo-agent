@@ -241,26 +241,63 @@ impl MutationIdempotencyStore {
         F: FnOnce() -> Fut,
         Fut: Future<Output = HttpResponse>,
     {
+        self.execute_with_policy(prepared, operation, false).await
+    }
+
+    /// Preserve key/fingerprint conflict handling while rechecking a
+    /// state-dependent response against its current authoritative owner.
+    pub(crate) async fn execute_revalidating<F, Fut>(
+        self: &Arc<Self>,
+        prepared: PreparedMutationIdempotency,
+        operation: F,
+    ) -> HttpResponse
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = HttpResponse>,
+    {
+        self.execute_with_policy(prepared, operation, true).await
+    }
+
+    async fn execute_with_policy<F, Fut>(
+        self: &Arc<Self>,
+        prepared: PreparedMutationIdempotency,
+        operation: F,
+        revalidate: bool,
+    ) -> HttpResponse
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = HttpResponse>,
+    {
         let _key_guard = self.lock_key(&prepared.key_digest).await;
         let now = Instant::now();
-        {
+        let existing = {
             let mut cache = self.entries.lock().await;
             cache.prune_expired(now);
             if let Some(entry) = cache.entries.get(&prepared.key_digest) {
                 if entry.payload_fingerprint != prepared.payload_fingerprint {
                     return conflict_response();
                 }
-                tracing::debug!(
-                    target: "bamboo.mutation_idempotency",
-                    correlation_id = %correlation_id(&prepared.key_digest),
-                    outcome = "replayed",
-                    "replayed idempotent mutation response"
-                );
-                return entry.response.to_response();
+                if !revalidate {
+                    tracing::debug!(
+                        target: "bamboo.mutation_idempotency",
+                        correlation_id = %correlation_id(&prepared.key_digest),
+                        outcome = "replayed",
+                        "replayed idempotent mutation response"
+                    );
+                    return entry.response.to_response();
+                }
+                true
+            } else {
+                false
             }
-        }
+        };
 
         let response = operation().await;
+        if existing {
+            // Keep the original key fingerprint, expiry and capacity slot.
+            // Only the state-dependent response is rechecked.
+            return response;
+        }
         let captured = match CachedHttpResponse::capture(response).await {
             Ok(captured) => captured,
             Err(error) => {
@@ -378,6 +415,54 @@ mod tests {
         assert_eq!(body(first).await, body(replay).await);
         assert_eq!(store.entry_count().await, 1);
         assert!(store.key_locks.is_empty(), "idle key locks must self-clean");
+    }
+
+    #[actix_web::test]
+    async fn revalidation_preserves_other_receipts_and_original_expiry() {
+        let store = Arc::new(MutationIdempotencyStore::new(Duration::from_secs(60), 2));
+        store
+            .execute(prepared("older", "a"), || async {
+                HttpResponse::Created().finish()
+            })
+            .await;
+        store
+            .execute(prepared("current", "b"), || async {
+                HttpResponse::Accepted().finish()
+            })
+            .await;
+        let current_key = prepared("current", "b").key_digest;
+        let before = {
+            let cache = store.entries.lock().await;
+            let entry = cache.entries.get(&current_key).unwrap();
+            (entry.expires_at, entry.sequence)
+        };
+        let rechecked = store
+            .execute_revalidating(prepared("current", "b"), || async {
+                HttpResponse::Conflict().finish()
+            })
+            .await;
+        assert_eq!(rechecked.status(), StatusCode::CONFLICT);
+        let after = {
+            let cache = store.entries.lock().await;
+            let entry = cache.entries.get(&current_key).unwrap();
+            (entry.expires_at, entry.sequence)
+        };
+        assert_eq!(before, after);
+        assert_eq!(store.entry_count().await, 2);
+        let older = store
+            .execute(prepared("older", "a"), || async {
+                panic!("revalidation must not evict an unrelated receipt")
+            })
+            .await;
+        assert_eq!(older.status(), StatusCode::CREATED);
+        let conflict = store
+            .execute_revalidating(prepared("current", "different"), || async {
+                panic!("a mismatched fingerprint must never execute")
+            })
+            .await;
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = serde_json::from_slice(&body(conflict).await.1).unwrap();
+        assert_eq!(body["error"]["code"], "idempotency_key_conflict");
     }
 
     #[actix_web::test]

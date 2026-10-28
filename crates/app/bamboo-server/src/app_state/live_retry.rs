@@ -180,6 +180,19 @@ impl LiveRetryBridge {
     }
 
     #[cfg(test)]
+    pub(crate) fn cancel_claimed_gate_for_test(&self, session: &str, run: &str) -> bool {
+        let map = self.offers();
+        let Some(entry) = map.get(session).filter(|entry| entry.run_id == run) else {
+            return false;
+        };
+        if !entry.claimed.load(Ordering::SeqCst) || entry.resolution.borrow().is_some() {
+            return false;
+        }
+        entry.gate.cancel_if_pending();
+        true
+    }
+
+    #[cfg(test)]
     pub(crate) fn reject_next_callback_for_test(&self) {
         self.reject_next_callback.store(true, Ordering::SeqCst);
     }
@@ -297,7 +310,11 @@ impl LiveRetryBridge {
                 return result;
             }
             if entry.gate.is_cancelled() {
-                return ContinueResult::NotPrepared;
+                return if entry.claimed.load(Ordering::SeqCst) {
+                    ContinueResult::OutcomeUncertain
+                } else {
+                    ContinueResult::NotPrepared
+                };
             }
             let winner = !entry.claimed.swap(true, Ordering::SeqCst);
             let resources = if winner {
