@@ -134,7 +134,9 @@ async fn cancel_running_runner(
     // except for the retained, exact owner of a fresh-input sync handoff.
     // The registry includes the interval while that owner is being taken.
     if matches!(runner.status, AgentStatus::Pending)
-        && !state.fresh_sync.is_current_owner(session_id, &runner.run_id)
+        && !state
+            .fresh_sync
+            .is_current_owner(session_id, &runner.run_id)
     {
         return RunnerCancelOutcome::NotActive;
     }

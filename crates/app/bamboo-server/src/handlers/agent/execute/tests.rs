@@ -1698,7 +1698,10 @@ mod execution_input_http {
         let mismatch: serde_json::Value = test::read_body_json(response).await;
         assert_eq!(mismatch_status, StatusCode::OK, "{mismatch}");
         assert_eq!(mismatch["sync"]["need_sync"], true);
-        assert!(mismatch.get("run_id").is_none(), "resync is not a started generation");
+        assert!(
+            mismatch.get("run_id").is_none(),
+            "resync is not a started generation"
+        );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         let pending_run = {
             let runners = state.agent_runners.read().await;
@@ -1763,7 +1766,10 @@ mod execution_input_http {
             "corrected sync must start the same admitted User: {body}"
         );
         assert_eq!(calls, 2);
-        assert_eq!(body["run_id"], pending_run, "the retained owner starts once");
+        assert_eq!(
+            body["run_id"], pending_run,
+            "the retained owner starts once"
+        );
         assert_eq!(
             after.messages.iter().filter(|m| m.id == fresh_id).count(),
             1
