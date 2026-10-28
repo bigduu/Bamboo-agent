@@ -20,7 +20,7 @@ pub const LIVE_BOOTSTRAP_OFFER_TTL: Duration = Duration::from_secs(10 * 60);
 pub struct LiveBootstrapOffer {
     gate: AdmissionGate,
     deadline: Instant,
-    decision: Option<oneshot::Sender<LiveBootstrapProof>>,
+    decision: Option<oneshot::Sender<AdmissionGate>>,
 }
 
 impl std::fmt::Debug for LiveBootstrapOffer {
@@ -65,8 +65,10 @@ impl LiveBootstrapOffer {
         if !proof.matches_gate(&self.gate) || Instant::now() >= self.deadline {
             return Err(io::Error::other("live bootstrap offer expired or changed"));
         }
+        // The receiver only needs the gate identity and committed state. Do
+        // not retain the Session-bearing proof during Retry-After/backoff.
         sender
-            .send(proof)
+            .send(self.gate.clone())
             .map_err(|_| io::Error::other("live bootstrap producer is no longer waiting"))
     }
 }
@@ -92,11 +94,15 @@ pub(super) async fn offer_and_wait(
     candidate: Candidate,
     attempts: u32,
     config: &RetryConfig,
+    observed_gate: &std::sync::Mutex<Option<AdmissionGate>>,
 ) -> bool {
     let Some(deadline) = Instant::now().checked_add(LIVE_BOOTSTRAP_OFFER_TTL) else {
         return false;
     };
     let gate = AdmissionGate::with_deadline(deadline.into_std());
+    if let Ok(mut observed) = observed_gate.lock() {
+        *observed = Some(gate.clone());
+    }
     let (decision, received) = oneshot::channel();
     let offer = LiveBootstrapOffer {
         gate: gate.clone(),
@@ -106,13 +112,13 @@ pub(super) async fn offer_and_wait(
     if sender.send(offer).is_err() {
         return false;
     }
-    let Ok(Ok(proof)) = tokio::time::timeout_at(deadline, received).await else {
+    let Ok(Ok(committed_gate)) = tokio::time::timeout_at(deadline, received).await else {
         gate.cancel_if_pending();
         return false;
     };
     // If a callback sent the proof but subsequently failed, commit never won;
     // that signal cannot authorize the still-live provider future.
-    if !proof.matches_gate(&gate) || !proof.is_committed() {
+    if !committed_gate.same_instance(&gate) || !committed_gate.is_committed() {
         return false;
     }
     let delay = backoff_delay(config, attempts.saturating_sub(1)).max(Duration::from_millis(1));

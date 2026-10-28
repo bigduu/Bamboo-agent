@@ -92,6 +92,9 @@ enum LiveVerticalCase {
     Continue,
     ConcurrentConfirm,
     StopWaiting,
+    StopAfterContinue,
+    StopDuringConfirm,
+    RejectConfirmation,
     HeadersTimeout,
 }
 
@@ -112,7 +115,14 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
                     // before any response headers from the synthetic upstream.
                     ResponseTemplate::new(200).set_delay(Duration::from_millis(500))
                 } else {
-                    ResponseTemplate::new(503).insert_header("Retry-After", "0")
+                    ResponseTemplate::new(503).insert_header(
+                        "Retry-After",
+                        match case {
+                            LiveVerticalCase::StopAfterContinue => "600",
+                            LiveVerticalCase::ConcurrentConfirm => "600",
+                            _ => "0",
+                        },
+                    )
                 }
             } else {
                 ResponseTemplate::new(200)
@@ -314,7 +324,105 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         "exactly one initial request before decision"
     );
 
-    if case == LiveVerticalCase::StopWaiting {
+    if case == LiveVerticalCase::StopDuringConfirm {
+        let gate = state.live_retry.pause_confirmations_for_test();
+        let request = || {
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request()
+        };
+        let requests = async {
+            futures::join!(
+                test::call_service(&app, request()),
+                test::call_service(&app, request())
+            )
+        };
+        let stop = async {
+            tokio::time::timeout(Duration::from_secs(5), gate.claimed.notified())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), gate.follower.notified())
+                .await
+                .unwrap();
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/stop/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        };
+        let ((first, second), ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            futures::join!(requests, stop)
+        })
+        .await
+        .expect("Stop must release both confirmation requests");
+        for response in [first, second] {
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["code"], "retry_resume_outcome_uncertain");
+            assert_eq!(body["run_id"], run_id);
+        }
+        assert_eq!(state.live_retry.active_payloads_for_test(), 0);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_http.len()
+        );
+        assert_eq!(tools.0.load(Ordering::SeqCst), before_tool);
+        tokio::time::timeout(Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        return;
+    }
+    if case == LiveVerticalCase::RejectConfirmation {
+        state.live_retry.reject_next_callback_for_test();
+        let confirmation = tokio::time::timeout(
+            Duration::from_secs(5),
+            test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/execute/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                    .to_request(),
+            ),
+        )
+        .await
+        .expect("a refused gate callback must not deadlock");
+        assert_eq!(confirmation.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = test::read_body_json(confirmation).await;
+        assert_eq!(body["error"]["code"], "retry_resume_not_prepared");
+        assert_eq!(state.live_retry.active_payloads_for_test(), 0);
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_http.len()
+        );
+        assert_eq!(tools.0.load(Ordering::SeqCst), before_tool);
+        tokio::time::timeout(Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        return;
+    }
+    if case == LiveVerticalCase::StopAfterContinue {
+        let confirmation = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(confirmation.status(), StatusCode::OK);
+    }
+    if matches!(
+        case,
+        LiveVerticalCase::StopWaiting | LiveVerticalCase::StopAfterContinue
+    ) {
         let stale = test::call_service(
             &app,
             test::TestRequest::post()
@@ -344,6 +452,22 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         let stopped: serde_json::Value = test::read_body_json(stop).await;
         assert_eq!(stopped["run_id"], run_id);
         wait_for_owned_terminal_with_cancellation(&state, id, &run_id, &mut events, true).await;
+        let diagnostics = bamboo_llm::retry::recent_initial_request_diagnostics(id);
+        let cancelled = diagnostics
+            .iter()
+            .rev()
+            .map(|value| serde_json::to_value(value).unwrap())
+            .find(|value| value["stop_reason"] == "cancelled_or_dropped")
+            .expect("cancelled request diagnostic");
+        if case == LiveVerticalCase::StopAfterContinue {
+            assert_eq!(cancelled["retry_mode"], "until_cancelled");
+            assert!(cancelled["attempt_limit"].is_null());
+            assert!(cancelled["total_budget_ms"].is_null());
+            assert!(cancelled["remaining_budget_ms"].is_null());
+        } else {
+            assert!(cancelled["retry_mode"].is_null());
+            assert!(cancelled["attempt_limit"].is_number());
+        }
         let waiting_after = test::call_service(
             &app,
             test::TestRequest::get()
@@ -364,7 +488,31 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         .await;
         assert_eq!(late.status(), StatusCode::CONFLICT);
         let late: serde_json::Value = test::read_body_json(late).await;
-        assert_eq!(late["error"]["code"], "retry_resume_not_prepared");
+        let expected = if case == LiveVerticalCase::StopAfterContinue {
+            "retry_resume_outcome_uncertain"
+        } else {
+            "retry_resume_not_prepared"
+        };
+        assert_eq!(late["error"]["code"], expected);
+        assert_eq!(state.live_retry.active_payloads_for_test(), 0);
+        // Once the lightweight receipt is cleaned up, no history is inferred.
+        state.live_retry.clear_receipt_for_test(id, &run_id);
+        let after_cleanup = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(after_cleanup.status(), StatusCode::CONFLICT);
+        let after_cleanup: serde_json::Value = test::read_body_json(after_cleanup).await;
+        assert_eq!(
+            after_cleanup["error"]["code"],
+            "retry_resume_outcome_uncertain"
+        );
+        assert_eq!(after_cleanup["run_id"], run_id);
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(
             server.received_requests().await.unwrap().len(),
@@ -467,24 +615,90 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
             .to_request()
     };
     let response = if case == LiveVerticalCase::ConcurrentConfirm {
-        let (first, second) = futures::join!(
-            test::call_service(&app, request()),
-            test::call_service(&app, request())
-        );
-        let (winner, loser) = if first.status() == StatusCode::OK {
-            (first, second)
-        } else {
-            (second, first)
+        let gate = state.live_retry.pause_confirmations_for_test();
+        let requests = async {
+            futures::join!(
+                test::call_service(&app, request()),
+                test::call_service(&app, request())
+            )
         };
-        assert_eq!(winner.status(), StatusCode::OK, "one confirmation must win");
+        let release = async {
+            tokio::time::timeout(Duration::from_secs(10), gate.claimed.notified())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(10), gate.follower.notified())
+                .await
+                .unwrap();
+            assert_eq!(
+                server.received_requests().await.unwrap().len(),
+                before_http.len()
+            );
+            gate.release.notify_one();
+        };
+        let ((first, second), ()) = futures::join!(requests, release);
         assert_eq!(
-            loser.status(),
-            StatusCode::CONFLICT,
-            "one confirmation must be refused"
+            first.status(),
+            StatusCode::OK,
+            "first client must receive the committed continuation"
         );
-        let refused: serde_json::Value = test::read_body_json(loser).await;
-        assert_eq!(refused["error"]["code"], "retry_resume_not_prepared");
-        winner
+        assert_eq!(
+            second.status(),
+            StatusCode::OK,
+            "second client must recognize the same committed continuation"
+        );
+        let repeated: serde_json::Value = test::read_body_json(second).await;
+        assert_eq!(repeated["status"], "retry_continuing");
+        assert_eq!(repeated["run_id"], run_id);
+        assert_eq!(state.live_retry.active_payloads_for_test(), 0);
+        let duplicate = test::call_service(&app, request()).await;
+        assert_eq!(duplicate.status(), StatusCode::OK);
+        let duplicate: serde_json::Value = test::read_body_json(duplicate).await;
+        assert_eq!(duplicate["run_id"], run_id);
+        assert_eq!(duplicate["status"], "retry_continuing");
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_http.len()
+        );
+        let first: serde_json::Value = test::read_body_json(first).await;
+        assert_eq!(first["run_id"], run_id);
+        assert_eq!(first["status"], "retry_continuing");
+        let stop = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/stop/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stop.status(), StatusCode::OK);
+        wait_for_owned_terminal_with_cancellation(&state, id, &run_id, &mut events, true).await;
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_http.len()
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), before_provider);
+        assert_eq!(tools.0.load(Ordering::SeqCst), before_tool);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|m| m.content == "one owned Root input")
+                .count(),
+            1
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|m| m.tool_call_id.as_deref() == Some("vertical-tool-call"))
+                .count(),
+            1
+        );
+        tokio::time::timeout(Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        return;
     } else {
         test::call_service(&app, request()).await
     };
@@ -565,6 +779,24 @@ async fn live_retry_http_real_actor_tool_then_anthropic_once() {
 #[actix_web::test]
 async fn live_retry_http_concurrent_confirm_and_trait_port_are_one_shot() {
     run_live_retry_vertical(LiveVerticalCase::ConcurrentConfirm).await;
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn live_retry_http_stop_after_confirmation_reports_continuous_mode() {
+    run_live_retry_vertical(LiveVerticalCase::StopAfterContinue).await;
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn live_retry_http_rejected_callback_cannot_deadlock() {
+    run_live_retry_vertical(LiveVerticalCase::RejectConfirmation).await;
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn live_retry_http_stop_releases_competing_confirmations() {
+    run_live_retry_vertical(LiveVerticalCase::StopDuringConfirm).await;
 }
 
 #[cfg(unix)]

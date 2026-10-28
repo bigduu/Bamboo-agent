@@ -329,6 +329,22 @@ impl Drop for CancellationObservation<'_> {
             .ok()
             .and_then(|value| value.clone());
         if let Some(mut observation) = latest {
+            // Observe the committed actor gate even if the provider future
+            // has not yet resumed to set live_continuous. Clone before
+            // inspecting the gate so the two mutexes are never nested.
+            let gate = self
+                .budget
+                .live_gate
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if self.budget.is_continuous() || gate.is_some_and(|gate| gate.is_committed()) {
+                observation.diagnostic.retry_mode = Some("until_cancelled");
+                observation.diagnostic.attempt_limit = None;
+                observation.diagnostic.total_budget_ms = None;
+                observation.diagnostic.remaining_budget_ms = None;
+                observation.deadline = None;
+            }
             observation.diagnostic.event = "stop";
             observation.diagnostic.stop_reason = Some(RequestStopReason::CancelledOrDropped);
             self.budget.record(observation);
@@ -367,6 +383,42 @@ mod tests {
         let json = serde_json::to_string(&events).unwrap();
         assert!(!json.contains(&session));
         assert!(json.len() < 12 * 1024);
+    }
+
+    #[test]
+    fn cancellation_uses_only_a_committed_live_confirmation() {
+        for (committed, cancelled) in [(false, false), (false, true), (true, false)] {
+            let session = format!("live-cancel-{}", uuid::Uuid::new_v4());
+            let budget =
+                InitialRequestBudget::new(&RetryConfig::default()).with_session_id(Some(&session));
+            budget.record(budget.observation(
+                Instant::now(),
+                "backoff",
+                "http_status",
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+            ));
+            let gate = bamboo_domain::AdmissionGate::default();
+            *budget.live_gate.lock().unwrap() = Some(gate.clone());
+            if committed {
+                gate.commit(|| Ok::<(), ()>(())).unwrap();
+            } else if cancelled {
+                gate.cancel_if_pending();
+            }
+            drop(CancellationObservation {
+                budget: &budget,
+                completed: false,
+            });
+            let events = recent_initial_request_diagnostics(&session);
+            let last = events.last().unwrap();
+            assert_eq!(
+                last.stop_reason,
+                Some(RequestStopReason::CancelledOrDropped)
+            );
+            assert_eq!(last.retry_mode, committed.then_some("until_cancelled"));
+            assert_eq!(last.attempt_limit.is_none(), committed);
+            assert_eq!(last.total_budget_ms.is_none(), committed);
+            assert_eq!(last.remaining_budget_ms.is_none(), committed);
+        }
     }
 
     #[test]

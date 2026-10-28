@@ -692,6 +692,7 @@ pub(crate) struct InitialRequestBudget {
     session_hash: Option<String>,
     latest: Mutex<Option<AttemptObservation>>,
     live_continuous: AtomicBool,
+    live_gate: Mutex<Option<bamboo_domain::AdmissionGate>>,
     live_candidate: Mutex<Option<live_bootstrap::Candidate>>,
     deferred_terminal: Mutex<Option<AttemptObservation>>,
 }
@@ -714,6 +715,7 @@ impl InitialRequestBudget {
             session_hash: None,
             latest: Mutex::new(None),
             live_continuous: AtomicBool::new(false),
+            live_gate: Mutex::new(None),
             live_candidate: Mutex::new(None),
             deferred_terminal: Mutex::new(None),
         }
@@ -941,6 +943,7 @@ where
                     candidate,
                     budget.attempts.load(Ordering::Acquire),
                     config,
+                    &budget.live_gate,
                 )
                 .await
             }

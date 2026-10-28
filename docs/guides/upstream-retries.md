@@ -87,6 +87,17 @@ return through its authoritative Host reservation path. Do not promise unlimited
 requests across those guardrails. The separate finite diagnostic budget is
 unchanged.
 
+For the negotiated v1 live-bootstrap continuation, a run admits at most one
+offer. Concurrent confirmations of that exact offer share its committed
+result; they never create another run or replay tools. If confirmation is still
+unresolved after a bounded wait, or the run expires, stops or changes, the
+client receives an uncertain result and should follow the original run. A
+later bootstrap in the same run cannot consume a delayed confirmation for the
+earlier offer. Multiple separately confirmable offers would require a protocol
+that identifies each offer. The Host caps outstanding registered offer
+operations at 32 and tracks at most 1024 run markers; capacity exhaustion
+leaves the bounded request failure intact and does not create a continuation.
+
 ## Diagnostic compatibility
 
 Finite receipts preserve the existing error text and numeric limits. They now

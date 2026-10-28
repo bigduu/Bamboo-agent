@@ -439,7 +439,8 @@ mod idempotency_e2e {
         let response = test::call_service(&app, retry(&run_id)).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let body: serde_json::Value = test::read_body_json(response).await;
-        assert_eq!(body["error"]["code"], "retry_resume_not_prepared");
+        assert_eq!(body["error"]["code"], "retry_resume_outcome_uncertain");
+        assert_eq!(body["run_id"], run_id);
         assert!(!proof.is_committed());
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         let different = test::call_service(&app, retry("different-run")).await;
