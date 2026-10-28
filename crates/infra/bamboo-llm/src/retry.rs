@@ -355,14 +355,30 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     // trust or hostname failure forever. Ordinary typed network errors and
     // the separate headers timeout remain eligible for retry below.
     let mut tls_source = err.source();
+    let mut opaque_connect_io = false;
     while let Some(cause) = tls_source {
         if cause.downcast_ref::<native_tls::Error>().is_some() {
             return false;
         }
+        if let Some(io) = cause.downcast_ref::<std::io::Error>() {
+            opaque_connect_io |= matches!(
+                io.kind(),
+                std::io::ErrorKind::Other
+                    | std::io::ErrorKind::InvalidData
+                    | std::io::ErrorKind::InvalidInput
+                    | std::io::ErrorKind::PermissionDenied
+            );
+        }
         tls_source = cause.source();
     }
-    if err.is_timeout() || err.is_connect() {
+    if err.is_timeout() {
         return true;
+    }
+    if err.is_connect() {
+        // Rustls certificate errors can arrive as opaque io::Error::Other.
+        // Unknown or invalid connect errors are not evidence of a transient
+        // network fault and must not cause an unbounded retry.
+        return !opaque_connect_io;
     }
     let mut source = err.source();
     while let Some(cause) = source {
