@@ -346,7 +346,7 @@ fn is_retryable_status(status: StatusCode) -> bool {
 /// and serialization failures must remain terminal.
 fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     use std::error::Error;
-    if err.is_builder() || err.is_decode() {
+    if err.is_builder() || err.is_decode() || err.is_body() {
         return false;
     }
     // Native TLS can erase the distinction between certificate validation
@@ -372,6 +372,14 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     let mut known_transient_connect_io = false;
     let mut opaque_connect_io = false;
     while let Some(cause) = tls_source {
+        // A request-body stream may fail after its prefix was delivered.
+        // Its error text must never be mistaken for a network failure.
+        if cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body)
+        {
+            return false;
+        }
         if cause.downcast_ref::<native_tls::Error>().is_some() {
             return false;
         }
