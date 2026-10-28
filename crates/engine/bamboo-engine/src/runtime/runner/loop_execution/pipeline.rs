@@ -3794,6 +3794,11 @@ async fn run_pipeline_inner(
                     }
                 };
 
+            // Only a validated, accepted output can authorize its Gold route.
+            if let Some(attempt) = llm_output.host_gold_attempt.as_ref() {
+                attempt.accept();
+            }
+
             if stream_output.tool_calls.is_empty() {
                 if crate::runtime::runner::round_lifecycle::is_openai_client_tool_search_boundary(
                     &stream_output.provider_transcript_items,

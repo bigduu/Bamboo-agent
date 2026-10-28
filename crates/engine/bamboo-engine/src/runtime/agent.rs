@@ -15,20 +15,41 @@ use bamboo_domain::RuntimeSessionPersistence;
 // Refuse only this Gold selection instead of dropping the inherited policy.
 struct ChildGoldPolicyRefusal {
     dispatched: std::sync::atomic::AtomicBool,
+    rejected: Option<Arc<dyn bamboo_llm::LLMProvider>>,
 }
 
 impl ChildGoldPolicyRefusal {
-    fn error() -> bamboo_llm::LLMError {
+    fn unverified_error() -> bamboo_llm::LLMError {
         bamboo_llm::LLMError::Api(
             "Existing Gold policy returned an unverified provider for managed child resume".into(),
         )
     }
+
+    fn error(&self) -> bamboo_llm::LLMError {
+        if self
+            .rejected
+            .as_ref()
+            .is_some_and(|provider| provider.local_dispatch_refused())
+        {
+            return stale_gold_policy_error();
+        }
+        self.rejected
+            .as_ref()
+            .and_then(|provider| provider.known_pre_dispatch_error())
+            .unwrap_or_else(Self::unverified_error)
+    }
+}
+
+fn stale_gold_policy_error() -> bamboo_llm::LLMError {
+    bamboo_llm::LLMError::Api(
+        "Inherited Gold target already refused a dispatch; a fresh target is required".into(),
+    )
 }
 
 #[async_trait::async_trait]
 impl bamboo_llm::LLMProvider for ChildGoldPolicyRefusal {
     fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
-        Some(Self::error())
+        Some(self.error())
     }
     fn queue_requires_current_route(&self) -> bool {
         // Keep the default unique queue identity. A prior allowed queued Gold
@@ -47,7 +68,7 @@ impl bamboo_llm::LLMProvider for ChildGoldPolicyRefusal {
     ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
         self.dispatched
             .store(true, std::sync::atomic::Ordering::Release);
-        Err(Self::error())
+        Err(self.error())
     }
 }
 
@@ -62,13 +83,261 @@ pub(crate) fn compose_child_gold_policy(
         // `delegate` was already fixed to the selected provider after the
         // optional Work decoration by bind_child_gold_delegate.
         let result = inherited(model, delegate.clone());
-        if !Arc::ptr_eq(&result, &delegate) {
+        if !gold_policy_reaches_delegate(&result, &delegate) {
             return Arc::new(ChildGoldPolicyRefusal {
                 dispatched: std::sync::atomic::AtomicBool::new(false),
+                rejected: None,
             }) as Arc<dyn bamboo_llm::LLMProvider>;
         }
-        managed(model, delegate)
+        if result.local_dispatch_refused() {
+            return Arc::new(ChildGoldPolicyRefusal {
+                dispatched: std::sync::atomic::AtomicBool::new(false),
+                rejected: Some(result),
+            }) as Arc<dyn bamboo_llm::LLMProvider>;
+        }
+        let allocation_identity = gold_policy_allocation_identity(&result, &delegate);
+        let policy: Arc<dyn bamboo_llm::LLMProvider> = Arc::new(ChildGoldPolicyProvider {
+            inherited: inherited.clone(),
+            delegate,
+            allocation_identity,
+            model: model.to_owned(),
+            dispatched: std::sync::atomic::AtomicBool::new(false),
+        });
+        managed(model, policy)
     })
+}
+
+fn gold_policy_allocation_identity(
+    policy: &Arc<dyn bamboo_llm::LLMProvider>,
+    delegate: &Arc<dyn bamboo_llm::LLMProvider>,
+) -> usize {
+    policy
+        .resource_allocation_identity()
+        .or_else(|| delegate.resource_allocation_identity())
+        .unwrap_or(Arc::as_ptr(delegate) as *const () as usize)
+}
+
+// Queue/allocation identity is intentionally not proof of dispatch provenance.
+// Only explicitly attested immutable delegate edges may reach the exact Work
+// decorated Arc supplied to the policy. Bound traversal so a bad adapter cannot
+// create an infinite cycle or unbounded inspection.
+fn gold_policy_reaches_delegate(
+    candidate: &Arc<dyn bamboo_llm::LLMProvider>,
+    delegate: &Arc<dyn bamboo_llm::LLMProvider>,
+) -> bool {
+    const MAX_WRAPPERS: usize = 32;
+    let mut seen = Vec::<Arc<dyn bamboo_llm::LLMProvider>>::new();
+    let mut current = candidate.clone();
+    for _ in 0..=MAX_WRAPPERS {
+        if Arc::ptr_eq(&current, delegate) {
+            return true;
+        }
+        if seen.iter().any(|previous| Arc::ptr_eq(previous, &current)) {
+            return false;
+        }
+        seen.push(current.clone());
+        let Some(next) = current.fixed_gold_policy_delegate() else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+// The inherited resolver is a live policy. Re-evaluate it at dispatch, after
+// any auxiliary semaphore wait, and keep the returned wrapper rather than
+// discarding its policy. A non-attested result never enters the Work delegate.
+struct ChildGoldPolicyProvider {
+    inherited: crate::runtime::config::GoldTargetResolver,
+    delegate: Arc<dyn bamboo_llm::LLMProvider>,
+    allocation_identity: usize,
+    model: String,
+    dispatched: std::sync::atomic::AtomicBool,
+}
+
+impl ChildGoldPolicyProvider {
+    fn select(
+        &self,
+        model: &str,
+    ) -> Result<Arc<dyn bamboo_llm::LLMProvider>, bamboo_llm::LLMError> {
+        if model != self.model {
+            return Err(bamboo_llm::LLMError::Api(
+                "Gold model changed after policy selection".into(),
+            ));
+        }
+        let current = (self.inherited)(model, self.delegate.clone());
+        if !gold_policy_reaches_delegate(&current, &self.delegate) {
+            return Err(ChildGoldPolicyRefusal::unverified_error());
+        }
+        // The refusal marker is per target. Reusing a target that already
+        // refused could misclassify a later upstream error as a local refusal.
+        // Refuse before the Work delegate rather than invoking that target.
+        if current.local_dispatch_refused() {
+            return Err(stale_gold_policy_error());
+        }
+        // Keep the concurrency budget chosen for this evaluation. An adapter
+        // which changes its explicit allocation identity cannot safely reuse
+        // the slot already acquired for the prior policy.
+        if gold_policy_allocation_identity(&current, &self.delegate) != self.allocation_identity {
+            return Err(bamboo_llm::LLMError::Api(
+                "Gold policy changed its allocation identity before dispatch".into(),
+            ));
+        }
+        Ok(current)
+    }
+
+    fn dispatch(
+        &self,
+        model: &str,
+    ) -> Result<Arc<dyn bamboo_llm::LLMProvider>, bamboo_llm::LLMError> {
+        let selected = self.select(model).and_then(|provider| {
+            if let Some(error) = provider.known_pre_dispatch_error() {
+                Err(error)
+            } else {
+                Ok(provider)
+            }
+        });
+        if selected.is_err() {
+            self.dispatched
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        selected
+    }
+
+    fn note_delegate_refusal<T>(
+        &self,
+        provider: &Arc<dyn bamboo_llm::LLMProvider>,
+        result: &Result<T, bamboo_llm::LLMError>,
+    ) {
+        if result.is_err() && provider.local_dispatch_refused() {
+            self.dispatched
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl bamboo_llm::LLMProvider for ChildGoldPolicyProvider {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn bamboo_llm::LLMProvider>> {
+        // Every successful dispatch is rechecked to reach this immutable
+        // delegate; a changed or opaque route is refused before dispatch.
+        Some(self.delegate.clone())
+    }
+
+    fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+        match self.select(&self.model) {
+            Ok(provider) => provider.known_pre_dispatch_error(),
+            Err(error) => Some(error),
+        }
+    }
+
+    fn queue_requires_current_route(&self) -> bool {
+        true
+    }
+
+    fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
+        bamboo_llm::provider::queued_identity_for(&self.delegate)
+    }
+
+    fn local_dispatch_refused(&self) -> bool {
+        self.dispatched.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        Some(self.allocation_identity)
+    }
+
+    async fn supports_vision(&self, model: &str) -> bool {
+        match self.select(&self.model) {
+            Ok(provider) => provider.supports_vision(model).await,
+            Err(_) => false,
+        }
+    }
+
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        match self.select(&self.model) {
+            Ok(provider) => provider.vision_support_override(model).await,
+            Err(_) => Some(false),
+        }
+    }
+
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required: Option<&str>,
+    ) -> bamboo_domain::CapabilityLoadingMode {
+        match self.select(&self.model) {
+            Ok(provider) => provider.capability_loading_mode(model, required).await,
+            Err(_) => bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        }
+    }
+
+    async fn provider_visible_tool_footprint(
+        &self,
+        ir: &bamboo_llm::PromptIR,
+        tools: &[bamboo_agent_core::ToolSchema],
+        model: &str,
+        required: Option<&str>,
+    ) -> Result<bamboo_llm::ProviderVisibleToolFootprint, bamboo_llm::LLMError> {
+        self.select(model)?
+            .provider_visible_tool_footprint(ir, tools, model, required)
+            .await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[bamboo_agent_core::Message],
+        tools: &[bamboo_agent_core::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        let provider = self.dispatch(model)?;
+        let result = provider.chat_stream(messages, tools, max, model).await;
+        self.note_delegate_refusal(&provider, &result);
+        result
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[bamboo_agent_core::Message],
+        tools: &[bamboo_agent_core::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::LLMRequestOptions>,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        let provider = self.dispatch(model)?;
+        let result = provider
+            .chat_stream_with_options(messages, tools, max, model, options)
+            .await;
+        self.note_delegate_refusal(&provider, &result);
+        result
+    }
+
+    async fn chat_stream_ir(
+        &self,
+        ir: &bamboo_llm::PromptIR,
+        tools: &[bamboo_agent_core::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::LLMRequestOptions>,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        let provider = self.dispatch(model)?;
+        let result = provider
+            .chat_stream_ir(ir, tools, max, model, options)
+            .await;
+        self.note_delegate_refusal(&provider, &result);
+        result
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, bamboo_llm::LLMError> {
+        self.select(&self.model)?.list_models().await
+    }
+
+    async fn list_model_info(
+        &self,
+    ) -> Result<Vec<bamboo_llm::provider::ProviderModelInfo>, bamboo_llm::LLMError> {
+        self.select(&self.model)?.list_model_info().await
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +468,21 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Opt a Host-owned non-HTTP consumer into per-attempt Gold provenance.
+    /// Direct SDK Agents keep their existing provider contract.
+    #[doc(hidden)]
+    pub fn with_host_gold_origin_resolver(
+        &self,
+        resolver: crate::runtime::host_gold::HostGoldOriginResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.host_gold_origin_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Bind the Host's Gold route to this execution without changing SDK defaults.
+    /// For managed child resume the synchronous resolver may be called again
+    /// at preflight and dispatch; it must not initiate a request or block.
     #[doc(hidden)]
     pub fn with_gold_target_resolver(
         &self,

@@ -1019,6 +1019,31 @@ async fn token_budget_resume_auxiliary_rejection_has_no_reservation() {
     );
 }
 
+// A trusted fixed policy wrapper must still reach the same Work decorator.
+struct FixedGoldPolicyWrapper {
+    inner: Arc<dyn LLMProvider>,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl LLMProvider for FixedGoldPolicyWrapper {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
+        Some(self.inner.clone())
+    }
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        self.inner.resource_allocation_identity()
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[bamboo_domain::Message],
+        tools: &[bamboo_domain::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.chat_stream(messages, tools, max, model).await
+    }
+}
+
 // The same Work decorator used by execute_bound remains inside the fixed Gold
 // delegate. The later caller cannot replace it with a different provider.
 #[tokio::test]
@@ -1131,12 +1156,62 @@ async fn child_resume_gold_delegate_keeps_work_budget_and_selected_provider() {
     assert_eq!(ledger(&fixture).total_charged, 0);
     assert!(ledger(&fixture).reservations.is_empty());
 
-    // The identity resolver stands in for an admitted Gold guard to isolate
-    // the delegate/budget binding without dispatching a real managed provider.
+    // A changed inherited policy must refuse at dispatch before the Work
+    // decorator reserves, even when preflight had admitted the prior policy.
+    let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let policy_state = permitted.clone();
+    let replacement = other_handle.clone();
+    let changing: crate::runtime::config::GoldTargetResolver = Arc::new(move |_, delegate| {
+        if policy_state.load(Ordering::SeqCst) {
+            delegate
+        } else {
+            replacement.clone()
+        }
+    });
+    let mut changing_config = AgentLoopConfig {
+        app_data_dir: Some(fixture.dir.path().to_path_buf()),
+        gold_target_resolver: Some(crate::runtime::agent::compose_child_gold_policy(
+            Some(changing),
+            Arc::new(|_, delegate| delegate),
+        )),
+        ..Default::default()
+    };
+    let changing_delegate = budget.decorate(&mut changing_config, main.clone());
+    crate::runtime::runtime::bind_child_gold_delegate(
+        &mut changing_config,
+        Some(&main),
+        &main,
+        &changing_delegate,
+    )
+    .unwrap();
+    let changing_gold =
+        changing_config.gold_target_resolver.as_ref().unwrap()("fixture-model", main.clone());
+    assert!(changing_gold.known_pre_dispatch_error().is_none());
+    permitted.store(false, Ordering::SeqCst);
+    assert!(changing_gold
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert!(changing_gold.local_dispatch_refused());
+    assert_eq!(selected.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(other.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger(&fixture).total_charged, 0);
+    assert!(ledger(&fixture).reservations.is_empty());
+
+    // An admitted transparent wrapper must remain in the path and settle
+    // exactly the one shared Work reservation around the selected provider.
+    let wrapper_calls = Arc::new(AtomicUsize::new(0));
+    let policy_calls = wrapper_calls.clone();
+    let policy: crate::runtime::config::GoldTargetResolver = Arc::new(move |_, delegate| {
+        Arc::new(FixedGoldPolicyWrapper {
+            inner: delegate,
+            calls: policy_calls.clone(),
+        })
+    });
     let mut config = AgentLoopConfig {
         app_data_dir: Some(fixture.dir.path().to_path_buf()),
         gold_target_resolver: Some(crate::runtime::agent::compose_child_gold_policy(
-            Some(Arc::new(|_model, delegate| delegate)),
+            Some(policy),
             Arc::new(|_model, delegate| delegate),
         )),
         ..Default::default()
@@ -1151,6 +1226,7 @@ async fn child_resume_gold_delegate_keeps_work_budget_and_selected_provider() {
         .unwrap();
     assert_eq!(selected.calls.load(Ordering::SeqCst), 1);
     assert_eq!(other.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(wrapper_calls.load(Ordering::SeqCst), 1);
     assert_eq!(ledger(&fixture).total_charged, 140);
     while let Some(chunk) = stream.next().await {
         chunk.unwrap();

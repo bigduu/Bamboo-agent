@@ -162,6 +162,49 @@ fn gold_factory_identity_is_static(config: &Config, id: &str) -> bool {
 }
 
 impl ProviderRegistry {
+    /// Prove the unique managed origin of an already-selected dispatch Arc.
+    /// The provider, uniqueness, and factory binding come from one nonblocking
+    /// registry snapshot. Failure (including busy, poison, unmanaged, absent,
+    /// ambiguous, or missing binding) is unknown provenance, not SDK proof.
+    /// A returned origin still needs the live-config Gold admission guard.
+    #[doc(hidden)]
+    pub fn managed_origin_for_dispatched_provider(
+        self: &Arc<Self>,
+        selected: &Arc<dyn LLMProvider>,
+    ) -> Result<(String, Arc<ManagedProviderOrigin>), LLMError> {
+        let state = self.state.try_read().map_err(|_| {
+            LLMError::Api(
+                "Provider registry is busy or poisoned during dispatch origin lookup".into(),
+            )
+        })?;
+        let RegistryOrigin::Managed { bindings, .. } = &state.origin else {
+            return Err(LLMError::Api(
+                "Dispatch provider registry is not managed".into(),
+            ));
+        };
+        let mut matching = state
+            .providers
+            .iter()
+            .filter(|(_, provider)| Arc::ptr_eq(provider, selected));
+        let (name, _) = matching.next().ok_or_else(|| {
+            LLMError::Api("Dispatched provider is absent from the managed registry".into())
+        })?;
+        if matching.next().is_some() {
+            return Err(LLMError::Api(
+                "Dispatched provider has multiple managed registry keys".into(),
+            ));
+        }
+        if !bindings.contains_key(name) {
+            return Err(LLMError::Api(
+                "Dispatched provider has no managed factory binding".into(),
+            ));
+        }
+        let origin = self
+            .managed_origin_for_snapshot(&state, name, selected)
+            .ok_or_else(|| LLMError::Api("Managed dispatch origin became unavailable".into()))?;
+        Ok((name.clone(), origin))
+    }
+
     fn managed_origin_for_snapshot(
         self: &Arc<Self>,
         state: &RegistryState,
@@ -2700,3 +2743,7 @@ mod tests {
 #[cfg(test)]
 #[path = "provider_registry_child_gold_tests.rs"]
 mod provider_registry_child_gold_tests;
+
+#[cfg(test)]
+#[path = "main_dispatch_origin_tests.rs"]
+mod main_dispatch_origin_tests;

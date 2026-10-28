@@ -1682,6 +1682,174 @@ mod tests {
         .as_string()
     }
 
+    // Focused safety regression for the real Connect run_prompt path.
+    #[tokio::test]
+    async fn connect_gold_stays_with_accepted_main_origin_after_swap() {
+        use bamboo_domain::ProviderModelRef;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let model = body["model"].as_str().unwrap();
+                let delta = match model {
+                    "main-a" => serde_json::json!({"content":"synthetic answer"}),
+                    "only-a-gold" => serde_json::json!({"tool_calls":[{"index":0,
+                        "id":"fixture-gold","type":"function","function":{
+                            "name":"report_gold_evaluation","arguments":
+                            "{\"decision\":\"achieved\",\"confidence\":\"high\",\"reasoning\":\"synthetic\",\"missing_information\":[]}"}}]}),
+                    other => panic!("unexpected synthetic model {other}"),
+                };
+                let frame = serde_json::json!({"id":"fixture","object":"chat.completion.chunk","created":0,
+                    "model":model,"choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                let response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"));
+                if model == "main-a" { response.set_delay(Duration::from_secs(4)) } else { response }
+            }).mount(&a).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("synthetic refusal"))
+            .mount(&b)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state.stop_config_watcher_for_test();
+        let mut config = state.config.read().await.clone();
+        config.provider = "account-a".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.clear();
+        for (name, model, admitted, endpoint) in [
+            (
+                "account-a",
+                "main-a",
+                serde_json::json!(["main-a", "only-a-gold"]),
+                a.uri(),
+            ),
+            (
+                "account-b",
+                "main-b",
+                serde_json::json!(["main-b"]),
+                b.uri(),
+            ),
+        ] {
+            config.provider_instances.insert(
+                name.into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+                    "base_url":endpoint, "model":model, "runtime_models":admitted
+                }))
+                .unwrap(),
+            );
+        }
+        config.extra.insert(
+            "gold".into(),
+            serde_json::json!({"enabled":true,
+            "auto_continue_enabled":true,"goal":"synthetic Connect goal",
+            "model_name":"only-a-gold", "max_auto_continuations":1}),
+        );
+        state
+            .provider_registry
+            .reload_from_config(&config, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let main_a = state
+            .provider_registry
+            .provider_for_configured_model(&config, &ProviderModelRef::new("account-a", "main-a"))
+            .unwrap();
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-a", "only-a-gold")
+            )
+            .is_ok());
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-b", "only-a-gold")
+            )
+            .is_err());
+        *state.config.write().await = config;
+        *state.provider.write().await = main_a;
+        let ctx = ConnectContext {
+            agent: Arc::new(state.agent.with_host_gold_origin_resolver(
+                crate::app_state::host_gold_origin::origin_resolver(
+                    state.provider_registry.clone(),
+                    state.initial_injected_provider.clone(),
+                ),
+            )),
+            tools: state.tools_for(ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
+            permission_checker: state.permission_checker.clone(),
+        };
+        let bridge = Arc::new(ConnectBridge::new(ctx, None));
+        let task = tokio::spawn(async move {
+            let platform: Arc<dyn Platform> = FakePlatform::new("fake");
+            bridge
+                .run_prompt(
+                    "fake:chat:user",
+                    platform,
+                    &ReplyCtx(serde_json::json!({})),
+                    "synthetic Connect task",
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if !a.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed A Connect main request did not arrive");
+        *state.provider.write().await = state.provider_registry.get("account-b").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if a.received_requests().await.unwrap().iter().any(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                        == "only-a-gold"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the captured account A did not receive Gold");
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("Connect run did not settle")
+            .unwrap();
+        let seen_b = b.received_requests().await.unwrap();
+        assert!(
+            !seen_b.iter().any(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                    == "only-a-gold"
+            }),
+            "Gold must never be sent to B"
+        );
+    }
+
     #[test]
     fn session_key_formats_as_platform_chat_user() {
         let key = SessionKey {

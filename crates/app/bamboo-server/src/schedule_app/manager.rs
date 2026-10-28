@@ -2041,6 +2041,186 @@ budgets:
         result.unwrap_or_else(|_| guard.failed("terminal", last_record, Some(poll_pending)))
     }
 
+    // Focused safety regression: exercises the real non-Workflow Schedule run
+    // with two isolated config-managed OpenAI-compatible loopback endpoints.
+    #[tokio::test]
+    async fn scheduled_gold_stays_with_accepted_main_origin_after_swap() {
+        use bamboo_domain::ProviderModelRef;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let model = body["model"].as_str().unwrap();
+                let delta = match model {
+                    "main-a" => serde_json::json!({"content":"synthetic answer"}),
+                    "only-a-gold" => serde_json::json!({"tool_calls":[{"index":0,
+                        "id":"fixture-gold","type":"function","function":{
+                            "name":"report_gold_evaluation","arguments":
+                            "{\"decision\":\"achieved\",\"confidence\":\"high\",\"reasoning\":\"synthetic\",\"missing_information\":[]}"}}]}),
+                    other => panic!("unexpected synthetic model {other}"),
+                };
+                let frame = serde_json::json!({"id":"fixture","object":"chat.completion.chunk","created":0,
+                    "model":model,"choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                let response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"));
+                if model == "main-a" { response.set_delay(Duration::from_secs(4)) } else { response }
+            }).mount(&a).await;
+        // Auth rejection is deliberate: observe the incorrectly dispatched
+        // request without allowing additional model work or retries.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("synthetic refusal"))
+            .mount(&b)
+            .await;
+
+        let (dir, state, _fixture_provider, tools) = fixture().await;
+        let mut config = state.config.read().await.clone();
+        config.provider = "account-a".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.clear();
+        for (name, model, admitted, endpoint) in [
+            (
+                "account-a",
+                "main-a",
+                json!(["main-a", "only-a-gold"]),
+                a.uri(),
+            ),
+            ("account-b", "main-b", json!(["main-b"]), b.uri()),
+        ] {
+            config.provider_instances.insert(
+                name.into(),
+                serde_json::from_value(json!({
+                    "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+                    "base_url":endpoint, "model":model, "runtime_models":admitted
+                }))
+                .unwrap(),
+            );
+        }
+        config.extra.insert(
+            "gold".into(),
+            json!({"enabled":true,
+            "auto_continue_enabled":true,"goal":"synthetic scheduled goal",
+            "model_name":"only-a-gold", "max_auto_continuations":1}),
+        );
+        state
+            .provider_registry
+            .reload_from_config(&config, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let main_a = state
+            .provider_registry
+            .provider_for_configured_model(&config, &ProviderModelRef::new("account-a", "main-a"))
+            .unwrap();
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-a", "only-a-gold")
+            )
+            .is_ok());
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-b", "only-a-gold")
+            )
+            .is_err());
+        *state.config.write().await = config;
+        *state.provider.write().await = main_a;
+        let mut ctx = context(&state, state.schedule_store.clone(), tools).await;
+        ctx.agent = Arc::new(ctx.agent.with_host_gold_origin_resolver(
+            crate::app_state::host_gold_origin::origin_resolver(
+                state.provider_registry.clone(),
+                state.initial_injected_provider.clone(),
+            ),
+        ));
+        let run_config: ScheduleRunConfig = serde_json::from_value(json!({
+            "auto_execute":true,"model":"main-a","task_message":"synthetic scheduled task"
+        }))
+        .unwrap();
+        let schedule = state
+            .schedule_store
+            .create_schedule(
+                "Gold witness".into(),
+                ScheduleTrigger::Once {
+                    at: Utc::now() + chrono::Duration::hours(1),
+                },
+                true,
+                run_config,
+            )
+            .await
+            .unwrap();
+        let claim = state
+            .schedule_store
+            .create_run_now(&schedule.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let started = run_schedule_job(ctx, job(&claim), None).await.unwrap();
+        assert!(matches!(
+            started,
+            ScheduleRunLifecycleResult::BackgroundExecutionInProgress
+        ));
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if !a.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed A main request did not arrive");
+        // Reproduce the provider-lock publication step of a reload while A's
+        // response remains delayed; no configuration or network is external.
+        *state.provider.write().await = state.provider_registry.get("account-b").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if a.received_requests().await.unwrap().iter().any(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                        == "only-a-gold"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the captured account A did not receive Gold");
+        let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let record = state
+                    .schedule_store
+                    .get_run_record(&claim.run_id)
+                    .await
+                    .unwrap();
+                if record.status.is_terminal() {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled run did not reach a terminal state");
+        assert_eq!(terminal.status, ScheduleRunStatus::Success);
+        let seen_b = b.received_requests().await.unwrap();
+        assert!(
+            !seen_b.iter().any(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                    == "only-a-gold"
+            }),
+            "Gold must never be sent to B"
+        );
+    }
+
     mod guard_metadata_tests {
         use super::{
             guard_metadata, guard_progress_for_job, guard_progress_for_received_job,
