@@ -892,3 +892,129 @@ async fn work_budget_and_reasoning_snapshot_share_real_auxiliary_semaphore() {
         "the simulated usage settles at EOF"
     );
 }
+
+// A resumed run's two live role handles must share the canonical Work budget.
+#[tokio::test]
+async fn token_budget_resume_auxiliary_pair_cannot_escape_shared_exhaustion() {
+    use std::sync::atomic::AtomicBool;
+
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let main_inner = Provider::new(Script::Known);
+    let summary_inner = Provider::new(Script::Known);
+    let background_inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let want_summary = Arc::new(AtomicBool::new(true));
+    let callback_want_summary = Arc::clone(&want_summary);
+    let summary: Arc<dyn LLMProvider> = summary_inner.clone();
+    let background: Arc<dyn LLMProvider> = background_inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        resume_auxiliary_resolver: Some(Arc::new(move || {
+            let summary = callback_want_summary
+                .load(Ordering::SeqCst)
+                .then(|| bamboo_llm::ResolvedModel::new(summary.clone(), "fixture-model"));
+            (
+                Ok(summary),
+                Some(bamboo_llm::ResolvedModel::new(
+                    background.clone(),
+                    "fixture-model",
+                )),
+            )
+        })),
+        ..Default::default()
+    };
+    let main = budget.decorate(&mut config, main_inner.clone());
+    drop(
+        main.chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap(),
+    );
+    let before_attempts = ledger(&f);
+    let pair = config.resolve_auxiliary_models();
+    assert_eq!(
+        pair.summarization_model_name.as_deref(),
+        Some("fixture-model")
+    );
+    assert_eq!(pair.background_model_name.as_deref(), Some("fixture-model"));
+    assert!(pair.summarization_model_error.is_none());
+    for provider in [
+        pair.summarization_model_provider.unwrap(),
+        pair.background_model_provider.unwrap(),
+    ] {
+        assert!(provider
+            .chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .is_err());
+    }
+    want_summary.store(false, Ordering::SeqCst);
+    let absent = config.resolve_auxiliary_models();
+    assert!(absent.summarization_model_name.is_none());
+    assert!(absent.summarization_model_provider.is_none());
+    assert!(absent.summarization_model_error.is_none());
+    assert!(absent
+        .background_model_provider
+        .unwrap()
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(main_inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(summary_inner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(background_inner.calls.load(Ordering::SeqCst), 0);
+    let after_attempts = ledger(&f);
+    assert_eq!(after_attempts.total_charged, 140);
+    assert_eq!(
+        after_attempts.reservations.len(),
+        before_attempts.reservations.len()
+    );
+}
+
+// A locally rejected summary is not a dispatch or a Work token reservation.
+#[tokio::test]
+async fn token_budget_resume_auxiliary_rejection_has_no_reservation() {
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let main_inner = Provider::new(Script::Known);
+    let background_inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let background: Arc<dyn LLMProvider> = background_inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        resume_auxiliary_resolver: Some(Arc::new(move || {
+            (
+                Err(LLMError::Api("synthetic resume route rejected".into())),
+                Some(bamboo_llm::ResolvedModel::new(
+                    background.clone(),
+                    "fixture-model",
+                )),
+            )
+        })),
+        ..Default::default()
+    };
+    let _main = budget.decorate(&mut config, main_inner.clone());
+    let before_selection = ledger(&f);
+    let selected = config.resolve_auxiliary_models();
+    assert!(selected.summarization_model_name.is_none());
+    assert!(selected.summarization_model_provider.is_none());
+    assert!(selected
+        .summarization_model_error
+        .as_deref()
+        .is_some_and(|error| error.contains("synthetic resume route rejected")));
+    assert!(selected.background_model_provider.is_some());
+    assert_eq!(main_inner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(background_inner.calls.load(Ordering::SeqCst), 0);
+    let after_selection = ledger(&f);
+    assert_eq!(after_selection.total_charged, 0);
+    assert_eq!(
+        after_selection.reservations.len(),
+        before_selection.reservations.len()
+    );
+}

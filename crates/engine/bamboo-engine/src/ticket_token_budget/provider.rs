@@ -111,6 +111,24 @@ impl NativeWorkTokenBudget {
                 })
             }));
         }
+        if let Some(resolve) = loop_config.resume_auxiliary_resolver.take() {
+            let budget = budget.clone();
+            let limits = limits.clone();
+            loop_config.resume_auxiliary_resolver = Some(Arc::new(move || {
+                let (summary, background) = resolve();
+                let summary = summary.map(|target| {
+                    target.map(|mut model| {
+                        model.provider = budget.wrap(model.provider, &limits);
+                        model
+                    })
+                });
+                let background = background.map(|mut model| {
+                    model.provider = budget.wrap(model.provider, &limits);
+                    model
+                });
+                (summary, background)
+            }));
+        }
         if let Some(resolve) = loop_config.vision_model_resolver.take() {
             let budget = budget.clone();
             let limits = limits.clone();

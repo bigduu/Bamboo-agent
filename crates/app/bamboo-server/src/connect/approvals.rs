@@ -27,7 +27,6 @@ use bamboo_engine::execution::{
     create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
     SessionExecutionReserveOutcome,
 };
-use bamboo_engine::runtime::config::BackgroundModelResolver;
 use bamboo_engine::runtime::execution::agent_spawn::{
     spawn_session_execution, SessionExecutionArgs,
 };
@@ -49,32 +48,10 @@ use bamboo_engine::session_app::respond::{
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use bamboo_engine::session_app::types::RespondInput;
 use bamboo_engine::{ModelRoster, RoleModel};
-use bamboo_llm::{Config, ProviderRegistry};
 
 use super::bridge::ConnectContext;
 use super::platform::{Button, OutboundMessage, Platform, PlatformResult, ReplyCtx};
 use super::render::PendingAsk;
-
-// Use the resume snapshot's provider key, never a later default account. A
-// contended config or a refused route has no background model for this round.
-fn connect_resume_background_model_resolver(
-    config: Arc<tokio::sync::RwLock<Config>>,
-    registry: Arc<ProviderRegistry>,
-    provider_name: String,
-) -> BackgroundModelResolver {
-    Arc::new(move |_run_provider_name| {
-        if provider_name.is_empty() {
-            return None;
-        }
-        config.try_read().ok().and_then(|current| {
-            bamboo_engine::model_config_helper::resolve_background_model(
-                &current,
-                &provider_name,
-                &registry,
-            )
-        })
-    })
-}
 
 /// Longest a button's visible label is allowed to be — Telegram (and most IM
 /// platforms) truncate/reject very long inline-button text, so keep it well
@@ -698,7 +675,7 @@ impl ResumeExecutionPort for ConnectResumePort {
             ),
         };
 
-        let background_resolver = connect_resume_background_model_resolver(
+        let resume_resolver = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
             self.ctx.config.clone(),
             self.ctx.provider_registry.clone(),
             config.provider_name.clone(),
@@ -706,7 +683,7 @@ impl ResumeExecutionPort for ConnectResumePort {
         let resume_agent = Arc::new(
             self.ctx
                 .agent
-                .with_background_model_resolver(background_resolver),
+                .with_resume_auxiliary_resolver(resume_resolver),
         );
 
         let (mpsc_tx, _forwarder_handle, mut history_commit_barrier) =
@@ -1231,20 +1208,21 @@ mod tests {
                     .get("account-b")
                     .is_some_and(|b| Arc::ptr_eq(provider, &b))
             }));
-        let missing = connect_resume_background_model_resolver(
+        let missing = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
             fixture.config.clone(),
             fixture.registry.clone(),
             "account-missing".into(),
         );
-        assert!(missing("account-a").is_none());
-        let resolver = connect_resume_background_model_resolver(
+        let (_, missing_background) = missing();
+        assert!(missing_background.is_none());
+        let resolver = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
             fixture.config.clone(),
             fixture.registry.clone(),
             resume.provider_name,
         );
-        // The resume callback remains bound to B even if a caller passes A.
+        // The callback captures the session's B key, not the global A key.
         fixture
-            .verify_resume_background(Arc::new(move || resolver("account-a")))
+            .verify_resume_background(Arc::new(move || resolver().1))
             .await;
     }
 

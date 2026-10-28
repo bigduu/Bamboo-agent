@@ -107,6 +107,17 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Bind a resumed Connect run's live summary/background selection.
+    #[doc(hidden)]
+    pub fn with_resume_auxiliary_resolver(
+        &self,
+        resolver: crate::runtime::config::ResumeAuxiliaryResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.resume_auxiliary_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Bind the Host's Gold route to this execution without changing SDK defaults.
     #[doc(hidden)]
     pub fn with_gold_target_resolver(

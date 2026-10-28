@@ -122,6 +122,37 @@ pub fn live_background_model_resolver(
     })
 }
 
+/// Resolve a Connect resume's summary and background from one live Config
+/// snapshot. Rejected summary roles remain errors; an absent role stays unset.
+#[doc(hidden)]
+pub fn live_resume_auxiliary_resolver(
+    config: Arc<tokio::sync::RwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    provider_name: String,
+) -> crate::runtime::config::ResumeAuxiliaryResolver {
+    Arc::new(move || {
+        if provider_name.is_empty() {
+            return (
+                Err(bamboo_llm::LLMError::Api(
+                    "Connect resume provider is unavailable".into(),
+                )),
+                None,
+            );
+        }
+        let Ok(current) = config.try_read() else {
+            return (
+                Err(bamboo_llm::LLMError::Api(
+                    "Live model configuration is unavailable for Connect resume".into(),
+                )),
+                None,
+            );
+        };
+        let summary = try_resolve_task_summary_model(&current, &provider_name, &registry);
+        let background = resolve_background_model(&current, &provider_name, &registry);
+        (summary, background)
+    })
+}
+
 /// Vision model — **global**. Resolved on demand (only when a request actually
 /// carries an image), so it is not part of [`GlobalAreaModels`]'s eager trio.
 /// Still global-only: takes no session. `provider_name` is the fallback key.

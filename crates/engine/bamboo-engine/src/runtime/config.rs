@@ -45,6 +45,17 @@ pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sy
 pub type BackgroundModelResolver =
     Arc<dyn Fn(&str) -> Option<bamboo_llm::ResolvedModel> + Send + Sync>;
 
+/// The Connect resume's summary and background routes from one Config read.
+#[doc(hidden)]
+pub type ResumeAuxiliarySelection = (
+    Result<Option<bamboo_llm::ResolvedModel>, bamboo_llm::LLMError>,
+    Option<bamboo_llm::ResolvedModel>,
+);
+
+/// Per-execution, live summary/background selection for a resumed Connect run.
+#[doc(hidden)]
+pub type ResumeAuxiliaryResolver = Arc<dyn Fn() -> ResumeAuxiliarySelection + Send + Sync>;
+
 /// One execution's explicitly selected Gold route, installed only by the Host.
 #[doc(hidden)]
 pub type GoldTargetResolver =
@@ -1107,6 +1118,8 @@ pub struct AgentLoopConfig {
         Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
     /// Override only the background pair without changing other resolver semantics.
     pub(crate) background_model_resolver: Option<BackgroundModelResolver>,
+    /// Resolve resume summary and background using the same live snapshot.
+    pub(crate) resume_auxiliary_resolver: Option<ResumeAuxiliaryResolver>,
     /// Optional per-round resolver for the disabled tool/skill sets so they follow
     /// LIVE global config instead of staying frozen for the whole run. Returns the
     /// current `(disabled_tools, disabled_skill_ids)`. When `None`, the snapshotted
@@ -1217,6 +1230,7 @@ impl Default for AgentLoopConfig {
             features_final_evidence_check: false,
             auxiliary_model_resolver: None,
             background_model_resolver: None,
+            resume_auxiliary_resolver: None,
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,
             run_budget: bamboo_config::RunBudgetConfig::default(),
@@ -1251,6 +1265,25 @@ impl AgentLoopConfig {
             models.background_model_name =
                 background.as_ref().map(|model| model.model_name.clone());
             models.background_model_provider = background.map(|model| model.provider);
+        }
+        if let Some(resolve) = &self.resume_auxiliary_resolver {
+            let (summary, background) = resolve();
+            models.background_model_name =
+                background.as_ref().map(|model| model.model_name.clone());
+            models.background_model_provider = background.map(|model| model.provider);
+            match summary {
+                Ok(summary) => {
+                    models.summarization_model_name =
+                        summary.as_ref().map(|model| model.model_name.clone());
+                    models.summarization_model_provider = summary.map(|model| model.provider);
+                    models.summarization_model_error = None;
+                }
+                Err(error) => {
+                    models.summarization_model_name = None;
+                    models.summarization_model_provider = None;
+                    models.summarization_model_error = Some(error.to_string());
+                }
+            }
         }
         models
     }

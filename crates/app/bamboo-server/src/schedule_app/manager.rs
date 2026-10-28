@@ -1298,8 +1298,8 @@ fn resolve_run_config_from_config(
 #[cfg(test)]
 mod build_context_tests {
 
-    // This calls the exact Schedule builder used when a run is started.
-    // The matrix exercises its returned resolver, not a whole scheduled run.
+    // Use the Schedule configuration and background callback builders, then
+    // compose their results for the matrix; this is not a whole scheduled run.
     #[tokio::test]
     async fn scheduled_run_legacy_background_rechecks_managed_admission() {
         let fixture = crate::background_live_consumer_tests::Fixture::new().await;
