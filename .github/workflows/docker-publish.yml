@@ -246,7 +246,7 @@ jobs:
             org.opencontainers.image.revision=${{ needs.release.outputs.source }}
             org.opencontainers.image.version=${{ needs.release.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.platform }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
+          cache-to: ${{ github.event_name == 'workflow_dispatch' && format('type=gha,mode=max,scope={0},ignore-error=true', matrix.platform) || '' }}
           load: true
           push: false
       - name: Verify the packaged executable version and loader
