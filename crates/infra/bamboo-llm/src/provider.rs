@@ -299,6 +299,15 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
+    /// True only for a Host route whose managed registry admitted the target.
+    /// An opaque SDK provider defaults to retaining its original Arc. This
+    /// cannot freeze credentials or other mutable state inside that provider;
+    /// SDK owners must keep those stable or implement the snapshot hook.
+    #[doc(hidden)]
+    fn queue_requires_current_route(&self) -> bool {
+        false
+    }
+
     /// Underlying allocation used for pairing a delayed model and provider.
     /// Transparent decorators should forward this unchanged. This identity
     /// does not establish that dynamic credentials inside a provider are fixed.
@@ -492,19 +501,45 @@ pub fn queued_snapshot_for(provider: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLM
     match provider.queued_provider_snapshot()? {
         Some(inner) => Ok(Arc::new(QueuedBudgetProvider {
             inner,
+            require_current: provider.queue_requires_current_route(),
             original: provider,
         })),
         None => Ok(provider),
     }
 }
 
+/// Mark only a route admitted from a Host-managed registry snapshot.
+/// The original handle and its concurrency identity remain unchanged.
+#[doc(hidden)]
+pub fn mark_host_queued_route(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> {
+    Arc::new(QueuedBudgetProvider {
+        inner: provider.clone(),
+        original: provider,
+        require_current: true,
+    })
+}
+
 struct QueuedBudgetProvider {
     inner: Arc<dyn LLMProvider>,
     original: Arc<dyn LLMProvider>,
+    require_current: bool,
 }
 
 #[async_trait]
 impl LLMProvider for QueuedBudgetProvider {
+    fn queue_requires_current_route(&self) -> bool {
+        self.require_current || self.inner.queue_requires_current_route()
+    }
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(inner) = self.inner.queued_provider_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            inner,
+            original: self.original.clone(),
+            require_current: self.require_current,
+        })))
+    }
     fn queued_route_identity(&self) -> QueuedRouteIdentity {
         queued_identity_for(&self.inner)
     }

@@ -466,6 +466,9 @@ impl Usage {
 
 #[async_trait::async_trait]
 impl LLMProvider for BudgetedProvider {
+    fn queue_requires_current_route(&self) -> bool {
+        self.inner.queue_requires_current_route()
+    }
     fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
         bamboo_llm::provider::queued_identity_for(&self.inner)
     }

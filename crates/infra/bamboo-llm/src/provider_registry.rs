@@ -259,6 +259,14 @@ impl ProviderRegistry {
         target: &bamboo_domain::ProviderModelRef,
     ) -> Result<Arc<dyn LLMProvider>, LLMError> {
         let state = self.state.read().recover_poison();
+        Self::configured_model_in_snapshot(&state, config, target)
+    }
+
+    fn configured_model_in_snapshot(
+        state: &RegistryState,
+        config: &Config,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<Arc<dyn LLMProvider>, LLMError> {
         if let RegistryOrigin::Managed { key, bindings } = &state.origin {
             if config
                 .provider_instances
@@ -276,7 +284,7 @@ impl ProviderRegistry {
                     target.provider
                 ))
             })?;
-            let provider = Self::provider_for_model_in_snapshot(&state, target)?;
+            let provider = Self::provider_for_model_in_snapshot(state, target)?;
             let saved = bindings.get(&target.provider).ok_or_else(stale_binding)?;
             if !bool::from(saved.0.as_slice().ct_eq(current.0.as_slice())) {
                 return Err(stale_binding());
@@ -290,7 +298,22 @@ impl ProviderRegistry {
             }
             return Ok(provider);
         }
-        Self::provider_for_model_in_snapshot(&state, target)
+        Self::provider_for_model_in_snapshot(state, target)
+    }
+
+    /// Return a coherent configured handle and whether its registry generation
+    /// is Host-managed under the same lock. The keyed binding does not retain
+    /// or expose plaintext credentials.
+    #[doc(hidden)]
+    pub fn provider_for_configured_model_with_origin(
+        &self,
+        config: &Config,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<(Arc<dyn LLMProvider>, bool), LLMError> {
+        let state = self.state.read().recover_poison();
+        let managed = matches!(&state.origin, RegistryOrigin::Managed { .. });
+        let provider = Self::configured_model_in_snapshot(&state, config, target)?;
+        Ok((provider, managed))
     }
 
     /// The legacy direct-provider seam is only available to an explicitly
@@ -924,6 +947,49 @@ mod tests {
         assert!(rebuilt
             .provider_for_configured_model(changed, &target)
             .is_ok());
+    }
+
+    #[tokio::test]
+    async fn queue_host_provenance_checks_the_exact_target_in_one_snapshot() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = managed_config();
+        let other = config.provider_instances.get("relay").unwrap().clone();
+        config.provider_instances.insert("other".into(), other);
+        let registry = ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+            .await
+            .unwrap();
+        let target = bamboo_domain::ProviderModelRef::new("relay", "fast");
+        let (selected, managed) = registry
+            .provider_for_configured_model_with_origin(&config, &target)
+            .unwrap();
+        assert!(managed);
+        let sdk = ProviderRegistry::new(
+            HashMap::from([("relay".into(), selected.clone())]),
+            "relay".into(),
+        );
+        let (sdk_selected, sdk_managed) = sdk
+            .provider_for_configured_model_with_origin(&config, &target)
+            .unwrap();
+        assert!(!sdk_managed);
+        assert!(Arc::ptr_eq(&selected, &sdk_selected));
+        {
+            let mut state = registry.state.write().recover_poison();
+            state.providers.remove("relay");
+            // Deliberately reuse A under a different still-bound ID: scanning
+            // all registry handles would incorrectly accept this selection.
+            state.providers.insert("other".into(), selected.clone());
+        }
+        assert!(matches!(
+            registry.provider_for_configured_model_with_origin(&config, &target),
+            Err(LLMError::Auth(_))
+        ));
+        // A previous managed selection remains tagged even if the registry is
+        // subsequently replaced by an SDK registry containing the same Arc.
+        registry.replace_with(sdk);
+        let (_, now_managed) = registry
+            .provider_for_configured_model_with_origin(&config, &target)
+            .unwrap();
+        assert!(managed && !now_managed);
     }
 
     #[tokio::test]

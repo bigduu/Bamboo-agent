@@ -834,9 +834,17 @@ async fn work_budget_and_reasoning_snapshot_share_real_auxiliary_semaphore() {
     let _permit = tokio::time::timeout(Duration::from_secs(2), waiting)
         .await
         .unwrap();
-    snapshot
+    let mut stream = snapshot
         .chat_stream(&[], &[], Some(40), "fixture-model")
         .await
         .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
     assert_eq!(calls.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ledger(&fixture).total_charged,
+        30,
+        "the simulated usage settles at EOF"
+    );
 }

@@ -431,6 +431,17 @@ fn try_resolve_role_ref_chain<'a>(
     provider_registry: &Arc<ProviderRegistry>,
     candidates: impl IntoIterator<Item = Option<&'a bamboo_domain::ProviderModelRef>>,
 ) -> Result<Option<ResolvedModel>, LLMError> {
+    Ok(
+        try_resolve_role_ref_chain_with_origin(config, provider_registry, candidates)?
+            .map(|(model, _)| model),
+    )
+}
+
+fn try_resolve_role_ref_chain_with_origin<'a>(
+    config: &Config,
+    provider_registry: &Arc<ProviderRegistry>,
+    candidates: impl IntoIterator<Item = Option<&'a bamboo_domain::ProviderModelRef>>,
+) -> Result<Option<(ResolvedModel, bool)>, LLMError> {
     // A present-but-invalid reference fails closed. Automatic fallback applies
     // only when a role is unset, never when an explicit provider id is stale.
     let Some(model_ref) = candidates.into_iter().flatten().next() else {
@@ -462,8 +473,12 @@ fn try_resolve_role_ref_chain<'a>(
             )));
         }
     }
-    let provider = provider_registry.provider_for_configured_model(config, model_ref)?;
-    Ok(Some(ResolvedModel::from_ref(provider, model_ref)))
+    let (provider, managed) =
+        provider_registry.provider_for_configured_model_with_origin(config, model_ref)?;
+    Ok(Some((
+        ResolvedModel::from_ref(provider, model_ref),
+        managed,
+    )))
 }
 
 fn try_resolve_legacy_role(
@@ -472,6 +487,18 @@ fn try_resolve_legacy_role(
     provider_registry: &Arc<ProviderRegistry>,
     model: Option<String>,
 ) -> Result<Option<ResolvedModel>, LLMError> {
+    Ok(
+        try_resolve_legacy_role_with_origin(config, provider_name, provider_registry, model)?
+            .map(|(model, _)| model),
+    )
+}
+
+fn try_resolve_legacy_role_with_origin(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+    model: Option<String>,
+) -> Result<Option<(ResolvedModel, bool)>, LLMError> {
     if config
         .provider_instances
         .get(provider_name)
@@ -482,7 +509,7 @@ fn try_resolve_legacy_role(
         )));
     }
     let model_ref = model.map(|model| bamboo_domain::ProviderModelRef::new(provider_name, model));
-    try_resolve_role_ref_chain(config, provider_registry, [model_ref.as_ref()])
+    try_resolve_role_ref_chain_with_origin(config, provider_registry, [model_ref.as_ref()])
 }
 
 /// Resolve the task summarization model for conversation/task compression.
@@ -648,8 +675,15 @@ pub fn resolve_fast_model_for_runner(
         );
     };
 
-    match try_resolve_fast_model(config, provider_name, provider_registry) {
-        Ok(Some(model)) => (Some(model.model_name), Some(model.provider)),
+    match try_resolve_fast_model_with_origin(config, provider_name, provider_registry) {
+        Ok(Some((model, managed))) => {
+            let provider = if managed {
+                bamboo_llm::provider::mark_host_queued_route(model.provider)
+            } else {
+                model.provider
+            };
+            (Some(model.model_name), Some(provider))
+        }
         Ok(None) => (None, None),
         Err(error) => {
             let model_name = config
@@ -694,14 +728,25 @@ pub fn try_resolve_fast_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Result<Option<ResolvedModel>, LLMError> {
+    Ok(
+        try_resolve_fast_model_with_origin(config, provider_name, provider_registry)?
+            .map(|(model, _)| model),
+    )
+}
+
+fn try_resolve_fast_model_with_origin(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<Option<(ResolvedModel, bool)>, LLMError> {
     if let Some(defaults) = config.defaults.as_ref() {
-        return try_resolve_role_ref_chain(
+        return try_resolve_role_ref_chain_with_origin(
             config,
             provider_registry,
             [defaults.fast.as_ref(), Some(&defaults.chat)],
         );
     }
-    try_resolve_legacy_role(
+    try_resolve_legacy_role_with_origin(
         config,
         provider_name,
         provider_registry,

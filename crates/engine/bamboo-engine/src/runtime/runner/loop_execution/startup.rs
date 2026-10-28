@@ -71,6 +71,7 @@ pub(super) struct QueuedEvaluation<R> {
     pub(super) provider: Arc<dyn LLMProvider>,
     pub(super) model_name: String,
     route: bamboo_llm::provider::QueuedRouteIdentity,
+    require_current: bool,
 }
 
 impl<R> QueuedEvaluation<R> {
@@ -82,11 +83,13 @@ impl<R> QueuedEvaluation<R> {
         use bamboo_llm::provider::{queued_identity_for, queued_snapshot_for};
         let provider = queued_snapshot_for(provider).ok()?;
         let route = queued_identity_for(&provider);
+        let require_current = provider.queue_requires_current_route();
         Some(Self {
             request,
             provider,
             model_name,
             route,
+            require_current,
         })
     }
 
@@ -95,11 +98,23 @@ impl<R> QueuedEvaluation<R> {
         provider: Arc<dyn LLMProvider>,
         model_name: &str,
     ) -> Option<Arc<dyn LLMProvider>> {
+        // An opaque SDK provider has no authoritative live registry. Preserve
+        // its captured pair; never replace it with a newly returned provider.
+        if !self.require_current {
+            // An explicit local refusal is never treated as an unset route.
+            if provider.known_pre_dispatch_error().is_some() {
+                return None;
+            }
+            return Some(self.provider.clone());
+        }
         if self.model_name != model_name {
             return None;
         }
         use bamboo_llm::provider::{queued_identity_for, queued_snapshot_for, QueuedRouteIdentity};
         let provider = queued_snapshot_for(provider).ok()?;
+        if !provider.queue_requires_current_route() {
+            return None;
+        }
         let same = match (&self.route, queued_identity_for(&provider)) {
             (QueuedRouteIdentity::Stable(left), QueuedRouteIdentity::Stable(right)) => {
                 Arc::ptr_eq(left, &right)

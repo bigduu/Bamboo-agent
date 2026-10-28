@@ -13122,6 +13122,9 @@ mod tests {
 
         #[async_trait::async_trait]
         impl LLMProvider for CaptureAux {
+            fn queue_requires_current_route(&self) -> bool {
+                true
+            }
             async fn chat_stream(
                 &self,
                 _messages: &[Message],
@@ -13180,6 +13183,9 @@ mod tests {
         }
         #[async_trait::async_trait]
         impl LLMProvider for AliasProvider {
+            fn queue_requires_current_route(&self) -> bool {
+                true
+            }
             fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
                 bamboo_llm::provider::QueuedRouteIdentity::Stable(self.identity.clone())
             }
@@ -13202,6 +13208,34 @@ mod tests {
             ) -> Result<LLMStream, LLMError> {
                 self.inner
                     .chat_stream_with_options(messages, tools, max, model, options)
+                    .await
+            }
+        }
+
+        // Default SDK implementations are deliberately opaque: a new wrapper
+        // per resolution must preserve the pair saved at enqueue.
+        struct SdkOpaque(Arc<dyn LLMProvider>);
+        #[async_trait::async_trait]
+        impl LLMProvider for SdkOpaque {
+            async fn chat_stream(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.0.chat_stream(m, t, n, model).await
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                self.0
+                    .chat_stream_with_options(m, t, n, model, options)
                     .await
             }
         }
@@ -13268,6 +13302,9 @@ mod tests {
             "rewrapped_new_effort",
             "explicit_rejected_then_valid",
             "same_identity_new_provider",
+            "sdk_rewrapped_same_provider",
+            "sdk_rewrapped_other_provider",
+            "sdk_rewrapped_rejected",
         ] {
             let calls: Calls = Arc::new(Mutex::new(Vec::new()));
             let efforts: Efforts = Arc::new(Mutex::new(Vec::new()));
@@ -13307,6 +13344,14 @@ mod tests {
             }
             if scenario == "explicit_rejected_then_valid" {
                 original.fast_model_provider = Some(Arc::new(ExplicitlyRejected));
+            }
+            if matches!(
+                scenario,
+                "sdk_rewrapped_same_provider"
+                    | "sdk_rewrapped_other_provider"
+                    | "sdk_rewrapped_rejected"
+            ) {
+                original.fast_model_provider = Some(Arc::new(SdkOpaque(a.clone())));
             }
             let main: Arc<dyn LLMProvider> = Arc::new(WaitForQueuedCalls(calls.clone()));
             let initial_task_provider = original
@@ -13464,6 +13509,18 @@ mod tests {
                 "same_model_new_provider" => {
                     current.lock().unwrap().fast_model_provider = Some(b.clone());
                 }
+                "sdk_rewrapped_same_provider" | "sdk_rewrapped_other_provider" => {
+                    let inner = if scenario == "sdk_rewrapped_same_provider" {
+                        a.clone()
+                    } else {
+                        b.clone()
+                    };
+                    current.lock().unwrap().fast_model_provider = Some(Arc::new(SdkOpaque(inner)));
+                }
+                "sdk_rewrapped_rejected" => {
+                    current.lock().unwrap().fast_model_provider =
+                        Some(Arc::new(ExplicitlyRejected));
+                }
                 "same_identity_new_provider" => {
                     current.lock().unwrap().fast_model_provider = Some(alias_b.clone());
                 }
@@ -13520,7 +13577,9 @@ mod tests {
                 "unchanged"
                 | "rewrapped_same_effort"
                 | "rewrapped_new_effort"
-                | "same_identity_new_provider" => pair("fast-a", "model-a"),
+                | "same_identity_new_provider"
+                | "sdk_rewrapped_same_provider"
+                | "sdk_rewrapped_other_provider" => pair("fast-a", "model-a"),
                 "name_only" => pair("main", "model-a"),
                 "provider_only" => pair("fast-a", "main-model"),
                 "unset" => pair("main", "main-model"),
@@ -15116,6 +15175,331 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(main.calls.load(Ordering::SeqCst), 1);
         assert_eq!(session.model, "actual-model");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn managed_fast_queue_never_crosses_provider_or_model_after_refresh() {
+        use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_llm::{Config, LLMRequestOptions, ProviderRegistry};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct Foreground(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LLMProvider for Foreground {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                // Keep the real loop open while queued tasks complete.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                if options
+                    .and_then(|o| o.request_purpose.as_deref())
+                    .is_some_and(|p| p == "task_evaluation" || p == "gold_evaluation")
+                {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    return Err(LLMError::Auth("unexpected main fallback".into()));
+                }
+                self.chat_stream(m, t, n, model).await
+            }
+        }
+
+        for scenario in ["unchanged", "switch", "disabled", "revoked", "removed"] {
+            let a = MockServer::start().await;
+            let b = MockServer::start().await;
+            for server in [&a, &b] {
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string("data: [DONE]\n\n"),
+                    )
+                    .mount(server)
+                    .await;
+            }
+            let data = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            cfg.provider = "fast-a".into();
+            cfg.default_provider_instance = Some("fast-a".into());
+            cfg.http_proxy = "http://127.0.0.1:9".into();
+            cfg.https_proxy.clear();
+            cfg.proxy_auth = None;
+            cfg.defaults = Some(
+                serde_json::from_value(json!({
+                    "chat": {"provider": "fast-a", "model": "model-a"},
+                    "fast": {"provider": "fast-a", "model": "model-a"}
+                }))
+                .unwrap(),
+            );
+            for (id, model, endpoint) in [
+                ("fast-a", "model-a", a.uri()),
+                ("fast-b", "model-b", b.uri()),
+            ] {
+                cfg.provider_instances.insert(
+                    id.into(),
+                    serde_json::from_value(json!({
+                        "provider_type": "openai", "enabled": true,
+                        "api_key": "synthetic-only", "base_url": endpoint,
+                        "model": model, "runtime_models": [model]
+                    }))
+                    .unwrap(),
+                );
+            }
+            let registry = Arc::new(
+                ProviderRegistry::from_config(&cfg, data.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let current = Arc::new(Mutex::new(cfg));
+            let resolver_config = current.clone();
+            let resolver_registry = registry.clone();
+            let resolver = Arc::new(move || {
+                let config = resolver_config.lock().unwrap();
+                let (fast_model_name, fast_model_provider) =
+                    crate::model_config_helper::resolve_fast_model_for_runner(
+                        Some(&config),
+                        "fast-a",
+                        &resolver_registry,
+                    );
+                AuxiliaryModelConfig {
+                    fast_model_name,
+                    fast_model_provider,
+                    ..Default::default()
+                }
+            });
+            let original = resolver();
+            let fast_a = original.fast_model_provider.as_ref().unwrap().clone();
+            assert!(
+                fast_a.queue_requires_current_route(),
+                "a managed Host route must be marked"
+            );
+            let config = AgentLoopConfig {
+                model_name: Some("main-model".into()),
+                system_prompt: Some("synthetic system".into()),
+                gold_config: Some(GoldConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                auxiliary_model_resolver: Some(resolver),
+                prompt_memory_flags: PromptMemoryFlags {
+                    project_prompt_injection: false,
+                    relevant_recall: false,
+                    relevant_recall_rerank: false,
+                    project_first_dream: false,
+                    ledger_agenda: false,
+                },
+                ..Default::default()
+            };
+            let mut session = Session::new("managed-queue", "main-model");
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "main-model".into();
+            state.auxiliary_models = original;
+            let _drop_flag = seed_blocked_task_evaluation(&mut session, &mut state);
+            let existing = state.task_evaluation.in_flight.take().unwrap();
+            existing.join_handle.abort();
+            let _ = existing.join_handle.await;
+            state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
+                request: existing.request,
+                metrics_started: Arc::new(AtomicBool::new(false)),
+                metrics_terminal: Arc::new(AtomicBool::new(false)),
+                join_handle: tokio::spawn(async { None }),
+            });
+            state.task_evaluation.queued_request = None;
+            state.task_context.as_mut().unwrap().task_list_dirty = true;
+            let previous_gold =
+                crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+                    &state.task_context,
+                    &session,
+                    &session.id,
+                    1,
+                    Some("model-a"),
+                    None,
+                    GoldCheckpoint::PostRound,
+                    config.gold_config.as_ref().unwrap(),
+                    crate::runtime::stream::handler::StreamTimeoutContext::default(),
+                )
+                .unwrap()
+                .unwrap();
+            state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+                request: previous_gold,
+                join_handle: tokio::spawn(async { None }),
+            });
+            let (tx, _rx) = mpsc::channel(128);
+            super::spawn_task_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                fast_a.clone(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            super::spawn_gold_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                fast_a,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert!(state.task_evaluation.queued_request.is_some());
+            assert!(state.gold_evaluation.queued_request.is_some());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !state
+                    .task_evaluation
+                    .in_flight
+                    .as_ref()
+                    .unwrap()
+                    .join_handle
+                    .is_finished()
+                    || !state
+                        .gold_evaluation
+                        .in_flight
+                        .as_ref()
+                        .unwrap()
+                        .join_handle
+                        .is_finished()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let mut cfg = current.lock().unwrap();
+                match scenario {
+                    "switch" => {
+                        cfg.defaults.as_mut().unwrap().fast =
+                            Some(bamboo_domain::ProviderModelRef::new("fast-b", "model-b"))
+                    }
+                    "disabled" => cfg.provider_instances.get_mut("fast-a").unwrap().enabled = false,
+                    "revoked" => {
+                        cfg.provider_instances
+                            .get_mut("fast-a")
+                            .unwrap()
+                            .extra
+                            .insert("runtime_models".into(), json!([]));
+                    }
+                    "removed" => {
+                        cfg.provider_instances.remove("fast-a");
+                    }
+                    _ => {}
+                }
+            }
+            let main_calls = Arc::new(AtomicUsize::new(0));
+            let main: Arc<dyn LLMProvider> = Arc::new(Foreground(main_calls.clone()));
+            super::run_pipeline(
+                &mut session,
+                &tx,
+                main,
+                Arc::new(AlwaysOkExecutor),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .expect("foreground pipeline should complete");
+            let requests_a = a.received_requests().await.unwrap();
+            let requests_b = b.received_requests().await.unwrap();
+            assert_eq!(
+                main_calls.load(Ordering::SeqCst),
+                0,
+                "no fallback to the main account for {scenario}"
+            );
+            assert!(
+                requests_b.is_empty(),
+                "never send A's queued model to B for {scenario}"
+            );
+            let expected_a = if scenario == "unchanged" { 2 } else { 0 };
+            assert_eq!(
+                requests_a.len(),
+                expected_a,
+                "unexpected A dispatch for {scenario}"
+            );
+            for request in &requests_a {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"],
+                    "model-a"
+                );
+            }
+            if scenario == "switch" {
+                assert!(state.task_evaluation.in_flight.is_none());
+                assert!(state.gold_evaluation.in_flight.is_none());
+                let fast_b = state
+                    .auxiliary_models
+                    .fast_model_provider
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                assert!(fast_b.queue_requires_current_route());
+                state.task_context.as_mut().unwrap().task_list_dirty = true;
+                super::spawn_task_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    fast_b.clone(),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                super::spawn_gold_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    fast_b,
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if b.received_requests().await.unwrap().len() >= 2 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("new work should use the admitted B route");
+                let later = b.received_requests().await.unwrap();
+                assert_eq!(later.len(), 2);
+                for request in &later {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()
+                            ["model"],
+                        "model-b"
+                    );
+                }
+                assert!(a.received_requests().await.unwrap().is_empty());
+            }
+        }
     }
 }
 

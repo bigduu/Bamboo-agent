@@ -72,6 +72,9 @@ impl RoleReasoningProvider {
 
 #[async_trait]
 impl LLMProvider for RoleReasoningProvider {
+    fn queue_requires_current_route(&self) -> bool {
+        self.inner.queue_requires_current_route()
+    }
     fn queued_route_identity(&self) -> crate::provider::QueuedRouteIdentity {
         crate::provider::queued_identity_for(&self.inner)
     }

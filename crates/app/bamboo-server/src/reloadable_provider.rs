@@ -427,10 +427,11 @@ mod tests {
             queued_identity_for(&replaced)
         ));
         // A frozen dispatch handle cannot retarget to B after it was resolved.
-        unchanged
+        let mut stream = unchanged
             .chat_stream(&[], &[], None, "synthetic")
             .await
             .unwrap();
+        assert!(futures::StreamExt::next(&mut stream).await.is_none());
         assert_eq!(a_calls.load(Ordering::SeqCst), 1);
         assert_eq!(b_calls.load(Ordering::SeqCst), 0);
 
@@ -492,7 +493,8 @@ mod tests {
             let _permit = tokio::time::timeout(Duration::from_secs(2), waiting)
                 .await
                 .unwrap();
-            pinned.chat_stream(&[], &[], None, &model).await.unwrap();
+            let mut stream = pinned.chat_stream(&[], &[], None, &model).await.unwrap();
+            assert!(futures::StreamExt::next(&mut stream).await.is_none());
             assert_eq!(calls.load(Ordering::SeqCst), index + 1);
         }
         // Different outer wrappers over one lock keep their existing distinct
