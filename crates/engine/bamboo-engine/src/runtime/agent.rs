@@ -10,6 +10,67 @@ use bamboo_agent_core::Session;
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
 use bamboo_domain::RuntimeSessionPersistence;
 
+// An inherited policy may decline the supplied delegate, but an opaque new
+// wrapper/provider cannot prove it still represents the managed selected route.
+// Refuse only this Gold selection instead of dropping the inherited policy.
+struct ChildGoldPolicyRefusal {
+    dispatched: std::sync::atomic::AtomicBool,
+}
+
+impl ChildGoldPolicyRefusal {
+    fn error() -> bamboo_llm::LLMError {
+        bamboo_llm::LLMError::Api(
+            "Existing Gold policy returned an unverified provider for managed child resume".into(),
+        )
+    }
+}
+
+#[async_trait::async_trait]
+impl bamboo_llm::LLMProvider for ChildGoldPolicyRefusal {
+    fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+        Some(Self::error())
+    }
+    fn queue_requires_current_route(&self) -> bool {
+        // Keep the default unique queue identity. A prior allowed queued Gold
+        // request must not compare equal when the current policy now refuses.
+        true
+    }
+    fn local_dispatch_refused(&self) -> bool {
+        self.dispatched.load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn chat_stream(
+        &self,
+        _: &[bamboo_agent_core::Message],
+        _: &[bamboo_agent_core::ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        self.dispatched
+            .store(true, std::sync::atomic::Ordering::Release);
+        Err(Self::error())
+    }
+}
+
+pub(crate) fn compose_child_gold_policy(
+    inherited: Option<crate::runtime::config::GoldTargetResolver>,
+    managed: crate::runtime::config::GoldTargetResolver,
+) -> crate::runtime::config::GoldTargetResolver {
+    let Some(inherited) = inherited else {
+        return managed;
+    };
+    Arc::new(move |model, delegate| {
+        // `delegate` was already fixed to the selected provider after the
+        // optional Work decoration by bind_child_gold_delegate.
+        let result = inherited(model, delegate.clone());
+        if !Arc::ptr_eq(&result, &delegate) {
+            return Arc::new(ChildGoldPolicyRefusal {
+                dispatched: std::sync::atomic::AtomicBool::new(false),
+            }) as Arc<dyn bamboo_llm::LLMProvider>;
+        }
+        managed(model, delegate)
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Agent — stable public object
 // ---------------------------------------------------------------------------
@@ -146,6 +207,23 @@ impl Agent {
     ) -> Self {
         let mut runtime = (*self.runtime).clone();
         runtime.gold_target_resolver = Some(resolver);
+        runtime.child_resume_gold_selected = None;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    // Only managed child resume opts into an exact selected-main check. SDK
+    // and other Host resolvers retain their existing delegate behavior.
+    pub(crate) fn with_child_resume_gold_target_resolver(
+        &self,
+        selected: Arc<dyn bamboo_llm::LLMProvider>,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(compose_child_gold_policy(
+            runtime.gold_target_resolver.take(),
+            resolver,
+        ));
+        runtime.child_resume_gold_selected = Some(selected);
         Self::from_runtime(Arc::new(runtime))
     }
 
@@ -1013,3 +1091,7 @@ mod auxiliary_factory_isolation_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "child_resume_gold_policy_tests.rs"]
+mod child_resume_gold_policy_tests;

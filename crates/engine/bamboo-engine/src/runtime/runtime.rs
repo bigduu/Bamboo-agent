@@ -97,6 +97,36 @@ mod auxiliary_resolver_factory_tests {
     }
 }
 
+// Preserve the exact managed child-resume route through the optional Work
+// decorator. `main` is the undecorated override and `decorated_main` was built
+// from it by execute_bound. Do not trust a later resolver caller to supply the
+// matching delegate, and do not silently downgrade an invariant violation.
+pub(crate) fn bind_child_gold_delegate(
+    config: &mut AgentLoopConfig,
+    selected: Option<&Arc<dyn LLMProvider>>,
+    main: &Arc<dyn LLMProvider>,
+    decorated_main: &Arc<dyn LLMProvider>,
+) -> crate::runtime::runner::Result<()> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    if !Arc::ptr_eq(selected, main) {
+        return Err(bamboo_agent_core::AgentError::LLM(
+            "Managed child-resume provider differs from its selected route".into(),
+        ));
+    }
+    let resolve = config.gold_target_resolver.take().ok_or_else(|| {
+        bamboo_agent_core::AgentError::LLM(
+            "Managed child-resume Gold route is missing its guard".into(),
+        )
+    })?;
+    let delegate = decorated_main.clone();
+    config.gold_target_resolver = Some(Arc::new(move |model, _untrusted_delegate| {
+        resolve(model, delegate.clone())
+    }));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // AgentRuntime — shared resources (assembled once)
 // ---------------------------------------------------------------------------
@@ -118,6 +148,8 @@ pub struct AgentRuntime {
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
     pub(crate) gold_target_resolver: Option<crate::runtime::config::GoldTargetResolver>,
+    // Private to managed child resume; never inferred from a registry name.
+    pub(crate) child_resume_gold_selected: Option<Arc<dyn LLMProvider>>,
     pub(crate) background_model_resolver: Option<crate::runtime::config::BackgroundModelResolver>,
     pub(crate) auxiliary_model_resolver_factory: Option<AuxiliaryModelResolverFactory>,
     pub(crate) resume_auxiliary_resolver: Option<crate::runtime::config::ResumeAuxiliaryResolver>,
@@ -319,6 +351,7 @@ impl AgentRuntimeBuilder {
             session_inbox: self.session_inbox,
             live_bootstrap_host: None,
             gold_target_resolver: None,
+            child_resume_gold_selected: None,
             background_model_resolver: None,
             auxiliary_model_resolver_factory: None,
             resume_auxiliary_resolver: None,
@@ -1198,10 +1231,17 @@ impl AgentRuntime {
         };
 
         drop(config);
+        let undecorated_main = llm.clone();
         let llm = match ticket_token_budget {
             Some(budget) => budget.decorate(&mut loop_config, llm),
             None => llm,
         };
+        bind_child_gold_delegate(
+            &mut loop_config,
+            self.child_resume_gold_selected.as_ref(),
+            &undecorated_main,
+            &llm,
+        )?;
         #[cfg(test)]
         crate::runtime::tests::observe_untrusted_inputs(
             &session.id,

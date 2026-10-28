@@ -468,3 +468,50 @@ async fn routing_contract_gold_terminal_reads_live_fast_and_preserves_unverified
         crate::runtime::goal_state::GoalRuntimeStatus::NeedInput
     );
 }
+
+#[test]
+fn child_gold_policy_denial_drops_previously_allowed_queued_target() {
+    use crate::runtime::agent::compose_child_gold_policy;
+    use crate::runtime::config::GoldTargetResolver;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let context = RoutingContext::new(None);
+    let selected: Arc<dyn LLMProvider> = context.providers["chat-a"].clone();
+    let other: Arc<dyn LLMProvider> = context.providers["fast-b"].clone();
+    let allowed = Arc::new(AtomicBool::new(true));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let state = allowed.clone();
+    let calls = checks.clone();
+    let replacement = other.clone();
+    let inherited: GoldTargetResolver = Arc::new(move |_, delegate| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        if state.load(Ordering::SeqCst) {
+            delegate
+        } else {
+            replacement.clone()
+        }
+    });
+    let managed: GoldTargetResolver =
+        Arc::new(|_, delegate| bamboo_llm::provider::mark_host_queued_route(delegate));
+    let resolver = compose_child_gold_policy(Some(inherited), managed);
+    let config = AgentLoopConfig {
+        gold_config: Some(GoldConfig {
+            enabled: true,
+            model_name: None,
+            ..Default::default()
+        }),
+        gold_target_resolver: Some(resolver.clone()),
+        ..Default::default()
+    };
+    // No explicit Gold model keeps the Fast path and does not invoke policy.
+    let fast = select_gold_evaluation_provider(&config, &selected, Some(&other));
+    assert!(Arc::ptr_eq(&fast, &other));
+    assert_eq!(checks.load(Ordering::SeqCst), 0);
+    let initial = resolver("gold", selected.clone());
+    assert!(initial.queue_requires_current_route());
+    let queued = QueuedEvaluation::new((), initial, "gold".into()).unwrap();
+    allowed.store(false, Ordering::SeqCst);
+    let current = resolver("gold", selected);
+    assert!(current.known_pre_dispatch_error().is_some());
+    assert!(queued.current_provider(current, "gold").is_none());
+    context.assert_no_requests();
+}

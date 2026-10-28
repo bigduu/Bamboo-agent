@@ -434,6 +434,28 @@ fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<
     }
 }
 
+// Bind the explicit Gold model to the account selected in this very resume.
+// None means the same selection snapshot was embedder-managed; do not install
+// a Host policy in that case. An incomplete managed proof is still Some and
+// is rejected by the guard, never treated as an unmanaged selection.
+fn make_child_resume_gold_resolver(
+    config: Arc<RwLock<Config>>,
+    provider_name: String,
+    expected: Arc<dyn bamboo_llm::LLMProvider>,
+    origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+) -> Option<crate::runtime::config::GoldTargetResolver> {
+    let origin = origin?;
+    Some(Arc::new(move |model, delegate| {
+        bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            config.clone(),
+            origin.clone(),
+            bamboo_domain::ProviderModelRef::new(provider_name.as_str(), model),
+            expected.clone(),
+            delegate,
+        )
+    }))
+}
+
 fn make_resume_auxiliary_model_resolver(
     config_handle: Arc<RwLock<Config>>,
     _config_snapshot: Config,
@@ -2085,11 +2107,11 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 return;
             }
         };
-        let provider_override = if let Some(mut model_ref) = session_model_ref {
+        let (selected_provider, managed_origin) = if let Some(mut model_ref) = session_model_ref {
             model_ref.provider = resolved_provider_name.clone();
             persist_model_ref(&mut session, &model_ref);
-            match self.provider_router.route(&model_ref) {
-                Ok(provider) => Some(provider),
+            match self.provider_router.route_with_origin(&model_ref) {
+                Ok(selection) => selection,
                 Err(error) => {
                     tracing::error!(
                         session_id = %session_id,
@@ -2103,8 +2125,11 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 }
             }
         } else {
-            match self.provider_registry.get(&resolved_provider_name) {
-                Some(provider) => Some(provider),
+            match self
+                .provider_registry
+                .get_with_origin(&resolved_provider_name)
+            {
+                Some(selection) => selection,
                 None => {
                     tracing::error!(
                         session_id = %session_id,
@@ -2115,6 +2140,17 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                     return;
                 }
             }
+        };
+        let agent = match make_child_resume_gold_resolver(
+            self.config.clone(),
+            resolved_provider_name.clone(),
+            selected_provider.clone(),
+            managed_origin,
+        ) {
+            Some(resolver) => Arc::new(
+                agent.with_child_resume_gold_target_resolver(selected_provider.clone(), resolver),
+            ),
+            None => agent,
         };
         let resolved_fast_provider = resolve_fast_model(
             &config_snapshot,
@@ -2182,7 +2218,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             session,
             execution_reservation,
             tools_override: Some(root_tools),
-            provider_override,
+            provider_override: Some(selected_provider),
             model_roster,
             reasoning_effort,
             reasoning_effort_source,
@@ -4150,6 +4186,7 @@ impl ChildCompletionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("child_completion_gold_origin_tests.rs");
     include!("child_completion_background_tests.rs");
     include!("child_completion_exec_tests.rs");
     use bamboo_domain::session::runtime_state::SuspensionState;

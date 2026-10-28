@@ -2696,3 +2696,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "provider_registry_child_gold_tests.rs"]
+mod provider_registry_child_gold_tests;
