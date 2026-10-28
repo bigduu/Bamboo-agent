@@ -617,6 +617,7 @@ mod provider_selection_tests {
     struct GoldOverrideContext {
         inner: Arc<crate::app_context::model_routing_test_support::RoutingContext>,
         routes: Mutex<Vec<(String, String)>>,
+        require_unlocked_config: bool,
     }
 
     #[async_trait::async_trait]
@@ -670,6 +671,12 @@ mod provider_selection_tests {
             &self,
             target: &bamboo_domain::ProviderModelRef,
         ) -> Option<Arc<dyn LLMProvider>> {
+            if self.require_unlocked_config {
+                assert!(
+                    self.inner.config.try_write().is_ok(),
+                    "SDK callback must not hold config read lock"
+                );
+            }
             self.routes
                 .lock()
                 .unwrap()
@@ -699,6 +706,7 @@ mod provider_selection_tests {
         let context = GoldOverrideContext {
             inner: state.clone(),
             routes: Mutex::new(Vec::new()),
+            require_unlocked_config: false,
         };
         let session = synthetic_pending_gold_session();
         let gold = explicit_gold_config();
@@ -802,6 +810,218 @@ mod provider_selection_tests {
             assert!(state.requests("chat-a").is_empty());
             assert!(state.requests("memory-c").is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn routing_contract_gold_sdk_override_can_write_config_without_deadlock() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        let state = RoutingContext::new(Some(false));
+        state.registry.remove("chat-a");
+        let context = GoldOverrideContext {
+            inner: state.clone(),
+            routes: Mutex::new(Vec::new()),
+            require_unlocked_config: true,
+        };
+        let session = synthetic_pending_gold_session();
+        let gold = explicit_gold_config();
+        let evaluation =
+            super::evaluate_gold_state_for_pending_question(&context, &session.id, &session, &gold)
+                .await
+                .unwrap();
+        super::evaluate_gold_auto_answer_question(
+            &context,
+            &session.id,
+            &session,
+            &gold,
+            &evaluation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(context.routes.lock().unwrap().len(), 2);
+        assert_eq!(
+            state.requests("memory-c"),
+            vec![
+                ("explicit-gold".into(), "gold_evaluation".into()),
+                ("explicit-gold".into(), "gold_auto_answer".into()),
+            ]
+        );
+        assert!(state.requests("chat-a").is_empty());
+        assert!(state.requests("fast-b").is_empty());
+    }
+
+    async fn managed_gold_mock() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let args = serde_json::json!({
+            "decision": "continue", "confidence": "high",
+            "reasoning": "synthetic managed Gold", "missing_information": [],
+            "next_action": "Continue the synthetic task"
+        })
+        .to_string();
+        let frame = serde_json::json!({
+            "id": "synthetic", "object": "chat.completion.chunk", "created": 0,
+            "model": "fixture", "choices": [{"index": 0, "delta": {"tool_calls": [{
+                "index": 0, "id": "synthetic-gold", "type": "function",
+                "function": {"name": "report_gold_evaluation", "arguments": args}
+            }]}, "finish_reason": null}]
+        });
+        let sse = format!("data: {frame}\n\ndata: [DONE]\n\n");
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    #[tokio::test]
+    async fn routing_contract_gold_managed_stale_account_stops_both_consumers() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        let mut observations = Vec::new();
+        for flag in [None, Some(false), Some(true)] {
+            for change in ["disabled", "removed", "revoked"] {
+                let chat = managed_gold_mock().await;
+                let fast = managed_gold_mock().await;
+                let memory = managed_gold_mock().await;
+                let state = RoutingContext::new(flag);
+                let snapshot = {
+                    let mut config = state.config.write().await;
+                    config.http_proxy = "https://127.0.0.1:9".into();
+                    config.https_proxy.clear();
+                    config.proxy_auth = None;
+                    for (id, server) in
+                        [("chat-a", &chat), ("fast-b", &fast), ("memory-c", &memory)]
+                    {
+                        let instance = config.provider_instances.get_mut(id).unwrap();
+                        instance.api_key = "fixture-only-not-a-credential".into();
+                        instance.base_url = Some(server.uri());
+                    }
+                    config.clone()
+                };
+                let root = tempfile::tempdir().unwrap();
+                let managed =
+                    bamboo_llm::ProviderRegistry::from_config(&snapshot, root.path().to_path_buf())
+                        .await
+                        .unwrap();
+                state.registry.replace_with(managed);
+                let old_handle = state.registry.get("chat-a").unwrap();
+                let session = synthetic_pending_gold_session();
+                let gold = explicit_gold_config();
+                let evaluation = super::evaluate_gold_state_for_pending_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &gold,
+                )
+                .await
+                .expect("managed Gold state must succeed before invalidation");
+                assert_eq!(evaluation.confidence, GoldConfidence::High);
+                assert_eq!(evaluation.reasoning, "synthetic managed Gold");
+                let requests = chat.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1);
+                let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+                assert_eq!(body["model"], "explicit-gold");
+                assert!(fast.received_requests().await.unwrap().is_empty());
+                assert!(memory.received_requests().await.unwrap().is_empty());
+
+                make_gold_target_stale(&state, change).await;
+                assert!(Arc::ptr_eq(
+                    &old_handle,
+                    &state.registry.get("chat-a").unwrap()
+                ));
+                let rejected_state = super::evaluate_gold_state_for_pending_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &gold,
+                )
+                .await
+                .is_err();
+                let after_state = chat.received_requests().await.unwrap().len();
+                let rejected_answer = super::evaluate_gold_auto_answer_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &gold,
+                    &evaluation,
+                )
+                .await
+                .is_err();
+                let after_answer = chat.received_requests().await.unwrap().len();
+                observations.push((
+                    flag,
+                    change,
+                    rejected_state,
+                    rejected_answer,
+                    after_state,
+                    after_answer,
+                    fast.received_requests().await.unwrap().len(),
+                    memory.received_requests().await.unwrap().len(),
+                ));
+            }
+        }
+        assert_eq!(observations.len(), 9);
+        assert!(
+            observations.iter().all(
+                |(_, _, state, answer, after_state, after_answer, fast, memory)| *state
+                    && *answer
+                    && *after_state == 1
+                    && *after_answer == 1
+                    && *fast == 0
+                    && *memory == 0
+            ),
+            "stale managed Gold must not dispatch: {observations:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_contract_gold_managed_empty_registry_never_uses_old_direct_provider() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        let state = RoutingContext::new(None);
+        let mut built = bamboo_config::Config::default();
+        built.provider = "disabled".into();
+        built.provider_instances.insert(
+            "disabled".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": false
+            }))
+            .unwrap(),
+        );
+        let root = tempfile::tempdir().unwrap();
+        let managed = bamboo_llm::ProviderRegistry::from_config(&built, root.path().to_path_buf())
+            .await
+            .unwrap();
+        assert!(managed.is_empty());
+        state.registry.replace_with(managed);
+        {
+            let mut config = state.config.write().await;
+            config.defaults = None;
+            config.provider_instances.clear();
+            config.default_provider_instance = None;
+            config.provider = "disabled".into();
+        }
+        let mut session = synthetic_pending_gold_session();
+        session.model_ref = None;
+        assert!(
+            crate::session_app::provider_model::session_effective_model_ref(&session).is_none()
+        );
+        let result = super::evaluate_gold_state_for_pending_question(
+            state.as_ref(),
+            &session.id,
+            &session,
+            &explicit_gold_config(),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "empty managed registry must reject the old direct handle"
+        );
+        state.assert_no_requests();
     }
 
     #[derive(Default)]
