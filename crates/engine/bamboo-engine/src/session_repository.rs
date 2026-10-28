@@ -859,6 +859,28 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn checkpoint_live_bootstrap(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        gate: bamboo_domain::AdmissionGate,
+    ) -> std::io::Result<bamboo_domain::LiveBootstrapProof> {
+        self.persistence
+            .checkpoint_live_bootstrap(session, inbox, gate)
+            .await
+    }
+
+    async fn confirm_live_bootstrap(
+        &self,
+        proof: &bamboo_domain::LiveBootstrapProof,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        self.persistence
+            .confirm_live_bootstrap(proof, inbox, publish)
+            .await
+    }
+
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         // The execute-boundary checkpoint uses LockedSessionStore's atomic
         // append-safe transcript merge, then publishes that reconciled snapshot

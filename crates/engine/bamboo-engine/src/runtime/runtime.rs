@@ -54,6 +54,7 @@ pub struct AgentRuntime {
     pub(crate) workspace_execution_host:
         Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
+    pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
     pub attachment_reader: Arc<dyn AttachmentReader>,
@@ -250,6 +251,7 @@ impl AgentRuntimeBuilder {
                 .persistence
                 .ok_or_else(|| format_missing("persistence"))?,
             session_inbox: self.session_inbox,
+            live_bootstrap_host: None,
             activation_router: self.activation_router,
             session_messenger: self.session_messenger,
             attachment_reader: self
@@ -789,11 +791,38 @@ impl AgentRuntime {
         self.execute_with_inputs(session, req, None).await
     }
 
+    /// Select an initial-request retry policy for this execution only.
+    pub async fn execute_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
+        self.execute_with_inputs_and_upstream_retry(session, req, None, upstream_retry)
+            .await
+    }
+
     pub(crate) async fn execute_with_inputs(
         &self,
         session: &mut Session,
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
+        self.execute_with_inputs_and_upstream_retry(
+            session,
+            req,
+            inputs,
+            bamboo_llm::retry::UpstreamRetry::Bounded,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_with_inputs_and_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
     ) -> crate::runtime::runner::Result<()> {
         struct WorkspaceFinish(Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>);
         impl Drop for WorkspaceFinish {
@@ -852,9 +881,12 @@ impl AgentRuntime {
                     .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
             }
             runtime.inherited_child_wait_captured = true;
-            return runtime.execute_bound(session, req, inputs).await;
+            return runtime
+                .execute_bound(session, req, inputs, upstream_retry)
+                .await;
         }
-        self.execute_bound(session, req, inputs).await
+        self.execute_bound(session, req, inputs, upstream_retry)
+            .await
     }
 
     async fn execute_bound(
@@ -862,6 +894,7 @@ impl AgentRuntime {
         session: &mut Session,
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
     ) -> crate::runtime::runner::Result<()> {
         if self.persistence.root_actor_execution_required(session) {
             return Err(bamboo_agent_core::AgentError::Tool(
@@ -987,6 +1020,7 @@ impl AgentRuntime {
             storage: Some(self.storage.clone()),
             persistence: Some(self.persistence.clone()),
             session_inbox: self.session_inbox.clone(),
+            live_bootstrap_host: self.live_bootstrap_host.clone(),
             session_activation_notifications,
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
@@ -1081,6 +1115,7 @@ impl AgentRuntime {
             counted_loop,
             loop_control,
             stream_timeout: config.stream_timeout,
+            upstream_retry,
             ..Default::default()
         };
 

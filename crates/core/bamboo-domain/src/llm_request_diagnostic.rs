@@ -18,6 +18,7 @@ pub enum LlmRequestStopReason {
     AttemptsExhausted,
     TimeBudgetExhausted,
     RetryDelayExceedsBudget,
+    RetryDelayTooLarge,
     NonRetryableTransport,
     UnclassifiedErrorBody,
     CancelledOrDropped,
@@ -31,6 +32,7 @@ impl LlmRequestStopReason {
             Self::RetryDelayExceedsBudget => {
                 "Required retry delay exceeds the remaining time budget"
             }
+            Self::RetryDelayTooLarge => "Required retry delay is too large to schedule safely",
             Self::NonRetryableTransport => "Transport failure is not automatically retryable",
             Self::UnclassifiedErrorBody => "Upstream error response could not be safely classified",
             Self::CancelledOrDropped => "Request cancelled or its caller stopped waiting",
@@ -52,16 +54,18 @@ struct InitialRequestDiagnosticFields {
     session_hash: Option<String>,
     run_id: Option<Uuid>,
     attempt: u32,
-    attempt_limit: u32,
+    attempt_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_mode: Option<String>,
     event: String,
     phase: String,
     failure: String,
     status: Option<u16>,
     attempt_timeout_ms: u64,
-    total_budget_ms: u64,
+    total_budget_ms: Option<u64>,
     attempt_elapsed_ms: u64,
     total_elapsed_ms: u64,
-    remaining_budget_ms: u64,
+    remaining_budget_ms: Option<u64>,
     retry_delay_ms: Option<u64>,
     stop_reason: LlmRequestStopReason,
     upstream_outcome: String,
@@ -229,14 +233,35 @@ impl InitialRequestDiagnosticFields {
             && self.request_id == self.diagnostic_id
             && self.error_id == Some(self.diagnostic_id)
             && self.session_hash.as_deref().is_some_and(valid_session_hash)
-            && (1..=4).contains(&self.attempt_limit)
-            && self.attempt <= self.attempt_limit
+            && match self.retry_mode.as_deref() {
+                None => {
+                    self.attempt_limit
+                        .is_some_and(|limit| limit > 0 && self.attempt <= limit)
+                        && self
+                            .total_budget_ms
+                            .is_some_and(|budget| budget <= 3_600_000)
+                        && self
+                            .remaining_budget_ms
+                            .zip(self.total_budget_ms)
+                            .is_some_and(|(remaining, total)| remaining <= total)
+                }
+                Some("until_cancelled") => {
+                    self.attempt_limit.is_none()
+                        && self.total_budget_ms.is_none()
+                        && self.remaining_budget_ms.is_none()
+                        && !matches!(
+                            self.stop_reason,
+                            LlmRequestStopReason::AttemptsExhausted
+                                | LlmRequestStopReason::TimeBudgetExhausted
+                                | LlmRequestStopReason::RetryDelayExceedsBudget
+                        )
+                }
+                _ => false,
+            }
             && self
                 .status
                 .is_none_or(|status| (100..=599).contains(&status))
             && self.attempt_timeout_ms <= 60_000
-            && self.total_budget_ms <= 60_000
-            && self.remaining_budget_ms <= self.total_budget_ms
             && ["send_headers", "error_body", "response_status", "backoff"]
                 .contains(&self.phase.as_str())
             && ["unknown", "response_received"].contains(&self.upstream_outcome.as_str())
@@ -321,9 +346,13 @@ impl LlmRequestDiagnostic {
             .status
             .map(|s| format!("HTTP {s}"))
             .unwrap_or_else(|| "no HTTP response".into());
+        let limit = f
+            .attempt_limit
+            .map(|n| format!(" (limit {n})"))
+            .unwrap_or_default();
         format!(
-            "Anthropic upstream request failed ({status}): {}. {} after {} request(s) (limit {}). Diagnostic ID: {}. Try again later or contact the upstream gateway administrator.",
-            f.failure, f.stop_reason.guidance(), f.attempt, f.attempt_limit, f.diagnostic_id,
+            "Anthropic upstream request failed ({status}): {}. {} after {} request(s){limit}. Diagnostic ID: {}. Try again later or contact the upstream gateway administrator.",
+            f.failure, f.stop_reason.guidance(), f.attempt, f.diagnostic_id,
         )
     }
 }
@@ -480,6 +509,32 @@ mod tests {
         let mut cleared = cold;
         cleared.clear_last_run_error();
         assert!(!cleared.metadata.contains_key(LAST_RUN_LLM_DIAGNOSTIC_KEY));
+    }
+
+    #[test]
+    fn configured_and_continuous_receipts_keep_distinct_validated_limits() {
+        let session = Session::new("retry-diagnostic", "model");
+        let mut bounded = serde_json::to_value(sample(&session)).unwrap();
+        bounded["attempt_limit"] = 12.into();
+        bounded["total_budget_ms"] = 300_000.into();
+        assert!(LlmRequestDiagnostic::from_json(&bounded.to_string()).is_some());
+        let mut continuous = bounded.clone();
+        continuous["retry_mode"] = "until_cancelled".into();
+        for field in ["attempt_limit", "total_budget_ms", "remaining_budget_ms"] {
+            continuous[field] = serde_json::Value::Null;
+        }
+        continuous["stop_reason"] = "cancelled_or_dropped".into();
+        let diagnostic = LlmRequestDiagnostic::from_json(&continuous.to_string()).unwrap();
+        assert!(diagnostic.matches_error_message(&diagnostic.error_message()));
+        for field in ["attempt_limit", "total_budget_ms", "remaining_budget_ms"] {
+            let mut invalid = continuous.clone();
+            invalid[field] = 1.into();
+            assert!(LlmRequestDiagnostic::from_json(&invalid.to_string()).is_none());
+        }
+        continuous["retry_mode"] = "unrecognized".into();
+        assert!(LlmRequestDiagnostic::from_json(&continuous.to_string()).is_none());
+        bounded["total_budget_ms"] = 3_600_001.into();
+        assert!(LlmRequestDiagnostic::from_json(&bounded.to_string()).is_none());
     }
 
     #[test]
