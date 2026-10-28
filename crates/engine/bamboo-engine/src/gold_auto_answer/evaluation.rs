@@ -472,6 +472,338 @@ mod provider_selection_tests {
         }
     }
 
+    use crate::app_context::AgentSessionContext;
+
+    async fn make_gold_target_stale(
+        state: &crate::app_context::model_routing_test_support::RoutingContext,
+        change: &str,
+    ) {
+        let mut config = state.config.write().await;
+        match change {
+            "disabled" => {
+                config.provider_instances.get_mut("chat-a").unwrap().enabled = false;
+            }
+            "removed" => {
+                assert!(config.provider_instances.remove("chat-a").is_some());
+            }
+            "revoked" => {
+                config
+                    .provider_instances
+                    .get_mut("chat-a")
+                    .unwrap()
+                    .extra
+                    .insert(
+                        "runtime_models".to_string(),
+                        serde_json::json!(["main-a", "legacy-fast-a"]),
+                    );
+            }
+            "derived" => {
+                config
+                    .provider_instances
+                    .get_mut("chat-a")
+                    .unwrap()
+                    .extra
+                    .remove("runtime_models");
+            }
+            _ => unreachable!("fixture change"),
+        }
+        if change == "revoked" || change == "derived" {
+            assert!(!bamboo_config::provider_runtime_models(&config, "chat-a")
+                .unwrap()
+                .iter()
+                .any(|model| model == "explicit-gold"));
+        }
+        assert!(state.registry.get("chat-a").is_some());
+        assert!(state
+            .registry
+            .runtime_models_for_provider("chat-a")
+            .unwrap()
+            .iter()
+            .any(|model| model == "explicit-gold"));
+    }
+
+    fn synthetic_pending_gold_session() -> Session {
+        let mut session = crate::app_context::model_routing_test_support::RoutingContext::session();
+        session.pending_question = Some(PendingQuestion {
+            tool_call_id: "synthetic-question".into(),
+            tool_name: "conclusion_with_options".into(),
+            question: "Continue the synthetic task?".into(),
+            options: vec!["Continue".into()],
+            allow_custom: false,
+            source: PendingQuestionSource::PauseTool,
+        });
+        session
+    }
+
+    fn explicit_gold_config() -> GoldConfig {
+        GoldConfig {
+            model_name: Some("explicit-gold".into()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_contract_gold_state_rejects_stale_explicit_account_without_dispatch() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        let mut failures = Vec::new();
+        for flag in [None, Some(false), Some(true)] {
+            for change in ["disabled", "removed", "revoked", "derived"] {
+                let state = RoutingContext::new(flag);
+                make_gold_target_stale(&state, change).await;
+                let session = synthetic_pending_gold_session();
+                let result = super::evaluate_gold_state_for_pending_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &explicit_gold_config(),
+                )
+                .await;
+                let requests = ["chat-a", "fast-b", "memory-c"].map(|id| (id, state.requests(id)));
+                if result.is_ok() || requests.iter().any(|(_, calls)| !calls.is_empty()) {
+                    failures.push(format!(
+                        "flag={flag:?}, change={change}, result={result:?}, requests={requests:?}"
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "stale Gold state route dispatched: {failures:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn routing_contract_gold_answer_rechecks_live_target_after_state_evaluation() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        let mut failures = Vec::new();
+        for flag in [None, Some(false), Some(true)] {
+            for change in ["disabled", "removed", "revoked", "derived"] {
+                let state = RoutingContext::new(flag);
+                let session = synthetic_pending_gold_session();
+                let gold = explicit_gold_config();
+                let evaluation = super::evaluate_gold_state_for_pending_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &gold,
+                )
+                .await
+                .expect("synthetic state evaluation should succeed before invalidation");
+                let original = vec![("explicit-gold".to_string(), "gold_evaluation".to_string())];
+                assert_eq!(state.requests("chat-a"), original);
+                make_gold_target_stale(&state, change).await;
+                let result = super::evaluate_gold_auto_answer_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &gold,
+                    &evaluation,
+                )
+                .await;
+                let chat = state.requests("chat-a");
+                let fast = state.requests("fast-b");
+                let memory = state.requests("memory-c");
+                if result.is_ok() || chat != original || !fast.is_empty() || !memory.is_empty() {
+                    failures.push(format!("flag={flag:?}, change={change}, result={result:?}, chat={chat:?}, fast={fast:?}, memory={memory:?}"));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "stale Gold answer route dispatched: {failures:#?}"
+        );
+    }
+
+    struct GoldOverrideContext {
+        inner: Arc<crate::app_context::model_routing_test_support::RoutingContext>,
+        routes: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::app_context::AgentSessionContext for GoldOverrideContext {
+        fn sessions(&self) -> &crate::SessionCache {
+            self.inner.sessions()
+        }
+        fn storage(&self) -> &Arc<dyn bamboo_agent_core::storage::Storage> {
+            self.inner.storage()
+        }
+        fn persistence(&self) -> &Arc<bamboo_storage::LockedSessionStore> {
+            self.inner.persistence()
+        }
+        fn agent_runners(
+            &self,
+        ) -> &Arc<
+            tokio::sync::RwLock<
+                std::collections::HashMap<
+                    String,
+                    crate::runtime::execution::runner_state::AgentRunner,
+                >,
+            >,
+        > {
+            self.inner.agent_runners()
+        }
+        fn account_sink(&self) -> &Arc<crate::events::AccountEventSink> {
+            self.inner.account_sink()
+        }
+        fn config(&self) -> &Arc<tokio::sync::RwLock<bamboo_llm::Config>> {
+            self.inner.config()
+        }
+        fn provider_registry(&self) -> &Arc<bamboo_llm::ProviderRegistry> {
+            self.inner.provider_registry()
+        }
+        async fn get_session_event_sender(
+            &self,
+            id: &str,
+        ) -> tokio::sync::broadcast::Sender<bamboo_agent_core::AgentEvent> {
+            self.inner.get_session_event_sender(id).await
+        }
+        async fn load_session_merged(&self, id: &str) -> Option<Session> {
+            self.inner.load_session_merged(id).await
+        }
+        async fn save_and_cache_session(&self, session: &mut Session) {
+            self.inner.save_and_cache_session(session).await
+        }
+        async fn get_provider(&self) -> Arc<dyn LLMProvider> {
+            self.inner.get_provider().await
+        }
+        fn get_provider_for_model_ref(
+            &self,
+            target: &bamboo_domain::ProviderModelRef,
+        ) -> Option<Arc<dyn LLMProvider>> {
+            self.routes
+                .lock()
+                .unwrap()
+                .push((target.provider.clone(), target.model.clone()));
+            if target.provider == "chat-a" && target.model == "explicit-gold" {
+                Some(self.inner.providers["memory-c"].clone())
+            } else {
+                None
+            }
+        }
+        async fn get_provider_for_endpoint(&self, name: &str) -> Option<Arc<dyn LLMProvider>> {
+            self.inner.get_provider_for_endpoint(name).await
+        }
+        fn title_gen_acquire(&self, id: &str) -> bool {
+            self.inner.title_gen_acquire(id)
+        }
+        fn title_gen_release(&self, id: &str) {
+            self.inner.title_gen_release(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn routing_contract_explicit_gold_preserves_embedder_provider_override() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        let state = RoutingContext::new(Some(false));
+        state.registry.remove("chat-a");
+        let context = GoldOverrideContext {
+            inner: state.clone(),
+            routes: Mutex::new(Vec::new()),
+        };
+        let session = synthetic_pending_gold_session();
+        let gold = explicit_gold_config();
+        let evaluation =
+            super::evaluate_gold_state_for_pending_question(&context, &session.id, &session, &gold)
+                .await
+                .unwrap();
+        super::evaluate_gold_auto_answer_question(
+            &context,
+            &session.id,
+            &session,
+            &gold,
+            &evaluation,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            context.routes.lock().unwrap().as_slice(),
+            &[
+                ("chat-a".into(), "explicit-gold".into()),
+                ("chat-a".into(), "explicit-gold".into()),
+            ]
+        );
+        assert_eq!(
+            state.requests("memory-c"),
+            vec![
+                ("explicit-gold".into(), "gold_evaluation".into()),
+                ("explicit-gold".into(), "gold_auto_answer".into()),
+            ]
+        );
+        assert!(state.requests("chat-a").is_empty());
+        assert!(state.requests("fast-b").is_empty());
+    }
+
+    #[tokio::test]
+    async fn routing_contract_explicit_gold_accepts_enabled_legacy_provider() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+        use std::collections::HashMap;
+        for flag in [None, Some(false), Some(true)] {
+            let state = RoutingContext::new(flag);
+            {
+                let mut config = state.config.write().await;
+                config.provider_instances.clear();
+                config.default_provider_instance = None;
+                config.provider = "openai".into();
+                config.defaults = None;
+                config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+                    model: Some("legacy-chat".into()),
+                    fast_model: Some("legacy-fast".into()),
+                    ..Default::default()
+                });
+                assert!(bamboo_config::synthesize_legacy_instances(&config)
+                    .iter()
+                    .any(|(id, instance)| id == "openai" && instance.enabled));
+                assert!(bamboo_config::provider_runtime_models(&config, "openai")
+                    .unwrap()
+                    .iter()
+                    .any(|model| model == "legacy-fast"));
+            }
+            state
+                .registry
+                .insert("openai".into(), state.providers["fast-b"].clone());
+            state.registry.set_runtime_models(HashMap::from([(
+                "openai".to_string(),
+                vec!["legacy-chat".to_string(), "legacy-fast".to_string()],
+            )]));
+            let mut session = synthetic_pending_gold_session();
+            session.model = "legacy-chat".into();
+            session.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+                "openai",
+                "legacy-chat",
+            ));
+            let gold = GoldConfig {
+                model_name: Some("legacy-fast".into()),
+                ..Default::default()
+            };
+            let evaluation = super::evaluate_gold_state_for_pending_question(
+                state.as_ref(),
+                &session.id,
+                &session,
+                &gold,
+            )
+            .await
+            .unwrap();
+            super::evaluate_gold_auto_answer_question(
+                state.as_ref(),
+                &session.id,
+                &session,
+                &gold,
+                &evaluation,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                state.requests("fast-b"),
+                vec![
+                    ("legacy-fast".into(), "gold_evaluation".into()),
+                    ("legacy-fast".into(), "gold_auto_answer".into()),
+                ]
+            );
+            assert!(state.requests("chat-a").is_empty());
+            assert!(state.requests("memory-c").is_empty());
+        }
+    }
+
     #[derive(Default)]
     struct RecordingRejectingProvider {
         requests: Mutex<Vec<(String, Option<ReasoningEffort>)>>,
