@@ -38,9 +38,11 @@ scoped exceptions with named owners. Preserve
 applicable native-platform acceptance before dev admission. Fix failures in the
 feature branch before merging; record exact source, commands and results.
 Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
-and 15 frontend artifact/policy registrations once. Each native feature job
-runs the same 61 portable Node registrations once on its own OS; retain the
-Windows unsupported-platform assertions. The `Browser Runtime Unit and E2E`
+and 15 frontend artifact/policy registrations once. Each native feature job runs
+only the nine OS behavior cases selected by `scripts/run-native-node-tests.cjs`,
+which requires every selected name to actually pass. Retain Windows unsupported
+process-binding assertions and macOS's real process/listener checks; portable
+policies run only in Quick. The `Browser Runtime Unit and E2E`
 feature job owns all `browser-runtime` Node test files on Node 24; both feature
 aggregates require it to pass. Do not add a second automatic owner for those
 tests.
