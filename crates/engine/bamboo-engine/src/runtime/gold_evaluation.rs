@@ -294,6 +294,15 @@ where
     let stream = match stream {
         Ok(stream) => stream,
         Err(error) if llm.local_dispatch_refused() => {
+            // No provider request was dispatched. Free the scarce slot before
+            // waiting for a potentially backpressured event consumer.
+            drop(_dispatch_guard);
+            let _ = event_tx
+                .send(AgentEvent::GoldEvaluationCancelled {
+                    session_id: session_id.to_string(),
+                    reason: "route_rejected".to_string(),
+                })
+                .await;
             return Err(GoldEvaluationError::Routing(AgentError::LLM(
                 error.to_string(),
             )));
@@ -753,6 +762,154 @@ mod tests {
         }
         assert!(routing.requests("fast-b").is_empty());
         assert!(routing.requests("chat-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_gold_route_revoked_after_started_has_route_terminal_and_releases_permit() {
+        use crate::app_context::model_routing_test_support::CaptureProvider;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, ProviderRegistry};
+        use std::time::Duration;
+        use tokio::sync::RwLock;
+
+        // This managed handle is only constructed and validated. If routing
+        // incorrectly dispatches, the only delegate is a synthetic capture;
+        // no LLM request is sent to the loopback address in the config.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = "gold-a".into();
+        config.default_provider_instance = Some("gold-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.insert(
+            "gold-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "enabled": true,
+                "api_key": "synthetic-only",
+                "base_url": "http://127.0.0.1:1",
+                "model": "main-model",
+                "runtime_models": ["main-model", "explicit-gold"]
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let target = ProviderModelRef::new("gold-a", "explicit-gold");
+        let (selected, origin) = registry.provider_for_model_with_origin(&target).unwrap();
+        let capture = Arc::new(CaptureProvider::default());
+        let live = Arc::new(RwLock::new(config));
+        let guard = bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            live.clone(),
+            origin.expect("the factory-built registry is managed"),
+            target,
+            selected,
+            capture.clone(),
+        );
+        assert!(guard.known_pre_dispatch_error().is_none());
+
+        let held =
+            crate::runtime::runner::auxiliary_budget::acquire(&guard, "explicit-gold", 1).await;
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let runner_guard = guard.clone();
+        let runner_tx = event_tx.clone();
+        let handle = tokio::spawn(async move {
+            execute_async_gold_evaluation(
+                synthetic_request("explicit-gold"),
+                runner_guard,
+                runner_tx,
+                1,
+            )
+            .await
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("Gold should start before waiting for its auxiliary slot")
+            .expect("Gold event sender must remain open");
+        assert!(matches!(
+            started,
+            AgentEvent::GoldEvaluationStarted {
+                ref session_id,
+                checkpoint: GoldCheckpoint::PostRound,
+                iteration: 1,
+            } if session_id == "gold-preflight-fixture"
+        ));
+        assert!(!handle.is_finished(), "the held permit blocks dispatch");
+        assert!(capture.requests.lock().unwrap().is_empty());
+        // Fill the event channel to ensure a failure event cannot be sent yet.
+        // The refused evaluation must release its auxiliary slot before it
+        // waits for the event sink to accept that event.
+        event_tx
+            .send(AgentEvent::Token {
+                content: "saturation-fixture".into(),
+            })
+            .await
+            .unwrap();
+
+        live.write()
+            .await
+            .provider_instances
+            .get_mut("gold-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["main-model"]));
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !guard.local_dispatch_refused() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the managed guard must refuse the revoked route");
+        assert!(
+            capture.requests.lock().unwrap().is_empty(),
+            "no provider call"
+        );
+        let available = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::runtime::runner::auxiliary_budget::acquire(&guard, "explicit-gold", 1),
+        )
+        .await
+        .expect("the refused evaluation must release its auxiliary permit before its event send");
+        drop(available);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::Token { ref content }) if content == "saturation-fixture"
+        ));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the revoked evaluation must stop")
+            .expect("the evaluation task must not panic");
+        let error = outcome.expect_err("a revoked route must not become a verdict");
+        match error {
+            AgentError::LLM(message) => assert!(
+                message.contains("no longer admitted"),
+                "unexpected routing error: {message}"
+            ),
+            other => panic!("expected an LLM routing error, got {other:?}"),
+        }
+        assert!(guard.local_dispatch_refused());
+        assert!(
+            capture.requests.lock().unwrap().is_empty(),
+            "no provider call"
+        );
+
+        // This describes the auxiliary evaluation's route refusal, not a user
+        // cancellation of the owning run and not a completed Gold verdict.
+        let terminal = event_rx
+            .try_recv()
+            .expect("Started must have a route terminal");
+        let terminal = serde_json::to_value(terminal).unwrap();
+        assert_eq!(terminal["type"], "gold_evaluation_cancelled");
+        assert_eq!(terminal["session_id"], "gold-preflight-fixture");
+        assert_eq!(terminal["reason"], "route_rejected");
+        assert!(event_rx.try_recv().is_err(), "exactly one terminal event");
     }
 
     #[tokio::test]
