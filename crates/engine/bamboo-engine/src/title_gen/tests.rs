@@ -220,6 +220,274 @@ async fn routing_contract_title_accepts_an_enabled_synthesized_legacy_provider()
     }
 }
 
+// These tests use only local mock services, temporary roots, and fake keys.
+async fn managed_title_mock() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(concat!(
+                    "data: {\"id\":\"mock\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"fixture\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic routing title\"},\"finish_reason\":null}]}\n\n",
+                    "data: [DONE]\n\n"
+                )),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+async fn managed_title_request_count(server: &wiremock::MockServer) -> usize {
+    server.received_requests().await.unwrap().len()
+}
+
+#[tokio::test]
+async fn routing_contract_title_config_managed_removed_instance_never_dispatches() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+
+    let mut observations = Vec::new();
+    for flag in [None, Some(false), Some(true)] {
+        let chat = managed_title_mock().await;
+        let fast = managed_title_mock().await;
+        let memory = managed_title_mock().await;
+        let state = RoutingContext::new(flag);
+        let config_snapshot = {
+            let mut config = state.config.write().await;
+            // The client's loopback exclusion prevents use of inherited proxies.
+            config.http_proxy = "https://127.0.0.1:9".into();
+            config.https_proxy.clear();
+            config.proxy_auth = None;
+            for (id, server) in [("chat-a", &chat), ("fast-b", &fast), ("memory-c", &memory)] {
+                let instance = config.provider_instances.get_mut(id).unwrap();
+                instance.api_key = "fixture-only-not-a-credential".into();
+                instance.base_url = Some(server.uri());
+            }
+            config.clone()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let managed =
+            bamboo_llm::ProviderRegistry::from_config(&config_snapshot, root.path().to_path_buf())
+                .await
+                .unwrap();
+        assert!(managed.get("fast-b").is_some());
+        state.registry.replace_with(managed);
+        let old_handle = state.registry.get("fast-b").unwrap();
+        let context: Arc<dyn AgentSessionContext> = state.clone();
+        let session = RoutingContext::session();
+
+        // Positive control proves that the selected managed provider really
+        // reaches the Fast endpoint and that its stream is consumable.
+        assert_eq!(
+            try_llm_title(&context, &session, "Synthetic managed title")
+                .await
+                .unwrap(),
+            "Synthetic routing title"
+        );
+        let requests = fast.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "cheap-b");
+        assert_eq!(managed_title_request_count(&chat).await, 0);
+        assert_eq!(managed_title_request_count(&memory).await, 0);
+
+        {
+            let mut config = state.config.write().await;
+            assert!(config.provider_instances.remove("fast-b").is_some());
+            assert!(config.provider_instances.contains_key("chat-a"));
+            assert_eq!(
+                config
+                    .defaults
+                    .as_ref()
+                    .unwrap()
+                    .fast
+                    .as_ref()
+                    .unwrap()
+                    .provider,
+                "fast-b"
+            );
+        }
+        assert!(Arc::ptr_eq(
+            &old_handle,
+            &state.registry.get("fast-b").unwrap()
+        ));
+        let rejected = try_llm_title(&context, &session, "Synthetic stale managed title")
+            .await
+            .is_err();
+        observations.push((
+            flag,
+            rejected,
+            managed_title_request_count(&fast).await,
+            managed_title_request_count(&chat).await,
+            managed_title_request_count(&memory).await,
+        ));
+    }
+    assert_eq!(observations.len(), 3);
+    assert!(
+        observations
+            .iter()
+            .all(|(_, rejected, fast, chat, memory)| *rejected
+                && *fast == 1
+                && *chat == 0
+                && *memory == 0),
+        "removed managed Fast must not dispatch, for any flag: {observations:?}"
+    );
+}
+
+#[tokio::test]
+async fn routing_contract_title_config_managed_same_id_legacy_requires_new_registry() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+
+    let mut observations = Vec::new();
+    for flag in [None, Some(false), Some(true)] {
+        let instance_endpoint = managed_title_mock().await;
+        let legacy_endpoint = managed_title_mock().await;
+        let other_endpoint = managed_title_mock().await;
+        let state = RoutingContext::new(flag);
+        let config_snapshot = {
+            let mut config = state.config.write().await;
+            config.http_proxy = "https://127.0.0.1:9".into();
+            config.https_proxy.clear();
+            config.proxy_auth = None;
+            config.provider = "openai".into();
+            config.default_provider_instance = Some("openai".into());
+            config.provider_instances.clear();
+            config.provider_instances.insert(
+                "openai".into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type": "openai", "enabled": true,
+                    "api_key": "fixture-instance-not-a-credential",
+                    "base_url": instance_endpoint.uri(), "model": "same-model",
+                    "runtime_models": ["same-model"]
+                }))
+                .unwrap(),
+            );
+            // Keep one native instance after removing "openai" so the
+            // legacy alias is rebuilt in hybrid mode, without constructing
+            // the unrelated default Copilot provider.
+            config.provider_instances.insert(
+                "other-account".into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type": "openai", "enabled": true,
+                    "api_key": "fixture-other-not-a-credential",
+                    "base_url": other_endpoint.uri(), "model": "other-model",
+                    "runtime_models": ["other-model"]
+                }))
+                .unwrap(),
+            );
+            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+                api_key: "fixture-legacy-not-a-credential".into(),
+                base_url: Some(legacy_endpoint.uri()),
+                model: Some("same-model".into()),
+                fast_model: Some("same-model".into()),
+                ..Default::default()
+            });
+            config.defaults = Some(
+                serde_json::from_value(serde_json::json!({
+                    "chat": {"provider":"openai", "model":"same-model"},
+                    "fast": {"provider":"openai", "model":"same-model"}
+                }))
+                .unwrap(),
+            );
+            assert!(!bamboo_config::synthesize_legacy_instances(&config)
+                .iter()
+                .any(|(id, _)| id == "openai"));
+            config.clone()
+        };
+        let root = tempfile::tempdir().unwrap();
+        let managed =
+            bamboo_llm::ProviderRegistry::from_config(&config_snapshot, root.path().to_path_buf())
+                .await
+                .unwrap();
+        assert!(managed.get("openai").is_some());
+        state.registry.replace_with(managed);
+        let old_handle = state.registry.get("openai").unwrap();
+        let context: Arc<dyn AgentSessionContext> = state.clone();
+        let session = RoutingContext::session();
+
+        assert_eq!(
+            try_llm_title(&context, &session, "Synthetic instance title")
+                .await
+                .unwrap(),
+            "Synthetic routing title"
+        );
+        assert_eq!(managed_title_request_count(&instance_endpoint).await, 1);
+        assert_eq!(managed_title_request_count(&legacy_endpoint).await, 0);
+        assert_eq!(managed_title_request_count(&other_endpoint).await, 0);
+
+        let replacement_config = {
+            let mut config = state.config.write().await;
+            assert!(config.provider_instances.remove("openai").is_some());
+            assert!(config.provider_instances.contains_key("other-account"));
+            let legacy = bamboo_config::synthesize_legacy_instances(&config);
+            let (_, instance) = legacy.iter().find(|(id, _)| id == "openai").unwrap();
+            assert_eq!(instance.model.as_deref(), Some("same-model"));
+            let legacy_url = legacy_endpoint.uri();
+            assert_eq!(instance.base_url.as_deref(), Some(legacy_url.as_str()));
+            config.clone()
+        };
+        assert!(Arc::ptr_eq(
+            &old_handle,
+            &state.registry.get("openai").unwrap()
+        ));
+        let rejected = try_llm_title(&context, &session, "Synthetic stale instance title")
+            .await
+            .is_err();
+        let old_after_stale = managed_title_request_count(&instance_endpoint).await;
+        let new_after_stale = managed_title_request_count(&legacy_endpoint).await;
+        let other_after_stale = managed_title_request_count(&other_endpoint).await;
+
+        // Once the registry is built from the new legacy source, the identical
+        // ID and model must select the new endpoint, proving compatibility.
+        let refreshed = bamboo_llm::ProviderRegistry::from_config(
+            &replacement_config,
+            root.path().to_path_buf(),
+        )
+        .await
+        .unwrap();
+        assert!(refreshed.get("openai").is_some());
+        state.registry.replace_with(refreshed);
+        assert_eq!(
+            try_llm_title(&context, &session, "Synthetic legacy title")
+                .await
+                .unwrap(),
+            "Synthetic routing title"
+        );
+        assert_eq!(
+            managed_title_request_count(&instance_endpoint).await,
+            old_after_stale
+        );
+        assert_eq!(
+            managed_title_request_count(&legacy_endpoint).await,
+            new_after_stale + 1
+        );
+        assert_eq!(
+            managed_title_request_count(&other_endpoint).await,
+            other_after_stale
+        );
+        observations.push((
+            flag,
+            rejected,
+            old_after_stale,
+            new_after_stale,
+            other_after_stale,
+        ));
+    }
+    assert_eq!(observations.len(), 3);
+    assert!(
+        observations
+            .iter()
+            .all(|(_, rejected, old, legacy, other)| *rejected
+                && *old == 1
+                && *legacy == 0
+                && *other == 0),
+        "same ID must not route through the old source, for any flag: {observations:?}"
+    );
+}
+
 #[test]
 fn test_heuristic_title_strips_code_fences_and_caps_length() {
     let input = "```rust\nfn main() {}\n```\nHelp me debug this Rust program please";
