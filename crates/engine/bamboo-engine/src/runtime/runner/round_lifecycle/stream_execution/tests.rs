@@ -5665,3 +5665,128 @@ async fn synthetic_provider_api_overflow_stays_recoverable() {
         "API overflow must remain recoverable: {error:?}"
     );
 }
+
+#[tokio::test]
+async fn unmanaged_response_body_error_after_headers_is_terminal() {
+    use std::error::Error;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct SyntheticResponseProvider {
+        url: String,
+        calls: Arc<AtomicUsize>,
+        sends: Arc<AtomicUsize>,
+    }
+    #[async_trait]
+    impl LLMProvider for SyntheticResponseProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .read_timeout(std::time::Duration::from_millis(350))
+                .build()
+                .unwrap();
+            self.sends.fetch_add(1, Ordering::SeqCst);
+            let response = client
+                .post(&self.url)
+                .body("synthetic request")
+                .send()
+                .await?;
+            let error = response
+                .bytes()
+                .await
+                .expect_err("partial response body must fail");
+            let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+            let mut body_error = false;
+            while let Some(cause) = source {
+                body_error |= cause
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_body);
+                source = cause.source();
+            }
+            assert!(body_error, "expected nested reqwest response-body error");
+            Err(bamboo_llm::provider::LLMError::Http(error))
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let received = Arc::new(AtomicUsize::new(0));
+    let server_received = received.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buffer = [0u8; 1024];
+        assert!(socket.read(&mut buffer).await.unwrap() > 0);
+        server_received.fetch_add(1, Ordering::SeqCst);
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\nsynthetic-prefix").await.unwrap();
+        std::future::pending::<()>().await;
+    });
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sends = Arc::new(AtomicUsize::new(0));
+    let llm: Arc<dyn LLMProvider> = Arc::new(SyntheticResponseProvider {
+        url,
+        calls: calls.clone(),
+        sends: sends.clone(),
+    });
+    let mut session = Session::new("synthetic-response-body", "test-model");
+    let config = test_config("synthetic system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("synthetic system"),
+            Message::user("synthetic input"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let cancel_token = CancellationToken::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        execute_llm_stream(
+            &mut session,
+            &config,
+            &llm,
+            &prepared_context,
+            &[],
+            &LlmStreamFrame {
+                event_tx: &event_tx,
+                cancel_token: &cancel_token,
+                session_id: "synthetic-response-body",
+                model: "test-model",
+                provider_name: None,
+                provider_type: None,
+                reasoning_effort: None,
+                max_context_tokens: 400_000,
+                max_output_tokens: 128,
+                observation_progress_hint: None,
+                prompt_memory_exposure: None,
+            },
+        ),
+    )
+    .await
+    .expect("synthetic response should not hang");
+    server.abort();
+    let _ = server.await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(sends.load(Ordering::SeqCst), 1);
+    assert_eq!(received.load(Ordering::SeqCst), 1);
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("partial response unexpectedly succeeded"),
+    };
+    assert!(
+        matches!(error, AgentError::LLMNonRetryable(_)),
+        "response body failure must stop: {error:?}"
+    );
+}

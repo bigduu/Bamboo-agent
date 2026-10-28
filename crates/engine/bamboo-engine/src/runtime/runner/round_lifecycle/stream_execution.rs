@@ -316,7 +316,7 @@ fn format_reqwest_transport_error(error: &reqwest::Error) -> String {
     }
 }
 
-fn is_request_body_failure(error: &bamboo_llm::provider::LLMError) -> bool {
+fn is_http_body_failure(error: &bamboo_llm::provider::LLMError) -> bool {
     let bamboo_llm::provider::LLMError::Http(http) = error else {
         return false;
     };
@@ -1615,10 +1615,10 @@ pub(super) async fn execute_llm_stream(
                     // even overflow-looking text cannot authorize another call.
                     return AgentError::LLMNonRetryable(error.to_string());
                 }
-                // A request body producer can fail after sending a prefix.
-                // Its source text is not evidence of model context overflow and
-                // must not trigger recovery that replays the request.
-                let body_failure = is_request_body_failure(&error);
+                // Request or response body errors can happen after request
+                // bytes were sent. Their source text must not trigger model
+                // context recovery that replays the request.
+                let body_failure = is_http_body_failure(&error);
                 let message = format_provider_error(error);
                 if body_failure {
                     AgentError::LLMNonRetryable(message)
