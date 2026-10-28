@@ -160,8 +160,10 @@ protected-Dev controller and keeps product source
 publisher `40613036533`/attempt 1. Preserve its 27 signed crate originals, sealed
 frontend and three native artifacts. Only the proven unstarted client-core,
 TUI and agent packages may receive their first verification compile; retained or
-ambiguous originals cannot be rebuilt. Restore uses read-only GitHub access and
-signing-key verification; only publish receives release/registry write credentials.
+ambiguous originals cannot be rebuilt. Authorize uses the read-only `github.token`.
+Restore uses the existing release token to read the private draft and verifies its
+signature; its script permits no external writes. Only publish executes external
+writes and receives the Cargo registry token.
 The recovery leaves the Release draft, `receipt.completed=false` and the original
 publisher ID, and verifies `recovery2371.completed=true` with no pending write.
 It performs no native build, finalization or version allocation. After authenticated

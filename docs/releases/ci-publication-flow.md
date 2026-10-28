@@ -83,12 +83,14 @@ gh workflow run recover-frozen-crate-release.yml -R bigduu/Bamboo-agent --ref de
 ```
 
 The workflow checks out controller and product separately, preserving its real
-runner/run/attempt identity. Read-only authorization rechecks the original source,
-failure, reservation, registry and artifacts. Authenticated restoration writes
-only the original sealed frontend locally; it does not download npm or repack it.
+runner/run/attempt identity. Authorization uses the read-only `github.token`.
+Restoration uses the existing release token to read the private draft because
+draft visibility with `contents: read` is not established. It authenticates the
+original state and writes only the sealed frontend locally, with no external
+write, npm download or repack.
 The existing Cargo sandbox then owns metadata and verification compilation after
-temporary version stamping and the original external-lock check. Release and
-registry write credentials are mapped only to the final publish step.
+temporary version stamping and the original external-lock check. Only the final
+publish step executes external writes and receives the Cargo registry token.
 
 The controller reuses the retained server archive, or verifies its existing
 registry version. Only `bamboo-client-core`, `bamboo-tui` and `bamboo-agent` may be

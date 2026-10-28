@@ -90,9 +90,10 @@ jobs:
         run: node ../controller/scripts/crate-release-frozen-recovery.cjs authorize
 
       - name: Authenticate and restore the original sealed frontend locally
+        # Draft reads need the existing release token; this CLI permits no external writes.
         working-directory: product
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.BAMBOO_RELEASE_TOKEN }}
           BAMBOO_RELEASE_SIGNING_KEY: ${{ secrets.BAMBOO_RELEASE_SIGNING_KEY }}
           BAMBOO_RELEASE_SIGNING_KEY_SHA256: ${{ vars.BAMBOO_RELEASE_SIGNING_KEY_SHA256 }}
         run: node ../controller/scripts/crate-release-frozen-recovery.cjs restore
