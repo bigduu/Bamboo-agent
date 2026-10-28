@@ -285,6 +285,7 @@ function verifyRegistryMetadata(receipt, name, version, entry) {
   if (version !== TARGET.version) return entry
   if (receipt.crates.slice(0, 26).includes(name)) assert.ok(entry, 'Original published prefix disappeared; do not republish')
   if (entry) {
+    assert.equal(entry.yanked, false, 'Registry package must be explicitly unyanked')
     const expected = receipt.packageChecksums[name]
     assert.ok(expected, 'Registry tail has no reserved package checksum; stop')
     assert.equal(entry.checksum, expected, 'Registry checksum changed')

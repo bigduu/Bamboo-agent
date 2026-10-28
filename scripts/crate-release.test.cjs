@@ -2021,7 +2021,7 @@ function runtime2371({ stored, published, fail } = {}) {
   const receipt = stored ? clone(stored) : signReceipt(clone(original2371), signingKey)
   authenticateReceipt(receipt, signingKey); recovery2371.stateOf(receipt)
   const entry = reservation2371(receipt), calls = []
-  published ||= new Map(original2371.crates.slice(0, 26).map(name => [name, { checksum: receipt.packageChecksums[name] }]))
+  published ||= new Map(original2371.crates.slice(0, 26).map(name => [name, { checksum: receipt.packageChecksums[name], yanked: false }]))
   let remote = clone(receipt), writes = 0
   const context = { automatic: true, identity: receipt.identity, crates: receipt.crates,
     assertCurrentMain: async () => { authenticateReceipt(remote, signingKey); recovery2371.baseline(remote) },
@@ -2053,7 +2053,7 @@ function runtime2371({ stored, published, fail } = {}) {
     cargoPublish: async name => {
       calls.push('upload:' + name)
       if (fail?.('upload', name)) throw Error('upload transport unknown')
-      published.set(name, { checksum: receipt.packageChecksums[name] }); return { status: 0, output: '' }
+      published.set(name, { checksum: receipt.packageChecksums[name], yanked: false }); return { status: 0, output: '' }
     },
     verifyArchive: async (name, value, expected) => { assert.equal(published.get(name).checksum, expected); assert.equal(value.identity.sourceRevision, recovery2371.TARGET.source); calls.push('verify:' + name) },
     wait: async () => { throw Error('Unexpected polling') },
@@ -2120,16 +2120,28 @@ test('2371 stops ambiguous write-ahead/compile failures and resumes only sealed 
   const changed = clone(retry.remote()); changed.recovery2371.sealed[0].producer.runId = '40613036533'
   signReceipt(changed, signingKey); assert.throws(() => recovery2371.stateOf(changed))
   const foreign = runtime2371()
-  foreign.published.set('bamboo-client-core', { checksum: 'a'.repeat(64) })
+  foreign.published.set('bamboo-client-core', { checksum: 'a'.repeat(64), yanked: false })
   await assert.rejects(recovery2371.recoveryPublish(foreign.context, foreign.authority), /no reserved package checksum/)
   assert.equal(foreign.calls.some(call => call.startsWith('compile:')), false)
   const missing = runtime2371(); missing.published.delete('bamboo-domain')
   await assert.rejects(recovery2371.recoveryPublish(missing.context, missing.authority), /Original published prefix disappeared/)
   assert.equal(missing.calls.some(call => /^(?:reuse|compile|upload):/.test(call)), false)
   const serverComplete = runtime2371()
-  serverComplete.published.set('bamboo-server', { checksum: original2371.packageChecksums['bamboo-server'] })
+  serverComplete.published.set('bamboo-server', { checksum: original2371.packageChecksums['bamboo-server'], yanked: false })
   await recovery2371.recoveryPublish(serverComplete.context, serverComplete.authority)
   assert.equal(serverComplete.calls.some(call => /^(?:reuse|upload):bamboo-server$/.test(call)), false)
+})
+
+test('2371 registry acceptance rejects yanked and unknown yank state before publishing or compiling', async () => {
+  for (const name of ['bamboo-domain', 'bamboo-server']) {
+    for (const state of [{ yanked: true }, {}]) {
+      const x = runtime2371()
+      x.published.set(name, { checksum: original2371.packageChecksums[name], ...state })
+      await assert.rejects(recovery2371.recoveryPublish(x.context, x.authority), /Registry package must be explicitly unyanked/)
+      assert.equal(x.calls.some(call => /^(?:compile|reuse|upload|readback):/.test(call)), false)
+      assert.equal(x.remote().recovery2371, undefined)
+    }
+  }
 })
 
 test('2371 frontend verification and upload classification never substitute bytes or disclose response secrets', () => {
