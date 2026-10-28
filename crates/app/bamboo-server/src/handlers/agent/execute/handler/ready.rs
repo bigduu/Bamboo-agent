@@ -53,6 +53,8 @@ pub(super) struct ReadyExecution<'a> {
     /// Optional per-run resource guardrail override from THIS execute request
     /// (issue #221). `None` uses the config-level default.
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
+    pub upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    pub live_bootstrap_resume: bool,
 }
 
 pub(super) struct ExecuteReadyContext<'a> {
@@ -408,7 +410,12 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         app_data_dir: Some(state.app_data_dir.clone()),
         run_budget: ready.run_budget,
     }
-    .spawn_with_native_inputs(ready.untrusted_inputs, native_binding);
+    .spawn_with_native_inputs_and_retry(
+        ready.untrusted_inputs,
+        native_binding,
+        ready.upstream_retry,
+        ready.live_bootstrap_resume,
+    );
 
     started_response(session_id, sync_info, run_id)
 }

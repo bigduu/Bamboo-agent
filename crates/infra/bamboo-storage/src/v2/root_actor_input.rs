@@ -7,6 +7,68 @@ use bamboo_domain::{
     SessionMessageEnvelope,
 };
 
+/// A detached physical job can outlive the async waiter. Dropping the waiter
+/// cancels the same gate that the final synchronous effect must commit.
+struct CancelPendingOnDrop {
+    gate: bamboo_domain::AdmissionGate,
+    armed: bool,
+}
+
+impl CancelPendingOnDrop {
+    fn new(gate: bamboo_domain::AdmissionGate) -> Self {
+        Self { gate, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CancelPendingOnDrop {
+    fn drop(&mut self) {
+        if self.armed {
+            self.gate.cancel_if_pending();
+        }
+    }
+}
+
+/// Nonserializable, process-local observation. It is not provider authority.
+struct LiveBootstrapCapture {
+    owner: RootActorRuntimeWrite,
+    committed: serde_json::Value,
+    inbox_directory: PathBuf,
+    inbox_generation: u64,
+    consumed: AtomicBool,
+}
+
+impl LiveBootstrapCapture {
+    fn matches_owner(&self, owner: &RootActorRuntimeWrite) -> bool {
+        self.owner.fence == owner.fence
+            && self.owner.created_at == owner.created_at
+            && self.owner.conversation_generation == owner.conversation_generation
+    }
+}
+
+fn ensure_live_bootstrap_canonical_file_sizes(directory: &Path) -> io::Result<()> {
+    for name in [
+        "session.json",
+        RUNTIME_SIDECAR_FILE,
+        "actor-authority.json",
+        "actor-authority.initialized.json",
+    ] {
+        let meta = std::fs::symlink_metadata(directory.join(name))?;
+        if !meta.file_type().is_file()
+            || meta.len() > crate::session_merge::LIVE_BOOTSTRAP_SESSION_JSON_LIMIT as u64
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "live bootstrap canonical file exceeds limit or is invalid",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone)]
 pub(super) struct RootActorInputProof {
     root: RootActorWriteProof,
@@ -72,6 +134,15 @@ impl SessionStoreV2 {
         target: &str,
         owner: &RootActorRuntimeWrite,
     ) -> io::Result<Arc<DefaultWriterGuards>> {
+        self.root_input_guards_inner(target, owner, false).await
+    }
+
+    async fn root_input_guards_inner(
+        &self,
+        target: &str,
+        owner: &RootActorRuntimeWrite,
+        limit_recovery_files: bool,
+    ) -> io::Result<Arc<DefaultWriterGuards>> {
         if target != owner.fence.actor_id {
             return Err(conflict("Root Inbox target changed"));
         }
@@ -81,14 +152,21 @@ impl SessionStoreV2 {
         let session = self
             .acquire_session_write_lock(target, SaveKind::Full)
             .await?;
-        let proof = RootActorWriteProof::new(self.sessions_dir.join(target), owner.clone());
+        let directory = self.sessions_dir.join(target);
+        let proof = RootActorWriteProof::new(directory.clone(), owner.clone());
         let guards = DefaultWriterGuards::shared_with_root_actor(
             lifecycle,
             task,
             session,
             Some(proof.clone()),
         );
-        Self::default_writer_job(&guards, move || proof.validate().map(|_| ())).await?;
+        Self::default_writer_job(&guards, move || {
+            if limit_recovery_files {
+                ensure_live_bootstrap_canonical_file_sizes(&directory)?;
+            }
+            proof.validate().map(|_| ())
+        })
+        .await?;
         Ok(guards)
     }
 
@@ -152,6 +230,200 @@ impl SessionStoreV2 {
                 ))
             }
         })
+    }
+
+    pub(super) async fn checkpoint_root_live_bootstrap_impl(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &Session,
+        inbox: Arc<dyn SessionInboxPort>,
+        gate: bamboo_domain::AdmissionGate,
+        publish: RootActorRuntimePublisher,
+    ) -> io::Result<bamboo_domain::LiveBootstrapProof> {
+        let mut cancel_on_drop = CancelPendingOnDrop::new(gate.clone());
+        if gate.is_cancelled() || gate.is_committed() {
+            return Err(conflict("live bootstrap gate unavailable"));
+        }
+        let started = Instant::now();
+        let inbox = self.bound_root_inbox(owner, &inbox)?;
+        let mut guards = self
+            .root_input_guards_inner(&session.id, owner, true)
+            .await?;
+        let root = guards.root_actor.clone().expect("bound Root proof");
+        let (directory, filesystem) = inbox
+            .filesystem_with_authority(
+                &session.id,
+                InboxAuthority::Root {
+                    _guard: guards.physical.clone(),
+                },
+            )
+            .await
+            .map_err(conflict)?;
+        if directory != self.sessions_dir.join(&session.id).join("inbox") {
+            return Err(conflict("Root Inbox directory changed"));
+        }
+        // The started physical writer retains Inbox as well as Session/Actor
+        // even if its awaiting task is cancelled during a blocking write.
+        Arc::get_mut(&mut guards)
+            .expect("new Root guards are private")
+            ._input_filesystem = Some(filesystem.clone());
+        let expected = crate::session_merge::bounded_live_bootstrap_value(session)?;
+        let candidate = session.clone();
+        let check_root = root.clone();
+        let check_session_directory = self.sessions_dir.join(&session.id);
+        let check_dir = directory.clone();
+        let check_filesystem = filesystem.clone();
+        let check_gate = gate.clone();
+        let before = Self::default_writer_job(&guards, move || {
+            if check_gate.is_cancelled() || check_gate.is_committed() {
+                return Err(conflict("live bootstrap gate unavailable"));
+            }
+            ensure_live_bootstrap_canonical_file_sizes(&check_session_directory)?;
+            check_root.validate_candidate(&candidate)?;
+            let current = check_root.validate()?;
+            crate::session_merge::validate_live_bootstrap_candidate(&candidate, &current)?;
+            crate::session_inbox::empty_live_bootstrap_generation_locked(
+                &check_dir,
+                &check_filesystem,
+            )
+            .map_err(conflict)
+        })
+        .await?;
+        self.save_session_after_lock(session, started, &guards, None)
+            .await?;
+        let check_root = root.clone();
+        let check_session_directory = self.sessions_dir.join(&session.id);
+        let check_dir = directory.clone();
+        let check_filesystem = filesystem.clone();
+        let check_expected = expected.clone();
+        let check_gate = gate.clone();
+        Self::default_writer_job(&guards, move || {
+            if check_gate.is_cancelled() || check_gate.is_committed() {
+                return Err(conflict("live bootstrap gate unavailable"));
+            }
+            ensure_live_bootstrap_canonical_file_sizes(&check_session_directory)?;
+            let saved = check_root.validate()?;
+            if crate::session_merge::bounded_live_bootstrap_value(&saved)? != check_expected {
+                return Err(conflict("live bootstrap Session readback changed"));
+            }
+            let after = crate::session_inbox::empty_live_bootstrap_generation_locked(
+                &check_dir,
+                &check_filesystem,
+            )
+            .map_err(conflict)?;
+            if after != before {
+                return Err(conflict("live bootstrap Inbox changed"));
+            }
+            Ok(())
+        })
+        .await?;
+        // Reuse the existing guarded cache publication, not an event or grant.
+        self.publish_root_actor_runtime(&guards, publish).await?;
+        if gate.is_cancelled() || gate.is_committed() {
+            return Err(conflict("live bootstrap gate unavailable"));
+        }
+        let proof = bamboo_domain::LiveBootstrapProof::from_storage(
+            LiveBootstrapCapture {
+                owner: owner.clone(),
+                committed: expected,
+                inbox_directory: directory,
+                inbox_generation: before,
+                consumed: AtomicBool::new(false),
+            },
+            gate,
+        );
+        cancel_on_drop.disarm();
+        Ok(proof)
+    }
+
+    pub(super) async fn confirm_root_live_bootstrap_impl(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        proof: &bamboo_domain::LiveBootstrapProof,
+        inbox: Arc<dyn SessionInboxPort>,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        let captured = proof
+            .storage_ref::<LiveBootstrapCapture>()
+            .ok_or_else(|| conflict("wrong live bootstrap proof"))?;
+        let mut cancel_on_drop = CancelPendingOnDrop::new(proof.storage_gate());
+        // Storage validates the actor and commits a supplied synchronous
+        // effect once; it cannot create a provider continuation. The private
+        // Host must supply that effect only for a live provider-created offer
+        // whose gate matches this proof.
+        if !captured.matches_owner(owner) {
+            return Err(conflict("live bootstrap owner unavailable"));
+        }
+        let inbox = self.bound_root_inbox(owner, &inbox)?;
+        let mut guards = self
+            .root_input_guards_inner(&owner.fence.actor_id, owner, true)
+            .await?;
+        let root = guards.root_actor.clone().expect("bound Root proof");
+        let (directory, filesystem) = inbox
+            .filesystem_with_authority(
+                &owner.fence.actor_id,
+                InboxAuthority::Root {
+                    _guard: guards.physical.clone(),
+                },
+            )
+            .await
+            .map_err(conflict)?;
+        if directory != self.sessions_dir.join(&owner.fence.actor_id).join("inbox")
+            || directory != captured.inbox_directory
+        {
+            return Err(conflict("Root Inbox directory changed"));
+        }
+        Arc::get_mut(&mut guards)
+            .expect("new Root guards are private")
+            ._input_filesystem = Some(filesystem.clone());
+        let held = proof.clone();
+        let session_directory = self.sessions_dir.join(&owner.fence.actor_id);
+        let result = Self::default_writer_job(&guards, move || {
+            let captured = held
+                .storage_ref::<LiveBootstrapCapture>()
+                .ok_or_else(|| conflict("wrong live bootstrap proof"))?;
+            let check = || -> io::Result<()> {
+                ensure_live_bootstrap_canonical_file_sizes(&session_directory)?;
+                let current = root.validate()?;
+                if crate::session_merge::bounded_live_bootstrap_value(&current)?
+                    != captured.committed
+                {
+                    return Err(conflict("live bootstrap Session changed"));
+                }
+                let generation = crate::session_inbox::empty_live_bootstrap_generation_locked(
+                    &directory,
+                    &filesystem,
+                )
+                .map_err(conflict)?;
+                if generation != captured.inbox_generation {
+                    return Err(conflict("live bootstrap Inbox changed"));
+                }
+                Ok(())
+            };
+            check()?;
+            match held.storage_gate().commit(|| {
+                check()?;
+                // Burn before invoking the callback: even a lost ACK after an
+                // effect must not let a retry invoke the decision twice.
+                if captured.consumed.swap(true, Ordering::AcqRel) {
+                    return Err(conflict("live bootstrap proof already consumed"));
+                }
+                publish(&check)
+            })? {
+                bamboo_domain::AdmissionCommit::Committed(()) => Ok(()),
+                bamboo_domain::AdmissionCommit::Cancelled => {
+                    Err(conflict("live bootstrap cancelled"))
+                }
+                bamboo_domain::AdmissionCommit::AlreadyCommitted => {
+                    Err(conflict("live bootstrap already committed"))
+                }
+            }
+        })
+        .await;
+        if result.is_ok() {
+            cancel_on_drop.disarm();
+        }
+        result
     }
 
     pub(super) async fn save_root_actor_input_impl(

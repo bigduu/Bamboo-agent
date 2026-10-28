@@ -865,6 +865,9 @@ async fn build_direct_execute_agent_with_router(
         .metrics_collector(metrics)
         .config(Arc::new(RwLock::new(config)))
         .provider(provider)
+        .memory_store(bamboo_memory::memory_store::MemoryStore::new(
+            temp.path().join("jiandu"),
+        ))
         .default_tools(tools_override.unwrap_or_else(|| Arc::new(BuiltinToolExecutor::new())));
     if let Some(router) = router {
         builder = builder.activation_router(router);

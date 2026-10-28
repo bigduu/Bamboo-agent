@@ -351,6 +351,173 @@ mod idempotency_e2e {
         web::Data::new(state)
     }
 
+    // A real running Root and a valid V2 checkpoint do not create a provider
+    // offer. HTTP cannot use the proof or cause a second provider request.
+    #[actix_web::test]
+    async fn live_retry_http_rejects_without_provider_offer_even_with_root_checkpoint() {
+        use bamboo_domain::{
+            ActorActivationStatus, ActorDirectoryPort, AdmissionGate, RootActorRuntimeWrite,
+        };
+        let provider = BlockingProvider::new();
+        let state = state_with_provider(provider.clone()).await;
+        let id = "live-retry-no-provider-offer";
+        let mut session = Session::new(id, "execute-model");
+        session.title_generated = true;
+        session.add_message(Message::user("one synthetic input"));
+        crate::handlers::agent::events::mark_pending_turn(&mut session);
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let first = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first: serde_json::Value = test::read_body_json(first).await;
+        let run_id = first["run_id"].as_str().expect("actual run id").to_owned();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            provider.started.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let durable = state.storage.load_session(id).await.unwrap().unwrap();
+        let actor = state
+            .session_store
+            .inspect_actor(id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap();
+        assert_eq!(actor.status, ActorActivationStatus::Running);
+        assert_eq!(actor.run_id, run_id);
+        let owner = RootActorRuntimeWrite {
+            fence: actor.fence(),
+            created_at: durable.created_at,
+            conversation_generation: durable.conversation_generation_observation(),
+        };
+        let proof = state
+            .storage
+            .checkpoint_root_live_bootstrap(
+                &owner,
+                &durable,
+                state.session_inbox.clone(),
+                AdmissionGate::default(),
+                Arc::new(|_| {}),
+            )
+            .await
+            .expect("actual fenced Root checkpoint");
+
+        let waiting = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/execute/{id}/retry"))
+                .to_request(),
+        )
+        .await;
+        let waiting: serde_json::Value = test::read_body_json(waiting).await;
+        assert_eq!(waiting["status"], "unavailable");
+        let retry = |run: &str| {
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run))
+                .insert_header(("Idempotency-Key", "live-retry-no-offer-key"))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request()
+        };
+        let response = test::call_service(&app, retry(&run_id)).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "retry_resume_outcome_uncertain");
+        assert_eq!(body["run_id"], run_id);
+        assert!(!proof.is_committed());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let different = test::call_service(&app, retry("different-run")).await;
+        assert_eq!(different.status(), StatusCode::CONFLICT);
+        let different: serde_json::Value = test::read_body_json(different).await;
+        assert_eq!(different["error"]["code"], "idempotency_key_conflict");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let stop = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/stop/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stop.status(), StatusCode::OK);
+        provider.release.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(10), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    // Invalid continuation inputs must keep their HTTP contract and must not
+    // reach a provider or reserve a runner.
+    #[actix_web::test]
+    async fn live_retry_http_invalid_continuation_keeps_bad_request_without_dispatch() {
+        let provider = BlockingProvider::new();
+        let state = state_with_provider(provider.clone()).await;
+        let id = "live-retry-invalid-continuation";
+        let mut session = Session::new(id, "execute-model");
+        session.title_generated = true;
+        state.save_and_cache_session(&mut session).await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+
+        for (run, payload, message) in [
+            (
+                "",
+                serde_json::json!({"upstream_retry": {"mode": "until_cancelled"}}),
+                "Invalid Bamboo-Run-Id",
+            ),
+            (
+                "owned-run",
+                serde_json::json!({"upstream_retry": {"mode": "until_cancelled"}, "model": "other"}),
+                "A continuation requires only upstream_retry.mode=until_cancelled",
+            ),
+            (
+                "owned-run",
+                serde_json::json!({}),
+                "A continuation requires only upstream_retry.mode=until_cancelled",
+            ),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/execute/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run))
+                    .set_json(payload)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(body["error"]["message"], message);
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        assert!(!state.agent_runners.read().await.contains_key(id));
+        tokio::time::timeout(std::time::Duration::from_secs(10), state.shutdown())
+            .await
+            .unwrap();
+    }
+
     /// #733: execute retries replay the original Accepted response (including
     /// run_id) instead of entering preparation or spawning another agent loop.
     #[actix_web::test]

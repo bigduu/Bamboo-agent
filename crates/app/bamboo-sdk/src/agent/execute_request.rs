@@ -10,6 +10,7 @@ pub use bamboo_engine::runtime::loop_control::{
     inspect_loop, LoopControlReceipt, LoopStatusSnapshot,
 };
 pub use bamboo_engine::{CountedLoopConfig, ExecuteRequestBuilder, LoopControlConfig};
+pub use bamboo_llm::retry::UpstreamRetry;
 
 #[cfg(test)]
 mod tests {
@@ -21,6 +22,41 @@ mod tests {
     use bamboo_agent_core::AgentEvent;
 
     use super::ExecuteRequestBuilder;
+
+    #[test]
+    fn prior_public_execute_request_literal_remains_constructible() {
+        let (event_tx, _rx) = mpsc::channel::<AgentEvent>(8);
+        let req = bamboo_engine::ExecuteRequest {
+            ticket_token_budget: None,
+            ticket_worker_plan: None,
+            initial_message: "legacy literal".into(),
+            event_tx,
+            cancel_token: CancellationToken::new(),
+            tools: None,
+            provider_override: None,
+            model_roster: Default::default(),
+            reasoning_effort: None,
+            auxiliary_model_resolver: None,
+            disabled_filter_resolver: None,
+            disabled_tools: None,
+            disabled_skill_ids: None,
+            selected_skill_ids: None,
+            selected_skill_mode: None,
+            image_fallback: None,
+            gold_config: None,
+            guardian_config: None,
+            guardian_spawner: None,
+            bash_resume_hook: None,
+            bash_completion_sink: None,
+            app_data_dir: None,
+            run_budget: None,
+            counted_loop: None,
+            loop_control: None,
+        };
+        let policy: crate::UpstreamRetry = crate::agent::UpstreamRetry::UntilCancelled;
+        assert_eq!(req.initial_message, "legacy literal");
+        assert_eq!(policy, crate::UpstreamRetry::UntilCancelled);
+    }
 
     #[test]
     fn build_with_only_required_fields_defaults_optionals_to_none() {
