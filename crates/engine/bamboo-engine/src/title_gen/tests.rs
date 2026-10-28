@@ -62,6 +62,164 @@ async fn routing_contract_title_invalid_explicit_fast_never_dispatches_a_fallbac
     }
 }
 
+#[tokio::test]
+async fn routing_contract_title_rejects_removed_fast_with_a_retained_registry() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    for flag in [None, Some(false), Some(true)] {
+        let state = RoutingContext::new(flag);
+        {
+            let mut config = state.config.write().await;
+            assert!(config.provider_instances.remove("fast-b").is_some());
+            assert!(config.provider_instances.contains_key("chat-a"));
+            assert_eq!(
+                config
+                    .defaults
+                    .as_ref()
+                    .unwrap()
+                    .fast
+                    .as_ref()
+                    .unwrap()
+                    .provider,
+                "fast-b"
+            );
+        }
+        assert!(state.registry.get("fast-b").is_some());
+        assert_eq!(
+            state.registry.runtime_models_for_provider("fast-b"),
+            Some(vec!["cheap-b".to_string()])
+        );
+
+        let context: Arc<dyn AgentSessionContext> = state.clone();
+        let result = try_llm_title(
+            &context,
+            &RoutingContext::session(),
+            "Synthetic removed-account request",
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "flag {flag:?}: removed Fast instance unexpectedly resolved: {:?}",
+            state.requests("fast-b")
+        );
+        state.assert_no_requests();
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_title_accepts_an_embedder_owned_registry() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use std::collections::HashMap;
+
+    for flag in [None, Some(false), Some(true)] {
+        for explicit_admission in [false, true] {
+            let state = RoutingContext::new(flag);
+            {
+                let mut config = state.config.write().await;
+                config.provider_instances.clear();
+                config.default_provider_instance = None;
+            }
+            let providers: HashMap<String, Arc<dyn bamboo_llm::LLMProvider>> = state
+                .providers
+                .iter()
+                .map(|(id, provider)| {
+                    (
+                        id.clone(),
+                        provider.clone() as Arc<dyn bamboo_llm::LLMProvider>,
+                    )
+                })
+                .collect();
+            let registry = bamboo_llm::ProviderRegistry::new(providers, "chat-a".into());
+            if explicit_admission {
+                registry.set_runtime_models(HashMap::from([(
+                    "fast-b".to_string(),
+                    vec!["cheap-b".to_string()],
+                )]));
+            }
+            state.registry.replace_with(registry);
+            assert_eq!(
+                state
+                    .registry
+                    .runtime_models_for_provider("fast-b")
+                    .is_some(),
+                explicit_admission
+            );
+
+            let context: Arc<dyn AgentSessionContext> = state.clone();
+            assert_eq!(
+                try_llm_title(
+                    &context,
+                    &RoutingContext::session(),
+                    "Synthetic embedded request",
+                )
+                .await
+                .unwrap(),
+                "Synthetic routing title"
+            );
+            assert_eq!(
+                state.requests("fast-b"),
+                vec![("cheap-b".into(), "title_generation".into())]
+            );
+            assert!(state.requests("chat-a").is_empty());
+            assert!(state.requests("memory-c").is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_title_accepts_an_enabled_synthesized_legacy_provider() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use std::collections::HashMap;
+
+    for flag in [None, Some(false), Some(true)] {
+        let state = RoutingContext::new(flag);
+        {
+            let mut config = state.config.write().await;
+            config.provider_instances.clear();
+            config.default_provider_instance = None;
+            config.provider = "openai".to_string();
+            config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+                model: Some("legacy-chat".into()),
+                fast_model: Some("legacy-fast".into()),
+                ..Default::default()
+            });
+            let defaults = config.defaults.as_mut().unwrap();
+            defaults.chat = bamboo_domain::ProviderModelRef::new("openai", "legacy-chat");
+            defaults.fast = Some(bamboo_domain::ProviderModelRef::new(
+                "openai",
+                "legacy-fast",
+            ));
+            assert!(bamboo_config::synthesize_legacy_instances(&config)
+                .iter()
+                .any(|(id, instance)| id == "openai" && instance.enabled));
+        }
+
+        state
+            .registry
+            .insert("openai".into(), state.providers["fast-b"].clone());
+        state.registry.set_runtime_models(HashMap::from([(
+            "openai".to_string(),
+            vec!["legacy-fast".to_string()],
+        )]));
+        let context: Arc<dyn AgentSessionContext> = state.clone();
+        assert_eq!(
+            try_llm_title(
+                &context,
+                &RoutingContext::session(),
+                "Synthetic legacy request",
+            )
+            .await
+            .unwrap(),
+            "Synthetic routing title"
+        );
+        assert_eq!(
+            state.requests("fast-b"),
+            vec![("legacy-fast".into(), "title_generation".into())]
+        );
+        assert!(state.requests("chat-a").is_empty());
+        assert!(state.requests("memory-c").is_empty());
+    }
+}
+
 #[test]
 fn test_heuristic_title_strips_code_fences_and_caps_length() {
     let input = "```rust\nfn main() {}\n```\nHelp me debug this Rust program please";
