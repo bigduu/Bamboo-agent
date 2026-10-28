@@ -455,3 +455,93 @@ async fn oversized_numeric_server_hints_stop_instead_of_becoming_short_backoff()
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }
+
+#[tokio::test]
+async fn request_body_error_after_prefix_is_not_replayed() {
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use std::error::Error;
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::Notify;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let notify = Arc::new(Notify::new());
+    let received = Arc::new(AtomicUsize::new(0));
+    let server_notify = notify.clone();
+    let server_received = received.clone();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let notify = server_notify.clone();
+            let received = server_received.clone();
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let mut buffer = [0u8; 1024];
+                loop {
+                    let Ok(count) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if count == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&buffer[..count]);
+                    if bytes
+                        .windows(b"synthetic-prefix".len())
+                        .any(|window| window == b"synthetic-prefix")
+                    {
+                        received.fetch_add(1, Ordering::SeqCst);
+                        notify.notify_one();
+                        // Keep the connection open until the client's body error closes it.
+                        let _ = socket.read(&mut buffer).await;
+                        return;
+                    }
+                    assert!(bytes.len() < 16 * 1024, "synthetic request prefix missing");
+                }
+            });
+        }
+    });
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let config = fast(1);
+    let attempts = AtomicUsize::new(0);
+    let result = tokio::time::timeout(
+        Duration::from_millis(900),
+        with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            send_provider_request(&config, "synthetic-body", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                let wait = notify.clone();
+                let prefix = futures::stream::once(async {
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"synthetic-prefix"))
+                });
+                let fail = futures::stream::once(async move {
+                    wait.notified().await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::other(
+                        "connection reset: synthetic request body source failed",
+                    ))
+                });
+                client
+                    .post(&url)
+                    .body(reqwest::Body::wrap_stream(prefix.chain(fail)))
+            }),
+        ),
+    )
+    .await;
+    server.abort();
+    let error = match result {
+        Ok(Err(LLMError::Http(error))) => error,
+        Ok(Err(_)) => panic!("expected a request body transport error"),
+        Ok(Ok(_)) => panic!("synthetic body error unexpectedly succeeded"),
+        Err(_) => panic!("request body source failure kept retrying"),
+    };
+    let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+    let mut body_error = false;
+    while let Some(cause) = source {
+        body_error |= cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body);
+        source = cause.source();
+    }
+    assert!(body_error, "expected a nested reqwest request-body error");
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(received.load(Ordering::SeqCst), 1);
+}

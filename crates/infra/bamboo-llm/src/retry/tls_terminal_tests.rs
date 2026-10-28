@@ -237,7 +237,7 @@ async fn terminal_certificate_failure(trust: bool, host: &str) {
         result.is_ok(),
         "permanent TLS validation failure kept retrying"
     );
-    let error = result.unwrap().err().expect("TLS failure must be returned");
+    let error = result.unwrap().expect_err("TLS failure must be returned");
     assert_native_tls_error(error);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
@@ -297,7 +297,7 @@ async fn opaque_handshake_failure_stops_instead_of_guessing_it_is_transient() {
     )
     .await;
     assert!(result.is_ok(), "opaque TLS failure must not keep retrying");
-    let error = result.unwrap().err().expect("TLS failure must be returned");
+    let error = result.unwrap().expect_err("TLS failure must be returned");
     assert_native_tls_error(error);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
@@ -322,8 +322,7 @@ async fn rustls_certificate_failure(trust: bool, host: &str) {
     .await;
     let error = result
         .expect("Rustls certificate failure kept retrying")
-        .err()
-        .expect("Rustls certificate failure must be returned");
+        .expect_err("Rustls certificate failure must be returned");
     let LLMError::Http(error) = error else {
         panic!("expected a Rustls request transport error");
     };
@@ -458,7 +457,7 @@ async fn synthetic_dns_failure(transient: bool) {
         assert!(calls.load(Ordering::SeqCst) >= 2);
     } else {
         let result = result.expect("unknown resolver failure kept retrying");
-        let LLMError::Http(error) = result.err().expect("resolver must fail") else {
+        let LLMError::Http(error) = result.expect_err("resolver must fail") else {
             panic!("expected resolver transport error");
         };
         assert!(error.is_connect());
