@@ -1,8 +1,10 @@
-//! Real loopback TLS regression tests. The checked-in identity is test-only.
+//! Real loopback TLS regression tests using a throwaway synthetic identity.
 use super::*;
+use std::fs;
 use std::net::SocketAddr;
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
@@ -10,9 +12,70 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
-const CERT: &[u8] = include_bytes!("tls_test_fixtures/test-only-cert.der");
-const ROOT_PEM: &[u8] = include_bytes!("tls_test_fixtures/test-only-cert.pem");
-const KEY: &[u8] = include_bytes!("tls_test_fixtures/test-only-key.der");
+struct TestIdentity {
+    cert: Vec<u8>,
+    root_pem: Vec<u8>,
+    key: Vec<u8>,
+}
+
+fn identity() -> &'static TestIdentity {
+    static IDENTITY: OnceLock<TestIdentity> = OnceLock::new();
+    IDENTITY.get_or_init(|| {
+        // Apple limits server certificate validity even for a custom trusted
+        // root, so generate a short-lived identity instead of expiring a
+        // committed fixture. The CI environments already require openssl.
+        let dir = tempfile::tempdir().expect("temporary certificate directory");
+        let config = dir.path().join("cert.cnf");
+        let pem = dir.path().join("cert.pem");
+        let cert = dir.path().join("cert.der");
+        let key_pem = dir.path().join("key.pem");
+        let key = dir.path().join("key.der");
+        fs::write(
+            &config,
+            "[req]\nprompt=no\ndistinguished_name=dn\nx509_extensions=v3_req\n\
+             [dn]\nCN=synthetic.invalid\n\
+             [v3_req]\nbasicConstraints=critical,CA:TRUE\n\
+             keyUsage=critical,digitalSignature,keyCertSign\n\
+             extendedKeyUsage=serverAuth\nsubjectAltName=DNS:synthetic.invalid\n\
+             subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid:always\n",
+        )
+        .unwrap();
+        let run = |command: &mut Command| {
+            let output = command
+                .output()
+                .expect("openssl must be available for TLS tests");
+            assert!(
+                output.status.success(),
+                "synthetic certificate command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(Command::new("openssl")
+            .args([
+                "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-config",
+            ])
+            .arg(&config)
+            .args(["-extensions", "v3_req", "-keyout"])
+            .arg(&key_pem)
+            .arg("-out")
+            .arg(&pem));
+        run(Command::new("openssl")
+            .args(["x509", "-in"])
+            .arg(&pem)
+            .args(["-outform", "DER", "-out"])
+            .arg(&cert));
+        run(Command::new("openssl")
+            .args(["pkcs8", "-topk8", "-nocrypt", "-in"])
+            .arg(&key_pem)
+            .args(["-outform", "DER", "-out"])
+            .arg(&key));
+        TestIdentity {
+            cert: fs::read(cert).unwrap(),
+            root_pem: fs::read(pem).unwrap(),
+            key: fs::read(key).unwrap(),
+        }
+    })
+}
 
 struct LocalPeer {
     addr: SocketAddr,
@@ -38,8 +101,8 @@ async fn peer(reset_handshake: bool) -> LocalPeer {
     .unwrap()
     .with_no_client_auth()
     .with_single_cert(
-        vec![CertificateDer::from(CERT.to_vec())],
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(KEY.to_vec())),
+        vec![CertificateDer::from(identity().cert.clone())],
+        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(identity().key.clone())),
     )
     .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(config));
@@ -79,7 +142,8 @@ fn client(peer: &LocalPeer, trust: bool) -> reqwest::Client {
         .no_proxy()
         .resolve("synthetic.invalid", peer.addr);
     if trust {
-        builder = builder.add_root_certificate(reqwest::Certificate::from_pem(ROOT_PEM).unwrap());
+        builder = builder
+            .add_root_certificate(reqwest::Certificate::from_pem(&identity().root_pem).unwrap());
     }
     builder.build().unwrap()
 }
