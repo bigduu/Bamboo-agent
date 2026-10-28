@@ -32,13 +32,16 @@ pub(super) fn select_gold_evaluation_provider(
     main: &Arc<dyn LLMProvider>,
     fast: Option<&Arc<dyn LLMProvider>>,
 ) -> Arc<dyn LLMProvider> {
-    if config
+    if let Some(model) = config
         .gold_config
         .as_ref()
-        .and_then(|gold| gold.model_name.as_ref())
-        .is_some()
+        .and_then(|gold| gold.model_name.as_deref())
     {
-        main.clone()
+        config
+            .gold_target_resolver
+            .as_ref()
+            .map(|resolve| resolve(model, main.clone()))
+            .unwrap_or_else(|| main.clone())
     } else {
         fast.cloned().unwrap_or_else(|| main.clone())
     }

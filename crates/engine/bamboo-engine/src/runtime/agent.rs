@@ -96,6 +96,17 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Bind the Host's Gold route to this execution without changing SDK defaults.
+    #[doc(hidden)]
+    pub fn with_gold_target_resolver(
+        &self,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Install the registered SDK adapter on this execution's runtime only.
     #[doc(hidden)]
     pub fn with_sdk_skill_execution_host(

@@ -22,6 +22,17 @@ impl ProviderModelRouter {
         self.registry.provider_for_model(target)
     }
 
+    /// Select the same route as `route` and retain its managed source registry.
+    /// Unmanaged selections retain the embedder's existing behavior.
+    #[doc(hidden)]
+    pub fn route_with_origin(
+        &self,
+        target: &ProviderModelRef,
+    ) -> Result<(Arc<dyn LLMProvider>, Option<Arc<ProviderRegistry>>), LLMError> {
+        let (provider, managed) = self.registry.provider_for_model_with_origin(target)?;
+        Ok((provider, managed.then(|| self.registry.clone())))
+    }
+
     /// Resolve the canonical provider type for a given model reference.
     ///
     /// In multi-instance mode `target.provider` may be an instance id, so this

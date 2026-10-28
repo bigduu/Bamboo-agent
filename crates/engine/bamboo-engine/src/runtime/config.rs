@@ -40,6 +40,11 @@ pub type DisabledFilterSets = (BTreeSet<String>, BTreeSet<String>);
 /// Late-bound resolver for disabled tool and skill-id filters.
 pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sync>;
 
+/// One execution's explicitly selected Gold route, installed only by the Host.
+#[doc(hidden)]
+pub type GoldTargetResolver =
+    Arc<dyn Fn(&str, Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct AuxiliaryModelConfig {
     pub fast_model_name: Option<String>,
@@ -927,6 +932,7 @@ pub struct AgentLoopConfig {
     /// Durable logical-session inbox admitted at safe round boundaries.
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn LiveBootstrapHost>>,
+    pub(crate) gold_target_resolver: Option<GoldTargetResolver>,
     /// Active-owner wake generation. The loop consumes this at the same safe
     /// boundary where it drains SessionInbox; it never interrupts an in-flight
     /// provider/tool operation.
@@ -1156,6 +1162,7 @@ impl Default for AgentLoopConfig {
             guidance_active_run_id: None,
             session_inbox: None,
             live_bootstrap_host: None,
+            gold_target_resolver: None,
             session_activation_notifications: None,
             attachment_reader: None,
             metrics_collector: None,

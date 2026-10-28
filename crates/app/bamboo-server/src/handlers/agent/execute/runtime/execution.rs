@@ -26,6 +26,8 @@ use bamboo_engine::{
 use bamboo_llm::{Config, LLMProvider};
 
 use super::session_state;
+#[path = "gold_route.rs"]
+mod gold_route;
 
 pub(crate) struct SpawnAgentExecution {
     pub(crate) state: actix_web::web::Data<AppState>,
@@ -39,6 +41,8 @@ pub(crate) struct SpawnAgentExecution {
     /// the roster.
     pub(crate) provider_name: String,
     pub(crate) provider_override: Option<Arc<dyn LLMProvider>>,
+    /// The registry that selected this managed override, captured with the handle.
+    pub(crate) provider_override_managed_registry: Option<Arc<bamboo_llm::ProviderRegistry>>,
     /// Cohesive primary + auxiliary model/provider selection.
     pub(crate) model_roster: ModelRoster,
     pub(crate) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
@@ -253,6 +257,17 @@ fn spawn_agent_execution_with_inputs(
             tools_for_execution(args.state.as_ref(), args.is_child_session),
         )
     });
+    let gold_target_resolver = gold_route::make_gold_target_resolver(
+        args.state.as_ref(),
+        &args.provider_name,
+        provider_override.as_ref(),
+        args.provider_override_managed_registry.as_ref(),
+    );
+    let agent = if let Some(resolver) = gold_target_resolver {
+        Arc::new(agent.with_gold_target_resolver(resolver))
+    } else {
+        agent
+    };
     let agent = match live_retry {
         Some(host) => Arc::new(agent.with_live_bootstrap_host(host)),
         None => agent,

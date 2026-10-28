@@ -293,6 +293,14 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
+    /// Whether this single-use target refused its request locally.
+    /// This is for evaluation lifecycle classification, never accounting or
+    /// authorization evidence. Implementations must not infer it from later state.
+    #[doc(hidden)]
+    fn local_dispatch_refused(&self) -> bool {
+        false
+    }
+
     /// Transparent Host decorators retain the original provider allocation's
     /// process-wide concurrency identity. This is never a model/client ID.
     fn resource_allocation_identity(&self) -> Option<usize> {
@@ -527,6 +535,10 @@ struct QueuedBudgetProvider {
 
 #[async_trait]
 impl LLMProvider for QueuedBudgetProvider {
+    fn local_dispatch_refused(&self) -> bool {
+        self.inner.local_dispatch_refused()
+    }
+
     fn queue_requires_current_route(&self) -> bool {
         self.require_current || self.inner.queue_requires_current_route()
     }

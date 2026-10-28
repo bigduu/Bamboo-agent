@@ -72,6 +72,10 @@ impl RoleReasoningProvider {
 
 #[async_trait]
 impl LLMProvider for RoleReasoningProvider {
+    fn local_dispatch_refused(&self) -> bool {
+        self.inner.local_dispatch_refused()
+    }
+
     fn queue_requires_current_route(&self) -> bool {
         self.inner.queue_requires_current_route()
     }

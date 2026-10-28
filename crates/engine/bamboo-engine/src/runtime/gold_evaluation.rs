@@ -290,8 +290,20 @@ where
         session_id,
         &timeout_context,
     )
-    .await?
-    .map_err(|error| AgentError::LLM(error.to_string()))?;
+    .await?;
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) if llm.local_dispatch_refused() => {
+            return Err(GoldEvaluationError::Routing(AgentError::LLM(
+                error.to_string(),
+            )));
+        }
+        Err(error) => {
+            return Err(GoldEvaluationError::Evaluation(AgentError::LLM(
+                error.to_string(),
+            )))
+        }
+    };
     let stream_output =
         consume_llm_stream_silent_with_context(stream, &cancel_token, session_id, &timeout_context)
             .await?;

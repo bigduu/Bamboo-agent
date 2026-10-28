@@ -15501,6 +15501,226 @@ mod tests {
             }
         }
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_explicit_gold_uses_original_guard_and_independent_refusal_state() {
+        use crate::runtime::config::{GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, LLMRequestOptions, ProviderRegistry};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio::sync::RwLock;
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        struct Main {
+            target: Arc<dyn LLMProvider>,
+            requests: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for Main {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while self.requests.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                o: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                if model == "explicit-gold" {
+                    self.target
+                        .chat_stream_with_options(m, t, n, model, o)
+                        .await
+                } else {
+                    self.chat_stream(m, t, n, model).await
+                }
+            }
+        }
+
+        let account = MockServer::start().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                request_count.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n")
+            })
+            .mount(&account)
+            .await;
+        let data = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.provider = "gold-a".into();
+        cfg.default_provider_instance = Some("gold-a".into());
+        cfg.http_proxy = "http://127.0.0.1:9".into();
+        cfg.https_proxy.clear();
+        cfg.proxy_auth = None;
+        cfg.provider_instances.insert("gold-a".into(), serde_json::from_value(json!({
+            "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+            "base_url":account.uri(), "model":"main-model", "runtime_models":["main-model", "explicit-gold"]
+        })).unwrap());
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&cfg, data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let selected = registry
+            .provider_for_configured_model(&cfg, &ProviderModelRef::new("gold-a", "main-model"))
+            .unwrap();
+        let live = Arc::new(RwLock::new(cfg));
+        let markers: Arc<Mutex<Vec<Arc<dyn LLMProvider>>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolver_markers = markers.clone();
+        let resolver_live = live.clone();
+        let resolver_registry = registry.clone();
+        let resolver_selected = selected.clone();
+        let resolver: crate::runtime::config::GoldTargetResolver =
+            Arc::new(move |model, delegate| {
+                let guard = bamboo_llm::gold_admission::guarded_gold_target(
+                    resolver_live.clone(),
+                    resolver_registry.clone(),
+                    ProviderModelRef::new("gold-a", model),
+                    resolver_selected.clone(),
+                    delegate,
+                );
+                resolver_markers.lock().unwrap().push(guard.clone());
+                guard
+            });
+        let config = AgentLoopConfig {
+            model_name: Some("main-model".into()),
+            system_prompt: Some("synthetic system".into()),
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                model_name: Some("explicit-gold".into()),
+                ..Default::default()
+            }),
+            gold_target_resolver: Some(resolver),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            ..Default::default()
+        };
+        let main: Arc<dyn LLMProvider> = Arc::new(Main {
+            target: selected,
+            requests: requests.clone(),
+        });
+        let mut session = Session::new("guarded-queue", "main-model");
+        let mut state = e2e_loop_state(&session.id);
+        state.model_name = "main-model".into();
+        let previous = crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+            &None,
+            &session,
+            &session.id,
+            1,
+            Some("main-model"),
+            None,
+            GoldCheckpoint::PostRound,
+            config.gold_config.as_ref().unwrap(),
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .unwrap()
+        .unwrap();
+        state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+            request: previous,
+            join_handle: tokio::spawn(async { None }),
+        });
+        let (tx, _rx) = mpsc::channel(128);
+        let first = super::select_gold_evaluation_provider(&config, &main, None);
+        super::spawn_gold_evaluation_if_needed(
+            1,
+            &session,
+            &tx,
+            &config,
+            &mut state,
+            first,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(state.gold_evaluation.queued_request.is_some());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .unwrap()
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            main,
+            Arc::new(AlwaysOkExecutor),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("foreground pipeline should complete");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "exactly one queued Gold dispatch"
+        );
+        let seen = account.received_requests().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&seen[0].body).unwrap()["model"],
+            "explicit-gold"
+        );
+        let (old_guard, new_guard) = {
+            let markers = markers.lock().unwrap();
+            assert!(markers.len() >= 2, "a new guard must be created at refresh");
+            (markers[0].clone(), markers[1].clone())
+        };
+        assert!(!old_guard.local_dispatch_refused());
+        assert!(!new_guard.local_dispatch_refused());
+        assert!(old_guard
+            .chat_stream(&[], &[], None, "different-model")
+            .await
+            .is_err());
+        assert!(old_guard.local_dispatch_refused());
+        assert!(
+            !new_guard.local_dispatch_refused(),
+            "refusal belongs to exactly one guard"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "wrong model is locally rejected"
+        );
+    }
 }
 
 #[cfg(test)]

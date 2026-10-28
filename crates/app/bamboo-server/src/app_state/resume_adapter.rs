@@ -182,7 +182,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
             model_ref.provider = resolved_provider_name.clone();
             persist_model_ref(&mut session, &model_ref);
         }
-        let provider_override = match self.0.provider_registry.get(&resolved_provider_name) {
+        let (provider_override, provider_override_is_managed) = match self
+            .0
+            .provider_registry
+            .get_with_origin(&resolved_provider_name)
+        {
             Some(provider) => provider,
             None => {
                 tracing::error!(
@@ -194,6 +198,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 return;
             }
         };
+        let provider_override_managed_registry =
+            provider_override_is_managed.then(|| self.0.provider_registry.clone());
         let resolved_provider_type = resolve_provider_type(
             &config_snapshot,
             &resolved_provider_name,
@@ -327,6 +333,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     is_child_session,
                     provider_name: resolved_provider_name,
                     provider_override: Some(provider_override.clone()),
+                    provider_override_managed_registry,
                     model_roster,
                     reasoning_effort,
                     reasoning_effort_source,
@@ -707,6 +714,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 is_child_session,
                 provider_name: resolved_provider_name,
                 provider_override: Some(provider_override),
+                provider_override_managed_registry,
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source,

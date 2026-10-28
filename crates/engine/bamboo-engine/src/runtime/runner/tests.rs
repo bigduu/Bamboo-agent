@@ -192,7 +192,6 @@ async fn agent_loop_explicit_gold_requires_managed_account_admission() {
     use bamboo_llm::{Config, ProviderRegistry};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::RwLock as StdRwLock;
     use std::time::Duration;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, ResponseTemplate};
@@ -313,11 +312,11 @@ async fn agent_loop_explicit_gold_requires_managed_account_admission() {
 
     // The closure exercises the same shared role resolvers as the Host, while
     // the genuine runner executes both Gold checkpoint consumers.
-    let live_config = Arc::new(StdRwLock::new(config));
+    let live_config = Arc::new(tokio::sync::RwLock::new(config));
     let resolver_config = live_config.clone();
     let resolver_registry = registry.clone();
     let resolver = Arc::new(move || {
-        let config = resolver_config.read().unwrap();
+        let config = resolver_config.try_read().unwrap();
         let areas =
             crate::model_areas::resolve_global_area_models(&config, "chat-a", &resolver_registry);
         let (fast_model_name, fast_model_provider) =
@@ -343,10 +342,24 @@ async fn agent_loop_explicit_gold_requires_managed_account_admission() {
             ..Default::default()
         }
     });
+    // Model the Host's per-run binding using the exact same guarded target,
+    // leaving SDK runs without this hook unchanged.
+    let gold_config_handle = live_config.clone();
+    let gold_registry = registry.clone();
+    let gold_expected = main.clone();
+    let gold_resolver = Arc::new(move |model: &str, delegate: Arc<dyn LLMProvider>| {
+        bamboo_llm::gold_admission::guarded_gold_target(
+            gold_config_handle.clone(),
+            gold_registry.clone(),
+            ProviderModelRef::new("chat-a", model),
+            gold_expected.clone(),
+            delegate,
+        )
+    });
     let mut request_offset = 0usize;
     for revoked in [false, true] {
         if revoked {
-            let mut current = live_config.write().unwrap();
+            let mut current = live_config.write().await;
             current
                 .provider_instances
                 .get_mut("chat-a")
@@ -390,6 +403,7 @@ async fn agent_loop_explicit_gold_requires_managed_account_admission() {
                 ledger_agenda: false,
             },
             auxiliary_model_resolver: Some(resolver.clone()),
+            gold_target_resolver: Some(gold_resolver.clone()),
             run_budget: bamboo_config::RunBudgetConfig {
                 max_rounds: Some(4),
                 ..Default::default()

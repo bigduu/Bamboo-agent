@@ -9,6 +9,7 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod terminal;
+include!("token_budget_outer_guard_fixture.rs");
 
 enum Script {
     Known,

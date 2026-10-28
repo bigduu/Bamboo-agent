@@ -224,6 +224,20 @@ impl ProviderRegistry {
         Self::provider_for_model_in_snapshot(&state, target)
     }
 
+    /// Select the existing model route and its origin from the same generation.
+    #[doc(hidden)]
+    pub fn provider_for_model_with_origin(
+        &self,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<(Arc<dyn LLMProvider>, bool), LLMError> {
+        let state = self.state.read().recover_poison();
+        let provider = Self::provider_for_model_in_snapshot(&state, target)?;
+        Ok((
+            provider,
+            matches!(&state.origin, RegistryOrigin::Managed { .. }),
+        ))
+    }
+
     fn provider_for_model_in_snapshot(
         state: &RegistryState,
         target: &bamboo_domain::ProviderModelRef,
@@ -548,6 +562,17 @@ impl ProviderRegistry {
             .values()
             .cloned()
             .collect()
+    }
+
+    /// The same unvalidated `get` route and origin, from one generation.
+    #[doc(hidden)]
+    pub fn get_with_origin(&self, name: &str) -> Option<(Arc<dyn LLMProvider>, bool)> {
+        let state = self.state.read().recover_poison();
+        let provider = state.providers.get(name)?.clone();
+        Some((
+            provider,
+            matches!(&state.origin, RegistryOrigin::Managed { .. }),
+        ))
     }
 
     /// Get the default provider (the one configured as `config.provider`).
