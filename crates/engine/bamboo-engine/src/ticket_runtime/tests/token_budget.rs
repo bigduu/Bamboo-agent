@@ -756,3 +756,87 @@ async fn token_budget_unconfigured_ordinary_child_preserves_legacy_and_later_con
     );
     assert_eq!(ledger(&f).total_charged, 0);
 }
+
+#[tokio::test]
+async fn work_budget_and_reasoning_snapshot_share_real_auxiliary_semaphore() {
+    use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+    use bamboo_llm::{provider::queued_snapshot_for, ResolvedModel};
+    use std::time::Duration;
+
+    struct Snapshotting {
+        inner: Arc<dyn LLMProvider>,
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for Snapshotting {
+        fn queued_provider_snapshot(
+            &self,
+        ) -> bamboo_llm::provider::Result<Option<Arc<dyn LLMProvider>>> {
+            Ok(Some(self.inner.clone()))
+        }
+        async fn list_model_info(&self) -> bamboo_llm::provider::Result<Vec<ProviderModelInfo>> {
+            self.inner.list_model_info().await
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_domain::Message],
+            tools: &[bamboo_domain::ToolSchema],
+            cap: Option<u32>,
+            model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.inner.chat_stream(messages, tools, cap, model).await
+        }
+    }
+
+    let (fixture, _registration) = admitted().await;
+    configure(&fixture, 140);
+    let budget = NativeWorkTokenBudget::capture(
+        Some(fixture.service.clone()),
+        fixture.storage.clone(),
+        &fixture.child,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let calls = Provider::new(Script::Known);
+    let inner: Arc<dyn LLMProvider> = Arc::new(Snapshotting {
+        inner: calls.clone(),
+    });
+    let decorated = budget.wrap(
+        inner,
+        &AgentLoopConfig {
+            app_data_dir: Some(fixture.dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let reference = ProviderModelRef::new("fixture", "fixture-model")
+        .with_reasoning_effort(ReasoningEffort::Low);
+    let original = ResolvedModel::from_ref(decorated, &reference).provider;
+    let snapshot = queued_snapshot_for(original.clone()).unwrap();
+    assert_eq!(
+        snapshot.resource_allocation_identity(),
+        original.resource_allocation_identity()
+    );
+
+    let permit =
+        crate::runtime::runner::auxiliary_budget::acquire(&original, "fixture-model", 1).await;
+    let mut waiting = Box::pin(crate::runtime::runner::auxiliary_budget::acquire(
+        &snapshot,
+        "fixture-model",
+        1,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), waiting.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 0);
+    drop(permit);
+    let _permit = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap();
+    snapshot
+        .chat_stream(&[], &[], Some(40), "fixture-model")
+        .await
+        .unwrap();
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 1);
+}

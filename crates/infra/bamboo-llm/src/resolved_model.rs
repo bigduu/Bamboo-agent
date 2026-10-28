@@ -72,6 +72,20 @@ impl RoleReasoningProvider {
 
 #[async_trait]
 impl LLMProvider for RoleReasoningProvider {
+    fn queued_route_identity(&self) -> crate::provider::QueuedRouteIdentity {
+        crate::provider::queued_identity_for(&self.inner)
+    }
+
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(inner) = self.inner.queued_provider_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            inner,
+            reasoning_effort: self.reasoning_effort,
+        })))
+    }
+
     fn known_pre_dispatch_error(&self) -> Option<crate::provider::LLMError> {
         self.inner.known_pre_dispatch_error()
     }

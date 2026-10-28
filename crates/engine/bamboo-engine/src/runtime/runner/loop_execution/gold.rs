@@ -12,7 +12,9 @@ use crate::runtime::gold_evaluation::{
     apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold_with_dispatch,
     execute_async_gold_evaluation, AsyncGoldEvaluationRequest, GoldEvaluationResult,
 };
-use crate::runtime::runner::loop_execution::startup::{InFlightGoldEvaluation, LoopRunState};
+use crate::runtime::runner::loop_execution::startup::{
+    InFlightGoldEvaluation, LoopRunState, QueuedEvaluation,
+};
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::{
     AgentError, AgentEvent, GoldCheckpoint, GoldConfidence, GoldDecision, Message, Session,
@@ -486,6 +488,7 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
     state: &mut LoopRunState,
     event_tx: &mpsc::Sender<AgentEvent>,
     llm: Arc<dyn LLMProvider>,
+    config: &AgentLoopConfig,
     cancel_token: CancellationToken,
     configured_limit: usize,
 ) {
@@ -493,15 +496,35 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
         return;
     }
 
-    let Some(request) = state.gold_evaluation.queued_request.take() else {
+    let Some(queued) = state.gold_evaluation.queued_request.take() else {
         return;
     };
-
+    // A dedicated Gold model belongs to the executing provider. Without one,
+    // the target is the current complete Fast pair, with main fallback only
+    // when the SDK left that part unset.
+    let current_model = config
+        .gold_config
+        .as_ref()
+        .filter(|gold| gold.enabled)
+        .map(|gold| {
+            gold.model_name
+                .as_deref()
+                .or(state.auxiliary_models.fast_model_name.as_deref())
+                .unwrap_or(state.model_name.as_str())
+        });
+    let Some(_admitted) = current_model.and_then(|model| queued.current_provider(llm, model))
+    else {
+        tracing::warn!(
+            "[{}] Dropped queued Gold evaluation after its model or provider changed",
+            state.session_id
+        );
+        return;
+    };
     spawn_gold_evaluation_request(
         state,
         event_tx,
-        request,
-        llm,
+        queued.request,
+        queued.provider,
         cancel_token,
         configured_limit,
     );
@@ -548,12 +571,20 @@ pub(super) fn spawn_gold_evaluation_if_needed(
     };
 
     if state.gold_evaluation.in_flight.is_some() {
-        state.gold_evaluation.queued_request = Some(request);
-        tracing::debug!(
-            "[{}] Queued latest async Gold evaluation snapshot for round {} while another evaluation is still in flight",
-            state.session_id,
-            turn + 1
-        );
+        let model_name = request.model_name.clone();
+        state.gold_evaluation.queued_request = QueuedEvaluation::new(request, llm, model_name);
+        if state.gold_evaluation.queued_request.is_some() {
+            tracing::debug!(
+                "[{}] Queued latest async Gold evaluation for round {}",
+                state.session_id,
+                turn + 1
+            );
+        } else {
+            tracing::warn!(
+                "[{}] Could not bind the queued Gold evaluation to a stable provider",
+                state.session_id
+            );
+        }
         return Ok(());
     }
 
@@ -724,7 +755,13 @@ mod tests {
     async fn queued_refused_fast_is_not_harvested_or_persisted_as_gold_success() {
         let (model, provider) = synthetic_rejected_fast().await;
         let mut session = Session::new("queued-gold-fixture", "model");
-        let config = AgentLoopConfig::default();
+        let config = AgentLoopConfig {
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let request = build_async_gold_evaluation_request(
             &None,
             &session,
@@ -752,10 +789,17 @@ mod tests {
             overflow_recovery: Default::default(),
             task_evaluation: Default::default(),
             gold_evaluation: crate::runtime::runner::loop_execution::startup::GoldEvaluationState {
-                queued_request: Some(request.clone()),
+                queued_request: QueuedEvaluation::new(
+                    request.clone(),
+                    provider.clone(),
+                    model.clone(),
+                ),
                 ..Default::default()
             },
-            auxiliary_models: Default::default(),
+            auxiliary_models: crate::runtime::config::AuxiliaryModelConfig {
+                fast_model_name: Some(model.clone()),
+                ..Default::default()
+            },
             runtime_state: bamboo_domain::AgentRuntimeState::new(session.id.clone()),
         };
         let (tx, mut rx) = mpsc::channel(8);
@@ -764,6 +808,7 @@ mod tests {
             &mut state,
             &tx,
             provider.clone(),
+            &config,
             CancellationToken::new(),
             1,
         );
@@ -791,10 +836,11 @@ mod tests {
 
         // A run already cancelled before the queued task is polled must not
         // dispatch or emit a Gold Started/Completed event either.
-        state.gold_evaluation.queued_request = Some(request);
+        state.gold_evaluation.queued_request =
+            QueuedEvaluation::new(request, provider.clone(), model.clone());
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        start_queued_gold_evaluation_if_idle(&mut state, &tx, provider, cancelled, 1);
+        start_queued_gold_evaluation_if_idle(&mut state, &tx, provider, &config, cancelled, 1);
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !state
                 .gold_evaluation

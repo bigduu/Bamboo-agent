@@ -27,6 +27,19 @@ impl ReloadableProvider {
 
 #[async_trait]
 impl LLMProvider for ReloadableProvider {
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let current = self
+            .inner
+            .try_read()
+            .map_err(|_| {
+                bamboo_llm::LLMError::Api(
+                    "Provider is being reconfigured; retry the queued evaluation".into(),
+                )
+            })?
+            .clone();
+        Ok(Some(bamboo_llm::provider::queued_snapshot_for(current)?))
+    }
+
     fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
         match self.inner.try_read() {
             Ok(provider) => provider.known_pre_dispatch_error(),
@@ -363,5 +376,142 @@ mod tests {
         *inner.write().await = Arc::new(VisionMetadataProvider(false));
         assert_eq!(p.vision_support_override("same").await, Some(false));
         assert_eq!(p.vision_support_override("unknown").await, None);
+    }
+
+    #[tokio::test]
+    async fn queued_snapshot_tracks_the_actual_reloadable_provider() {
+        use bamboo_llm::provider::{queued_identity_for, queued_snapshot_for, QueuedRouteIdentity};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Capture(Arc<AtomicUsize>);
+        #[async_trait]
+        impl LLMProvider for Capture {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        fn same(left: QueuedRouteIdentity, right: QueuedRouteIdentity) -> bool {
+            match (left, right) {
+                (QueuedRouteIdentity::Stable(a), QueuedRouteIdentity::Stable(b)) => {
+                    Arc::ptr_eq(&a, &b)
+                }
+                _ => false,
+            }
+        }
+
+        let a_calls = Arc::new(AtomicUsize::new(0));
+        let b_calls = Arc::new(AtomicUsize::new(0));
+        let a: Arc<dyn LLMProvider> = Arc::new(Capture(a_calls.clone()));
+        let b: Arc<dyn LLMProvider> = Arc::new(Capture(b_calls.clone()));
+        let inner = Arc::new(RwLock::new(a));
+        let reloadable: Arc<dyn LLMProvider> = Arc::new(ReloadableProvider::new(inner.clone()));
+        let first = queued_snapshot_for(reloadable.clone()).unwrap();
+        let unchanged = queued_snapshot_for(reloadable.clone()).unwrap();
+        assert!(same(
+            queued_identity_for(&first),
+            queued_identity_for(&unchanged)
+        ));
+
+        *inner.write().await = b;
+        let replaced = queued_snapshot_for(reloadable.clone()).unwrap();
+        assert!(!same(
+            queued_identity_for(&first),
+            queued_identity_for(&replaced)
+        ));
+        // A frozen dispatch handle cannot retarget to B after it was resolved.
+        unchanged
+            .chat_stream(&[], &[], None, "synthetic")
+            .await
+            .unwrap();
+        assert_eq!(a_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(b_calls.load(Ordering::SeqCst), 0);
+
+        let _guard = inner.write().await;
+        assert!(
+            queued_snapshot_for(reloadable).is_err(),
+            "busy reload must fail closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn reloadable_snapshot_shares_real_auxiliary_semaphore_with_original() {
+        use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+        use bamboo_engine::runtime::runner::test_acquire_auxiliary_budget;
+        use bamboo_llm::{provider::queued_snapshot_for, ResolvedModel};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct Capture(Arc<AtomicUsize>);
+        #[async_trait]
+        impl LLMProvider for Capture {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let raw: Arc<dyn LLMProvider> = Arc::new(Capture(calls.clone()));
+        let shared = Arc::new(RwLock::new(raw));
+        let live_a: Arc<dyn LLMProvider> = Arc::new(ReloadableProvider::new(shared.clone()));
+        let live_b: Arc<dyn LLMProvider> = Arc::new(ReloadableProvider::new(shared));
+        let reference =
+            ProviderModelRef::new("fixture", "model-a").with_reasoning_effort(ReasoningEffort::Low);
+        let with_reasoning = ResolvedModel::from_ref(live_a.clone(), &reference).provider;
+        for (index, original) in [live_a.clone(), with_reasoning].into_iter().enumerate() {
+            let pinned = queued_snapshot_for(original.clone()).expect("snapshot");
+            let original_key = original
+                .resource_allocation_identity()
+                .unwrap_or(Arc::as_ptr(&original) as *const () as usize);
+            assert_eq!(pinned.resource_allocation_identity(), Some(original_key));
+            let model = format!("budget-fixture-{index}");
+            let permit = test_acquire_auxiliary_budget(&original, &model, 1).await;
+            let mut waiting = Box::pin(test_acquire_auxiliary_budget(&pinned, &model, 1));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), waiting.as_mut())
+                    .await
+                    .is_err(),
+                "the snapshot must wait on the original provider's sole permit"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), index);
+            drop(permit);
+            let _permit = tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap();
+            pinned.chat_stream(&[], &[], None, &model).await.unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), index + 1);
+        }
+        // Different outer wrappers over one lock keep their existing distinct
+        // budget keys; freezing one must not merge them.
+        assert_ne!(
+            Arc::as_ptr(&live_a) as *const () as usize,
+            Arc::as_ptr(&live_b) as *const () as usize
+        );
+        let frozen_a = queued_snapshot_for(live_a.clone()).unwrap();
+        let frozen_b = queued_snapshot_for(live_b.clone()).unwrap();
+        assert_ne!(
+            frozen_a.resource_allocation_identity(),
+            frozen_b.resource_allocation_identity()
+        );
+        let weak = Arc::downgrade(&live_a);
+        drop(live_a);
+        assert!(
+            weak.upgrade().is_some(),
+            "the snapshot must keep its identity allocation alive"
+        );
     }
 }

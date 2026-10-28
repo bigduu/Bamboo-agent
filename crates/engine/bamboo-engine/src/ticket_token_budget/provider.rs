@@ -466,6 +466,21 @@ impl Usage {
 
 #[async_trait::async_trait]
 impl LLMProvider for BudgetedProvider {
+    fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
+        bamboo_llm::provider::queued_identity_for(&self.inner)
+    }
+    fn queued_provider_snapshot(
+        &self,
+    ) -> bamboo_llm::provider::Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(inner) = self.inner.queued_provider_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            inner,
+            budget: self.budget.clone(),
+            limits: self.limits.clone(),
+        })))
+    }
     fn known_pre_dispatch_error(&self) -> Option<LLMError> {
         self.inner.known_pre_dispatch_error()
     }

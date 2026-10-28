@@ -12,7 +12,17 @@ use bamboo_domain::{Message, ModelContextResetReason};
 use futures::Stream;
 use serde::Serialize;
 use std::pin::Pin;
+use std::sync::Arc;
 use thiserror::Error;
+
+/// Allocation identity for pairing delayed requests. Dynamic credentials
+/// inside an existing provider remain the provider owner’s responsibility.
+#[doc(hidden)]
+#[derive(Clone)]
+pub enum QueuedRouteIdentity {
+    Stable(Arc<dyn LLMProvider>),
+    Unmanaged,
+}
 
 /// Errors that can occur when working with LLM providers
 #[derive(Error, Debug)]
@@ -289,6 +299,21 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
+    /// Underlying allocation used for pairing a delayed model and provider.
+    /// Transparent decorators should forward this unchanged. This identity
+    /// does not establish that dynamic credentials inside a provider are fixed.
+    #[doc(hidden)]
+    fn queued_route_identity(&self) -> QueuedRouteIdentity {
+        QueuedRouteIdentity::Unmanaged
+    }
+
+    /// Freeze only transparent mutable handles for delayed dispatch. An SDK
+    /// provider defaults to its existing Arc; it owns changes behind that Arc.
+    #[doc(hidden)]
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        Ok(None)
+    }
+
     /// Effective Vision support. Missing declarations default to enabled;
     /// only an explicit false disables it. Never infer from model names.
     async fn supports_vision(&self, model: &str) -> bool {
@@ -448,6 +473,117 @@ pub trait LLMProvider: Send + Sync {
             .into_iter()
             .map(ProviderModelInfo::from_id)
             .collect())
+    }
+}
+
+/// Produce a stable, process-local identity for a known wrapper's inner Arc.
+#[doc(hidden)]
+pub fn queued_identity_for(provider: &Arc<dyn LLMProvider>) -> QueuedRouteIdentity {
+    match provider.queued_route_identity() {
+        QueuedRouteIdentity::Unmanaged => QueuedRouteIdentity::Stable(provider.clone()),
+        identity => identity,
+    }
+}
+
+/// Resolve a transparent mutable wrapper once, retaining the original outer
+/// Arc and its existing process-wide auxiliary-budget identity.
+#[doc(hidden)]
+pub fn queued_snapshot_for(provider: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLMProvider>> {
+    match provider.queued_provider_snapshot()? {
+        Some(inner) => Ok(Arc::new(QueuedBudgetProvider {
+            inner,
+            original: provider,
+        })),
+        None => Ok(provider),
+    }
+}
+
+struct QueuedBudgetProvider {
+    inner: Arc<dyn LLMProvider>,
+    original: Arc<dyn LLMProvider>,
+}
+
+#[async_trait]
+impl LLMProvider for QueuedBudgetProvider {
+    fn queued_route_identity(&self) -> QueuedRouteIdentity {
+        queued_identity_for(&self.inner)
+    }
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        Some(
+            self.original
+                .resource_allocation_identity()
+                .unwrap_or(Arc::as_ptr(&self.original) as *const () as usize),
+        )
+    }
+    async fn supports_vision(&self, model: &str) -> bool {
+        self.inner.supports_vision(model).await
+    }
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        self.inner.vision_support_override(model).await
+    }
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        self.inner
+            .capability_loading_mode(model, required_tool)
+            .await
+    }
+    async fn provider_visible_tool_footprint(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        self.inner
+            .provider_visible_tool_footprint(ir, tools, model, required_tool)
+            .await
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream> {
+        self.inner
+            .chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        self.inner
+            .chat_stream_with_options(messages, tools, max_output_tokens, model, options)
+            .await
+    }
+    async fn chat_stream_ir(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        self.inner
+            .chat_stream_ir(ir, tools, max_output_tokens, model, options)
+            .await
+    }
+    async fn list_models(&self) -> Result<Vec<String>> {
+        self.inner.list_models().await
+    }
+    async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_model_info().await
     }
 }
 
