@@ -95,20 +95,67 @@ const FEATURE_CONTEXTS = [
       "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"] }] },
 ];
 
-// A package and its additive feature cases always share the same runner.
-const FEATURE_SHARDS = ["agent", "server", "packages-0", "packages-1", "packages-2", "packages-3", "packages-4"];
+const SERVER_FILTERS = ["browser::", "handlers::agent::chat::", "handlers::agent::execute::",
+  "handlers::settings::", "app_state::", "handlers::"];
+const SERVER_LIB_SHARDS = ["server-browser", "server-chat", "server-execute", "server-settings",
+  "server-app-state", "server-handlers", "server-other"];
+const FEATURE_SHARDS = ["agent-core", "agent-tests-0", "agent-tests-1", "agent-tests-2", "agent-tests-3",
+  ...SERVER_LIB_SHARDS, "server-tests-0", "server-tests-1",
+  "packages-0", "packages-1", "packages-2", "packages-3", "packages-4"];
 function packageShard(name) {
   if (name === "bamboo-agent") return "agent";
   if (name === "bamboo-server") return "server";
   return "packages-" + createHash("sha256").update(name).digest().readUInt32BE(0) % 5;
 }
+function defaultFeatures(owner) {
+  const enabled = new Set(["default"]), pending = ["default"];
+  while (pending.length) for (const feature of owner.features?.[pending.pop()] || []) {
+    if (Object.hasOwn(owner.features, feature) && !enabled.has(feature)) {
+      enabled.add(feature); pending.push(feature);
+    }
+  }
+  return enabled;
+}
+function integrationTargets(owner, shard) {
+  const agent = owner.name === "bamboo-agent", count = agent ? 4 : 2;
+  const index = Number(shard.slice(shard.lastIndexOf("-") + 1));
+  assert.ok(Number.isInteger(index) && index >= 0 && index < count, "Invalid integration shard");
+  const enabled = defaultFeatures(owner);
+  return owner.targets.filter((target) => target.test && target.kind.includes("test") &&
+    (target["required-features"] || []).every((feature) => enabled.has(feature)))
+    .filter((target) => {
+      // Both default catalogs must be available to the additive Ticket owner.
+      if (agent && ["ticket_runtime_publication", "ticket_runtime_files"].includes(target.name)) return index === 0;
+      return createHash("sha256").update(target.name).digest().readUInt32BE(0) % count === index;
+    }).map((target) => target.name).sort();
+}
+function defaultShardArguments(owner, shard) {
+  const args = cargoArguments(owner);
+  if (!shard) return args;
+  if (shard === "agent-core") return [...args, "--lib", "--bins"];
+  if (shard.startsWith("agent-tests-") || shard.startsWith("server-tests-")) {
+    const targets = integrationTargets(owner, shard);
+    assert.ok(targets.length, "Integration shard has no targets: " + shard);
+    return [...args, ...targets.flatMap((target) => ["--test", target])];
+  }
+  const index = SERVER_LIB_SHARDS.indexOf(shard);
+  if (index >= 0) {
+    args.push("--lib");
+    if (index < SERVER_FILTERS.length) args.push(SERVER_FILTERS[index]);
+    args.push("--", ...SERVER_FILTERS.slice(0, index).flatMap((filter) => ["--skip", filter]));
+  }
+  return args;
+}
 function selectShard(packages, featureContexts, shard) {
   if (!shard) return { packages, featureContexts };
   assert.ok(FEATURE_SHARDS.includes(shard), "Unknown feature shard: " + shard);
-  const selected = packages.filter((owner) => packageShard(owner.name) === shard);
+  const group = shard.startsWith("agent-") ? "agent" : shard.startsWith("server-") ? "server" : shard;
+  const selected = packages.filter((owner) => packageShard(owner.name) === group);
   assert.ok(selected.length, "Feature shard must contain at least one package: " + shard);
   const names = new Set(selected.map((owner) => owner.name));
-  return { packages: selected, featureContexts: featureContexts.filter((context) => names.has(context.package)) };
+  return { packages: selected, featureContexts: featureContexts.filter((context) => names.has(context.package) &&
+    (context.package !== "bamboo-agent" || shard === "agent-tests-0") &&
+    (context.package !== "bamboo-server" || shard === "server-other")) };
 }
 
 function selectedPackages(metadata) {
@@ -339,7 +386,10 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
   featureContexts = selection.featureContexts;
   const directory = fs.mkdtempSync(path.join(environment.RUNNER_TEMP || os.tmpdir(), "bamboo-feature-tests-"));
   const contexts = [], defaults = new Map();
+  const docOwner = environment.BAMBOO_FEATURE_SHARD === "agent-core" || environment.BAMBOO_FEATURE_SHARD === "server-tests-0"
+    ? packages[0] : null;
   const plan = [...packages.map((owner) => ({ label: "default-" + owner.name })),
+    ...(docOwner ? [{ label: "default-doc-" + docOwner.name }, { label: "default-examples-" + docOwner.name }] : []),
     ...featureContexts.map((context) => ({ label: "feature-" + context.package, features: context.features, targets: context.targets }))];
   const finished = [], source = { root, sourceCatalogSha,
     controllerSha256: createHash("sha256").update(fs.readFileSync(__filename)).digest("hex"),
@@ -387,7 +437,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
   for (const owner of packages) {
     let run;
     try {
-      run = cargo("default-" + owner.name, cargoArguments(owner));
+      run = cargo("default-" + owner.name, defaultShardArguments(owner, environment.BAMBOO_FEATURE_SHARD));
       run.receipt.catalog = catalog(run, owner);
       defaults.set(owner.name, run.receipt.catalog);
       if (owner.name === "bamboo-infrastructure") {
@@ -447,6 +497,18 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     finished.push("default-" + owner.name);
     checkpoint("context-finished", "default-" + owner.name);
   }
+  if (docOwner) {
+    const commands = [
+      ["default-doc-" + docOwner.name, ["test", "--locked", "--no-fail-fast", "--message-format=json-render-diagnostics", "-p", docOwner.name, "--doc"]],
+      ["default-examples-" + docOwner.name, ["build", "--locked", "--profile", "test", "--message-format=json-render-diagnostics", "-p", docOwner.name, "--examples"]],
+    ];
+    for (const [label, args] of commands) {
+      try { cargo(label, args); }
+      catch (error) { contexts.push({ label, status: 1, error: error.message }); }
+      finished.push(label);
+      checkpoint("context-finished", label);
+    }
+  }
   for (const context of featureContexts) {
     let compile;
     try {
@@ -501,12 +563,12 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     "Feature Unit/E2E: " + packages.length + " independent default package contexts; " + featureContexts.length +
     " explicit additive feature contexts; one owned target directory. Status: " + status + ".\n");
   checkpoint("finished", null, null, status === 0 && finished.length === plan.length &&
-    contexts.length === packages.length + featureContexts.reduce((count, context) => count + 1 + context.targets.length, 0));
+    contexts.length === packages.length + (docOwner ? 2 : 0) + featureContexts.reduce((count, context) => count + 1 + context.targets.length, 0));
   return { status, contexts, directory, packages: packages.map((item) => item.name) };
 }
 
 module.exports = { selectedPackages, sourceFeatureHash, cargoArguments, compiledExecutable, sshExecutable, runSerialStorage,
-  FEATURE_SHARDS, packageShard, selectShard,
+  FEATURE_SHARDS, SERVER_FILTERS, SERVER_LIB_SHARDS, packageShard, integrationTargets, defaultShardArguments, selectShard,
   SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, PLANNER_SERIAL, runPlannerSerial,
   DEFAULT_TELEMETRY_CASE, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, validateFeatureCatalog, runFeatureTests };
 if (require.main === module) {

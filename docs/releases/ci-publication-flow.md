@@ -7,7 +7,7 @@ The current workflow files and branch protection are authoritative during rollou
 ## Feature: test before dev
 
 Create a feature branch and PR to `dev`. Code CI runs Linux Unit and E2E in
-independently rerunnable package shards; native-platform cases are available by
+independently rerunnable test shards; native-platform cases are available by
 manual dispatch. Root and docs Markdown-only changes run Quick Checks. Fix failures on that feature branch before
 merging. Run focused local tests for changed behavior; retain the actual CI
 source and results for review.
