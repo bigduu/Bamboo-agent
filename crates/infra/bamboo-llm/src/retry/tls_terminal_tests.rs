@@ -218,7 +218,7 @@ async fn trusted_matching_certificate_still_succeeds() {
 }
 
 #[tokio::test]
-async fn connection_reset_during_handshake_remains_retryable() {
+async fn opaque_handshake_failure_stops_instead_of_guessing_it_is_transient() {
     let peer = peer(true).await;
     let client = client(&peer, true);
     let url = format!("https://synthetic.invalid:{}/", peer.addr.port());
@@ -235,10 +235,31 @@ async fn connection_reset_during_handshake_remains_retryable() {
         ),
     )
     .await;
-    assert!(
-        result.is_err(),
-        "temporary handshake reset must keep retrying"
-    );
+    assert!(result.is_ok(), "opaque TLS failure must not keep retrying");
+    assert!(result.unwrap().is_err());
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn plain_tcp_reset_before_headers_remains_retryable() {
+    let peer = peer(true).await;
+    let client = reqwest::Client::builder().no_proxy().build().unwrap();
+    let url = format!("http://127.0.0.1:{}/", peer.addr.port());
+    let config = retry_config();
+    let attempts = AtomicUsize::new(0);
+    let result = tokio::time::timeout(
+        Duration::from_millis(900),
+        with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            send_provider_request(&config, "synthetic", || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                client.get(&url)
+            }),
+        ),
+    )
+    .await;
+    assert!(result.is_err(), "known TCP resets should remain retryable");
     assert!(attempts.load(Ordering::SeqCst) >= 2);
     assert!(peer.accepted.load(Ordering::SeqCst) >= 2);
 }
