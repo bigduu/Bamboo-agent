@@ -5433,6 +5433,7 @@ async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_defin
 async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow() {
     use bytes::Bytes;
     use futures::StreamExt;
+    use std::error::Error;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
     use tokio::sync::Notify;
@@ -5441,6 +5442,7 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
         url: String,
         notify: Arc<Notify>,
         calls: Arc<AtomicUsize>,
+        builds: Arc<AtomicUsize>,
     }
 
     #[async_trait]
@@ -5459,23 +5461,43 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
                 base_delay: std::time::Duration::from_millis(1),
                 max_delay: std::time::Duration::from_millis(5),
             };
-            bamboo_llm::retry::send_provider_request(&config, "synthetic-body", || {
-                let notify = self.notify.clone();
-                let prefix = futures::stream::once(async {
-                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"synthetic-prefix"))
-                });
-                let fail = futures::stream::once(async move {
-                    notify.notified().await;
-                    Err::<Bytes, std::io::Error>(std::io::Error::other(
-                        "input is too long: synthetic request body source failed",
-                    ))
-                });
-                client
-                    .post(&self.url)
-                    .body(reqwest::Body::wrap_stream(prefix.chain(fail)))
-            })
-            .await?;
-            panic!("synthetic request body must fail");
+            let result =
+                bamboo_llm::retry::send_provider_request(&config, "synthetic-body", || {
+                    self.builds.fetch_add(1, Ordering::SeqCst);
+                    let notify = self.notify.clone();
+                    let prefix = futures::stream::once(async {
+                        Ok::<Bytes, std::io::Error>(Bytes::from_static(b"synthetic-prefix"))
+                    });
+                    let fail = futures::stream::once(async move {
+                        notify.notified().await;
+                        Err::<Bytes, std::io::Error>(std::io::Error::other(
+                            "input is too long: synthetic request body source failed",
+                        ))
+                    });
+                    client
+                        .post(&self.url)
+                        .body(reqwest::Body::wrap_stream(prefix.chain(fail)))
+                })
+                .await;
+            let error = match result {
+                Err(bamboo_llm::provider::LLMError::Http(error)) => error,
+                Err(error) => panic!("expected HTTP body failure, got {error:?}"),
+                Ok(_) => panic!("synthetic request body must fail"),
+            };
+            let mut cause: Option<&(dyn Error + 'static)> = Some(&error);
+            let mut body_error = false;
+            while let Some(current) = cause {
+                body_error |= current
+                    .downcast_ref::<reqwest::Error>()
+                    .is_some_and(reqwest::Error::is_body);
+                cause = current.source();
+            }
+            assert!(body_error, "expected nested reqwest request-body error");
+            assert!(
+                super::format_reqwest_transport_error(&error).contains("input is too long"),
+                "overflow words must reach Engine error classification"
+            );
+            Err(bamboo_llm::provider::LLMError::Http(error))
         }
     }
 
@@ -5508,10 +5530,12 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
     });
 
     let calls = Arc::new(AtomicUsize::new(0));
+    let builds = Arc::new(AtomicUsize::new(0));
     let llm: Arc<dyn LLMProvider> = Arc::new(SyntheticBodyProvider {
         url,
         notify,
         calls: calls.clone(),
+        builds: builds.clone(),
     });
     let mut session = Session::new("synthetic-body-overflow", "test-model");
     let config = test_config("synthetic system");
@@ -5554,13 +5578,18 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
     )
     .await
     .expect("synthetic Engine request should not hang");
-    server.await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), server)
+        .await
+        .expect("synthetic server should terminate")
+        .unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(builds.load(Ordering::SeqCst), 1);
     assert_eq!(received.load(Ordering::SeqCst), 1);
     let error = match result {
         Err(error) => error,
         Ok(_) => panic!("synthetic body error unexpectedly succeeded"),
     };
+    assert!(error.to_string().contains("input is too long"));
     assert!(
         matches!(error, AgentError::LLMNonRetryable(_)),
         "request body failure was misclassified: {error:?}"
@@ -5568,8 +5597,9 @@ async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow(
 }
 
 #[tokio::test]
-async fn genuine_model_api_overflow_stays_recoverable() {
-    struct SyntheticOverflowProvider;
+async fn synthetic_provider_api_overflow_stays_recoverable() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct SyntheticOverflowProvider(Arc<AtomicUsize>);
     #[async_trait]
     impl LLMProvider for SyntheticOverflowProvider {
         async fn chat_stream(
@@ -5579,13 +5609,15 @@ async fn genuine_model_api_overflow_stays_recoverable() {
             _max_output_tokens: Option<u32>,
             _model: &str,
         ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.0.fetch_add(1, Ordering::SeqCst);
             Err(bamboo_llm::provider::LLMError::Api(
                 "input is too long".to_owned(),
             ))
         }
     }
     let _env_lock = isolate_prompt_safe_env_cache();
-    let llm: Arc<dyn LLMProvider> = Arc::new(SyntheticOverflowProvider);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm: Arc<dyn LLMProvider> = Arc::new(SyntheticOverflowProvider(calls.clone()));
     let mut session = Session::new("synthetic-model-overflow", "test-model");
     let config = test_config("synthetic system");
     let prepared_context = PreparedContext {
@@ -5627,8 +5659,9 @@ async fn genuine_model_api_overflow_stays_recoverable() {
         Err(error) => error,
         Ok(_) => panic!("synthetic overflow unexpectedly succeeded"),
     };
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(
         matches!(error, AgentError::LLMOverflow(_)),
-        "genuine API overflow must remain recoverable: {error:?}"
+        "API overflow must remain recoverable: {error:?}"
     );
 }
