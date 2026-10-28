@@ -388,7 +388,7 @@ impl Tool for BrowserTool {
             "type":"object",
             "properties": {
                 "action":{"type":"string","enum":["tabs","new_tab","activate_tab","close_tab","navigate","history","viewport","snapshot","click","click_at","hover","drag","fill","select_option","set_file_input","type","press","key","scroll","download","screenshot","dialog_respond"]},
-                "profile_mode":{"type":"string","enum":["shared","clean"],"description":"Optional with tabs only: explicitly open shared or clean. Omit to preserve an active scope/default. An active scope must be closed in the workbench before switching; unsupported shared never becomes clean automatically."},
+                "profile_mode":{"type":"string","enum":["shared","clean"],"description":"Optional with tabs only. Omit for the shared default on a new scope or to preserve an active scope. Request clean explicitly only when a fresh session without shared site state is needed. An active scope must be closed in the workbench before switching; unsupported shared never becomes clean automatically."},
                 "tab_id":{"type":"string","description":"Opaque tab ID from tabs/state; required for activate_tab and close_tab"},
                 "dialog_id":{"type":"string","description":"Opaque pending_dialog ID from this chat; required for dialog_respond"},
                 "accept":{"type":"boolean","description":"Accept or dismiss the exact pending JavaScript dialog"},
