@@ -12,6 +12,10 @@ pub(crate) struct ModelVisionProvider {
 
 #[async_trait]
 impl LLMProvider for ModelVisionProvider {
+    fn known_pre_dispatch_error(&self) -> Option<crate::provider::LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+
     async fn vision_support_override(&self, model: &str) -> Option<bool> {
         self.overrides.get(model).copied()
     }
@@ -79,6 +83,36 @@ mod tests {
     use super::*;
     use crate::{ModelCatalogService, ProviderRegistry, ResolvedModel};
     use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+
+    struct LocalRefusal;
+    #[async_trait]
+    impl LLMProvider for LocalRefusal {
+        fn known_pre_dispatch_error(&self) -> Option<crate::provider::LLMError> {
+            Some(crate::provider::LLMError::Auth("synthetic refusal".into()))
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            panic!("a known local refusal must not dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_and_role_decorators_forward_known_pre_dispatch_failure() {
+        let vision: Arc<dyn LLMProvider> = Arc::new(ModelVisionProvider {
+            inner: Arc::new(LocalRefusal),
+            overrides: BTreeMap::new(),
+        });
+        let mut reference = ProviderModelRef::new("fixture", "model");
+        reference.reasoning_effort = Some(ReasoningEffort::Low);
+        let selected = ResolvedModel::from_ref(vision, &reference);
+        assert!(matches!(selected.provider.known_pre_dispatch_error(),
+            Some(crate::provider::LLMError::Auth(message)) if message == "synthetic refusal"));
+    }
     struct MetadataProvider;
     #[async_trait]
     impl LLMProvider for MetadataProvider {

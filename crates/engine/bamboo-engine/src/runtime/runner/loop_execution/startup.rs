@@ -55,9 +55,11 @@ pub(super) struct InFlightTaskEvaluation {
 
 pub(super) struct InFlightGoldEvaluation {
     pub(super) request: AsyncGoldEvaluationRequest,
-    // `Option<..>` output: `None` when the run was cancelled while the Gold
-    // evaluation was in flight (see `spawn_gold_evaluation_request`).
-    pub(super) join_handle: tokio::task::JoinHandle<Option<AsyncGoldEvaluationResult>>,
+    // None is run cancellation; Err is a known local routing refusal, which
+    // must never be harvested as a successful evaluator result.
+    pub(super) join_handle: tokio::task::JoinHandle<
+        Option<Result<AsyncGoldEvaluationResult, bamboo_agent_core::AgentError>>,
+    >,
 }
 
 #[derive(Default)]

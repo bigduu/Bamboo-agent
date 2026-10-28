@@ -274,6 +274,15 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// An already-known local routing refusal, when no request may be sent.
+    /// This query must be nonblocking and must not initiate a request.
+    /// The default preserves existing providers and SDK implementations.
+    /// Transparent provider wrappers should forward this to their inner handle.
+    #[doc(hidden)]
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        None
+    }
+
     /// Transparent Host decorators retain the original provider allocation's
     /// process-wide concurrency identity. This is never a model/client ID.
     fn resource_allocation_identity(&self) -> Option<usize> {

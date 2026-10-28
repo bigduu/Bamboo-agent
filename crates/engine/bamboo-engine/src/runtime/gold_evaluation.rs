@@ -67,6 +67,36 @@ pub(crate) struct AsyncGoldEvaluationResult {
     pub(crate) evaluation_result: GoldEvaluationResult,
 }
 
+// A known local routing refusal is not an evaluator verdict. Other evaluator
+// errors retain the existing low-confidence fallback for async Gold.
+#[derive(Debug)]
+pub(crate) enum GoldEvaluationError {
+    Routing(AgentError),
+    Evaluation(AgentError),
+}
+
+impl From<AgentError> for GoldEvaluationError {
+    fn from(error: AgentError) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+impl std::fmt::Display for GoldEvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Routing(error) | Self::Evaluation(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl GoldEvaluationError {
+    fn into_agent_error(self) -> AgentError {
+        match self {
+            Self::Routing(error) | Self::Evaluation(error) => error,
+        }
+    }
+}
+
 fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
     let counter = TiktokenTokenCounter::default();
     u64::from(counter.count_messages(messages))
@@ -128,7 +158,7 @@ pub(crate) async fn execute_async_gold_evaluation(
     llm: Arc<dyn LLMProvider>,
     event_tx: mpsc::Sender<AgentEvent>,
     configured_limit: usize,
-) -> AsyncGoldEvaluationResult {
+) -> Result<AsyncGoldEvaluationResult, AgentError> {
     let budget_provider = llm.clone();
     let budget_model = request.model_name.clone();
     let acquire_dispatch_guard = async move {
@@ -158,7 +188,8 @@ pub(crate) async fn execute_async_gold_evaluation(
     .await
     {
         Ok(result) => result,
-        Err(error) => GoldEvaluationResult {
+        Err(GoldEvaluationError::Routing(error)) => return Err(error),
+        Err(GoldEvaluationError::Evaluation(error)) => GoldEvaluationResult {
             checkpoint: request.checkpoint,
             iteration: request.round_number as u32,
             decision: GoldDecision::Continue,
@@ -171,11 +202,11 @@ pub(crate) async fn execute_async_gold_evaluation(
         },
     };
 
-    AsyncGoldEvaluationResult {
+    Ok(AsyncGoldEvaluationResult {
         round_number: request.round_number,
         model_name: request.model_name,
         evaluation_result,
-    }
+    })
 }
 
 pub async fn evaluate_gold(
@@ -194,6 +225,7 @@ pub async fn evaluate_gold(
         std::future::ready(()),
     )
     .await
+    .map_err(GoldEvaluationError::into_agent_error)
 }
 
 pub(crate) async fn evaluate_gold_with_dispatch<G, Fut>(
@@ -203,10 +235,16 @@ pub(crate) async fn evaluate_gold_with_dispatch<G, Fut>(
     llm: Arc<dyn LLMProvider>,
     frame: &GoldEvalFrame<'_>,
     acquire_dispatch_guard: Fut,
-) -> Result<GoldEvaluationResult, AgentError>
+) -> Result<GoldEvaluationResult, GoldEvaluationError>
 where
     Fut: std::future::Future<Output = G>,
 {
+    if let Some(error) = llm.known_pre_dispatch_error() {
+        return Err(GoldEvaluationError::Routing(AgentError::LLM(
+            error.to_string(),
+        )));
+    }
+
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let session_id = frame.session_id;
@@ -726,6 +764,62 @@ mod tests {
         assert!(event_rx.try_recv().is_err());
         assert_eq!(routing.requests("fast-b").len(), 1);
         assert!(routing.requests("chat-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn network_error_is_not_reclassified_after_provider_state_changes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct SwitchAfterNetworkError {
+            changed: AtomicBool,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for SwitchAfterNetworkError {
+            fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+                self.changed
+                    .load(Ordering::SeqCst)
+                    .then(|| bamboo_llm::LLMError::Auth("different later provider state".into()))
+            }
+
+            async fn chat_stream(
+                &self,
+                _: &[bamboo_agent_core::Message],
+                _: &[bamboo_agent_core::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.changed.store(true, Ordering::SeqCst);
+                Err(bamboo_llm::LLMError::RequestFailed(
+                    "synthetic network failure".into(),
+                ))
+            }
+        }
+        let provider = Arc::new(SwitchAfterNetworkError {
+            changed: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        });
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let outcome = execute_async_gold_evaluation(
+            synthetic_request("fixture-model"),
+            provider.clone(),
+            event_tx,
+            1,
+        )
+        .await
+        .expect("an ordinary request error retains the previous async fallback");
+        assert!(outcome
+            .evaluation_result
+            .reasoning
+            .contains("synthetic network failure"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(provider.known_pre_dispatch_error().is_some());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationStarted { .. })
+        ));
+        assert!(event_rx.try_recv().is_err());
     }
 
     fn report_call(arguments: serde_json::Value) -> ToolCall {

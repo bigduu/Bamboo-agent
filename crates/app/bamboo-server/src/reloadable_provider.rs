@@ -27,6 +27,15 @@ impl ReloadableProvider {
 
 #[async_trait]
 impl LLMProvider for ReloadableProvider {
+    fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+        match self.inner.try_read() {
+            Ok(provider) => provider.known_pre_dispatch_error(),
+            Err(_) => Some(bamboo_llm::LLMError::Api(
+                "Provider is being reconfigured; retry the auxiliary evaluation".into(),
+            )),
+        }
+    }
+
     async fn vision_support_override(&self, model: &str) -> Option<bool> {
         self.current().await.vision_support_override(model).await
     }
@@ -109,6 +118,131 @@ impl LLMProvider for ReloadableProvider {
 mod tests {
     use super::*;
     use bamboo_llm::{ProviderVisibleToolSegment, ProviderVisibleToolSegmentKind};
+
+    struct LocalRefusal;
+    #[async_trait]
+    impl LLMProvider for LocalRefusal {
+        fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+            Some(bamboo_llm::LLMError::Auth("synthetic refusal".into()))
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            panic!("a known local refusal must not dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn reloadable_provider_forwards_current_pre_dispatch_failure() {
+        let inner: Arc<RwLock<Arc<dyn LLMProvider>>> =
+            Arc::new(RwLock::new(Arc::new(LocalRefusal)));
+        let wrapper = ReloadableProvider::new(inner.clone());
+        assert!(matches!(wrapper.known_pre_dispatch_error(),
+            Some(bamboo_llm::LLMError::Auth(message)) if message == "synthetic refusal"));
+        *inner.write().await = Arc::new(FootprintProvider);
+        assert!(wrapper.known_pre_dispatch_error().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn locked_reloadable_fails_closed_without_blocking_gold_preflight() {
+        use bamboo_agent_core::{GoldCheckpoint, Session};
+        use bamboo_engine::runtime::gold_evaluation::{evaluate_gold, GoldEvalFrame};
+        use bamboo_engine::runtime::GoldConfig;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        struct SyntheticGold(AtomicUsize);
+        #[async_trait]
+        impl LLMProvider for SyntheticGold {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(futures::stream::iter([Ok(
+                    bamboo_llm::LLMChunk::Done,
+                )])))
+            }
+        }
+        let actual = Arc::new(SyntheticGold(AtomicUsize::new(0)));
+        let inner: Arc<RwLock<Arc<dyn LLMProvider>>> = Arc::new(RwLock::new(actual.clone()));
+        let wrapper = Arc::new(ReloadableProvider::new(inner.clone()));
+        assert!(wrapper.known_pre_dispatch_error().is_none());
+
+        let write_guard = inner.write().await;
+        let for_query = wrapper.clone();
+        let mut query = tokio::task::spawn_blocking(move || for_query.known_pre_dispatch_error());
+        let query_outcome = tokio::time::timeout(Duration::from_secs(2), &mut query).await;
+        // Keep the lock through the real Gold evaluation below, including the
+        // failure case; it must return before the writer is released.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let provider: Arc<dyn LLMProvider> = wrapper.clone();
+        let mut evaluation = tokio::spawn(async move {
+            let session = Session::new("gold-lock-fixture", "fixture-model");
+            let frame = GoldEvalFrame {
+                event_tx: &tx,
+                session_id: &session.id,
+                model: "fixture-model",
+                timeout_context: Default::default(),
+                reasoning_effort: None,
+                checkpoint: GoldCheckpoint::Terminal,
+                iteration: 1,
+            };
+            evaluate_gold(&session, None, &GoldConfig::default(), provider, &frame).await
+        });
+        let evaluation_outcome =
+            tokio::time::timeout(Duration::from_secs(2), &mut evaluation).await;
+        // Always release the guard before failing an assertion, so a buggy
+        // blocking implementation cannot strand a test worker on teardown.
+        drop(write_guard);
+
+        assert!(matches!(
+            query_outcome.expect("preflight must not wait for the provider write lock").unwrap(),
+            Some(bamboo_llm::LLMError::Api(message)) if message.contains("reconfigured")
+        ));
+        assert!(evaluation_outcome
+            .expect("Gold must not wait for the provider write lock")
+            .unwrap()
+            .is_err());
+        assert!(rx.try_recv().is_err(), "no Gold event should be emitted");
+        assert_eq!(actual.0.load(Ordering::SeqCst), 0);
+        assert!(wrapper.known_pre_dispatch_error().is_none());
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let session = Session::new("gold-lock-control", "fixture-model");
+        let frame = GoldEvalFrame {
+            event_tx: &tx,
+            session_id: &session.id,
+            model: "fixture-model",
+            timeout_context: Default::default(),
+            reasoning_effort: None,
+            checkpoint: GoldCheckpoint::Terminal,
+            iteration: 1,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            evaluate_gold(&session, None, &GoldConfig::default(), wrapper, &frame),
+        )
+        .await
+        .expect("the unlocked provider should run promptly");
+        assert!(result.is_ok());
+        assert_eq!(actual.0.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(bamboo_agent_core::AgentEvent::GoldEvaluationStarted { .. })
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(bamboo_agent_core::AgentEvent::GoldEvaluationCompleted { .. })
+        ));
+    }
 
     struct FootprintProvider;
 

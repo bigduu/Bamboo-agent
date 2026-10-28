@@ -352,8 +352,16 @@ pub(super) async fn poll_completed_gold_evaluation(state: &mut LoopRunState) {
     };
 
     match in_flight.join_handle.await {
-        Ok(Some(result)) => {
+        Ok(Some(Ok(result))) => {
             state.gold_evaluation.completed = Some(result);
+        }
+        Ok(Some(Err(error))) => {
+            tracing::warn!(
+                "[{}] Async Gold evaluation refused for round {}: {}",
+                state.session_id,
+                in_flight.request.round_number,
+                error
+            );
         }
         Ok(None) => {
             // The run was cancelled while this Gold evaluation was in flight; the

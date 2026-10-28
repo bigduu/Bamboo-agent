@@ -353,6 +353,36 @@ async fn provider(f: &Fixture, inner: Arc<Provider>) -> Arc<dyn LLMProvider> {
 }
 
 #[tokio::test]
+async fn token_budget_decorator_forwards_known_fast_refusal_without_reservation() {
+    let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+    let mut config = routing.config.read().await.clone();
+    config.provider_instances.get_mut("fast-b").unwrap().enabled = false;
+    let (_, rejected) = crate::model_config_helper::resolve_fast_model_for_runner(
+        Some(&config),
+        "chat-a",
+        &routing.registry,
+    );
+    let (fixture, _registration) = admitted().await;
+    configure(&fixture, 140);
+    let budget = NativeWorkTokenBudget::capture(
+        Some(fixture.service.clone()),
+        fixture.storage.clone(),
+        &fixture.child,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let decorated = budget.wrap(rejected.unwrap(), &AgentLoopConfig::default());
+    assert!(matches!(
+        decorated.known_pre_dispatch_error(),
+        Some(LLMError::Auth(_))
+    ));
+    assert_eq!(ledger(&fixture).total_charged, 0);
+    assert!(routing.requests("fast-b").is_empty());
+    assert!(routing.requests("chat-a").is_empty());
+}
+
+#[tokio::test]
 async fn token_budget_reserves_before_provider_and_settles_only_after_trailing_usage_eof() {
     let (f, _registration) = admitted().await;
     configure(&f, 140);

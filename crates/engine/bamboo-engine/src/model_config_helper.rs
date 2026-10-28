@@ -600,6 +600,10 @@ impl FastRouteError {
 
 #[async_trait::async_trait]
 impl bamboo_llm::LLMProvider for RejectedFastProvider {
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        Some(self.error.to_llm_error())
+    }
+
     async fn chat_stream(
         &self,
         _messages: &[bamboo_agent_core::Message],

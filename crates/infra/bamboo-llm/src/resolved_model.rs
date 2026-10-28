@@ -72,6 +72,10 @@ impl RoleReasoningProvider {
 
 #[async_trait]
 impl LLMProvider for RoleReasoningProvider {
+    fn known_pre_dispatch_error(&self) -> Option<crate::provider::LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+
     fn resource_allocation_identity(&self) -> Option<usize> {
         Some(
             self.inner

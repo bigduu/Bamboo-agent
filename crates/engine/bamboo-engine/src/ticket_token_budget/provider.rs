@@ -466,6 +466,10 @@ impl Usage {
 
 #[async_trait::async_trait]
 impl LLMProvider for BudgetedProvider {
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+
     fn resource_allocation_identity(&self) -> Option<usize> {
         Some(
             self.inner

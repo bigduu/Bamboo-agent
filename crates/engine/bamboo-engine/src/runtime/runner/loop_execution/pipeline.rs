@@ -2157,7 +2157,15 @@ async fn abort_in_flight_evaluations(
         // emitted GoldEvaluationCompleted and must not receive a contradictory
         // cancellation lifecycle event during run cleanup.
         match in_flight.join_handle.await {
-            Ok(Some(_result)) => {}
+            Ok(Some(Ok(_result))) => {}
+            Ok(Some(Err(error))) => {
+                tracing::warn!(
+                    "[{}] Async Gold evaluation refused during cleanup for round {}: {}",
+                    state.session_id,
+                    in_flight.request.round_number,
+                    error
+                );
+            }
             Ok(None) => gold_was_cancelled = true,
             Err(error) if error.is_cancelled() => gold_was_cancelled = true,
             Err(error) => {
@@ -13805,7 +13813,7 @@ mod tests {
         .expect("completed event");
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
             request,
-            join_handle: tokio::spawn(async move { Some(result) }),
+            join_handle: tokio::spawn(async move { Some(Ok(result)) }),
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !state
