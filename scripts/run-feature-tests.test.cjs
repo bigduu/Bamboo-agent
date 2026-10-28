@@ -9,6 +9,21 @@ const { selectedPackages, sourceFeatureHash, cargoArguments, sshExecutable, runS
   SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES,
   DEFAULT_TELEMETRY_CASE, FEATURE_CONTEXTS, validateFeatureCatalog, runFeatureTests, PLANNER_SERIAL, runPlannerSerial } = require("./run-feature-tests.cjs");
 
+test("feature shards partition package and additive owners exactly once", () => {
+  const { FEATURE_SHARDS, packageShard, selectShard } = require("./run-feature-tests.cjs");
+  const metadata = JSON.parse(spawnSync("cargo", ["metadata", "--locked", "--format-version", "1", "--no-deps"], { encoding: "utf8" }).stdout);
+  const packages = selectedPackages(metadata);
+  const selections = FEATURE_SHARDS.map(shard => selectShard(packages, FEATURE_CONTEXTS, shard));
+  assert.deepEqual(selections.flatMap(item => item.packages.map(owner => owner.name)).sort(), packages.map(owner => owner.name).sort());
+  assert.deepEqual(selections.flatMap(item => item.featureContexts.map(context => context.package)).sort(), FEATURE_CONTEXTS.map(context => context.package).sort());
+  for (const selection of selections) for (const context of selection.featureContexts) {
+    assert.ok(selection.packages.some(owner => owner.name === context.package));
+  }
+  assert.equal(packageShard("bamboo-agent"), "agent");
+  assert.equal(packageShard("bamboo-server"), "server");
+  assert.throws(() => selectShard(packages, FEATURE_CONTEXTS, "unknown"));
+});
+
 function packageMetadata(name, targets = []) { return { id: name, name, targets, features: {} }; }
 function metadataFixture() {
   return { workspace_members: ["bamboo-agent", "bamboo-broker", "bamboo-storage", "bamboo-tool-event-recorder-example", "bamboo-analytics"],

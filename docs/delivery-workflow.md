@@ -69,11 +69,11 @@ compilation or packaging. If a previously successful original output is missing,
 explicit recovery rather than quietly rebuilding it. Product/source repairs
 return through feature/dev and require a new frozen cut.
 
-Bamboo's feature CI uses one Linux executor and one owned target directory for
-the canonical Unit/E2E configuration, reusing the compiled SSH fixture. Native
-checks on other operating systems remain distinct. A future restoration
-of parallel case workers must transport the actual test outputs and required
-resources; dependency caches alone cannot establish compilation reuse.
+Bamboo's feature CI uses independently rerunnable Linux package shards for the
+canonical Unit/E2E configuration, reusing the compiled SSH fixture within its
+owner. Isolated shards can compile shared dependencies independently; their
+caches are not proof of compilation reuse. Native diagnostics on other operating
+systems run by manual dispatch rather than on every feature PR.
 
 Apply the same ownership rule within each native OS: compatible test selections
 share one compilation and its outputs. An OS label alone does not justify two
