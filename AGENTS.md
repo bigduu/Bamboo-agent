@@ -38,9 +38,11 @@ scoped exceptions with named owners. Preserve
 applicable native-platform acceptance before dev admission. Fix failures in the
 feature branch before merging; record exact source, commands and results.
 Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
-and 15 frontend artifact/policy registrations once. Each native feature job
-runs the same 61 portable Node registrations once on its own OS; retain the
-Windows unsupported-platform assertions. The `Browser Runtime Unit and E2E`
+and 15 frontend artifact/policy registrations once. Each native feature job runs
+only the nine OS behavior cases selected by `scripts/run-native-node-tests.cjs`,
+which requires every selected name to actually pass. Retain Windows unsupported
+process-binding assertions and macOS's real process/listener checks; portable
+policies run only in Quick. The `Browser Runtime Unit and E2E`
 feature job owns all `browser-runtime` Node test files on Node 24; both feature
 aggregates require it to pass. Do not add a second automatic owner for those
 tests.
@@ -152,3 +154,22 @@ dev advancement does not change it. Promote only the exact published source to
 main. A needed product repair gets a feature branch, passing tests and dev
 admission, then a fresh cut. Existing frozen release/recovery contracts remain
 unchanged during the explicitly documented cutover dependency.
+
+For the fixed `v2026.10.19` infrastructure failure, #2371 adds the manual
+`recover-frozen-crate-release.yml` controller. It requires the exact reviewed
+protected-Dev controller and keeps product source
+`4786b7db862cabbebce49e288da62b284ccf5b72`, draft `426156779` and original
+publisher `40613036533`/attempt 1. Preserve its 27 signed crate originals, sealed
+frontend and three native artifacts. Only the proven unstarted client-core,
+TUI and agent packages may receive their first verification compile; retained or
+ambiguous originals cannot be rebuilt. Authorize uses the read-only `github.token`.
+Restore uses the existing release token to read the private draft and verifies its
+signature; its script permits no external writes. Only publish executes external
+writes and receives the Cargo registry token.
+The recovery leaves the Release draft, `receipt.completed=false` and the original
+publisher ID, and verifies `recovery2371.completed=true` with no pending write.
+It performs no native build, finalization or version allocation. After authenticated
+readback, resume the original publisher's failed crate job and its finalizer using
+the attempt-1 native outputs. Keep the recovery run's real `GITHUB_*` identity;
+never impersonate the original run. See the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261019-crate-recovery).
+Reviewed source alone does not establish a successful recovery or publication.

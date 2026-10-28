@@ -433,8 +433,8 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: Test portable Supervisor and frontend policies
-        run: node --test scripts/supervisor-native-acceptance.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+      - name: Test native Supervisor and frontend behavior
+        run: node scripts/run-native-node-tests.cjs scripts/supervisor-native-acceptance.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
       - uses: dtolnay/rust-toolchain@stable
       - name: Preserve the Actor acceptance compiler
         if: runner.os == 'Windows'
