@@ -1463,12 +1463,8 @@ mod execution_input_http {
             .unwrap();
     }
 
-    // Draft consumer regressions for inclusion inside
-    // crates/app/bamboo-server/src/handlers/agent/execute/tests.rs::execution_input_http.
-    // Prepared against HEAD dce5f96bf36473636f16996de105e3f7c133aad0 and
-    // git diff SHA-256 671549aca4a7602f38a0f14eeba62d48d2ea11cc3b760c8698ee3a0902b70234.
-    // NOT compiled or run. Do not include these cases in acceptance counts until
-    // their fixture preconditions and results are observed on the actual source.
+    // Consumer regressions for fresh input after a failed run. Each case
+    // observes the actual admission path and retains the original input identity.
 
     async fn scratch_wait_failed_root(state: &web::Data<crate::AppState>, id: &str, run: &str) {
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -1511,10 +1507,9 @@ mod execution_input_http {
         .expect("the actual failed Root must be saved and its exact owner retired");
     }
 
-    // A new User created by the actual direct/legacy Chat route has a pending
-    // handoff even though runtime.json can still contain the previous failure.
-    // A Child exercises the existing direct append path without forging a Root
-    // owner or bypassing the normal Root queued-input authority.
+    // A Child's new User is durably queued even while runtime.json still
+    // records an older failure. Execute must consume that exact receipt once
+    // without forging a Root owner or replaying the old input.
     #[actix_web::test]
     async fn scratch_retry_direct_fresh_user_survives_old_failed_runtime() {
         let provider = Arc::new(OwnedRootProvider::default());
@@ -1533,6 +1528,7 @@ mod execution_input_http {
         let mut child = bamboo_agent_core::Session::new_child(id, parent, "test-model", "Child");
         child.title_generated = true;
         child.add_message(bamboo_agent_core::Message::user("old failed input"));
+        let old_user_id = child.messages.last().unwrap().id.clone();
         child.set_last_run_status("error");
         child.set_last_run_error("synthetic previous failure");
         let mut runtime = bamboo_domain::AgentRuntimeState::new("older-run");
@@ -1564,21 +1560,41 @@ mod execution_input_http {
             "{}",
             String::from_utf8_lossy(&chat_body)
         );
+        let chat_body: serde_json::Value = serde_json::from_slice(&chat_body).unwrap();
+        let fresh_id = chat_body["message_id"]
+            .as_str()
+            .expect("Chat returns the durable Inbox message ID")
+            .to_string();
+        let generation = chat_body["ingress_seq"]
+            .as_u64()
+            .expect("Chat returns the matching Inbox generation");
+        let receipt_id = bamboo_domain::SessionMessageId::parse(fresh_id.clone()).unwrap();
         let prepared = state.storage.load_session(id).await.unwrap().unwrap();
-        let fresh = prepared.messages.last().unwrap();
-        assert_eq!(fresh.content, "direct fresh user");
-        let fresh_id = fresh.id.clone();
-        assert_eq!(prepared.last_run_status().as_deref(), Some("pending"));
         assert_eq!(
-            prepared.agent_runtime_state.as_ref().map(|s| s.status),
-            Some(bamboo_domain::AgentStatusState::Failed)
+            prepared.messages.last().unwrap().content,
+            "old failed input"
         );
+        assert!(!prepared
+            .messages
+            .iter()
+            .any(|message| message.id == fresh_id));
+        assert_eq!(prepared.last_run_status().as_deref(), Some("error"));
+        let previous_runtime = prepared.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(previous_runtime.run_id, "older-run");
+        assert_eq!(
+            previous_runtime.status,
+            bamboo_domain::AgentStatusState::Failed
+        );
+        let queued = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(queued.pending, 1);
+        assert_eq!(queued.claimed, 0);
+        assert_eq!(queued.oldest_generation, Some(generation));
+        assert!(queued.activation_pending());
         assert!(!state
             .session_inbox
-            .inspect(id)
+            .was_admitted(id, &receipt_id)
             .await
-            .unwrap()
-            .activation_pending());
+            .unwrap());
         let app = test::init_service(
             actix_web::App::new()
                 .app_data(state.clone())
@@ -1591,40 +1607,91 @@ mod execution_input_http {
             .to_request()).await;
         let status = response.status();
         let body: serde_json::Value = test::read_body_json(response).await;
-        if status == StatusCode::ACCEPTED {
-            tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                loop {
-                    if provider.messages.lock().unwrap().iter().any(|messages| {
-                        messages
-                            .iter()
-                            .any(|m| m.id == fresh_id && m.content == "direct fresh user")
-                    }) {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("actual provider saw the exact new User");
-        }
-        let calls = provider.messages.lock().unwrap().len();
-        let after = state.storage.load_session(id).await.unwrap().unwrap();
-        eprintln!(
-            "direct fresh: HTTP {status}, body={body}, provider_calls={calls}, fresh_count={}",
-            after.messages.iter().filter(|m| m.id == fresh_id).count()
-        );
-        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
-            .await
-            .unwrap();
         assert_eq!(
             status,
             StatusCode::ACCEPTED,
-            "a genuine direct fresh User must start: {body}"
+            "fresh queued User must start: {body}"
         );
+        assert_eq!(body["status"], "started");
+        let run_id = body["run_id"]
+            .as_str()
+            .expect("new exact run ID")
+            .to_string();
+        assert_ne!(run_id, "older-run");
+        let after = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let completed = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(id)
+                    .is_some_and(|runner| {
+                        runner.run_id == run_id && matches!(runner.status, AgentStatus::Completed)
+                    });
+                let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+                if completed
+                    && persisted.last_run_status().as_deref() == Some("completed")
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break persisted;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("new Child run must finish and retire its exact owner");
+        {
+            let calls = provider.messages.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "provider must be called once for the fresh run"
+            );
+            assert_eq!(
+                calls[0]
+                    .iter()
+                    .filter(|message| message.id == fresh_id
+                        && message.role == bamboo_agent_core::Role::User
+                        && message.content == "direct fresh user")
+                    .count(),
+                1
+            );
+        }
         assert_eq!(
-            after.messages.iter().filter(|m| m.id == fresh_id).count(),
+            after
+                .messages
+                .iter()
+                .filter(|message| message.id == fresh_id
+                    && message.role == bamboo_agent_core::Role::User
+                    && message.content == "direct fresh user")
+                .count(),
             1
         );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.id == old_user_id)
+                .count(),
+            1
+        );
+        let drained = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(drained.pending, 0);
+        assert_eq!(drained.claimed, 0);
+        assert_eq!(drained.oldest_generation, None);
+        assert!(!drained.activation_pending());
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &receipt_id)
+            .await
+            .unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
     }
 
     // A fresh owned input admitted before a client-sync mismatch is still pending
