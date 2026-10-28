@@ -202,6 +202,47 @@ async fn compression_refreshes_model_and_provider_together_between_passes() {
     }
 }
 
+// A background-only resolver must not suppress the standalone/SDK fallback
+// from missing summary to background, and must keep the resolved pair intact.
+#[tokio::test]
+async fn compression_uses_background_override_with_no_full_auxiliary_resolver() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let (main, main_calls) = recording_llm();
+    let (background, background_calls) = recording_llm();
+    let resolved_background = Arc::clone(&background);
+    let config = AgentLoopConfig {
+        app_data_dir: Some(data_dir.path().to_path_buf()),
+        background_model_name: Some("stale-background".into()),
+        background_model_provider: Some(Arc::clone(&main)),
+        summarization_model_name: None,
+        auxiliary_model_resolver: None,
+        background_model_resolver: Some(Arc::new(move || {
+            Some(bamboo_llm::ResolvedModel::new(
+                Arc::clone(&resolved_background),
+                "live-background",
+            ))
+        })),
+        ..Default::default()
+    };
+    let mut session = bounded_compression_session("background-only-override");
+    assert!(maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "main-model-763",
+        "background-only-override",
+        &[],
+        &main,
+        None,
+        "mid-turn",
+    )
+    .await
+    .unwrap());
+    assert!(main_calls.lock().unwrap().is_empty());
+    let calls = background_calls.lock().unwrap();
+    assert!(calls.len() >= 2, "compression must complete map and reduce");
+    assert!(calls.iter().all(|model| model == "live-background"));
+}
+
 #[tokio::test]
 async fn compression_does_not_reuse_stale_or_memory_route_when_live_summary_is_unavailable() {
     let data_dir = tempfile::tempdir().unwrap();

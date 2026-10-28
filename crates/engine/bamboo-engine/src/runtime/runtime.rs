@@ -56,6 +56,7 @@ pub struct AgentRuntime {
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
     pub(crate) gold_target_resolver: Option<crate::runtime::config::GoldTargetResolver>,
+    pub(crate) background_model_resolver: Option<crate::runtime::config::BackgroundModelResolver>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
     pub attachment_reader: Arc<dyn AttachmentReader>,
@@ -254,6 +255,7 @@ impl AgentRuntimeBuilder {
             session_inbox: self.session_inbox,
             live_bootstrap_host: None,
             gold_target_resolver: None,
+            background_model_resolver: None,
             activation_router: self.activation_router,
             session_messenger: self.session_messenger,
             attachment_reader: self
@@ -1069,6 +1071,7 @@ impl AgentRuntime {
             provider_type,
             reasoning_effort,
             auxiliary_model_resolver,
+            background_model_resolver: self.background_model_resolver.clone(),
             disabled_filter_resolver,
             disabled_tools: {
                 let mut merged = config.disabled_tool_references();

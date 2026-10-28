@@ -40,6 +40,10 @@ pub type DisabledFilterSets = (BTreeSet<String>, BTreeSet<String>);
 /// Late-bound resolver for disabled tool and skill-id filters.
 pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sync>;
 
+/// A per-execution background route. `None` is authoritative for that read.
+#[doc(hidden)]
+pub type BackgroundModelResolver = Arc<dyn Fn() -> Option<bamboo_llm::ResolvedModel> + Send + Sync>;
+
 /// One execution's explicitly selected Gold route, installed only by the Host.
 #[doc(hidden)]
 pub type GoldTargetResolver =
@@ -1100,6 +1104,8 @@ pub struct AgentLoopConfig {
     /// for fast/background/planning/search/summarization helpers.
     pub(crate) auxiliary_model_resolver:
         Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    /// Override only the background pair without changing other resolver semantics.
+    pub(crate) background_model_resolver: Option<BackgroundModelResolver>,
     /// Optional per-round resolver for the disabled tool/skill sets so they follow
     /// LIVE global config instead of staying frozen for the whole run. Returns the
     /// current `(disabled_tools, disabled_skill_ids)`. When `None`, the snapshotted
@@ -1209,6 +1215,7 @@ impl Default for AgentLoopConfig {
             features_dynamic_model_routing: false,
             features_final_evidence_check: false,
             auxiliary_model_resolver: None,
+            background_model_resolver: None,
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,
             run_budget: bamboo_config::RunBudgetConfig::default(),
@@ -1223,7 +1230,8 @@ impl AgentLoopConfig {
     /// empty result is authoritative; only callers without one use the startup
     /// fields (SDK and standalone-loop compatibility).
     pub(crate) fn resolve_auxiliary_models(&self) -> AuxiliaryModelConfig {
-        self.auxiliary_model_resolver
+        let mut models = self
+            .auxiliary_model_resolver
             .as_ref()
             .map(|resolver| resolver())
             .unwrap_or_else(|| AuxiliaryModelConfig {
@@ -1236,7 +1244,14 @@ impl AgentLoopConfig {
                 background_model_provider: self.background_model_provider.clone(),
                 summarization_model_provider: self.summarization_model_provider.clone(),
                 summarization_model_error: None,
-            })
+            });
+        if let Some(resolve) = &self.background_model_resolver {
+            let background = resolve();
+            models.background_model_name =
+                background.as_ref().map(|model| model.model_name.clone());
+            models.background_model_provider = background.map(|model| model.provider);
+        }
+        models
     }
 
     pub fn bind_ticket_worker_plan(

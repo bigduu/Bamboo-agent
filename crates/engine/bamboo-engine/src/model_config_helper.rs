@@ -586,12 +586,31 @@ pub fn try_resolve_background_model(
             ],
         );
     }
-    try_resolve_legacy_role(
+    let legacy_memory = config
+        .memory()
+        .as_ref()
+        .and_then(|memory| memory.background_model.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let result = try_resolve_legacy_role(
         config,
         provider_name,
         provider_registry,
         get_memory_background_model_for_provider(config, provider_name),
-    )
+    );
+    let Err(error) = result else {
+        return result;
+    };
+    // Only an explicitly configured legacy memory override may use the
+    // managed background-only compatibility route; fast/chat stays ordinary.
+    let Some(model) = legacy_memory else {
+        return Err(error);
+    };
+    let target = bamboo_domain::ProviderModelRef::new(provider_name, model);
+    match provider_registry.try_legacy_memory_provider(config, &target)? {
+        Some(provider) => Ok(Some(ResolvedModel::from_ref(provider, &target))),
+        None => Err(error),
+    }
 }
 
 // A failed Fast selection must not look like an absent role at runner call
@@ -1006,6 +1025,70 @@ mod tests {
             })
             .collect();
         Arc::new(ProviderRegistry::new(providers, default.to_string()))
+    }
+
+    #[tokio::test]
+    async fn legacy_background_resolution_keeps_session_provider_and_fast_fallback() {
+        let mut config = Config::default();
+        config.default_provider_instance = Some("account-a".into());
+        config.defaults = None;
+        for (id, model, key) in [
+            ("account-a", "chat-a", "synthetic-key-a"),
+            ("account-b", "chat-b", "synthetic-key-b"),
+        ] {
+            config.provider_instances.insert(
+                id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "enabled":true, "api_key":key,
+                    "base_url":"http://127.0.0.1:1", "model":model
+                }))
+                .unwrap(),
+            );
+        }
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .background_model = Some("memory-v1".into());
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().into())
+                .await
+                .unwrap(),
+        );
+        let b = registry.get("account-b").unwrap();
+        for flag in [false, true] {
+            config.features.provider_model_ref = flag;
+            let resolved = try_resolve_background_model(&config, "account-b", &registry)
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.model_name, "memory-v1");
+            assert!(Arc::ptr_eq(&resolved.provider, &b));
+        }
+        config.memory_mut().as_mut().unwrap().background_model = Some("memory-v2".into());
+        let live = try_resolve_background_model(&config, "account-b", &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.model_name, "memory-v2");
+        assert!(Arc::ptr_eq(&live.provider, &b));
+        config
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat-b"]));
+        assert!(try_resolve_background_model(&config, "account-b", &registry).is_err());
+        config
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .remove("runtime_models");
+        config.memory_mut().as_mut().unwrap().background_model = None;
+        let fast = try_resolve_background_model(&config, "account-b", &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fast.model_name, "chat-b");
+        assert!(Arc::ptr_eq(&fast.provider, &b));
     }
 
     #[test]

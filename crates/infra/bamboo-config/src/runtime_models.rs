@@ -102,6 +102,24 @@ fn legacy_model_inputs<'a>(config: &'a Config, id: &str) -> Option<ModelInputs<'
     }
 }
 
+/// Whether this exact configured provider key has no explicit runtime list.
+/// The borrowed projection does not materialize unrelated provider credentials.
+#[doc(hidden)]
+pub fn has_implicit_runtime_models_for_provider_key(
+    config: &Config,
+    provider: &str,
+) -> Result<bool, String> {
+    let inputs = config
+        .provider_instances
+        .get(provider)
+        .map(instance_model_inputs)
+        .or_else(|| legacy_model_inputs(config, provider));
+    let Some(inputs) = inputs else {
+        return Ok(false);
+    };
+    Ok(inputs.enabled && explicit_runtime_models_from_extra(inputs.extra)?.is_none())
+}
+
 fn default_refs(
     defaults: &DefaultsConfig,
 ) -> impl Iterator<Item = &bamboo_domain::ProviderModelRef> {

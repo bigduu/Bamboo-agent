@@ -50,6 +50,8 @@ pub struct ResolvedRunConfig {
     pub base_system_prompt: String,
     pub workspace_path: Option<String>,
     pub lifecycle_hooks: bamboo_config::LifecycleHooksConfig,
+    /// Per-round background admission, paired with this run's frozen other roles.
+    pub auxiliary_model_resolver: Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -762,23 +764,7 @@ async fn run_schedule_job(
     // (marking the run terminal, and writing a visible failure marker) is
     // carried by the `on_complete` hook, which runs after the runner is
     // finalized but before the session is persisted — so the marker is saved.
-    let aux_fast_model = resolved.model_roster.fast_model();
-    let aux_fast_provider = resolved.model_roster.fast_model_provider();
-    let aux_background_model = resolved.model_roster.background_model();
-    let aux_background_provider = resolved.model_roster.background_model_provider();
-    let aux_summarization_model = resolved.model_roster.summarization_model();
-    let aux_summarization_provider = resolved.model_roster.summarization_model_provider();
-    let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
-        fast_model_name: aux_fast_model.clone(),
-        fast_model_provider: aux_fast_provider.clone(),
-        background_model_name: aux_background_model.clone(),
-        planning_model_name: None,
-        search_model_name: None,
-        summarization_model_name: aux_summarization_model.clone(),
-        background_model_provider: aux_background_provider.clone(),
-        summarization_model_provider: aux_summarization_provider.clone(),
-        summarization_model_error: None,
-    });
+    let auxiliary_model_resolver = resolved.auxiliary_model_resolver.clone();
 
     let schedule_store = ctx.schedule_store.clone();
     let schedule_id_for_state = job.schedule_id.clone();
@@ -1256,9 +1242,27 @@ fn resolve_run_config_from_config(
 
     let model_roster =
         bamboo_engine::ModelRoster::from_areas(Some(model), provider_name, provider_type, areas);
+    let fixed_models = AuxiliaryModelConfig {
+        fast_model_name: model_roster.fast_model(),
+        fast_model_provider: model_roster.fast_model_provider(),
+        background_model_name: model_roster.background_model(),
+        planning_model_name: None,
+        search_model_name: None,
+        summarization_model_name: model_roster.summarization_model(),
+        background_model_provider: model_roster.background_model_provider(),
+        summarization_model_provider: model_roster.summarization_model_provider(),
+        summarization_model_error: None,
+    };
+    let auxiliary_model_resolver = bamboo_engine::model_areas::live_background_model_resolver(
+        config.clone(),
+        provider_registry.clone(),
+        model_roster.provider_name.clone().unwrap_or_default(),
+        fixed_models,
+    );
 
     ResolvedRunConfig {
         model_roster,
+        auxiliary_model_resolver,
         reasoning_effort,
         gold_config: bamboo_engine::model_config_helper::resolve_gold_config(
             &config_snapshot,
@@ -1273,6 +1277,20 @@ fn resolve_run_config_from_config(
 
 #[cfg(test)]
 mod build_context_tests {
+
+    // This calls the exact Schedule builder used when a run is started.
+    // The matrix exercises its returned resolver, not a whole scheduled run.
+    #[tokio::test]
+    async fn scheduled_run_legacy_background_rechecks_managed_admission() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let resolved =
+            resolve_run_config_from_config(&test_job(), &fixture.config, &fixture.registry);
+        assert_eq!(
+            resolved.model_roster.provider_name.as_deref(),
+            Some("account-a")
+        );
+        fixture.verify(resolved.auxiliary_model_resolver).await;
+    }
     use super::ScheduleRunJob;
     use super::{
         resolve_run_config_from_config, schedule_workspace_source,

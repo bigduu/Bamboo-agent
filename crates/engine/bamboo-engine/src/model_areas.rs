@@ -96,6 +96,32 @@ pub fn resolve_global_area_models(
     }
 }
 
+/// Preserve a run's other auxiliary selections while resolving its background
+/// model and provider from the current config at every round. A busy config
+/// or a rejected route yields no background model for that round.
+#[doc(hidden)]
+pub fn live_background_model_resolver(
+    config: Arc<tokio::sync::RwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    provider_name: String,
+    fixed: crate::AuxiliaryModelConfig,
+) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync> {
+    Arc::new(move || {
+        let background = if provider_name.is_empty() {
+            None
+        } else {
+            config
+                .try_read()
+                .ok()
+                .and_then(|current| resolve_background_model(&current, &provider_name, &registry))
+        };
+        let mut models = fixed.clone();
+        models.background_model_name = background.as_ref().map(|model| model.model_name.clone());
+        models.background_model_provider = background.map(|model| model.provider);
+        models
+    })
+}
+
 /// Vision model — **global**. Resolved on demand (only when a request actually
 /// carries an image), so it is not part of [`GlobalAreaModels`]'s eager trio.
 /// Still global-only: takes no session. `provider_name` is the fallback key.

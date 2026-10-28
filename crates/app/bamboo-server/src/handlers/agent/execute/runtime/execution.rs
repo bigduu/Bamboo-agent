@@ -14,7 +14,8 @@ use crate::permission_audit::record_bamboo_runtime_permission_metadata;
 use crate::tools::ToolSurface;
 use bamboo_engine::model_areas::resolve_global_area_models;
 use bamboo_engine::model_config_helper::{
-    resolve_fast_model_for_runner, resolve_planning_model, resolve_search_model,
+    resolve_background_model, resolve_fast_model_for_runner, resolve_planning_model,
+    resolve_search_model,
 };
 use bamboo_engine::session_app::provider_model::session_effective_model_ref;
 
@@ -122,6 +123,13 @@ pub(crate) fn make_auxiliary_model_resolver(
             }
             Err(_) => resolve_fast_model_for_runner(None, &provider_name, &provider_registry),
         };
+        // Background admission must use the authoritative live config, not
+        // the cached snapshot: a writer may be revoking this model/account.
+        // No configured model means consumers skip the background request.
+        let background = config
+            .try_read()
+            .ok()
+            .and_then(|guard| resolve_background_model(&guard, &provider_name, &provider_registry));
         let resolved_planning =
             resolve_planning_model(&config_snapshot, &provider_name, &provider_registry);
         let resolved_search =
@@ -130,11 +138,11 @@ pub(crate) fn make_auxiliary_model_resolver(
         AuxiliaryModelConfig {
             fast_model_name,
             fast_model_provider,
-            background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
+            background_model_name: background.as_ref().map(|m| m.model_name.clone()),
             planning_model_name: resolved_planning.as_ref().map(|m| m.model_name.clone()),
             search_model_name: resolved_search.as_ref().map(|m| m.model_name.clone()),
             summarization_model_name: areas.summarization.as_ref().map(|m| m.model_name.clone()),
-            background_model_provider: areas.background.map(|m| m.provider),
+            background_model_provider: background.map(|m| m.provider),
             summarization_model_provider: areas.summarization.map(|m| m.provider),
             summarization_model_error: areas.summarization_error,
         }
@@ -550,6 +558,234 @@ mod tests {
             expected_requests
         );
         assert_eq!(primary.0.load(Ordering::SeqCst), 0);
+    }
+
+    // Deterministically pause the normal provider-publication ordering after
+    // installing the new Config but before replacing its managed registry.
+    // Dispatch mirrors external-memory's requirement for a background name and
+    // selected provider; the endpoint and all credentials are synthetic.
+    #[tokio::test]
+    async fn host_legacy_memory_rejects_cached_route_during_provider_publication() {
+        use super::make_auxiliary_model_resolver;
+        use crate::app_state::AppState;
+        use actix_web::web::Data;
+        use bamboo_agent_core::{Message, ToolSchema};
+        use bamboo_engine::AuxiliaryModelConfig;
+        use bamboo_llm::{LLMError, LLMProvider, LLMStream, ProviderRegistry};
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[derive(Default)]
+        struct MainCounter(AtomicUsize);
+        #[async_trait::async_trait]
+        impl LLMProvider for MainCounter {
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSchema],
+                _max_output_tokens: Option<u32>,
+                _model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(LLMError::Api("unexpected main provider call".into()))
+            }
+        }
+
+        async fn dispatch_background(models: AuxiliaryModelConfig) -> Result<bool, LLMError> {
+            match (
+                models.background_model_name,
+                models.background_model_provider,
+            ) {
+                (None, None) => Ok(false),
+                (Some(model), Some(provider)) => {
+                    let mut stream = provider
+                        .chat_stream(
+                            &[Message::user("synthetic memory query")],
+                            &[],
+                            Some(32),
+                            &model,
+                        )
+                        .await?;
+                    while let Some(chunk) = stream.next().await {
+                        chunk?;
+                    }
+                    Ok(true)
+                }
+                _ => panic!("background name and provider must remain paired"),
+            }
+        }
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )),
+            )
+            .mount(&mock)
+            .await;
+        let home = tempfile::tempdir().expect("isolated Host data directory");
+        let mut config = Config::default();
+        config.provider = "account-a".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.defaults = None;
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        let memory = config.memory_mut().get_or_insert_with(Default::default);
+        memory.auto_dream_enabled = false;
+        memory.gardener_enabled = false;
+        memory.dedup_gardener_enabled = false;
+        memory.ledger_gardener_enabled = false;
+        memory.ledger_distillation_enabled = false;
+        memory.granularity_freshness_gardener_enabled = false;
+        memory.background_model = Some("memory-only".into());
+        config.provider_instances.insert(
+            "account-a".into(),
+            serde_json::from_value(json!({
+                "provider_type":"openai", "enabled":true,
+                "api_key":"synthetic-host-only", "base_url":mock.uri(), "model":"chat-a"
+            }))
+            .unwrap(),
+        );
+        let primary = Arc::new(MainCounter::default());
+        let main: Arc<dyn LLMProvider> = primary.clone();
+        let mut app_state = AppState::new_with_provider(home.path().to_path_buf(), config, main)
+            .await
+            .expect("synthetic Host should initialize");
+        app_state.stop_config_watcher_for_test();
+        let state = Data::new(app_state);
+        let baseline = state.config.read().await.clone();
+        let old_handle = state.provider_registry.get("account-a").unwrap();
+        let resolver = make_auxiliary_model_resolver(&state, "account-a");
+        let baseline_selection = resolver();
+        assert_eq!(
+            baseline_selection.background_model_name.as_deref(),
+            Some("memory-only")
+        );
+        assert!(Arc::ptr_eq(
+            baseline_selection
+                .background_model_provider
+                .as_ref()
+                .unwrap(),
+            &old_handle
+        ));
+
+        let mut denied = baseline.clone();
+        denied
+            .provider_instances
+            .get_mut("account-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), json!(["chat-a"]));
+        let denied_registry = ProviderRegistry::from_config(&denied, home.path().to_path_buf())
+            .await
+            .expect("explicit denial should make a valid generation");
+        // Match config_runtime's publication: live config changes while the
+        // write guard is held; the registry is replaced before releasing it.
+        let mut write_guard = state.config.write().await;
+        *write_guard = denied.clone();
+        let blocked = resolver();
+        let blocked_name = blocked.background_model_name.clone();
+        let blocked_has_provider = blocked.background_model_provider.is_some();
+        state.provider_registry.replace_with(denied_registry);
+        drop(write_guard);
+        let blocked_dispatched =
+            tokio::time::timeout(Duration::from_secs(5), dispatch_background(blocked))
+                .await
+                .expect("blocked dispatch should finish")
+                .expect("synthetic peer should respond");
+        let blocked_requests = mock.received_requests().await.unwrap().len();
+
+        let denied_selection = resolver();
+        let denied_name = denied_selection.background_model_name.clone();
+        let denied_dispatched = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch_background(denied_selection),
+        )
+        .await
+        .expect("denied dispatch should finish")
+        .expect("synthetic peer should respond");
+        let denied_requests = mock.received_requests().await.unwrap().len();
+
+        // A subsequent valid explicit allowlist and matching registry restore
+        // the same model/account after the publication guard is released.
+        let mut allowed = denied;
+        allowed
+            .provider_instances
+            .get_mut("account-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), json!(["chat-a", "memory-only"]));
+        let allowed_registry = ProviderRegistry::from_config(&allowed, home.path().to_path_buf())
+            .await
+            .expect("allowing generation");
+        let mut write_guard = state.config.write().await;
+        *write_guard = allowed;
+        state.provider_registry.replace_with(allowed_registry);
+        drop(write_guard);
+        let allowed_selection = resolver();
+        let allowed_name = allowed_selection.background_model_name.clone();
+        let allowed_handle = state.provider_registry.get("account-a").unwrap();
+        let allowed_same_account = allowed_selection
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| Arc::ptr_eq(provider, &allowed_handle));
+        let allowed_dispatched = tokio::time::timeout(
+            Duration::from_secs(5),
+            dispatch_background(allowed_selection),
+        )
+        .await
+        .expect("allowed dispatch should finish")
+        .expect("synthetic peer should respond");
+        let requests = mock.received_requests().await.unwrap();
+        let allowed_requests = requests.len() - denied_requests;
+        let final_model = requests.last().map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["model"].as_str().unwrap().to_string()
+        });
+
+        // One combined assertion preserves all evidence even when the expected
+        // RED route dispatches once before the restored positive control.
+        assert_eq!(
+            (
+                (
+                    blocked_name,
+                    blocked_has_provider,
+                    blocked_dispatched,
+                    blocked_requests
+                ),
+                (denied_name, denied_dispatched, denied_requests),
+                (
+                    allowed_name,
+                    allowed_same_account,
+                    allowed_dispatched,
+                    allowed_requests,
+                    final_model
+                ),
+                primary.0.load(Ordering::SeqCst)
+            ),
+            (
+                (None, false, false, 0),
+                (None, false, 0),
+                (
+                    Some("memory-only".to_string()),
+                    true,
+                    true,
+                    1,
+                    Some("memory-only".to_string())
+                ),
+                0
+            ),
+        );
     }
 
     #[test]

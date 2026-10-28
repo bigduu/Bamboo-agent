@@ -8,7 +8,7 @@
 //! synthesized-legacy branch remains only for hybrid configurations whose
 //! default still names a legacy alias during the Lotus migration window.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
@@ -52,6 +52,8 @@ enum RegistryOrigin {
     Managed {
         key: Box<ring::hmac::Key>,
         bindings: HashMap<String, Binding>,
+        // Per-generation provider keys without an explicit runtime model list.
+        legacy_memory_implicit: HashSet<String>,
     },
 }
 
@@ -166,7 +168,7 @@ impl ProviderRegistry {
         name: &str,
         selected: &Arc<dyn LLMProvider>,
     ) -> Option<Arc<ManagedProviderOrigin>> {
-        let RegistryOrigin::Managed { key, bindings } = &state.origin else {
+        let RegistryOrigin::Managed { key, bindings, .. } = &state.origin else {
             return None;
         };
         Some(Arc::new(ManagedProviderOrigin {
@@ -236,7 +238,13 @@ impl ProviderRegistry {
                 })?;
         let mut models = HashMap::new();
         let mut bindings = HashMap::new();
+        let mut legacy_memory_implicit = HashSet::new();
         for provider in providers.keys() {
+            if bamboo_config::has_implicit_runtime_models_for_provider_key(config, provider)
+                .map_err(LLMError::Api)?
+            {
+                legacy_memory_implicit.insert(provider.clone());
+            }
             models.insert(
                 provider.clone(),
                 bamboo_config::provider_runtime_models(config, provider).map_err(LLMError::Api)?,
@@ -255,6 +263,7 @@ impl ProviderRegistry {
                 origin: RegistryOrigin::Managed {
                     key: Box::new(key),
                     bindings,
+                    legacy_memory_implicit,
                 },
             }),
         })
@@ -302,7 +311,15 @@ impl ProviderRegistry {
                 (provider, ids.into_iter().collect())
             })
             .collect();
-        self.state.write().recover_poison().runtime_models = Some(models);
+        let mut state = self.state.write().recover_poison();
+        state.runtime_models = Some(models);
+        if let RegistryOrigin::Managed {
+            legacy_memory_implicit,
+            ..
+        } = &mut state.origin
+        {
+            legacy_memory_implicit.clear();
+        }
     }
 
     /// Admitted IDs; None is an unmanaged embedded registry, never discovery.
@@ -403,7 +420,7 @@ impl ProviderRegistry {
         config: &Config,
         target: &bamboo_domain::ProviderModelRef,
     ) -> Result<Arc<dyn LLMProvider>, LLMError> {
-        if let RegistryOrigin::Managed { key, bindings } = &state.origin {
+        if let RegistryOrigin::Managed { key, bindings, .. } = &state.origin {
             if config
                 .provider_instances
                 .get(&target.provider)
@@ -435,6 +452,68 @@ impl ProviderRegistry {
             return Ok(provider);
         }
         Self::provider_for_model_in_snapshot(state, target)
+    }
+
+    /// Narrow compatibility route for the old memory.background_model string.
+    /// This does not add the model to the provider's general runtime list.
+    /// The supplied Config must be the caller's authoritative request snapshot.
+    #[doc(hidden)]
+    pub fn try_legacy_memory_provider(
+        &self,
+        config: &Config,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<Option<Arc<dyn LLMProvider>>, LLMError> {
+        if config.defaults.is_some()
+            || target.provider.trim().is_empty()
+            || target.provider.trim() != target.provider
+            || target.model.trim().is_empty()
+            || target.model.trim() != target.model
+            || config
+                .memory()
+                .as_ref()
+                .and_then(|memory| memory.background_model.as_deref())
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                != Some(target.model.as_str())
+        {
+            return Ok(None);
+        }
+        let state = self.state.read().recover_poison();
+        let RegistryOrigin::Managed {
+            key,
+            bindings,
+            legacy_memory_implicit,
+        } = &state.origin
+        else {
+            return Ok(None);
+        };
+        if !legacy_memory_implicit.contains(&target.provider)
+            || !bamboo_config::has_implicit_runtime_models_for_provider_key(
+                config,
+                &target.provider,
+            )
+            .map_err(LLMError::Api)?
+        {
+            return Ok(None);
+        }
+        let current = configured_binding(config, &target.provider, key)?.ok_or_else(|| {
+            LLMError::Auth(format!(
+                "Provider '{}' has no available current configuration",
+                target.provider
+            ))
+        })?;
+        let saved = bindings.get(&target.provider).ok_or_else(stale_binding)?;
+        if !bool::from(saved.0.as_slice().ct_eq(current.0.as_slice())) {
+            return Err(stale_binding());
+        }
+        let provider = state
+            .providers
+            .get(&target.provider)
+            .cloned()
+            .ok_or_else(|| {
+                LLMError::Auth(format!("Provider '{}' is not available", target.provider))
+            })?;
+        Ok(Some(provider))
     }
 
     /// Return a coherent configured handle and whether its registry generation
@@ -736,8 +815,14 @@ impl ProviderRegistry {
         // An arbitrary inserted handle has no proven configuration binding.
         // Invalidate first: if dropping a replaced provider panics, poison
         // recovery must never pair its replacement with the old binding.
-        if let RegistryOrigin::Managed { bindings, .. } = &mut state.origin {
+        if let RegistryOrigin::Managed {
+            bindings,
+            legacy_memory_implicit,
+            ..
+        } = &mut state.origin
+        {
             bindings.remove(&key);
+            legacy_memory_implicit.remove(&key);
         }
         let replaced = state.providers.insert(key.clone(), provider);
         state.metadata.insert(
@@ -759,8 +844,14 @@ impl ProviderRegistry {
         if let Some(models) = state.runtime_models.as_mut() {
             models.remove(key);
         }
-        if let RegistryOrigin::Managed { bindings, .. } = &mut state.origin {
+        if let RegistryOrigin::Managed {
+            bindings,
+            legacy_memory_implicit,
+            ..
+        } = &mut state.origin
+        {
             bindings.remove(key);
+            legacy_memory_implicit.remove(key);
         }
         state.providers.remove(key)
     }
@@ -1057,6 +1148,309 @@ mod tests {
     use super::*;
     use bamboo_config::OpenAIConfig;
 
+    fn legacy_memory_test_config() -> Config {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.defaults = None;
+        for (id, model, key) in [
+            ("account-a", "chat-a", "synthetic-key-a"),
+            ("account-b", "chat-b", "synthetic-key-b"),
+        ] {
+            config.provider_instances.insert(
+                id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "enabled":true, "api_key":key,
+                    "base_url":"http://127.0.0.1:1", "model":model
+                }))
+                .unwrap(),
+            );
+        }
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .background_model = Some(" memory-v1 ".into());
+        config
+    }
+
+    #[tokio::test]
+    async fn legacy_memory_live_update_preserves_exact_provider_without_general_admission() {
+        let mut config = legacy_memory_test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProviderRegistry::from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        let target = bamboo_domain::ProviderModelRef::new("account-b", "memory-v1");
+        let b = registry.get("account-b").unwrap();
+        let a = registry.get("account-a").unwrap();
+        let selected = registry
+            .try_legacy_memory_provider(&config, &target)
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&selected, &b));
+        assert!(!Arc::ptr_eq(&selected, &a));
+        assert!(registry.provider_for_model(&target).is_err());
+        assert!(registry
+            .provider_for_configured_model(&config, &target)
+            .is_err());
+
+        // Memory-only updates do not rebuild providers: the next route reads
+        // the current value, while the old model is no longer this role.
+        config.memory_mut().as_mut().unwrap().background_model = Some("memory-v2".into());
+        assert!(registry
+            .try_legacy_memory_provider(&config, &target)
+            .unwrap()
+            .is_none());
+        let updated = bamboo_domain::ProviderModelRef::new("account-b", "memory-v2");
+        assert!(Arc::ptr_eq(
+            &registry
+                .try_legacy_memory_provider(&config, &updated)
+                .unwrap()
+                .unwrap(),
+            &b
+        ));
+        assert!(registry.provider_for_model(&updated).is_err());
+        let mut with_defaults = config.clone();
+        with_defaults.defaults = Some(
+            serde_json::from_value(serde_json::json!({
+                "chat": {"provider":"account-a", "model":"chat-a"}
+            }))
+            .unwrap(),
+        );
+        assert!(registry
+            .try_legacy_memory_provider(&with_defaults, &updated)
+            .unwrap()
+            .is_none());
+
+        let mut changed_account = config.clone();
+        changed_account
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .api_key = "different-key".into();
+        assert!(registry
+            .try_legacy_memory_provider(&changed_account, &updated)
+            .is_err());
+        let mut disabled = config.clone();
+        disabled
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .enabled = false;
+        assert!(!matches!(
+            registry.try_legacy_memory_provider(&disabled, &updated),
+            Ok(Some(_))
+        ));
+        let unknown = bamboo_domain::ProviderModelRef::new("missing", "memory-v2");
+        assert!(!matches!(
+            registry.try_legacy_memory_provider(&config, &unknown),
+            Ok(Some(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_memory_requires_implicit_snapshot_and_live_allowlist() {
+        let config = legacy_memory_test_config();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProviderRegistry::from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        let target = bamboo_domain::ProviderModelRef::new("account-b", "memory-v1");
+        assert!(registry
+            .try_legacy_memory_provider(&config, &target)
+            .unwrap()
+            .is_some());
+        let mut live_explicit = config.clone();
+        live_explicit
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat-b"]));
+        assert!(registry
+            .try_legacy_memory_provider(&live_explicit, &target)
+            .unwrap()
+            .is_none());
+        assert!(registry
+            .provider_for_configured_model(&live_explicit, &target)
+            .is_err());
+        live_explicit
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!([]));
+        assert!(registry
+            .try_legacy_memory_provider(&live_explicit, &target)
+            .unwrap()
+            .is_none());
+        assert!(registry
+            .provider_for_configured_model(&live_explicit, &target)
+            .is_err());
+        live_explicit
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(null));
+        assert!(registry
+            .try_legacy_memory_provider(&live_explicit, &target)
+            .is_err());
+
+        // A later explicit deny cannot be bypassed by removing the live list
+        // before the corresponding registry generation is rebuilt.
+        live_explicit
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat-b"]));
+        let explicit_snapshot = ProviderRegistry::from_config(&live_explicit, dir.path().into())
+            .await
+            .unwrap();
+        live_explicit
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .remove("runtime_models");
+        assert!(explicit_snapshot
+            .try_legacy_memory_provider(&live_explicit, &target)
+            .unwrap()
+            .is_none());
+        assert!(explicit_snapshot
+            .provider_for_configured_model(&live_explicit, &target)
+            .is_err());
+        explicit_snapshot
+            .reload_from_config(&live_explicit, dir.path().into())
+            .await
+            .unwrap();
+        assert!(explicit_snapshot
+            .try_legacy_memory_provider(&live_explicit, &target)
+            .unwrap()
+            .is_some());
+
+        // External admission replacement is authoritative until a new managed generation.
+        registry.set_runtime_models(HashMap::from([
+            ("account-a".into(), vec!["chat-a".into()]),
+            ("account-b".into(), vec!["chat-b".into()]),
+        ]));
+        assert!(registry
+            .try_legacy_memory_provider(&config, &target)
+            .unwrap()
+            .is_none());
+        assert!(registry.provider_for_model(&target).is_err());
+        registry
+            .reload_from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        assert!(registry
+            .try_legacy_memory_provider(&config, &target)
+            .unwrap()
+            .is_some());
+        let same_handle = registry.get("account-b").unwrap();
+        registry.insert("account-b".into(), same_handle);
+        assert!(!matches!(
+            registry.try_legacy_memory_provider(&config, &target),
+            Ok(Some(_))
+        ));
+        registry
+            .reload_from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        registry.remove("account-b");
+        assert!(!matches!(
+            registry.try_legacy_memory_provider(&config, &target),
+            Ok(Some(_))
+        ));
+
+        let mut explicitly_allowed = config.clone();
+        explicitly_allowed
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .insert(
+                "runtime_models".into(),
+                serde_json::json!(["chat-b", "memory-v1"]),
+            );
+        let explicit_registry =
+            ProviderRegistry::from_config(&explicitly_allowed, dir.path().into())
+                .await
+                .unwrap();
+        assert!(explicit_registry
+            .try_legacy_memory_provider(&explicitly_allowed, &target)
+            .unwrap()
+            .is_none());
+        assert!(explicit_registry
+            .provider_for_configured_model(&explicitly_allowed, &target)
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn legacy_memory_honors_legacy_provider_and_unmanaged_registry_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.defaults = None;
+        config.providers_mut().openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "api_key":"synthetic-only", "base_url":"http://127.0.0.1:1", "model":"chat"
+            }))
+            .unwrap(),
+        );
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .background_model = Some("legacy-memory".into());
+        let target = bamboo_domain::ProviderModelRef::new("openai", "legacy-memory");
+        let managed = ProviderRegistry::from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        let handle = managed.get("openai").unwrap();
+        assert!(Arc::ptr_eq(
+            &managed
+                .try_legacy_memory_provider(&config, &target)
+                .unwrap()
+                .unwrap(),
+            &handle
+        ));
+        assert!(managed.provider_for_model(&target).is_err());
+        let mut denied = config.clone();
+        denied
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat"]));
+        assert!(managed
+            .try_legacy_memory_provider(&denied, &target)
+            .unwrap()
+            .is_none());
+        assert!(managed
+            .provider_for_configured_model(&denied, &target)
+            .is_err());
+
+        let unmanaged =
+            ProviderRegistry::new(HashMap::from([("openai".into(), handle)]), "openai".into());
+        assert!(unmanaged
+            .try_legacy_memory_provider(&config, &target)
+            .unwrap()
+            .is_none());
+        assert!(unmanaged
+            .provider_for_configured_model(&config, &target)
+            .is_ok());
+        unmanaged.set_runtime_models(HashMap::from([("openai".into(), vec!["chat".into()])]));
+        assert!(unmanaged
+            .provider_for_configured_model(&config, &target)
+            .is_err());
+        assert!(unmanaged
+            .try_legacy_memory_provider(&config, &target)
+            .unwrap()
+            .is_none());
+    }
+
     fn managed_config() -> Config {
         let mut config = Config::default();
         config.default_provider_instance = Some("relay".into());
@@ -1264,6 +1658,7 @@ mod tests {
                     origin: RegistryOrigin::Managed {
                         key: Box::new(key),
                         bindings: HashMap::from([("relay".into(), binding)]),
+                        legacy_memory_implicit: HashSet::new(),
                     },
                 }),
             }
@@ -1837,6 +2232,7 @@ mod tests {
                     origin: RegistryOrigin::Managed {
                         key: Box::new(key),
                         bindings: HashMap::from([("relay".into(), binding)]),
+                        legacy_memory_implicit: HashSet::new(),
                     },
                 }),
             }
@@ -1916,6 +2312,7 @@ mod tests {
                 origin: RegistryOrigin::Managed {
                     key: Box::new(key),
                     bindings: HashMap::from([("relay".into(), binding)]),
+                    legacy_memory_implicit: HashSet::new(),
                 },
             }),
         };

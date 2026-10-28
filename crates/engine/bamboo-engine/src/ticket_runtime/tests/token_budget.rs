@@ -612,6 +612,49 @@ async fn token_budget_dynamic_auxiliary_and_vision_cannot_escape_shared_exhausti
 }
 
 #[tokio::test]
+async fn token_budget_background_only_override_cannot_escape_shared_exhaustion() {
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let dynamic: Arc<dyn LLMProvider> = inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        auxiliary_model_resolver: None,
+        background_model_resolver: Some(Arc::new(move || {
+            Some(bamboo_llm::ResolvedModel::new(
+                dynamic.clone(),
+                "fixture-model",
+            ))
+        })),
+        ..Default::default()
+    };
+    let main = budget.decorate(&mut config, inner.clone());
+    drop(
+        main.chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap(),
+    );
+    let background = config.resolve_auxiliary_models();
+    assert_eq!(
+        background.background_model_name.as_deref(),
+        Some("fixture-model")
+    );
+    assert!(background
+        .background_model_provider
+        .unwrap()
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger(&f).total_charged, 140);
+}
+
+#[tokio::test]
 async fn token_budget_unknown_model_and_revoked_root_block_before_provider() {
     let (f, _registration) = admitted().await;
     configure(&f, 500);

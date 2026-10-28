@@ -21,7 +21,7 @@ use bamboo_engine::execution::{
     create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
     spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
 };
-use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
+use bamboo_engine::{AuxiliaryModelConfig, ModelRoster, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
 
 use crate::permission_audit::record_bamboo_runtime_permission_metadata;
@@ -209,6 +209,32 @@ fn resolve_connect_run_config(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> ResolvedConnectRunConfig {
     bamboo_engine::resolved_defaults::resolve_default_run_config(config_snapshot, provider_registry)
+}
+
+// Construct the same resolver used by Connect's new-run execution. The
+// provider key comes from the resolved run, not a later global default.
+pub(super) fn connect_auxiliary_model_resolver(
+    config: Arc<TokioRwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    model_roster: &ModelRoster,
+) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> {
+    let fixed = AuxiliaryModelConfig {
+        fast_model_name: model_roster.fast_model(),
+        fast_model_provider: model_roster.fast_model_provider(),
+        background_model_name: model_roster.background_model(),
+        planning_model_name: None,
+        search_model_name: None,
+        summarization_model_name: model_roster.summarization_model(),
+        background_model_provider: model_roster.background_model_provider(),
+        summarization_model_provider: model_roster.summarization_model_provider(),
+        summarization_model_error: None,
+    };
+    bamboo_engine::model_areas::live_background_model_resolver(
+        config,
+        registry,
+        model_roster.provider_name.clone().unwrap_or_default(),
+        fixed,
+    )
 }
 
 /// Builds a fresh session for a connect chat key. Mirrors
@@ -984,25 +1010,11 @@ impl ConnectBridge {
                 root_publication,
             );
 
-        // Auxiliary (fast/background/summarization) model resolver — mirrors
-        // `schedule_app::manager::run_schedule_job` exactly.
-        let aux_fast_model = resolved.model_roster.fast_model();
-        let aux_fast_provider = resolved.model_roster.fast_model_provider();
-        let aux_background_model = resolved.model_roster.background_model();
-        let aux_background_provider = resolved.model_roster.background_model_provider();
-        let aux_summarization_model = resolved.model_roster.summarization_model();
-        let aux_summarization_provider = resolved.model_roster.summarization_model_provider();
-        let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
-            fast_model_name: aux_fast_model.clone(),
-            fast_model_provider: aux_fast_provider.clone(),
-            background_model_name: aux_background_model.clone(),
-            planning_model_name: None,
-            search_model_name: None,
-            summarization_model_name: aux_summarization_model.clone(),
-            background_model_provider: aux_background_provider.clone(),
-            summarization_model_provider: aux_summarization_provider.clone(),
-            summarization_model_error: None,
-        });
+        let auxiliary_model_resolver = connect_auxiliary_model_resolver(
+            self.ctx.config.clone(),
+            self.ctx.provider_registry.clone(),
+            &resolved.model_roster,
+        );
 
         spawn_session_execution(SessionExecutionArgs {
             agent: self.ctx.agent.clone(),
@@ -1311,6 +1323,29 @@ async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
 
 #[cfg(test)]
 mod tests {
+
+    // Exercise the exact builder installed for a Connect new run. This is a
+    // resolver-level test, not a complete platform/session execution.
+    #[tokio::test]
+    async fn connect_new_run_legacy_background_rechecks_managed_admission() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let snapshot =
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture.config.read())
+                .await
+                .expect("config snapshot timeout")
+                .clone();
+        let resolved = resolve_connect_run_config(&snapshot, &fixture.registry);
+        assert_eq!(
+            resolved.model_roster.provider_name.as_deref(),
+            Some("account-a")
+        );
+        let resolver = connect_auxiliary_model_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+            &resolved.model_roster,
+        );
+        fixture.verify(resolver).await;
+    }
     use super::*;
     use crate::app_state::AppState;
     use crate::tools::ToolSurface;

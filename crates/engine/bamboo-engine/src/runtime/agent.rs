@@ -96,6 +96,17 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Bind a live background route to this execution without changing other roles.
+    #[doc(hidden)]
+    pub fn with_background_model_resolver(
+        &self,
+        resolver: crate::runtime::config::BackgroundModelResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.background_model_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Bind the Host's Gold route to this execution without changing SDK defaults.
     #[doc(hidden)]
     pub fn with_gold_target_resolver(
