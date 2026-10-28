@@ -107,6 +107,26 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Install a run-keyed auxiliary resolver on this Agent clone only.
+    #[doc(hidden)]
+    pub fn with_auxiliary_model_resolver_factory(
+        &self,
+        factory: Arc<
+            dyn Fn(&str) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.auxiliary_model_resolver_factory = Some(factory);
+        // The factory resolves background and summary with the other roles.
+        // Inherited overrides could belong to another run and would otherwise
+        // replace those selections with a second config read.
+        runtime.background_model_resolver = None;
+        runtime.resume_auxiliary_resolver = None;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Bind a resumed Connect run's live summary/background selection.
     #[doc(hidden)]
     pub fn with_resume_auxiliary_resolver(
@@ -897,5 +917,99 @@ impl AgentBuilder {
 impl Default for AgentBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod auxiliary_factory_isolation_tests {
+    use super::*;
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{Message, ToolSchema};
+    use bamboo_llm::{LLMError, LLMProvider, LLMStream};
+
+    struct UnusedProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for UnusedProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api("provider must not be called".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_clone_discards_only_its_inherited_route_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(dir.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let metrics = bamboo_metrics::MetricsCollector::spawn(
+            Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                dir.path().join("metrics.db"),
+            )),
+            7,
+        );
+        let ordinary = Agent::builder()
+            .storage(storage)
+            .persistence(persistence)
+            .attachment_reader(store)
+            .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+            .metrics_collector(metrics)
+            .config(Arc::new(tokio::sync::RwLock::new(
+                bamboo_llm::Config::default(),
+            )))
+            .provider(Arc::new(UnusedProvider))
+            .default_tools(Arc::new(bamboo_tools::BuiltinToolExecutor::new()))
+            .build()
+            .unwrap();
+        let background: crate::runtime::config::BackgroundModelResolver = Arc::new(|_| None);
+        let resume: crate::runtime::config::ResumeAuxiliaryResolver = Arc::new(|| (Ok(None), None));
+        let bound = ordinary
+            .with_background_model_resolver(background.clone())
+            .with_resume_auxiliary_resolver(resume.clone());
+        let sibling = bound.clone();
+        let schedule = bound.with_auxiliary_model_resolver_factory(Arc::new(|key| {
+            let key = key.to_owned();
+            Arc::new(move || crate::AuxiliaryModelConfig {
+                fast_model_name: Some(key.clone()),
+                ..Default::default()
+            })
+        }));
+
+        assert!(ordinary.runtime.auxiliary_model_resolver_factory.is_none());
+        assert!(ordinary.runtime.background_model_resolver.is_none());
+        assert!(ordinary.runtime.resume_auxiliary_resolver.is_none());
+        for agent in [&bound, &sibling] {
+            assert!(agent.runtime.auxiliary_model_resolver_factory.is_none());
+            assert!(Arc::ptr_eq(
+                agent.runtime.background_model_resolver.as_ref().unwrap(),
+                &background,
+            ));
+            assert!(Arc::ptr_eq(
+                agent.runtime.resume_auxiliary_resolver.as_ref().unwrap(),
+                &resume,
+            ));
+        }
+        assert!(schedule.runtime.background_model_resolver.is_none());
+        assert!(schedule.runtime.resume_auxiliary_resolver.is_none());
+        let factory = schedule
+            .runtime
+            .auxiliary_model_resolver_factory
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            factory("run-key")().fast_model_name.as_deref(),
+            Some("run-key")
+        );
     }
 }

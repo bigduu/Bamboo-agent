@@ -218,22 +218,10 @@ pub(super) fn connect_auxiliary_model_resolver(
     registry: Arc<ProviderRegistry>,
     model_roster: &ModelRoster,
 ) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> {
-    let fixed = AuxiliaryModelConfig {
-        fast_model_name: model_roster.fast_model(),
-        fast_model_provider: model_roster.fast_model_provider(),
-        background_model_name: model_roster.background_model(),
-        planning_model_name: None,
-        search_model_name: None,
-        summarization_model_name: model_roster.summarization_model(),
-        background_model_provider: model_roster.background_model_provider(),
-        summarization_model_provider: model_roster.summarization_model_provider(),
-        summarization_model_error: None,
-    };
-    bamboo_engine::model_areas::live_background_model_resolver(
+    bamboo_engine::model_areas::live_auxiliary_model_resolver(
         config,
         registry,
         model_roster.provider_name.clone().unwrap_or_default(),
-        fixed,
     )
 }
 
@@ -1344,7 +1332,29 @@ mod tests {
             fixture.registry.clone(),
             &resolved.model_roster,
         );
-        fixture.verify(resolver).await;
+        let initial = resolver();
+        assert_eq!(initial.fast_model_name.as_deref(), Some("fast-a"));
+        assert!(initial
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+        let mut guard = fixture.config.write().await;
+        guard.default_provider_instance = Some("account-b".into());
+        let blocked = resolver();
+        assert!(blocked.background_model_provider.is_none());
+        assert!(blocked.summarization_model_error.is_some());
+        drop(guard);
+        let current = resolver();
+        assert!(current
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+
+        fixture.verify_live(resolver).await;
     }
     use super::*;
     use crate::app_state::AppState;

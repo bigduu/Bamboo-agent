@@ -762,6 +762,8 @@ async fn run_schedule_job(
     // (marking the run terminal, and writing a visible failure marker) is
     // carried by the `on_complete` hook, which runs after the runner is
     // finalized but before the session is persisted — so the marker is saved.
+    // Unmodified custom contexts retain their roster snapshot. The standard
+    // builder's Agent factory replaces this with a live resolver for this run.
     let aux_fast_model = resolved.model_roster.fast_model();
     let aux_fast_provider = resolved.model_roster.fast_model_provider();
     let aux_background_model = resolved.model_roster.background_model();
@@ -772,12 +774,10 @@ async fn run_schedule_job(
         fast_model_name: aux_fast_model.clone(),
         fast_model_provider: aux_fast_provider.clone(),
         background_model_name: aux_background_model.clone(),
-        planning_model_name: None,
-        search_model_name: None,
-        summarization_model_name: aux_summarization_model.clone(),
         background_model_provider: aux_background_provider.clone(),
+        summarization_model_name: aux_summarization_model.clone(),
         summarization_model_provider: aux_summarization_provider.clone(),
-        summarization_model_error: None,
+        ..Default::default()
     });
 
     let schedule_store = ctx.schedule_store.clone();
@@ -1154,8 +1154,8 @@ pub fn build_schedule_context(
     // Each execution supplies its own roster key to this shared immutable
     // resolver. The Agent clone is scoped to Schedule; the caller's Agent and
     // the public ScheduleContext/ResolvedRunConfig layout remain unchanged.
-    let schedule_agent = Arc::new(base.agent.with_background_model_resolver(
-        schedule_background_model_resolver(config.clone(), provider_registry.clone()),
+    let schedule_agent = Arc::new(base.agent.with_auxiliary_model_resolver_factory(
+        schedule_auxiliary_model_resolver_factory(config.clone(), provider_registry.clone()),
     ));
     ScheduleContext {
         schedule_store: base.schedule_store,
@@ -1180,6 +1180,20 @@ pub fn build_schedule_context(
     }
 }
 
+fn schedule_auxiliary_model_resolver_factory(
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    registry: Arc<bamboo_llm::ProviderRegistry>,
+) -> Arc<dyn Fn(&str) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> + Send + Sync> {
+    Arc::new(move |provider_name| {
+        bamboo_engine::model_areas::live_auxiliary_model_resolver(
+            config.clone(),
+            registry.clone(),
+            provider_name.to_string(),
+        )
+    })
+}
+
+#[cfg(test)]
 fn schedule_background_model_resolver(
     config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     registry: Arc<bamboo_llm::ProviderRegistry>,
@@ -1298,6 +1312,44 @@ fn resolve_run_config_from_config(
 #[cfg(test)]
 mod build_context_tests {
 
+    // The standard builder's factory binds the actual run key even when the
+    // current default differs. It also fails closed during config publication.
+    #[tokio::test]
+    async fn schedule_factory_uses_run_provider_and_live_config() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let factory = super::schedule_auxiliary_model_resolver_factory(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+        );
+        let a = factory("account-a");
+        let b = factory("account-b");
+        assert!(a()
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+        assert!(b()
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-b").unwrap())
+            }));
+        let mut guard = fixture.config.write().await;
+        guard.default_provider_instance = Some("account-b".into());
+        let blocked = a();
+        assert!(blocked.background_model_provider.is_none());
+        assert!(blocked.summarization_model_error.is_some());
+        drop(guard);
+        assert!(a()
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+        fixture.verify_live(a).await;
+    }
+
     // Use the Schedule configuration and background callback builders, then
     // compose their results for the matrix; this is not a whole scheduled run.
     #[tokio::test]
@@ -1309,9 +1361,9 @@ mod build_context_tests {
             resolved.model_roster.provider_name.as_deref(),
             Some("account-a")
         );
-        // The actual Schedule callback receives its run's frozen roster key.
-        // Compose it with the frozen roles as AgentLoopConfig does; the engine
-        // unit test separately exercises actual per-run key forwarding.
+        // The retained legacy background-only helper receives the frozen roster
+        // key and is composed with fixed roles for this compatibility matrix.
+        // The full live factory and per-run key forwarding are tested separately.
         let fixed = bamboo_engine::AuxiliaryModelConfig {
             fast_model_name: resolved.model_roster.fast_model(),
             fast_model_provider: resolved.model_roster.fast_model_provider(),

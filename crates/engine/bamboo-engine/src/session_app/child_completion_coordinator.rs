@@ -42,10 +42,8 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, RwLock};
 
-use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_gold_config,
-    resolve_provider_routing_key, GOLD_CONFIG_METADATA_KEY,
+    resolve_fast_model, resolve_gold_config, resolve_provider_routing_key, GOLD_CONFIG_METADATA_KEY,
 };
 use crate::session_activation::{
     SessionActivationLaunch, SessionActivationReserveOutcome, SessionActivationSpawner,
@@ -418,6 +416,7 @@ async fn derive_completed_child_ids(
     completed
 }
 
+#[cfg(test)]
 fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<Config>) -> Config {
     if let Ok(config_guard) = config.try_read() {
         let snapshot = config_guard.clone();
@@ -437,36 +436,15 @@ fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<
 
 fn make_resume_auxiliary_model_resolver(
     config_handle: Arc<RwLock<Config>>,
-    config_snapshot: Config,
+    _config_snapshot: Config,
     provider_registry: Arc<ProviderRegistry>,
     provider_name_for_aux: String,
 ) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync> {
-    let cached_config = Arc::new(StdRwLock::new(config_snapshot));
-    Arc::new(move || {
-        let config_snapshot = read_config_snapshot(&config_handle, cached_config.as_ref());
-        // Auxiliary models are global (config-derived), never session-bound.
-        let areas = resolve_global_area_models(
-            &config_snapshot,
-            &provider_name_for_aux,
-            &provider_registry,
-        );
-        // A cached configuration cannot prove current background admission
-        // while another task is writing the authoritative configuration.
-        let background = config_handle.try_read().ok().and_then(|guard| {
-            resolve_background_model(&guard, &provider_name_for_aux, &provider_registry)
-        });
-        crate::AuxiliaryModelConfig {
-            fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
-            fast_model_provider: areas.fast.map(|m| m.provider),
-            background_model_name: background.as_ref().map(|m| m.model_name.clone()),
-            planning_model_name: None,
-            search_model_name: None,
-            summarization_model_name: areas.summarization.as_ref().map(|m| m.model_name.clone()),
-            background_model_provider: background.map(|m| m.provider),
-            summarization_model_provider: areas.summarization.map(|m| m.provider),
-            summarization_model_error: areas.summarization_error,
-        }
-    })
+    crate::model_areas::live_auxiliary_model_resolver(
+        config_handle,
+        provider_registry,
+        provider_name_for_aux,
+    )
 }
 
 /// Per-parent async locks that serialize concurrent `on_child_completed`

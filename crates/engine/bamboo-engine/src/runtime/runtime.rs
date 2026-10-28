@@ -35,6 +35,68 @@ use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort};
 use crate::session_activation::SessionActivationRouter;
 use crate::session_messaging::SessionMessenger;
 
+pub(crate) type AuxiliaryModelResolver = Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>;
+pub(crate) type AuxiliaryModelResolverFactory =
+    Arc<dyn Fn(&str) -> AuxiliaryModelResolver + Send + Sync>;
+
+// A host factory is installed only on the Schedule Agent clone. Explicitly
+// absent roster keys are passed as empty, never substituted with a global key.
+fn select_auxiliary_model_resolver(
+    factory: Option<&AuxiliaryModelResolverFactory>,
+    roster_provider: Option<&str>,
+    fallback: Option<AuxiliaryModelResolver>,
+) -> Option<AuxiliaryModelResolver> {
+    factory
+        .map(|create| create(roster_provider.unwrap_or_default()))
+        .or(fallback)
+}
+
+#[cfg(test)]
+mod auxiliary_resolver_factory_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn factory_receives_each_roster_key_and_sdk_fallback_is_unchanged() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let recorded = keys.clone();
+        let factory: AuxiliaryModelResolverFactory = Arc::new(move |key| {
+            recorded.lock().unwrap().push(key.to_string());
+            let name = key.to_string();
+            Arc::new(move || AuxiliaryModelConfig {
+                fast_model_name: Some(name.clone()),
+                ..Default::default()
+            })
+        });
+        let fallback: AuxiliaryModelResolver = Arc::new(|| AuxiliaryModelConfig {
+            fast_model_name: Some("snapshot".into()),
+            ..Default::default()
+        });
+        let a = select_auxiliary_model_resolver(
+            Some(&factory),
+            Some("account-a"),
+            Some(fallback.clone()),
+        )
+        .unwrap();
+        let b = select_auxiliary_model_resolver(
+            Some(&factory),
+            Some("account-b"),
+            Some(fallback.clone()),
+        )
+        .unwrap();
+        let missing = select_auxiliary_model_resolver(Some(&factory), None, None).unwrap();
+        assert_eq!(a().fast_model_name.as_deref(), Some("account-a"));
+        assert_eq!(b().fast_model_name.as_deref(), Some("account-b"));
+        assert_eq!(missing().fast_model_name.as_deref(), Some(""));
+        assert_eq!(*keys.lock().unwrap(), vec!["account-a", "account-b", ""]);
+        let unchanged =
+            select_auxiliary_model_resolver(None, Some("account-a"), Some(fallback.clone()))
+                .unwrap();
+        assert!(Arc::ptr_eq(&unchanged, &fallback));
+        assert!(select_auxiliary_model_resolver(None, None, None).is_none());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // AgentRuntime — shared resources (assembled once)
 // ---------------------------------------------------------------------------
@@ -57,6 +119,7 @@ pub struct AgentRuntime {
     pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
     pub(crate) gold_target_resolver: Option<crate::runtime::config::GoldTargetResolver>,
     pub(crate) background_model_resolver: Option<crate::runtime::config::BackgroundModelResolver>,
+    pub(crate) auxiliary_model_resolver_factory: Option<AuxiliaryModelResolverFactory>,
     pub(crate) resume_auxiliary_resolver: Option<crate::runtime::config::ResumeAuxiliaryResolver>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
@@ -257,6 +320,7 @@ impl AgentRuntimeBuilder {
             live_bootstrap_host: None,
             gold_target_resolver: None,
             background_model_resolver: None,
+            auxiliary_model_resolver_factory: None,
             resume_auxiliary_resolver: None,
             activation_router: self.activation_router,
             session_messenger: self.session_messenger,
@@ -984,6 +1048,11 @@ impl AgentRuntime {
             provider_type,
             ..
         } = model_roster;
+        let auxiliary_model_resolver = select_auxiliary_model_resolver(
+            self.auxiliary_model_resolver_factory.as_ref(),
+            provider_name.as_deref(),
+            auxiliary_model_resolver,
+        );
         let active_provider =
             provider_name.unwrap_or_else(|| config.effective_default_provider().to_string());
         let hook_runner = inputs
