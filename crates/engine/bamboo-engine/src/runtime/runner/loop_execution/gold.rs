@@ -21,6 +21,27 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::RoundStatus as MetricsRoundStatus;
 
+/// Preserve the account paired with a Gold model selection. A dedicated Gold
+/// model belongs to the executing account; otherwise use the Fast provider,
+/// including a rejecting provider when Fast routing failed. SDK callers that
+/// only specify a model continue to use the executing provider.
+pub(super) fn select_gold_evaluation_provider(
+    config: &AgentLoopConfig,
+    main: &Arc<dyn LLMProvider>,
+    fast: Option<&Arc<dyn LLMProvider>>,
+) -> Arc<dyn LLMProvider> {
+    if config
+        .gold_config
+        .as_ref()
+        .and_then(|gold| gold.model_name.as_ref())
+        .is_some()
+    {
+        main.clone()
+    } else {
+        fast.cloned().unwrap_or_else(|| main.clone())
+    }
+}
+
 /// Outcome of the terminal goal gate evaluated when the agent produces no tool
 /// calls (i.e. it would otherwise complete the run).
 pub(super) enum GoldTerminalDecision {

@@ -326,6 +326,216 @@ mod tests {
     use bamboo_llm::Config;
     use std::sync::{Arc, RwLock as StdRwLock};
 
+    // Real Host resolver with a config-managed registry and two synthetic
+    // accounts. Only Fast uses the loopback HTTP peer; the main provider is
+    // an in-process counter that reveals an accidental fallback.
+    #[tokio::test]
+    async fn host_fast_resolver_rejects_stale_config_and_busy_lock() {
+        use super::make_auxiliary_model_resolver;
+        use crate::app_state::AppState;
+        use actix_web::web::Data;
+        use bamboo_agent_core::{Message, ToolSchema};
+        use bamboo_engine::AuxiliaryModelConfig;
+        use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions, LLMStream};
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[derive(Default)]
+        struct MainCounter(AtomicUsize);
+
+        #[async_trait::async_trait]
+        impl LLMProvider for MainCounter {
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolSchema],
+                _max_output_tokens: Option<u32>,
+                _model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(LLMError::Api("synthetic main provider was called".into()))
+            }
+        }
+
+        // This mirrors the runner's selected-provider and selected-model
+        // fallback. It is not a full agent-loop integration test.
+        async fn dispatch_selected(
+            models: AuxiliaryModelConfig,
+            main: Arc<dyn LLMProvider>,
+        ) -> Result<(), LLMError> {
+            let model = models.fast_model_name.unwrap_or_else(|| "main-a".into());
+            let provider = models.fast_model_provider.unwrap_or(main);
+            let options = LLMRequestOptions {
+                request_purpose: Some("task_evaluation".into()),
+                ..Default::default()
+            };
+            let mut stream = provider
+                .chat_stream_with_options(
+                    &[Message::user("synthetic Host routing test")],
+                    &[],
+                    Some(32),
+                    &model,
+                    Some(&options),
+                )
+                .await?;
+            while let Some(chunk) = stream.next().await {
+                chunk?;
+            }
+            Ok(())
+        }
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )),
+            )
+            .mount(&mock)
+            .await;
+
+        let temp_dir = tempfile::tempdir().expect("isolated Host data directory");
+        let mut config = Config::default();
+        config.provider = "chat-a".into();
+        config.default_provider_instance = Some("chat-a".into());
+        // Force any proxy use to a local dead endpoint; loopback is excluded by
+        // Bamboo's HTTP client. All configured provider URLs are local mocks.
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        let memory = config.memory_mut().get_or_insert_with(Default::default);
+        memory.auto_dream_enabled = false;
+        memory.gardener_enabled = false;
+        memory.dedup_gardener_enabled = false;
+        memory.ledger_gardener_enabled = false;
+        memory.ledger_distillation_enabled = false;
+        memory.granularity_freshness_gardener_enabled = false;
+        config.defaults = Some(
+            serde_json::from_value(json!({
+                "chat": {"provider": "chat-a", "model": "main-a"},
+                "fast": {"provider": "fast-b", "model": "cheap-b"}
+            }))
+            .unwrap(),
+        );
+        for (id, model) in [("chat-a", "main-a"), ("fast-b", "cheap-b")] {
+            config.provider_instances.insert(
+                id.into(),
+                serde_json::from_value(json!({
+                    "provider_type": "openai",
+                    "enabled": true,
+                    "api_key": "synthetic-host-only",
+                    "base_url": mock.uri(),
+                    "model": model,
+                    "runtime_models": [model]
+                }))
+                .unwrap(),
+            );
+        }
+
+        let primary = Arc::new(MainCounter::default());
+        let main: Arc<dyn LLMProvider> = primary.clone();
+        let mut app_state =
+            AppState::new_with_provider(temp_dir.path().to_path_buf(), config, main.clone())
+                .await
+                .expect("synthetic Host should initialize");
+        app_state.stop_config_watcher_for_test();
+        let state = Data::new(app_state);
+        let baseline = state.config.read().await.clone();
+        let old_fast = state.provider_registry.get("fast-b").expect("managed Fast");
+        let resolver = make_auxiliary_model_resolver(&state, "chat-a");
+        let mut expected_requests = 0;
+
+        for flag in [None, Some(false), Some(true)] {
+            for change in ["disabled", "removed"] {
+                let mut current = baseline.clone();
+                current.features = serde_json::from_value(match flag {
+                    None => json!({}),
+                    Some(value) => json!({"provider_model_ref": value}),
+                })
+                .unwrap();
+                *state.config.write().await = current;
+
+                let selected = resolver();
+                assert_eq!(selected.fast_model_name.as_deref(), Some("cheap-b"));
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    dispatch_selected(selected, main.clone()),
+                )
+                .await
+                .expect("valid Fast should respond promptly")
+                .expect("valid Fast should reach the loopback provider");
+                expected_requests += 1;
+                let requests = mock.received_requests().await.unwrap();
+                assert_eq!(requests.len(), expected_requests);
+                let body: serde_json::Value =
+                    serde_json::from_slice(&requests.last().unwrap().body).unwrap();
+                assert_eq!(body["model"], "cheap-b");
+                assert_eq!(primary.0.load(Ordering::SeqCst), 0);
+
+                {
+                    let mut current = state.config.write().await;
+                    match change {
+                        "disabled" => {
+                            current
+                                .provider_instances
+                                .get_mut("fast-b")
+                                .unwrap()
+                                .enabled = false
+                        }
+                        "removed" => {
+                            current.provider_instances.remove("fast-b");
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                assert!(Arc::ptr_eq(
+                    &old_fast,
+                    &state.provider_registry.get("fast-b").unwrap()
+                ));
+                let result = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    dispatch_selected(resolver(), main.clone()),
+                )
+                .await
+                .expect("rejected route should finish promptly");
+                assert!(
+                    matches!(result, Err(LLMError::Auth(_))),
+                    "flag={flag:?}, change={change}"
+                );
+                assert_eq!(
+                    mock.received_requests().await.unwrap().len(),
+                    expected_requests
+                );
+                assert_eq!(primary.0.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        // Prime the existing cached snapshot with valid config, then hold the
+        // live write lock across selection. Drop it before awaiting dispatch.
+        *state.config.write().await = baseline;
+        assert_eq!(resolver().fast_model_name.as_deref(), Some("cheap-b"));
+        let write_guard = state.config.write().await;
+        let blocked = resolver();
+        drop(write_guard);
+        let result = tokio::time::timeout(Duration::from_secs(5), dispatch_selected(blocked, main))
+            .await
+            .expect("busy config should fail promptly");
+        assert!(matches!(result, Err(LLMError::Api(_))));
+        assert_eq!(
+            mock.received_requests().await.unwrap().len(),
+            expected_requests
+        );
+        assert_eq!(primary.0.load(Ordering::SeqCst), 0);
+    }
+
     #[test]
     fn read_config_snapshot_refreshes_cached_snapshot_from_live_config() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
