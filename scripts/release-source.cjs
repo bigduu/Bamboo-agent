@@ -80,7 +80,7 @@ function githubRead(route) {
 function sourceEvent(env) {
   return JSON.parse(require('node:fs').readFileSync(env.GITHUB_EVENT_PATH, 'utf8'))
 }
-function frozenInputs(env, event) {
+function frozenInputs(env, event, workflow = 'publish-crate.yml') {
   const source = event.inputs?.expected_source_sha
   assert.equal(env.GITHUB_REPOSITORY, REPOSITORY)
   assert.equal(env.GITHUB_EVENT_NAME, 'workflow_dispatch')
@@ -89,12 +89,12 @@ function frozenInputs(env, event) {
   assert.equal(env.GITHUB_SHA, env.GITHUB_WORKFLOW_SHA)
   assert.equal(env.GITHUB_REF, 'refs/heads/dev')
   assert.equal(env.GITHUB_REF_PROTECTED, 'true')
-  assert.equal(env.GITHUB_WORKFLOW_REF, REPOSITORY + '/.github/workflows/publish-crate.yml@' + env.GITHUB_REF)
+  assert.equal(env.GITHUB_WORKFLOW_REF, REPOSITORY + '/.github/workflows/' + workflow + '@' + env.GITHUB_REF)
   for (const name of ['feature_pr', 'accepted_ci_run']) assert.match(String(event.inputs[name] || ''), /^[1-9][0-9]*$/)
   return source
 }
-function frozenGuard(validation, env = process.env, read = githubRead, event = sourceEvent(env)) {
-  const source = frozenInputs(env, event)
+function guard(validation, env, read, event, workflow) {
+  const source = frozenInputs(env, event, workflow)
   assert.equal(validation.sourceRevision, source)
   const dev = read('branches/dev'), ref = read('git/ref/heads/release/' + source)
   assert.equal(dev.name, 'dev'); assert.equal(dev.protected, true)
@@ -120,11 +120,19 @@ function frozenGuard(validation, env = process.env, read = githubRead, event = s
   }
   return { pr, run }
 }
-function authorizeFrozenRelease(env = process.env, read = githubRead, log = id =>
-  require('./crate-release.cjs').command(['gh', 'api', '--hostname', 'github.com', '--allow-escape-sequences',
-    'repos/' + REPOSITORY + '/actions/jobs/' + id + '/logs'], { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 })) {
-  const event = sourceEvent(env), source = frozenInputs(env, event)
-  const { pr, run } = frozenGuard({ sourceRevision: source }, env, read, event)
+function frozenGuard(validation, env = process.env, read = githubRead, event = sourceEvent(env)) {
+  return guard(validation, env, read, event, 'publish-crate.yml')
+}
+function featureLog(id) {
+  return require('./crate-release.cjs').command(['gh', 'api', '--hostname', 'github.com', '--allow-escape-sequences',
+    'repos/' + REPOSITORY + '/actions/jobs/' + id + '/logs'], { encoding: 'utf8', timeout: 30000, maxBuffer: 1024 * 1024 })
+}
+function authorizeFrozenRelease(env = process.env, read = githubRead, log = featureLog) {
+  return authorizeFrozen(env, read, log, sourceEvent(env), 'publish-crate.yml')
+}
+function authorizeFrozen(env, read, log, event, workflow) {
+  const source = frozenInputs(env, event, workflow)
+  const { pr, run } = guard({ sourceRevision: source }, env, read, event, workflow)
   assert.equal(run.workflow_id, read('actions/workflows/ci.yml').id)
   const suite = read('check-suites/' + run.check_suite_id)
   assert.equal(suite.app.id, 15368); assert.equal(suite.head_sha, pr.head.sha)
@@ -158,8 +166,22 @@ function authorizeFrozenRelease(env = process.env, read = githubRead, log = id =
   const validation = { schemaVersion: 1, kind: 'bamboo-frozen-dev-release/v1', repository: REPOSITORY,
     sourceRevision: source, sourceTree: merged.tree.sha, cutRevision: source, releaseHead: source,
     baseRevision: merged.parents[0].sha, featurePr: pr.number, validatedRevision: tested.sha, ciRun }
-  frozenGuard(validation, env, read, event)
+  guard(validation, env, read, event, workflow)
   return validation
+}
+// Fixed recovery request, derived here rather than forging publisher environment
+// or accepting caller-selected source/CI/workflow identities.
+function recoveryEvent(env) {
+  const event = sourceEvent(env)
+  assert.deepEqual(Object.keys(event.inputs).sort(), ['expected_controller_sha'])
+  assert.equal(event.inputs.expected_controller_sha, env.EXPECTED_CONTROLLER_SHA)
+  return { inputs: { expected_source_sha: '4786b7db862cabbebce49e288da62b284ccf5b72', feature_pr: '2369', accepted_ci_run: '40588035791' } }
+}
+function authorizeFrozenRecovery(env = process.env, read = githubRead, log = featureLog) {
+  return authorizeFrozen(env, read, log, recoveryEvent(env), 'recover-frozen-crate-release.yml')
+}
+function frozenRecoveryGuard(validation, env = process.env, read = githubRead) {
+  return guard(validation, env, read, recoveryEvent(env), 'recover-frozen-crate-release.yml')
 }
 // The immutable product source must contain the completed cutover too: promoting
 // an older tested Dev cut would restore Main builds or the old tag Docker build.
@@ -187,7 +209,7 @@ function assertFrozenSourceWorkflows(read = file => require('node:fs').readFileS
     assert.deepEqual(events.sort(), [...required].sort(), 'Source retains an old or unknown trigger: ' + file)
   }
 }
-module.exports = { ...module.exports, FEATURE_CHECKS, authorizeFrozenRelease, frozenGuard, assertFrozenSourceWorkflows }
+module.exports = { ...module.exports, FEATURE_CHECKS, authorizeFrozenRelease, frozenGuard, authorizeFrozenRecovery, frozenRecoveryGuard, assertFrozenSourceWorkflows }
 if (require.main === module) {
   if (process.argv[2] === 'source-contract') {
     const source = frozenInputs(process.env, sourceEvent(process.env))
