@@ -50,8 +50,8 @@ function recipes(platform) {
     ...(windows ? [{ id: "ticket-default", package: "bamboo-tickets", targets: ["--lib"], filters: [TICKET], count: 1, exact: true }] : []),
     { id: "skills-default", package: "bamboo-skills", targets: ["--lib"], filters: SKILLS, count: windows ? 39 : 41 },
     { id: "skill-tool-default", package: "bamboo-server-tools", targets: ["--lib"], filters: ["skill_runtime::catalog_tests::"], count: windows ? 46 : 47 },
-    { id: "llm-retry-native", package: "bamboo-llm", targets: ["--lib"], filters: [LLM_RETRY_TLS, LLM_RETRY_BODY],
-      requiredCases: LLM_RETRY_CASES, count: 12 },
+    { id: "llm-retry-native", package: "bamboo-llm", targets: ["--lib"], filters: LLM_RETRY_CASES,
+      exact: true, requiredCases: LLM_RETRY_CASES, count: 12 },
     { id: "engine-retry-native", package: "bamboo-engine", targets: ["--lib"], filters: ENGINE_RETRY_CASES,
       exact: true, requiredCases: ENGINE_RETRY_CASES, count: 3 },
   ].map(recipe => ({ toolchain: "stable", frontend: "embedded", profile: recipe.unwind ? "dev" : "test", ...recipe }));

@@ -85,11 +85,11 @@ test("retry native owners select every real source witness and keep distinct def
       const names = cases(recipe);
       assert.equal(names.length, expected); assert.equal(new Set(names).size, expected);
       assert.deepEqual([...recipe.requiredCases].sort(), [...names].sort());
-      const list = [...names, "unselected::other"].map(name => name + ": test").join("\n");
+      const list = [...names, names[0] + "_extra", "unselected::other"].map(name => name + ": test").join("\n");
       assert.deepEqual(selectedCases(list, recipe), [...names].sort());
       const args = cargoArguments(recipe), separator = args.indexOf("--");
       assert.deepEqual(args.slice(separator + 1, separator + 1 + recipe.filters.length), recipe.filters);
-      assert.equal(args.includes("--exact"), id === "engine-retry-native");
+      assert.ok(args.includes("--exact"));
       const log = `test result: ok. ${expected} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s`;
       assertRuntime(log, names, recipe);
       for (let index = 0; index < names.length; index++) {
