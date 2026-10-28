@@ -249,7 +249,7 @@ impl LiveRetryBridge {
 
     /// Called while holding the installed runner's registry read guard.
     pub(crate) fn cancel_and_token(&self, session: &str, run: &str, token: &CancellationToken) {
-        let mut map = self.offers();
+        let map = self.offers();
         if let Some(entry) = map
             .get(session)
             .filter(|entry| entry.run_id == run)
