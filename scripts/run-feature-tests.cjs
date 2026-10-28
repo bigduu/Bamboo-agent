@@ -56,11 +56,11 @@ const PLANNER_SERIAL = {
 
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
 // Audited from accepted dev3fe: preserve its FileInbox, current-user/Work
-// and TicketApplication cancellation/drain changes. Only stream_execution.rs
-// changes the sensitive closure for per-execution retries; cfg, functions,
+// and TicketApplication cancellation/drain changes. stream_execution.rs adds
+// the unconditional is_http_body_failure classifier; existing feature cfg and
 // modules, all31 default owners, four contexts and all19 additions remain.
-// The existing default catalogs own the new retry and Stop regressions.
-const FEATURE_SOURCE_SHA256 = "adf62394951e27257c989172438ee1dc1885a03ee1321f17eaa252e03333db55";
+// Default catalogs own the retry, Stop and Engine body-failure regressions.
+const FEATURE_SOURCE_SHA256 = "0b9b6786b2b6ddb132054a6062abd7a699fcf8dee5bc4f14d85a8a916f6a101b";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
