@@ -50,7 +50,7 @@ struct RegistryState {
 enum RegistryOrigin {
     Unmanaged,
     Managed {
-        key: ring::hmac::Key,
+        key: Box<ring::hmac::Key>,
         bindings: HashMap<String, Binding>,
     },
 }
@@ -172,7 +172,7 @@ impl ProviderRegistry {
         Some(Arc::new(ManagedProviderOrigin {
             registry: self.clone(),
             provider_id: name.to_owned(),
-            key: key.clone(),
+            key: key.as_ref().clone(),
             // Missing binding is still managed and fails closed on use.
             original_binding: bindings.get(name).map(|binding| binding.0),
             selected: selected.clone(),
@@ -252,7 +252,10 @@ impl ProviderRegistry {
                 metadata,
                 default_provider,
                 runtime_models: Some(models),
-                origin: RegistryOrigin::Managed { key, bindings },
+                origin: RegistryOrigin::Managed {
+                    key: Box::new(key),
+                    bindings,
+                },
             }),
         })
     }
@@ -1259,7 +1262,7 @@ mod tests {
                         vec!["chat".into(), "fast".into()],
                     )])),
                     origin: RegistryOrigin::Managed {
-                        key,
+                        key: Box::new(key),
                         bindings: HashMap::from([("relay".into(), binding)]),
                     },
                 }),
@@ -1832,7 +1835,7 @@ mod tests {
                     default_provider: "relay".into(),
                     runtime_models: Some(HashMap::from([("relay".into(), vec!["chat".into()])])),
                     origin: RegistryOrigin::Managed {
-                        key,
+                        key: Box::new(key),
                         bindings: HashMap::from([("relay".into(), binding)]),
                     },
                 }),
@@ -1911,7 +1914,7 @@ mod tests {
                 default_provider: "relay".into(),
                 runtime_models: Some(HashMap::from([("relay".into(), vec!["chat".into()])])),
                 origin: RegistryOrigin::Managed {
-                    key,
+                    key: Box::new(key),
                     bindings: HashMap::from([("relay".into(), binding)]),
                 },
             }),
