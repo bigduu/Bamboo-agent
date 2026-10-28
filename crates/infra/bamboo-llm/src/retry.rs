@@ -349,6 +349,18 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     if err.is_builder() || err.is_decode() {
         return false;
     }
+    // Native TLS can erase the distinction between certificate validation
+    // failures and network errors, while reqwest labels both as connect
+    // failures. Stop when TLS hides the cause rather than retrying a permanent
+    // trust or hostname failure forever. Ordinary typed network errors and
+    // the separate headers timeout remain eligible for retry below.
+    let mut tls_source = err.source();
+    while let Some(cause) = tls_source {
+        if cause.downcast_ref::<native_tls::Error>().is_some() {
+            return false;
+        }
+        tls_source = cause.source();
+    }
     if err.is_timeout() || err.is_connect() {
         return true;
     }
