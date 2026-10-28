@@ -5,25 +5,21 @@ source-bound validation results and resource handoffs are recorded in the PR.
 
 ## Two different image inputs
 
-| Input with the same explicitly non-Vision main model | Behavior |
+| Input with an explicitly non-Vision main model | Behavior |
 | --- | --- |
-| An image uploaded directly into the conversation, including a stored attachment URL | Reject with the existing “does not support Vision” error. Do not resolve a Vision target or send image bytes to either model. |
-| A model-issued `ViewImage` call for a local image | Execute the existing tool permission/file checks, send the tool result to the explicitly configured Vision model, then return labeled text to the original main model. |
+| A conversation upload or stored historical image | When explicit auxiliary Vision configuration is valid, startup permits the run and the prepared context contains a text reference instead of raw image parts. The original Session image remains intact. Missing or invalid configuration fails startup with retained-image guidance. |
+| A model-issued `ViewImage` call for a local image or retained conversation reference | Execute the existing tool permission/file checks, send the authorized image to the explicitly configured Vision model, then return labeled text to the original main model. |
 
-Configuring a Vision model does not grant permission to forward conversation
-uploads. The fallback belongs to the tool invocation, not to general context
-preparation, session history, the upload handler, or the startup validator.
-Resuming a text-only model with raw historical image parts keeps the existing
-rejection. Previously completed ViewImage fallback results are already text.
+Startup checks the explicit target configuration without constructing or
+calling its provider. A configured target does not itself trigger an image
+request. Context preparation projects image parts into transient references
+before dispatch to the non-Vision main; it does not rewrite durable history.
+Only a permitted `ViewImage` call can resolve a retained reference and request
+a description. The original image bytes are never forwarded to that main model.
 
-The following original boundaries are unchanged from accepted base
-`bf6b20bab2832b45d4b0927e971cea64866f2c77`:
-
-- `session_app/execute/validation.rs` rejects image-bearing sessions when the
-  actual executing model has an explicit Vision opt-out.
-- `runtime/runner/round_lifecycle/context_preparation/transforms.rs` rejects
-  remaining raw image parts before attachment resolution or provider dispatch.
-- The HTTP startup regression continues to expect `BAD_REQUEST` for that model.
+The independent legacy image hook retains its own opt-in behavior when the
+main model has no explicit capability declaration. It is not a substitute for
+the explicit target required by the non-Vision reference path.
 
 ## Tool-only routing
 
@@ -36,7 +32,10 @@ terminal lifecycle events and tool-result persistence.
 
 The target is an exact `defaults.vision` provider instance/model, or the active
 instance's explicit `vision_model`. It never guesses fast/chat, a model name,
-or another provider account. The shared factory supports native provider
+or another provider account. An explicitly saved `defaults.vision` role is
+honored even when the primary-chat `features.provider_model_ref` rollout is
+omitted or false. Only an unset global Vision role permits the active-instance
+compatibility setting; an invalid explicit role fails closed. The shared factory supports native provider
 protocols and preserves the selected role's reasoning preference. The Session
 main model and provider do not change.
 
@@ -67,20 +66,29 @@ and the existing cumulative encoded tool-image budget.
 
 ## Offline regression coverage
 
-`vision_same_nonvision_main_rejects_uploads_but_describes_viewimage_output`
-uses the same main provider/effective model and valid Vision target for both
-paths. Data-URL and attachment-URL conversation images fail both the original
-startup validator and the real pipeline, with zero target resolutions, zero
-main-model calls and zero Vision calls. The subsequent real Builtin `view_image`
-call resolves the target once, makes one mock Vision request, returns labeled
-text to the main model, and preserves its model identity. An enabled legacy
-Vision hook does not bypass the upload rejection.
+Saved-role regressions cover the primary-chat rollout flag omitted, false and
+true, including pure startup preflight, exact provider/model/reasoning identity,
+a valid legacy target that must not replace an invalid saved role, and live role
+changes between calls. Loopback fake providers verify that an already resolved
+request retains its complete target while the next request reads the new pair;
+disabled or explicitly non-Vision targets make no additional request.
+
+The HTTP regressions `vision_nonvision_new_upload_reaches_main_with_references`
+and `vision_nonvision_history_followup_reaches_main_with_references` exercise
+the real startup path. With configured auxiliary Vision, the main provider
+receives a retained reference and the original image message is preserved;
+without configuration the historical-image follow-up is rejected. Reference
+tests also cover retained inline/attachment images and reject forged
+cross-session or malformed references before any attachment or file is read. The loop test
+`vision_nonvision_upload_and_history_followup_use_only_requested_reference_fallback`
+checks new and historical inline/attachment images, no raw images for the
+main model, and one auxiliary request after an explicit ViewImage call.
 
 Other mocks cover direct tool images, unconfigured/non-Vision targets,
 exact instance isolation, native OpenAI/Anthropic/Gemini requests to local fake
 HTTP services, failure, empty/overlong output, timeout, tool cancellation and
-budget limits. Historical-image automatic fallback tests were removed because
-that behavior is outside the requested boundary.
+budget limits. Historical images are not automatically described by an auxiliary model;
+the explicit ViewImage call remains the description boundary.
 
 Run these tests with fake providers and loopback HTTP services only; never use
 configured paid model credentials. The PR must record the exact source,
