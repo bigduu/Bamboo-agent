@@ -211,7 +211,6 @@ fn build_manager_with_schedule_storage(
             base_system_prompt: String::new(),
             workspace_path: None,
             lifecycle_hooks: bamboo_config::LifecycleHooksConfig::default(),
-            auxiliary_model_resolver: Arc::new(bamboo_engine::AuxiliaryModelConfig::default),
         }
     });
 

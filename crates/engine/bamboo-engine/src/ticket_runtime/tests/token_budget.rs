@@ -625,7 +625,7 @@ async fn token_budget_background_only_override_cannot_escape_shared_exhaustion()
     let mut config = AgentLoopConfig {
         app_data_dir: Some(f.dir.path().to_path_buf()),
         auxiliary_model_resolver: None,
-        background_model_resolver: Some(Arc::new(move || {
+        background_model_resolver: Some(Arc::new(move |_| {
             Some(bamboo_llm::ResolvedModel::new(
                 dynamic.clone(),
                 "fixture-model",

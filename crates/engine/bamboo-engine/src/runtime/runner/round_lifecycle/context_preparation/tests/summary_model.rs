@@ -216,7 +216,7 @@ async fn compression_uses_background_override_with_no_full_auxiliary_resolver() 
         background_model_provider: Some(Arc::clone(&main)),
         summarization_model_name: None,
         auxiliary_model_resolver: None,
-        background_model_resolver: Some(Arc::new(move || {
+        background_model_resolver: Some(Arc::new(move |_| {
             Some(bamboo_llm::ResolvedModel::new(
                 Arc::clone(&resolved_background),
                 "live-background",

@@ -50,8 +50,6 @@ pub struct ResolvedRunConfig {
     pub base_system_prompt: String,
     pub workspace_path: Option<String>,
     pub lifecycle_hooks: bamboo_config::LifecycleHooksConfig,
-    /// Per-round background admission, paired with this run's frozen other roles.
-    pub auxiliary_model_resolver: Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>,
 }
 
 #[derive(Clone)]
@@ -764,7 +762,23 @@ async fn run_schedule_job(
     // (marking the run terminal, and writing a visible failure marker) is
     // carried by the `on_complete` hook, which runs after the runner is
     // finalized but before the session is persisted — so the marker is saved.
-    let auxiliary_model_resolver = resolved.auxiliary_model_resolver.clone();
+    let aux_fast_model = resolved.model_roster.fast_model();
+    let aux_fast_provider = resolved.model_roster.fast_model_provider();
+    let aux_background_model = resolved.model_roster.background_model();
+    let aux_background_provider = resolved.model_roster.background_model_provider();
+    let aux_summarization_model = resolved.model_roster.summarization_model();
+    let aux_summarization_provider = resolved.model_roster.summarization_model_provider();
+    let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
+        fast_model_name: aux_fast_model.clone(),
+        fast_model_provider: aux_fast_provider.clone(),
+        background_model_name: aux_background_model.clone(),
+        planning_model_name: None,
+        search_model_name: None,
+        summarization_model_name: aux_summarization_model.clone(),
+        background_model_provider: aux_background_provider.clone(),
+        summarization_model_provider: aux_summarization_provider.clone(),
+        summarization_model_error: None,
+    });
 
     let schedule_store = ctx.schedule_store.clone();
     let schedule_id_for_state = job.schedule_id.clone();
@@ -1137,10 +1151,16 @@ pub fn build_schedule_context(
     config: std::sync::Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
 ) -> ScheduleContext {
+    // Each execution supplies its own roster key to this shared immutable
+    // resolver. The Agent clone is scoped to Schedule; the caller's Agent and
+    // the public ScheduleContext/ResolvedRunConfig layout remain unchanged.
+    let schedule_agent = Arc::new(base.agent.with_background_model_resolver(
+        schedule_background_model_resolver(config.clone(), provider_registry.clone()),
+    ));
     ScheduleContext {
         schedule_store: base.schedule_store,
         workflow_runs: base.workflow_runs,
-        agent: base.agent,
+        agent: schedule_agent,
         tools: base.tools,
         permission_config: base.permission_config,
         sessions_cache: base.sessions_cache,
@@ -1158,6 +1178,24 @@ pub fn build_schedule_context(
             resolve_run_config_from_config(job, &config, &provider_registry)
         }),
     }
+}
+
+fn schedule_background_model_resolver(
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    registry: Arc<bamboo_llm::ProviderRegistry>,
+) -> bamboo_engine::runtime::config::BackgroundModelResolver {
+    Arc::new(move |provider_name| {
+        if provider_name.is_empty() {
+            return None;
+        }
+        config.try_read().ok().and_then(|current| {
+            bamboo_engine::model_config_helper::resolve_background_model(
+                &current,
+                provider_name,
+                &registry,
+            )
+        })
+    })
 }
 
 fn resolve_run_config_from_config(
@@ -1242,27 +1280,9 @@ fn resolve_run_config_from_config(
 
     let model_roster =
         bamboo_engine::ModelRoster::from_areas(Some(model), provider_name, provider_type, areas);
-    let fixed_models = AuxiliaryModelConfig {
-        fast_model_name: model_roster.fast_model(),
-        fast_model_provider: model_roster.fast_model_provider(),
-        background_model_name: model_roster.background_model(),
-        planning_model_name: None,
-        search_model_name: None,
-        summarization_model_name: model_roster.summarization_model(),
-        background_model_provider: model_roster.background_model_provider(),
-        summarization_model_provider: model_roster.summarization_model_provider(),
-        summarization_model_error: None,
-    };
-    let auxiliary_model_resolver = bamboo_engine::model_areas::live_background_model_resolver(
-        config.clone(),
-        provider_registry.clone(),
-        model_roster.provider_name.clone().unwrap_or_default(),
-        fixed_models,
-    );
 
     ResolvedRunConfig {
         model_roster,
-        auxiliary_model_resolver,
         reasoning_effort,
         gold_config: bamboo_engine::model_config_helper::resolve_gold_config(
             &config_snapshot,
@@ -1289,7 +1309,33 @@ mod build_context_tests {
             resolved.model_roster.provider_name.as_deref(),
             Some("account-a")
         );
-        fixture.verify(resolved.auxiliary_model_resolver).await;
+        // The actual Schedule callback receives its run's frozen roster key.
+        // Compose it with the frozen roles as AgentLoopConfig does; the engine
+        // unit test separately exercises actual per-run key forwarding.
+        let fixed = bamboo_engine::AuxiliaryModelConfig {
+            fast_model_name: resolved.model_roster.fast_model(),
+            fast_model_provider: resolved.model_roster.fast_model_provider(),
+            background_model_name: resolved.model_roster.background_model(),
+            background_model_provider: resolved.model_roster.background_model_provider(),
+            summarization_model_name: resolved.model_roster.summarization_model(),
+            summarization_model_provider: resolved.model_roster.summarization_model_provider(),
+            ..Default::default()
+        };
+        let callback = super::schedule_background_model_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+        );
+        let provider = resolved.model_roster.provider_name.unwrap();
+        fixture
+            .verify(Arc::new(move || {
+                let mut models = fixed.clone();
+                let background = callback(&provider);
+                models.background_model_name =
+                    background.as_ref().map(|model| model.model_name.clone());
+                models.background_model_provider = background.map(|model| model.provider);
+                models
+            }))
+            .await;
     }
     use super::ScheduleRunJob;
     use super::{

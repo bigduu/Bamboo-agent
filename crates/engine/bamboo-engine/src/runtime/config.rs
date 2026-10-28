@@ -42,7 +42,8 @@ pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sy
 
 /// A per-execution background route. `None` is authoritative for that read.
 #[doc(hidden)]
-pub type BackgroundModelResolver = Arc<dyn Fn() -> Option<bamboo_llm::ResolvedModel> + Send + Sync>;
+pub type BackgroundModelResolver =
+    Arc<dyn Fn(&str) -> Option<bamboo_llm::ResolvedModel> + Send + Sync>;
 
 /// One execution's explicitly selected Gold route, installed only by the Host.
 #[doc(hidden)]
@@ -1246,7 +1247,7 @@ impl AgentLoopConfig {
                 summarization_model_error: None,
             });
         if let Some(resolve) = &self.background_model_resolver {
-            let background = resolve();
+            let background = resolve(self.provider_name.as_deref().unwrap_or_default());
             models.background_model_name =
                 background.as_ref().map(|model| model.model_name.clone());
             models.background_model_provider = background.map(|model| model.provider);

@@ -104,8 +104,8 @@ impl NativeWorkTokenBudget {
         if let Some(resolve) = loop_config.background_model_resolver.take() {
             let budget = budget.clone();
             let limits = limits.clone();
-            loop_config.background_model_resolver = Some(Arc::new(move || {
-                resolve().map(|mut model| {
+            loop_config.background_model_resolver = Some(Arc::new(move |provider_name| {
+                resolve(provider_name).map(|mut model| {
                     model.provider = budget.wrap(model.provider, &limits);
                     model
                 })

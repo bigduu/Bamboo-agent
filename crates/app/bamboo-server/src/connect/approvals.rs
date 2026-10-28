@@ -62,7 +62,7 @@ fn connect_resume_background_model_resolver(
     registry: Arc<ProviderRegistry>,
     provider_name: String,
 ) -> BackgroundModelResolver {
-    Arc::new(move || {
+    Arc::new(move |_run_provider_name| {
         if provider_name.is_empty() {
             return None;
         }
@@ -1236,13 +1236,16 @@ mod tests {
             fixture.registry.clone(),
             "account-missing".into(),
         );
-        assert!(missing().is_none());
+        assert!(missing("account-a").is_none());
         let resolver = connect_resume_background_model_resolver(
             fixture.config.clone(),
             fixture.registry.clone(),
             resume.provider_name,
         );
-        fixture.verify_resume_background(resolver).await;
+        // The resume callback remains bound to B even if a caller passes A.
+        fixture
+            .verify_resume_background(Arc::new(move || resolver("account-a")))
+            .await;
     }
 
     use bamboo_agent_core::tools::{FunctionCall, ToolCall};
