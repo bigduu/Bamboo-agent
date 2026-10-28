@@ -620,6 +620,114 @@ mod tests {
     use super::*;
     use bamboo_agent_core::tools::FunctionCall;
 
+    // This witness supports both the old return shape and the corrected one,
+    // allowing the same assertions to run as a RED test on the baseline.
+    trait GoldOutcomeWitness {
+        fn is_routing_refusal(&self) -> bool;
+        fn ordinary_failure_reasoning(&self) -> Option<&str>;
+    }
+
+    impl GoldOutcomeWitness for AsyncGoldEvaluationResult {
+        fn is_routing_refusal(&self) -> bool {
+            false
+        }
+        fn ordinary_failure_reasoning(&self) -> Option<&str> {
+            Some(&self.evaluation_result.reasoning)
+        }
+    }
+
+    impl GoldOutcomeWitness for Result<AsyncGoldEvaluationResult, AgentError> {
+        fn is_routing_refusal(&self) -> bool {
+            self.is_err()
+        }
+        fn ordinary_failure_reasoning(&self) -> Option<&str> {
+            self.as_ref()
+                .ok()
+                .map(|result| result.evaluation_result.reasoning.as_str())
+        }
+    }
+
+    fn synthetic_request(model: &str) -> AsyncGoldEvaluationRequest {
+        AsyncGoldEvaluationRequest {
+            session_id: "gold-preflight-fixture".into(),
+            round_number: 1,
+            model_name: model.into(),
+            timeout_context: StreamTimeoutContext::default(),
+            reasoning_effort: None,
+            checkpoint: GoldCheckpoint::PostRound,
+            session_snapshot: Session::new("gold-preflight-fixture", model),
+            task_context_snapshot: None,
+            gold_config: GoldConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_fast_never_waits_for_budget_or_emits_a_gold_verdict() {
+        let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+        let mut config = routing.config.read().await.clone();
+        config.provider_instances.get_mut("fast-b").unwrap().enabled = false;
+        let (model, provider) = crate::model_config_helper::resolve_fast_model_for_runner(
+            Some(&config),
+            "chat-a",
+            &routing.registry,
+        );
+        let model = model.unwrap();
+        let provider = provider.unwrap();
+        // Also verify trait-object propagation through the role decorator.
+        let mut reference = bamboo_domain::ProviderModelRef::new("fast-b", model.as_str());
+        reference.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Low);
+        let decorated = bamboo_llm::ResolvedModel::from_ref(provider.clone(), &reference).provider;
+
+        for selected in [provider, decorated] {
+            let held =
+                crate::runtime::runner::auxiliary_budget::acquire(&selected, &model, 1).await;
+            let (event_tx, mut event_rx) = mpsc::channel(8);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                execute_async_gold_evaluation(synthetic_request(&model), selected, event_tx, 1),
+            )
+            .await
+            .expect("rejected Fast must not wait for an auxiliary permit");
+            assert!(
+                outcome.is_routing_refusal(),
+                "refusal must not become a Gold verdict"
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "no Gold Started or Completed event"
+            );
+            drop(held);
+        }
+        assert!(routing.requests("fast-b").is_empty());
+        assert!(routing.requests("chat-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn ordinary_provider_failure_keeps_existing_async_gold_behavior() {
+        use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+        let routing = RoutingContext::new(None);
+        *routing.providers["fast-b"].failure.lock().unwrap() = Some(Failure::Network);
+        let provider: Arc<dyn LLMProvider> = routing.providers["fast-b"].clone();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let outcome =
+            execute_async_gold_evaluation(synthetic_request("cheap-b"), provider, event_tx, 1)
+                .await;
+        assert!(outcome
+            .ordinary_failure_reasoning()
+            .unwrap()
+            .contains("Gold evaluation failed"));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationStarted { .. })
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(routing.requests("fast-b").len(), 1);
+        assert!(routing.requests("chat-a").is_empty());
+    }
+
     fn report_call(arguments: serde_json::Value) -> ToolCall {
         ToolCall {
             id: "call-1".to_string(),

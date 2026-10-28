@@ -666,6 +666,146 @@ mod tests {
         }
     }
 
+    async fn synthetic_rejected_fast() -> (String, Arc<dyn LLMProvider>) {
+        let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+        let mut config = routing.config.read().await.clone();
+        config.provider_instances.get_mut("fast-b").unwrap().enabled = false;
+        let (model, provider) = crate::model_config_helper::resolve_fast_model_for_runner(
+            Some(&config),
+            "chat-a",
+            &routing.registry,
+        );
+        (model.unwrap(), provider.unwrap())
+    }
+
+    #[tokio::test]
+    async fn terminal_refused_fast_uses_existing_failure_path_before_gold_started() {
+        let (model, provider) = synthetic_rejected_fast().await;
+        let mut session = Session::new("s", "model");
+        let config = gold_continue_config();
+        let (tx, mut rx) = mpsc::channel(16);
+        let decision = evaluate_gold_terminal(
+            &mut session,
+            &None,
+            &config,
+            &model,
+            None,
+            "s",
+            1,
+            provider,
+            &tx,
+        )
+        .await;
+        assert!(matches!(decision, GoldTerminalDecision::Stop));
+        let state = read_goal_state(&session).unwrap();
+        assert_eq!(state.status, GoalRuntimeStatus::NeedInput);
+        assert!(
+            state.eval_history.is_empty(),
+            "a refusal is not a Gold verdict"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(
+                event,
+                AgentEvent::GoldEvaluationStarted { .. }
+                    | AgentEvent::GoldEvaluationCompleted { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_refused_fast_is_not_harvested_or_persisted_as_gold_success() {
+        let (model, provider) = synthetic_rejected_fast().await;
+        let mut session = Session::new("queued-gold-fixture", "model");
+        let config = AgentLoopConfig::default();
+        let request = build_async_gold_evaluation_request(
+            &None,
+            &session,
+            &session.id,
+            1,
+            Some(&model),
+            None,
+            GoldCheckpoint::PostRound,
+            &GoldConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut state = crate::runtime::runner::loop_execution::startup::LoopRunState {
+            session_id: session.id.clone(),
+            execution_id: "queued-gold-fixture-run".into(),
+            current_inputs: None,
+            model_name: "model".into(),
+            metrics_collector: None,
+            debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
+            task_context: None,
+            overflow_recovery: Default::default(),
+            task_evaluation: Default::default(),
+            gold_evaluation: crate::runtime::runner::loop_execution::startup::GoldEvaluationState {
+                queued_request: Some(request.clone()),
+                ..Default::default()
+            },
+            auxiliary_models: Default::default(),
+            runtime_state: bamboo_domain::AgentRuntimeState::new(session.id.clone()),
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let held = crate::runtime::runner::auxiliary_budget::acquire(&provider, &model, 1).await;
+        start_queued_gold_evaluation_if_idle(
+            &mut state,
+            &tx,
+            provider.clone(),
+            CancellationToken::new(),
+            1,
+        );
+        assert!(state.gold_evaluation.queued_request.is_none());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .unwrap()
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued refusal must not wait for the held permit");
+        poll_completed_gold_evaluation(&mut state).await;
+        apply_completed_gold_evaluation(&mut session, &config, &mut state).await;
+        assert!(state.gold_evaluation.completed.is_none());
+        assert!(!session.metadata.contains_key("gold.last_decision"));
+        assert!(rx.try_recv().is_err());
+        drop(held);
+
+        // A run already cancelled before the queued task is polled must not
+        // dispatch or emit a Gold Started/Completed event either.
+        state.gold_evaluation.queued_request = Some(request);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        start_queued_gold_evaluation_if_idle(&mut state, &tx, provider, cancelled, 1);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .unwrap()
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        poll_completed_gold_evaluation(&mut state).await;
+        assert!(state.gold_evaluation.completed.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
     /// Seed the durable goal state so a test can exercise a specific declared
     /// status / continuation count.
     fn seed_goal_state(

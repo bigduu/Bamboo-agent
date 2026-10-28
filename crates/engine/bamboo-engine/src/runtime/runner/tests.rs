@@ -185,6 +185,263 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_loop_explicit_gold_requires_managed_account_admission() {
+    use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+    use bamboo_domain::ProviderModelRef;
+    use bamboo_llm::{Config, ProviderRegistry};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::RwLock as StdRwLock;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    let account_a = MockServer::start().await;
+    let account_b = MockServer::start().await;
+    let main_calls = Arc::new(AtomicUsize::new(0));
+    let main_counter = main_calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let model = body["model"].as_str().unwrap();
+            let (delta, delay) = match model {
+                "main-a" if main_counter.fetch_add(1, Ordering::SeqCst) % 2 == 0 => (
+                    json!({"tool_calls": [{
+                        "index": 0, "id": "fixture-update-goal", "type": "function",
+                        "function": {
+                            "name": "update_goal",
+                            "arguments": json!({"status": "complete"}).to_string()
+                        }
+                    }]}),
+                    false,
+                ),
+                "main-a" => (json!({"content": "synthetic done"}), true),
+                "explicit-gold" => (
+                    json!({"tool_calls": [{
+                        "index": 0, "id": "fixture-gold", "type": "function",
+                        "function": {
+                            "name": "report_gold_evaluation",
+                            "arguments": json!({
+                                "decision": "achieved",
+                                "confidence": "high",
+                                "reasoning": "synthetic goal verified",
+                                "missing_information": []
+                            }).to_string()
+                        }
+                    }]}),
+                    false,
+                ),
+                _ => panic!("unexpected model in synthetic account A: {model}"),
+            };
+            let frame = json!({
+                "id": "synthetic-routing",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+            });
+            let response = ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"));
+            if delay {
+                // The post-round evaluation is detached. Hold the second main
+                // response so it can be observed before run finalization.
+                response.set_delay(Duration::from_secs(1))
+            } else {
+                response
+            }
+        })
+        .mount(&account_a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&account_b)
+        .await;
+
+    let root = tempfile::tempdir().expect("isolated provider data directory");
+    let mut config = Config::default();
+    config.provider = "chat-a".into();
+    config.default_provider_instance = Some("chat-a".into());
+    config.http_proxy = "http://127.0.0.1:9".into();
+    config.https_proxy.clear();
+    config.proxy_auth = None;
+    config.defaults = Some(
+        serde_json::from_value(json!({
+            "chat": {"provider": "chat-a", "model": "main-a"},
+            "fast": {"provider": "fast-b", "model": "cheap-b"}
+        }))
+        .unwrap(),
+    );
+    for (id, model, endpoint, admitted) in [
+        (
+            "chat-a",
+            "main-a",
+            account_a.uri(),
+            vec!["main-a", "explicit-gold"],
+        ),
+        ("fast-b", "cheap-b", account_b.uri(), vec!["cheap-b"]),
+    ] {
+        config.provider_instances.insert(
+            id.into(),
+            serde_json::from_value(json!({
+                "provider_type": "openai",
+                "enabled": true,
+                "api_key": "synthetic-only-not-a-credential",
+                "base_url": endpoint,
+                "model": model,
+                "runtime_models": admitted
+            }))
+            .unwrap(),
+        );
+    }
+    let registry = Arc::new(
+        ProviderRegistry::from_config(&config, root.path().to_path_buf())
+            .await
+            .expect("synthetic managed registry"),
+    );
+    let main_ref = ProviderModelRef::new("chat-a", "main-a");
+    let gold_ref = ProviderModelRef::new("chat-a", "explicit-gold");
+    let main = registry
+        .provider_for_configured_model(&config, &main_ref)
+        .expect("main model is admitted on A");
+    assert!(registry
+        .provider_for_configured_model(&config, &gold_ref)
+        .is_ok());
+
+    // The closure exercises the same shared role resolvers as the Host, while
+    // the genuine runner executes both Gold checkpoint consumers.
+    let live_config = Arc::new(StdRwLock::new(config));
+    let resolver_config = live_config.clone();
+    let resolver_registry = registry.clone();
+    let resolver = Arc::new(move || {
+        let config = resolver_config.read().unwrap();
+        let areas =
+            crate::model_areas::resolve_global_area_models(&config, "chat-a", &resolver_registry);
+        let (fast_model_name, fast_model_provider) =
+            crate::model_config_helper::resolve_fast_model_for_runner(
+                Some(&config),
+                "chat-a",
+                &resolver_registry,
+            );
+        AuxiliaryModelConfig {
+            fast_model_name,
+            fast_model_provider,
+            background_model_name: areas
+                .background
+                .as_ref()
+                .map(|target| target.model_name.clone()),
+            background_model_provider: areas.background.map(|target| target.provider),
+            summarization_model_name: areas
+                .summarization
+                .as_ref()
+                .map(|target| target.model_name.clone()),
+            summarization_model_provider: areas.summarization.map(|target| target.provider),
+            summarization_model_error: areas.summarization_error,
+            ..Default::default()
+        }
+    });
+    let mut request_offset = 0usize;
+    for revoked in [false, true] {
+        if revoked {
+            let mut current = live_config.write().unwrap();
+            current
+                .provider_instances
+                .get_mut("chat-a")
+                .unwrap()
+                .extra
+                .insert("runtime_models".into(), json!(["main-a"]));
+            assert!(registry
+                .provider_for_configured_model(&current, &main_ref)
+                .is_ok());
+            assert!(registry
+                .provider_for_configured_model(&current, &gold_ref)
+                .is_err());
+            assert!(Arc::ptr_eq(&main, &registry.get("chat-a").unwrap()));
+        }
+        let before_main = main_calls.load(Ordering::SeqCst);
+        let mut session = Session::new(
+            if revoked {
+                "gold-revoked"
+            } else {
+                "gold-admitted"
+            },
+            "main-a",
+        );
+        session.model_ref = Some(main_ref.clone());
+        let (event_tx, _event_rx) = mpsc::channel(128);
+        let loop_config = AgentLoopConfig {
+            model_name: Some("main-a".into()),
+            provider_name: Some("chat-a".into()),
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("synthetic goal".into()),
+                model_name: Some("explicit-gold".into()),
+                ..Default::default()
+            }),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            auxiliary_model_resolver: Some(resolver.clone()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(4),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            super::run_agent_loop_with_config(
+                &mut session,
+                "synthetic request".into(),
+                event_tx,
+                main.clone(),
+                Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+                CancellationToken::new(),
+                loop_config,
+            ),
+        )
+        .await
+        .expect("synthetic real runner must finish")
+        .expect("synthetic foreground run must succeed");
+        assert_eq!(main_calls.load(Ordering::SeqCst) - before_main, 2);
+        let requests = account_a.received_requests().await.unwrap();
+        let recent = &requests[request_offset..];
+        request_offset = requests.len();
+        let gold: Vec<_> = recent
+            .iter()
+            .filter(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                    == "explicit-gold"
+            })
+            .collect();
+        assert!(account_b.received_requests().await.unwrap().is_empty());
+        if revoked {
+            assert!(
+                gold.is_empty(),
+                "revoked explicit Gold model must not dispatch; got {} requests",
+                gold.len()
+            );
+        } else {
+            for checkpoint in ["checkpoint=post_round", "checkpoint=terminal"] {
+                assert!(
+                    gold.iter().any(|request| {
+                        String::from_utf8_lossy(&request.body).contains(checkpoint)
+                    }),
+                    "admitted explicit Gold must reach {checkpoint} on A"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn agent_loop_gold_checkpoints_keep_provider_and_model_paired() {
     use crate::app_context::model_routing_test_support::RoutingContext;
