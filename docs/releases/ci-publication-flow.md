@@ -126,11 +126,22 @@ time of this guide, the default is protected `dev`, so merging the listener into
 `dev` enables automatic Docker consumption even before Main is promoted. After
 the first publisher succeeds, check its corresponding Docker run before doing
 anything else. Do not manually dispatch a duplicate consumer. If a consumer run
-failed, recover its failed jobs in the same run and reuse its verified outputs.
+failed, recover its failed jobs in the same run and reuse its verified outputs
+when the installed controller can safely do so.
 
-If the expected automatic run is confirmed missing, recheck the live default
-branch and installed listener. Only when no consumer run for this release exists,
-use the existing recovery flow for its exact version and source:
+Automatic `workflow_run` events use read-only GitHub Actions cache access: they
+restore cached layers but do not export them. A protected Dev manual dispatch may
+export an optional cache; an export failure does not bypass image verification.
+If an older automatic controller failed because it attempted a cache export,
+wait for all its jobs to finish, preserve the failure and inspect each target's
+candidate and final image. After the reviewed controller fix reaches Dev, an
+exact-version/source manual recovery may reuse verified candidates and build
+only a failed target whose candidate is confirmed absent. Unknown registry state
+or a missing candidate for an already completed image stops recovery.
+
+If the expected automatic run is confirmed missing, or the failed-controller
+recovery above applies, recheck the live default branch and installed listener.
+Use the existing recovery flow for its exact version and source:
 
 ```bash
 gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \

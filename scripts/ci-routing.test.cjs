@@ -5,6 +5,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { test } = require("node:test");
+const { runInNewContext } = require("node:vm");
 const read = file => fs.readFileSync(file, "utf8").replace(/\r\n/g, "\n");
 const ci = read(".github/workflows/ci.yml");
 const frontend = read(".github/workflows/frontend-acceptance.yml");
@@ -327,4 +328,17 @@ test("Docker receives the completed publisher's matching run and attempt", () =>
   const patchCopy = arm.indexOf("COPY --from=planner /app/third_party/libduckdb-sys");
   assert.ok(patchCopy >= 0 && patchCopy < arm.indexOf("RUN cargo chef cook"),
     "The local Cargo patch must exist in the dependency stage before chef cook");
+});
+
+test("automatic Docker releases restore cache without attempting a read-only export", () => {
+  const docker = read(".github/workflows/docker-publish.yml");
+  assert.match(docker, /cache-from: type=gha,scope=\$\{\{ matrix\.platform \}\}/);
+  const matches = [...docker.matchAll(/^\s+cache-to: \$\{\{ (.+) \}\}$/gm)];
+  assert.equal(matches.length, 1, "Require one event-scoped cache export");
+  const select = event_name => runInNewContext(matches[0][1], {
+    github: { event_name }, matrix: { platform: "linux/amd64" },
+    format: (value, platform) => value.replace("{0}", platform),
+  });
+  assert.equal(select("workflow_run"), "");
+  assert.equal(select("workflow_dispatch"), "type=gha,mode=max,scope=linux/amd64,ignore-error=true");
 });
