@@ -185,6 +185,194 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
     );
 }
 
+// Insert before `agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation`.
+#[tokio::test]
+async fn agent_loop_rejects_explicit_invalid_fast_for_task_and_gold_evaluations() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig};
+    use bamboo_llm::LLMRequestOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SyntheticMain {
+        main_calls: AtomicUsize,
+        evaluations: std::sync::Mutex<Vec<(String, String)>>,
+        fast: Arc<crate::app_context::model_routing_test_support::CaptureProvider>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for SyntheticMain {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.chat_stream_with_options(messages, tools, max, model, None)
+                .await
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            let purpose = options
+                .and_then(|value| value.request_purpose.as_deref())
+                .unwrap_or("agent_loop");
+            if matches!(purpose, "task_evaluation" | "gold_evaluation") {
+                self.evaluations
+                    .lock()
+                    .unwrap()
+                    .push((model.to_string(), purpose.to_string()));
+                return Err(LLMError::Api("synthetic evaluation refusal".into()));
+            }
+            if self.main_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "task-write".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "Task".into(),
+                        arguments: serde_json::json!({
+                            "tasks": [{"content": "Synthetic work", "status": "in_progress",
+                                "activeForm": "Doing synthetic work"}]
+                        })
+                        .to_string(),
+                    },
+                };
+                return Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            // Keep the real foreground loop alive until both post-round tasks
+            // have had a chance to reach their fake provider. A correct repair
+            // may dispatch neither, so the bounded wait must also expire.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                loop {
+                    let main_count = self.evaluations.lock().unwrap().len();
+                    let fast_count = self.fast.requests.lock().unwrap().len();
+                    if main_count + fast_count >= 2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            Ok(Box::pin(stream::iter([
+                Ok(LLMChunk::Token("synthetic done".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    for flag in [None, Some(false), Some(true)] {
+        for invalid in [false, true] {
+            let routing = RoutingContext::new(flag);
+            let mut config_snapshot = routing.config.read().await.clone();
+            // Preserve the old registry and target while the live config now
+            // rejects Fast; the valid run is the actual-consumer positive.
+            if invalid {
+                config_snapshot
+                    .provider_instances
+                    .get_mut("fast-b")
+                    .unwrap()
+                    .enabled = false;
+            }
+            assert!(routing.registry.get("fast-b").is_some());
+            let snapshot = Arc::new(std::sync::Mutex::new(config_snapshot));
+            let resolver_snapshot = snapshot.clone();
+            let registry = routing.registry.clone();
+            let resolver = Arc::new(move || {
+                let config = resolver_snapshot.lock().unwrap();
+                let areas =
+                    crate::model_areas::resolve_global_area_models(&config, "chat-a", &registry);
+                AuxiliaryModelConfig {
+                    fast_model_name: areas.fast.as_ref().map(|target| target.model_name.clone()),
+                    fast_model_provider: areas.fast.map(|target| target.provider),
+                    background_model_name: areas
+                        .background
+                        .as_ref()
+                        .map(|target| target.model_name.clone()),
+                    background_model_provider: areas.background.map(|target| target.provider),
+                    summarization_model_name: areas
+                        .summarization
+                        .as_ref()
+                        .map(|target| target.model_name.clone()),
+                    summarization_model_provider: areas.summarization.map(|target| target.provider),
+                    summarization_model_error: areas.summarization_error,
+                    ..Default::default()
+                }
+            });
+            let main = Arc::new(SyntheticMain {
+                main_calls: AtomicUsize::new(0),
+                evaluations: std::sync::Mutex::new(Vec::new()),
+                fast: routing.providers["fast-b"].clone(),
+            });
+            let tools = BuiltinToolExecutorBuilder::new()
+                .with_command_tool("Task")
+                .expect("register Task tool")
+                .build();
+            let mut session = Session::new("synthetic-evaluation-session", "main-a");
+            session.set_task_list(task_list_with_in_progress_item(
+                &session.id,
+                "Synthetic work",
+            ));
+            let (event_tx, _event_rx) = mpsc::channel(128);
+            let loop_config = AgentLoopConfig {
+                system_prompt: Some("synthetic system".into()),
+                model_name: Some("main-a".into()),
+                gold_config: Some(GoldConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                auxiliary_model_resolver: Some(resolver),
+                run_budget: bamboo_config::RunBudgetConfig {
+                    max_rounds: Some(3),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let outcome = super::run_agent_loop_with_config(
+                &mut session,
+                "synthetic goal".into(),
+                event_tx,
+                main.clone(),
+                Arc::new(tools),
+                CancellationToken::new(),
+                loop_config,
+            )
+            .await;
+            // Fail the fixture on unrelated runner errors: without an actual
+            // foreground round, a no-dispatch observation would be meaningless.
+            outcome.expect("synthetic foreground loop should complete");
+            assert!(main.main_calls.load(Ordering::SeqCst) >= 2);
+            let on_main = main.evaluations.lock().unwrap().clone();
+            let on_fast = routing.requests("fast-b");
+            if invalid {
+                assert!(on_main.is_empty() && on_fast.is_empty(),
+                    "explicit disabled Fast must not dispatch: flag={flag:?}, main={on_main:?}, fast={on_fast:?}");
+            } else {
+                assert!(
+                    on_main.is_empty(),
+                    "valid Fast must not use main account: {on_main:?}"
+                );
+                for purpose in ["task_evaluation", "gold_evaluation"] {
+                    assert!(
+                        on_fast
+                            .iter()
+                            .any(|(model, actual)| model == "cheap-b" && actual == purpose),
+                        "valid Fast must reach {purpose}: flag={flag:?}, fast={on_fast:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation() {
     struct RecordingRoundProvider {
