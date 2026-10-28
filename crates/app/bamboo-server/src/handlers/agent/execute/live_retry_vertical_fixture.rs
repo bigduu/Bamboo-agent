@@ -891,56 +891,148 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         .unwrap();
 }
 
+// Retry policy reads process-wide OnceLocks. Execute each synthetic case in
+// its own child so the default test catalog does not depend on ambient env or
+// race with other tests that initialize the process-wide policy.
+#[cfg(unix)]
+async fn run_isolated_live_retry(case: LiveVerticalCase, name: &str) {
+    use std::time::Duration;
+    const CHILD: &str = "BAMBOO_TEST_LIVE_RETRY_CHILD";
+    if std::env::var(CHILD).as_deref() == Ok(name) {
+        assert_eq!(bamboo_llm::retry::global().max_attempts, 1);
+        assert_eq!(
+            bamboo_llm::retry::initial_request_limits().attempt_timeout,
+            Duration::from_millis(100)
+        );
+        run_live_retry_vertical(case).await;
+        return;
+    }
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    let _permit = SLOTS
+        .get_or_init(|| tokio::sync::Semaphore::new(2))
+        .acquire()
+        .await
+        .unwrap();
+    let full_name = format!("handlers::agent::execute::tests::execution_input_http::{name}");
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command.env_clear();
+    for key in ["PATH", "TMPDIR", "TMP", "TEMP"] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    command
+        .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+        .env(CHILD, name)
+        .env("BAMBOO_LLM_MAX_RETRIES", "0")
+        .env("BAMBOO_LLM_RETRY_BASE_DELAY_MS", "1")
+        .env("BAMBOO_LLM_RETRY_MAX_DELAY_MS", "5")
+        .env("BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS", "5000")
+        .env("BAMBOO_LLM_RETRY_ATTEMPT_TIMEOUT_MS", "100")
+        .env("RUST_MIN_STACK", "8388608")
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(90), command.output())
+        .await
+        .expect("isolated live retry case timed out")
+        .expect("isolated live retry case failed to start");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "isolated {name} failed: {stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored"),
+        "isolated {name} did not run exactly once: {stdout}\n{stderr}"
+    );
+}
+
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_real_actor_tool_then_anthropic_once() {
-    run_live_retry_vertical(LiveVerticalCase::Continue).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::Continue,
+        "live_retry_http_real_actor_tool_then_anthropic_once",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_concurrent_confirm_and_trait_port_are_one_shot() {
-    run_live_retry_vertical(LiveVerticalCase::ConcurrentConfirm).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::ConcurrentConfirm,
+        "live_retry_http_concurrent_confirm_and_trait_port_are_one_shot",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_stop_after_confirmation_reports_continuous_mode() {
-    run_live_retry_vertical(LiveVerticalCase::StopAfterContinue).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::StopAfterContinue,
+        "live_retry_http_stop_after_confirmation_reports_continuous_mode",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_rejected_callback_cannot_deadlock() {
-    run_live_retry_vertical(LiveVerticalCase::RejectConfirmation).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::RejectConfirmation,
+        "live_retry_http_rejected_callback_cannot_deadlock",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_early_idempotency_key_cannot_consume_later_offer() {
-    run_live_retry_vertical(LiveVerticalCase::EarlyKeyBeforeOffer).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::EarlyKeyBeforeOffer,
+        "live_retry_http_early_idempotency_key_cannot_consume_later_offer",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_cancelled_claim_is_uncertain_before_result_publication() {
-    run_live_retry_vertical(LiveVerticalCase::GateCancelledBeforeResult).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::GateCancelledBeforeResult,
+        "live_retry_http_cancelled_claim_is_uncertain_before_result_publication",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_stop_releases_competing_confirmations() {
-    run_live_retry_vertical(LiveVerticalCase::StopDuringConfirm).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::StopDuringConfirm,
+        "live_retry_http_stop_releases_competing_confirmations",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_stop_waiting_cancels_exact_run_without_replay() {
-    run_live_retry_vertical(LiveVerticalCase::StopWaiting).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::StopWaiting,
+        "live_retry_http_stop_waiting_cancels_exact_run_without_replay",
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[actix_web::test]
 async fn live_retry_http_response_headers_timeout_continues_same_run() {
-    run_live_retry_vertical(LiveVerticalCase::HeadersTimeout).await;
+    run_isolated_live_retry(
+        LiveVerticalCase::HeadersTimeout,
+        "live_retry_http_response_headers_timeout_continues_same_run",
+    )
+    .await;
 }
