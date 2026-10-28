@@ -55,28 +55,8 @@ jobs:
           shared-key: bamboo-ci-test-${{ runner.os }}
           workspaces: . -> target/grouped-default
           save-if: false
-      - name: Verify selected context and original read-only Plan contracts
-        shell: bash
-        run: |
-          set -euo pipefail
-          result="$RUNNER_TEMP/planner-tools.log"
-          cargo test --locked -p bamboo-server-tools --lib plan::tests:: \
-            -- --test-threads=1 2>&1 | tee "$result"
-          grep -Eq 'test result: ok\. [1-9][0-9]* passed; 0 failed' "$result"
-          for case in \
-            selected_context_uses_canonical_child_binding_without_changing_parent_authority \
-            invalid_selected_context_never_saves_a_child_or_arms_a_wait \
-            unsupported_selected_context_route_fails_before_persist_without_legacy_fallback; do
-            grep -Fq "plan::tests::$case ... ok" "$result"
-          done
-      - name: Verify immutable artifacts and durable completion recovery
-        shell: bash
-        run: |
-          set -euo pipefail
-          result="$RUNNER_TEMP/planner-artifacts.log"
-          cargo test --locked -p bamboo-engine --lib planner_artifact \
-            -- --test-threads=1 2>&1 | tee "$result"
-          grep -Fq 'test result: ok. 10 passed; 0 failed; 0 ignored' "$result"
+      # Planner12/10 library runtime belongs to the canonical default driver.
+      # This source/config remains the distinct API-only CLI and lint owner.
       - name: Verify actual CLI worker, publication, automatic resume and cold partial reads
         shell: bash
         run: |

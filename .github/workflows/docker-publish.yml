@@ -1,57 +1,131 @@
 name: Publish Docker image (GHCR)
+# BAMBOO_RELEASE_IMAGE_CONSUMER_V1
 
-# Builds the `bamboo` container image and publishes it to GitHub Container
-# Registry so it can be pulled and run directly:
-#
-#   docker pull ghcr.io/<owner>/bamboo:latest
-#   docker run --rm -p 9562:9562 ghcr.io/<owner>/bamboo:latest          # server
-#   # or as a broker worker, driven by deploy_agent env=docker on the host.
-#
-# Multi-arch (amd64 + arm64) is built on NATIVE per-arch runners and merged
-# into one manifest — a Rust release build under QEMU arm64 emulation is far
-# too slow. (If arm64 runners are unavailable, e.g. a private repo without the
-# larger-runner plan, drop the arm64 matrix entry or switch to a single QEMU
-# job with docker/setup-qemu-action.)
-#
-# The Bamboo repository and release producers default to the same verified,
-# crate-owned Lotus Next artifact. Legacy Lotus remains one explicit,
-# fixed-version rollback selection during the bounded migration window.
-
+# Images consume a completed release. The x64 binary is reused; Linux ARM64
+# remains a separate native target, not a second build of the x64 binary.
 on:
+  workflow_run:
+    workflows: [Publish Crate]
+    types: [completed]
+    branches: [dev]
   workflow_dispatch:
     inputs:
-      frontend_package:
-        description: "Frontend package; legacy Lotus is the explicit fixed-version rollback path"
+      version:
+        description: Completed Bamboo release version
         required: true
-        type: choice
-        default: "@bigduu/lotus-next"
-        options:
-          - "@bigduu/lotus-next"
-          - "@bigduu/lotus"
-      lotus_version:
-        description: "Exact selected frontend npm version; from_lock uses the committed Lotus Next lock or fixed legacy rollback version"
-        required: false
-        default: "from_lock"
         type: string
-  push:
-    tags:
-      - "v*"
-      - "bamboo-v*"
+      source:
+        description: Exact source SHA of that completed release
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: bamboo-docker-release-${{ github.event.workflow_run.id || inputs.version }}
+  queue: max
+  cancel-in-progress: false
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/bamboo
-  # The docker/* actions still bundle a Node.js 20 runtime; GitHub force-migrates
-  # JS actions to Node 24 on 2026-06-16. Opt in now so this workflow runs on
-  # Node 24 ahead of the cutover (consistent with the repo-wide Node 24 sweep).
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
+  release:
+    name: Verify completed release
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    outputs:
+      source: ${{ steps.verify.outputs.source }}
+      version: ${{ steps.verify.outputs.version }}
+      asset_id: ${{ steps.verify.outputs.asset_id }}
+      asset_sha256: ${{ steps.verify.outputs.asset_sha256 }}
+      asset_size: ${{ steps.verify.outputs.asset_size }}
+    steps:
+      - name: Download the completed publisher's identity
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+          name: bamboo-completed-release-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
+          path: ${{ runner.temp }}/release
+      - name: Verify release, tag, manifest and original Linux binary identity
+        id: verify
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_SOURCE: ${{ inputs.source }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, re, subprocess
+          repository = 'bigduu/Bamboo-agent'
+          assert os.environ['GITHUB_REPOSITORY'] == repository
+          event = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          def api(route, binary=False):
+              args = ['gh', 'api', '--hostname', 'github.com', f'repos/{repository}/{route}']
+              if binary: args += ['-H', 'Accept: application/octet-stream']
+              data = subprocess.check_output(args, timeout=60)
+              return data if binary else json.loads(data)
+          if os.environ['GITHUB_EVENT_NAME'] == 'workflow_run':
+              run = event['workflow_run']
+              assert run['event'] == 'workflow_dispatch' and run['conclusion'] == 'success'
+              assert run['path'] == '.github/workflows/publish-crate.yml' and run['head_branch'] == 'dev'
+              assert run['repository']['full_name'] == run['head_repository']['full_name'] == repository
+              with open(os.path.join(os.environ['RUNNER_TEMP'], 'release', 'release.json')) as f:
+                  identity = json.load(f)
+              assert str(identity['runId']) == str(run['id'])
+              version, source = identity['version'], identity['source']
+          else:
+              assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
+              assert os.environ['GITHUB_REF'] == 'refs/heads/dev' and os.environ['GITHUB_REF_PROTECTED'] == 'true'
+              version, source = os.environ['INPUT_VERSION'], os.environ['INPUT_SOURCE']
+          assert re.fullmatch(r'[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
+          assert re.fullmatch(r'[0-9a-f]{40}', source)
+          release = api('releases/tags/v' + version)
+          assert release['tag_name'] == 'v' + version and release['target_commitish'] == source
+          assert not release['draft'] and not release['prerelease'] and release['published_at']
+          tag = api('git/ref/tags/v' + version)
+          assert tag['object']['type'] == 'commit' and tag['object']['sha'] == source
+          def asset(name):
+              found = [item for item in release['assets'] if item['name'] == name]
+              assert len(found) == 1 and found[0]['state'] == 'uploaded' and found[0]['size'] > 0
+              return found[0]
+          for name in ['bamboo-aarch64-apple-darwin', 'bamboo-x86_64-pc-windows-msvc.exe',
+                       'bamboo-executables-provenance-v2.json', 'release-provenance.json']:
+              asset(name)
+          manifest_asset = asset('bamboo-sidecars-v2.json')
+          assert manifest_asset['size'] < 1024 * 1024
+          raw = api('releases/assets/' + str(manifest_asset['id']), binary=True)
+          assert len(raw) == manifest_asset['size']
+          assert manifest_asset['digest'] == 'sha256:' + hashlib.sha256(raw).hexdigest()
+          manifest = json.loads(raw)
+          assert manifest['schemaVersion'] == 2 and manifest['version'] == version and manifest['sourceRevision'] == source
+          entries = [item for item in manifest['artifacts'] if item['target'] == 'x86_64-unknown-linux-gnu']
+          assert len(entries) == 1 and entries[0]['assetName'] == 'bamboo-x86_64-unknown-linux-gnu'
+          executable = asset(entries[0]['assetName'])
+          assert executable['size'] == entries[0]['sizeBytes'] and executable['digest'] == 'sha256:' + entries[0]['sha256']
+          assert re.fullmatch(r'[0-9a-f]{64}', entries[0]['sha256'])
+          values = {'source': source, 'version': version, 'asset_id': executable['id'],
+                    'asset_sha256': entries[0]['sha256'], 'asset_size': executable['size']}
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              for key, value in values.items(): output.write(f'{key}={value}\n')
+          PY
+
   build:
     name: Build (${{ matrix.platform }})
+    needs: release
     runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: bamboo-image-${{ needs.release.outputs.version }}-${{ matrix.platform }}
+      queue: max
+      cancel-in-progress: false
     permissions:
       contents: read
+      actions: read
       packages: write
     strategy:
       fail-fast: false
@@ -59,219 +133,243 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
+            dockerfile: .docker-release/Dockerfile
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            dockerfile: .docker-release/Dockerfile.arm64
     steps:
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Select an existing verified candidate
+        id: candidate
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_SOURCE: ${{ needs.release.outputs.source }}
+          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
+        run: |
+          set -euo pipefail
+          image="$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bamboo" | tr '[:upper:]' '[:lower:]')"
+          candidate="${image}:ci-v${RELEASE_VERSION}-${PLATFORM//\//-}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tag=$candidate" >> "$GITHUB_OUTPUT"
+          if docker buildx imagetools inspect "$candidate" >"$RUNNER_TEMP/image-inspect" 2>"$RUNNER_TEMP/image-error"; then
+            docker pull --platform "$PLATFORM" "$candidate"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$candidate")" = "$RELEASE_SOURCE"
+            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$candidate")" = "$RELEASE_VERSION"
+            actual="$(docker run --rm "$candidate" --version)"
+            test "${actual##* }" = "$RELEASE_VERSION"
+            if [ "$PLATFORM" = linux/amd64 ]; then
+              actual="$(docker run --rm --entrypoint sha256sum "$candidate" /usr/local/bin/bamboo)"
+              test "${actual%% *}" = "$EXPECTED_SHA256"
+            fi
+            echo 'mode=reuse' >> "$GITHUB_OUTPUT"
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/image-error"; then
+            if docker buildx imagetools inspect "${image}:v${RELEASE_VERSION}" >/dev/null 2>"$RUNNER_TEMP/final-image-error"; then
+              echo 'The completed image exists but its candidate is missing; recover the original digest instead of rebuilding.' >&2
+              exit 1
+            elif ! grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/final-image-error"; then
+              cat "$RUNNER_TEMP/final-image-error" >&2
+              exit 1
+            fi
+            echo 'mode=build' >> "$GITHUB_OUTPUT"
+          else
+            cat "$RUNNER_TEMP/image-error" >&2
+            exit 1
+          fi
       - uses: actions/checkout@v7
+        if: steps.candidate.outputs.mode == 'build'
+        with:
+          ref: ${{ needs.release.outputs.source }}
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: Setup Node.js
+      - name: Download and verify the original x64 binary
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/amd64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ASSET_ID: ${{ needs.release.outputs.asset_id }}
+          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
+          EXPECTED_SIZE: ${{ needs.release.outputs.asset_size }}
+        run: |
+          set -euo pipefail
+          mkdir -p .docker-release
+          git show "${GITHUB_WORKFLOW_SHA}:docker/Dockerfile.published" > .docker-release/Dockerfile
+          gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" \
+            -H 'Accept: application/octet-stream' > .docker-release/bamboo
+          echo "${EXPECTED_SHA256}  .docker-release/bamboo" | sha256sum --check -
+          test "$(stat -c %s .docker-release/bamboo)" = "${EXPECTED_SIZE}"
+          chmod 755 .docker-release/bamboo
+
+      - name: Setup Node.js for the distinct ARM64 build
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
-
-      - name: Resolve exact release frontend
+      - name: Resolve the locked frontend for ARM64
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
         id: frontend
         env:
-          # Tag pushes have no workflow inputs and therefore resolve the
-          # committed Lotus Next lock rather than a moving npm tag.
-          FRONTEND_PACKAGE: ${{ github.event.inputs.frontend_package || '@bigduu/lotus-next' }}
-          FRONTEND_VERSION: ${{ github.event.inputs.lotus_version || 'from_lock' }}
+          FRONTEND_PACKAGE: '@bigduu/lotus-next'
+          FRONTEND_VERSION: from_lock
         run: node scripts/release-frontend-policy.cjs
-
-      - name: Stage frontend package from npm
-        # The shared resolver selects the committed Lotus Next lock by default
-        # and permits only one fixed legacy rollback. LOTUS_SOURCE=package
-        # hard-fails when the exact package is missing instead of falling back.
+      - name: Stage the locked frontend and stamp the ARM64 version
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
         env:
           LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
           LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
           EXPECTED_FRONTEND_NAME: ${{ steps.frontend.outputs.frontend_name }}
+          TARGET_VERSION: ${{ needs.release.outputs.version }}
         run: |
           set -euo pipefail
           npm install --no-save --no-package-lock --ignore-scripts "${LOTUS_PACKAGE_NAME}@${LOTUS_VERSION}"
           LOTUS_SOURCE=package node scripts/frontend-package.cjs stage
-          FRONTEND_PACKAGE_DIR="crates/app/bamboo-server/frontend_package"
-          test -f "${FRONTEND_PACKAGE_DIR}/lotus-frontend.zip"
-          test -f "${FRONTEND_PACKAGE_DIR}/frontend-manifest.json"
-          EMBEDDED_NAME="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_name")"
-          EMBEDDED="$(node -p "require('./${FRONTEND_PACKAGE_DIR}/frontend-manifest.json').frontend_version")"
-          echo "Embedded frontend: ${EMBEDDED_NAME}@${EMBEDDED}"
-          if [ "${EMBEDDED_NAME}" != "${EXPECTED_FRONTEND_NAME}" ]; then
-            echo "::error::Embedded frontend ${EMBEDDED_NAME} does not match expected ${EXPECTED_FRONTEND_NAME}"
-            exit 1
-          fi
-          if [ "${EMBEDDED}" != "${LOTUS_VERSION}" ]; then
-            echo "::error::Embedded frontend version ${EMBEDDED} does not match resolved ${LOTUS_VERSION}"
-            exit 1
-          fi
+          python3 scripts/crate-release-lock.py stamp "${TARGET_VERSION}"
+          cargo metadata --format-version 1 >/dev/null
+          python3 scripts/crate-release-lock.py
+          mkdir -p .docker-release
+          git show "${GITHUB_WORKFLOW_SHA}:docker/Dockerfile" > .docker-release/Dockerfile.arm64
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image repo (lowercase)
-        id: repo
-        run: echo "name=$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Build and push by digest
-        id: build
+      - name: Build the candidate once
+        if: steps.candidate.outputs.mode == 'build'
         uses: docker/build-push-action@v7
         with:
           context: .
-          file: docker/Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
+          tags: ${{ steps.candidate.outputs.tag }}
+          labels: |
+            org.opencontainers.image.revision=${{ needs.release.outputs.source }}
+            org.opencontainers.image.version=${{ needs.release.outputs.version }}
           cache-from: type=gha,scope=${{ matrix.platform }}
           cache-to: type=gha,mode=max,scope=${{ matrix.platform }}
-          outputs: type=image,name=${{ steps.repo.outputs.name }},push-by-digest=true,name-canonical=true,push=true
-
-      - name: Smoke-test API and embedded frontend
-        shell: bash
+          load: true
+          push: false
+      - name: Verify the packaged executable version and loader
+        if: steps.candidate.outputs.mode == 'build'
         env:
-          IMAGE_REF: ${{ steps.repo.outputs.name }}@${{ steps.build.outputs.digest }}
+          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          CONTAINER_NAME="bamboo-frontend-smoke-${{ strategy.job-index }}"
-          cleanup() {
-            status=$?
-            trap - EXIT
-            if [ "${status}" -ne 0 ]; then
-              docker logs "${CONTAINER_NAME}" || true
-            fi
-            docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-            exit "${status}"
-          }
-          trap cleanup EXIT
-
-          docker pull "${IMAGE_REF}"
-          docker run --detach --name "${CONTAINER_NAME}" \
-            --publish 127.0.0.1::9562 "${IMAGE_REF}"
-          HOST_PORT="$(docker port "${CONTAINER_NAME}" 9562/tcp | tail -1 | awk -F: '{print $NF}')"
-          ROOT_RESPONSE="$(mktemp)"
-          ROOT_HEADERS="$(mktemp)"
-
-          ready=0
-          for _ in $(seq 1 30); do
-            if curl -fsS "http://127.0.0.1:${HOST_PORT}/api/v1/health" >/dev/null \
-              && curl -fsS "http://127.0.0.1:${HOST_PORT}/" \
-                --dump-header "${ROOT_HEADERS}" --output "${ROOT_RESPONSE}" \
-              && test -s "${ROOT_RESPONSE}" \
-              && grep -Eiq '^content-type: *text/html' "${ROOT_HEADERS}"; then
-              ready=1
-              break
-            fi
-            sleep 1
-          done
-          if [ "${ready}" -ne 1 ]; then
-            echo "::error::Built image did not serve both the Bamboo API and embedded frontend"
-            exit 1
+          actual="$(docker run --rm "$IMAGE_REF" --version)"
+          test "${actual##* }" = "$RELEASE_VERSION"
+          if [ "$PLATFORM" = linux/amd64 ]; then
+            actual="$(docker run --rm --entrypoint sha256sum "$IMAGE_REF" /usr/local/bin/bamboo)"
+            test "${actual%% *}" = "$EXPECTED_SHA256"
           fi
-          docker exec "${CONTAINER_NAME}" \
-            test -s /data/frontend/.frontend-manifest.json
-
-      - name: Export digest
+      - name: Retain the verified candidate in GHCR
+        if: steps.candidate.outputs.mode == 'build'
+        env:
+          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
+        run: docker push "$IMAGE_REF"
+      - name: Retain the image digest
+        env:
+          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
+          IMAGE_REPO: ${{ steps.candidate.outputs.image }}
         run: |
+          set -euo pipefail
+          docker pull "$IMAGE_REF"
+          digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE_REF" | grep -F "${IMAGE_REPO}@sha256:" | head -1)"
+          digest="${digest#*@}"
           mkdir -p /tmp/digests
-          digest="${{ steps.build.outputs.digest }}"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           touch "/tmp/digests/${digest#sha256:}"
-
-      - name: Upload digest
-        uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v7
         with:
           name: digest-${{ strategy.job-index }}
           path: /tmp/digests/*
           if-no-files-found: error
-          retention-days: 1
+          overwrite: true
+          retention-days: 7
 
   merge:
-    name: Merge multi-arch manifest
+    name: Publish multi-architecture manifest
+    needs: [release, build]
     runs-on: ubuntu-latest
-    needs: build
+    concurrency:
+      group: bamboo-image-manifest
+      queue: max
+      cancel-in-progress: false
     permissions:
       contents: read
       packages: write
+    outputs:
+      image: ${{ steps.manifest.outputs.image }}
     steps:
-      - name: Download digests
-        uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@v8
         with:
           path: /tmp/digests
           pattern: digest-*
           merge-multiple: true
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image repo (lowercase)
-        id: repo
-        run: echo "name=$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      - name: Docker metadata (tags)
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ${{ steps.repo.outputs.name }}
-          # Triggers are workflow_dispatch + tag push, so `latest` always applies;
-          # tag pushes also get the tag name, and every build gets a commit-sha
-          # and a date tag for traceability.
-          tags: |
-            type=raw,value=latest
-            type=ref,event=tag
-            type=sha,format=short
-            type=raw,value={{date 'YYYY.MM.DD'}}
-
-      - name: Create and push manifest list
-        working-directory: /tmp/digests
+      - name: Publish the versioned manifest
+        id: manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_SOURCE: ${{ needs.release.outputs.source }}
         run: |
-          docker buildx imagetools create \
-            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
-            $(printf '${{ steps.repo.outputs.name }}@sha256:%s ' *)
-
-      - name: Inspect published image
-        run: |
-          docker buildx imagetools inspect ${{ steps.repo.outputs.name }}:latest
+          set -euo pipefail
+          image="$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bamboo" | tr '[:upper:]' '[:lower:]')"
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          mapfile -t digests < <(find /tmp/digests -type f -maxdepth 1 -printf '%f\n' | sort)
+          test "${#digests[@]}" = 2
+          for digest in "${digests[@]}"; do
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
+          done
+          tag="${image}:v${RELEASE_VERSION}"
+          if docker buildx imagetools inspect --raw "$tag" >"$RUNNER_TEMP/manifest.json" 2>"$RUNNER_TEMP/manifest-error"; then
+            python3 - "${digests[@]}" <<'PY'
+          import json, os, sys
+          manifest = json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'manifest.json')))
+          items = [item for item in manifest['manifests'] if item.get('platform', {}).get('os') == 'linux'
+                   and item['platform'].get('architecture') in ('amd64', 'arm64')]
+          assert len(items) == 2 and {item['platform']['architecture'] for item in items} == {'amd64', 'arm64'}
+          assert {item['digest'] for item in items} == {'sha256:' + digest for digest in sys.argv[1:]}
+          PY
+            docker buildx imagetools create -t "${image}:sha-${RELEASE_SOURCE:0:7}" "$tag"
+            if [ "$latest" = "v${RELEASE_VERSION}" ]; then
+              docker buildx imagetools create -t "${image}:latest" "$tag"
+            fi
+          elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/manifest-error"; then
+            args=(-t "$tag" -t "${image}:sha-${RELEASE_SOURCE:0:7}")
+            if [ "$latest" = "v${RELEASE_VERSION}" ]; then args+=(-t "${image}:latest"); fi
+            for digest in "${digests[@]}"; do args+=("${image}@sha256:${digest}"); done
+            docker buildx imagetools create "${args[@]}"
+          else
+            cat "$RUNNER_TEMP/manifest-error" >&2
+            exit 1
+          fi
+          docker buildx imagetools inspect "$tag"
+          echo "image=${image}:v${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
 
   image-scan:
     name: Scan published image (Trivy)
-    runs-on: ubuntu-latest
     needs: merge
+    runs-on: ubuntu-latest
     permissions:
-      contents: read
       packages: read
     steps:
-      - name: Log in to GHCR
-        uses: docker/login-action@v4
+      - uses: docker/login-action@v4
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Compute image repo (lowercase)
-        id: repo
-        run: echo "name=$(echo '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
-
-      # CVE scan of the image actually published to GHCR. Starts warn-only
-      # (exit-code 0, ignore-unfixed) so pre-existing, not-yet-patched
-      # base-image CVEs don't block publishing — tighten once the baseline is
-      # triaged. Pinned by commit SHA: trivy-action's tags were compromised
-      # in a supply-chain attack in 2026-03 (credential-stealer injected into
-      # tags 0.0.1-0.34.2); this SHA is a signed, verified post-incident
-      # release. (bamboo-agent#254)
-      - name: Trivy scan
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
-          image-ref: ${{ steps.repo.outputs.name }}:latest
+          image-ref: ${{ needs.merge.outputs.image }}
           format: table
           severity: CRITICAL,HIGH
           ignore-unfixed: true
