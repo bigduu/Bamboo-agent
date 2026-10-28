@@ -69,7 +69,7 @@ compilation or packaging. If a previously successful original output is missing,
 explicit recovery rather than quietly rebuilding it. Product/source repairs
 return through feature/dev and require a new frozen cut.
 
-Bamboo's feature CI uses independently rerunnable Linux package shards for the
+Bamboo's feature CI uses independently rerunnable Linux test shards for the
 canonical Unit/E2E configuration, reusing the compiled SSH fixture within its
 owner. Isolated shards can compile shared dependencies independently; their
 caches are not proof of compilation reuse. Native diagnostics on other operating
