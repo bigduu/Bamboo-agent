@@ -1654,6 +1654,14 @@ mod execution_input_http {
             assert_eq!(
                 calls[0]
                     .iter()
+                    .filter(|message| message.id == fresh_id)
+                    .count(),
+                1,
+                "the provider input must not contain a duplicate message ID"
+            );
+            assert_eq!(
+                calls[0]
+                    .iter()
                     .filter(|message| message.id == fresh_id
                         && message.role == bamboo_agent_core::Role::User
                         && message.content == "direct fresh user")
@@ -1661,6 +1669,15 @@ mod execution_input_http {
                 1
             );
         }
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.id == fresh_id)
+                .count(),
+            1,
+            "the durable transcript must not contain a duplicate message ID"
+        );
         assert_eq!(
             after
                 .messages
