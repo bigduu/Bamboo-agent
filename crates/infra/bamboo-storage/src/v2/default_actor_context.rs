@@ -50,9 +50,15 @@ enum TaskGuard {
         _guard: RuntimeTaskTransactionWriteGuard,
     },
 }
-enum LifecycleGuard {
+pub(super) enum LifecycleGuard {
     Shared { _guard: SessionLifecycleReadGuard },
     Exclusive { _guard: SessionLifecycleWriteGuard },
+}
+
+impl LifecycleGuard {
+    pub(super) fn retains_exclusive(&self) -> bool {
+        matches!(self, Self::Exclusive { .. })
+    }
 }
 
 impl DefaultWriterGuards {
@@ -66,6 +72,33 @@ impl DefaultWriterGuards {
 
     pub(super) fn shared_with_root_actor(
         lifecycle: SessionLifecycleReadGuard,
+        task: RuntimeTaskTransactionReadGuard,
+        session: SessionWriteGuard,
+        root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+    ) -> Arc<Self> {
+        Self::with_shared_task(
+            LifecycleGuard::Shared { _guard: lifecycle },
+            task,
+            session,
+            root_actor,
+        )
+    }
+
+    pub(super) fn root_birth(
+        lifecycle: SessionLifecycleWriteGuard,
+        task: RuntimeTaskTransactionReadGuard,
+        session: SessionWriteGuard,
+    ) -> Arc<Self> {
+        Self::with_shared_task(
+            LifecycleGuard::Exclusive { _guard: lifecycle },
+            task,
+            session,
+            None,
+        )
+    }
+
+    fn with_shared_task(
+        lifecycle: LifecycleGuard,
         task: RuntimeTaskTransactionReadGuard,
         session: SessionWriteGuard,
         root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
@@ -88,9 +121,27 @@ impl DefaultWriterGuards {
                 _supervisor: None,
                 _creation: None,
                 _task: Some(TaskGuard::Shared { _guard: task }),
-                _lifecycle: Some(LifecycleGuard::Shared { _guard: lifecycle }),
+                _lifecycle: Some(lifecycle),
             }),
         })
+    }
+
+    /// Check the actual retained owner, including the creation scopes that
+    /// enclose these physical guards. A preflight flag is never sufficient.
+    pub(super) fn retains_exclusive_lifecycle(&self) -> bool {
+        self.physical
+            ._lifecycle
+            .as_ref()
+            .is_some_and(LifecycleGuard::retains_exclusive)
+            || match self.physical._creation.as_ref() {
+                Some(RootCreationPhysicalGuards::Supervised { _guard }) => {
+                    _guard.retains_exclusive_lifecycle()
+                }
+                Some(RootCreationPhysicalGuards::HostScoped { _guard }) => {
+                    _guard.retains_exclusive_lifecycle()
+                }
+                None => false,
+            }
     }
 
     pub(super) fn exclusive(
@@ -331,6 +382,48 @@ impl SessionStoreV2 {
         let directory = self.abs_path_from_rel(&Self::default_writer_rel_path(session)?);
         let (record, marker) = self.default_actor_observation(&directory).await;
         Ok(!permits_unfenced_context(&record, &marker, Some(session)))
+    }
+
+    /// File presence only selects a lock mode. It grants no identity, repair,
+    /// permission or vacancy: the ordinary canonical pair/proof checks remain
+    /// mandatory under the final physical writer guards.
+    pub(super) async fn root_has_birth_files(&self, id: &str) -> io::Result<bool> {
+        validate_session_id(id)?;
+        let directory = self.sessions_dir.join(id);
+        for name in ["session.json", RUNTIME_SIDECAR_FILE] {
+            match fs::symlink_metadata(directory.join(name)).await {
+                Ok(meta) if meta.file_type().is_file() => return Ok(true),
+                Ok(_) => {
+                    return Err(other_io_error("Root birth source is not a regular file"));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(false)
+    }
+
+    /// Final fence shared by all default full/runtime writers, including
+    /// callers other than Storage::save_session. Never recreate a missing
+    /// Root from a runtime checkpoint or a caller retaining only shared scope.
+    pub(super) async fn check_root_birth_guards(
+        &self,
+        session: &Session,
+        guards: &DefaultWriterGuards,
+        full: bool,
+    ) -> io::Result<()> {
+        if session.kind == SessionKind::Root
+            && !self.root_has_birth_files(&session.id).await?
+            && (!full || !guards.retains_exclusive_lifecycle())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                SessionAuthorityConflict(
+                    "new Root birth requires exclusive lifecycle ownership".into(),
+                ),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) async fn lock_default_writer_lifecycle(

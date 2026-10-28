@@ -20,6 +20,7 @@ mod context_preparation;
 mod prefix_drift;
 mod stream_execution;
 mod token_budget;
+pub(crate) use token_budget::resolve_known_token_ceilings;
 mod token_estimation;
 
 pub(crate) use context_preparation::force_overflow_context_recovery;
@@ -476,9 +477,9 @@ mod tests {
                 let offered =
                     request_tool_schemas_for_loading_mode(&supervisor, &schemas, mode, None);
                 let expected = if mode == CapabilityLoadingMode::StickyFallback {
-                    vec!["Read", "discover_capabilities"]
+                    vec!["discover_capabilities"]
                 } else {
-                    vec!["Read", "SubAgent", "session_control", "session_history"]
+                    vec!["SubAgent", "session_control", "session_history"]
                 };
                 assert_eq!(
                     offered

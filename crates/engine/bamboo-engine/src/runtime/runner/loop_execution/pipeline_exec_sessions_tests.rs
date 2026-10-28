@@ -11,6 +11,9 @@ use bamboo_llm::{LLMChunk, LLMError, LLMStream};
 use futures::stream;
 use serde_json::{json, Value};
 
+#[path = "pipeline_background_exec_tests.rs"]
+mod background_exec_tests;
+
 // Release the command even when an assertion unwinds before the explicit poll.
 struct ReleaseGate(PathBuf);
 

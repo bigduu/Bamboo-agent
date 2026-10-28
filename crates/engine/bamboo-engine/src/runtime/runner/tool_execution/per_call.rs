@@ -3071,6 +3071,10 @@ mod hook_tests {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let names = [
             "Read",
+            "Grep",
+            "Glob",
+            "GetFileInfo",
+            "ViewImage",
             "SubAgent",
             "Plan",
             "Task",
@@ -3129,8 +3133,7 @@ mod hook_tests {
                 .unwrap();
                 let allowed = matches!(
                     name,
-                    "Read"
-                        | "SubAgent"
+                    "SubAgent"
                         | "Plan"
                         | "Task"
                         | "session_control"
@@ -3144,7 +3147,6 @@ mod hook_tests {
                 }
             }
             let expected = vec![
-                "Read",
                 "SubAgent",
                 "Plan",
                 "Task",
@@ -4003,17 +4005,18 @@ mod hook_tests {
         .await
         .expect("denied parent review returns a tool outcome");
         assert!(outcome.result.is_err());
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0].resource, "[redacted]");
-        let request = asks[0]
-            .permission_request
-            .as_ref()
-            .expect("typed review request");
-        assert_eq!(request.resource, "[redacted]");
-        assert!(request.suggested_matchers.is_empty());
-        assert!(!format!("{:?}", asks[0]).contains("private-key"));
-        drop(asks);
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 1);
+            assert_eq!(asks[0].resource, "[redacted]");
+            let request = asks[0]
+                .permission_request
+                .as_ref()
+                .expect("typed review request");
+            assert_eq!(request.resource, "[redacted]");
+            assert!(request.suggested_matchers.is_empty());
+            assert!(!format!("{:?}", asks[0]).contains("private-key"));
+        }
 
         let eval_args = serde_json::json!({
             "code":"document.title = 'private-source'",
@@ -4042,16 +4045,17 @@ mod hook_tests {
         .await
         .expect("denied eval review returns a tool outcome");
         assert!(outcome.result.is_err());
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 2);
-        assert_eq!(asks[1].resource, "[redacted]");
-        let eval_request = asks[1].permission_request.as_ref().unwrap();
-        assert_eq!(eval_request.resource, "[redacted]");
-        assert!(eval_request.suggested_matchers.is_empty());
-        for secret in ["private-source", "private-query", "browser_eval:17:"] {
-            assert!(!format!("{:?}", asks[1]).contains(secret));
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 2);
+            assert_eq!(asks[1].resource, "[redacted]");
+            let eval_request = asks[1].permission_request.as_ref().unwrap();
+            assert_eq!(eval_request.resource, "[redacted]");
+            assert!(eval_request.suggested_matchers.is_empty());
+            for secret in ["private-source", "private-query", "browser_eval:17:"] {
+                assert!(!format!("{:?}", asks[1]).contains(secret));
+            }
         }
-        drop(asks);
 
         let invalid_type_args = serde_json::json!({
             "action":"type",
@@ -4119,7 +4123,7 @@ mod hook_tests {
                 Some(reviewer_proxy.clone()),
                 hook_ask_outcome(
                     &malformed_call,
-                    &execution_name,
+                    execution_name,
                     &config,
                     &session,
                     &runtime_state,
@@ -4159,7 +4163,7 @@ mod hook_tests {
             Some(reviewer_proxy),
             hook_ask_outcome(
                 &read_only_call,
-                &execution_name,
+                execution_name,
                 &config,
                 &session,
                 &runtime_state,
@@ -4264,25 +4268,26 @@ mod hook_tests {
             assert!(outcome.result.is_err());
         }
 
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 3);
-        for ask in asks.iter() {
-            assert_eq!(ask.tool_name, "browser");
-            assert_eq!(ask.resource, "[redacted]");
-            let request = ask.permission_request.as_ref().unwrap();
-            assert_eq!(request.tool_name, "browser");
-            assert_eq!(request.resource, "[redacted]");
-            assert_eq!(
-                request.operation_summary,
-                "Download from selected browser element"
-            );
-            assert!(request.suggested_matchers.is_empty());
-            let display = format!("{ask:?}");
-            assert!(!display.contains(secret));
-            assert!(!display.contains("download:css:"));
-            assert!(!display.contains("private-namespace"));
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 3);
+            for ask in asks.iter() {
+                assert_eq!(ask.tool_name, "browser");
+                assert_eq!(ask.resource, "[redacted]");
+                let request = ask.permission_request.as_ref().unwrap();
+                assert_eq!(request.tool_name, "browser");
+                assert_eq!(request.resource, "[redacted]");
+                assert_eq!(
+                    request.operation_summary,
+                    "Download from selected browser element"
+                );
+                assert!(request.suggested_matchers.is_empty());
+                let display = format!("{ask:?}");
+                assert!(!display.contains(secret));
+                assert!(!display.contains("download:css:"));
+                assert!(!display.contains("private-namespace"));
+            }
         }
-        drop(asks);
 
         let malformed = serde_json::json!({
             "action":"download", "selector":secret, "expected_epoch":17,
@@ -4365,25 +4370,26 @@ mod hook_tests {
         .await
         .expect("parent review returns an outcome");
         assert!(outcome.result.is_err());
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0].tool_name, "default::browser");
-        assert_eq!(asks[0].resource, "[redacted]");
-        let request = asks[0]
-            .permission_request
-            .as_ref()
-            .expect("typed review request");
-        assert_eq!(
-            request.permission_type,
-            bamboo_tools::permission::PermissionType::BrowserInteraction
-        );
-        assert_eq!(request.resource, "[redacted]");
-        assert_eq!(request.operation_summary, "Select native browser options");
-        assert!(request.suggested_matchers.is_empty());
-        for private in ["private-option-value", "data-private", "options:"] {
-            assert!(!format!("{:?}", asks[0]).contains(private));
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 1);
+            assert_eq!(asks[0].tool_name, "default::browser");
+            assert_eq!(asks[0].resource, "[redacted]");
+            let request = asks[0]
+                .permission_request
+                .as_ref()
+                .expect("typed review request");
+            assert_eq!(
+                request.permission_type,
+                bamboo_tools::permission::PermissionType::BrowserInteraction
+            );
+            assert_eq!(request.resource, "[redacted]");
+            assert_eq!(request.operation_summary, "Select native browser options");
+            assert!(request.suggested_matchers.is_empty());
+            for private in ["private-option-value", "data-private", "options:"] {
+                assert!(!format!("{:?}", asks[0]).contains(private));
+            }
         }
-        drop(asks);
 
         let invalid_args = serde_json::json!({
             "action":"select_option",

@@ -14,11 +14,12 @@ pub use jiandu_memory::memory_store::{
     DurableMemoryType, FreshnessKind, MemoryConsolidateResult, MemoryContradictionResult,
     MemoryDuplicateCandidate, MemoryMergeResult, MemoryPurgeResult, MemoryQueryOptions,
     MemoryQueryResult, MemoryRecallCandidate, MemoryRecallOptions, MemoryRetrievalInput,
-    MemoryScope, MemorySplitPiece, MemorySplitResult, SessionState, TemporalGranularity,
-    DEFAULT_QUERY_LIMIT, DEFAULT_SESSION_TOPIC, MAX_EXPLICIT_MEMORY_ENTITIES,
-    MAX_EXPLICIT_MEMORY_KEYWORDS, MAX_MAX_CHARS, MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN,
-    MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS,
-    MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
+    MemoryScope, MemorySplitPiece, MemorySplitResult, ProjectMemoryCandidates, ProjectMemoryRead,
+    ProjectMemoryRef, SessionState, TemporalGranularity, DEFAULT_QUERY_LIMIT,
+    DEFAULT_SESSION_TOPIC, MAX_EXPLICIT_MEMORY_ENTITIES, MAX_EXPLICIT_MEMORY_KEYWORDS,
+    MAX_MAX_CHARS, MAX_MEMORY_ENTITIES, MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS,
+    MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS, MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN,
+    MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
 };
 
 /// Jiandu's inspection result plus Bamboo's flattened Dream timestamp.
@@ -129,6 +130,40 @@ impl Default for MemoryStore {
 }
 
 impl MemoryStore {
+    /// Compact, read-only discovery in the Host-authorized Project only.
+    pub async fn query_project_sources_read_only(
+        &self,
+        project: &bamboo_domain::ProjectId,
+        query: &str,
+    ) -> io::Result<ProjectMemoryCandidates> {
+        let project: jiandu_memory::ProjectId = project
+            .as_str()
+            .parse::<jiandu_memory::ProjectId>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        self.store
+            .for_project(&project)
+            .query_project_sources_read_only(&project, query)
+            .await
+    }
+
+    /// Read the native exact adopted version without a Global/Session fallback.
+    pub async fn read_project_source_read_only(
+        &self,
+        project: &bamboo_domain::ProjectId,
+        memory_id: &str,
+        content_version: &str,
+    ) -> io::Result<ProjectMemoryRead> {
+        let project: jiandu_memory::ProjectId = project
+            .as_str()
+            .parse::<jiandu_memory::ProjectId>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.to_string()))?;
+        let reference = ProjectMemoryRef::new(project, memory_id, content_version)?;
+        self.store
+            .for_project(reference.project_id())
+            .get_project_source_read_only(&reference)
+            .await
+    }
+
     /// The active Jiandu canonical root, including an explicitly selected root.
     /// External clients must share this root rather than guessing a default.
     pub fn data_dir(&self) -> PathBuf {

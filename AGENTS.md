@@ -2,6 +2,14 @@
 
 Read [README.md](./README.md) for the product boundary. Use this canonical Jiandu memory contract:
 
+Before CI or release work, read the complete local
+[shared delivery workflow](docs/delivery-workflow.md),
+[Actions ownership audit](docs/ci-workflow-audit.md) and
+[Bamboo commands and test map](docs/releases/ci-publication-flow.md).
+Every agent follows the same feature/dev/release/main workflow. The shared
+review documents include historical snapshots; use the local guide and actual
+workflow files for the current implementation and rollout status.
+
 - Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
 - Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
 - Query before writing. Store one confirmed atomic fact with a specific title and a few useful keywords, entities, and tags.
@@ -14,29 +22,98 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream sn
 
 Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
 branch and isolated worktree; only the named integrator writes a shared batch
-branch. Dev CI admission requires the `Test` check to pass its compile-only mode.
-Before admission, run the affected tests locally, add or update coverage for changed
-behavior, and record exact source, commands and results in the PR. Auxiliary
-`Quick Checks` do not replace compilation or local test evidence. Dev CI does
-not run the full test suite on every PR. Freeze a recorded batch for complete
-release acceptance; `release → main` must pass the full required suite and
-platform matrix. Keep one release owner and one writer per build output; never
-cancel or clean another worker's resources. Verify the separately approved
-protection configuration and never bypass current gates. Normal direct pushes
-must be fast-forward and satisfy the same evidence and checks; never force push.
-Use the authoritative
-[Release Process](./CONTRIBUTING.md#release-process) for cuts, repairs and publication.
-The [CI and publication flow](./docs/releases/ci-publication-flow.md) records
-the phase contracts: validate the frozen release before merge, authenticate
-that evidence on the actual main merge, then publish that source. A successful
-lightweight main admission is evidence reuse, not another full test run. Never
-replace dev compilation or release acceptance with skipped/stub checks, or
-substitute another commit's binary for a versioned release build.
-After one authenticated version/frontend preparation, crate publication and
-the source-selected native matrix run concurrently. Native workers consume
-hash-bound same-run frontend transport without publication credentials. Only
-the final publisher joins completed crates and all required native receipts;
-parallel builds never create another allocator or publication queue.
+branch. Every feature PR to `dev` must pass required `Test`, which aggregates
+Unit, E2E and the live SSH fixture on its actual merge source. One Linux Cargo
+executor owns one target directory and preserves independent default package
+configurations. Cargo runs each package's library/binary, integration and
+documentation cases once. Explicit feature owners run only their catalogued
+additional cases; new feature-sensitive cases require ownership review.
+Compatible configurations reuse compiled artifacts, with features/profile and
+actual Cargo freshness recorded. The ignored SSH case reuses its compiled
+executable. Unit/E2E are logical target groups. All agents add ordinary cases to that
+Cargo target catalog, instead of creating another Linux workflow for a covered
+case subset. CI policy rejects unregistered Rust test producers; native OS,
+containment-boundary, explicit manual diagnostics and pinned legacy routes are
+scoped exceptions with named owners. Preserve
+applicable native-platform acceptance before dev admission. Fix failures in the
+feature branch before merging; record exact source, commands and results.
+Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
+and 15 frontend artifact/policy registrations once. Each native feature job
+runs the same 61 portable Node registrations once on its own OS; retain the
+Windows unsupported-platform assertions. The `Browser Runtime Unit and E2E`
+feature job owns all `browser-runtime` Node test files on Node 24; both feature
+aggregates require it to pass. Do not add a second automatic owner for those
+tests.
+Keep the standalone default storage authority families' serial selection in that same
+executor, reusing its compiled library-test executable without repeating cases.
+Planner's 12 Plan and 10 artifact library cases are excluded from the ordinary
+parallel harness and run once serially using each package's same compiled
+canonical test executable. Preserve each default dependency graph and fail the
+existing feature gate on a missing, repeated or failed case. The independent
+Delegated Planner workflow retains its distinct API-only real CLI and original
+Clippy configurations; it does not repeat these library cases.
+`Quick Checks` remains auxiliary and never substitutes for runtime tests.
+
+`trusted-observer.yml` is the single automatic owner for the two original
+API-only Observer joint recipes, run sequentially in one target directory on the
+actual PR head. Keep both package selections and their full behavior assertions.
+The first recipe owns the shared supervisor-management serde case; the second
+skips only that full case name and still selects `bamboo-domain` for its six
+subscription windows. `observer-subscriptions.yml` retains the complete original
+recipe as an explicit manual diagnostic on the selected workflow SHA. The shared
+five-library Clippy check remains solely in `observer-api-lint.yml`; these API-only
+contexts remain distinct from canonical embedded feature tests.
+
+## Native feature ownership
+
+#2319 gives Windows and macOS one feature job, workspace and owned target each.
+`native-feature-tests` runs `node scripts/native-test-owner.cjs`; both required
+`Test` and `E2E Tests` require that whole matrix to succeed. Never start a second
+dev-PR Actor, Ticket, TLS or recorder producer. Their separate workflows/full
+jobs are retained for explicit diagnosis or historical recovery.
+
+Preserve these configurations; a shared directory is not permission to unify
+their features or reuse an incompatible executable:
+
+- Windows Actor keeps Rust 1.99.0/MSVC, API-only frontend and all 41 selected
+  cases (9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial processes).
+  Standalone default storage remains separate from server storage/test-utils.
+  Its actual junction/host evidence and frozen lib-test executable checks stay.
+- Ordinary Windows server/TLS/frontend, recorder, Ticket and portable Skill use
+  independent default package contexts, the stable toolchain and test opt-0.
+  Actor API-only and ordinary embedded server outputs are distinct.
+- macOS TLS/backtrace keeps the existing all-feature dev-profile opt-z server
+  unwind guard; ordinary recorder/Skill/frontend tests keep test opt-0.
+- Recorder lifecycle uses its actual Cargo-built binary and package working
+  directory. Preserve `CARGO_BIN_EXE_tool-event-recorder`; never replace it with
+  an invented path or stub executable.
+
+The driver records compiled names, runtime counts, executable hashes and actual
+Cargo freshness. A repeated compatible unit must be fresh; different feature,
+profile, frontend or compiler identities remain distinct. Zero/ignored/missing
+cases, source drift or missing native output fail admission. Native children
+receive no publication/provider/tunnel credentials or workflow write channels.
+Failed evidence is retained under the original source/run/attempt; do not clean
+another owner or call a cache hit runtime evidence.
+
+For this ownership change, run Node driver/policy/routing and the frozen authority
+fixtures locally. Real Windows PowerShell/process/junction and macOS unwind
+acceptance must pass on the matching native runners before dev admission.
+Keep the results from the actual feature source and retain historical release
+receipts. Skipped jobs and a cache hit do not establish test acceptance.
+
+The intended release contract is feature tests -> accepted dev cut -> one version
+reservation and release build/publication -> main promotion of the published
+source. Release branches do not repair product code or rerun Unit/E2E; main
+records stable code through immutable tags, Release manifests/provenance and the
+promotion description, without another build or test run. Keep source manifests
+at `0.0.0` and stamp only disposable formal-build checkouts. Repairs return
+through feature/dev tests and produce a new frozen cut.
+
+Use the [Release Process](./CONTRIBUTING.md#release-process) and
+[CI and publication flow](./docs/releases/ci-publication-flow.md) for the same
+workflow. During rollout, check the installed workflow before releasing and
+preserve existing signed receipts and immutable tags.
 
 ## Pull Request Review
 
@@ -46,38 +123,32 @@ For the #791 multi-agent epic, the user's 2026-09-28 delivery instruction takes
 precedence over the per-Issue PR and review steps below. Inventory all related
 PR heads and existing work first, then merge implemented work into one local
 integration baseline. Review integration changes locally and use focused checks
-while assembling it. Submit one PR to `dev` with the required compilation gate
-and local test/coverage evidence under the current gate policy. Run the complete affected regression once
-on the frozen release snapshot before promotion to `main`. Do not request or
-wait for GitHub Codex PR review for this epic. Close superseded component PRs and clean only safely merged worktrees after the final
-integration is accepted. Preserve dirty or uncertain worktrees.
+while assembling it. Submit one PR to `dev` with required Unit/E2E and local
+test/coverage evidence under the current feature-admission policy. Complete
+affected regression before dev admission; the target release path builds the
+accepted product without repeating those tests. Do not request or wait for GitHub
+Codex PR review for this epic. Close superseded component PRs and clean only
+safely merged worktrees after final integration. Preserve dirty or uncertain
+worktrees.
 
-- Every non-draft pull request that enters review must have a Codex review for
-  its current head and base. If no current review is already running or complete,
-  add a pull-request comment whose entire body is `@codex review`; do not rely
-  only on automatic review triggering.
-- Wait for the `Codex Review Summary` to finish. A 👍 reaction on the trigger or
-  an explicit Codex zero-findings result confirms a clean run; a `Completed`
-  summary alone only confirms that the run ended. Review suggestions or inline
-  comments are findings that must be resolved. Inspect the summary, review body,
-  reactions, and unresolved threads instead of treating an empty
-  `reviewDecision` or a `COMMENTED` review as approval.
-- Any head commit or base change invalidates the earlier Codex result. After the
-  update, resolve applicable findings and trigger a fresh exact-head review.
-- Green CI does not mean review passed. Add `review:agent` and remove
-  `review:needed` only after the current-head Codex review has finished with no
-  unresolved findings and the remaining acceptance and merge gates pass.
+### General review
+
+- Every PR needs an independent review of its current head and base. Any agent
+  may perform that review using the same acceptance criteria and record its
+  findings. Resolve applicable findings and review affected changes again after
+  the head or base changes.
+- Merge only after the required checks pass and unresolved review threads are
+  addressed. Human approval is required when the user or branch protection asks
+  for it. Use `review:agent` only after the independent review is complete.
 
 ## Release Branches
 
-Follow the authoritative [Release Process](./CONTRIBUTING.md#release-process):
-cut a same-repository `release/<40-character-cut-SHA>` from the freshly read
-actual protected-`dev` HEAD after the Release Process prerequisites have merged.
-Its bounded early-cut route permits a known pending frontend consumer only when
-recorded at the cut and later admitted through the full separate `F`/`U` procedure.
-Record the cut timestamp, SHA, tree, fresh-read receipt, and bounded scope;
-review must verify the receipt and normal branch creation. Promote that frozen
-branch to `main`. Keep `dev` open; never chase its moving tip in a release. Necessary
-release-based fixes must pass normal review/checks into protected `dev` with
-exact ancestry preserved before fast-forwarding the release. Keep frozen tags
-immutable and retain all required checks, platform coverage, and protection.
+Follow the authoritative [Release Process](./CONTRIBUTING.md#release-process).
+After release-source admission is enabled, cut a same-repository
+`release/<40-character-cut-SHA>` exactly at the freshly read, tested protected-dev
+commit. Record its timestamp, SHA, tree and source receipt. Keep that product
+source fixed through version reservation, native builds and publication; normal
+dev advancement does not change it. Promote only the exact published source to
+main. A needed product repair gets a feature branch, passing tests and dev
+admission, then a fresh cut. Existing frozen release/recovery contracts remain
+unchanged during the explicitly documented cutover dependency.

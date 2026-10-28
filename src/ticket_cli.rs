@@ -160,9 +160,7 @@ pub async fn run(command: TicketCommands) -> anyhow::Result<()> {
             destination,
         } => {
             let snapshot = read_source(&data_dir, DEFAULT_SUPERVISOR_SESSION_ID).await?;
-            let binding = binding(&snapshot.session)?;
-            let service =
-                TicketService::open_offline(scope_root(&data_dir, &snapshot.session)?, binding)?;
+            let service = offline_service(&data_dir, &snapshot.session)?;
             json!({"status":"read_only_backup","commit":service.export(destination)?})
         }
         TicketCommands::MigrationPlan {
@@ -470,14 +468,15 @@ fn binding(session: &Session) -> anyhow::Result<ScopeBinding> {
     let SessionAuthorityIdentity::Supervisor { incarnation_id } = session.authority_identity else {
         bail!("canonical Supervisor required")
     };
-    ensure!(
-        session.root_orchestration_only_enabled() && session.root_tool_authority_revision > 0,
-        "explicit attach required"
-    );
+    // Work uses the verified Supervisor incarnation, not its thinking mode.
+    // Preserve the existing offline store, principal and receipt checks below.
+    let binding_revision = session
+        .supervisor_orchestration_revision()
+        .context("canonical Supervisor orchestration authority required")?;
     Ok(ScopeBinding {
         scope_id: format!("supervisor/{incarnation_id}"),
         supervisor_session_id: session.id.clone(),
-        binding_revision: session.root_tool_authority_revision,
+        binding_revision,
     })
 }
 fn scope_root(data: &Path, session: &Session) -> anyhow::Result<PathBuf> {
@@ -489,6 +488,17 @@ fn scope_root(data: &Path, session: &Session) -> anyhow::Result<PathBuf> {
         .join("tickets")
         .join(incarnation_id.to_string()))
 }
+
+fn offline_service(data: &Path, session: &Session) -> anyhow::Result<TicketService> {
+    // read_source verified canonical Main/proof. Resolve an old sealed revision
+    // only inside this incarnation/id namespace, under the existing OS writer
+    // lock, without invoking runtime restart reconciliation.
+    Ok(TicketService::open_offline_supervisor_mode_compatible(
+        scope_root(data, session)?,
+        binding(session)?,
+    )?)
+}
+
 fn owner(binding: ScopeBinding) -> Authority {
     Authority::from_verified_host(
         binding,
@@ -550,7 +560,7 @@ pub async fn legacy_commit(
     // Replay the original receipt before checking current source/CAS. Turning
     // orchestration-only on intentionally changed the Supervisor snapshot.
     if scope.join("HEAD").exists() {
-        let service = TicketService::open_offline(&scope, binding(&supervisor)?)?;
+        let service = offline_service(data, &supervisor)?;
         let snapshot = service.published()?.1;
         if let Some(receipt) = snapshot.receipts.get(operation_id) {
             let command: Command = serde_json::from_str(&receipt.canonical_request)?;
@@ -587,7 +597,7 @@ pub async fn legacy_commit(
                 "idempotency_conflict"
             );
             if attach {
-                finish_attach(data, &supervisor, expected).await?;
+                finish_attach(data, &supervisor, expected, &service).await?;
             }
             return Ok(json!({"status":"imported_needs_review","receipt":receipt,"replayed":true}));
         }
@@ -602,9 +612,10 @@ pub async fn legacy_commit(
         "revision_conflict: source snapshot changed"
     );
     let mut operations = Vec::new();
-    let binding = binding(&supervisor)?;
+    let mut binding = binding(&supervisor)?;
     let service = if scope.join("HEAD").exists() {
-        let offline = TicketService::open_offline(&scope, binding.clone())?;
+        let offline = offline_service(data, &supervisor)?;
+        binding = offline.published()?.1.binding;
         drop(offline);
         TicketService::open(&scope, binding.clone())?
     } else {
@@ -668,14 +679,19 @@ pub async fn legacy_commit(
     let command = service.prepare_command(&authority, operation_id, operations)?;
     let receipt = service.execute(&authority, &command)?;
     if attach {
-        finish_attach(data, &supervisor, expected).await?;
+        finish_attach(data, &supervisor, expected, &service).await?;
     }
     Ok(
         json!({"status":"imported_needs_review","receipt":receipt,"restart_host_required":attach,"source_snapshot_hash":expected}),
     )
 }
 
-async fn finish_attach(data: &Path, attached: &Session, expected: &str) -> anyhow::Result<()> {
+async fn finish_attach(
+    data: &Path,
+    attached: &Session,
+    expected: &str,
+    service: &TicketService,
+) -> anyhow::Result<()> {
     let actual = SessionStoreV2::new(data.canonicalize()?).await?;
     let current = actual
         .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
@@ -688,11 +704,16 @@ async fn finish_attach(data: &Path, attached: &Session, expected: &str) -> anyho
         );
         actual.save_session(attached).await?;
     }
+    let (actual, _) = ticket_runtime::verified_scope_binding_for_service(
+        &actual,
+        service,
+        DEFAULT_SUPERVISOR_SESSION_ID,
+    )
+    .await?;
+    let expected_binding = binding(attached)?;
     ensure!(
-        ticket_runtime::verified_scope_binding(&actual, DEFAULT_SUPERVISOR_SESSION_ID)
-            .await?
-            .0
-            == binding(attached)?,
+        actual.scope_id == expected_binding.scope_id
+            && actual.supervisor_session_id == expected_binding.supervisor_session_id,
         "canonical attach binding failed"
     );
     Ok(())
@@ -765,10 +786,10 @@ pub async fn migration_plan(
     operation_id: &str,
 ) -> anyhow::Result<Value> {
     let source = read_source(data, DEFAULT_SUPERVISOR_SESSION_ID).await?;
-    let binding = binding(&source.session)?;
     let root = scope_root(data, &source.session)?;
-    let service = TicketService::open_offline(&root, binding.clone())?;
+    let service = offline_service(data, &source.session)?;
     let (commit, snapshot) = service.published()?;
+    let binding = snapshot.binding.clone();
     require_scope_stopped(&source, &snapshot)?;
     let destination = destination.canonicalize()?;
     let dest = destination
@@ -795,10 +816,10 @@ pub async fn migration_plan(
 
 pub async fn migrate(data: &Path, request: &MigrationRequest) -> anyhow::Result<Value> {
     let source = read_source(data, DEFAULT_SUPERVISOR_SESSION_ID).await?;
-    let binding = binding(&source.session)?;
     let root = scope_root(data, &source.session)?;
-    let service = TicketService::open_offline(&root, binding.clone())?;
+    let service = offline_service(data, &source.session)?;
     let (_, snapshot) = service.published()?;
+    let binding = snapshot.binding.clone();
     require_scope_stopped(&source, &snapshot)?;
     ensure!(
         request.binding == binding && request.source_root == root.to_string_lossy(),
@@ -862,10 +883,13 @@ pub async fn migrate(data: &Path, request: &MigrationRequest) -> anyhow::Result<
         let storage = SessionStoreV2::new(dest_data.to_path_buf()).await?;
         storage.rebuild_index_from_disk().await?;
         ensure!(
-            ticket_runtime::verified_scope_binding(&storage, DEFAULT_SUPERVISOR_SESSION_ID)
-                .await?
-                .0
-                == request.binding,
+            ticket_runtime::verified_scope_binding_for_service(
+                &storage,
+                &copy,
+                DEFAULT_SUPERVISOR_SESSION_ID
+            )
+            .await?
+            .0 == request.binding,
             "copied canonical Supervisor proof mismatch"
         );
     }

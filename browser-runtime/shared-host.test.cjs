@@ -2,7 +2,7 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
 const { spawn } = require('node:child_process');
-const { once } = require('node:events');
+const { once, EventEmitter } = require('node:events');
 const { randomBytes, createHash } = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -15,7 +15,12 @@ async function fixture(t) {
   const profile = path.join(root, createHash('sha256').update('synthetic-shared-account').digest('hex'));
   const home = path.join(root, 'home');
   fs.mkdirSync(profile, { mode: 0o700 }); fs.mkdirSync(home, { mode: 0o700 });
+  let heldNavigation;
+  let navigationEntered;
+  const heldNavigationEntered = new Promise(resolve => { navigationEntered = resolve; });
+  const releaseNavigation = () => heldNavigation?.end('<title>Held navigation</title>');
   const server = http.createServer((request, response) => {
+    if (request.url === '/held') { heldNavigation = response; navigationEntered(); return; }
     if (request.url === '/slow') { setTimeout(() => response.end('<title>Slow A</title>'), 350); return; }
     if (request.url === '/download') {
       response.setHeader('content-type', 'application/octet-stream');
@@ -35,17 +40,29 @@ async function fixture(t) {
       BAMBOO_BROWSER_PROFILE_DIR: profile, BAMBOO_BROWSER_HOST_PROTOCOL: '2',
       ...(process.env.BAMBOO_BROWSER_EXECUTABLE ? { BAMBOO_BROWSER_EXECUTABLE: process.env.BAMBOO_BROWSER_EXECUTABLE } : {}),
       ...(process.env.PLAYWRIGHT_BROWSERS_PATH ? { PLAYWRIGHT_BROWSERS_PATH: process.env.PLAYWRIGHT_BROWSERS_PATH } : {}),
-    }, stdio: ['pipe', 'pipe', 'pipe'],
+    }, stdio: ['pipe', 'pipe', 'pipe', 'ipc'],
   });
-  const pending = new Map(); const events = []; let next = 1; let generation; let stderr = '';
+  const pending = new Map(); const controls = new Map(); const notifications = new EventEmitter();
+  const events = []; const calls = []; let next = 1; let generation; let stderr = '';
   child.stderr.on('data', bytes => { stderr = (stderr + bytes).slice(-5000); });
   const exited = once(child, 'exit').then(([code, signal]) => {
     for (const waiter of pending.values()) { clearTimeout(waiter.timer); waiter.reject(new Error(`host exit ${code}/${signal}: ${stderr}`)); }
-    pending.clear(); return { code, signal };
+    for (const waiter of controls.values()) { clearTimeout(waiter.timer); waiter.reject(new Error(`fixture exit ${code}/${signal}`)); }
+    pending.clear(); controls.clear(); return { code, signal };
+  });
+  child.on('message', message => {
+    const key = `${message.token}:${message.type}`;
+    const waiter = controls.get(key);
+    if (waiter) { controls.delete(key); clearTimeout(waiter.timer); waiter.resolve(); }
+  });
+  const control = (type, token) => new Promise((resolve, reject) => {
+    const key = `${token}:${type}`;
+    const timer = setTimeout(() => { controls.delete(key); reject(new Error(`${type} fixture handshake timeout`)); }, 15000);
+    controls.set(key, { resolve, reject, timer });
   });
   readline.createInterface({ input: child.stdout }).on('line', line => {
     const value = JSON.parse(line);
-    if (value.event) { events.push(value); return; }
+    if (value.event) { events.push(value); notifications.emit('host-event', value); return; }
     const waiter = pending.get(value.id); if (!waiter) return;
     pending.delete(value.id); clearTimeout(waiter.timer);
     try {
@@ -60,6 +77,7 @@ async function fixture(t) {
     else waiter.reject(Object.assign(new Error(value.error), { code: value.code }));
   });
   const call = (action, args = {}, owner) => new Promise((resolve, reject) => {
+    calls.push({ action, args, owner });
     const id = next++;
     const timer = setTimeout(() => { pending.delete(id); reject(new Error(`${action} timeout: ${stderr}`)); }, 15000);
     pending.set(id, { resolve, reject, timer, owner });
@@ -69,6 +87,8 @@ async function fixture(t) {
     }) + '\n');
   });
   t.after(async () => {
+    releaseNavigation();
+    if (child.connected) child.disconnect();
     child.stdin.end();
     const result = await exited;
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
@@ -86,8 +106,103 @@ async function fixture(t) {
       close: () => call('scope_close', {}, owner),
     };
   };
-  return { info, call, open, url, events, profile };
+  const holdRead = async (action, owner, targetUrl) => {
+    const token = randomBytes(12).toString('hex');
+    const armed = control('read-armed', token);
+    child.send({ type: 'hold-read', token, url: targetUrl });
+    await armed;
+    const entered = control('read-entered', token);
+    const read = call(action, {}, owner);
+    await Promise.race([entered, read.then(() => { throw new Error('Read returned before its CDP barrier'); })]);
+    return { read, async release() {
+      const released = control('read-released', token);
+      child.send({ type: 'release-read', token });
+      await released;
+    } };
+  };
+  const waitEvent = predicate => {
+    const existing = events.find(predicate);
+    if (existing) return Promise.resolve(existing);
+    return new Promise((resolve, reject) => {
+      const finish = value => { if (predicate(value)) { clearTimeout(timer); notifications.off('host-event', finish); resolve(value); } };
+      const timer = setTimeout(() => { notifications.off('host-event', finish); reject(new Error('host event timeout')); }, 15000);
+      notifications.on('host-event', finish);
+    });
+  };
+  return { info, call, open, url, events, profile, calls, holdRead, waitEvent,
+    heldNavigationEntered, releaseNavigation };
 }
+
+for (const action of ['state', 'tab_list']) {
+  test(`read admission: held ${action} permits one viewport write without affecting another scope`, async t => {
+    const f = await fixture(t); const a = await f.open(); const b = await f.open();
+    const initial = await a.visit(f.url + '/?scope=a');
+    const other = await b.visit(f.url + '/?scope=b');
+    const barrier = await f.holdRead(action, a, initial.url);
+    let readSettled = false;
+    void barrier.read.then(() => { readSettled = true; });
+    let resized; let read;
+    try {
+      resized = await f.call('viewport', { width: 519, height: 737, expected_epoch: initial.page_epoch }, a);
+      assert.deepEqual(resized.viewport, { width: 519, height: 737 });
+      assert.equal(readSettled, false, 'the one write must finish while the ordinary read is still held');
+      assert.deepEqual((await b.state()).viewport, other.viewport);
+      assert.equal((await b.state()).active_tab_id, other.active_tab_id);
+    } finally { await barrier.release(); read = await barrier.read; }
+    assert.deepEqual(read.viewport, resized.viewport);
+    assert.equal(read.page_epoch, resized.page_epoch);
+    assert.equal(read.active_tab_id, resized.active_tab_id);
+    const frame = await f.waitEvent(event => event.event === 'frame' && event.scope_id === a.id &&
+      event.page_epoch === resized.page_epoch && event.viewport_width === 519 && event.viewport_height === 737);
+    assert.equal(frame.scope_generation, a.generation);
+    assert.equal(frame.active_tab_id, resized.active_tab_id);
+    assert.equal(f.calls.filter(call => call.action === 'viewport' && call.owner === a).length, 1);
+  });
+}
+
+test('read admission: state and tab_list preserve real dialog identities and blocked writes', async t => {
+  const f = await fixture(t); const a = await f.open(); const b = await f.open();
+  await Promise.all([a.visit(), b.visit()]);
+  for (const type of ['alert', 'confirm', 'prompt']) {
+    const initial = await a.state();
+    const shown = await f.call('eval', { code: `(() => { ${type}('A only'); return true; })()`, expected_epoch: initial.page_epoch, expected_url: initial.url }, a);
+    const dialog = shown.pending_dialog;
+    assert.equal(dialog.type, type);
+    for (const action of ['state', 'tab_list']) {
+      const observed = await f.call(action, {}, a);
+      assert.equal(observed.pending_dialog.dialog_id, dialog.dialog_id);
+      assert.equal(observed.pending_dialog.page_epoch, dialog.page_epoch);
+    }
+    assert.equal((await b.state()).pending_dialog, undefined);
+    await assert.rejects(f.call('viewport', { width: 519, height: 737, expected_epoch: shown.page_epoch }, a),
+      error => error.code === 'dialog_pending');
+    await assert.rejects(f.call('dialog_respond', { dialog_id: '0'.repeat(24), accept: true, expected_epoch: shown.page_epoch }, a),
+      error => error.code === 'stale_dialog');
+    await assert.rejects(f.call('dialog_respond', { dialog_id: dialog.dialog_id, accept: true, expected_epoch: shown.page_epoch - 1 }, a),
+      error => error.code === 'stale_epoch');
+    const answered = await f.call('dialog_respond', { dialog_id: dialog.dialog_id, accept: true, expected_epoch: shown.page_epoch }, a);
+    assert.equal(answered.pending_dialog, undefined);
+  }
+});
+
+test('read admission: a second mutation stays queued and retains its stale epoch failure', async t => {
+  const f = await fixture(t); const a = await f.open(); const initial = await a.visit();
+  const navigation = f.call('navigate', { url: f.url + '/held', expected_epoch: initial.page_epoch }, a);
+  await f.heldNavigationEntered;
+  let writeSettled = false;
+  const write = f.call('viewport', { width: 519, height: 737, expected_epoch: initial.page_epoch }, a)
+    .then(value => ({ value }), error => ({ error })).then(result => { writeSettled = true; return result; });
+  const during = await a.state();
+  assert.equal(writeSettled, false, 'the second mutation must remain behind navigation');
+  assert.deepEqual(during.viewport, initial.viewport);
+  f.releaseNavigation();
+  const navigated = await navigation;
+  assert.equal((await write).error.code, 'stale_epoch');
+  const final = await a.state();
+  assert.equal(final.page_epoch, navigated.page_epoch);
+  assert.deepEqual(final.viewport, initial.viewport);
+  assert.equal(f.calls.filter(call => call.action === 'viewport').length, 1);
+});
 
 test('one host routes shared chat pages independently and preserves the account profile on chat close', async t => {
   const f = await fixture(t); const a = await f.open(); const b = await f.open();

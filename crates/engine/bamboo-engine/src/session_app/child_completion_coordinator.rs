@@ -672,11 +672,16 @@ fn typed_child_resume_message(
     let inspection = serde_json::json!({
         "intent":"inspect", "target":completion.child_session_id, "message":"result",
     });
+    let hint = if projection["view"] == "planner_artifact" {
+        "For an available planner artifact call Plan with its read object to list sections, then add section_id to read only needed text. This plan grants no execution approval.".to_string()
+    } else {
+        format!("For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.")
+    };
     let mut message = Message::user(format!(
         "Runtime notification: child session `{}` finished with status `{}`. Remaining child sessions: {}.\n\n\
          Child typed result:\n{}\n\n\
          Resume the parent task. Child-reported evidence and verification are claims, not host-certified facts. \
-         For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.",
+         {hint}",
         completion.child_session_id, completion.status, remaining_children, projection,
     ));
     message.metadata = Some(serde_json::json!({
@@ -1377,9 +1382,26 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             } else {
                 SessionActivationPolicy::InterruptSpecificWait
             };
-            let mut typed_result = loaded_child
-                .as_ref()
-                .and_then(|child| sealed_child_report(&completion, child, &parent));
+            let mut typed_result = if let Some(child) = loaded_child.as_ref() {
+                match super::child_session::planner_artifact::publish_completion(
+                    &self.app_data_dir,
+                    &completion,
+                    child,
+                    &parent,
+                )
+                .await
+                {
+                    Ok(Some(projection)) => Some(projection),
+                    Ok(None) => sealed_child_report(&completion, child, &parent),
+                    Err(error) => {
+                        tracing::warn!(%error, child_session_id = %child.id,
+                            "planner artifact publication failed; leaving wait armed");
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let mut resume_message = if let Some(projection) = typed_result.as_mut() {
                 let message =
                     typed_child_resume_message(&completion, remaining_children, projection);
@@ -1609,7 +1631,24 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                             .as_ref()
                             .and_then(|source| source.result(&sibling, &parent));
                         let mut typed_result =
-                            sealed_child_report(&sibling_completion, &sibling, &parent);
+                            match super::child_session::planner_artifact::publish_completion(
+                                &self.app_data_dir,
+                                &sibling_completion,
+                                &sibling,
+                                &parent,
+                            )
+                            .await
+                            {
+                                Ok(Some(projection)) => Some(projection),
+                                Ok(None) => {
+                                    sealed_child_report(&sibling_completion, &sibling, &parent)
+                                }
+                                Err(error) => {
+                                    tracing::warn!(%error, %child_id,
+                                    "sibling planner artifact publication failed; leaving wait armed");
+                                    return;
+                                }
+                            };
                         let mut presentation = if let Some(projection) = typed_result.as_ref() {
                             typed_child_resume_message(
                                 &sibling_completion,
@@ -2690,6 +2729,7 @@ fn apply_bash_resume_transition(session: &mut Session, resume_message: &Message)
     runtime_state.suspension = None;
     write_runtime_state(session, &runtime_state);
     session.metadata.remove("runtime.suspend_reason");
+    session.metadata.remove("runtime.background_exec_id");
     session.add_message(resume_message.clone());
     true
 }
@@ -2727,16 +2767,30 @@ impl ChildCompletionCoordinator {
                 tracing::info!(%session_id, "bash self-resume backstop: session gone; nothing to do");
                 return;
             };
-            if read_runtime_state(&session).waiting_for_bash.is_none() {
+            let Some(wait) = read_runtime_state(&session).waiting_for_bash else {
                 // The push (or another path) already resumed. This is the common
                 // case — the backstop yields silently after a single load.
                 return;
+            };
+            if wait.bash_ids != bash_ids {
+                // A newer Human turn may have installed a different wait.
+                return;
             }
 
-            let still_running =
-                bamboo_tools::tools::bash_runtime::running_shells_for_session(&session_id);
+            let still_running = bash_ids.iter().any(|id| {
+                bamboo_tools::tools::bash_runtime::get_shell(id).is_some_and(|shell| {
+                    shell.session_id.as_deref() == Some(session_id.as_str())
+                        && shell.status() == "running"
+                })
+            });
             let timed_out = tokio::time::Instant::now() >= deadline;
-            if still_running.is_empty() || timed_out {
+            if session.metadata.contains_key("runtime.background_exec_id")
+                && self.runner_is_running(&session_id).await
+            {
+                delay = (delay * 2).min(max_delay);
+                continue;
+            }
+            if !still_running || timed_out {
                 // The shell(s) finished but the loop is still suspended → the push
                 // was lost (pre-persist window / no sink), or the ceiling hit.
                 // Resume under the shared per-session lock so we never race the
@@ -2751,7 +2805,12 @@ impl ChildCompletionCoordinator {
                 );
                 self.perform_bash_resume(
                     &session_id,
-                    bash_completion_resume_message(&bash_ids, timed_out),
+                    if session.metadata.contains_key("runtime.background_exec_id") {
+                        exec_wait_resume_message(&bash_ids, timed_out)
+                    } else {
+                        bash_completion_resume_message(&bash_ids, timed_out)
+                    },
+                    &bash_ids,
                 )
                 .await;
                 return;
@@ -2781,7 +2840,12 @@ impl ChildCompletionCoordinator {
     /// non-`Started` outcome) and re-clear/re-append/re-resume. It converges
     /// because the runner's finalize persist is one-shot: once landed, our retry's
     /// save is the last writer, the message sticks, and resume fires.
-    async fn perform_bash_resume(&self, session_id: &str, resume_message: Message) {
+    async fn perform_bash_resume(
+        &self,
+        session_id: &str,
+        resume_message: Message,
+        expected_ids: &[String],
+    ) {
         let retry_backoff = Duration::from_millis(200);
         const MAX_RESUME_ATTEMPTS: u8 = 5;
         for attempt in 0..MAX_RESUME_ATTEMPTS {
@@ -2793,6 +2857,21 @@ impl ChildCompletionCoordinator {
                 tracing::warn!(%session_id, "bash resume: session not found; nothing to resume");
                 return;
             };
+            if read_runtime_state(&session)
+                .waiting_for_bash
+                .as_ref()
+                .is_none_or(|wait| wait.bash_ids != expected_ids)
+            {
+                return;
+            }
+
+            // A Human may already be talking in the same session. Let that
+            // owner receive the durable result at its normal inbox boundary.
+            if session.metadata.contains_key("runtime.background_exec_id")
+                && self.runner_is_running(session_id).await
+            {
+                continue;
+            }
 
             if !apply_bash_resume_transition(&mut session, &resume_message) {
                 // Double-resume guard: the wait was already cleared by another
@@ -2867,6 +2946,108 @@ impl BashResumeHook for ChildCompletionCoordinator {
             coordinator.bash_self_resume(session_id, bash_ids).await;
         });
     }
+
+    fn supports_background_exec(&self) -> bool {
+        self.agent
+            .session_messenger()
+            .is_some_and(|messenger| messenger.supports_runtime_target_lifetime())
+    }
+
+    fn arrange_exec_self_resume(
+        &self,
+        job: bamboo_tools::tools::exec_command::BackgroundExecJob,
+        session_created_at: chrono::DateTime<Utc>,
+    ) {
+        let session_id = job.session_id().to_owned();
+        let ids = vec![job.id().to_owned()];
+        let coordinator = self.clone();
+        tokio::spawn(async move {
+            let info = job.completion().await;
+            drop(job);
+            coordinator
+                .deliver_shell_completion_for_lifetime(
+                    info,
+                    ShellCompletionKind::Exec,
+                    Some(session_created_at),
+                )
+                .await;
+        });
+        self.arrange_bash_self_resume(session_id, ids);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellCompletionKind {
+    Bash,
+    Exec,
+}
+
+async fn clear_completed_exec_wait<P>(
+    persistence: &LockedSessionStore,
+    session: &Session,
+    handle: &str,
+    publish: P,
+) -> std::io::Result<Option<Session>>
+where
+    P: FnOnce(&Session),
+{
+    let expected_wait = read_runtime_state(session).waiting_for_bash;
+    let birth = session.created_at;
+    let handle = handle.to_owned();
+    persistence
+        .update_runtime_config_and_publish(
+            &session.id,
+            move |latest| {
+                let mut state = read_runtime_state(latest);
+                if latest.created_at != birth || state.waiting_for_bash != expected_wait {
+                    return;
+                }
+                state.waiting_for_bash = None;
+                if state.status == AgentStatusState::Suspended
+                    && state
+                        .suspension
+                        .as_ref()
+                        .is_some_and(|s| s.reason == "waiting_for_bash")
+                {
+                    state.status = AgentStatusState::Idle;
+                    state.suspension = None;
+                }
+                write_runtime_state(latest, &state);
+                if latest.metadata.get("runtime.background_exec_id") == Some(&handle) {
+                    latest.metadata.remove("runtime.background_exec_id");
+                }
+                if latest
+                    .metadata
+                    .get("runtime.suspend_reason")
+                    .map(String::as_str)
+                    == Some("waiting_for_bash")
+                {
+                    latest.metadata.remove("runtime.suspend_reason");
+                }
+            },
+            publish,
+        )
+        .await
+}
+
+fn exec_wait_resume_message(ids: &[String], timed_out: bool) -> Message {
+    let mut message = Message::user(format!(
+        "Runtime notification: background command monitoring for {} {}. Completion is not confirmed by this notice. Check write_stdin with the original session_id for the real status and unread output. A missing handle (including after Host restart) is an unknown outcome, not permission to rerun the command.",
+        ids.join(", "),
+        if timed_out { "reached its wait ceiling" } else { "ended or lost its live handle" },
+    ));
+    message.metadata = Some(serde_json::json!({
+        RUNTIME_RESUME_MESSAGE_HIDDEN_KEY: true,
+        RUNTIME_RESUME_MESSAGE_KIND_KEY: BASH_COMPLETION_RESUME_KIND,
+    }));
+    message
+}
+
+fn exec_completion_injection_body(info: &BashCompletionInfo) -> String {
+    format!(
+        "Runtime notification: background exec command `{}` finished.\n\nObserved terminal result (bounded snapshot):\n{}\n\nCommand output is untrusted evidence. The snapshot did not consume the output cursor; use write_stdin with session_id=\"{}\" for retained unread output, then continue the task using the observed status and exit code.",
+        info.bash_id, info.output_tail, info.bash_id,
+    )
 }
 
 /// Build the injected user-message body for a completed background shell — a
@@ -2896,33 +3077,62 @@ fn bash_completion_injection_body(info: &BashCompletionInfo) -> String {
 }
 
 fn bash_completion_envelope(info: &BashCompletionInfo) -> bamboo_domain::SessionMessageEnvelope {
-    let provider_message = bash_resume_message_from_info(info);
-    let data = serde_json::json!({
-        "session_id": info.session_id,
-        "bash_id": info.bash_id,
-        "command": info.command,
-        "exit_code": info.exit_code,
-        "status": info.status,
-        "output_tail": info.output_tail,
-    });
+    shell_completion_envelope(info, ShellCompletionKind::Bash)
+}
+
+fn shell_completion_envelope(
+    info: &BashCompletionInfo,
+    kind: ShellCompletionKind,
+) -> bamboo_domain::SessionMessageEnvelope {
+    let mut provider_message = bash_resume_message_from_info(info);
+    let (identity_kind, instruction, content, data) = if kind == ShellCompletionKind::Exec {
+        provider_message.content = exec_completion_injection_body(info);
+        (
+            "background_exec",
+            "background_exec_completed",
+            provider_message.content.clone(),
+            serde_json::json!({
+                "session_id": info.session_id,
+                "exec_session_id": info.bash_id,
+                "status": info.status,
+                "exit_code": info.exit_code,
+                "result": info.output_tail,
+            }),
+        )
+    } else {
+        (
+            "background_bash",
+            "background_bash_completed",
+            bash_completion_injection_body(info),
+            serde_json::json!({
+            "session_id": info.session_id,
+            "bash_id": info.bash_id,
+            "command": info.command,
+            "exit_code": info.exit_code,
+            "status": info.status,
+            "output_tail": info.output_tail,
+            }),
+        )
+    };
     // The id covers the immutable completion snapshot. An exact delivery retry
     // (whose transport timestamp may differ) is idempotent; a changed status,
     // output tail, command, or exit code is a distinct correction rather than
     // silently reusing one id with different semantics.
     let identity = data.clone();
     bamboo_domain::SessionMessageEnvelope {
-        id: bamboo_domain::SessionMessageId::stable("background_bash_completion", &identity),
+        id: bamboo_domain::SessionMessageId::stable(
+            &format!("{identity_kind}_completion"),
+            &identity,
+        ),
         source: bamboo_domain::SessionMessageSource::Runtime {
-            subsystem: "background_bash".to_string(),
+            subsystem: identity_kind.to_string(),
         },
         target_session_id: info.session_id.clone(),
         kind: bamboo_domain::SessionMessageKind::RuntimeInstruction,
         body: bamboo_domain::SessionMessageBody::RuntimeInstruction(
             bamboo_domain::SessionRuntimeInstruction {
-                instruction: "background_bash_completed".to_string(),
-                content: Some(bamboo_domain::SessionMessageContent::text(
-                    bash_completion_injection_body(info),
-                )),
+                instruction: instruction.to_string(),
+                content: Some(bamboo_domain::SessionMessageContent::text(content)),
                 data: Some(data),
                 provider_message: Some(session_provider_message(&provider_message)),
             },
@@ -2987,13 +3197,32 @@ impl ChildCompletionCoordinator {
     /// - Every notice is then delivered through the same typed SessionMessenger
     ///   as peer/user steering. The durable inbox and activation router decide
     ///   whether to notify the current owner or reserve one successor.
-    async fn deliver_bash_completion(&self, mut info: BashCompletionInfo) {
+    async fn deliver_bash_completion(&self, info: BashCompletionInfo) {
+        self.deliver_shell_completion(info, ShellCompletionKind::Bash)
+            .await;
+    }
+
+    async fn deliver_shell_completion(&self, info: BashCompletionInfo, kind: ShellCompletionKind) {
+        self.deliver_shell_completion_for_lifetime(info, kind, None)
+            .await;
+    }
+
+    async fn deliver_shell_completion_for_lifetime(
+        &self,
+        mut info: BashCompletionInfo,
+        kind: ShellCompletionKind,
+        expected_birth: Option<chrono::DateTime<Utc>>,
+    ) {
         // A background shell completes outside the originating tool call, so
         // fire its PostToolUse seam here before routing the completion into the
         // next round/resume message. Do not hold the resume lock while an
         // arbitrary command hook runs: its configured timeout must never block
         // the independent liveness backstop.
-        if let Some(hook_session) = self.load_session(&info.session_id).await {
+        if let Some(hook_session) = self
+            .load_session(&info.session_id)
+            .await
+            .filter(|_| kind == ShellCompletionKind::Bash)
+        {
             let config_snapshot = self.config.read().await.clone();
             let _ = run_background_bash_post_tool_hooks(
                 &config_snapshot.lifecycle_hooks,
@@ -3016,15 +3245,29 @@ impl ChildCompletionCoordinator {
             return;
         };
 
-        let waiting = read_runtime_state(&session).waiting_for_bash.is_some();
+        if expected_birth.is_some_and(|birth| session.created_at != birth) {
+            // A reused display id cannot redirect an old command's result into
+            // a new Session lifetime.
+            return;
+        }
+        let runtime = read_runtime_state(&session);
+        let waiting = runtime.waiting_for_bash.as_ref().is_some_and(|wait| {
+            kind == ShellCompletionKind::Bash || wait.bash_ids.contains(&info.bash_id)
+        });
         // The producer flips the shell's `running` flag false BEFORE firing this
         // push, so a now-empty per-session registry means every shell the loop was
         // waiting on has finished — safe to resume. If OTHER waited shells are
         // still running, fall through to the enqueue path and let the last one (or
         // the backstop) drive the resume.
-        let all_shells_done =
-            bamboo_tools::tools::bash_runtime::running_shells_for_session(&info.session_id)
-                .is_empty();
+        let all_shells_done = runtime.waiting_for_bash.as_ref().is_none_or(|wait| {
+            wait.bash_ids.iter().all(|id| {
+                id == &info.bash_id
+                    || bamboo_tools::tools::bash_runtime::get_shell(id).is_none_or(|shell| {
+                        shell.session_id.as_deref() == Some(info.session_id.as_str())
+                            && shell.status() != "running"
+                    })
+            })
+        });
         let delivery_plan = bash_completion_delivery_plan(waiting, all_shells_done);
 
         // Stage 1: make the completion durable BEFORE clearing the wait. The
@@ -3034,7 +3277,16 @@ impl ChildCompletionCoordinator {
         // crash.
         let messenger = self.agent.session_messenger().cloned();
         let admission = match messenger.as_ref() {
-            Some(messenger) => match messenger.admit(bash_completion_envelope(&info)).await {
+            Some(messenger) => match if kind == ShellCompletionKind::Exec {
+                messenger
+                    .admit_runtime_for_target(
+                        shell_completion_envelope(&info, kind),
+                        expected_birth.unwrap_or(session.created_at),
+                    )
+                    .await
+            } else {
+                messenger.admit(bash_completion_envelope(&info)).await
+            } {
                 Ok(admission) => Some(admission),
                 Err(error) => {
                     tracing::warn!(
@@ -3083,7 +3335,17 @@ impl ChildCompletionCoordinator {
         }
 
         if let (Some(messenger), Some(admission)) = (messenger.as_ref(), admission.as_ref()) {
-            if let Err(error) = messenger.prepare_activation(admission).await {
+            let prepared = if kind == ShellCompletionKind::Exec {
+                messenger
+                    .prepare_message_activation(
+                        admission,
+                        SessionActivationPolicy::RespectSpecificWait,
+                    )
+                    .await
+            } else {
+                messenger.prepare_activation(admission).await
+            };
+            if let Err(error) = prepared {
                 tracing::warn!(
                     session_id = %info.session_id,
                     bash_id = %info.bash_id,
@@ -3101,26 +3363,54 @@ impl ChildCompletionCoordinator {
                 status = %info.status,
                 "background bash completion: push-resuming suspended loop (event-driven)"
             );
-            let mut resumable = session.clone();
-            let mut runtime_state = read_runtime_state(&resumable);
-            runtime_state.waiting_for_bash = None;
-            runtime_state.status = AgentStatusState::Idle;
-            runtime_state.suspension = None;
-            write_runtime_state(&mut resumable, &runtime_state);
-            resumable.metadata.remove("runtime.suspend_reason");
-            resumable.updated_at = Utc::now();
-            if let Err(error) = self.persistence.merge_save_runtime(&mut resumable).await {
-                tracing::warn!(
-                    session_id = %info.session_id,
-                    %error,
-                    "background bash completion is durable but wait-state clear failed; leaving activation to the wait backstop"
+            if kind == ShellCompletionKind::Exec {
+                // The Human may have started a new foreground turn since the
+                // handoff. Clear only this exact wait under the persistence
+                // lock; never save the earlier message/status snapshot over
+                // that active conversation.
+                match clear_completed_exec_wait(
+                    &self.persistence,
+                    &session,
+                    &info.bash_id,
+                    |saved| {
+                        self.sessions.insert(
+                            saved.id.clone(),
+                            Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                        );
+                    },
+                )
+                .await
+                {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(session_id = %info.session_id, %error, "background exec completion is durable but wait clear failed");
+                        return;
+                    }
+                }
+            } else {
+                let mut resumable = session.clone();
+                let mut runtime_state = read_runtime_state(&resumable);
+                runtime_state.waiting_for_bash = None;
+                runtime_state.status = AgentStatusState::Idle;
+                runtime_state.suspension = None;
+                write_runtime_state(&mut resumable, &runtime_state);
+                resumable.metadata.remove("runtime.suspend_reason");
+                resumable.metadata.remove("runtime.background_exec_id");
+                resumable.updated_at = Utc::now();
+                if let Err(error) = self.persistence.merge_save_runtime(&mut resumable).await {
+                    tracing::warn!(
+                        session_id = %info.session_id,
+                        %error,
+                        "background bash completion is durable but wait-state clear failed; leaving activation to the wait backstop"
+                    );
+                    return;
+                }
+                self.sessions.insert(
+                    resumable.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(resumable)),
                 );
-                return;
             }
-            self.sessions.insert(
-                resumable.id.clone(),
-                Arc::new(crate::SessionSnapshot::new(resumable)),
-            );
         }
 
         // Stage 3: activation is allowed only after the durable wait-state
@@ -3869,6 +4159,7 @@ impl ChildCompletionCoordinator {
 mod tests {
     use super::*;
     include!("child_completion_background_tests.rs");
+    include!("child_completion_exec_tests.rs");
     use bamboo_domain::session::runtime_state::SuspensionState;
 
     #[test]
@@ -4118,6 +4409,172 @@ mod tests {
             completed_at: child.updated_at,
             source: ChildCompletionSource::from_committed_session(child),
         }
+    }
+
+    fn planner_test_child(parent: &Session, id: &str) -> Session {
+        let mut report = typed_test_report();
+        report["plan_markdown"] = serde_json::json!("# Plan\n## Selected\nPLANNER_SECTION_ONLY\n## Appendix\nLARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME");
+        let mut child = typed_test_child(parent, id, &report.to_string());
+        child.set_subagent_type("planner");
+        child.metadata.insert(
+            super::super::child_session::planner_artifact::CONTRACT_KEY.into(),
+            "1".into(),
+        );
+        child
+            .agent_runtime_state
+            .get_or_insert_with(Default::default)
+            .read_only = true;
+        ChildCompletionSource::prepare(&mut child, "native-planner-report", &Default::default());
+        child
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_artifact_completion_publishes_before_durable_resume_and_deduplicates() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "plan-parent",
+            vec!["plan-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session("plan-parent").await.unwrap().unwrap();
+        parent.add_message(Message::user("Original selected source"));
+        store.save_session(&parent).await.unwrap();
+        let child = planner_test_child(&parent, "plan-child");
+        store.save_session(&child).await.unwrap();
+        let completion = typed_test_completion(&child);
+        coordinator.on_child_completed(completion.clone()).await;
+        coordinator.on_child_completed(completion).await;
+        let claims = inbox.claim(&parent.id, 8).await.unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let message = claims[0].envelope.to_provider_message().unwrap();
+        assert!(message.content.contains("planner_artifact"));
+        assert!(!message
+            .content
+            .contains("LARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME"));
+        assert!(fits_child_result_budget(&claims[0].envelope));
+        let raw = message
+            .content
+            .split_once("Child typed result:\n")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap();
+        let projection: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert_eq!(projection["execution_approved"], false);
+        let path = store
+            .bamboo_home_dir()
+            .join(projection["file"].as_str().unwrap());
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains("PLANNER_SECTION_ONLY"));
+        let restored = store.load_session(&parent.id).await.unwrap().unwrap();
+        assert_eq!(restored.kind, parent.kind);
+        assert_eq!(restored.root_thinking_mode(), parent.root_thinking_mode());
+        assert_eq!(
+            restored
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .permission_mode,
+            parent.agent_runtime_state.as_ref().unwrap().permission_mode
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn planner_artifact_terminal_sibling_recovery_publishes_the_same_bounded_reference() {
+        let (_temp, store, inbox, coordinator, _, _) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "plan-recovery",
+            vec!["plan-sibling".into(), "trigger-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store.load_session("plan-recovery").await.unwrap().unwrap();
+        parent.add_message(Message::user("Original selected source"));
+        store.save_session(&parent).await.unwrap();
+        let child = planner_test_child(&parent, "plan-sibling");
+        store.save_session(&child).await.unwrap();
+        let completion =
+            save_completion_test_child(&store, &parent.id, "trigger-child", "completed").await;
+        coordinator.on_child_completed(completion).await;
+        let claims = inbox.claim(&parent.id, 8).await.unwrap();
+        assert_eq!(claims.len(), 2, "both terminal outcomes remain durable");
+        let message = claims
+            .iter()
+            .map(|c| c.envelope.to_provider_message().unwrap())
+            .find(|m| m.content.contains("planner_artifact"))
+            .unwrap();
+        assert!(!message
+            .content
+            .contains("LARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME"));
+        let raw = message
+            .content
+            .split_once("Child typed result:\n")
+            .unwrap()
+            .1
+            .lines()
+            .next()
+            .unwrap();
+        let projection: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(store
+            .bamboo_home_dir()
+            .join(projection["file"].as_str().unwrap())
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report(
+    ) {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "lost-plan-parent",
+            vec!["lost-plan-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let mut parent = store
+            .load_session("lost-plan-parent")
+            .await
+            .unwrap()
+            .unwrap();
+        parent.add_message(Message::user("Original selected source"));
+        store.save_session(&parent).await.unwrap();
+        let mut child = planner_test_child(&parent, "lost-plan-child");
+        child.set_last_run_status("running");
+        child.messages.last_mut().unwrap().content = "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
+        ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());
+        child.updated_at = Utc::now() - chrono::Duration::minutes(5);
+        store.save_session(&child).await.unwrap();
+
+        // Exercise the actual boot watchdog, including canonical error save
+        // and publish_synthetic_completion(source=None), not a fabricated report.
+        coordinator.reconcile_orphans_at_boot().await;
+        coordinator.reconcile_orphans_at_boot().await;
+        let claims = inbox.claim(&parent.id, 8).await.unwrap();
+        assert_eq!(
+            claims.len(),
+            1,
+            "the lost worker must not strand the six-hour wait"
+        );
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+        let message = claims[0].envelope.to_provider_message().unwrap();
+        assert!(message.content.contains("planner_artifact"));
+        assert!(message.content.contains("\"available\":false"));
+        assert!(!serde_json::to_string(&claims[0].envelope)
+            .unwrap()
+            .contains("UNSEALED_REPORT"));
+        let child = store.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(child.last_run_status().as_deref(), Some("error"));
+        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
+        assert!(!store.bamboo_home_dir().join("plan/delegated").exists());
     }
 
     fn unusable_typed_test_child(

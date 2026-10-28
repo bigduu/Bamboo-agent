@@ -64,8 +64,8 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
             .unwrap();
         assert!(supervisor.supervisor_incarnation_id().is_some());
         assert!(
-            supervisor.root_orchestration_only_enabled(),
-            "formal Work retains its Ultra orchestration gate"
+            supervisor.supervisor_orchestration_revision().is_some(),
+            "formal Work requires canonical Supervisor business authority in either thinking mode"
         );
         let manifest = state
             .project_store

@@ -301,6 +301,11 @@ impl ToolPolicyGuard {
         self.observation_progress.finish_round()
     }
 
+    /// Exact trusted handle, before the feedback packet shortens display IDs.
+    pub(crate) fn quiet_command_for_background(&self) -> Option<&str> {
+        self.quiet_polls.pending_handle()
+    }
+
     /// Consume one completed batch. Only actual raw evidence can end a recovery
     /// episode; hidden wakeups and model claims cannot refund its finite budget.
     pub(crate) fn feedback_for_next_round(
@@ -756,16 +761,36 @@ mod tests {
             ("mcp::Read", "{}", Ok(ToolResult::text(true, "same"))),
         ] {
             let mut guard = ToolPolicyGuard::default();
-            assert!(!observation_round(&mut guard, 0, &[observation.clone()]));
-            assert!(!observation_round(&mut guard, 1, &[observation.clone()]));
+            assert!(!observation_round(
+                &mut guard,
+                0,
+                std::slice::from_ref(&observation)
+            ));
+            assert!(!observation_round(
+                &mut guard,
+                1,
+                std::slice::from_ref(&observation)
+            ));
             assert!(!observation_round(
                 &mut guard,
                 2,
                 &[observation.clone(), breaker]
             ));
-            assert!(!observation_round(&mut guard, 3, &[observation.clone()]));
-            assert!(!observation_round(&mut guard, 4, &[observation.clone()]));
-            assert!(observation_round(&mut guard, 5, &[observation.clone()]));
+            assert!(!observation_round(
+                &mut guard,
+                3,
+                std::slice::from_ref(&observation)
+            ));
+            assert!(!observation_round(
+                &mut guard,
+                4,
+                std::slice::from_ref(&observation)
+            ));
+            assert!(observation_round(
+                &mut guard,
+                5,
+                std::slice::from_ref(&observation)
+            ));
         }
     }
     #[test]

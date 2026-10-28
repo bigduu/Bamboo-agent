@@ -64,6 +64,9 @@ fn validate_management_overlay(
                 "Supervisor management overlay regressed or diverged",
             ));
         }
+        if side.schema_version < main.schema_version {
+            return Err(invalid("Supervisor management schema cannot downgrade"));
+        }
         for (id, previous) in &main.links {
             let current = side
                 .links
@@ -73,6 +76,24 @@ fn validate_management_overlay(
                 || (current.revision == previous.revision && current != previous)
             {
                 return Err(invalid("Supervisor link overlay regressed or diverged"));
+            }
+        }
+        for (id, previous) in &main.observers {
+            let current = side
+                .observers
+                .get(id)
+                .ok_or_else(|| invalid("runtime lost an Observer tombstone"))?;
+            if current.operation_id != previous.operation_id
+                || current.parent_created_at != previous.parent_created_at
+                || current.child_created_at != previous.child_created_at
+                || current.target_links != previous.target_links
+                || current.revision < previous.revision
+                || (current.revision == previous.revision && current != previous)
+                || (!previous.enabled && current.enabled)
+            {
+                return Err(invalid(
+                    "Observer registration overlay regressed or diverged",
+                ));
             }
         }
     }

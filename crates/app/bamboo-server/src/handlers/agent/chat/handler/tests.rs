@@ -399,8 +399,13 @@ async fn ticket_review_queued_ingress_does_not_requeue_activated_root_history() 
     );
 }
 
-#[actix_web::test]
-async fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once() {
+#[test]
+fn activated_root_chat_preserves_handoff_and_commits_multimodal_input_once() {
+    // Box before Actix's by-value wrappers consume the default test stack.
+    actix_web::rt::System::new().block_on(Box::pin(activated_root_chat_handoff_fixture()));
+}
+
+async fn activated_root_chat_handoff_fixture() {
     use actix_web::{test, web};
     use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
     let home = tempfile::tempdir().unwrap();
@@ -3025,6 +3030,9 @@ mod optional_model_e2e {
                     "session_id":session_id, "message_id":id,
                     "message":"raw Human request", "model":"test-model"
                 });
+                if ticket {
+                    body["thread_id"] = serde_json::json!("hook-queued-work");
+                }
                 if image {
                     body["images"] = serde_json::json!([{
                         "base64":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jF0cAAAAASUVORK5CYII=",

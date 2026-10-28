@@ -478,7 +478,82 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// Bounded trusted host scope observation, never a Session directory.
+    /// Strict metadata/runtime-only Root source for a bounded immutable view.
+    /// Requires the independent installed ReadContextView right, never raw
+    /// history or the older InspectBoundedProgress projection authority.
+    /// Authority validation may inspect Main; this is not a total-I/O cap.
+    async fn load_host_scoped_context_target(
+        &self,
+        token: &crate::HostSessionScopeToken,
+        caller: &crate::SessionCallerReference,
+        target_id: &str,
+    ) -> std::io::Result<Session> {
+        let _ = (token, caller, target_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "host_context_view_unsupported",
+        ))
+    }
+
+    /// Trusted Supervisor's effective current-application-user domain. A
+    /// custom backend must implement the canonical identity boundary; an old
+    /// Project list, ordinary load or missing capability is not a fallback.
+    async fn inspect_supervisor_current_user_scope(
+        &self,
+        supervisor: &SupervisorReference,
+    ) -> std::io::Result<crate::SupervisorCurrentUserScope> {
+        let _ = supervisor;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_current_user_scope_unsupported",
+        ))
+    }
+
+    /// Canonical metadata-only page in this store's current user domain.
+    /// Target observations include birth/generation, never an acting grant.
+    async fn list_supervisor_current_user_targets(
+        &self,
+        supervisor: &SupervisorReference,
+        query: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> std::io::Result<crate::SupervisorCurrentUserPage> {
+        let _ = (supervisor, query, after, limit);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_current_user_directory_unsupported",
+        ))
+    }
+
+    /// Canonical exact target selection for a new immutable management intent.
+    /// The final reader/writer must revalidate this lifetime under its guards.
+    async fn inspect_supervisor_current_user_target(
+        &self,
+        supervisor: &SupervisorReference,
+        target: &str,
+    ) -> std::io::Result<crate::SupervisorCurrentUserTarget> {
+        let _ = (supervisor, target);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_current_user_target_unsupported",
+        ))
+    }
+
+    /// Return history and its target selector from one retained canonical read.
+    /// A second unguarded load must not pair old progress with a replacement
+    /// Session's new selector. Custom stores fail closed until implemented.
+    async fn load_supervisor_current_user_observed_session(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _target: &str,
+    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "atomic current-user Session observation is unsupported",
+        ))
+    }
+
+    /// Legacy host scope metadata, retained for compatibility and Observer CAS.
     async fn inspect_supervisor_scope(
         &self,
         supervisor: &SupervisorReference,
@@ -532,6 +607,54 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "storage backend does not support scoped Supervisor history",
+        ))
+    }
+
+    /// Exact historical Observer classification from protected canonical state.
+    /// Cosmetic roles never exempt work, and revoked registrations classify
+    /// only their original Child and parent lifetimes.
+    async fn is_supervisor_observer_child(
+        &self,
+        parent: &Session,
+        child_id: &str,
+    ) -> std::io::Result<bool> {
+        let _ = (parent, child_id);
+        Ok(false)
+    }
+
+    /// Current admission, separate from historical classification. A disabled
+    /// or stale registered Observer returns an error, never ordinary fallback.
+    async fn supervisor_observer_activation(&self, child: &Session) -> std::io::Result<bool> {
+        let _ = child;
+        Ok(false)
+    }
+
+    /// A fixed-view read under an explicit durable Observer registration.
+    /// Called only after the Host namespace proves never-installed absence.
+    async fn load_supervisor_observer_context_target(
+        &self,
+        caller: &crate::SessionCallerReference,
+        target_id: &str,
+    ) -> std::io::Result<(Session, crate::SupervisorObserverContext)> {
+        let _ = (caller, target_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "storage backend does not support Supervisor Observer context",
+        ))
+    }
+
+    /// A strict control-plane source and its exact relationship epoch, read
+    /// under one retained canonical Supervisor/target authority lock set.
+    /// The projection receives no messages; strict authority checks may read Main.
+    async fn load_supervisor_context_target(
+        &self,
+        supervisor: &SupervisorReference,
+        target_id: &str,
+    ) -> std::io::Result<(Session, SupervisorLinkObservation)> {
+        let _ = (supervisor, target_id);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "supervisor_context_view_unsupported",
         ))
     }
 

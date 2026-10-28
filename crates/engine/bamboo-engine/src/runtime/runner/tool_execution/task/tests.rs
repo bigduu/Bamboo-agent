@@ -295,8 +295,10 @@ async fn ticket_task_projection_never_patches_root_or_session_authority() {
     plan.bind_session(&mut fixture.session).unwrap();
     let (tool_call, result) = task_call_and_result();
     let persistence = Arc::new(RecordingPersistence::default());
-    let mut config = AgentLoopConfig::default();
-    config.persistence = Some(persistence.clone());
+    let mut config = AgentLoopConfig {
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
     config.bind_ticket_worker_plan(plan);
     let result = super::maybe_apply_ticket_task(&tool_call, &result, &mut fixture.session, &config)
         .await
@@ -357,8 +359,10 @@ async fn root_taskwrite_uses_control_plane_save_and_preserves_event_and_context_
     let mut task_context: Option<TaskLoopContext> = None;
     let (tx, mut rx) = mpsc::channel(4);
     let persistence = Arc::new(RecordingPersistence::default());
-    let mut config = AgentLoopConfig::default();
-    config.persistence = Some(persistence.clone());
+    let config = AgentLoopConfig {
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
 
     maybe_handle_taskwrite(
         &tool_call,
@@ -411,8 +415,10 @@ async fn child_taskwrite_saves_child_and_shared_root_control_planes_without_full
 
     let persistence = Arc::new(RecordingPersistence::default());
     persistence.seed(root);
-    let mut config = AgentLoopConfig::default();
-    config.persistence = Some(persistence.clone());
+    let config = AgentLoopConfig {
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
 
     let mut child = Session::new_child("child-1", "root-1", "model", "Child");
     child.add_message(Message::user("live child history"));
@@ -442,30 +448,32 @@ async fn child_taskwrite_saves_child_and_shared_root_control_planes_without_full
         "the shared root must use one atomic Task patch"
     );
 
-    let saves = persistence
-        .control_planes
-        .lock()
-        .expect("recorded control planes");
-    let child_save = saves
-        .iter()
-        .find(|saved| saved.id == "child-1")
-        .expect("child control-plane save");
-    let patches = persistence
-        .patched_task_sessions
-        .lock()
-        .expect("recorded Task patches");
-    let root_save = patches
-        .iter()
-        .find(|saved| saved.id == "root-1")
-        .expect("root atomic Task patch");
-    assert_eq!(child_save.task_list_version_meta().as_deref(), Some("1"));
-    assert_eq!(root_save.task_list_version_meta().as_deref(), Some("1"));
-    assert_eq!(task_list_value(child_save), task_list_value(root_save));
-    assert_eq!(
-        root_save.messages.len(),
-        1,
-        "atomic patch must preserve unrelated root fields"
-    );
+    {
+        let saves = persistence
+            .control_planes
+            .lock()
+            .expect("recorded control planes");
+        let child_save = saves
+            .iter()
+            .find(|saved| saved.id == "child-1")
+            .expect("child control-plane save");
+        let patches = persistence
+            .patched_task_sessions
+            .lock()
+            .expect("recorded Task patches");
+        let root_save = patches
+            .iter()
+            .find(|saved| saved.id == "root-1")
+            .expect("root atomic Task patch");
+        assert_eq!(child_save.task_list_version_meta().as_deref(), Some("1"));
+        assert_eq!(root_save.task_list_version_meta().as_deref(), Some("1"));
+        assert_eq!(task_list_value(child_save), task_list_value(root_save));
+        assert_eq!(
+            root_save.messages.len(),
+            1,
+            "atomic patch must preserve unrelated root fields"
+        );
+    }
 
     assert!(
         task_context
@@ -499,8 +507,10 @@ async fn child_taskwrite_publishes_snapshot_rebased_by_local_save_everywhere() {
     let persistence = Arc::new(RebasingTaskPersistence::new(
         authoritative_task_list.clone(),
     ));
-    let mut config = AgentLoopConfig::default();
-    config.persistence = Some(persistence.clone());
+    let config = AgentLoopConfig {
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
     let mut child = Session::new_child(child_id, root_id, "model", "Child");
     let mut task_context = None;
     let (tx, mut rx) = mpsc::channel(4);
@@ -591,9 +601,11 @@ async fn child_taskwrite_custom_fallback_full_load_and_save_preserve_message_his
     let persistence = Arc::new(SaveOnlyPersistence::new(storage.clone()));
     let mut child = Session::new_child("fallback-child", "fallback-root", "model", "Child");
     child.add_message(Message::user("child history must survive"));
-    let mut config = AgentLoopConfig::default();
-    config.storage = Some(storage);
-    config.persistence = Some(persistence.clone());
+    let config = AgentLoopConfig {
+        storage: Some(storage),
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
     let mut task_context = None;
     let (tx, _rx) = mpsc::channel(4);
     let (tool_call, result) = task_call_and_result();
@@ -678,9 +690,11 @@ async fn child_taskwrite_root_cas_conflict_refreshes_repository_without_full_sav
 
     let mut child = Session::new_child(child_id, root_id, "model", "Child");
     child.add_message(Message::user("child transcript"));
-    let mut config = AgentLoopConfig::default();
-    config.storage = Some(storage);
-    config.persistence = Some(repository.clone());
+    let config = AgentLoopConfig {
+        storage: Some(storage),
+        persistence: Some(repository.clone()),
+        ..Default::default()
+    };
     let (tx, mut rx) = mpsc::channel(4);
     let (tool_call, result) = task_call_and_result();
     let taskwrite = tokio::spawn(async move {
@@ -825,8 +839,10 @@ async fn child_taskwrite_default_atomic_port_preserves_custom_full_session_state
 
     let mut child = Session::new_child("default-port-child", "default-port-root", "model", "Child");
     child.add_message(Message::user("child history"));
-    let mut config = AgentLoopConfig::default();
-    config.persistence = Some(persistence.clone());
+    let config = AgentLoopConfig {
+        persistence: Some(persistence.clone()),
+        ..Default::default()
+    };
     let mut task_context = None;
     let (tx, _rx) = mpsc::channel(4);
     let (tool_call, result) = task_call_and_result();
@@ -909,9 +925,11 @@ async fn child_task_control_planes_reload_without_rewriting_history_or_unrelated
         "uncheckpointed child message must not be rewritten by Task",
         None,
     ));
-    let mut config = AgentLoopConfig::default();
-    config.storage = Some(store.clone());
-    config.persistence = Some(Arc::new(repository.clone()));
+    let config = AgentLoopConfig {
+        storage: Some(store.clone()),
+        persistence: Some(Arc::new(repository.clone())),
+        ..Default::default()
+    };
     let mut task_context = None;
     let (tx, mut rx) = mpsc::channel(4);
     let (tool_call, result) = task_call_and_result();

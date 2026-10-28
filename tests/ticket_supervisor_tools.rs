@@ -11,7 +11,7 @@ use std::{sync::atomic::Ordering, time::Duration};
 #[actix_web::test]
 async fn actual_supervisor_work_tools_return_before_held_native_worker_finishes() {
     let f = Fixture::new().await;
-    post(&f.client, &f.base, "/chat", &json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,
+    post(&f.client, &f.base, "/chat", &json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,"thread_id":"ticket-supervisor-tools-e2e",
         "message":"TICKET_SUPERVISOR_E2E create and start one Work then reply without waiting for the Worker.", "model":"ticket-model","provider":"openai",
         "model_ref":{"provider":"openai","model":"ticket-model"}})).await;
     let executed = post(
@@ -76,7 +76,7 @@ async fn actual_supervisor_work_tools_return_before_held_native_worker_finishes(
         overview["data"]["needs_acceptance"], 0,
         "held Worker has not submitted"
     );
-    post(&f.client, &f.base, "/chat", &json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,
+    post(&f.client, &f.base, "/chat", &json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,"thread_id":"ticket-supervisor-tools-e2e",
         "message":"TICKET_SUPERVISOR_E2E keep working on my next message while that Worker is held.",
         "model":"ticket-model","provider":"openai"})).await;
     let next = post(

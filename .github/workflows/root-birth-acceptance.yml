@@ -1,0 +1,81 @@
+name: Root Birth Strict Lint
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'crates/infra/bamboo-storage/src/v2.rs'
+      - 'crates/infra/bamboo-storage/src/v2/default_actor_context.rs'
+      - 'crates/infra/bamboo-storage/src/v2/host_session_scope.rs'
+      - 'crates/infra/bamboo-storage/src/v2/host_root_create.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor*.rs'
+      - 'crates/infra/bamboo-storage/src/v2/root_birth_tests.rs'
+      - '.github/workflows/root-birth-acceptance.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: root-birth-acceptance-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  authority:
+    name: Canonical Root birth strict lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: target/grouped-default
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '8388608'
+      EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Bind acceptance to the exact clean source
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE"
+          test -z "$status"
+          git show -s --format='Root birth source: %H tree: %T' HEAD
+          sha256sum Cargo.lock
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Restore existing dependencies without saving cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      # The canonical feature executor compiles these storage Unit cases with
+      # all features and runs the original selectors serially from that
+      # same executable. Preserve this independent strict analysis policy.
+
+      - name: Check affected production library under the original strict policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo clippy --locked --all-features --lib -p bamboo-storage -- -D warnings -A deprecated -A clippy::module_inception -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args -A clippy::too-many-arguments -A clippy::while-let-loop -A clippy::type_complexity -A dead-code
+
+      - name: Verify exact source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE"
+          test -z "$status"
+          git show -s --format='Final Root birth source: %H tree: %T' HEAD

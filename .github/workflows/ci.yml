@@ -1,29 +1,24 @@
 name: CI
+# BAMBOO_FEATURE_RELEASE_ROUTE_V1
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
     inputs:
       snapshot_sha:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
-  # Main-push CI authenticates pre-merge acceptance for automatic publication.
   pull_request:
     branches: [ dev, main ]
 
 permissions:
   contents: read
 
-# Queue every main push for its own release gate; supersede iterative PR/manual
-# validation independently. Full promotion validation still covers three platforms.
+# Feature PRs and exact dev diagnostics share the existing validation owners.
+# Main PRs perform only read-only promotion checks; newer inputs supersede older runs.
 concurrency:
   group: ci-${{ github.event_name }}-${{ (github.event_name == 'workflow_dispatch' && inputs.snapshot_sha) || github.event.pull_request.number || github.ref }}
-  # Every main merge needs a completed CI gate before its own publication.
-  # PRs/manual validation keep their existing superseding-run behavior.
-  queue: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'max' || 'single' }}
-  cancel-in-progress: ${{ github.event_name != 'push' || github.ref != 'refs/heads/main' }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,88 +41,41 @@ env:
 jobs:
   validation-source:
     name: Validation Source
+    if: github.event_name != 'pull_request' || github.base_ref == 'dev'
     runs-on: ubuntu-latest
     outputs:
-      full: ${{ steps.scope.outputs.full }}
+      full: ${{ steps.source.outputs.full }}
+      feature: ${{ steps.source.outputs.feature }}
     steps:
-      - name: Bind full validation to the actual event snapshot
-        id: scope
+      - name: Select the event source
+        id: source
         env:
           EXPECTED_SNAPSHOT_SHA: ${{ inputs.snapshot_sha }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
-          full=false
+          feature=false
           case "$GITHUB_EVENT_NAME" in
             workflow_dispatch)
+              test "$GITHUB_REF" = refs/heads/dev
               [[ "$EXPECTED_SNAPSHOT_SHA" =~ ^[0-9a-f]{40}$ ]]
               test "$EXPECTED_SNAPSHOT_SHA" = "$GITHUB_SHA"
-              full=true
-              ;;
+              feature=true ;;
             pull_request)
               case "$GITHUB_BASE_REF" in
-                main) full=true ;;
-                dev) ;;
+                dev) feature=true ;;
                 *) exit 1 ;;
-              esac
-              ;;
-            push)
-              test "$GITHUB_REF" = refs/heads/main
-              ;;
+              esac ;;
             *) exit 1 ;;
           esac
-          printf 'Event source: %s; full validation: %s\n' "$GITHUB_SHA" "$full"
-          printf 'full=%s\n' "$full" >> "$GITHUB_OUTPUT"
-
-  main-release-admission:
-    name: Main Release Admission
-    needs: validation-source
-    if: always() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Authenticate completed release acceptance before checkout
-        env:
-          GH_TOKEN: ${{ github.token }}
-          SOURCE_RESULT: ${{ needs.validation-source.result }}
-          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
-          ADMISSION_MODE: main
-          ADMISSION_HELPER_SHA256: "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
-        run: |
-          python3 - <<'PYTHON'
-          import base64
-          import hashlib
-          import json
-          import os
-          import re
-          import subprocess
-
-          repository = os.environ["GITHUB_REPOSITORY"]
-          assert repository == "bigduu/Bamboo-agent"
-          revision = os.environ["GITHUB_WORKFLOW_SHA"]
-          expected = os.environ["ADMISSION_HELPER_SHA256"]
-          assert re.fullmatch(r"[0-9a-f]{40}", revision)
-          assert re.fullmatch(r"[0-9a-f]{64}", expected)
-          # Fixed-origin GET only, before any source checkout or credential-bearing code.
-          response = json.loads(subprocess.check_output(
-              ["gh", "api", "--hostname", "github.com",
-               f"repos/{repository}/contents/scripts/main-release-admission.py?ref={revision}"],
-              text=True, timeout=30))
-          assert response["encoding"] == "base64" and len(response["content"]) <= 180000
-          body = base64.b64decode(response["content"], validate=False)
-          assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected, "Unknown admission verifier"
-          exec(compile(body, "pinned-main-release-admission", "exec"), {
-              "__name__": "__main__", "ADMISSION_SCRIPT_SHA256": expected,
-          })
-          PYTHON
+          printf 'Event source: %s; full validation: false\n' "$GITHUB_SHA"
+          printf 'full=false\nfeature=%s\n' "$feature" >> "$GITHUB_OUTPUT"
 
   quick-checks:
     name: Quick Checks
-    if: github.event_name == 'pull_request' && github.base_ref == 'dev'
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -148,10 +96,13 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Test fast workflow and release policies
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         run: node --test scripts/supervisor-native-acceptance.test.cjs
+
+      - name: Test portable frontend artifact and release policies
+        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
   promotion-source:
     name: Promotion Source
@@ -165,6 +116,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           HEAD_REF: ${{ github.head_ref }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           python3 - <<'PYTHON'
@@ -187,6 +139,10 @@ jobs:
           cut = match.group(1)
           head = os.environ["HEAD_SHA"]
           require(re.fullmatch(r"[0-9a-f]{40}", head) is not None, "Missing exact pull-request head")
+          require(head == cut, "Release head must equal its accepted dev cut; repairs return through feature/dev")
+          base, snapshot = os.environ["BASE_SHA"], os.environ["GITHUB_SHA"]
+          require(all(re.fullmatch(r"[0-9a-f]{40}", value) for value in [base, snapshot]),
+                  "Missing exact pull-request base or merge snapshot")
           token = os.environ["GH_TOKEN"]
           require(bool(token), "Missing read-only source proof authority")
 
@@ -225,439 +181,295 @@ jobs:
                       "Release ancestry proof is missing or does not match")
 
           require(branch(release) == head, "Release branch no longer matches the exact PR head")
+          require(branch("main") == base, "main no longer matches the exact PR base")
+          merged, product = api(f"git/commits/{snapshot}"), api(f"git/commits/{cut}")
+          require(merged["sha"] == snapshot and product["sha"] == cut, "Promotion commit identity changed")
+          require([parent["sha"] for parent in merged["parents"]] == [base, head],
+                  "Actual PR merge parents differ from its base and release head")
+          require(re.fullmatch(r"[0-9a-f]{40}", product["tree"]["sha"]) is not None
+                  and merged["tree"]["sha"] == product["tree"]["sha"],
+                  "Actual PR merge tree differs from the published release cut")
           dev = branch("dev", protected=True)
           ancestor(cut, head)
           ancestor(head, dev)
+          releases = [item for item in api("releases?per_page=100")
+                      if re.fullmatch(r"v[0-9]{4}\.[0-9]{1,2}\.[0-9]+", item["tag_name"])
+                      and item["target_commitish"] == head and item["draft"] is False
+                      and item["prerelease"] is False and item["published_at"]]
+          require(len(releases) == 1, "Require one completed public release for the exact frozen source")
+          published = api(f"releases/{releases[0]['id']}")
+          require(published["target_commitish"] == head and published["draft"] is False
+                  and published["prerelease"] is False and published["published_at"], "Release is not complete")
+          tag = api(f"git/ref/tags/{urllib.parse.quote(published['tag_name'], safe='')}")
+          require(tag["object"]["type"] == "commit" and tag["object"]["sha"] == head,
+                  "Formal version tag must point to the exact release source")
+          for name in ["bamboo-aarch64-apple-darwin", "bamboo-x86_64-unknown-linux-gnu",
+                       "bamboo-x86_64-pc-windows-msvc.exe", "bamboo-sidecars-v2.json",
+                       "bamboo-executables-provenance-v2.json", "release-provenance.json"]:
+              assets = [asset for asset in published["assets"] if asset["name"] == name]
+              require(len(assets) == 1 and assets[0]["state"] == "uploaded" and assets[0]["size"] > 0,
+                      f"Completed release asset is missing: {name}")
           # Normal dev advancement is allowed; rewritten history is not.
           # Comparisons are always between immutable SHAs, never moving refs.
           current_dev = branch("dev", protected=True)
           if current_dev != dev:
               ancestor(dev, current_dev)
           require(branch(release) == head, "Release branch changed during source proof")
+          require(branch("main") == base, "main changed during source proof")
           print(f"Accepted frozen release cut={cut} head={head} protected_dev={current_dev}")
           PYTHON
 
   test:
     name: Test
-    permissions:
-      contents: read
-      actions: read
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-    needs: [validation-source, main-release-admission, test-crates, test-ssh]
-    # A source-gate failure must fail required Test, never turn it into a skip.
-    if: always() && !cancelled()
+    needs: [validation-source, quick-checks, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, docs, security, deny]
+    if: always() && !cancelled() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev'))
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event_name == 'pull_request' && github.base_ref == 'dev' && 45 || 75 }}
     steps:
       - name: Require validation admission
         env:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
-          FULL_VALIDATION: ${{ needs.validation-source.outputs.full }}
-          MAIN_ADMISSION_RESULT: ${{ needs.main-release-admission.result }}
+          FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
+          QUICK_RESULT: ${{ needs.quick-checks.result }}
+          FEATURE_RESULT: ${{ needs.feature-tests.result }}
+          NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
+          BROWSER_RESULT: ${{ needs.browser-runtime-tests.result }}
+          LINT_RESULT: ${{ needs.lint.result }}
+          MSRV_RESULT: ${{ needs.msrv.result }}
+          DOCS_RESULT: ${{ needs.docs.result }}
+          SECURITY_RESULT: ${{ needs.security.result }}
+          DENY_RESULT: ${{ needs.deny.result }}
         shell: bash
         run: |
           set -euo pipefail
           test "$SOURCE_RESULT" = success
-          case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FULL_VALIDATION" in
-            pull_request:dev:false|pull_request:main:true|workflow_dispatch::true) ;;
-            push::false)
-              test "$GITHUB_REF" = refs/heads/main
-              test "$MAIN_ADMISSION_RESULT" = success
-              ;;
+          case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FEATURE_VALIDATION" in
+            pull_request:dev:true|workflow_dispatch::true)
+              for key in QUICK_RESULT FEATURE_RESULT NATIVE_RESULT BROWSER_RESULT LINT_RESULT MSRV_RESULT DOCS_RESULT SECURITY_RESULT DENY_RESULT; do
+                test "${!key}" = success
+              done ;;
             *) exit 1 ;;
           esac
 
+  feature-tests:
+    name: Feature Unit and E2E
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/feature-tests
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
       - uses: actions/checkout@v7
-        if: github.event_name != 'push'
-
-      - name: Require the exact clean event source
-        if: github.event_name != 'push'
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-feature-configurations-${{ runner.os }}
+          workspaces: . -> target/feature-tests
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Require exact feature source and committed frontend
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          source_status="$(git status --porcelain --untracked-files=all)"
-          test -z "$source_status"
-          git show -s --format='Source: %H tree: %T' HEAD
-          sha256sum Cargo.lock
-
-      - name: Setup Node.js
-        if: github.event_name != 'push'
-        uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-
-      - name: Test CI workflow policy
-        if: needs.validation-source.outputs.full == 'true'
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs
-
-      - name: Test Supervisor driver and owned loopback process binding
-        if: needs.validation-source.outputs.full == 'true'
-        run: node --test scripts/supervisor-native-acceptance.test.cjs
-
-      - name: Test frontend artifact and release policies
-        if: needs.validation-source.outputs.full == 'true'
-        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
-
-      - name: Stage frontend package
-        if: needs.validation-source.outputs.full == 'true'
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node scripts/frontend-package.cjs verify
+      - name: Record feature profile, toolchain and available disk
         shell: bash
         run: |
           set -euo pipefail
-          node scripts/frontend-package.cjs stage
-          node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
+          {
+            rustc -vV
+            cargo -V
+            printf 'Target: %s\nDev debug: %s\nTest debug: %s\nIncremental: %s\n' "$CARGO_TARGET_DIR" "$CARGO_PROFILE_DEV_DEBUG" "$CARGO_PROFILE_TEST_DEBUG" "$CARGO_INCREMENTAL"
+            df -Pk "$GITHUB_WORKSPACE" "$RUNNER_TEMP"
+          } | tee "$RUNNER_TEMP/bamboo-feature-profile.log"
+      - name: Run default and additive Unit/E2E with shared outputs
+        run: node scripts/run-feature-tests.cjs
+      - name: Record final feature disk usage
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          df -Pk "$GITHUB_WORKSPACE" "$RUNNER_TEMP" | tee -a "$RUNNER_TEMP/bamboo-feature-profile.log"
+          if [[ -d "$CARGO_TARGET_DIR" ]]; then
+            du -sk "$CARGO_TARGET_DIR" | tee -a "$RUNNER_TEMP/bamboo-feature-profile.log"
+          fi
+      - name: Require source to remain exact and clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve feature Cargo evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: feature-unit-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/bamboo-feature-tests-*/*
+            ${{ runner.temp }}/bamboo-feature-profile.log
+          if-no-files-found: ignore
+          retention-days: 7
 
-      - name: Install Rust
-        if: github.event_name != 'push'
+  browser-runtime-tests:
+    name: Browser Runtime Unit and E2E (${{ matrix.shard }})
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [host, profile, shared, other]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Bind the exact clean browser runtime source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          git show -s --format='Browser runtime source: %H tree: %T' HEAD
+          sha256sum browser-runtime/package-lock.json
+      - name: Install the locked runtime without package scripts
+        run: npm ci --prefix browser-runtime --ignore-scripts
+      - name: Install only the matching headless shell
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers
+        run: |
+          node -e "require('node:assert/strict').equal(require('./browser-runtime/node_modules/playwright-core/package.json').version, '1.62.1')"
+          node browser-runtime/node_modules/playwright-core/cli.js install --with-deps chromium-headless-shell
+      - name: Run every runtime file once without workflow credentials
+        shell: bash
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/bamboo-browser-runtime-browsers
+          BROWSER_RUNTIME_SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          node <<'NODE' | tee "$RUNNER_TEMP/browser-runtime.tap"
+          const { spawnSync } = require('node:child_process');
+          const environment = Object.fromEntries(['PATH', 'HOME', 'USERPROFILE', 'SystemRoot', 'TEMP', 'TMP', 'TMPDIR',
+            'LANG', 'LC_ALL', 'NODE_PATH', 'PLAYWRIGHT_BROWSERS_PATH', 'GITHUB_REPOSITORY', 'GITHUB_SHA',
+            'GITHUB_REF', 'GITHUB_EVENT_NAME', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'GITHUB_WORKFLOW_SHA']
+            .filter(key => process.env[key] !== undefined).map(key => [key, process.env[key]]));
+          const assert = require('node:assert/strict');
+          const inventory = require('node:fs').readdirSync('browser-runtime').filter(file => file.endsWith('.test.cjs')).sort();
+          assert.equal(new Set(inventory).size, inventory.length, 'Duplicate runtime file');
+          const browserFiles = ['host.test.cjs', 'profile.test.cjs', 'shared-host.test.cjs'];
+          const shards = {
+            host: [browserFiles[0]], profile: [browserFiles[1]], shared: [browserFiles[2]],
+            other: inventory.filter(file => !browserFiles.includes(file)),
+          };
+          assert.deepEqual(Object.values(shards).flat().sort(), inventory, 'Runtime shards must cover every file exactly once');
+          for (const files of Object.values(shards)) assert.ok(files.length > 0, 'Empty runtime shard');
+          const files = shards[process.env.BROWSER_RUNTIME_SHARD];
+          assert.ok(Array.isArray(files) && files.length > 0, 'Unknown runtime shard');
+          console.log('# Runtime shard: ' + process.env.BROWSER_RUNTIME_SHARD + '; files: ' + files.join(', '));
+          const result = spawnSync(process.execPath, ['--test', '--test-reporter=tap', '--test-concurrency=1', ...files], { cwd: 'browser-runtime', env: environment, stdio: 'inherit' });
+          if (result.error) throw result.error;
+          process.exit(result.status ?? 1);
+          NODE
+          node <<'NODE'
+          const assert = require('node:assert/strict');
+          const log = require('node:fs').readFileSync(process.env.RUNNER_TEMP + '/browser-runtime.tap', 'utf8');
+          const count = name => {
+            const values = [...log.matchAll(new RegExp('^# ' + name + ' ([0-9]+)$', 'gm'))];
+            assert.equal(values.length, 1, 'Missing or duplicate runtime summary: ' + name);
+            return Number(values[0][1]);
+          };
+          assert.ok(count('tests') > 0 && count('pass') > 0, 'Runtime cases must actually execute');
+          for (const name of ['fail', 'cancelled', 'skipped', 'todo']) assert.equal(count(name), 0, 'Runtime suite did not fully pass: ' + name);
+          assert.equal(count('tests'), count('pass'), 'Every declared runtime case must pass');
+          NODE
+      - name: Require unchanged browser runtime source after execution
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+      - name: Preserve browser runtime outcome including failures
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: browser-runtime-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/browser-runtime.tap
+          if-no-files-found: error
+          retention-days: 7
+
+  native-feature-tests:
+    name: Native Feature (${{ matrix.os }})
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2025, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/native-feature
+      PR_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Test portable Supervisor and frontend policies
+        run: node --test scripts/supervisor-native-acceptance.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Preserve the Actor acceptance compiler
+        if: runner.os == 'Windows'
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
-
-      - name: Record the full validation toolchain
-        if: github.event_name != 'push'
-        run: |
-          rustc --version --verbose
-          cargo --version --verbose
-
-      - name: Check formatting
-        if: needs.validation-source.outputs.full == 'true'
-        run: cargo fmt --all -- --check
-
-      - name: Rust cache
-        if: github.event_name != 'push'
-        uses: swatinem/rust-cache@v2
+          toolchain: 1.99.0-x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
         with:
-          shared-key: bamboo-ci-test-${{ runner.os }}
-          workspaces: . -> target/grouped-default
-          # Keep iterative dev PR caches; main PRs restore from their base branch.
-          save-if: ${{ (github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Verify published server crate owns the frontend package
-        if: needs.validation-source.outputs.full == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          PACKAGE_FILES="$(cargo package --locked -p bamboo-server --allow-dirty --list)"
-          for required in \
-            build.rs \
-            frontend_build.rs \
-            frontend_package/frontend-manifest.json \
-            frontend_package/lotus-frontend.zip; do
-            if ! grep -Fxq "${required}" <<< "${PACKAGE_FILES}"; then
-              echo "::error::bamboo-server package is missing ${required}"
-              exit 1
-            fi
-          done
-
-      - name: Build locked Rust workspace
-        if: github.event_name == 'pull_request' && github.base_ref == 'dev'
-        run: cargo build --locked
-
-      - name: Require all crate tests and the SSH fixture
-        if: needs.validation-source.outputs.full == 'true'
-        env:
-          CRATE_RESULT: ${{ needs.test-crates.result }}
-          SSH_RESULT: ${{ needs.test-ssh.result }}
-        run: |
-          test "$CRATE_RESULT" = success
-          test "$SSH_RESULT" = success
-
-      - name: Preserve failed synthetic Ticket fixture evidence
-        if: failure() && github.event_name != 'push'
-        uses: actions/upload-artifact@v7
-        with:
-          name: ticket-fixture-failure-${{ github.run_id }}-${{ github.run_attempt }}
-          # These fixtures use isolated synthetic providers and retain their
-          # directories only on failure. Never upload config or session stores.
-          path: |
-            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
-            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
-            /tmp/bamboo-1754-required-packet-*/host.log
-          if-no-files-found: ignore
-          retention-days: 7
-
-      - name: Require the exact clean source after full validation
-        if: always() && github.event_name != 'push'
+          workspaces: . -> target/native-feature
+          shared-key: bamboo-native-feature-${{ runner.os }}
+          cache-workspace-crates: false
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Require the committed native inputs
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
-          source_status="$(git status --porcelain --untracked-files=all)"
-          test -z "$source_status"
-
-  test-crates:
-    name: Test (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})
-    needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - bamboo-agent
-          - bamboo-domain
-          - bamboo-agent-core
-          - bamboo-config
-          - bamboo-llm
-          - bamboo-storage
-          - bamboo-tickets
-          - bamboo-a2a
-          - bamboo-infrastructure
-          - bamboo-memory
-          - bamboo-metrics
-          - bamboo-notification
-          - bamboo-hooks
-          - bamboo-skills
-          - bamboo-mcp
-          - bamboo-plugin
-          - bamboo-plugin-protocol
-          - bamboo-projects
-          - bamboo-permission
-          - bamboo-compression
-          - bamboo-subagent
-          - bamboo-engine
-          - bamboo-orchestration
-          - bamboo-tools
-          - bamboo-server-tools
-          - bamboo-sdk
-          - bamboo-tui
-          - bamboo-client-core
-          - bamboo-broker
-        include:
-          - crate: bamboo-server
-            server_block: browser
-          - crate: bamboo-server
-            server_block: chat
-          - crate: bamboo-server
-            server_block: execute
-          - crate: bamboo-server
-            server_block: settings
-          - crate: bamboo-server
-            server_block: app-state
-          - crate: bamboo-server
-            server_block: handlers
-          - crate: bamboo-server
-            server_block: other
-          - crate: bamboo-server
-            server_block: integration
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
-      TEST_CRATE: ${{ matrix.crate }}
-      SERVER_TEST_BLOCK: ${{ matrix.server_block }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-          package-manager-cache: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-test-${{ runner.os }}
-          workspaces: . -> target/grouped-default
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-      - name: Stage frontend package
-        run: node scripts/frontend-package.cjs stage
-      - name: Test crate
-        if: matrix.crate != 'bamboo-server'
-        run: cargo test --locked --no-fail-fast -p "$TEST_CRATE"
-      - name: Test server block
-        if: matrix.crate == 'bamboo-server'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$SERVER_TEST_BLOCK" == integration ]]; then
-            integration_args=()
-            for file in crates/app/bamboo-server/tests/*.rs; do
-              target=${file##*/}
-              target=${target%.rs}
-              # The only feature-gated integration target is disabled in default mode.
-              if [[ "$target" != env_cache_isolation ]]; then
-                integration_args+=(--test "$target")
-              fi
-            done
-            test "${#integration_args[@]}" -gt 0
-            server_status=0
-            cargo test --locked --no-fail-fast -p bamboo-server "${integration_args[@]}" || server_status=$?
-            cargo build --locked -p bamboo-server --examples --profile test || server_status=$?
-            cargo test --locked --no-fail-fast -p bamboo-server --doc || server_status=$?
-            exit "$server_status"
-          fi
-          case "$SERVER_TEST_BLOCK" in
-            browser) server_index=0 ;;
-            chat) server_index=1 ;;
-            execute) server_index=2 ;;
-            settings) server_index=3 ;;
-            app-state) server_index=4 ;;
-            handlers) server_index=5 ;;
-            other) server_index=6 ;;
-            *) exit 1 ;;
-          esac
-          server_filters=('browser::' 'handlers::agent::chat::' 'handlers::agent::execute::' 'handlers::settings::' 'app_state::' 'handlers::')
-          server_args=(--lib)
-          if (( server_index < ${#server_filters[@]} )); then
-            server_args+=("${server_filters[$server_index]}")
-          fi
-          server_args+=(--)
-          for (( index=0; index<server_index; index++ )); do
-            server_args+=(--skip "${server_filters[$index]}")
-          done
-          cargo test --locked --no-fail-fast -p bamboo-server "${server_args[@]}"
-      - name: Preserve failed synthetic Ticket fixture evidence
-        if: failure()
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node scripts/frontend-package.cjs verify
+          openssl version
+      - name: Run fixed native ownership and record real compiled cases
+        run: node scripts/native-test-owner.cjs
+      - name: Preserve native ownership evidence including failures
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: fixture-failure-test-${{ matrix.crate }}${{ matrix.server_block && format('-{0}', matrix.server_block) || '' }}-${{ github.run_attempt }}
-          path: |
-            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
-            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
-            /tmp/bamboo-1754-required-packet-*/host.log
-          if-no-files-found: ignore
-          retention-days: 7
-
-  e2e-crates:
-    name: E2E (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})
-    needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    strategy:
-      fail-fast: false
-      matrix:
-        crate:
-          - bamboo-agent
-          - bamboo-domain
-          - bamboo-agent-core
-          - bamboo-config
-          - bamboo-llm
-          - bamboo-storage
-          - bamboo-tickets
-          - bamboo-a2a
-          - bamboo-infrastructure
-          - bamboo-memory
-          - bamboo-metrics
-          - bamboo-notification
-          - bamboo-hooks
-          - bamboo-skills
-          - bamboo-mcp
-          - bamboo-plugin
-          - bamboo-plugin-protocol
-          - bamboo-projects
-          - bamboo-permission
-          - bamboo-compression
-          - bamboo-subagent
-          - bamboo-engine
-          - bamboo-orchestration
-          - bamboo-tools
-          - bamboo-server-tools
-          - bamboo-sdk
-          - bamboo-tui
-          - bamboo-client-core
-          - bamboo-broker
-        include:
-          - crate: bamboo-server
-            server_block: browser
-          - crate: bamboo-server
-            server_block: chat
-          - crate: bamboo-server
-            server_block: execute
-          - crate: bamboo-server
-            server_block: settings
-          - crate: bamboo-server
-            server_block: app-state
-          - crate: bamboo-server
-            server_block: handlers
-          - crate: bamboo-server
-            server_block: other
-          - crate: bamboo-server
-            server_block: integration
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-all-features
-      TEST_CRATE: ${{ matrix.crate }}
-      SERVER_TEST_BLOCK: ${{ matrix.server_block }}
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
-        with:
-          node-version: '24'
-          package-manager-cache: false
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-e2e-${{ runner.os }}
-          workspaces: . -> target/grouped-all-features
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-      - name: Stage frontend package
-        run: node scripts/frontend-package.cjs stage
-      - name: Run E2E crate tests
-        if: matrix.crate != 'bamboo-server'
-        run: cargo test --locked --no-fail-fast -p "$TEST_CRATE" --all-features --lib --tests
-      - name: Run E2E server block
-        if: matrix.crate == 'bamboo-server'
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$SERVER_TEST_BLOCK" == integration ]]; then
-            cargo test --locked --no-fail-fast -p bamboo-server --all-features --test '*'
-            exit
-          fi
-          case "$SERVER_TEST_BLOCK" in
-            browser) server_index=0 ;;
-            chat) server_index=1 ;;
-            execute) server_index=2 ;;
-            settings) server_index=3 ;;
-            app-state) server_index=4 ;;
-            handlers) server_index=5 ;;
-            other) server_index=6 ;;
-            *) exit 1 ;;
-          esac
-          server_filters=('browser::' 'handlers::agent::chat::' 'handlers::agent::execute::' 'handlers::settings::' 'app_state::' 'handlers::')
-          server_args=(--lib)
-          if (( server_index < ${#server_filters[@]} )); then
-            server_args+=("${server_filters[$server_index]}")
-          fi
-          server_args+=(--)
-          for (( index=0; index<server_index; index++ )); do
-            server_args+=(--skip "${server_filters[$index]}")
-          done
-          cargo test --locked --no-fail-fast -p bamboo-server --all-features "${server_args[@]}"
-      - name: Preserve failed synthetic Ticket fixture evidence
-        if: failure()
-        uses: actions/upload-artifact@v7
-        with:
-          name: fixture-failure-e2e-${{ matrix.crate }}${{ matrix.server_block && format('-{0}', matrix.server_block) || '' }}-${{ github.run_attempt }}
-          path: |
-            /tmp/bamboo-1481-ticket-lifecycle-*/host/host.log
-            /tmp/bamboo-1481-ticket-lifecycle-*/host/question-readiness.json
-            /tmp/bamboo-1754-required-packet-*/host.log
-          if-no-files-found: ignore
-          retention-days: 7
-
-  test-ssh:
-    name: Test SSH
-    needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    env:
-      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-ssh-live
-    steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-ssh-${{ runner.os }}
-          workspaces: . -> target/grouped-ssh-live
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-      - name: Run SSH fixture
-        run: bash scripts/run-russh-live.sh
+          name: native-feature-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bamboo-native-owner-*/*
+          if-no-files-found: error
+          retention-days: 14
 
   msrv:
     name: MSRV (Rust 1.95)
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -671,7 +483,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-msrv-1.95-${{ runner.os }}
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Test MSRV graph audit
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
@@ -682,80 +494,27 @@ jobs:
       - name: Check workspace on MSRV
         run: cargo check --locked --workspace --all-targets --all-features
 
-  tls-fixture-test:
-    name: TLS Fixture (${{ matrix.os }})
-    needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
-    # Keep the test-only certificate generator portable across the OpenSSL and
-    # LibreSSL variants on every supported host. The release build matrix below
-    # does not compile or execute #[cfg(test)] code.
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-tls-fixture-${{ matrix.os }}
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Verify OpenSSL
-        run: openssl version
-
-      - name: Run TLS fixture tests (macOS unwind guard)
-        if: runner.os == 'macOS'
-        run: scripts/run-macos-server-lib-tests.sh
-
-      - name: Run TLS fixture tests
-        if: runner.os == 'Windows'
-        run: cargo test --locked --no-fail-fast -p bamboo-server --lib server::tls::tests -- --nocapture
-
-  tool-event-recorder-e2e:
-    name: ToolEvent Recorder E2E (${{ matrix.os }})
-    needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-tool-event-recorder-${{ matrix.os }}
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Run native recorder contract and lifecycle tests
-        run: cargo test --locked --no-fail-fast -p bamboo-tool-event-recorder-example -- --nocapture --test-threads=1
-
   e2e-test:
     name: E2E Tests
-    needs: [validation-source, e2e-crates]
-    if: always() && !cancelled() && needs.validation-source.outputs.full == 'true'
+    needs: [validation-source, feature-tests, native-feature-tests, browser-runtime-tests]
+    if: always() && !cancelled() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev'))
     runs-on: ubuntu-latest
     steps:
-      - name: Require all E2E crate tests
+      - name: Require feature E2E execution
         env:
-          CRATE_RESULT: ${{ needs.e2e-crates.result }}
-        run: test "$CRATE_RESULT" = success
+          FEATURE_RESULT: ${{ needs.feature-tests.result }}
+          NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
+          BROWSER_RESULT: ${{ needs.browser-runtime-tests.result }}
+        run: |
+          set -euo pipefail
+          test "$FEATURE_RESULT" = success
+          test "$NATIVE_RESULT" = success
+          test "$BROWSER_RESULT" = success
 
   lint:
     name: Lint
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -769,10 +528,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-lint-${{ runner.os }}
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Run clippy
         run: |
@@ -787,75 +543,10 @@ jobs:
             -A clippy::type_complexity \
             -A dead-code
 
-  build:
-    name: Platform Tests (${{ matrix.os }})
-    # Integration work is validated on Linux. The native platform test
-    # matrix is reserved for this repository's frozen release branches to main;
-    # workflow_dispatch remains an explicit escape hatch for manual validation.
-    needs: validation-source
-    if: >-
-      needs.validation-source.outputs.full == 'true' &&
-      (github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' &&
-       github.base_ref == 'main' &&
-       startsWith(github.head_ref, 'release/') &&
-       github.event.pull_request.head.repo.full_name == github.repository))
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v7
-        with:
-          node-version: lts/*
-
-      - name: Test Supervisor driver and owned loopback process binding
-        if: runner.os != 'Linux'
-        run: node --test scripts/supervisor-native-acceptance.test.cjs
-
-      - name: Test frontend artifact and release policies
-        if: runner.os != 'Linux'
-        run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
-
-      - name: Stage frontend package
-        shell: bash
-        run: |
-          set -euo pipefail
-          node scripts/frontend-package.cjs stage
-          node -e "for (const file of ['crates/app/bamboo-server/frontend_package/lotus-frontend.zip', 'crates/app/bamboo-server/frontend_package/frontend-manifest.json']) require('node:fs').accessSync(file)"
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Rust cache
-        uses: swatinem/rust-cache@v2
-        with:
-          shared-key: bamboo-ci-build-${{ matrix.os }}
-          # Platform tests do not run on main pushes; retain warm caches within
-          # a live promotion PR and permit manual runs on main to seed its base.
-          save-if: ${{ ((github.event_name == 'pull_request' && github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
-
-      - name: Verify portable Skill source publication
-        run: cargo test --locked --no-fail-fast -p bamboo-skills progressive::source_tests -- --test-threads=1
-
-      - name: Verify portable selected Skill source
-        run: cargo test --locked --no-fail-fast -p bamboo-skills progressive::read_tests -- --test-threads=1
-
-      - name: Verify portable Skill read Tool
-        run: cargo test --locked --no-fail-fast -p bamboo-server-tools skill_runtime::catalog_tests -- --test-threads=1
-
-      - name: Verify portable frontend package contract
-        if: runner.os != 'Linux'
-        run: cargo test --locked --no-fail-fast -p bamboo-server --test frontend_build_contract
-
   docs:
     name: Documentation
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -867,15 +558,40 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-docs-${{ runner.os }}
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Build documentation
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --all-features --document-private-items
+
+      - name: Retain the exact feature documentation site
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          echo '<meta http-equiv="refresh" content="0;url=bamboo_agent/index.html">' > target/doc/index.html
+          python3 - <<'PYDOC'
+          import json, os, subprocess
+          source = {key: os.environ[key] for key in ['GITHUB_REPOSITORY', 'GITHUB_SHA', 'GITHUB_RUN_ID', 'GITHUB_RUN_ATTEMPT', 'PR_NUMBER', 'PR_HEAD_SHA']}
+          source['tree'] = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip()
+          with open('target/doc/_bamboo-ci-source.json', 'w') as output:
+              json.dump(source, output)
+          PYDOC
+
+      - name: Upload feature documentation site
+        uses: actions/upload-artifact@v7
+        with:
+          name: documentation-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/doc
+          if-no-files-found: error
+          retention-days: 90
 
   security:
     name: Security Audit
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -887,7 +603,7 @@ jobs:
         uses: swatinem/rust-cache@v2
         with:
           shared-key: bamboo-ci-security-${{ runner.os }}
-          save-if: ${{ (github.event_name == 'push' && github.ref == 'refs/heads/main') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
 
       - name: Install cargo-audit
         # Pinned + --locked for reproducible, non-drifting CI runs (was
@@ -911,7 +627,7 @@ jobs:
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)
     needs: validation-source
-    if: needs.validation-source.outputs.full == 'true'
+    if: needs.validation-source.outputs.feature == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

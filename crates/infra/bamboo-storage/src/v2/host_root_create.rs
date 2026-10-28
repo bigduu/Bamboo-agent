@@ -87,7 +87,12 @@ impl SessionStoreV2 {
     ) -> io::Result<super::host_session_scope::LegacySessionDeliveryGuards> {
         root_first_input_request(caller, operation_id, candidate, envelope)?;
         let authority = self
-            .lock_unscoped_supervisor_delivery(caller, supervisor, &candidate.id)
+            .lock_unscoped_supervisor_delivery(
+                caller,
+                supervisor,
+                &candidate.id,
+                candidate.created_at,
+            )
             .await?;
         self.check_first_input_reserved_root(candidate).await?;
         Ok(authority)

@@ -96,6 +96,14 @@ impl TicketApplication {
                 .ok_or_else(|| Error::ScopeDenied("invalid Supervisor binding".into()))?,
         };
         let envelope = envelope(expected, pending)?;
+        // The Work binding remains sealed at its original positive revision.
+        // Notification admission uses the live canonical business role, not a
+        // thinking-mode counter. Final Storage rechecks this same incarnation.
+        let role = self
+            .storage
+            .inspect_supervisor_current_user_scope(&supervisor)
+            .await
+            .map_err(|error| Error::AuthorityUnavailable(error.to_string()))?;
         let inbox = self
             .messenger
             .get()
@@ -106,7 +114,7 @@ impl TicketApplication {
             inbox
                 .stage_supervisor_patrol_notice(
                     &supervisor,
-                    expected.binding_revision,
+                    role.orchestration_revision,
                     &envelope,
                     &guard.0,
                 )

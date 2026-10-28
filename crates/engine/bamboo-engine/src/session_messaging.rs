@@ -1142,19 +1142,55 @@ impl SessionMessenger {
         }))
     }
 
-    /// Follow an already-attached Ordinary Root from the original executing
-    /// Supervisor. The concrete inbox revalidates and retains all authority
-    /// locks through durable admission; a prior inspect_link is never a grant.
+    /// Current-user management always retains the immutable selected target
+    /// and full original caller through the existing physical Inbox writer.
+    pub async fn supervisor_current_user_followup(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        let envelope = SessionMessageEnvelope {
+            id: bamboo_domain::supervisor_current_user_message_id(supervisor, target, operation_id),
+            source: SessionMessageSource::Session {
+                session_id: caller.session_id.clone(),
+            },
+            target_session_id: target.session_id.clone(),
+            kind: SessionMessageKind::PeerMessage,
+            body: SessionMessageBody::Content(SessionMessageContent::text(message)),
+            created_at: chrono::Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: Some(operation_id.to_string()),
+        };
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_supervisor_current_user_followup(caller, supervisor, target, &envelope)
+            .await
+            .map_err(SessionMessengerError::Inbox)?;
+        let admission = self.record_admission(envelope, delivery, started);
+        self.activate_prepared(&admission).await
+    }
+
+    /// Follow an originally observed Session from the canonical Supervisor.
+    /// Retain its birth across retries. The concrete Inbox revalidates all
+    /// authority under physical locks; a fresh ID lookup cannot replace it.
     pub async fn supervisor_followup(
         &self,
         supervisor: &SupervisorReference,
-        target_session_id: &str,
+        target: &Session,
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         self.supervisor_followup_delivery(
             supervisor,
-            target_session_id,
+            &target.id,
+            target.created_at,
             operation_id,
             message,
             None,
@@ -1168,13 +1204,14 @@ impl SessionMessenger {
         &self,
         caller: &SessionCallerReference,
         supervisor: &SupervisorReference,
-        target_session_id: &str,
+        target: &Session,
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         self.supervisor_followup_delivery(
             supervisor,
-            target_session_id,
+            &target.id,
+            target.created_at,
             operation_id,
             message,
             Some(caller),
@@ -1186,6 +1223,7 @@ impl SessionMessenger {
         &self,
         supervisor: &SupervisorReference,
         target_session_id: &str,
+        target_created_at: chrono::DateTime<chrono::Utc>,
         operation_id: &str,
         message: &str,
         original_caller: Option<&SessionCallerReference>,
@@ -1221,12 +1259,17 @@ impl SessionMessenger {
         let result = match original_caller {
             Some(caller) => {
                 self.inbox
-                    .deliver_unscoped_supervisor_followup(caller, supervisor, &envelope)
+                    .deliver_unscoped_supervisor_followup(
+                        caller,
+                        supervisor,
+                        target_created_at,
+                        &envelope,
+                    )
                     .await
             }
             None => {
                 self.inbox
-                    .deliver_supervisor_followup(supervisor, &envelope)
+                    .deliver_supervisor_followup(supervisor, target_created_at, &envelope)
                     .await
             }
         };
@@ -1332,6 +1375,33 @@ impl SessionMessenger {
         envelope: SessionMessageEnvelope,
     ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
         self.admit_with_gate(envelope, None).await
+    }
+
+    pub(crate) fn supports_runtime_target_lifetime(&self) -> bool {
+        self.inbox.supports_runtime_target_lifetime()
+    }
+
+    pub(crate) async fn admit_runtime_for_target(
+        &self,
+        envelope: SessionMessageEnvelope,
+        target_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<SessionMessengerAdmission, SessionMessengerError> {
+        let started = Instant::now();
+        let result = async {
+            self.validate_relationship(&envelope).await?;
+            self.inbox
+                .deliver_runtime_for_target(&envelope, target_created_at)
+                .await
+                .map_err(SessionMessengerError::Inbox)
+        }
+        .await;
+        match result {
+            Ok(receipt) => Ok(self.record_admission(envelope, receipt, started)),
+            Err(error) => {
+                self.record_rejection(&error);
+                Err(error)
+            }
+        }
     }
 
     pub async fn admit_with_gate(
@@ -1584,6 +1654,8 @@ mod tests {
         SessionMessageContent, SessionMessageId, SessionMessageKind,
     };
     use bamboo_storage::{FileSessionInbox, SessionStoreV2};
+    use chrono::Utc;
+    use std::time::Duration;
     use tempfile::TempDir;
 
     struct RecordingActivation {
@@ -1842,6 +1914,22 @@ mod tests {
 
     #[async_trait]
     impl SessionInboxPort for PausedPeerAdmission {
+        fn supports_runtime_target_lifetime(&self) -> bool {
+            true
+        }
+
+        async fn deliver_runtime_for_target(
+            &self,
+            envelope: &SessionMessageEnvelope,
+            target_created_at: chrono::DateTime<Utc>,
+        ) -> Result<SessionInboxReceipt, SessionInboxError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            self.inner
+                .deliver_runtime_for_target(envelope, target_created_at)
+                .await
+        }
+
         async fn deliver(
             &self,
             envelope: &SessionMessageEnvelope,
@@ -1989,6 +2077,113 @@ mod tests {
                 assert_eq!(activation.calls.lock().await.len(), 1);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn background_exec_admission_rechecks_target_birth_at_actual_inbox_publication() {
+        let (_temp, store, activation, _) = fixture().await;
+        let old = Session::new("runtime-completion-target", "model");
+        store.save_session(&old).await.unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let inbox = Arc::new(FileSessionInbox::new(
+            store.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let paused = SessionMessenger::new(
+            store.clone(),
+            Arc::new(PausedPeerAdmission {
+                inner: inbox.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+            }),
+            activation.clone(),
+        );
+        let mut envelope = SessionMessageEnvelope::user_input(&old.id, "unused");
+        envelope.source = SessionMessageSource::Runtime {
+            subsystem: "background_exec".into(),
+        };
+        envelope.kind = bamboo_domain::SessionMessageKind::RuntimeInstruction;
+        envelope.body = bamboo_domain::SessionMessageBody::RuntimeInstruction(
+            bamboo_domain::SessionRuntimeInstruction {
+                instruction: "background_exec_completed".into(),
+                content: Some(bamboo_domain::SessionMessageContent::text(
+                    "old command result",
+                )),
+                data: None,
+                provider_message: None,
+            },
+        );
+        let birth = old.created_at;
+        let sending = tokio::spawn(async move {
+            match paused.admit_runtime_for_target(envelope, birth).await {
+                Ok(admission) => {
+                    paused.prepare_activation(&admission).await.unwrap();
+                    paused.activate_prepared(&admission).await.unwrap();
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .unwrap();
+        store.delete_session(&old.id).await.unwrap();
+        let replacement = store.recreate_root_session(&old.id, "model").await.unwrap();
+        assert_ne!(replacement.created_at, birth);
+        release.notify_one();
+        assert!(!tokio::time::timeout(Duration::from_secs(5), sending)
+            .await
+            .unwrap()
+            .unwrap());
+        assert_eq!(inbox.inspect(&old.id).await.unwrap().pending, 0);
+        assert!(activation.calls.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn background_exec_old_receipt_cannot_authorize_a_recreated_sessions_staged_message() {
+        let (_temp, store, activation, messenger) = fixture().await;
+        let old = Session::new("runtime-activation-target", "model");
+        store.save_session(&old).await.unwrap();
+        let mut envelope = SessionMessageEnvelope::user_input(&old.id, "unused");
+        envelope.source = SessionMessageSource::Runtime {
+            subsystem: "background_exec".into(),
+        };
+        envelope.kind = SessionMessageKind::RuntimeInstruction;
+        envelope.body =
+            SessionMessageBody::RuntimeInstruction(bamboo_domain::SessionRuntimeInstruction {
+                instruction: "background_exec_completed".into(),
+                content: Some(SessionMessageContent::text("old result")),
+                data: None,
+                provider_message: None,
+            });
+        let admission = messenger
+            .admit_runtime_for_target(envelope, old.created_at)
+            .await
+            .unwrap();
+        store.delete_session(&old.id).await.unwrap();
+        let replacement = store.recreate_root_session(&old.id, "model").await.unwrap();
+        assert_ne!(replacement.created_at, old.created_at);
+        let staged = messenger
+            .admit(SessionMessageEnvelope::user_input(
+                &old.id,
+                "new staged input",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(admission.delivery.generation, staged.delivery.generation);
+        assert_ne!(admission.delivery.id, staged.delivery.id);
+        assert!(messenger
+            .prepare_message_activation(&admission, SessionActivationPolicy::RespectSpecificWait)
+            .await
+            .is_err());
+        assert!(!messenger
+            .inbox()
+            .inspect(&old.id)
+            .await
+            .unwrap()
+            .activation_pending());
+        assert!(activation.calls.lock().await.is_empty());
     }
 
     #[tokio::test]

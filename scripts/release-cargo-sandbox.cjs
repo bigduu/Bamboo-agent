@@ -12,6 +12,106 @@ const assert = require("node:assert/strict");
 const IMAGE = "rust:1.99.0-bookworm@sha256:114c7a4425406451c2866b6aafe69fe29b1b298832db1277d411ac73c82d04d6";
 const FRONTEND = "crates/app/bamboo-server/frontend_package";
 
+const MiB = 1024 ** 2;
+const DEFAULT_DISK_POLICY = Object.freeze({ lowFreeBytes: 2 * 1024 ** 3, maxScratchBytes: 8 * 1024 ** 3 });
+const WORKER_SCRIPT = [
+  'umask 022', 'cargo "$@"', 'status=$?',
+  'find -P /source /cargo-home /target -uid 65532 -type d -exec chmod a+rwx {} \\;',
+  'find -P /source /cargo-home /target -uid 65532 -type f -exec chmod a+rwX {} +',
+  'exit "$status"',
+].join("\n");
+
+function diskPolicy(policy = DEFAULT_DISK_POLICY) {
+  assert.ok(policy && typeof policy === "object" && !Array.isArray(policy), "Invalid Cargo disk policy");
+  assert.deepEqual(Object.keys(policy).sort(), ["lowFreeBytes", "maxScratchBytes"], "Unknown Cargo disk policy field");
+  for (const value of Object.values(policy)) assert.ok(Number.isSafeInteger(value) && value >= 16 * MiB && value <= 16 * 1024 ** 3, "Cargo disk watermarks must be 16MiB..16GiB");
+  assert.ok(policy.lowFreeBytes <= policy.maxScratchBytes, "Invalid Cargo disk watermark order");
+  return { lowFreeBytes: policy.lowFreeBytes, maxScratchBytes: policy.maxScratchBytes };
+}
+function ownedScratch(state) {
+  const root = state.stateRoot;
+  assert.ok(path.isAbsolute(root) && path.resolve(root) === root && root !== path.parse(root).root, "Unsafe Cargo state root");
+  const owner = fs.lstatSync(root);
+  assert.ok(owner.isDirectory() && !owner.isSymbolicLink() && (owner.mode & 0o077) === 0, "Unsafe Cargo state root");
+  assert.equal(fs.realpathSync(root), root, "Symlink in Cargo state parents");
+  let target = root;
+  for (const part of ["data", "target"]) {
+    target = path.join(target, part);
+    const stat = fs.lstatSync(target);
+    assert.ok(stat.isDirectory() && !stat.isSymbolicLink(), "Unsafe compiler scratch parent");
+  }
+  const scratch = path.join(target, "debug");
+  const stat = fs.lstatSync(scratch, { throwIfNoEntry: false });
+  assert.ok(!stat || (stat.isDirectory() && !stat.isSymbolicLink()), "Unsafe compiler scratch");
+  let bytes = 0;
+  function visit(directory) {
+    for (const entry of fs.readdirSync(directory)) {
+      const file = path.join(directory, entry);
+      const item = fs.lstatSync(file);
+      if (item.isSymbolicLink()) continue;
+      bytes += Number.isSafeInteger(item.blocks) && item.blocks >= 0 ? item.blocks * 512 : item.size;
+      if (item.isDirectory()) visit(file);
+    }
+  }
+  if (stat) visit(scratch);
+  return { target, scratch, bytes, exists: !!stat };
+}
+function diskDiagnostic(state, phase, args = [], attempt = 1) {
+  const policy = diskPolicy(state.diskPolicy);
+  const scratch = ownedScratch(state);
+  const stat = fs.statfsSync(scratch.target);
+  const available = stat.bavail * stat.bsize;
+  assert.ok(Number.isSafeInteger(available) && available >= 0, "Invalid Cargo filesystem capacity");
+  const index = args.findIndex(arg => arg === "-p" || arg === "--package");
+  const name = index >= 0 && /^[A-Za-z0-9_-]+$/.test(args[index + 1] || "") ? args[index + 1] : "workspace";
+  process.stderr.write(`[cargo-disk] phase=${phase} attempt=${attempt} package=${name} available_bytes=${available} scratch_bytes=${scratch.bytes} low_free_bytes=${policy.lowFreeBytes} max_scratch_bytes=${policy.maxScratchBytes}\n`);
+  return { ...scratch, available, policy, packageName: name };
+}
+function reclaimScratch(state) {
+  // No output, Cargo config, environment variable or source path selects this.
+  // Workers have exited before recovery; nested links are unlinked, never followed.
+  const scratch = ownedScratch(state);
+  if (scratch.exists) fs.rmSync(scratch.scratch, { recursive: true, force: true });
+  return scratch.bytes;
+}
+function dockerFailure(result) {
+  return /^(?:docker:|Error response from daemon:|Cannot connect to the Docker daemon|error during connect:|error waiting for container:)/im.test(result?.stderr || "");
+}
+function normalWorkerExit(result) {
+  return !!result && !result.error && !result.signal && Number.isInteger(result.status) && result.status >= 0 && result.status <= 255 && ![125, 126, 127].includes(result.status) && !dockerFailure(result);
+}
+function enospc(result) {
+  return normalWorkerExit(result) && result.status === 101 && /\bENOSPC\b|No space left on device/i.test((result.stderr || "") + "\n" + (result.stdout || ""));
+}
+function withDiskRecovery(state, args, invoke) {
+  const before = diskDiagnostic(state, "package-start", args);
+  if (before.available < before.policy.lowFreeBytes || before.bytes > before.policy.maxScratchBytes) {
+    reclaimScratch(state);
+    diskDiagnostic(state, "watermark-reclaim", args);
+  }
+  let result = invoke();
+  for (let attempt = 1; ; attempt++) {
+    if (normalWorkerExit(result)) {
+      try { diskDiagnostic(state, "package-end", args, attempt); }
+      catch {
+        if (result.status === 0) throw new Error("Cargo compiler scratch inspection refused");
+        process.stderr.write("[cargo-disk] scratch inspection refused; retaining original Cargo failure\n");
+        return result;
+      }
+    }
+    if (result.status === 0) return result;
+    // Raw diagnostics were already emitted inside the stop-commands boundary.
+    // Even a quoted legacy runner command must not be echoed outside it.
+    const failureKind = enospc(result) ? "space" : normalWorkerExit(result) ? "cargo" : "worker";
+    process.stderr.write(`[cargo-disk] phase=package-failed attempt=${attempt} package=${before.packageName} status=${result.status ?? "unknown"} failure_kind=${failureKind}\n`);
+    if (attempt !== 1 || !enospc(result)) return result;
+    try { reclaimScratch(state); }
+    catch { process.stderr.write("[cargo-disk] scratch reclamation refused; retaining original Cargo failure\n"); return result; }
+    diskDiagnostic(state, "enospc-retry", args, 2);
+    result = invoke();
+  }
+}
+
 function childEnv() {
   return Object.fromEntries(["PATH", "HOME"]
     .filter(key => process.env[key]).map(key => [key, process.env[key]]));
@@ -91,11 +191,14 @@ function snapshot(source, destination, revision) {
   }
   writable(destination);
 }
-function install(source, stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-cargo-"))) {
+function install(source, stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-cargo-")), policy = DEFAULT_DISK_POLICY) {
+  policy = diskPolicy(policy);
   source = fs.realpathSync(source);
   const revision = git(source, ["rev-parse", "HEAD"]).trim();
   assert.match(revision, /^[0-9a-f]{40}$/);
   fs.mkdirSync(stateRoot, { recursive: true, mode: 0o700 });
+  assert.ok(fs.lstatSync(stateRoot).isDirectory() && !fs.lstatSync(stateRoot).isSymbolicLink(), "Unsafe Cargo state root");
+  stateRoot = fs.realpathSync(stateRoot);
   fs.chmodSync(stateRoot, 0o700);
   for (const name of ["bin", "data", "data/cache", "data/target"]) {
     fs.mkdirSync(path.join(stateRoot, name), { recursive: true, mode: 0o777 });
@@ -105,11 +208,12 @@ function install(source, stateRoot = fs.mkdtempSync(path.join(os.tmpdir(), "bamb
   fs.mkdirSync(path.join(stateRoot, "docker"), { mode: 0o700 });
   const endpoint = process.env.DOCKER_HOST || command("docker", ["context", "inspect", ...(process.env.DOCKER_CONTEXT ? [process.env.DOCKER_CONTEXT] : []), "--format", '{{(index .Endpoints "docker").Host}}']).trim();
   assert.match(endpoint, /^unix:\/\/\//, "Publication requires a local Unix Docker endpoint");
-  const state = { source, revision, stateRoot, endpoint, target: path.join(source, "target") };
+  const state = { source, revision, stateRoot, endpoint, target: path.join(source, "target"), diskPolicy: policy };
   fs.writeFileSync(path.join(stateRoot, "state.json"), JSON.stringify(state), { mode: 0o600 });
   fs.copyFileSync(__filename, path.join(stateRoot, "bin/cargo"));
   copyRegular(__dirname, "release-cargo-upload.cjs", path.join(stateRoot, "bin"));
   fs.chmodSync(path.join(stateRoot, "bin/cargo"), 0o700);
+  diskDiagnostic(state, "startup");
   return state;
 }
 function remapMetadata(output, state) {
@@ -200,9 +304,16 @@ function run(state, args) {
   assert.equal(git(state.source, ["rev-parse", "HEAD"]).trim(), state.revision, "Publication source moved");
   if (args[0] === "publish") return publishArchive(state, args);
   const outputFile = packageFile(state, args);
+  const invoke = () => runWorker(state, args, outputFile);
+  const result = args[0] === "package" ? withDiskRecovery(state, args, invoke) : invoke();
+  return result.status ?? 1;
+}
+function runWorker(state, args, outputFile) {
   const work = fs.mkdtempSync(path.join(state.stateRoot, "data/work-"));
   const source = path.join(work, "source");
   const env = { ...childEnv(), DOCKER_HOST: state.endpoint };
+  let result;
+  let primaryError;
   try {
     snapshot(state.source, source, state.revision);
     const dockerArgs = ["--config", path.join(state.stateRoot, "docker"), "run", "--rm", "--init", "--user", "65532:65532", "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
@@ -211,8 +322,8 @@ function run(state, args) {
       "--mount", `type=bind,src=${path.join(state.stateRoot, "data/target")},dst=/target`, "--workdir", "/source",
       "--env", "HOME=/tmp", "--env", "CARGO_HOME=/cargo-home", "--env", "CARGO_TARGET_DIR=/target",
       "--env", "RUSTUP_TOOLCHAIN=1.99.0", "--env", "RUSTUP_AUTO_INSTALL=0", "--env", "CARGO_TERM_COLOR=never"];
-    dockerArgs.push(IMAGE, "/bin/sh", "-c", 'umask 022; cargo "$@"; status=$?; chmod -R a+rwX /source /cargo-home /target; exit "$status"', "cargo", ...args);
-    const result = spawnSync("docker", dockerArgs, { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
+    dockerArgs.push(IMAGE, "/bin/sh", "-c", WORKER_SCRIPT, "cargo", ...args);
+    result = spawnSync("docker", dockerArgs, { env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
     if (result.error) throw result.error;
     // Build output is untrusted; it must not issue runner workflow commands.
     const stop = crypto.randomBytes(24).toString("hex");
@@ -221,10 +332,20 @@ function run(state, args) {
     if (result.status === 0 && args[0] === "metadata") process.stdout.write(remapMetadata(result.stdout, state));
     else process.stderr.write(result.stdout || "");
     if (process.env.GITHUB_ACTIONS) process.stderr.write(`\n::${stop}::\n`);
-    if (result.status === 0) recover(state, source, outputFile);
-    return result.status ?? 1;
-  } finally {
-    fs.rmSync(work, { recursive: true, force: true });
+    if (result.status === 0) {
+      assert.ok(normalWorkerExit(result), "Ambiguous Cargo worker lifecycle");
+      recover(state, source, outputFile);
+    }
+    return result;
+  } catch (error) { primaryError = error; throw error; }
+  finally {
+    if (normalWorkerExit(result)) {
+      try { fs.rmSync(work, { recursive: true, force: true }); }
+      catch {
+        process.stderr.write("Cargo sandbox generated work cleanup failed\n");
+        if (!primaryError && result.status === 0) throw new Error("Cargo sandbox generated work cleanup failed");
+      }
+    } else process.stderr.write("Cargo sandbox retained work after an ambiguous Docker lifecycle\n");
   }
 }
 async function main() {
@@ -241,4 +362,4 @@ async function main() {
   } catch (error) { console.error(error.message); process.exitCode = 1; }
 }
 if (require.main === module) main();
-module.exports = { IMAGE, childEnv, install, snapshot, regular, copyRegular, packageFile, recover, remapMetadata, publishArchive, run };
+module.exports = { IMAGE, DEFAULT_DISK_POLICY, WORKER_SCRIPT, diskPolicy, ownedScratch, diskDiagnostic, reclaimScratch, withDiskRecovery, normalWorkerExit, enospc, childEnv, install, snapshot, regular, copyRegular, packageFile, recover, remapMetadata, publishArchive, run };

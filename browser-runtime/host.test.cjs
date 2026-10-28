@@ -495,17 +495,40 @@ const recoveryTest = stalledStop => test(
 recoveryTest(false);
 recoveryTest(true);
 
-test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async () => {
+test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async t => {
   const bytes = Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 256));
   const maximumBytes = Buffer.alloc(256 * 1024, 0x5a);
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-download-test-'));
+  const downloadRoot = fs.mkdtempSync(path.join(tempRoot, 'primary-'));
+  const quarantines = [];
+  const ownedDownloadDirectory = root => {
+    const entries = fs.readdirSync(root);
+    assert.equal(entries.length, 1, 'each host has exactly one private download directory');
+    assert.match(entries[0], /^bamboo-browser-download-[a-zA-Z0-9]+$/);
+    const directory = path.join(root, entries[0]);
+    const identity = fs.lstatSync(directory);
+    assert.ok(identity.isDirectory() && !identity.isSymbolicLink());
+    return { root, name: entries[0], directory, dev: identity.dev, ino: identity.ino };
+  };
+  const assertQuarantined = () => {
+    assert.equal(new Set(quarantines.map(owned => owned.root)).size, quarantines.length,
+      'retired hosts never share or reuse a scratch root');
+    for (const owned of quarantines) {
+      assert.deepEqual(fs.readdirSync(owned.root), [owned.name],
+        'abnormal retirement preserves its isolated download directory');
+      const identity = fs.lstatSync(owned.directory);
+      assert.ok(identity.isDirectory() && !identity.isSymbolicLink());
+      assert.equal(identity.dev, owned.dev);
+      assert.equal(identity.ino, owned.ino, 'quarantined scratch is never replaced or reused');
+    }
+  };
   const temporaryFilesIn = directory => fs.readdirSync(directory, { withFileTypes: true })
     .flatMap(entry => entry.isDirectory()
       ? temporaryFilesIn(path.join(directory, entry.name))
       : [path.join(directory, entry.name)]);
-  const temporaryDownloadFiles = () => fs.readdirSync(tempRoot)
+  const temporaryDownloadFiles = () => fs.readdirSync(downloadRoot)
     .filter(name => name.startsWith('bamboo-browser-download-'))
-    .flatMap(name => temporaryFilesIn(path.join(tempRoot, name)));
+    .flatMap(name => temporaryFilesIn(path.join(downloadRoot, name)));
   let oversizedChunks = 0;
   let unsolicitedRequests = 0;
   let hangingClosed = 0;
@@ -844,10 +867,11 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
       BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200',
       TMPDIR: os.tmpdir(),
-      BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
+      BAMBOO_BROWSER_DOWNLOAD_ROOT: downloadRoot,
     },
     stdio: ['pipe', 'pipe', 'inherit'],
   });
+  const hostClosed = once(host, 'close');
   const pending = new Map();
   let nextId = 1;
   const lines = readline.createInterface({ input: host.stdout });
@@ -868,8 +892,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   });
   try {
     const initial = (await call('state')).result;
-    assert.ok(fs.readdirSync(tempRoot).some(name => name.startsWith('bamboo-browser-download-')),
-      'an explicit session-owned root overrides Node platform temp defaults');
+    const ownedDownloads = ownedDownloadDirectory(downloadRoot);
     const ready = (await call('navigate', { url: base + '/', expected_epoch: initial.page_epoch })).result;
     const epoch = ready.page_epoch;
     const first = await call('download', { selector: '#small', expected_epoch: epoch });
@@ -1176,16 +1199,19 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(nativeRace.code, 'download_unverifiable', JSON.stringify(nativeRace));
     assert.equal(nativeRace.result, undefined);
     if (host.exitCode === null) await once(host, 'exit');
-    assert.deepEqual(fs.readdirSync(tempRoot), [],
-      'an ambiguous native download retires the host and its temporary directory');
+    assert.equal(host.exitCode, 1, 'an ambiguous native download retires the old host');
+    quarantines.push(ownedDownloads);
+    assertQuarantined();
 
-    // Failed cleanup/private-page creation must retire with no temp artifact.
+    // Forced retirement quarantines its unconfirmed native writer domain.
+    // Node exit alone does not grant the test permission to erase that scratch.
     for (const mode of ['cleanup', 'reject', 'timeout', 'script-helper-tamper', 'script-navigate']) {
+      const retiringRoot = fs.mkdtempSync(path.join(tempRoot, `${mode}-`));
       const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
         [path.join(__dirname, 'host.cjs')], {
           env: {
             ...process.env, NODE_ENV: 'test', TMPDIR: os.tmpdir(),
-            BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
+            BAMBOO_BROWSER_DOWNLOAD_ROOT: retiringRoot,
             BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
             BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
             BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
@@ -1193,6 +1219,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
           },
           stdio: ['pipe', 'pipe', 'inherit'],
         });
+      const retiringClosed = once(retiringHost, 'close');
       const retiringPending = new Map();
       let retiringId = 1;
       const retiringLines = readline.createInterface({ input: retiringHost.stdout });
@@ -1210,6 +1237,8 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       });
       try {
         const initial = (await retiringCall('state')).result;
+        const ownedDownloads = ownedDownloadDirectory(retiringRoot);
+        assertQuarantined();
         const ready = (await retiringCall('navigate', {
           url: base + (mode.startsWith('script-') ? `/${mode}` : '/'),
           expected_epoch: initial.page_epoch,
@@ -1230,21 +1259,26 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
         }
         assert.ok(performance.now() - startedAt <= 5_500, `${mode} exceeded total 5-second budget`);
         if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
-        assert.notEqual(retiringHost.exitCode, null, `${mode} retired the old host`);
-        assert.deepEqual(fs.readdirSync(tempRoot), [], `${mode} removed private download files`);
+        assert.equal(retiringHost.exitCode, 1, `${mode} retired the old host`);
+        quarantines.push(ownedDownloads);
+        assertQuarantined();
       } finally {
         retiringLines.close();
         retiringHost.stdin.destroy();
         retiringHost.kill();
+        await retiringClosed;
       }
     }
   } finally {
     host.stdin.end();
     host.kill();
+    await hostClosed;
     fixture.closeAllConnections();
     fixture.close();
     await once(fixture, 'close');
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    // The direct test host has no native owner proof for all descendants.
+    // Keep its private quarantine, including on assertion failure.
+    t.diagnostic(`Retained native-writer quarantine: ${tempRoot}`);
   }
 });
 

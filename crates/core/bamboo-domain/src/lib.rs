@@ -8,6 +8,7 @@ pub mod child_context_packet;
 pub mod host_session_create;
 pub mod host_session_scope;
 pub mod llm_request_diagnostic;
+pub mod observer_subscription;
 pub mod poison;
 pub mod reasoning;
 pub mod token_usage;
@@ -36,6 +37,7 @@ pub mod workflow;
 
 // Storage port definitions (moved from application-agent)
 pub mod storage;
+pub mod supervisor_current_user;
 
 // Shared prompt markers (deduped from server/engine).
 pub mod prompt_markers;
@@ -49,6 +51,7 @@ pub use host_session_scope::*;
 pub use ledger::*;
 pub use llm_request_diagnostic::*;
 pub use mcp_config::*;
+pub use observer_subscription::*;
 pub use project::*;
 pub use prompt_markers::{LEGACY_TODO_LIST_END_MARKER, LEGACY_TODO_LIST_START_MARKER};
 pub use provider_catalog::*;
@@ -57,6 +60,7 @@ pub use reasoning::{ReasoningEffort, DEFAULT_REASONING_EFFORT};
 pub use schedule::*;
 pub use session::*;
 pub use storage::*;
+pub use supervisor_current_user::*;
 pub use token_usage::{TokenUsage, MAX_DURABLE_TOKEN_COUNT};
 pub use tool_names::*;
 pub use tool_types::*;

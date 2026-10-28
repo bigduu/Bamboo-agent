@@ -944,13 +944,18 @@ const PLAN_TOOL_NAME: &str = "Plan";
 
 /// True when `call` creates one new child session.
 ///
-/// Every `Plan` call creates exactly one one-shot planner child. A `SubAgent`
-/// call counts only when its `action` is `"create"`, or when the action is
+/// `Plan` creates one one-shot planner child except for its explicit artifact
+/// `read` action. Missing/unparsable Plan arguments stay conservatively counted.
+/// A `SubAgent` call counts only when its `action` is `"create"`, or when the action is
 /// absent/unparsable (the tool's legacy create default). All other SubAgent
 /// actions manage existing children and do not consume the spawn budget.
 fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
     match call.function.name.as_str() {
-        PLAN_TOOL_NAME => return true,
+        PLAN_TOOL_NAME => {
+            return !serde_json::from_str::<serde_json::Value>(&call.function.arguments).is_ok_and(
+                |value| value.get("action").and_then(|action| action.as_str()) == Some("read"),
+            );
+        }
         SUBAGENT_TOOL_NAME => {}
         _ => return false,
     }
@@ -1243,6 +1248,12 @@ async fn maybe_suspend_for_orphaned_children(
                 &child_id,
             )
             .await
+                && !storage
+                    .is_supervisor_observer_child(session, &child_id)
+                    .await
+                    .map_err(|error| {
+                        AgentError::Tool(format!("Observer classification unavailable: {error}"))
+                    })?
             {
                 ordinary.push(child_id);
             }
@@ -1460,6 +1471,81 @@ async fn maybe_suspend_for_outstanding_bash(
     hook.arrange_bash_self_resume(session.id.clone(), hook_ids);
 
     Some(outcome)
+}
+
+/// Transfer the trusted quiet-poll observation to the host without spending
+/// another model recovery round. Stage the notice and wait together: failed
+/// persistence must neither publish a handoff nor start a detached monitor.
+async fn maybe_background_quiet_exec(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    handle: &str,
+) -> Result<bool, AgentError> {
+    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config)
+        || runtime.waiting_for_bash.is_some()
+    {
+        return Ok(false);
+    }
+    let (Some(persistence), Some(hook)) = (
+        config.persistence.as_ref(),
+        config.bash_resume_hook.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    if !hook.supports_background_exec() {
+        return Ok(false);
+    }
+    let Some(job) = bamboo_tools::tools::exec_command::reserve_background_job(&session.id, handle)
+    else {
+        return Ok(false);
+    };
+    let mut candidate = session.clone();
+    let mut waiting_runtime = runtime.clone();
+    let now = Utc::now();
+    waiting_runtime.status = AgentStatusState::Suspended;
+    waiting_runtime.suspension = Some(SuspensionState {
+        reason: "waiting_for_bash".into(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: Some("AfterToolExecution".into()),
+    });
+    waiting_runtime.waiting_for_bash =
+        Some(WaitingForBashState::for_bash(vec![handle.to_owned()], now));
+    state_bridge::write_runtime_state(&mut candidate, &waiting_runtime);
+    candidate
+        .metadata
+        .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+    candidate
+        .metadata
+        .insert("runtime.background_exec_id".into(), handle.to_owned());
+    candidate.updated_at = now;
+    let mut notice = Message::assistant(
+        format!("Moved command `{handle}` to background monitoring. You can continue this conversation; its result will return automatically."),
+        None,
+    );
+    notice.metadata = Some(serde_json::json!({
+        "runtime_kind": "background_exec_wait",
+        "source": "runtime",
+        "exec_session_id": handle,
+    }));
+    candidate.add_message(notice.clone());
+    persistence
+        .save_runtime_session(&mut candidate)
+        .await
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "Background command wait could not be saved: {error}"
+            ))
+        })?;
+    *session = candidate;
+    *runtime = waiting_runtime;
+    hook.arrange_exec_self_resume(job, session.created_at);
+    let _ = event_tx
+        .send(AgentEvent::message_appended(&session.id, &notice))
+        .await;
+    Ok(true)
 }
 
 /// Build the guardian reviewer's task brief: the static rubric plus the active
@@ -3034,6 +3120,12 @@ async fn run_pipeline_inner(
         ));
     }
 
+    // A trusted Supervisor may journal one observation reasoning turn while
+    // its original work/Planner wait remains armed. A newly discovered or
+    // replaced wait must not inherit that intermediate-publication allowance.
+    let supervisor_inherited_wait = session
+        .supervisor_incarnation_id()
+        .and_then(|_| state.runtime_state.waiting_for_children.clone());
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
@@ -3230,6 +3322,21 @@ async fn run_pipeline_inner(
             &state.runtime_state,
             config,
         );
+        if feedback_active {
+            if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
+                if maybe_background_quiet_exec(
+                    session,
+                    config,
+                    &mut state.runtime_state,
+                    event_tx,
+                    handle,
+                )
+                .await?
+                {
+                    break;
+                }
+            }
+        }
         let observation_progress_hint =
             match tool_policy_guard.feedback_for_next_round(feedback_active) {
                 crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
@@ -3655,10 +3762,18 @@ async fn run_pipeline_inner(
                     .await
                 {
                     Ok(Some(suspend)) => {
-                        if inherited_untagged_wait {
+                        let supervisor_reasoning_reply = supervisor_inherited_wait
+                            .as_ref()
+                            .is_some_and(|wait| {
+                                state.runtime_state.waiting_for_children.as_ref() == Some(wait)
+                            });
+                        if inherited_untagged_wait || supervisor_reasoning_reply {
                             // This safety-net wait can also survive a real user
                             // input. Keep its answer as an intermediate message
                             // while the remaining children still prevent Complete.
+                            // The Supervisor's tagged Planner wait has the same
+                            // bounded journal need; ordinary tagged/Guardian
+                            // final-message deferral remains unchanged.
                             let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                                 .then_some(stream_output.reasoning_content);
                             let reasoning_signature = reasoning
@@ -4501,7 +4616,7 @@ async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ord
                 .iter()
                 .map(|entry| entry.execution_name())
                 .collect::<Vec<_>>(),
-            ["Read", "SubAgent"]
+            ["SubAgent"]
         );
         let request = serde_json::from_value(
             serde_json::json!({"query":"SubAgent","kinds":["tool"],"limit":1}),
@@ -10186,6 +10301,79 @@ mod tests {
     }
 
     #[test]
+    fn planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it() {
+        use crate::runtime::stream::handler::StreamHandlingOutput;
+
+        let call = |arguments: serde_json::Value| bamboo_agent_core::tools::ToolCall {
+            id: "plan-budget".into(),
+            tool_type: "function".into(),
+            function: bamboo_agent_core::tools::FunctionCall {
+                name: "Plan".into(),
+                arguments: arguments.to_string(),
+            },
+        };
+        let mut output = StreamHandlingOutput {
+            response_id: None,
+            visible_message: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            reasoning_signature: None,
+            token_count: 0,
+            tool_calls: [0, 512, 1024]
+                .into_iter()
+                .map(|offset| {
+                    call(serde_json::json!({
+                        "action":"read", "child_session_id":"existing-planner",
+                        "expected_child_created_at":"2026-10-26T00:00:00Z",
+                        "expected_assignment_sha256":"a".repeat(64),
+                        "revision":"b".repeat(64), "section_id":"s1", "offset":offset
+                    }))
+                })
+                .collect(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_usage: None,
+            input_tokens: 0,
+            provider_transcript_items: Vec::new(),
+        };
+        let mut reads = super::RoundActivity::default();
+        let usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 0, 0);
+        reads.absorb_attempt(&output, usage);
+        reads.absorb_attempt(&output, usage);
+        let mut runtime = AgentRuntimeState::default();
+        reads.commit_to_runtime(&mut runtime);
+        assert_eq!(
+            runtime.round.total_tool_calls, 6,
+            "reads still count as tools"
+        );
+        assert_eq!(runtime.round.total_subagents_spawned, 0);
+        let budget = bamboo_config::RunBudgetConfig {
+            max_subagents: Some(2),
+            ..Default::default()
+        };
+        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
+
+        output.tool_calls = vec![call(
+            serde_json::json!({"action":"create","task":"Plan only"}),
+        )];
+        let mut create = super::RoundActivity::default();
+        create.absorb_attempt(&output, usage);
+        create.commit_to_runtime(&mut runtime);
+        assert_eq!(runtime.round.total_subagents_spawned, 1);
+        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
+        create.commit_to_runtime(&mut runtime);
+        let exceeded = check_run_budget_exceeded(&runtime.round, &budget).unwrap();
+        assert_eq!(exceeded.kind, "max_subagents");
+        assert_eq!(exceeded.actual, 2);
+        for arguments in [r#"{"task":"legacy create"}"#, "{"] {
+            output.tool_calls[0].function.arguments = arguments.into();
+            assert!(is_child_spawn_call(&output.tool_calls[0]));
+        }
+    }
+
+    #[test]
     fn is_child_spawn_call_counts_plan_and_subagent_create_only() {
         let call = |name: &str, arguments: &str| bamboo_agent_core::tools::ToolCall {
             id: "id".to_string(),
@@ -10197,7 +10385,7 @@ mod tests {
         };
         assert!(
             is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
-            "every Plan call creates one planner child"
+            "a default Plan call creates one planner child"
         );
         assert!(
             is_child_spawn_call(&call("SubAgent", r#"{"action":"create","prompt":"x"}"#)),
@@ -11226,6 +11414,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for ChildIndexStorage {
+        async fn load_root_authority(&self, id: &str) -> std::io::Result<Option<Session>> {
+            // This unit fixture's locked map is its sole canonical store.
+            // Keep the strict authority observation separate from history.
+            let mut observed = self.inner.load_session(id).await?;
+            if let Some(root) = observed.as_mut() {
+                if root.kind != bamboo_domain::SessionKind::Root
+                    || root.parent_session_id.is_some()
+                    || root.root_session_id != root.id
+                    || root.spawn_depth != 0
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unit authority observation is not a canonical Root",
+                    ));
+                }
+                root.messages.clear();
+            }
+            Ok(observed)
+        }
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
             self.inner.save_session(session).await
         }
@@ -11567,10 +11774,13 @@ mod tests {
 
     #[tokio::test]
     async fn partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait() {
-        for (tagged, buffered) in [true, false].into_iter().flat_map(|tagged| {
-            [false, true]
-                .into_iter()
-                .map(move |buffered| (tagged, buffered))
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for (supervisor, tagged, buffered) in [false, true].into_iter().flat_map(|supervisor| {
+            [true, false].into_iter().flat_map(move |tagged| {
+                [false, true]
+                    .into_iter()
+                    .map(move |buffered| (supervisor, tagged, buffered))
+            })
         }) {
             let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
                 inner: Arc::new(TestStorage::default()),
@@ -11580,7 +11790,19 @@ mod tests {
             config.model_name = Some("model".into());
             config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
             config.features_final_evidence_check = buffered;
-            let mut session = Session::new("partial-parent", "model");
+            let mut session = Session::new(
+                if supervisor {
+                    DEFAULT_SUPERVISOR_SESSION_ID
+                } else {
+                    "partial-parent"
+                },
+                "model",
+            );
+            if supervisor {
+                session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+            }
             let mut outcome = Message::user("fast child outcome");
             outcome.metadata = Some(serde_json::json!({
                 "runtime_kind": "child_completion_resume"
@@ -11634,7 +11856,8 @@ mod tests {
                 .iter()
                 .filter(|message| message.content == "continued after child")
                 .collect();
-            assert_eq!(replies.len(), usize::from(!tagged));
+            let journal_reply = !tagged || supervisor;
+            assert_eq!(replies.len(), usize::from(journal_reply));
             let mut events = Vec::new();
             while let Ok(event) = rx.try_recv() {
                 assert!(
@@ -11648,8 +11871,8 @@ mod tests {
                     .iter()
                     .filter(|event| matches!(event, AgentEvent::Token { content } if content == "continued after child"))
                     .count(),
-                usize::from(!buffered || !tagged),
-                "the untagged reply is published once in either streaming mode"
+                usize::from(!buffered || journal_reply),
+                "an eligible intermediate reply is published exactly once"
             );
             if let Some(reply) = replies.first() {
                 assert_eq!(reply.reasoning.as_deref(), Some("remaining child work"));
@@ -11679,6 +11902,71 @@ mod tests {
                 assert_eq!(groups[0].items().len(), 3);
                 assert_eq!(groups[0].items()[2].payload()["id"], "partial-native-reply");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_new_orphan_wait_keeps_terminal_reply_deferred() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for buffered in [false, true] {
+            let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+                inner: Arc::new(TestStorage::default()),
+                children: vec![("slow-child".into(), Some("running".into()))],
+            });
+            let mut config = config_with_storage(storage.clone());
+            config.model_name = Some("model".into());
+            config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
+            config.features_final_evidence_check = buffered;
+            let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            let mut outcome = Message::user("fast child outcome");
+            outcome.metadata = Some(serde_json::json!({"runtime_kind":"child_completion_resume"}));
+            session.add_message(outcome);
+            let mut state = e2e_loop_state(&session.id);
+            assert!(state.runtime_state.waiting_for_children.is_none());
+            session.agent_runtime_state = Some(state.runtime_state.clone());
+            storage.save_session(&session).await.unwrap();
+            let provider = Arc::new(PartialChildWorkProvider {
+                calls: AtomicUsize::new(0),
+                outcome_seen: AtomicBool::new(false),
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let sent_complete = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                Arc::new(PartialChildWorkExecutor::default()),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(provider.outcome_seen.load(Ordering::SeqCst));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert!(!sent_complete);
+            assert_eq!(state.runtime_state.status, AgentStatusState::Suspended);
+            let wait = state.runtime_state.waiting_for_children.as_ref().unwrap();
+            assert_eq!(wait.child_session_ids, vec!["slow-child"]);
+            assert!(wait.registered_by_tool_call_id.is_none());
+            assert!(
+                !session
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "continued after child"),
+                "new orphan discovery is not an inherited Supervisor reasoning turn"
+            );
+            let mut tokens = 0;
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(event, AgentEvent::Complete { .. }));
+                if matches!(event, AgentEvent::Token { content } if content=="continued after child")
+                {
+                    tokens += 1;
+                }
+            }
+            assert_eq!(tokens, usize::from(!buffered));
         }
     }
 
@@ -12007,8 +12295,10 @@ mod tests {
         // background bash, it MUST arrange a self-resume hook so the session
         // is always eventually resumed — no suspend-forever.
         let session_id = "s-bash-liveness";
-        let mut config = AgentLoopConfig::default();
-        config.persistence = Some(Arc::new(StubBashPersistence));
+        let mut config = AgentLoopConfig {
+            persistence: Some(Arc::new(StubBashPersistence)),
+            ..Default::default()
+        };
         let hook = RecordingBashResumeHook {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
@@ -12050,9 +12340,11 @@ mod tests {
         // Blocker 1: if all captured shells finish before the gate commits, the
         // gate returns None — no suspend-forever on a lost-wakeup.
         let session_id = "s-bash-toctou";
-        let mut config = AgentLoopConfig::default();
-        config.persistence = Some(Arc::new(StubBashPersistence));
-        config.bash_resume_hook = Some(Arc::new(NoopBashResumeHook));
+        let config = AgentLoopConfig {
+            persistence: Some(Arc::new(StubBashPersistence)),
+            bash_resume_hook: Some(Arc::new(NoopBashResumeHook)),
+            ..Default::default()
+        };
 
         let shell = bamboo_tools::tools::bash_runtime::spawn_background(
             "true",

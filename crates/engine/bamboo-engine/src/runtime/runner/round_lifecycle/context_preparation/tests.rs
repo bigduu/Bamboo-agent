@@ -3697,14 +3697,16 @@ fn retrieval_window_capped_trigger_stays_above_capped_target() {
     let budget = TokenBudget::with_safety_margin(1_000, 200, BudgetStrategy::default(), 0);
     assert_eq!(budget.max_request_input_tokens(), 800);
 
-    let mut config = AgentLoopConfig::default();
-    config.context_management = ContextManagementConfig {
-        strategy: ContextManagementStrategy::RetrievalWindow,
-        retrieval_window: RetrievalWindowContextConfig {
-            target_usage_ratio: 0.90,
-            trigger_usage_ratio: 0.95,
-            ..Default::default()
+    let config = AgentLoopConfig {
+        context_management: ContextManagementConfig {
+            strategy: ContextManagementStrategy::RetrievalWindow,
+            retrieval_window: RetrievalWindowContextConfig {
+                target_usage_ratio: 0.90,
+                trigger_usage_ratio: 0.95,
+                ..Default::default()
+            },
         },
+        ..Default::default()
     };
 
     assert_eq!(
@@ -6253,7 +6255,7 @@ fn context_pressure_notification_refires_only_on_level_transition() {
         ContextManagementStrategy::Summary,
     );
     assert!(
-        session.metadata.get(LAST_PRESSURE_LEVEL_KEY).is_none(),
+        !session.metadata.contains_key(LAST_PRESSURE_LEVEL_KEY),
         "stored level should be cleared once pressure drops below threshold"
     );
 
