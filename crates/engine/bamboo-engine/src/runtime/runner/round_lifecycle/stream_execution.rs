@@ -316,6 +316,23 @@ fn format_reqwest_transport_error(error: &reqwest::Error) -> String {
     }
 }
 
+fn is_request_body_failure(error: &bamboo_llm::provider::LLMError) -> bool {
+    let bamboo_llm::provider::LLMError::Http(http) = error else {
+        return false;
+    };
+    let mut source: Option<&(dyn StdError + 'static)> = Some(http);
+    while let Some(cause) = source {
+        if cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body)
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
+}
+
 fn format_provider_error(error: bamboo_llm::provider::LLMError) -> String {
     match error {
         bamboo_llm::provider::LLMError::Http(http) => format_reqwest_transport_error(&http),
@@ -1598,8 +1615,14 @@ pub(super) async fn execute_llm_stream(
                     // even overflow-looking text cannot authorize another call.
                     return AgentError::LLMNonRetryable(error.to_string());
                 }
+                // A request body producer can fail after sending a prefix.
+                // Its source text is not evidence of model context overflow and
+                // must not trigger recovery that replays the request.
+                let body_failure = is_request_body_failure(&error);
                 let message = format_provider_error(error);
-                if is_llm_overflow_error(&message) {
+                if body_failure {
+                    AgentError::LLMNonRetryable(message)
+                } else if is_llm_overflow_error(&message) {
                     AgentError::LLMOverflow(message)
                 } else if http_retry_observer.request_budget_managed() {
                     // Terminal auth, request-validation and transport failures
