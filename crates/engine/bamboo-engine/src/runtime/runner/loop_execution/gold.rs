@@ -756,8 +756,27 @@ mod tests {
 
     #[tokio::test]
     async fn queued_refused_fast_is_not_harvested_or_persisted_as_gold_success() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CallableProvider(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LLMProvider for CallableProvider {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(stream::iter([Ok(LLMChunk::Done)])))
+            }
+        }
+
         let (model, provider) = synthetic_rejected_fast().await;
         let mut session = Session::new("queued-gold-fixture", "model");
+        let metadata_before = session.metadata.clone();
         let config = AgentLoopConfig {
             gold_config: Some(GoldConfig {
                 enabled: true,
@@ -815,35 +834,40 @@ mod tests {
             CancellationToken::new(),
             1,
         );
+        // The refusal is handled synchronously while the permit remains held;
+        // no evaluation is spawned or left waiting for that permit.
         assert!(state.gold_evaluation.queued_request.is_none());
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while !state
-                .gold_evaluation
-                .in_flight
-                .as_ref()
-                .unwrap()
-                .join_handle
-                .is_finished()
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("queued refusal must not wait for the held permit");
+        assert!(state.gold_evaluation.in_flight.is_none());
         poll_completed_gold_evaluation(&mut state).await;
         apply_completed_gold_evaluation(&mut session, &config, &mut state).await;
         assert!(state.gold_evaluation.completed.is_none());
-        assert!(!session.metadata.contains_key("gold.last_decision"));
+        assert_eq!(session.metadata, metadata_before);
         assert!(rx.try_recv().is_err());
         drop(held);
+
+        // Prove the next provider can actually be called before checking
+        // cancellation. Its zero count below cannot be a routing refusal.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callable: Arc<dyn LLMProvider> = Arc::new(CallableProvider(calls.clone()));
+        assert!(callable.known_pre_dispatch_error().is_none());
+        let mut stream = callable.chat_stream(&[], &[], None, &model).await.unwrap();
+        assert!(matches!(stream.next().await, Some(Ok(LLMChunk::Done))));
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        calls.store(0, Ordering::SeqCst);
 
         // A run already cancelled before the queued task is polled must not
         // dispatch or emit a Gold Started/Completed event either.
         state.gold_evaluation.queued_request =
-            QueuedEvaluation::new(request, provider.clone(), model.clone());
+            QueuedEvaluation::new(request, callable.clone(), model.clone());
+        assert!(state.gold_evaluation.queued_request.is_some());
         let cancelled = CancellationToken::new();
         cancelled.cancel();
-        start_queued_gold_evaluation_if_idle(&mut state, &tx, provider, &config, cancelled, 1);
+        start_queued_gold_evaluation_if_idle(&mut state, &tx, callable, &config, cancelled, 1);
+        assert!(
+            state.gold_evaluation.in_flight.is_some(),
+            "the valid route reaches the cancellable task"
+        );
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !state
                 .gold_evaluation
@@ -860,6 +884,12 @@ mod tests {
         .unwrap();
         poll_completed_gold_evaluation(&mut state).await;
         assert!(state.gold_evaluation.completed.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cancelled work never calls the valid provider"
+        );
+        assert_eq!(session.metadata, metadata_before);
         assert!(rx.try_recv().is_err());
     }
 

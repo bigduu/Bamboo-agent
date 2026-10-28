@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::time::{sleep, timeout, Duration};
 
+include!("gold_router_registry_fixture.rs");
+
 fn auto_answer_call(arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         id: "call-1".to_string(),
