@@ -55,12 +55,15 @@ const PLANNER_SERIAL = {
 };
 
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-// Audited from accepted dev3fe: preserve its FileInbox, current-user/Work
-// and TicketApplication cancellation/drain changes. stream_execution.rs adds
-// the unconditional is_http_body_failure classifier; existing feature cfg and
-// modules, all31 default owners, four contexts and all19 additions remain.
-// Default catalogs own the retry, Stop and Engine body-failure regressions.
-const FEATURE_SOURCE_SHA256 = "0b9b6786b2b6ddb132054a6062abd7a699fcf8dee5bc4f14d85a8a916f6a101b";
+// Audited from accepted dev3fe and the live-bootstrap candidate: preserve the
+// existing FileInbox, current-user/Work and TicketApplication ownership. The
+// stream checkpoint and Inbox/actor methods are unconditional; the new root
+// bootstrap tests are cfg(test) and belong to the default storage catalog.
+// Default harnesses own 20 storage, two LLM and four Unix server live cases,
+// plus five fresh-input server regressions; none match the serial exclusions.
+// Feature cfg expressions, 31 default owners, four contexts and 19 explicit
+// additive cases remain unchanged. Default catalogs own retry and Stop tests.
+const FEATURE_SOURCE_SHA256 = "def74a37d747739e571ef5d61130f521be31a5ec7b0bf988c661160a34781cf4";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
