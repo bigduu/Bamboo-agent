@@ -5697,12 +5697,14 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
                 .post(&self.url)
                 .body("synthetic request")
                 .send()
-                .await?;
+                .await
+                .expect("synthetic response headers must arrive");
             let mut prefix = Vec::new();
             while prefix.len() < b"synthetic-prefix".len() {
                 let chunk = response
                     .chunk()
-                    .await?
+                    .await
+                    .expect("reading the synthetic prefix must not fail")
                     .expect("response prefix must arrive");
                 prefix.extend_from_slice(&chunk);
             }
