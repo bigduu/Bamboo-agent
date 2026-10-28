@@ -277,7 +277,9 @@ impl MutationIdempotencyStore {
                 if entry.payload_fingerprint != prepared.payload_fingerprint {
                     return conflict_response();
                 }
-                if !revalidate {
+                // A prior refusal or unknown result must not authorize a
+                // later offer merely because the same key was retried.
+                if !revalidate || entry.response.status != StatusCode::OK {
                     tracing::debug!(
                         target: "bamboo.mutation_idempotency",
                         correlation_id = %correlation_id(&prepared.key_digest),
@@ -427,7 +429,7 @@ mod tests {
             .await;
         store
             .execute(prepared("current", "b"), || async {
-                HttpResponse::Accepted().finish()
+                HttpResponse::Ok().finish()
             })
             .await;
         let current_key = prepared("current", "b").key_digest;
@@ -463,6 +465,22 @@ mod tests {
         assert_eq!(conflict.status(), StatusCode::CONFLICT);
         let body: serde_json::Value = serde_json::from_slice(&body(conflict).await.1).unwrap();
         assert_eq!(body["error"]["code"], "idempotency_key_conflict");
+    }
+
+    #[actix_web::test]
+    async fn revalidation_does_not_turn_a_cached_refusal_into_a_new_effect() {
+        let store = Arc::new(MutationIdempotencyStore::default());
+        let first = store
+            .execute_revalidating(prepared("retry", "same"), || async {
+                HttpResponse::Conflict().body("outcome uncertain")
+            })
+            .await;
+        let replay = store
+            .execute_revalidating(prepared("retry", "same"), || async {
+                panic!("a refused continuation must not consume a later offer")
+            })
+            .await;
+        assert_eq!(body(first).await, body(replay).await);
     }
 
     #[actix_web::test]

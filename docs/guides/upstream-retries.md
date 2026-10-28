@@ -97,6 +97,9 @@ earlier offer. Multiple separately confirmable offers would require a protocol
 that identifies each offer. The Host caps outstanding registered offer
 operations at 32 and tracks at most 1024 run markers; capacity exhaustion
 leaves the bounded request failure intact and does not create a continuation.
+When an idempotency key receives a refusal or uncertain result, retries with
+that key replay it; a later explicit confirmation is a new operation and uses a
+new key. These receipts are process-local and expire or may be evicted.
 
 ## Diagnostic compatibility
 

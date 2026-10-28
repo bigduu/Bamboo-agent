@@ -119,12 +119,21 @@ pub(crate) struct ConfirmationTestGate {
     pub release: tokio::sync::Notify,
 }
 
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RegistrationTestGate {
+    pub reached: tokio::sync::Notify,
+    pub release: tokio::sync::Notify,
+}
+
 #[derive(Default)]
 pub(crate) struct LiveRetryBridge {
     offers: Mutex<HashMap<String, Arc<Entry>>>,
     active_payloads: Arc<AtomicUsize>,
     #[cfg(test)]
     confirmation_test_gate: Mutex<Option<Arc<ConfirmationTestGate>>>,
+    #[cfg(test)]
+    registration_test_gate: Mutex<Option<Arc<RegistrationTestGate>>>,
     #[cfg(test)]
     reject_next_callback: AtomicBool,
 }
@@ -148,6 +157,18 @@ impl LiveRetryBridge {
             });
             map.remove(&entry.session_id);
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_registration_for_test(&self) -> Arc<RegistrationTestGate> {
+        let gate = Arc::new(RegistrationTestGate::default());
+        *self.registration_test_gate.lock().unwrap() = Some(gate.clone());
+        gate
+    }
+
+    #[cfg(test)]
+    fn registration_test_gate(&self) -> Option<Arc<RegistrationTestGate>> {
+        self.registration_test_gate.lock().unwrap().clone()
     }
 
     #[cfg(test)]
@@ -465,6 +486,14 @@ impl LiveBootstrapHost for BoundLiveBootstrapHost {
             || self.token.is_cancelled()
         {
             return Err(io::Error::other("live retry binding changed"));
+        }
+        #[cfg(test)]
+        if let Some(gate) = self.bridge.registration_test_gate() {
+            gate.reached.notify_one();
+            tokio::select! {
+                _ = gate.release.notified() => {},
+                _ = self.token.cancelled() => return Err(io::Error::other("run cancelled")),
+            }
         }
         let session_id = owner.fence.actor_id.clone();
         let run_id = owner.fence.run_id.clone();

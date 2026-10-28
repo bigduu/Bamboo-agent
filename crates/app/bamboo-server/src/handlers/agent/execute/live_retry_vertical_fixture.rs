@@ -95,6 +95,7 @@ enum LiveVerticalCase {
     StopAfterContinue,
     StopDuringConfirm,
     GateCancelledBeforeResult,
+    EarlyKeyBeforeOffer,
     RejectConfirmation,
     HeadersTimeout,
 }
@@ -200,6 +201,8 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         root,
     );
     let state = web::Data::new(state);
+    let registration_gate = (case == LiveVerticalCase::EarlyKeyBeforeOffer)
+        .then(|| state.live_retry.pause_registration_for_test());
     state
         .session_activation_router
         .set_spawner(Arc::new(ManualHttpOnly))
@@ -244,6 +247,25 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         "initial execute: {first}"
     );
     let run_id = first["run_id"].as_str().unwrap().to_owned();
+    if let Some(gate) = &registration_gate {
+        tokio::time::timeout(Duration::from_secs(10), gate.reached.notified())
+            .await
+            .unwrap();
+        let early = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .insert_header(("Idempotency-Key", "early-continuation-key"))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(early.status(), StatusCode::CONFLICT);
+        let early: serde_json::Value = test::read_body_json(early).await;
+        assert_eq!(early["error"]["code"], "retry_resume_outcome_uncertain");
+        gate.release.notify_one();
+    }
     let waiting = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let response = test::call_service(
@@ -657,11 +679,41 @@ async fn run_live_retry_vertical(case: LiveVerticalCase) {
         );
     }
 
+    if case == LiveVerticalCase::EarlyKeyBeforeOffer {
+        let replay = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .insert_header(("Idempotency-Key", "early-continuation-key"))
+                .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let replay: serde_json::Value = test::read_body_json(replay).await;
+        assert_eq!(replay["error"]["code"], "retry_resume_outcome_uncertain");
+        assert!(state
+            .live_retry
+            .waiting(&state.agent_runners, id)
+            .await
+            .is_some());
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            before_http.len()
+        );
+    }
     continue_allowed.store(true, Ordering::SeqCst);
     let request = || {
-        test::TestRequest::post()
+        let request = test::TestRequest::post()
             .uri(&format!("/api/v1/execute/{id}"))
-            .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+            .insert_header(("Bamboo-Run-Id", run_id.as_str()));
+        let request = if case == LiveVerticalCase::EarlyKeyBeforeOffer {
+            request.insert_header(("Idempotency-Key", "new-explicit-confirmation"))
+        } else {
+            request
+        };
+        request
             .set_json(serde_json::json!({"upstream_retry":{"mode":"until_cancelled"}}))
             .to_request()
     };
@@ -861,6 +913,12 @@ async fn live_retry_http_stop_after_confirmation_reports_continuous_mode() {
 #[actix_web::test]
 async fn live_retry_http_rejected_callback_cannot_deadlock() {
     run_live_retry_vertical(LiveVerticalCase::RejectConfirmation).await;
+}
+
+#[cfg(unix)]
+#[actix_web::test]
+async fn live_retry_http_early_idempotency_key_cannot_consume_later_offer() {
+    run_live_retry_vertical(LiveVerticalCase::EarlyKeyBeforeOffer).await;
 }
 
 #[cfg(unix)]
