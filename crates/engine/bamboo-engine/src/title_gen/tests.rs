@@ -63,7 +63,7 @@ async fn routing_contract_title_invalid_explicit_fast_never_dispatches_a_fallbac
 }
 
 #[tokio::test]
-async fn routing_contract_title_rejects_removed_fast_with_a_retained_registry() {
+async fn routing_contract_title_embedder_owned_removed_fast_keeps_sdk_route() {
     use crate::app_context::model_routing_test_support::RoutingContext;
     for flag in [None, Some(false), Some(true)] {
         let state = RoutingContext::new(flag);
@@ -96,12 +96,15 @@ async fn routing_contract_title_rejects_removed_fast_with_a_retained_registry() 
             "Synthetic removed-account request",
         )
         .await;
-        assert!(
-            result.is_err(),
-            "flag {flag:?}: removed Fast instance unexpectedly resolved: {:?}",
-            state.requests("fast-b")
+        // This provider map belongs to the embedding application, not Config.
+        // Managed removal is separately tested with ProviderRegistry::from_config.
+        assert_eq!(result.unwrap(), "Synthetic routing title", "flag {flag:?}");
+        assert_eq!(
+            state.requests("fast-b"),
+            vec![("cheap-b".into(), "title_generation".into())]
         );
-        state.assert_no_requests();
+        assert!(state.requests("chat-a").is_empty());
+        assert!(state.requests("memory-c").is_empty());
     }
 }
 

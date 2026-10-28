@@ -462,7 +462,7 @@ fn try_resolve_role_ref_chain<'a>(
             )));
         }
     }
-    let provider = ProviderModelRouter::new(provider_registry.clone()).route(model_ref)?;
+    let provider = provider_registry.provider_for_configured_model(config, model_ref)?;
     Ok(Some(ResolvedModel::from_ref(provider, model_ref)))
 }
 

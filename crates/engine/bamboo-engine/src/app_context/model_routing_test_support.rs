@@ -212,6 +212,18 @@ impl AgentSessionContext for RoutingContext {
             .route(target)
             .ok()
     }
+    fn get_provider_for_model_ref_with_config(
+        &self,
+        config: &Config,
+        target: &ProviderModelRef,
+    ) -> Result<Option<Arc<dyn LLMProvider>>, LLMError> {
+        self.registry
+            .provider_for_configured_model(config, target)
+            .map(Some)
+    }
+    fn resolve_provider_ref_under_config_lock(&self) -> bool {
+        true
+    }
     async fn get_provider_for_endpoint(&self, provider: &str) -> Option<Arc<dyn LLMProvider>> {
         self.registry.get(provider)
     }

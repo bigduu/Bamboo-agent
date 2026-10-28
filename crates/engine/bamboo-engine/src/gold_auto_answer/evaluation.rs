@@ -199,77 +199,117 @@ async fn resolve_gold_provider_and_model(
     session: &Session,
     gold_config: &GoldConfig,
 ) -> Result<GoldAuxiliaryTarget, String> {
-    let config_snapshot = state.config().read().await.clone();
-    let provider_name = gold_provider_name(&config_snapshot, session);
-    let stream_timeout = config_snapshot.stream_timeout;
-    let configured_limit = crate::runtime::config::normalize_auxiliary_evaluation_max_concurrency(
-        config_snapshot
-            .extra
-            .get("auxiliary_evaluation_max_concurrency")
-            .and_then(serde_json::Value::as_u64),
-    );
-    let explicit_model = gold_config
-        .model_name
-        .as_deref()
-        .map(str::trim)
-        .filter(|model| !model.is_empty());
-    // A dedicated bare Gold model belongs to the executing account. Otherwise
-    // use the complete global Fast target; never carry only its model name into
-    // a session/default provider, or reinterpret a rejected role as unset.
-    if explicit_model.is_none() {
-        if let Some(fast) = crate::model_config_helper::try_resolve_fast_model(
-            &config_snapshot,
-            &provider_name,
-            state.provider_registry(),
+    // Resolve synchronously against the live config while holding its read
+    // guard. In particular, never await the direct-provider seam under it.
+    let (
+        provider_name,
+        model,
+        stream_timeout,
+        configured_limit,
+        target,
+        no_config,
+        route_after_unlock,
+    ) = {
+        let config = state.config().read().await;
+        let provider_name = gold_provider_name(&config, session);
+        let stream_timeout = config.stream_timeout;
+        let configured_limit =
+            crate::runtime::config::normalize_auxiliary_evaluation_max_concurrency(
+                config
+                    .extra
+                    .get("auxiliary_evaluation_max_concurrency")
+                    .and_then(serde_json::Value::as_u64),
+            );
+        let explicit_model = gold_config
+            .model_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        // Dedicated Gold is bound to the executing account. Otherwise retain
+        // the complete Fast target and propagate a rejected explicit route.
+        if explicit_model.is_none() {
+            if let Some(fast) = crate::model_config_helper::try_resolve_fast_model(
+                &config,
+                &provider_name,
+                state.provider_registry(),
+            )
+            .map_err(|error| format!("Configured Gold fallback route is unavailable: {error}"))?
+            {
+                let selected_provider = config
+                    .defaults
+                    .as_ref()
+                    .map(|defaults| {
+                        defaults
+                            .fast
+                            .as_ref()
+                            .unwrap_or(&defaults.chat)
+                            .provider
+                            .clone()
+                    })
+                    .unwrap_or_else(|| provider_name.clone());
+                return Ok(gold_auxiliary_target(
+                    fast.provider,
+                    fast.model_name,
+                    selected_provider,
+                    stream_timeout,
+                    configured_limit,
+                ));
+            }
+        }
+        let model = explicit_model
+            .or_else(|| {
+                let model = session.model.trim();
+                (!model.is_empty() && model != "unknown").then_some(model)
+            })
+            .ok_or_else(|| "gold model name is required".to_string())?
+            .to_string();
+        let target = ProviderModelRef::new(&provider_name, &model);
+        let locked = state.resolve_provider_ref_under_config_lock();
+        if locked {
+            if let Some(provider) = state
+                .get_provider_for_model_ref_with_config(&config, &target)
+                .map_err(|error| {
+                    format!("Configured Gold provider/model route is unavailable: {error}")
+                })?
+            {
+                return Ok(gold_auxiliary_target(
+                    provider,
+                    model,
+                    provider_name,
+                    stream_timeout,
+                    configured_limit,
+                ));
+            }
+        }
+        let no_config = config.defaults.is_none()
+            && config.provider_instances.is_empty()
+            && session_effective_model_ref(session).is_none();
+        (
+            provider_name,
+            model,
+            stream_timeout,
+            configured_limit,
+            target,
+            no_config,
+            !locked,
         )
-        .map_err(|error| format!("Configured Gold fallback route is unavailable: {error}"))?
-        {
-            let selected_provider = config_snapshot
-                .defaults
-                .as_ref()
-                .map(|defaults| {
-                    defaults
-                        .fast
-                        .as_ref()
-                        .unwrap_or(&defaults.chat)
-                        .provider
-                        .clone()
-                })
-                .unwrap_or_else(|| provider_name.clone());
+    };
+
+    // Legacy embedder overrides previously ran without the config lock.
+    if route_after_unlock {
+        if let Some(provider) = state.get_provider_for_model_ref(&target) {
             return Ok(gold_auxiliary_target(
-                fast.provider,
-                fast.model_name,
-                selected_provider,
+                provider,
+                model,
+                provider_name,
                 stream_timeout,
                 configured_limit,
             ));
         }
     }
-    let model = explicit_model
-        .or_else(|| {
-            let model = session.model.trim();
-            (!model.is_empty() && model != "unknown").then_some(model)
-        })
-        .ok_or_else(|| "gold model name is required".to_string())?
-        .to_string();
-    let target = ProviderModelRef::new(&provider_name, &model);
-    if let Some(provider) = state.get_provider_for_model_ref(&target) {
-        return Ok(gold_auxiliary_target(
-            provider,
-            model,
-            provider_name,
-            stream_timeout,
-            configured_limit,
-        ));
-    }
     // A standalone context may supply one direct provider without a registry.
-    // Retain that SDK seam only without an explicit account/role configuration;
-    // a rejected configured route must never escape through get_default().
-    if state.provider_registry().is_empty()
-        && config_snapshot.defaults.is_none()
-        && config_snapshot.provider_instances.is_empty()
-        && session_effective_model_ref(session).is_none()
-    {
+    // Rejected configured routes must never escape through get_default().
+    if no_config && state.provider_registry().is_unmanaged_and_empty() {
         return Ok(gold_auxiliary_target(
             state.get_provider().await,
             model,
@@ -543,39 +583,8 @@ mod provider_selection_tests {
     }
 
     #[tokio::test]
-    async fn routing_contract_gold_state_rejects_stale_explicit_account_without_dispatch() {
+    async fn routing_contract_gold_embedder_owned_registry_preserves_its_routes() {
         use crate::app_context::model_routing_test_support::RoutingContext;
-        let mut failures = Vec::new();
-        for flag in [None, Some(false), Some(true)] {
-            for change in ["disabled", "removed", "revoked", "derived"] {
-                let state = RoutingContext::new(flag);
-                make_gold_target_stale(&state, change).await;
-                let session = synthetic_pending_gold_session();
-                let result = super::evaluate_gold_state_for_pending_question(
-                    state.as_ref(),
-                    &session.id,
-                    &session,
-                    &explicit_gold_config(),
-                )
-                .await;
-                let requests = ["chat-a", "fast-b", "memory-c"].map(|id| (id, state.requests(id)));
-                if result.is_ok() || requests.iter().any(|(_, calls)| !calls.is_empty()) {
-                    failures.push(format!(
-                        "flag={flag:?}, change={change}, result={result:?}, requests={requests:?}"
-                    ));
-                }
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "stale Gold state route dispatched: {failures:#?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn routing_contract_gold_answer_rechecks_live_target_after_state_evaluation() {
-        use crate::app_context::model_routing_test_support::RoutingContext;
-        let mut failures = Vec::new();
         for flag in [None, Some(false), Some(true)] {
             for change in ["disabled", "removed", "revoked", "derived"] {
                 let state = RoutingContext::new(flag);
@@ -588,30 +597,40 @@ mod provider_selection_tests {
                     &gold,
                 )
                 .await
-                .expect("synthetic state evaluation should succeed before invalidation");
-                let original = vec![("explicit-gold".to_string(), "gold_evaluation".to_string())];
-                assert_eq!(state.requests("chat-a"), original);
+                .unwrap();
                 make_gold_target_stale(&state, change).await;
-                let result = super::evaluate_gold_auto_answer_question(
+                // ProviderRegistry::new is controlled by the embedding host.
+                // The from_config test below verifies the opposite, managed case.
+                super::evaluate_gold_state_for_pending_question(
+                    state.as_ref(),
+                    &session.id,
+                    &session,
+                    &gold,
+                )
+                .await
+                .unwrap();
+                super::evaluate_gold_auto_answer_question(
                     state.as_ref(),
                     &session.id,
                     &session,
                     &gold,
                     &evaluation,
                 )
-                .await;
-                let chat = state.requests("chat-a");
-                let fast = state.requests("fast-b");
-                let memory = state.requests("memory-c");
-                if result.is_ok() || chat != original || !fast.is_empty() || !memory.is_empty() {
-                    failures.push(format!("flag={flag:?}, change={change}, result={result:?}, chat={chat:?}, fast={fast:?}, memory={memory:?}"));
-                }
+                .await
+                .unwrap();
+                assert_eq!(
+                    state.requests("chat-a"),
+                    vec![
+                        ("explicit-gold".into(), "gold_evaluation".into()),
+                        ("explicit-gold".into(), "gold_evaluation".into()),
+                        ("explicit-gold".into(), "gold_auto_answer".into()),
+                    ],
+                    "flag={flag:?}, change={change}"
+                );
+                assert!(state.requests("fast-b").is_empty());
+                assert!(state.requests("memory-c").is_empty());
             }
         }
-        assert!(
-            failures.is_empty(),
-            "stale Gold answer route dispatched: {failures:#?}"
-        );
     }
 
     struct GoldOverrideContext {
@@ -884,7 +903,7 @@ mod provider_selection_tests {
         use crate::app_context::model_routing_test_support::RoutingContext;
         let mut observations = Vec::new();
         for flag in [None, Some(false), Some(true)] {
-            for change in ["disabled", "removed", "revoked"] {
+            for change in ["disabled", "removed", "revoked", "derived"] {
                 let chat = managed_gold_mock().await;
                 let fast = managed_gold_mock().await;
                 let memory = managed_gold_mock().await;
@@ -940,8 +959,22 @@ mod provider_selection_tests {
                     &session,
                     &gold,
                 )
-                .await
-                .is_err();
+                .await;
+                let expected = match change {
+                    "disabled" => "is disabled",
+                    "removed" => "has no available current configuration",
+                    "revoked" | "derived" => "admitted",
+                    _ => unreachable!(),
+                };
+                let state_error = rejected_state
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("");
+                assert!(
+                    state_error.contains(expected),
+                    "state flag={flag:?}, change={change}: {state_error}"
+                );
                 let after_state = chat.received_requests().await.unwrap().len();
                 let rejected_answer = super::evaluate_gold_auto_answer_question(
                     state.as_ref(),
@@ -950,14 +983,22 @@ mod provider_selection_tests {
                     &gold,
                     &evaluation,
                 )
-                .await
-                .is_err();
+                .await;
+                let answer_error = rejected_answer
+                    .as_ref()
+                    .err()
+                    .map(String::as_str)
+                    .unwrap_or("");
+                assert!(
+                    answer_error.contains(expected),
+                    "answer flag={flag:?}, change={change}: {answer_error}"
+                );
                 let after_answer = chat.received_requests().await.unwrap().len();
                 observations.push((
                     flag,
                     change,
-                    rejected_state,
-                    rejected_answer,
+                    rejected_state.is_err(),
+                    rejected_answer.is_err(),
                     after_state,
                     after_answer,
                     fast.received_requests().await.unwrap().len(),
@@ -965,7 +1006,7 @@ mod provider_selection_tests {
                 ));
             }
         }
-        assert_eq!(observations.len(), 9);
+        assert_eq!(observations.len(), 12);
         assert!(
             observations.iter().all(
                 |(_, _, state, answer, after_state, after_answer, fast, memory)| *state
