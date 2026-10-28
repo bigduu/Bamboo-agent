@@ -95,6 +95,22 @@ const FEATURE_CONTEXTS = [
       "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"] }] },
 ];
 
+// A package and its additive feature cases always share the same runner.
+const FEATURE_SHARDS = ["agent", "server", "packages-0", "packages-1", "packages-2", "packages-3", "packages-4"];
+function packageShard(name) {
+  if (name === "bamboo-agent") return "agent";
+  if (name === "bamboo-server") return "server";
+  return "packages-" + createHash("sha256").update(name).digest().readUInt32BE(0) % 5;
+}
+function selectShard(packages, featureContexts, shard) {
+  if (!shard) return { packages, featureContexts };
+  assert.ok(FEATURE_SHARDS.includes(shard), "Unknown feature shard: " + shard);
+  const selected = packages.filter((owner) => packageShard(owner.name) === shard);
+  assert.ok(selected.length, "Feature shard must contain at least one package: " + shard);
+  const names = new Set(selected.map((owner) => owner.name));
+  return { packages: selected, featureContexts: featureContexts.filter((context) => names.has(context.package)) };
+}
+
 function selectedPackages(metadata) {
   const selected = new Set(metadata.workspace_default_members);
   const recorder = metadata.packages.find((item) => item.name === "bamboo-tool-event-recorder-example");
@@ -313,9 +329,14 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     { cwd: root, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   assert.equal(metadata.status, 0, metadata.stderr || "Cannot inspect packages");
   const workspace = JSON.parse(metadata.stdout);
-  const packages = selectedPackages(workspace);
-  assert.equal(sourceFeatureHash(packages, root), sourceCatalogSha,
+  const allPackages = selectedPackages(workspace);
+  assert.equal(sourceFeatureHash(allPackages, root), sourceCatalogSha,
     "Feature-sensitive source changed; review and update its explicit case ownership before admission");
+  for (const context of featureContexts) assert.ok(allPackages.some((owner) => owner.name === context.package),
+    "Missing feature owner: " + context.package);
+  const selection = selectShard(allPackages, featureContexts, environment.BAMBOO_FEATURE_SHARD);
+  const packages = selection.packages;
+  featureContexts = selection.featureContexts;
   const directory = fs.mkdtempSync(path.join(environment.RUNNER_TEMP || os.tmpdir(), "bamboo-feature-tests-"));
   const contexts = [], defaults = new Map();
   const plan = [...packages.map((owner) => ({ label: "default-" + owner.name })),
@@ -485,6 +506,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
 }
 
 module.exports = { selectedPackages, sourceFeatureHash, cargoArguments, compiledExecutable, sshExecutable, runSerialStorage,
+  FEATURE_SHARDS, packageShard, selectShard,
   SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, PLANNER_SERIAL, runPlannerSerial,
   DEFAULT_TELEMETRY_CASE, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, validateFeatureCatalog, runFeatureTests };
 if (require.main === module) {
