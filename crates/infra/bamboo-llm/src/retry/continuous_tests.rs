@@ -400,7 +400,7 @@ async fn managed_headers_timeout_never_becomes_a_successful_body_deadline() {
     let server = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut buffer = [0u8; 2048];
-        socket.read(&mut buffer).await.unwrap();
+        assert!(socket.read(&mut buffer).await.unwrap() > 0);
         socket
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n")
             .await

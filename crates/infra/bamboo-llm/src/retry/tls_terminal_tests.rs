@@ -1,5 +1,6 @@
 //! Real loopback TLS regression tests using a throwaway synthetic identity.
 use super::*;
+use std::error::Error;
 use std::fs;
 use std::net::SocketAddr;
 use std::process::Command;
@@ -107,9 +108,15 @@ async fn peer(reset_handshake: bool) -> LocalPeer {
     .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(config));
     let task = tokio::spawn(async move {
-        while let Ok((socket, _)) = listener.accept().await {
+        while let Ok((mut socket, _)) = listener.accept().await {
             seen.fetch_add(1, Ordering::SeqCst);
             if reset_handshake {
+                // Make sure the request or ClientHello has reached the peer;
+                // otherwise some platforms report an ordinary connect error.
+                let mut first_byte = [0u8; 1];
+                if socket.read_exact(&mut first_byte).await.is_err() {
+                    continue;
+                }
                 socket2::SockRef::from(&socket)
                     .set_linger(Some(Duration::ZERO))
                     .unwrap();
@@ -156,6 +163,20 @@ fn retry_config() -> RetryConfig {
     }
 }
 
+fn assert_native_tls_error(error: LLMError) {
+    let LLMError::Http(error) = error else {
+        panic!("expected an HTTP transport error");
+    };
+    let mut source: Option<&(dyn Error + 'static)> = Some(&error);
+    while let Some(cause) = source {
+        if cause.downcast_ref::<native_tls::Error>().is_some() {
+            return;
+        }
+        source = cause.source();
+    }
+    panic!("expected a native TLS error in the request error chain");
+}
+
 async fn terminal_certificate_failure(trust: bool, host: &str) {
     let peer = peer(false).await;
     let client = client(&peer, trust);
@@ -177,7 +198,8 @@ async fn terminal_certificate_failure(trust: bool, host: &str) {
         result.is_ok(),
         "permanent TLS validation failure kept retrying"
     );
-    assert!(result.unwrap().is_err());
+    let error = result.unwrap().err().expect("TLS failure must be returned");
+    assert_native_tls_error(error);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
 }
@@ -236,7 +258,37 @@ async fn opaque_handshake_failure_stops_instead_of_guessing_it_is_transient() {
     )
     .await;
     assert!(result.is_ok(), "opaque TLS failure must not keep retrying");
-    assert!(result.unwrap().is_err());
+    let error = result.unwrap().err().expect("TLS failure must be returned");
+    assert_native_tls_error(error);
+    assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn anthropic_consumer_stops_on_untrusted_certificate() {
+    let peer = peer(false).await;
+    let client = client(&peer, false);
+    let url = format!("https://synthetic.invalid:{}/", peer.addr.port());
+    let config = retry_config();
+    let attempts = AtomicUsize::new(0);
+    let result = tokio::time::timeout(
+        Duration::from_millis(900),
+        with_upstream_retry(UpstreamRetry::UntilCancelled, async {
+            let budget = InitialRequestBudget::new(&config);
+            send_anthropic_with_retry(&config, &budget, || {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                client.post(&url).body("synthetic request")
+            })
+            .await
+        }),
+    )
+    .await;
+    let error = match result {
+        Ok(Err(error)) => error,
+        Ok(Ok(_)) => panic!("untrusted certificate unexpectedly succeeded"),
+        Err(_) => panic!("Anthropic consumer kept retrying a TLS validation error"),
+    };
+    assert_native_tls_error(error);
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
     assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
 }
