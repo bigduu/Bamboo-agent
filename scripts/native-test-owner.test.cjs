@@ -14,7 +14,26 @@ const actorScopes = [...actorSource.matchAll(/Assert-TestList '([^']+)' '([^']+)
 }));
 const digest = file => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 
+// These fixture names come from the actual checked-out Rust sources. The real
+// native owner separately lists and hashes the Cargo-built test executable.
+function tokioTests(relative) {
+  const source = fs.readFileSync(path.join(__dirname, "..", relative), "utf8");
+  return [...source.matchAll(/#\[tokio::test(?:\([^\]]*\))?\]\s*async\s+fn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(/gu)].map(match => match[1]);
+}
+const llmTlsSource = "crates/infra/bamboo-llm/src/retry/tls_terminal_tests.rs";
+const llmContinuousSource = "crates/infra/bamboo-llm/src/retry/continuous_tests.rs";
+const engineSource = "crates/engine/bamboo-engine/src/runtime/runner/round_lifecycle/stream_execution/tests.rs";
+const llmBodyName = "request_body_error_after_prefix_is_not_replayed";
+const engineNames = ["body_error_with_overflow_words_must_not_be_recovered_as_model_overflow",
+  "synthetic_provider_api_overflow_stays_recoverable", "unmanaged_response_body_error_after_headers_is_terminal"];
+const enginePrefix = "runtime::runner::round_lifecycle::stream_execution::tests::";
+
 function cases(recipe) {
+  if (recipe.id === "llm-retry-native") return [
+    ...tokioTests(llmTlsSource).map(name => "retry::tls_terminal_tests::" + name),
+    ...tokioTests(llmContinuousSource).filter(name => name === llmBodyName).map(name => "retry::continuous_tests::" + name),
+  ];
+  if (recipe.id === "engine-retry-native") return tokioTests(engineSource).filter(name => engineNames.includes(name)).map(name => enginePrefix + name);
   if (recipe.id === "server-default") return [
     ...Array.from({ length: 7 }, (_, index) => TLS + "fixture_" + index),
     ...Array.from({ length: 7 }, (_, index) => FRONTEND + "fixture_" + index),
@@ -44,6 +63,41 @@ test("fixed native owners retain separate default, Actor API-only and macOS dev 
     assert.equal(recipe.frontend, "embedded");
   }
   assert.throws(() => recipes("linux"));
+});
+
+test("retry native owners select every real source witness and keep distinct default contexts", () => {
+  const retrySource = fs.readFileSync(path.join(__dirname, "../crates/infra/bamboo-llm/src/retry.rs"), "utf8");
+  assert.match(retrySource, /#\[path = "retry\/tls_terminal_tests\.rs"\]\s*mod tls_terminal_tests;/u);
+  assert.match(retrySource, /#\[path = "retry\/continuous_tests\.rs"\]\s*mod continuous_tests;/u);
+  const engineModules = [
+    ["../crates/engine/bamboo-engine/src/lib.rs", /pub mod runtime;/u],
+    ["../crates/engine/bamboo-engine/src/runtime/mod.rs", /pub mod runner;/u],
+    ["../crates/engine/bamboo-engine/src/runtime/runner.rs", /pub\(crate\) mod round_lifecycle;/u],
+    ["../crates/engine/bamboo-engine/src/runtime/runner/round_lifecycle.rs", /mod stream_execution;/u],
+    ["../crates/engine/bamboo-engine/src/runtime/runner/round_lifecycle/stream_execution.rs", /#\[cfg\(test\)\]\s*mod tests;/u],
+  ];
+  for (const [file, declaration] of engineModules) assert.match(fs.readFileSync(path.join(__dirname, file), "utf8"), declaration);
+  for (const platform of ["win32", "darwin"]) {
+    for (const [id, owner, expected] of [["llm-retry-native", "bamboo-llm", 12], ["engine-retry-native", "bamboo-engine", 3]]) {
+      const recipe = recipes(platform).find(item => item.id === id);
+      assert.ok(recipe); assert.equal(recipe.package, owner); assert.deepEqual(recipe.targets, ["--lib"]);
+      assert.equal(recipe.toolchain, "stable"); assert.equal(recipe.profile, "test"); assert.equal(recipe.frontend, "embedded");
+      const names = cases(recipe);
+      assert.equal(names.length, expected); assert.equal(new Set(names).size, expected);
+      assert.deepEqual([...recipe.requiredCases].sort(), [...names].sort());
+      const list = [...names, "unselected::other"].map(name => name + ": test").join("\n");
+      assert.deepEqual(selectedCases(list, recipe), [...names].sort());
+      const args = cargoArguments(recipe), separator = args.indexOf("--");
+      assert.deepEqual(args.slice(separator + 1, separator + 1 + recipe.filters.length), recipe.filters);
+      assert.equal(args.includes("--exact"), id === "engine-retry-native");
+      const log = `test result: ok. ${expected} passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s`;
+      assertRuntime(log, names, recipe);
+      for (let index = 0; index < names.length; index++) {
+        const substituted = names.map((name, i) => i === index ? name + "_substituted" : name);
+        assert.throws(() => assertRuntime(log, substituted, recipe), /Native required case set changed/);
+      }
+    }
+  }
 });
 
 test("native subprocesses receive their selected context without credentials or workflow write channels", () => {
@@ -163,7 +217,7 @@ function fixture(t, platform, fault) {
   return { root, target, temporary, revision, tree, calls, execute };
 }
 
-for (const [platform, expected] of [["win32", 145], ["darwin", 107]]) test(`fixed ${platform} owner proves ${expected} named cases in one target with real freshness bindings`, t => {
+for (const [platform, expected] of [["win32", 160], ["darwin", 122]]) test(`fixed ${platform} owner proves ${expected} named cases in one target with real freshness bindings`, t => {
   const f = fixture(t, platform);
   const result = runNativeOwner({ root: f.root, platform, execute: f.execute, environment: { RUNNER_TEMP: f.temporary, GITHUB_SHA: f.revision,
     GITHUB_TOKEN: "private", BAMBOO_RELEASE_SIGNING_KEY: "private", HTTP_PROXY: "private" } });

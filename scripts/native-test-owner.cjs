@@ -15,6 +15,27 @@ const TLS = "server::tls::tests::";
 const FRONTEND = "frontend_build::tests::";
 const TICKET = "workspace_files::physical::tests::unsupported_platform_file_operations_fail_closed_without_mutation";
 const ACTOR_TOOLCHAIN = "1.99.0-x86_64-pc-windows-msvc";
+const LLM_RETRY_TLS = "retry::tls_terminal_tests::";
+const LLM_RETRY_BODY = "retry::continuous_tests::request_body_error_after_prefix_is_not_replayed";
+const LLM_RETRY_CASES = [
+  "untrusted_certificate_is_terminal_even_in_continuous_mode",
+  "hostname_mismatch_is_terminal_even_in_continuous_mode",
+  "trusted_matching_certificate_still_succeeds",
+  "opaque_handshake_failure_stops_instead_of_guessing_it_is_transient",
+  "rustls_untrusted_certificate_is_terminal",
+  "rustls_hostname_mismatch_is_terminal",
+  "rustls_trusted_matching_certificate_succeeds",
+  "anthropic_consumer_stops_on_untrusted_certificate",
+  "dns_unknown_permanent_error_is_terminal",
+  "dns_explicit_transient_error_remains_retryable",
+  "plain_tcp_reset_before_headers_remains_retryable",
+].map(name => LLM_RETRY_TLS + name).concat(LLM_RETRY_BODY);
+const ENGINE_RETRY_PREFIX = "runtime::runner::round_lifecycle::stream_execution::tests::";
+const ENGINE_RETRY_CASES = [
+  "body_error_with_overflow_words_must_not_be_recovered_as_model_overflow",
+  "synthetic_provider_api_overflow_stays_recoverable",
+  "unmanaged_response_body_error_after_headers_is_terminal",
+].map(name => ENGINE_RETRY_PREFIX + name);
 
 function recipes(platform) {
   assert.ok(["win32", "darwin"].includes(platform), "Native ownership requires Windows or macOS");
@@ -29,6 +50,10 @@ function recipes(platform) {
     ...(windows ? [{ id: "ticket-default", package: "bamboo-tickets", targets: ["--lib"], filters: [TICKET], count: 1, exact: true }] : []),
     { id: "skills-default", package: "bamboo-skills", targets: ["--lib"], filters: SKILLS, count: windows ? 39 : 41 },
     { id: "skill-tool-default", package: "bamboo-server-tools", targets: ["--lib"], filters: ["skill_runtime::catalog_tests::"], count: windows ? 46 : 47 },
+    { id: "llm-retry-native", package: "bamboo-llm", targets: ["--lib"], filters: [LLM_RETRY_TLS, LLM_RETRY_BODY],
+      requiredCases: LLM_RETRY_CASES, count: 12 },
+    { id: "engine-retry-native", package: "bamboo-engine", targets: ["--lib"], filters: ENGINE_RETRY_CASES,
+      exact: true, requiredCases: ENGINE_RETRY_CASES, count: 3 },
   ].map(recipe => ({ toolchain: "stable", frontend: "embedded", profile: recipe.unwind ? "dev" : "test", ...recipe }));
 }
 
@@ -81,6 +106,7 @@ function assertRuntime(log, names, recipe) {
   assert.ok(summaries.length, "Native runtime has no test summary");
   assert.ok(summaries.every(match => match[1] === "ok" && match[3] === "0" && match[4] === "0"), "Native runtime failed or ignored required cases");
   assert.equal(summaries.reduce((total, match) => total + Number(match[2]), 0), names.length, "Native runtime did not execute the enumerated selection");
+  if (recipe.requiredCases) assert.deepEqual([...names].sort(), [...recipe.requiredCases].sort(), "Native required case set changed: " + recipe.id);
   const mandatory = recipe.id === "skills-default" ? (recipe.count === 39
     ? ["windows_real_opened_handle_identity_admits_and_reuses_regular_sources", "windows_real_directory_junction_cannot_supply_instruction_policy", "actual_windows_junction_is_created_and_rejected_without_reading_target"]
     : ["file_and_directory_links_and_fifo_cannot_supply_policy_or_main", "unix_file_directory_link_fifo_and_read_error_do_not_become_empty_or_absent"])
