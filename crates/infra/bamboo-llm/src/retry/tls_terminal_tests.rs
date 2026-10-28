@@ -61,6 +61,7 @@ async fn peer(reset_handshake: bool) -> LocalPeer {
                         let _ = stream
                             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
                             .await;
+                        let _ = stream.flush().await;
                     }
                 }
             });
