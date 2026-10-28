@@ -134,6 +134,11 @@ async fn trusted_matching_certificate_still_succeeds() {
     let client = client(&peer, true);
     let url = format!("https://synthetic.invalid:{}/", peer.addr.port());
     let config = retry_config();
+    let direct = tokio::time::timeout(Duration::from_secs(3), client.get(&url).send())
+        .await
+        .expect("direct trusted request timed out")
+        .expect("direct trusted handshake and response should succeed");
+    assert_eq!(direct.status(), reqwest::StatusCode::OK);
     let response = tokio::time::timeout(
         Duration::from_secs(3),
         with_upstream_retry(
@@ -145,7 +150,7 @@ async fn trusted_matching_certificate_still_succeeds() {
     .expect("trusted peer should respond")
     .expect("trusted matching certificate should be accepted");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    assert_eq!(peer.accepted.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.accepted.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]
