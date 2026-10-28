@@ -50,7 +50,8 @@ function assertRouting(source) {
   assert.match(job(source, "native-feature-tests"), /github.event_name == 'workflow_dispatch'/);
   assert.match(job(source, "native-feature-tests"), /os: \[windows-2025, macos-latest\]/);
   const shards = job(source, "feature-shards");
-  assert.match(shards, /fail-fast: false\n      matrix:\n        shard: \[agent, server, packages-0, packages-1, packages-2, packages-3, packages-4\]/);
+  assert.match(shards, /fail-fast: false\n      matrix:\n        shard:/);
+  assert.deepEqual([...shards.matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1]), require("./run-feature-tests.cjs").FEATURE_SHARDS);
   assert.match(shards, /BAMBOO_FEATURE_SHARD: \$\{\{ matrix.shard \}\}/);
   assert.match(job(source, "feature-tests"), /test "\$SHARDS_RESULT" = success/);
   assert.match(job(source, "msrv"), /cargo check --locked --workspace --all-targets --all-features/);
@@ -76,7 +77,7 @@ test("feature CI owns tests and quality once; main has only read-only promotion"
     ["  workflow_dispatch:", "  push:\n    branches: [main]\n  workflow_dispatch:"],
     ["needs.validation-source.outputs.feature == 'true'", "always()"],
     ["run: node scripts/run-feature-tests.cjs", "run: cargo test"],
-    ["shard: [agent, server, packages-0, packages-1, packages-2, packages-3, packages-4]", "shard: [agent]"],
+    ["          - agent-tests-0\n", ""],
     ["shard: [host, profile, shared, other]", "shard: [host, profile, shared]"],
     ["run: cargo fmt --all -- --check", "run: true"],
   ]) assert.throws(() => assertRouting(ci.replace(before, after)));

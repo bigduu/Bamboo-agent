@@ -24,7 +24,7 @@ Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
 branch and isolated worktree; only the named integrator writes a shared batch
 branch. Every feature PR to `dev` must pass required `Test`, which aggregates
 Unit, E2E and the live SSH fixture on its actual merge source. Linux Cargo
-tests run in independently rerunnable package shards, each owning its target
+tests run in independently rerunnable shards, each owning its target
 directory and preserving independent default package configurations. Cargo runs each package's library/binary, integration and
 documentation cases once. Explicit feature owners run only their catalogued
 additional cases; new feature-sensitive cases require ownership review.

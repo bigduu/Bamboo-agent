@@ -1,18 +1,18 @@
 # Feature Unit and E2E execution
 
-Feature code PRs to dev use seven independently rerunnable Linux package shards,
-each with its own target/feature-tests directory. The controller selects existing Cargo
+Feature code PRs to dev use independently rerunnable Linux test shards, each
+with its own target/feature-tests directory. The controller selects existing Cargo
 default-members plus the recorder; analytics and unrelated example packages
 stay outside acceptance.
 
-Each package belongs to exactly one shard and runs with its default features. Cargo's default
-target selection covers library/binary Unit cases, integration E2E cases and
-doctests once. Do not combine the selected packages into one Cargo command:
+Ordinary packages belong to one shard. Agent and server are further split by
+test target, and server library cases use disjoint namespace blocks. Library,
+binary, integration and doctest cases each run once. Do not combine the selected packages into one Cargo command:
 workspace feature unification can enable test utilities in production-default
 dependencies. Unit/E2E are logical target groups, not separate build jobs.
 
-The same shard owns each package's additive cases, serial selections and SSH
-fixture. Dependencies may be compiled in more than one isolated runner; the
+Each additive owner shares a shard with its relevant default catalog; serial
+selections and the SSH fixture stay with their package. Dependencies may be compiled in more than one isolated runner; the
 workflow does not run a separate workspace build or repeat a test selection.
 Root and docs Markdown-only PRs run Quick Checks without product compilation.
 

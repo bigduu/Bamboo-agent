@@ -326,7 +326,26 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [agent, server, packages-0, packages-1, packages-2, packages-3, packages-4]
+        shard:
+          - agent-core
+          - agent-tests-0
+          - agent-tests-1
+          - agent-tests-2
+          - agent-tests-3
+          - server-browser
+          - server-chat
+          - server-execute
+          - server-settings
+          - server-app-state
+          - server-handlers
+          - server-other
+          - server-tests-0
+          - server-tests-1
+          - packages-0
+          - packages-1
+          - packages-2
+          - packages-3
+          - packages-4
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
@@ -345,7 +364,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
-          shared-key: bamboo-feature-configurations-${{ runner.os }}-${{ matrix.shard }}
+          shared-key: bamboo-feature-configurations-${{ runner.os }}-${{ startsWith(matrix.shard, 'agent-') && 'agent' || startsWith(matrix.shard, 'server-') && 'server' || matrix.shard }}
           workspaces: . -> target/feature-tests
           save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
       - name: Require exact feature source and committed frontend
