@@ -5428,3 +5428,207 @@ async fn legacy_browser_dispatch_sends_acknowledgement_and_retains_durable_defin
     assert_eq!(*llm.requested_tool_names.lock().unwrap(), vec!["browser"]);
     assert_eq!(session.messages.last().unwrap().content, full_result);
 }
+
+#[tokio::test]
+async fn body_error_with_overflow_words_must_not_be_recovered_as_model_overflow() {
+    use bytes::Bytes;
+    use futures::StreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
+    use tokio::sync::Notify;
+
+    struct SyntheticBodyProvider {
+        url: String,
+        notify: Arc<Notify>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for SyntheticBodyProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let config = bamboo_llm::retry::RetryConfig {
+                max_attempts: 2,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(5),
+            };
+            bamboo_llm::retry::send_provider_request(&config, "synthetic-body", || {
+                let notify = self.notify.clone();
+                let prefix = futures::stream::once(async {
+                    Ok::<Bytes, std::io::Error>(Bytes::from_static(b"synthetic-prefix"))
+                });
+                let fail = futures::stream::once(async move {
+                    notify.notified().await;
+                    Err::<Bytes, std::io::Error>(std::io::Error::other(
+                        "input is too long: synthetic request body source failed",
+                    ))
+                });
+                client
+                    .post(&self.url)
+                    .body(reqwest::Body::wrap_stream(prefix.chain(fail)))
+            })
+            .await?;
+            panic!("synthetic request body must fail");
+        }
+    }
+
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let notify = Arc::new(Notify::new());
+    let received = Arc::new(AtomicUsize::new(0));
+    let server_notify = notify.clone();
+    let server_received = received.clone();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 1024];
+        loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "request ended before synthetic prefix");
+            bytes.extend_from_slice(&buffer[..count]);
+            if bytes
+                .windows(b"synthetic-prefix".len())
+                .any(|window| window == b"synthetic-prefix")
+            {
+                server_received.fetch_add(1, Ordering::SeqCst);
+                server_notify.notify_one();
+                let _ = socket.read(&mut buffer).await;
+                return;
+            }
+            assert!(bytes.len() < 16 * 1024, "synthetic request prefix missing");
+        }
+    });
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let llm: Arc<dyn LLMProvider> = Arc::new(SyntheticBodyProvider {
+        url,
+        notify,
+        calls: calls.clone(),
+    });
+    let mut session = Session::new("synthetic-body-overflow", "test-model");
+    let config = test_config("synthetic system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("synthetic system"),
+            Message::user("synthetic input"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let cancel_token = CancellationToken::new();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        execute_llm_stream(
+            &mut session,
+            &config,
+            &llm,
+            &prepared_context,
+            &[],
+            &LlmStreamFrame {
+                event_tx: &event_tx,
+                cancel_token: &cancel_token,
+                session_id: "synthetic-body-overflow",
+                model: "test-model",
+                provider_name: None,
+                provider_type: None,
+                reasoning_effort: None,
+                max_context_tokens: 400_000,
+                max_output_tokens: 128,
+                observation_progress_hint: None,
+                prompt_memory_exposure: None,
+            },
+        ),
+    )
+    .await
+    .expect("synthetic Engine request should not hang");
+    server.await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(received.load(Ordering::SeqCst), 1);
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("synthetic body error unexpectedly succeeded"),
+    };
+    assert!(
+        matches!(error, AgentError::LLMNonRetryable(_)),
+        "request body failure was misclassified: {error:?}"
+    );
+}
+
+#[tokio::test]
+async fn genuine_model_api_overflow_stays_recoverable() {
+    struct SyntheticOverflowProvider;
+    #[async_trait]
+    impl LLMProvider for SyntheticOverflowProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            Err(bamboo_llm::provider::LLMError::Api(
+                "input is too long".to_owned(),
+            ))
+        }
+    }
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let llm: Arc<dyn LLMProvider> = Arc::new(SyntheticOverflowProvider);
+    let mut session = Session::new("synthetic-model-overflow", "test-model");
+    let config = test_config("synthetic system");
+    let prepared_context = PreparedContext {
+        messages: vec![
+            Message::system("synthetic system"),
+            Message::user("synthetic input"),
+        ],
+        token_usage: usage(0, 24),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(16);
+    let cancel_token = CancellationToken::new();
+    let result = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &cancel_token,
+            session_id: "synthetic-model-overflow",
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            max_context_tokens: 400_000,
+            max_output_tokens: 128,
+            observation_progress_hint: None,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("synthetic overflow unexpectedly succeeded"),
+    };
+    assert!(
+        matches!(error, AgentError::LLMOverflow(_)),
+        "genuine API overflow must remain recoverable: {error:?}"
+    );
+}
