@@ -3,6 +3,7 @@
 //! manufactured Planner or evidence for #1059's unfinished artifact adapter.
 
 use super::*;
+use crate::app_state::AgentStatus;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, Tool, ToolCall, ToolCtx, ToolSchema};
 use bamboo_domain::{
@@ -20,7 +21,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -56,6 +57,9 @@ fn call(name: &str, id: &str, arguments: Value) -> ToolCall {
 struct Probe {
     turns: AtomicUsize,
     parent: Mutex<Vec<Vec<Message>>>,
+    hold_parent_report: AtomicBool,
+    parent_report_entered: Notify,
+    parent_report_release: Notify,
     entered: Notify,
     release: Notify,
     work_entered: Notify,
@@ -68,6 +72,9 @@ impl Probe {
         Self {
             turns: AtomicUsize::new(0),
             parent: Mutex::new(Vec::new()),
+            hold_parent_report: AtomicBool::new(false),
+            parent_report_entered: Notify::new(),
+            parent_report_release: Notify::new(),
             entered: Notify::new(),
             release: Notify::new(),
             work_entered: Notify::new(),
@@ -91,6 +98,14 @@ impl LLMProvider for Probe {
             .any(|message| message.content.contains(PRIVATE)));
         let chunk = match model {
             PARENT_MODEL => {
+                if messages
+                    .iter()
+                    .any(|message| message.content.contains(REPORT))
+                    && self.hold_parent_report.swap(false, Ordering::SeqCst)
+                {
+                    self.parent_report_entered.notify_one();
+                    self.parent_report_release.notified().await;
+                }
                 self.parent.lock().unwrap().push(messages.to_vec());
                 LLMChunk::Token("Supervisor processed its canonical input.".into())
             }
@@ -382,6 +397,41 @@ async fn wait_saved(state: &AppState, id: &str, predicate: impl Fn(&Session) -> 
     }
 }
 
+async fn wait_parent_report_quiescent(state: &AppState, probe: &Probe, id: &str) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let report_processed = {
+                let requests = probe.parent.lock().unwrap();
+                requests.iter().any(|messages| {
+                    messages
+                        .iter()
+                        .any(|message| message.content.contains(REPORT))
+                })
+            };
+            let runner_active = {
+                let runners = state.agent_runners.read().await;
+                runners.get(id).is_some_and(|runner| {
+                    matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+                })
+            };
+            let owner = state.session_activation_router.current_run_id(id).await;
+            let backlog = state.session_inbox.inspect(id).await.unwrap();
+            if report_processed
+                && saved(state, id).await.last_run_status().as_deref() == Some("completed")
+                && !runner_active
+                && owner.is_none()
+                && backlog.pending == 0
+                && backlog.claimed == 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("parent must process the report and release its runner, router and Inbox");
+}
+
 fn source(session: &Session) -> Option<ChildCompletionSource> {
     serde_json::from_str(session.metadata.get("runtime.child_completion_source_v1")?).ok()
 }
@@ -470,6 +520,9 @@ async fn native_case(with_work_wait: bool) {
         );
         assert_eq!(f.probe.turns.load(Ordering::SeqCst), 1);
     }
+    if !with_work_wait {
+        f.probe.hold_parent_report.store(true, Ordering::SeqCst);
+    }
     f.probe.release.notify_one();
     let observer = wait_saved(&f.state, OBSERVER, complete).await;
     let original_source = source(&observer).unwrap();
@@ -485,6 +538,34 @@ async fn native_case(with_work_wait: bool) {
         "the sealed Observer result must retain its report: {}",
         sealed_report.content
     );
+    if !with_work_wait {
+        tokio::time::timeout(WAIT, f.probe.parent_report_entered.notified())
+            .await
+            .expect("the report must reach the parent provider gate");
+        // The previous run's terminal status and an empty Inbox do not prove
+        // that the newly admitted report has been processed by the provider.
+        let staged = saved(&f.state, parent_id).await;
+        assert!(staged
+            .messages
+            .iter()
+            .any(|message| message.content.contains(REPORT)));
+        assert_eq!(staged.last_run_status().as_deref(), Some("completed"));
+        let backlog = f.state.session_inbox.inspect(parent_id).await.unwrap();
+        assert_eq!(backlog.pending, 0);
+        assert_eq!(backlog.claimed, 0);
+        {
+            let requests = f.probe.parent.lock().unwrap();
+            assert_eq!(
+                requests.len(),
+                1,
+                "only the earlier parent run was processed"
+            );
+            assert!(!requests[0]
+                .iter()
+                .any(|message| message.content.contains(REPORT)));
+        }
+        f.probe.parent_report_release.notify_one();
+    }
     let parent = wait_saved(&f.state, parent_id, |parent| {
         parent
             .messages
@@ -567,6 +648,7 @@ async fn native_case(with_work_wait: bool) {
         })
         .await;
     }
+    wait_parent_report_quiescent(&f.state, f.probe.as_ref(), parent_id).await;
     let retry = f
         .state
         .start_supervisor_observer(&f.reference, 0, operation, OBSERVER, f.targets())
@@ -651,8 +733,17 @@ async fn native_case(with_work_wait: bool) {
             .generation,
         generation
     );
+    wait_parent_report_quiescent(&reopened, probe.as_ref(), &reference.session_id).await;
     assert_eq!(probe.parent.lock().unwrap().len(), before);
     let parent = saved(&reopened, &reference.session_id).await;
+    assert_eq!(
+        parent
+            .messages
+            .iter()
+            .filter(|message| message.content.contains(REPORT))
+            .count(),
+        1
+    );
     assert!(reopened
         .storage
         .is_supervisor_observer_child(&parent, OBSERVER)
