@@ -166,9 +166,11 @@ be matched with the authenticated local trace API. They do not grant access.
 
 The existing legacy numeric session counters cannot represent an unknown
 value; when malformed provider evidence clears a count, compatibility paths
-may use zero or a local estimate. The optional prompt/cache ratio is omitted
-when either provider input or cache read is unknown. Use the optional hook or
-trace fields for the provider-reported value. Ticket budget settlement retains its reservation after
+may use zero or a local estimate. The optional prompt/cache detail is omitted
+for every provider when either provider input or cache read is unknown; for
+example an OpenAI-compatible response without cache usage no longer appears as
+an exact zero-percent cache hit. Use the optional hook or trace fields for the
+provider-reported value. Ticket budget settlement retains its reservation after
 malformed usage even if later frames recover, while still enforcing observed
 over-cap lower bounds. Rust stream consumers that exhaustively match the public
 `LLMChunk` enum must handle its new `ProviderUsageReplace` bookkeeping variant;

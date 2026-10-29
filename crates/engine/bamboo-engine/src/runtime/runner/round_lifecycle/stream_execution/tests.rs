@@ -2230,6 +2230,76 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
 }
 
 #[tokio::test]
+async fn openai_prompt_budget_omits_unknown_cache_but_keeps_explicit_zero() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    for cache_read in [None, Some(0)] {
+        let mut session = Session::new("session-openai-cache-availability", "test-model");
+        let (event_tx, mut event_rx) = mpsc::channel::<AgentEvent>(16);
+        let prepared_context = PreparedContext {
+            messages: vec![Message::system("system")],
+            token_usage: usage(0, 22),
+            truncation_occurred: false,
+            segments_removed: 0,
+            compressed_message_ids: Vec::new(),
+            prompt_cached_tool_outputs: 0,
+            prompt_cached_tool_tokens_saved: 0,
+        };
+        let llm: Arc<dyn LLMProvider> = mock_llm(vec![
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                total_tokens: Some(120),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: cache_read,
+                cache_write_input_tokens: None,
+            },
+            LLMChunk::Done,
+        ]);
+        execute_llm_stream(
+            &mut session,
+            &test_config("system"),
+            &llm,
+            &prepared_context,
+            &[],
+            &LlmStreamFrame {
+                event_tx: &event_tx,
+                cancel_token: &CancellationToken::new(),
+                session_id: "session-openai-cache-availability",
+                model: "test-model",
+                provider_name: None,
+                provider_type: Some("openai"),
+                reasoning_effort: None,
+                max_context_tokens: 400_000,
+                max_output_tokens: 128,
+                observation_progress_hint: None,
+                prompt_memory_exposure: None,
+            },
+        )
+        .await
+        .expect("execute synthetic OpenAI usage");
+        let mut last_budget = None;
+        while let Ok(event) = event_rx.try_recv() {
+            if let AgentEvent::TokenBudgetUpdated { usage } = event {
+                last_budget = Some(usage);
+            }
+        }
+        let budget = last_budget.expect("final budget event");
+        assert_eq!(budget.cache_read_input_tokens, 0);
+        match cache_read {
+            None => assert!(budget.provider_prompt_usage.is_none()),
+            Some(0) => {
+                let prompt = budget.provider_prompt_usage.expect("reported zero cache");
+                assert_eq!(prompt.total_input_tokens(), 100);
+                assert_eq!(prompt.cache_read_input_tokens, 0);
+                assert_eq!(prompt.cache_hit_rate(), Some(0.0));
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test]
 async fn execute_llm_stream_includes_task_block_in_full_request() {
     let _env_lock = isolate_prompt_safe_env_cache();
     let mut session = Session::new("session-stream-task", "test-model");

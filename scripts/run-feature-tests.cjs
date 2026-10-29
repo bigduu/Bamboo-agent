@@ -81,7 +81,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Root-fenced startup/response guard cases remain in the default storage owner;
 // Connect and Schedule routing cases stay in server-other, reasoning resolution
 // in the default engine owner, and Observer cases in server-app-state.
-const FEATURE_SOURCE_SHA256 = "1c9ab2d073e0e2558b5cee02d75e4d25372305e73387264b9f23ea548e6cc1b6";
+// Gemini replacement and budget cases remain in the default bamboo-llm and
+// bamboo-engine owners (packages-2 and packages-3); Responses cases remain in
+// the default server-handlers owner. No additive feature cases changed.
+const FEATURE_SOURCE_SHA256 = "af92f34f9284402df3d34d308127b42d74e406f417d20b809869f3f42a69a327";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
