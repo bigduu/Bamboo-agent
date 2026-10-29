@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::GoldConfig;
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_llm::Config;
-use bamboo_llm::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
+use bamboo_llm::{LLMError, ProviderRegistry, ResolvedModel};
 
 pub const GOLD_CONFIG_METADATA_KEY: &str = "gold_config";
 
@@ -935,10 +935,9 @@ pub fn resolve_code_review_model(
 pub fn resolve_subagent_model_ref(
     config: &Config,
     provider_name: &str,
-    provider_registry: &Arc<ProviderRegistry>,
+    _provider_registry: &Arc<ProviderRegistry>,
     subagent_type: &str,
 ) -> Option<bamboo_domain::ProviderModelRef> {
-    let router = ProviderModelRouter::new(provider_registry.clone());
     if let Some(defaults) = config.defaults.as_ref() {
         let candidate_refs = [
             defaults.subagent_models.get(subagent_type),
@@ -948,11 +947,34 @@ pub fn resolve_subagent_model_ref(
         ];
 
         let model_ref = candidate_refs.into_iter().flatten().next()?;
-        return router.route(model_ref).ok().map(|_| model_ref.clone());
+        // This is selection, not admission. Preserve an explicit invalid ref
+        // so the real child admission rejects it rather than inheriting the
+        // parent's unrelated model after `None`.
+        return Some(model_ref.clone());
     }
 
-    resolve_fast_model(config, provider_name, provider_registry)
-        .map(|resolved| bamboo_domain::ProviderModelRef::new(provider_name, resolved.model_name))
+    let legacy_model = if let Some(instance) = config.provider_instances.get(provider_name) {
+        // Retain a disabled instance's configured intent for final admission.
+        instance
+            .fast_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .or_else(|| {
+                instance
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+            })
+            .map(ToString::to_string)
+            .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()))
+    } else {
+        // Legacy provider entries historically treated a blank fast selection
+        // as unset and inherited the parent rather than selecting an empty ID.
+        get_fast_model_for_provider(config, provider_name).filter(|model| !model.trim().is_empty())
+    };
+    legacy_model.map(|model| bamboo_domain::ProviderModelRef::new(provider_name, model))
 }
 
 /// Resolve the model for a specific subagent type.
@@ -967,10 +989,7 @@ pub fn resolve_subagent_model(
 ) -> Option<ResolvedModel> {
     let model_ref =
         resolve_subagent_model_ref(config, provider_name, provider_registry, subagent_type)?;
-    let provider = ProviderModelRouter::new(provider_registry.clone())
-        .route(&model_ref)
-        .ok()?;
-    Some(ResolvedModel::from_ref(provider, &model_ref))
+    try_resolve_exact_model(config, provider_registry, &model_ref).ok()
 }
 
 /// Resolve the image-fallback configuration from a config snapshot.
@@ -1259,6 +1278,35 @@ mod tests {
             .err()
             .expect("a disabled exact ID must not route to an alias");
         assert!(error.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn subagent_resolved_model_requires_exact_current_admission() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+
+        let state = RoutingContext::new(None);
+        let mut config = state.config.try_read().unwrap().clone();
+        config.defaults.as_mut().unwrap().sub_agent =
+            Some(ProviderModelRef::new("fast-b", "cheap-b"));
+        let resolved = resolve_subagent_model(&config, "chat-a", &state.registry, "coder")
+            .expect("the selected admitted role must resolve");
+        assert_eq!(resolved.model_name, "cheap-b");
+        assert!(Arc::ptr_eq(
+            &resolved.provider,
+            &state.registry.get("fast-b").unwrap()
+        ));
+
+        let instance = config.provider_instances.get_mut("fast-b").unwrap();
+        instance.enabled = false;
+        assert!(resolve_subagent_model(&config, "chat-a", &state.registry, "coder").is_none());
+
+        let instance = config.provider_instances.get_mut("fast-b").unwrap();
+        instance.enabled = true;
+        instance
+            .extra
+            .insert("runtime_models".into(), serde_json::json!([]));
+        assert!(resolve_subagent_model(&config, "chat-a", &state.registry, "coder").is_none());
+        state.assert_no_requests();
     }
 
     #[test]
