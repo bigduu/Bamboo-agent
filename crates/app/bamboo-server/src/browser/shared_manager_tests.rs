@@ -163,6 +163,67 @@ fn active_clean_mode_is_preserved_until_explicit_close_and_reopen() {
 }
 
 #[test]
+fn agent_tabs_default_to_shared_and_clean_requires_an_explicit_request() {
+    use crate::tools::browser::BrowserTool;
+    use bamboo_agent_core::tools::{Tool, ToolCtx, ToolOutcome};
+
+    in_isolated_process(
+        "agent_tabs_default_to_shared_and_clean_requires_an_explicit_request",
+        |home| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let manager = Arc::new(BrowserManager::with_fixture_profile_root(
+                        home.join("profiles"),
+                    ));
+                    let tool = BrowserTool::new(manager.clone());
+                    let mut ctx = ToolCtx::none("browser-profile-test");
+                    ctx.session_id = Some(Arc::from("agent-chat"));
+                    for (args, mode, shared) in [
+                        (json!({"action":"tabs"}), "shared", true),
+                        (
+                            json!({"action":"tabs","profile_mode":"shared"}),
+                            "shared",
+                            true,
+                        ),
+                    ] {
+                        let ToolOutcome::Completed(result) =
+                            tool.invoke(args, ctx.clone()).await.unwrap()
+                        else {
+                            panic!("browser tabs must complete");
+                        };
+                        let state: Value = serde_json::from_str(&result.result).unwrap();
+                        assert_eq!(state["profile_mode"], mode);
+                        assert_eq!(state["storage_shared"], shared);
+                    }
+                    manager.close("agent-chat").await.unwrap();
+                    let ToolOutcome::Completed(result) = tool
+                        .invoke(json!({"action":"tabs","profile_mode":"clean"}), ctx.clone())
+                        .await
+                        .unwrap()
+                    else {
+                        panic!("clean browser tabs must complete");
+                    };
+                    let clean: Value = serde_json::from_str(&result.result).unwrap();
+                    assert_eq!(clean["profile_mode"], "clean");
+                    assert_eq!(clean["storage_shared"], false);
+                    let ToolOutcome::Completed(result) =
+                        tool.invoke(json!({"action":"tabs"}), ctx).await.unwrap()
+                    else {
+                        panic!("active browser tabs must complete");
+                    };
+                    let active: Value = serde_json::from_str(&result.result).unwrap();
+                    assert_eq!(active["profile_mode"], "clean");
+                    manager.close("agent-chat").await.unwrap();
+                    manager.shutdown().await;
+                });
+        },
+    );
+}
+
+#[test]
 fn cancelling_a_chat_mutation_closes_its_scope_without_killing_the_sibling_host() {
     in_isolated_process(
         "cancelling_a_chat_mutation_closes_its_scope_without_killing_the_sibling_host",
