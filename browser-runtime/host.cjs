@@ -3417,6 +3417,10 @@ function createChatScope({ id, generation, profileMode, context, downloadDir,
       if (action === 'state' || action === 'tab_list') return dialogState();
       throw dialogError('dialog_pending', 'answer the pending browser dialog first');
     }
+    // These reads bypass commandTail, so they must not acquire mutation
+    // ownership. Keep dialog-aware, epoch-stable reads without rejecting a
+    // concurrent write merely because its metadata read is still in flight.
+    if (action === 'state' || action === 'tab_list') return stateAfterDialog();
     const owner = { settled: false, hadDialog: false };
     const nextDialog = new Promise(resolve => { owner.notify = resolve; });
     inFlightAction = owner;

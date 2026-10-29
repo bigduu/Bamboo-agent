@@ -56,7 +56,7 @@ use async_trait::async_trait;
 pub use builder::AgentBuilder;
 pub use execute_request::{
     inspect_loop, CountedLoopConfig, ExecuteRequestBuilder, LoopControlConfig, LoopControlReceipt,
-    LoopStatusSnapshot,
+    LoopStatusSnapshot, UpstreamRetry,
 };
 use tokio::sync::mpsc;
 
@@ -619,6 +619,21 @@ impl Agent {
         #[cfg(test)]
         constructor_parity_tests::observe_inputs(&session.id, None);
         self.inner.execute_direct(session, request).await
+    }
+
+    /// Execute with an explicit per-run upstream retry policy through the same
+    /// direct owner, compatibility and session preparation checks as execute.
+    pub async fn execute_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        request: ExecuteRequest,
+        upstream_retry: UpstreamRetry,
+    ) -> Result<(), AgentError> {
+        #[cfg(test)]
+        constructor_parity_tests::observe_inputs(&session.id, None);
+        self.inner
+            .execute_direct_with_upstream_retry(session, request, upstream_retry)
+            .await
     }
 
     /// Shared execution path: prepare the session (system prompt + model), build
@@ -3082,11 +3097,261 @@ mod constructor_parity_tests {
             .session_delivery(bamboo_engine::SessionActivationRouter::new())
             .model("claude-test")
             .instruction("constructor fixture")
+            .test_memory_store(bamboo_memory::memory_store::MemoryStore::new(
+                root.join("jiandu"),
+            ))
             .with_defaults_for_data_dir(root.into())
             .await
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_upstream_retry_preserves_direct_execution_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        let mut session = Session::new("retry-sdk-owned", "claude-test");
+        session.add_message(Message::user("retained"));
+        let before = serde_json::to_value(&session).unwrap();
+        let lease = agent
+            .inner
+            .begin_direct_execution(&session.id)
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let request = ExecuteRequestBuilder::new("", tx, CancellationToken::new()).build();
+        let result = agent
+            .execute_with_upstream_retry(&mut session, request, UpstreamRetry::UntilCancelled)
+            .await;
+        assert!(
+            result.is_err(),
+            "an occupied direct owner must refuse execution"
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert!(provider.0.lock().unwrap().is_empty());
+        lease.abandon().await;
+    }
+
+    struct ManagedRetrySdkProvider {
+        url: String,
+        calls: AtomicUsize,
+        messages: Mutex<Vec<Vec<Message>>>,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LLMProvider for ManagedRetrySdkProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.messages.lock().unwrap().push(messages.to_vec());
+            self.entered.notify_one();
+            self.resume.notified().await;
+
+            let retry = bamboo_llm::retry::RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(5),
+            };
+            // A local proxy and the HTTP client's loopback exclusion disable
+            // inherited system proxies without changing process-global config.
+            let mut config = bamboo_llm::Config::default();
+            config.http_proxy = "http://127.0.0.1:9".into();
+            let client = bamboo_llm::http_client::build_http_client(&config)?;
+            let response =
+                bamboo_llm::retry::send_provider_request(&retry, "sdk-controlled-upstream", || {
+                    client.post(&self.url).json(messages)
+                })
+                .await?;
+            if !response.status().is_success() {
+                return Err(bamboo_llm::LLMError::RequestFailed(
+                    "controlled upstream returned a transient failure".into(),
+                ));
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token("controlled completion".into())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn read_controlled_sdk_post(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let header_end = loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "request closed before headers");
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+            assert!(
+                request.len() < 65_536,
+                "request headers exceeded fixture limit"
+            );
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(headers.starts_with("POST /controlled HTTP/1.1\r\n"));
+        let body_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            .expect("the controlled JSON body has a known length");
+        while request.len() < header_end + body_length {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "request closed before its body");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        request[header_end..header_end + body_length].to_vec()
+    }
+
+    #[tokio::test]
+    async fn sdk_explicit_upstream_retry_reaches_managed_consumer_under_direct_owner() {
+        use tokio::io::AsyncWriteExt;
+
+        fn assert_send<T: Send>(_: &T) {}
+
+        fn assert_original_user_once(messages: &[Message], user_id: &str) {
+            let matches: Vec<_> = messages
+                .iter()
+                .filter(|message| message.id == user_id)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].role, Role::User);
+            assert_eq!(matches[0].content, "one retained SDK user");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message.role == Role::User
+                        && message.content == "one retained SDK user")
+                    .count(),
+                1
+            );
+        }
+
+        for continuous in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        accepted = listener.accept() => {
+                            let (mut socket, _) = accepted.unwrap();
+                            let body = read_controlled_sdk_post(&mut socket).await;
+                            let status = if requests.len() < 3 {
+                                "503 Service Unavailable"
+                            } else {
+                                "200 OK"
+                            };
+                            requests.push(body);
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            socket.write_all(response.as_bytes()).await.unwrap();
+                        }
+                    }
+                }
+                requests
+            });
+            let root = tempfile::tempdir().unwrap();
+            let provider = Arc::new(ManagedRetrySdkProvider {
+                url: format!("http://{address}/controlled"),
+                calls: AtomicUsize::new(0),
+                messages: Mutex::new(Vec::new()),
+                entered: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            });
+            let agent = agent(root.path(), provider.clone()).await;
+            let mut session =
+                Session::new(format!("sdk-managed-retry-{continuous}"), "claude-test");
+            let user = Message::user("one retained SDK user");
+            let user_id = user.id.clone();
+            session.add_message(user);
+            agent.storage().save_session(&session).await.unwrap();
+            let session_id = session.id.clone();
+            let (tx, _rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+            let request = ExecuteRequestBuilder::new("", tx, CancellationToken::new())
+                .model("claude-test")
+                .build();
+
+            let execution = async {
+                if continuous {
+                    agent
+                        .execute_with_upstream_retry(
+                            &mut session,
+                            request,
+                            UpstreamRetry::UntilCancelled,
+                        )
+                        .await
+                } else {
+                    agent.execute(&mut session, request).await
+                }
+            };
+            // Both SDK execution branches are held across await by this future.
+            assert_send(&execution);
+            let verify_owner = async {
+                provider.entered.notified().await;
+                let competing = agent.inner.begin_direct_execution(&session_id).await;
+                assert!(
+                    competing.is_err(),
+                    "the SDK direct owner must already be held"
+                );
+                provider.resume.notify_one();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(execution, verify_owner)
+            })
+            .await
+            .expect("the controlled SDK execution and owner check must finish");
+            if continuous {
+                result.expect("the explicit continuous mode must recover");
+            } else {
+                assert!(matches!(result, Err(AgentError::LLMNonRetryable(_))));
+            }
+
+            stop_tx.send(()).unwrap();
+            let requests = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the controlled server must finish")
+                .unwrap();
+            assert_eq!(requests.len(), if continuous { 4 } else { 1 });
+            assert!(requests.iter().all(|body| body == &requests[0]));
+            let sent: Vec<Message> = serde_json::from_slice(&requests[0]).unwrap();
+            assert_original_user_once(&sent, &user_id);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            let observed = provider.messages.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_original_user_once(&observed[0], &user_id);
+            drop(observed);
+
+            let persisted = agent
+                .storage()
+                .load_session(&session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let users = persisted
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 1);
+            assert_eq!(users[0].id, user_id);
+            assert_eq!(users[0].content, "one retained SDK user");
+        }
     }
 
     struct ObservedInput(Arc<AtomicUsize>);

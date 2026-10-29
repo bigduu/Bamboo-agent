@@ -39,7 +39,10 @@ async fn actual_provider_failure_receipt_reaches_the_session_and_survives_cold_s
     let persisted = cold.last_run_diagnostic().unwrap();
     assert_eq!(persisted.diagnostic_id(), captured.diagnostic_id());
     assert!(persisted.matches_error_message(&cold.last_run_error().unwrap()));
-    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        bamboo_llm::retry::global().max_attempts as usize
+    );
 }
 
 const RECOVERY: &str = "Authentication Error, Error in connector: Error querying the database: FATAL: the database system is not yet accepting connections\nDETAIL: Consistent recovery state has not been yet reached.";
@@ -124,7 +127,10 @@ async fn connector_exhaustion_preserves_context_and_never_replays_successful_too
     assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     assert_eq!(tools.0.load(Ordering::SeqCst), 1);
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests.len(),
+        bamboo_llm::retry::global().max_attempts as usize
+    );
     assert!(requests.iter().all(|r| r.body == requests[0].body));
     assert!(String::from_utf8_lossy(&requests[0].body).contains("mid-loop tool result"));
     let saved = storage.load_session(&session.id).await.unwrap().unwrap();
@@ -402,10 +408,12 @@ async fn cancelling_anthropic_backoff_stops_without_another_model_request() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+const RECOVERIES_BEFORE_REJECTION: usize = 3;
+
 struct RecoveryThenRejected(AtomicUsize);
 impl Respond for RecoveryThenRejected {
     fn respond(&self, _: &wiremock::Request) -> ResponseTemplate {
-        if self.0.fetch_add(1, Ordering::SeqCst) < 3 {
+        if self.0.fetch_add(1, Ordering::SeqCst) < RECOVERIES_BEFORE_REJECTION {
             recovery()
         } else {
             ResponseTemplate::new(422).set_body_string("unprocessable model request")
@@ -432,35 +440,98 @@ async fn connector_recovery_then_terminal_422_does_not_reset_the_request_budget(
         .unwrap_err();
     assert!(matches!(error, AgentError::LLMNonRetryable(_)));
     assert!(error.to_string().contains("422"));
-    assert_eq!(server.received_requests().await.unwrap().len(), 4);
+    // A larger ceiling does not authorize retrying the first terminal response.
+    assert!(bamboo_llm::retry::global().max_attempts as usize > RECOVERIES_BEFORE_REJECTION + 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), RECOVERIES_BEFORE_REJECTION + 1);
+    assert!(requests
+        .iter()
+        .all(|request| request.body == requests[0].body));
+    let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        cold.messages
+            .iter()
+            .filter(|message| message.role == bamboo_agent_core::Role::User
+                && message.content == "once")
+            .count(),
+        1
+    );
+}
+
+struct ManagedResponseThenHang {
+    provider: AnthropicProvider,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for ManagedResponseThenHang {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        assert_eq!(self.calls.fetch_add(1, Ordering::SeqCst), 0);
+        // The managed send must finish before this deliberately unresponsive
+        // provider wrapper becomes the outer watchdog's responsibility.
+        let _stream = self
+            .provider
+            .chat_stream(messages, tools, max, model)
+            .await?;
+        std::future::pending().await
+    }
 }
 
 #[tokio::test]
 async fn anthropic_bootstrap_watchdog_does_not_restart_a_managed_budget() {
     let server = MockServer::start().await;
+    let hits = Arc::new(AtomicUsize::new(0));
+    let count = hits.clone();
+    let request_times = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed_times = request_times.clone();
     Mock::given(method("POST"))
-        .respond_with(recovery().insert_header("Retry-After", "5"))
+        .respond_with(move |_: &wiremock::Request| {
+            observed_times
+                .lock()
+                .unwrap()
+                .push(std::time::Instant::now());
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                recovery().insert_header("Retry-After", "2")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string("event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+            }
+        })
+        .expect(2)
         .mount(&server)
         .await;
-    let provider = Arc::new(AnthropicProvider::new("fixture-key").with_base_url(server.uri()));
+    let provider = Arc::new(ManagedResponseThenHang {
+        provider: AnthropicProvider::new("fixture-key").with_base_url(server.uri()),
+        calls: AtomicUsize::new(0),
+    });
     let mut config = bamboo_llm::Config::default();
     config.stream_timeout.transport_idle_timeout_secs = 1;
     let (_temp, agent, storage) =
-        build_direct_execute_agent_with_config(provider, None, None, config).await;
+        build_direct_execute_agent_with_config(provider.clone(), None, None, config).await;
     let mut session = Session::new("connector-bootstrap-watchdog", "test-model");
     session.add_message(Message::user("once"));
     storage.save_session(&session).await.unwrap();
     let (tx, _rx) = mpsc::channel(128);
-    let error = agent
-        .execute(&mut session, direct_request(tx, CancellationToken::new()))
-        .await
-        .unwrap_err();
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.execute(&mut session, direct_request(tx, CancellationToken::new())),
+    )
+    .await
+    .expect("the provider hang after managed headers must remain bounded")
+    .unwrap_err();
     let receipt =
         bamboo_llm::retry::public_request_diagnostic(&session.id, &error.to_string()).unwrap();
     let wire = serde_json::to_value(&receipt).unwrap();
     assert_eq!(wire["phase"], "bootstrap");
     assert_eq!(wire["last_http_status"], 401);
-    assert_eq!(wire["retry_delay_ms"], 5_000);
+    assert_eq!(wire["retry_delay_ms"], 2_000);
     assert_eq!(wire["semantic_output_started"], false);
     assert_eq!(wire["retry_safe"], false);
     match error {
@@ -468,9 +539,27 @@ async fn anthropic_bootstrap_watchdog_does_not_restart_a_managed_budget() {
             assert!(!timeout.retry_safe());
             assert_eq!(timeout.last_http_retry().unwrap().0, 401);
         }
-        other => panic!("expected managed bootstrap timeout, got {other:?}"),
+        other => panic!("expected bounded post-headers provider hang, got {other:?}"),
     }
-    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(requests[0].body, requests[1].body);
+    {
+        let times = request_times.lock().unwrap();
+        assert_eq!(times.len(), 2);
+        assert!(times[1].duration_since(times[0]) >= std::time::Duration::from_secs(2));
+    }
+    let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(
+        cold.messages
+            .iter()
+            .filter(|message| message.role == bamboo_agent_core::Role::User
+                && message.content == "once")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -561,4 +650,280 @@ async fn credential_and_permission_denials_with_overflow_text_remain_terminal() 
             .any(|m| m.content == "preserve context"));
         assert!(saved.compression_events.is_empty());
     }
+}
+
+struct InitialRetryTool(AtomicUsize);
+
+#[async_trait]
+impl ToolExecutor for InitialRetryTool {
+    async fn execute(&self, call: &ToolCall) -> Result<ToolResult, ToolError> {
+        assert_eq!(call.id, "retry-probe-tool");
+        assert_eq!(call.function.name, "Read");
+        assert_eq!(call.function.arguments, "{}");
+        assert_eq!(self.0.fetch_add(1, Ordering::SeqCst), 0);
+        Ok(ToolResult {
+            success: true,
+            result: "controlled retry tool result".to_string(),
+            display_preference: None,
+            images: Vec::new(),
+        })
+    }
+
+    fn list_tools(&self) -> Vec<ToolSchema> {
+        SuccessfulReadToolExecutor.list_tools()
+    }
+}
+
+struct InitialRetryProbe {
+    url: String,
+    tool_once: bool,
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LLMProvider for InitialRetryProbe {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+        _max: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.tool_once && call == 0 {
+            return Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![make_tool_call(
+                    "retry-probe-tool",
+                    "Read",
+                    "{}",
+                )])),
+                Ok(LLMChunk::Done),
+            ])));
+        }
+        if self.tool_once {
+            assert!(messages
+                .iter()
+                .any(|m| m.tool_call_id.as_deref() == Some("retry-probe-tool")));
+        }
+        let config = bamboo_llm::retry::RetryConfig {
+            max_attempts: 1,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+        };
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let response =
+            bamboo_llm::retry::send_provider_request(&config, "controlled-consumer", || {
+                client.post(&self.url).json(messages)
+            })
+            .await?;
+        if !response.status().is_success() {
+            return Err(LLMError::RequestFailed(
+                "controlled initial request failed".into(),
+            ));
+        }
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("controlled completed".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn execute_opt_in_retries_initial_http_without_replaying_tools_or_user_message() {
+    for continuous in [false, true] {
+        let server = MockServer::start().await;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let count = hits.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &wiremock::Request| {
+                ResponseTemplate::new(if count.fetch_add(1, Ordering::SeqCst) < 3 {
+                    503
+                } else {
+                    200
+                })
+            })
+            .mount(&server)
+            .await;
+        let provider = Arc::new(InitialRetryProbe {
+            url: server.uri(),
+            tool_once: true,
+            calls: AtomicUsize::new(0),
+        });
+        let tools = Arc::new(InitialRetryTool(AtomicUsize::new(0)));
+        let (_home, agent, storage) =
+            build_direct_execute_agent(provider.clone(), None, Some(tools.clone())).await;
+        let mut session = Session::new(&format!("retry-consumer-{continuous}"), "test-model");
+        session.add_message(Message::user("one retained user message"));
+        storage.save_session(&session).await.unwrap();
+        let (tx, _rx) = mpsc::channel(128);
+        let request = direct_request(tx, CancellationToken::new());
+        let result = agent
+            .execute_with_upstream_retry(
+                &mut session,
+                request,
+                if continuous {
+                    bamboo_llm::retry::UpstreamRetry::UntilCancelled
+                } else {
+                    bamboo_llm::retry::UpstreamRetry::Bounded
+                },
+            )
+            .await;
+        assert_eq!(result.is_ok(), continuous);
+        assert_eq!(hits.load(Ordering::SeqCst), if continuous { 4 } else { 1 });
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(tools.0.load(Ordering::SeqCst), 1);
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().all(|r| r.body == requests[0].body));
+        let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.content == "one retained user message")
+                .count(),
+            1
+        );
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.tool_call_id.as_deref() == Some("retry-probe-tool"))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn continuous_initial_retry_never_replays_partial_text_reasoning_or_tool_fragments() {
+    for kind in 0..3 {
+        let provider = Arc::new(PartialTransientProvider {
+            calls: AtomicUsize::new(0),
+            kind,
+        });
+        let (_home, agent, storage) =
+            build_direct_execute_agent(provider.clone(), None, None).await;
+        let mut session = Session::new(&format!("continuous-partial-{kind}"), "test-model");
+        session.add_message(Message::user("retained once"));
+        storage.save_session(&session).await.unwrap();
+        let (tx, _rx) = mpsc::channel(128);
+        let request = crate::runtime::ExecuteRequestBuilder::new("", tx, CancellationToken::new())
+            .model("test-model")
+            .build();
+        let error = agent
+            .execute_with_upstream_retry(
+                &mut session,
+                request,
+                bamboo_llm::retry::UpstreamRetry::UntilCancelled,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.content == "retained once")
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test]
+async fn actual_openai_bounded_consumer_stops_when_retry_after_cannot_fit_without_turn_replay() {
+    use bamboo_llm::providers::openai::OpenAIProvider;
+    for status in [429, 503] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .insert_header("Retry-After", "3600")
+                    .set_body_json(
+                        serde_json::json!({"error":{"message":"synthetic temporary failure"}}),
+                    ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = Arc::new(
+            OpenAIProvider::new("synthetic-key")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap()),
+        );
+        let (_home, agent, storage) = build_direct_execute_agent(provider, None, None).await;
+        let mut session = Session::new(&format!("bounded-openai-hint-{status}"), "test-model");
+        session.add_message(Message::user("one synthetic user identity"));
+        storage.save_session(&session).await.unwrap();
+        let (tx, _rx) = mpsc::channel(128);
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            agent.execute(&mut session, direct_request(tx, CancellationToken::new())),
+        )
+        .await
+        .expect("long hint must terminate without resetting a turn")
+        .unwrap_err();
+        assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let cold = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            cold.messages
+                .iter()
+                .filter(|m| m.content == "one synthetic user identity")
+                .count(),
+            1
+        );
+    }
+}
+
+struct LegacyLongHintProvider {
+    url: String,
+}
+#[async_trait]
+impl LLMProvider for LegacyLongHintProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let config = bamboo_llm::retry::RetryConfig {
+            max_attempts: 5,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: std::time::Duration::from_millis(5),
+        };
+        let response =
+            bamboo_llm::retry::send_with_retry(&config, "legacy-owned", || client.post(&self.url))
+                .await?;
+        Err(LLMError::RequestFailed(format!(
+            "HTTP {} synthetic temporary failure",
+            response.status()
+        )))
+    }
+}
+
+#[tokio::test]
+async fn legacy_public_http_policy_cannot_be_reset_by_an_engine_turn_retry() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "3600"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = Arc::new(LegacyLongHintProvider { url: server.uri() });
+    let (_home, agent, storage) = build_direct_execute_agent(provider, None, None).await;
+    let mut session = Session::new("legacy-long-hint", "test-model");
+    session.add_message(Message::user("one legacy synthetic message"));
+    storage.save_session(&session).await.unwrap();
+    let (tx, _rx) = mpsc::channel(128);
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        agent.execute(&mut session, direct_request(tx, CancellationToken::new())),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(matches!(error, AgentError::LLMNonRetryable(_)));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }

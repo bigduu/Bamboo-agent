@@ -87,6 +87,7 @@ async fn run_agent_loop_with_config_inner(
     let mut counted_generation = None;
     let mut counted_usage = super::to_event_token_usage(0, 0);
     let mut counted_runtime_identity = None;
+    let mut ordinary_runtime_identity = None;
     let result = async {
         crate::runtime::counted_loop::preflight(session, &config, &initial_message).await?;
         let session_start_source = session
@@ -314,6 +315,14 @@ async fn run_agent_loop_with_config_inner(
                 state.runtime_state.round.last_round_id.clone(),
                 state.runtime_state.execution_id.clone(),
             ));
+        } else {
+            // The ordinary loop owns this exact in-memory snapshot too. Its
+            // error exit must not leave a terminal run marked Running.
+            ordinary_runtime_identity = Some((
+                state.runtime_state.run_id.clone(),
+                state.runtime_state.round.last_round_id.clone(),
+                state.runtime_state.execution_id.clone(),
+            ));
         }
 
         let sent_complete = match pipeline_result {
@@ -415,6 +424,7 @@ async fn run_agent_loop_with_config_inner(
     };
     if let Err(error) = &result {
         fail_counted_runtime(session, counted_runtime_identity.as_ref(), error);
+        fail_unblocked_ordinary_runtime(session, ordinary_runtime_identity.as_ref(), error);
     }
     let checkpoint = crate::runtime::counted_loop::finish(
         session,
@@ -481,6 +491,24 @@ fn defers_terminal_complete(config: &AgentLoopConfig) -> bool {
             .loop_control
             .as_ref()
             .is_some_and(|control| control.supervisor_grant_id().is_some())
+}
+
+// A terminal ordinary run can still carry a Running snapshot from its last
+// round. Correct only that run's exact in-memory identity; a live child/Bash
+// wait or explicit suspension remains owned by its existing coordinator.
+fn fail_unblocked_ordinary_runtime(
+    session: &mut Session,
+    expected: Option<&(String, Option<String>, Option<String>)>,
+    error: &bamboo_agent_core::AgentError,
+) {
+    if session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+        runtime.waiting_for_children.is_some()
+            || runtime.waiting_for_bash.is_some()
+            || runtime.suspension.is_some()
+    }) {
+        return;
+    }
+    fail_counted_runtime(session, expected, error);
 }
 
 fn fail_counted_runtime(

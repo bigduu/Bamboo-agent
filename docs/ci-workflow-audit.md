@@ -54,6 +54,7 @@ separately from its future canonical-merge owner.
 | `trusted-observer.yml` | Added by accepted PR2313 after the original audit. Path-scoped Linux stable API-only runtime of domain/storage/server libraries plus stricter all-features library Clippy. It checks feature-head source rather than the canonical tested merge. Its API-only configuration and package graph are distinct from embedded default CI; migrate the owner explicitly before retiring this route. Do not claim that matching case names already establish deduplication or new-contract source evidence. |
 | `delegated-planner-acceptance.yml` | Added by accepted PR2304 after the original audit. Linux stable API-only Plan library, immutable-artifact library and real CLI/restart cases, followed by all-features library/integration Clippy. It also checks feature-head source. Runtime/compiler overlap must be compared with the canonical runner using actual target/features/configuration; its required-child integration lint is an additional selection. It remains active pending a bounded ownership/source-context migration. |
 | `observer-subscriptions.yml` | Added by accepted PR2316. Linux stable API-only joint domain/engine/server libraries, 19 serial cases, plus the same five-library all-features strict Clippy configuration as Trusted Observer. The joint engine/dev-dependency graph differs from standalone default CI. Issue2338 preserves both original joint graphs, consolidates the identical lint, and reuses the one overlapping serde case only with a current-M identical compiler unit/features/profile/path/hash and prior real PASS. Its original feature-head checks remain historical evidence until that migration passes hosted acceptance. |
+| `supervisor-role-acceptance.yml` | Supervisor Issue2342 owns this manual API-only snapshot diagnostic. Ordinary Role/current-user cases stay in the canonical Cargo target catalog, with no automatic Linux copy. Input must equal the exact dispatch source before checkout. Original feature-head `447a1e13` receipts (126 passed executions/125 distinct names) remain that source's evidence; they are not canonical merge-source admission. The retained diagnostic selects the Work-owner case once. |
 
 Native TLS, Recorder and portable Skill selections are also embedded in
 `ci.yml`. Issue2319 must compare actual target/features/profile/toolchain within
@@ -82,6 +83,11 @@ No local fixture or prepared owner establishes new-contract publication, Main
 promotion, Docker consumption or Pages deployment acceptance.
 
 ## Lotus Next
+
+The original PR450 snapshot below runs Unit on both Node versions. The later
+candidate `425457427c2547ce62c8069a896272d1c17f073d` assigns Unit once to
+Node 22 and the shared artifact checks to Node 24. It has not yet completed
+feature admission; see the tracker for its current status.
 
 | File | Responsibility and review decision |
 | --- | --- |

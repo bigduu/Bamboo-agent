@@ -522,6 +522,9 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
             // run gets the config-level `run_budget` default like every other
             // path.
             run_budget: None,
+            upstream_retry: None,
+            // Headless runs cannot offer an interactive same-run continuation.
+            live_bootstrap_resume: false,
         }),
     )
     .await;

@@ -431,6 +431,17 @@ fn try_resolve_role_ref_chain<'a>(
     provider_registry: &Arc<ProviderRegistry>,
     candidates: impl IntoIterator<Item = Option<&'a bamboo_domain::ProviderModelRef>>,
 ) -> Result<Option<ResolvedModel>, LLMError> {
+    Ok(
+        try_resolve_role_ref_chain_with_origin(config, provider_registry, candidates)?
+            .map(|(model, _)| model),
+    )
+}
+
+fn try_resolve_role_ref_chain_with_origin<'a>(
+    config: &Config,
+    provider_registry: &Arc<ProviderRegistry>,
+    candidates: impl IntoIterator<Item = Option<&'a bamboo_domain::ProviderModelRef>>,
+) -> Result<Option<(ResolvedModel, bool)>, LLMError> {
     // A present-but-invalid reference fails closed. Automatic fallback applies
     // only when a role is unset, never when an explicit provider id is stale.
     let Some(model_ref) = candidates.into_iter().flatten().next() else {
@@ -462,8 +473,12 @@ fn try_resolve_role_ref_chain<'a>(
             )));
         }
     }
-    let provider = ProviderModelRouter::new(provider_registry.clone()).route(model_ref)?;
-    Ok(Some(ResolvedModel::from_ref(provider, model_ref)))
+    let (provider, managed) =
+        provider_registry.provider_for_configured_model_with_origin(config, model_ref)?;
+    Ok(Some((
+        ResolvedModel::from_ref(provider, model_ref),
+        managed,
+    )))
 }
 
 pub fn try_resolve_exact_model(
@@ -475,12 +490,69 @@ pub fn try_resolve_exact_model(
         .ok_or_else(|| LLMError::Api("Configured model target is required".into()))
 }
 
+/// A primary route retains the canonical account, its unwrapped provider and
+/// the managed proof captured for that same provider generation.
+pub struct ResolvedPrimaryModel {
+    pub target: bamboo_domain::ProviderModelRef,
+    pub provider: Arc<dyn bamboo_llm::LLMProvider>,
+    pub managed_origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+}
+
+pub fn try_resolve_primary_model(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    requested: &bamboo_domain::ProviderModelRef,
+) -> Result<ResolvedPrimaryModel, LLMError> {
+    if requested.provider.trim().is_empty()
+        || requested.model.trim().is_empty()
+        || requested.provider.trim() != requested.provider
+        || requested.model.trim() != requested.model
+    {
+        return Err(LLMError::Api(
+            "Configured provider/model reference is invalid".into(),
+        ));
+    }
+    let mut target = requested.clone();
+    target.provider = resolve_provider_routing_key(config, &target.provider, registry)?;
+    // Primary reasoning is carried by the run request; using a role wrapper
+    // here would hide the selected registry Arc from managed Gold admission.
+    let mut raw_target = target.clone();
+    raw_target.reasoning_effort = None;
+    let (admitted, was_managed) =
+        try_resolve_role_ref_chain_with_origin(config, registry, [Some(&raw_target)])?
+            .ok_or_else(|| LLMError::Api("Configured model target is required".into()))?;
+    let (provider, managed_origin) =
+        registry.provider_for_configured_model_with_managed_origin(config, &raw_target)?;
+    if !Arc::ptr_eq(&admitted.provider, &provider) || (was_managed && managed_origin.is_none()) {
+        return Err(LLMError::Api(
+            "Provider route changed during model admission; retry".into(),
+        ));
+    }
+    Ok(ResolvedPrimaryModel {
+        target,
+        provider,
+        managed_origin,
+    })
+}
+
 fn try_resolve_legacy_role(
     config: &Config,
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
     model: Option<String>,
 ) -> Result<Option<ResolvedModel>, LLMError> {
+    Ok(
+        try_resolve_legacy_role_with_origin(config, provider_name, provider_registry, model)?
+            .map(|(model, _)| model),
+    )
+}
+
+fn try_resolve_legacy_role_with_origin(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+    model: Option<String>,
+) -> Result<Option<(ResolvedModel, bool)>, LLMError> {
     if config
         .provider_instances
         .get(provider_name)
@@ -491,7 +563,7 @@ fn try_resolve_legacy_role(
         )));
     }
     let model_ref = model.map(|model| bamboo_domain::ProviderModelRef::new(provider_name, model));
-    try_resolve_role_ref_chain(config, provider_registry, [model_ref.as_ref()])
+    try_resolve_role_ref_chain_with_origin(config, provider_registry, [model_ref.as_ref()])
 }
 
 /// Resolve the task summarization model for conversation/task compression.
@@ -568,12 +640,145 @@ pub fn try_resolve_background_model(
             ],
         );
     }
-    try_resolve_legacy_role(
+    let legacy_memory = config
+        .memory()
+        .as_ref()
+        .and_then(|memory| memory.background_model.as_deref())
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let result = try_resolve_legacy_role(
         config,
         provider_name,
         provider_registry,
         get_memory_background_model_for_provider(config, provider_name),
-    )
+    );
+    let Err(error) = result else {
+        return result;
+    };
+    // Only an explicitly configured legacy memory override may use the
+    // managed background-only compatibility route; fast/chat stays ordinary.
+    let Some(model) = legacy_memory else {
+        return Err(error);
+    };
+    let target = bamboo_domain::ProviderModelRef::new(provider_name, model);
+    match provider_registry.try_legacy_memory_provider(config, &target)? {
+        Some(provider) => Ok(Some(ResolvedModel::from_ref(provider, &target))),
+        None => Err(error),
+    }
+}
+
+// A failed Fast selection must not look like an absent role at runner call
+// sites: the runner otherwise falls back to the main account. Keep this
+// provider local to that execution path, not the public global role resolver.
+struct RejectedFastProvider {
+    error: FastRouteError,
+}
+
+enum FastRouteError {
+    Auth(String),
+    Api(String),
+    Other(String),
+}
+
+impl FastRouteError {
+    fn from_llm_error(error: LLMError) -> Self {
+        match error {
+            LLMError::Auth(message) => Self::Auth(message),
+            LLMError::Api(message) => Self::Api(message),
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn to_llm_error(&self) -> LLMError {
+        match self {
+            Self::Auth(message) => LLMError::Auth(message.clone()),
+            Self::Api(message) => LLMError::Api(message.clone()),
+            Self::Other(message) => LLMError::RequestFailed(message.clone()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl bamboo_llm::LLMProvider for RejectedFastProvider {
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        Some(self.error.to_llm_error())
+    }
+
+    async fn chat_stream(
+        &self,
+        _messages: &[bamboo_agent_core::Message],
+        _tools: &[bamboo_agent_core::ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<bamboo_llm::LLMStream, LLMError> {
+        Err(self.error.to_llm_error())
+    }
+
+    async fn vision_support_override(&self, _model: &str) -> Option<bool> {
+        Some(false)
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, LLMError> {
+        Err(self.error.to_llm_error())
+    }
+}
+
+/// Resolve the Fast name and provider for a runner's auxiliary evaluations.
+///
+/// `None` config represents a busy live configuration lock, not an unset
+/// role, and therefore fails closed. An absent role retains the existing
+/// `(None, None)` fallback contract. A rejected role gets a provider that
+/// returns its admission error without accessing any network or other account.
+/// Callers must pass an authoritative configuration guard, not a cached clone.
+#[doc(hidden)]
+pub fn resolve_fast_model_for_runner(
+    config: Option<&Config>,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> (Option<String>, Option<Arc<dyn bamboo_llm::LLMProvider>>) {
+    let Some(config) = config else {
+        let error = LLMError::Api(
+            "Live configuration is unavailable while selecting a Fast evaluation route".into(),
+        );
+        return (
+            None,
+            Some(Arc::new(RejectedFastProvider {
+                error: FastRouteError::from_llm_error(error),
+            })),
+        );
+    };
+
+    match try_resolve_fast_model_with_origin(config, provider_name, provider_registry) {
+        Ok(Some((model, managed))) => {
+            let provider = if managed {
+                bamboo_llm::provider::mark_host_queued_route(model.provider)
+            } else {
+                model.provider
+            };
+            (Some(model.model_name), Some(provider))
+        }
+        Ok(None) => (None, None),
+        Err(error) => {
+            let model_name = config
+                .defaults
+                .as_ref()
+                .map(|defaults| {
+                    defaults
+                        .fast
+                        .as_ref()
+                        .unwrap_or(&defaults.chat)
+                        .model
+                        .clone()
+                })
+                .or_else(|| get_fast_model_for_provider(config, provider_name));
+            (
+                model_name,
+                Some(Arc::new(RejectedFastProvider {
+                    error: FastRouteError::from_llm_error(error),
+                })),
+            )
+        }
+    }
 }
 
 /// Resolve the fast model for lightweight tasks like title generation.
@@ -596,14 +801,25 @@ pub fn try_resolve_fast_model(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> Result<Option<ResolvedModel>, LLMError> {
+    Ok(
+        try_resolve_fast_model_with_origin(config, provider_name, provider_registry)?
+            .map(|(model, _)| model),
+    )
+}
+
+fn try_resolve_fast_model_with_origin(
+    config: &Config,
+    provider_name: &str,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<Option<(ResolvedModel, bool)>, LLMError> {
     if let Some(defaults) = config.defaults.as_ref() {
-        return try_resolve_role_ref_chain(
+        return try_resolve_role_ref_chain_with_origin(
             config,
             provider_registry,
             [defaults.fast.as_ref(), Some(&defaults.chat)],
         );
     }
-    try_resolve_legacy_role(
+    try_resolve_legacy_role_with_origin(
         config,
         provider_name,
         provider_registry,
@@ -877,6 +1093,70 @@ mod tests {
         Arc::new(ProviderRegistry::new(providers, default.to_string()))
     }
 
+    #[tokio::test]
+    async fn legacy_background_resolution_keeps_session_provider_and_fast_fallback() {
+        let mut config = Config::default();
+        config.default_provider_instance = Some("account-a".into());
+        config.defaults = None;
+        for (id, model, key) in [
+            ("account-a", "chat-a", "synthetic-key-a"),
+            ("account-b", "chat-b", "synthetic-key-b"),
+        ] {
+            config.provider_instances.insert(
+                id.into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "enabled":true, "api_key":key,
+                    "base_url":"http://127.0.0.1:1", "model":model
+                }))
+                .unwrap(),
+            );
+        }
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .background_model = Some("memory-v1".into());
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().into())
+                .await
+                .unwrap(),
+        );
+        let b = registry.get("account-b").unwrap();
+        for flag in [false, true] {
+            config.features.provider_model_ref = flag;
+            let resolved = try_resolve_background_model(&config, "account-b", &registry)
+                .unwrap()
+                .unwrap();
+            assert_eq!(resolved.model_name, "memory-v1");
+            assert!(Arc::ptr_eq(&resolved.provider, &b));
+        }
+        config.memory_mut().as_mut().unwrap().background_model = Some("memory-v2".into());
+        let live = try_resolve_background_model(&config, "account-b", &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(live.model_name, "memory-v2");
+        assert!(Arc::ptr_eq(&live.provider, &b));
+        config
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat-b"]));
+        assert!(try_resolve_background_model(&config, "account-b", &registry).is_err());
+        config
+            .provider_instances
+            .get_mut("account-b")
+            .unwrap()
+            .extra
+            .remove("runtime_models");
+        config.memory_mut().as_mut().unwrap().background_model = None;
+        let fast = try_resolve_background_model(&config, "account-b", &registry)
+            .unwrap()
+            .unwrap();
+        assert_eq!(fast.model_name, "chat-b");
+        assert!(Arc::ptr_eq(&fast.provider, &b));
+    }
+
     #[test]
     fn routing_contract_saved_auxiliary_roles_keep_complete_targets_for_every_chat_flag() {
         use crate::app_context::model_routing_test_support::RoutingContext;
@@ -951,6 +1231,46 @@ mod tests {
             }
             state.assert_no_requests();
         }
+    }
+
+    #[test]
+    fn primary_route_canonicalizes_alias_and_keeps_raw_provider_and_effort() {
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "work-openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "model":"chat-model",
+                "runtime_models":["chat-model"]
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work-openai".into());
+        let registry = registry_with_provider_ids(&["work-openai"], "work-openai");
+        let target = bamboo_domain::ProviderModelRef::new("openai", "chat-model")
+            .with_reasoning_effort(ReasoningEffort::High);
+        let selected = try_resolve_primary_model(&config, &registry, &target).unwrap();
+        assert_eq!(selected.target.provider, "work-openai");
+        assert_eq!(
+            selected.target.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert!(Arc::ptr_eq(
+            &selected.provider,
+            &registry.get("work-openai").unwrap()
+        ));
+        assert!(selected.managed_origin.is_none());
+
+        config.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":false, "model":"chat-model"
+            }))
+            .unwrap(),
+        );
+        let error = try_resolve_primary_model(&config, &registry, &target)
+            .err()
+            .expect("a disabled exact ID must not route to an alias");
+        assert!(error.to_string().contains("disabled"));
     }
 
     #[test]

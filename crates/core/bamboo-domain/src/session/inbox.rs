@@ -1902,13 +1902,16 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
-    /// The original Supervisor's existing attached followup authority, with
+    /// The original Supervisor's canonical followup authority, with
     /// the same retained never-installed namespace and full caller fence.
+    /// Retain the originally observed target birth, including on exact retries;
+    /// an ID-only lookup must not retarget a deleted/recreated Session.
     /// This port preserves its existing RespectSpecificWait intent.
     async fn deliver_unscoped_supervisor_followup(
         &self,
         _caller: &crate::SessionCallerReference,
         _supervisor: &crate::SupervisorReference,
+        _target_created_at: DateTime<Utc>,
         _envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(
@@ -1932,13 +1935,30 @@ pub trait SessionInboxPort: Send + Sync {
         Err(SessionRunConflict::unsupported(expected_run_id).into())
     }
 
+    /// Current-user followup with an immutable observed target lifetime. The
+    /// existing Inbox retains canonical caller, target/ancestry and physical
+    /// publication guards; no installed per-Project capability is required.
+    async fn deliver_supervisor_current_user_followup(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _supervisor: &super::SupervisorReference,
+        _target: &crate::SupervisorCurrentUserTarget,
+        _envelope: &SessionMessageEnvelope,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        Err(SessionInboxError::Storage(
+            "current-user Supervisor followup admission is unsupported".into(),
+        ))
+    }
+
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
-    /// through the inbox receipt. An earlier link observation is not a grant.
+    /// through the inbox receipt. The original target birth is required even
+    /// for an exact retry. An earlier link observation is not a grant.
     /// Backends without this integrated boundary must fail closed.
     async fn deliver_supervisor_followup(
         &self,
         _supervisor: &super::SupervisorReference,
+        _target_created_at: DateTime<Utc>,
         _envelope: &SessionMessageEnvelope,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(

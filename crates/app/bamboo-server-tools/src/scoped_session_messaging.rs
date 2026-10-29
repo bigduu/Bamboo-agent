@@ -18,6 +18,7 @@ pub struct ScopedSessionSendRequest {
     pub message: String,
     /// None retains legacy intent only on the supported same-tree route.
     pub delivery_intent: Option<SessionMessageDeliveryIntent>,
+    pub target_ref: Option<bamboo_domain::SupervisorCurrentUserTarget>,
 }
 
 impl ScopedSessionSendRequest {
@@ -41,6 +42,7 @@ pub enum ScopedSessionSendError {
     OriginalCallerChanged,
     PlanReadOnly,
     UnsupportedDeliveryIntent,
+    TargetReferenceRequired,
     /// No receipt is available to attest whether publication happened. This
     /// is neither admitted=false nor permission to choose a new operation ID.
     OutcomeUncertain,
@@ -99,9 +101,60 @@ impl ScopedSessionSendPort for CanonicalSessionSendAdapter {
         let original = ctx
             .executing_caller_for(id)
             .ok_or(ScopedSessionSendError::AuthorityUnavailable)?;
-        // The installed Host namespace is selected before role compatibility.
-        // A stale/revoked/unsupported namespace is an explicit refusal. Only
-        // never-installed None can use the existing Supervisor/same-tree route.
+        let canonical = self
+            .storage
+            .load_execution_admission_snapshot(id)
+            .await
+            .map_err(|_| ScopedSessionSendError::AuthorityUnavailable)?
+            .ok_or(ScopedSessionSendError::AuthorityUnavailable)?;
+        canonical
+            .check_execution_compatibility()
+            .map_err(|_| ScopedSessionSendError::AuthorityUnavailable)?;
+        if !original.matches_session(&canonical) {
+            return Err(ScopedSessionSendError::OriginalCallerChanged);
+        }
+        let is_supervisor = canonical.supervisor_incarnation_id().is_some();
+        if let Some(incarnation) = canonical.supervisor_incarnation_id() {
+            let supervisor = ctx
+                .executing_supervisor_for(id)
+                .ok_or(ScopedSessionSendError::AuthorityUnavailable)?
+                .supervisor_reference();
+            if supervisor.incarnation_id != incarnation {
+                return Err(ScopedSessionSendError::OriginalCallerChanged);
+            }
+            if let Some(target) = request.target_ref.as_ref() {
+                if request.delivery_intent != Some(SessionMessageDeliveryIntent::TriggerTurn) {
+                    return Err(ScopedSessionSendError::UnsupportedDeliveryIntent);
+                }
+                if target.session_id != request.target_session_id {
+                    return Err(ScopedSessionSendError::TargetReferenceRequired);
+                }
+                // The final current-user Inbox writer also retains/checks any
+                // installed Host send scope. A selector cannot escape it.
+                return self
+                    .messenger
+                    .supervisor_current_user_followup(
+                        original,
+                        &supervisor,
+                        target,
+                        &request.operation_id,
+                        &request.message,
+                    )
+                    .await
+                    .map(Into::into)
+                    .map_err(Into::into);
+            }
+        } else {
+            if ctx.executing_supervisor.is_some() {
+                return Err(ScopedSessionSendError::AuthorityUnavailable);
+            }
+            if request.target_ref.is_some() {
+                return Err(ScopedSessionSendError::InvalidRequest);
+            }
+        }
+        // An explicit Host request retains its finite namespace for every
+        // role, including QueueOnly. It cannot borrow default management rights.
+        // Revocation/stale/unsupported lookup is terminal, never a fallback.
         let token = self
             .storage
             .find_host_session_scope(original)
@@ -124,60 +177,18 @@ impl ScopedSessionSendPort for CanonicalSessionSendAdapter {
                 .await
                 .map_err(Into::into);
         }
-        let canonical = self
-            .storage
-            .load_execution_admission_snapshot(id)
+        if is_supervisor {
+            return Err(ScopedSessionSendError::TargetReferenceRequired);
+        }
+        self.messenger
+            .send_peer_observed(
+                original,
+                &request.target_session_id,
+                &request.operation_id,
+                &request.message,
+                request.delivery_intent,
+            )
             .await
-            .map_err(|_| ScopedSessionSendError::AuthorityUnavailable)?
-            .ok_or(ScopedSessionSendError::AuthorityUnavailable)?;
-        canonical
-            .check_execution_compatibility()
-            .map_err(|_| ScopedSessionSendError::AuthorityUnavailable)?;
-        if !original.matches_session(&canonical) {
-            return Err(ScopedSessionSendError::OriginalCallerChanged);
-        }
-        if let Some(incarnation) = canonical.supervisor_incarnation_id() {
-            let supervisor = ctx
-                .executing_supervisor_for(id)
-                .ok_or(ScopedSessionSendError::AuthorityUnavailable)?
-                .supervisor_reference();
-            if supervisor.incarnation_id != incarnation {
-                return Err(ScopedSessionSendError::OriginalCallerChanged);
-            }
-            // The existing followup writer binds RespectSpecificWait activation.
-            // It has no QueueOnly port. Never reinterpret a requested queue-only
-            // operation as a wake-up, including on an exact retry.
-            if request.delivery_intent != Some(SessionMessageDeliveryIntent::TriggerTurn) {
-                return Err(ScopedSessionSendError::UnsupportedDeliveryIntent);
-            }
-            self.messenger
-                .supervisor_followup_observed(
-                    original,
-                    &supervisor,
-                    &request.target_session_id,
-                    &request.operation_id,
-                    &request.message,
-                )
-                .await
-                .map(Into::into)
-                .map_err(Into::into)
-        } else {
-            if ctx.executing_supervisor.is_some() {
-                return Err(ScopedSessionSendError::AuthorityUnavailable);
-            }
-            // The observed helper keeps the original caller, then reuses the
-            // same envelope and final lifetime/tree/Project Inbox guard. It
-            // cannot deliver across Roots merely because a Project matches.
-            self.messenger
-                .send_peer_observed(
-                    original,
-                    &request.target_session_id,
-                    &request.operation_id,
-                    &request.message,
-                    request.delivery_intent,
-                )
-                .await
-                .map_err(Into::into)
-        }
+            .map_err(Into::into)
     }
 }

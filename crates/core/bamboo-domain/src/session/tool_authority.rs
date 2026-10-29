@@ -79,17 +79,36 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
     ROOT_ORCHESTRATION_TOOLS.contains(&execution_name)
 }
 
-/// Role-specific management retains its own live Supervisor authority gate.
-/// Common Session ports additionally require concrete Host instance proof at
-/// model catalog/dispatch/replay; these category names alone grant nothing.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 1] = ["session_control"];
+/// Exact Supervisor surface, independent of an ordinary Root's thinking mode.
+/// These are delegation or bounded business views, never raw workspace/file,
+/// process, Skill, Workflow or external-provider execution. Concrete Session
+/// ports still require their live Host instance proof; names grant nothing.
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
+    "SubAgent",
+    "spawn_session",
+    "Plan",
+    "Task",
+    "session_history_current",
+    "session_history",
+    "session_message",
+    "session_control",
+    "work_overview",
+    "work_search",
+    "work_inspect",
+    "work_changes",
+    "work_update",
+    "work_dispatch",
+];
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(
     execution_name: &str,
     executing_supervisor: bool,
 ) -> bool {
-    orchestration_only_allows_execution_name(execution_name)
-        || (executing_supervisor && SUPERVISOR_ORCHESTRATION_TOOLS.contains(&execution_name))
+    if executing_supervisor {
+        SUPERVISOR_ORCHESTRATION_TOOLS.contains(&execution_name)
+    } else {
+        orchestration_only_allows_execution_name(execution_name)
+    }
 }
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -107,6 +126,15 @@ pub enum RootToolAuthorityError {
 }
 
 impl Session {
+    /// A trusted Supervisor's delegation-only business authority is independent
+    /// of thinking mode. Callers still need Storage's canonical identity proof.
+    /// Thinking-mode counters are not business permission epochs. Existing
+    /// positive Work binding revisions remain in their canonical Ticket store;
+    /// the Host verifies their unchanged Supervisor namespace separately.
+    pub fn supervisor_orchestration_revision(&self) -> Option<u64> {
+        self.supervisor_incarnation_id().map(|_| 1)
+    }
+
     pub fn root_thinking_mode(&self) -> RootThinkingMode {
         RootThinkingMode::from_enabled(self.root_orchestration_only_enabled())
     }
@@ -237,6 +265,71 @@ mod tests {
     use crate::session::{AgentRuntimeState, ModelContextState, PlanModeState, PlanModeStatus};
 
     #[test]
+    fn supervisor_direct_files_and_processes_require_delegation_in_both_modes() {
+        use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        for ultra in [false, true, false] {
+            supervisor.set_root_orchestration_only(ultra).unwrap();
+            let restored: Session =
+                serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
+            for name in [
+                "Read",
+                "Grep",
+                "Glob",
+                "GetFileInfo",
+                "ViewImage",
+                "Write",
+                "Edit",
+                "NotebookEdit",
+                "apply_patch",
+                "Bash",
+                "exec_command",
+                "write_stdin",
+                "load_skill",
+                "workflow_run",
+                "browser",
+                "browser_eval",
+                "mcp__vendor__Read",
+                "default::Read",
+                "vendor::Read",
+            ] {
+                assert!(
+                    !restored.allows_model_tool_execution(name),
+                    "Supervisor mode={ultra} must delegate {name}"
+                );
+            }
+            for name in [
+                "SubAgent",
+                "Plan",
+                "Task",
+                "session_control",
+                "session_history",
+            ] {
+                assert!(restored.allows_model_tool_execution(name), "{name}");
+            }
+            let child = Session::new_child_of("worker", &restored, "model", "worker");
+            assert!(child.authority_identity.is_ordinary());
+            assert!(child.allows_model_tool_execution("Read"));
+            assert!(child.allows_model_tool_execution("Edit"));
+            assert!(child.allows_model_tool_execution("exec_command"));
+        }
+        let mut ordinary = Session::new("ordinary", "model");
+        for ultra in [false, true] {
+            ordinary.set_root_orchestration_only(ultra).unwrap();
+            assert!(ordinary.allows_model_tool_execution("Read"));
+            assert_eq!(ordinary.supervisor_incarnation_id(), None);
+            // Standard's coarse tool policy is not the concrete Host port's
+            // management authorization. Keep its existing surface unchanged.
+            if ultra {
+                assert!(!ordinary.allows_model_tool_execution("session_control"));
+            }
+        }
+    }
+
+    #[test]
     fn supervisor_delegation_first_does_not_depend_on_ultra_or_leak_to_children() {
         use crate::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
@@ -247,10 +340,7 @@ mod tests {
             supervisor.set_root_orchestration_only(ultra).unwrap();
             let restored: Session =
                 serde_json::from_value(serde_json::to_value(&supervisor).unwrap()).unwrap();
-            for name in ROOT_ORCHESTRATION_TOOLS
-                .into_iter()
-                .chain(SUPERVISOR_ORCHESTRATION_TOOLS)
-            {
+            for name in SUPERVISOR_ORCHESTRATION_TOOLS {
                 assert!(
                     restored.allows_model_tool_execution(name),
                     "{ultra}: {name}"

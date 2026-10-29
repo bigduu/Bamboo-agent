@@ -7,6 +7,9 @@ const path = require("node:path")
 const { test } = require("node:test")
 const { runInNewContext } = require("node:vm")
 
+const historical = require("./tests/main-authority-bootstrap-fixture.cjs").legacyData()
+const legacyTest = (name, fn) => test(`historical: ${name}`, t => fn(t, historical.ci, id => job(id, historical.ci), historical.contributingRelease))
+
 const workflow = readFileSync(".github/workflows/ci.yml", "utf8")
 const cacheCleanupWorkflow = readFileSync(
   ".github/workflows/pr-cache-cleanup.yml",
@@ -29,16 +32,16 @@ const frozenCacheWriteHeader = [
 const cacheSaveIf = (predicate) =>
   `save-if: \${{ (${predicate}) && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}`
 
-const job = (id) => {
+const job = (id, source = workflow) => {
   const marker = `\n  ${id}:\n`
-  const start = workflow.indexOf(marker)
+  const start = source.indexOf(marker)
   assert.notEqual(start, -1, `missing CI job: ${id}`)
 
   const contentStart = start + marker.length
-  const nextJob = workflow.slice(contentStart).search(/\n  [a-z][a-z0-9-]*:\n/u)
+  const nextJob = source.slice(contentStart).search(/\n  [a-z][a-z0-9-]*:\n/u)
   return nextJob === -1
-    ? workflow.slice(contentStart)
-    : workflow.slice(contentStart, contentStart + nextJob)
+    ? source.slice(contentStart)
+    : source.slice(contentStart, contentStart + nextJob)
 }
 
 const comprehensiveOnly =
@@ -57,7 +60,7 @@ function assertCargoFailureCollection(source) {
   assert.doesNotMatch(source, /continue-on-error:\s*true|\|\|\s*(?:true|exit 0)/u)
 }
 
-test("runtime Cargo gates collect failures without masking their nonzero exit", () => {
+legacyTest("runtime Cargo gates collect failures without masking their nonzero exit", (_, workflow, job, contributing) => {
   const frontend = readFileSync(".github/workflows/frontend-acceptance.yml", "utf8")
   const macHelper = readFileSync("scripts/run-macos-server-lib-tests.sh", "utf8")
   for (const source of [workflow, frontend, macHelper]) {
@@ -78,7 +81,7 @@ test("runtime Cargo gates collect failures without masking their nonzero exit", 
   assert.match(macHelper, /^exit "\$cargo_status"$/mu)
 })
 
-test("platform matrices retain results after another platform fails", () => {
+legacyTest("platform matrices retain results after another platform fails", (_, workflow, job, contributing) => {
   for (const id of ["tls-fixture-test", "tool-event-recorder-e2e", "build"]) {
     const source = job(id)
     assert.match(source, /^    strategy:\n      fail-fast: false\n/mu)
@@ -166,7 +169,7 @@ test("macOS link guard preserves Cargo failures and rejects lost or oversized di
   }
 })
 
-test("main-push validation remains reachable by the existing automatic publisher", () => {
+legacyTest("main-push validation remains reachable by the existing automatic publisher", (_, workflow, job, contributing) => {
   assert.match(workflow, /^  push:\n    branches: \[ main \]$/mu)
   assert.match(workflow, /pull_request:\n\s+branches: \[ dev, main \]/u)
 
@@ -181,7 +184,7 @@ test("main-push validation remains reachable by the existing automatic publisher
   assert.doesNotMatch(testJob, /run: cargo test/u)
   assert.match(
     testJob,
-    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs scripts\/run-feature-tests\.test\.cjs\n/u,
+    /- name: Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs scripts\/crate-release\.test\.cjs scripts\/ci-routing\.test\.cjs scripts\/sidecar-release\.test\.cjs scripts\/test-groups\.test\.cjs scripts\/run-feature-tests\.test\.cjs scripts\/native-test-owner\.test\.cjs\n/u,
   )
   assert.match(
     testJob,
@@ -227,7 +230,7 @@ function serverMatrix(source) {
     .map((match) => ({ crate: match[1], block: match[2] }))
 }
 
-test("legacy release matrices retain their original crate and server coverage", () => {
+legacyTest("legacy release matrices retain their original crate and server coverage", (_, workflow, job, contributing) => {
   const manifest = readFileSync("Cargo.toml", "utf8")
   const members = manifest.match(/^default-members = \[([\s\S]*?)^\]/mu)
   assert.ok(members)
@@ -258,7 +261,7 @@ test("legacy release matrices retain their original crate and server coverage", 
   assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
 })
 
-test("one feature executor preserves default configurations and complete explicit additive case ownership", () => {
+test("feature shards preserve default configurations and complete explicit additive case ownership", () => {
   const { selectedPackages, sourceFeatureHash, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, cargoArguments } = require('./run-feature-tests.cjs')
   const result = spawnSync('cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
   assert.equal(result.status, 0, result.stderr)
@@ -287,12 +290,12 @@ test("one feature executor preserves default configurations and complete explici
     assert.ok(packages.some(owner => owner.name === context.package))
     assert.ok(!cargoArguments({ name: context.package }, context, true).includes('--all-features'))
   }
-  assert.match(job('feature-tests'), /target\/feature-tests/u)
-  assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
+  assert.match(job('feature-shards'), /target\/feature-tests/u)
+  assert.match(job('feature-shards'), /run: node scripts\/run-feature-tests.cjs/u)
 })
 
-test("the feature executor bounds debug artifacts and records capacity without changing release profiles", () => {
-  const feature = job("feature-tests")
+test("feature shards bound debug artifacts and record capacity without changing release profiles", () => {
+  const feature = job("feature-shards")
   assert.match(feature, /^    timeout-minutes: 90$/mu)
   for (const profile of ["DEV", "TEST"]) {
     const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
@@ -309,7 +312,7 @@ test("the feature executor bounds debug artifacts and records capacity without c
   assert.doesNotMatch(readFileSync(".github/workflows/publish-crate.yml", "utf8"), /CARGO_PROFILE_(?:DEV|TEST)_DEBUG/u)
 })
 
-test("required Test performs only result admission for feature PRs without an unused checkout, toolchain or cache", () => {
+legacyTest("required Test performs only result admission for feature PRs without an unused checkout, toolchain or cache", (_, workflow, job, contributing) => {
   const assertOwnership = (source) => {
     const steps = source.split(/\n      - /u).slice(1)
     assert.ok(steps.length > 1)
@@ -342,32 +345,162 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   assert.match(lint, /test "\$actual" = "\$EXPECTED_SOURCE"/u)
 })
 
+const OBSERVER_FAULT_HOST_CASES = [
+  "fault_cap_from_actual_publication_failure_notifies_idle_parent_once",
+  "fault_preserves_live_work_wait_and_original_user_input",
+  "fault_parent_inbox_before_checkpoint_reopens_and_never_replays_provider",
+  "fault_missing_source_can_report_but_revoked_registration_cannot",
+  "fault_delivery_failure_is_bounded_durable_and_preserves_original_payload",
+]
+
 function assertSubscriptionException(source) {
-  // Normal merge6cfe/PR2316 retains original F57c1 configuration. This is not
-  // actual-M acceptance or ownership migration; a future owner needs review.
-  assert.equal(createHash("sha256").update(source).digest("hex"), "e79b9f16140786a49761cd5baab66a5cf83faa5d793ed11464701c2b475175da")
-  assert.match(source, /pull_request:\n    branches: \[dev\]/u)
+  // Keep the complete original joint recipe as an explicit manual diagnostic.
+  // Only its entrypoint/source binding and the separate Clippy owner changed.
+  // This remains API-only feature-head evidence, never canonical-M admission.
+  const extension = "          faults = {\n" + OBSERVER_FAULT_HOST_CASES
+    .map(name => `              '${name}',\n`).join("") +
+    "          }\n          expected |= {f'app_state::observer_subscriptions::tests::fault::{name}' for name in faults}\n"
+  assert.ok(source.includes(extension), "Require all five exact fault cases")
+  const original = source
+    .replace("      - 'crates/app/bamboo-server/src/app_state/observer_fault_tests.rs'\n", "")
+    .replace(extension, "")
+    .replace("print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions, seven subscription and five fault Host fixtures passed')",
+      "print('Six canonical windows, exact legacy serde, five fail-closed Inbox regressions and all seven actual subscription Host fixtures passed')")
+  assert.equal(createHash("sha256").update(original).digest("hex"), "5a9ec1ee32d1e0faaee714a21bba5e64775b6a2bc61bc0ea90c88f29f6823431")
+  assert.equal(createHash("sha256").update(source).digest("hex"), "4ba96e60f4fb4b2a28aa1614e385a76f90f1c9d648d4a17a5a78166e72b4a0e5")
+  assert.match(source, /on:\n  workflow_dispatch:\n/u)
+  assert.doesNotMatch(source.split("\npermissions:")[0], /pull_request:|push:/u)
   assert.match(source, /runs-on: ubuntu-latest/u)
   assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
-  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
-  assert.match(source, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ github\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ github\.sha \}\}/u)
   assert.match(source, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
   assert.match(source, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
   assert.match(source, /--test-threads=1 --color=never/u)
-  assert.match(source, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-engine -p bamboo-storage/u)
+  assert.doesNotMatch(source, /cargo clippy/u)
 }
+
+const OBSERVER_SHARED_SERDE_CASE = "session::supervisor_management::tests::supervisor_management_public_serde_is_legacy_compatible_and_children_drop_state"
+function observerRecipe(source, name) {
+  const marker = `      - name: ${name}\n`, start = source.indexOf(marker)
+  assert.notEqual(start, -1, `Missing Observer recipe ${name}`)
+  const end = source.indexOf("\n      - ", start + marker.length)
+  return source.slice(start, end === -1 ? undefined : end).trimEnd()
+}
+function assertObserverRuntimeOwner(definitions) {
+  const combined = definitions["trusted-observer.yml"], manual = definitions["observer-subscriptions.yml"]
+  assertLinuxTestOwnership({ "trusted-observer.yml": combined, "observer-subscriptions.yml": manual })
+  const paths = source => [...source.split("\npermissions:")[0].matchAll(/^      - '([^']+)'$/gmu)].map(row => row[1]).sort()
+  assert.deepEqual(paths(combined), paths(definitions["observer-api-lint.yml"]).filter(file => file !== ".github/workflows/observer-api-lint.yml"))
+  assert.match(combined, /pull_request:\n    branches: \[dev\]/u)
+  assert.doesNotMatch(manual.split("\npermissions:")[0], /pull_request:|push:/u)
+  assert.match(combined, /timeout-minutes: 180/u)
+  const firstName = "Run real management, proof, lock-order and native Host cases"
+  const secondName = "Run exact canonical state and seven real subscription Host cases"
+  assert.ok(combined.indexOf(firstName) < combined.indexOf(secondName))
+  const first = observerRecipe(combined, firstName), second = observerRecipe(combined, secondName)
+  assert.match(first, /timeout-minutes: 90/u)
+  assert.ok(first.includes(`assert '${OBSERVER_SHARED_SERDE_CASE}' in results['domain']`), "The first joint recipe must prove the shared case passed")
+  const expected = observerRecipe(manual, secondName)
+    .replace(`name: ${secondName}\n`, `name: ${secondName}\n        if: success()\n        timeout-minutes: 90\n`)
+    .replace('            --test-threads=1 --color=never \\\n', `            --skip ${OBSERVER_SHARED_SERDE_CASE} \\\n            --test-threads=1 --color=never \\\n`)
+    .replace(`assert results['domain'] - window == {'${OBSERVER_SHARED_SERDE_CASE}'}`, "assert results['domain'] == window, 'Shared serde case already passed in the first joint recipe'")
+    .replace("Six canonical windows, exact legacy serde,", "Six canonical windows, shared serde already covered,")
+  assert.equal(second, expected, "Preserve the complete original joint recipe, skipping only the already-passed serde case")
+  assert.equal((combined.match(/--skip /gu) ?? []).length, 1)
+  assert.match(second, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
+  assert.equal((combined.match(/CARGO_TARGET_DIR:/gu) ?? []).length, 1)
+}
+
+test("one automatic Observer job preserves both joint graphs and executes shared serde once", () => {
+  const definitions = Object.fromEntries(readdirSync(".github/workflows").filter(file => /\.ya?ml$/u.test(file))
+    .map(file => [file, readFileSync(path.join(".github/workflows", file), "utf8")]))
+  assertObserverRuntimeOwner(definitions)
+  const name = "trusted-observer.yml", source = definitions[name]
+  for (const [before, after] of [[`--skip ${OBSERVER_SHARED_SERDE_CASE}`, "--skip supervisor_management"],
+    [`--skip ${OBSERVER_SHARED_SERDE_CASE}`, ""], ["        if: success()", "        if: always()"],
+    ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-engine -p bamboo-server --lib"],
+    ["Shared serde case already passed in the first joint recipe", "ignored duplicate"],
+    ["assert len(window) == 6", "assert len(window) >= 0"]]) {
+    assert.ok(source.includes(before), before)
+    assert.throws(() => assertObserverRuntimeOwner({ ...definitions, [name]: source.replace(before, after) }))
+  }
+  assert.throws(() => assertObserverRuntimeOwner({ ...definitions, "observer-subscriptions.yml": definitions["observer-subscriptions.yml"]
+    .replace("  workflow_dispatch:", "  pull_request:\n    branches: [dev]") }))
+})
+
+function assertObserverLintOwner(definitions) {
+  const filename = "observer-api-lint.yml", owner = definitions[filename]
+  assert.equal(typeof owner, "string", "Require the single shared Observer lint owner")
+  const paths = source => (source.split("\npermissions:\n")[0].match(/^      - .+$/gmu) ?? []).map(line => {
+    assert.match(line, /^      - '[^']+'$/u)
+    return line.slice(9, -1)
+  })
+  const originals = ["trusted-observer.yml", "observer-subscriptions.yml"]
+  const expected = [...new Set([...originals.flatMap(file => paths(definitions[file])), `.github/workflows/${filename}`])].sort()
+  assert.deepEqual(paths(owner).sort(), expected, "Preserve the complete union of both runtime path filters")
+  const trigger = owner.split("\non:\n")[1].split("\npermissions:\n")[0]
+  assert.deepEqual(trigger.match(/^  \S.*$/gmu), ["  pull_request:"])
+  assert.match(trigger, /^    branches: \[dev\]$/mu)
+  assert.deepEqual([...owner.split("\njobs:\n")[1].matchAll(/^  ([a-z-]+):$/gmu)].map(row => row[1]), ["lint"])
+  assert.match(owner, /runs-on: ubuntu-latest/u)
+  assert.match(owner, /uses: dtolnay\/rust-toolchain@stable\n        with:\n          components: clippy/u)
+  for (const line of ["CARGO_BUILD_JOBS: '1'", "CARGO_INCREMENTAL: '0'", "RUST_MIN_STACK: '8388608'",
+    "BAMBOO_FRONTEND_BUILD_MODE: api-only", "EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}",
+    "ref: ${{ github.event.pull_request.head.sha }}", "save-if: false"]) assert.ok(owner.includes(line), line)
+  assert.equal((owner.match(/test "\$actual" = "\$EXPECTED_SOURCE_SHA"/gu) ?? []).length, 2)
+  assert.equal((owner.match(/test -z "\$status"/gu) ?? []).length, 2)
+  assert.match(owner, /name: Verify exact source stayed clean\n        if: always\(\)/u)
+  assert.doesNotMatch(owner, /continue-on-error|CARGO_PROFILE_|RUSTFLAGS|cargo test|npm |secrets\./u)
+  const normalized = owner.replace(/\\\r?\n[ \t]*/gu, " ").replace(/[ \t]+/gu, " ")
+  const policy = normalized.match(/policy=\(([\s\S]*?)\)/u)?.[1].trim().split(/\s+/u)
+  assert.deepEqual(policy, ["-D", "warnings", "-A", "deprecated", "-A", "clippy::module_inception", "-A", "clippy::incompatible_msrv",
+    "-A", "clippy::needless_borrows_for_generic_args", "-A", "clippy::too-many-arguments", "-A", "clippy::while-let-loop",
+    "-A", "clippy::type_complexity", "-A", "dead-code"])
+  assert.match(normalized, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage -p bamboo-engine -p bamboo-server-tools -p bamboo-server -- "\$\{policy\[@\]\}"/u)
+  assert.doesNotMatch(normalized, /cargo clippy[^\n]*(?:--workspace|--tests|--bins)/u)
+  const packages = ["bamboo-domain", "bamboo-engine", "bamboo-server", "bamboo-server-tools", "bamboo-storage"]
+  const owners = Object.entries(definitions).flatMap(([file, source]) => {
+    if (!source.includes("BAMBOO_FRONTEND_BUILD_MODE: api-only")) return []
+    return [...source.replace(/\\\r?\n[ \t]*/gu, " ").matchAll(/cargo clippy[^\n]+/gu)].filter(([command]) =>
+      JSON.stringify([...command.matchAll(/(?:^| )-p ([a-z-]+)/gu)].map(row => row[1]).sort()) === JSON.stringify(packages)).map(() => file)
+  })
+  assert.deepEqual(owners, [filename], "The identical five-library API-only analysis must execute once")
+  for (const file of originals) assert.doesNotMatch(definitions[file], /cargo clippy/u)
+}
+
+test("Observer API-only Clippy has one owner for the union of both runtime paths", () => {
+  const definitions = Object.fromEntries(readdirSync(".github/workflows").filter(file => /\.ya?ml$/u.test(file))
+    .map(file => [file, readFileSync(path.join(".github/workflows", file), "utf8")]))
+  assertObserverLintOwner(definitions)
+  const name = "observer-api-lint.yml", owner = definitions[name]
+  for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
+    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
+    ["branches: [dev]", "branches: [main]"], ["--all-features", "--no-default-features"],
+    ["-p bamboo-server-tools ", ""], ["-D warnings", "-A warnings"], ['test -z "$status"', "true"],
+    ["save-if: false", "save-if: true"], ["  pull_request:", '  "push":\n  pull_request:']]) {
+    assert.ok(owner.includes(before), before)
+    assert.throws(() => assertObserverLintOwner({ ...definitions, [name]: owner.replace(before, after) }))
+  }
+  for (const file of ["crates/core/bamboo-domain/src/session/supervisor_management.rs",
+    "crates/infra/bamboo-storage/src/v2/child_wait_control_plane.rs", "crates/app/bamboo-server/src/app_state/builder.rs"]) {
+    assert.throws(() => assertObserverLintOwner({ ...definitions, [name]: owner.replace(`      - '${file}'\n`, "") }))
+  }
+  assert.throws(() => assertObserverLintOwner({ ...definitions, [name]: undefined }))
+  assert.throws(() => assertObserverLintOwner({ ...definitions, "extra-api-lint.yml": owner }))
+})
 
 function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {
-      "feature-tests": "The canonical isolated-default and explicit-feature test executor",
+      "feature-shards": "The canonical isolated-default and explicit-feature test shards",
       "quick-checks": "Small synthetic workflow/controller policy fixtures",
       test: "Pinned legacy release policy fixtures; feature mode is admission only",
       "test-crates": "Pinned legacy release Unit acceptance until source cutover",
       "e2e-crates": "Pinned legacy release E2E acceptance until source cutover",
       "test-ssh": "Pinned legacy release live SSH fixture until source cutover",
       build: "Pinned legacy release native-platform tests until source cutover",
-      "tool-event-recorder-e2e": "Legacy Linux coverage; feature matrix is Mac/Windows only",
+      "tool-event-recorder-e2e": "Pinned legacy recorder coverage; feature runs in its owned native matrix",
     },
     "frontend-acceptance.yml": {
       build: "Pinned legacy original-release-head build and policy fixtures",
@@ -375,7 +508,7 @@ function assertLinuxTestOwnership(definitions) {
     },
     "release-cargo-isolation.yml": { isolation: "Synthetic credential/ENOSPC containment boundary" },
     "trusted-observer.yml": { observer: "Accepted API-only/F multi-package Observer configuration; not M evidence" },
-    "delegated-planner-acceptance.yml": { planner: "New a64 API-only/F Planner targets; independent accepted configuration, not M evidence" },
+    "delegated-planner-acceptance.yml": { planner: "Distinct API-only/F Planner CLI and original Clippy; library cases run once on canonical M" },
     "observer-subscriptions.yml": { observer: "Inherited 6cfe API-only/F subscription joint graph; temporary exact configuration, not M evidence" },
     "ticket-platform-adapter.yml": { "native-budget": "Explicit manual snapshot diagnosis; normal PR job is Windows" },
   }
@@ -394,26 +527,26 @@ function assertLinuxTestOwnership(definitions) {
           !(/["']cargo["']/u.test(code) && /["']test["']/u.test(code))) continue
       assert.ok(registered[file]?.[id], `Ordinary Linux Rust tests must join the canonical feature executor: ${file}:${id}; consolidate targets or review an explicit scoped exception`)
       if (file === "delegated-planner-acceptance.yml") {
-        // Newly inherited #2304 owner, not part of the original A95 baseline.
-        assert.equal(createHash("sha256").update(source).digest("hex"), "318e924773ffdeb0407c5b73b15a70c330f7f64eb7ef3260c1a955782d12d912")
+        // Retain #2304 API-only CLI/lint; default library runtime has moved to M.
+        assert.equal(createHash("sha256").update(source).digest("hex"), "e40d291b67054a05629a85a8b802fe198a0ee6e3b0d9beb8102e09bd744509ff")
         assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
         assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/u)
-        for (const command of ["cargo test --locked -p bamboo-server-tools --lib plan::tests::",
-          "cargo test --locked -p bamboo-engine --lib planner_artifact",
-          "cargo test --locked -p bamboo-agent --test required_child_context_packet",
+        assert.doesNotMatch(block, /cargo test --locked -p bamboo-(?:server-tools|engine) --lib/u)
+        assert.ok(block.includes("-p bamboo-engine -p bamboo-server-tools -p bamboo-server --lib --"))
+        for (const command of ["cargo test --locked -p bamboo-agent --test required_child_context_packet",
           "cargo clippy --locked --all-features -p bamboo-agent"]) assert.ok(block.includes(command))
       }
       if (file === "trusted-observer.yml") {
         // Preserve this separately accepted F/config exactly; never relabel it as M.
-        assert.equal(createHash("sha256").update(source).digest("hex"), "7c26b1511759f5a40bad6a21dc44976a59f60c81f841cdf00396fa38e5d868ab")
+        assert.equal(createHash("sha256").update(source).digest("hex"), "ce58547220ee0620820911b4354af9d446acd65bb036cbfb1ce5411360acebaa")
         assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
         assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /test "\$actual" = "\$EXPECTED_SOURCE_SHA"/u)
         assert.match(block, /cargo test --locked -p bamboo-domain -p bamboo-storage -p bamboo-server --lib --/u)
-        assert.match(block, /cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage/u)
+        assert.doesNotMatch(block, /cargo clippy/u)
       }
       if (file === "ticket-platform-adapter.yml") {
         assert.match(block, /^    if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''$/mu)
@@ -426,14 +559,14 @@ function assertLinuxTestOwnership(definitions) {
         assert.match(block, /^    if: >-\n      needs.validation-source.outputs.full == 'true' &&\n/mu)
         assert.doesNotMatch(block, /outputs\.feature|base_ref == 'dev'/u)
       }
-      if (file === "ci.yml" && id === "feature-tests") {
+      if (file === "ci.yml" && id === "feature-shards") {
         assert.equal([...block.matchAll(/run: node scripts\/run-feature-tests\.cjs$/gmu)].length, 1)
         assert.doesNotMatch(block, /cargo test/u)
         const paths = [...block.matchAll(/\bscripts\/[a-zA-Z0-9_./-]+\.(?:cjs|mjs|js|py|sh)/gu)].map(match => match[0])
         assert.ok(paths.every(name => ["scripts/run-feature-tests.cjs", "scripts/frontend-package.cjs"].includes(name)))
       }
       if (file === "ci.yml" && id === "tool-event-recorder-e2e") {
-        assert.ok(block.includes(`needs.validation-source.outputs.feature == 'true' && '["macos-latest","windows-latest"]'`))
+        assert.match(block, /^    if: needs.validation-source.outputs.full == 'true'$/mu)
       }
     }
   }
@@ -444,10 +577,11 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
   const definitions = Object.fromEntries(readdirSync(directory).filter(file => /\.ya?ml$/u.test(file))
     .map(file => [file, readFileSync(path.join(directory, file), "utf8")]))
   assertLinuxTestOwnership(definitions)
+  assertObserverLintOwner(definitions)
+  assertObserverRuntimeOwner(definitions)
   for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
     ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
-    ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"],
-    ["cargo clippy --locked --all-features --lib", "cargo clippy --locked --lib"]]) {
+    ["-p bamboo-domain -p bamboo-storage -p bamboo-server --lib", "-p bamboo-server --lib"]]) {
     assert.throws(() => assertLinuxTestOwnership({ ...definitions,
       "trusted-observer.yml": definitions["trusted-observer.yml"].replace(before, after) }))
   }
@@ -462,29 +596,86 @@ test("all agents share canonical feature tests instead of adding ordinary Linux 
   const unregistered = workflow + "\n  extra-linux-tests:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test --locked -p bamboo-server --lib\n"
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ci.yml": unregistered }), /must join the canonical feature executor/u)
   assert.throws(() => assertLinuxTestOwnership({ ...definitions, "ticket-platform-adapter.yml": definitions["ticket-platform-adapter.yml"]
+    .replace("  workflow_dispatch:\n", "  pull_request:\n    branches: [dev]\n  workflow_dispatch:\n")
     .replace("if: github.event_name == 'workflow_dispatch' && inputs.snapshot_sha != ''", "if: github.event_name == 'pull_request'") }), /workflow_dispatch/u)
 })
 
-test("subscription exception retains exact F API-only graph without becoming merge-source evidence", () => {
+test("Supervisor API-only diagnostics are manual and bind the exact dispatch before checkout", () => {
+  const source = readFileSync(".github/workflows/supervisor-role-acceptance.yml", "utf8")
+  assert.match(source, /^  workflow_dispatch:$/mu)
+  assert.doesNotMatch(source, /^  (?:pull_request|push):/mu)
+  assert.match(source, /snapshot_sha:\n        description: .+\n        required: true\n        type: string/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /DISPATCH_SOURCE_SHA: \$\{\{ github\.sha \}\}/u)
+  assert.match(source, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
+  assert.match(source, /cancel-in-progress: false/u)
+  assert.doesNotMatch(source, /continue-on-error: true|\|\| true/u)
+  const marker = "      - name: Validate exact diagnostic source\n        run: |\n"
+  assert.ok(source.indexOf(marker) < source.indexOf("      - uses: actions/checkout@"))
+  const script = source.split(marker)[1].split("\n      - ")[0].split("\n")
+    .map(line => line.replace(/^          /u, "")).join("\n")
+  const sha = "a".repeat(40)
+  for (const [snapshot, dispatched, valid] of [[sha, sha, true], [sha, "b".repeat(40), false],
+    ["A".repeat(40), "A".repeat(40), false], ["a".repeat(39), "a".repeat(39), false],
+    ["", "", false], [sha + "\n", sha, false], ["$(exit 0)", sha, false]]) {
+    const result = spawnSync("bash", ["-c", script], { encoding: "utf8",
+      env: { PATH: process.env.PATH, EXPECTED_SOURCE_SHA: snapshot, DISPATCH_SOURCE_SHA: dispatched } })
+    assert.equal(result.status === 0, valid, "foreign/malformed diagnostic source must fail closed")
+  }
+  const ownerCase = "only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait"
+  const ownerBlock = source.split("run_nonempty work-owner")[1].split("run_nonempty engine")[0]
+  assert.ok(ownerBlock.includes(`ticket_runtime::tests::${ownerCase}`))
+  assert.ok(ownerBlock.includes("-- --exact --test-threads=1"))
+  assert.ok(source.includes(`--skip ${ownerCase}`), "the explicit case cannot run twice in the broad selector")
+  assert.equal((source.match(/test "\$\(git rev-parse HEAD\)" = "\$EXPECTED_SOURCE_SHA"/gu) || []).length, 2)
+})
+
+test("Original Epic API-only diagnostic binds its exact dispatch source", () => {
+  const source = readFileSync(".github/workflows/supervisor-epic-acceptance.yml", "utf8")
+  assert.match(source, /^  workflow_dispatch:$/mu)
+  assert.doesNotMatch(source, /^  (?:pull_request|push):/mu)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /DISPATCH_SOURCE_SHA: \$\{\{ github\.sha \}\}/u)
+  assert.match(source, /ref: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /cancel-in-progress: false/u)
+  const marker = "      - name: Require a fixed diagnostic source\n"
+  assert.ok(source.indexOf(marker) < source.indexOf("      - uses: actions/checkout@"))
+  const block = source.split(marker)[1].split("\n      - ")[0]
+  const script = block.split("        run: |\n")[1].replace(/^          /gmu, "")
+  const sha = "a".repeat(40)
+  for (const [snapshot, dispatched, valid] of [[sha, sha, true], [sha, "b".repeat(40), false],
+    ["b".repeat(40), "b".repeat(40), true], ["A".repeat(40), "A".repeat(40), false],
+    ["a".repeat(39), sha, false], ["", "", false], [sha + "\n", sha, false], ["$(exit 0)", sha, false]]) {
+    const result = spawnSync("bash", ["-c", script], { encoding: "utf8",
+      env: { PATH: process.env.PATH, EXPECTED_SOURCE_SHA: snapshot, DISPATCH_SOURCE_SHA: dispatched } })
+    assert.equal(result.status === 0, valid, "foreign/malformed diagnostic source must fail closed")
+  }
+})
+
+test("manual subscription diagnostic retains the original API-only joint recipe", () => {
   const source = readFileSync(".github/workflows/observer-subscriptions.yml", "utf8")
   assertLinuxTestOwnership({ "observer-subscriptions.yml": source })
   for (const [before, after] of [["BAMBOO_FRONTEND_BUILD_MODE: api-only", "BAMBOO_FRONTEND_BUILD_MODE: embedded"],
-    ["ref: ${{ github.event.pull_request.head.sha }}", "ref: ${{ github.sha }}"],
-    ["EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}", "EXPECTED_SOURCE_SHA: ${{ github.sha }}"],
-    ["ubuntu-latest", "windows-latest"], ["branches: [dev]", "branches: [main]"],
+    ["ref: ${{ github.sha }}", "ref: dev"],
+    ["EXPECTED_SOURCE_SHA: ${{ github.sha }}", "EXPECTED_SOURCE_SHA: dev"],
+    ["ubuntu-latest", "windows-latest"], ["  workflow_dispatch:", "  pull_request:\n    branches: [dev]"],
     ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-server --lib"],
     ["observer_subscription session::supervisor_management::tests::", "observer_subscription"],
-    ["--test-threads=1", "--test-threads=2"], ["--all-features", "--no-default-features"],
+    ["--test-threads=1", "--test-threads=2"],
     ["assert len(window) == 6", "assert len(window) >= 0"]]) {
     assert.ok(source.includes(before), before)
     assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(before, after) }))
   }
-  assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source }), /must join the canonical feature executor/u)
+  for (const name of OBSERVER_FAULT_HOST_CASES) {
+    assert.ok(source.includes(name), name)
+    assert.throws(() => assertLinuxTestOwnership({ "observer-subscriptions.yml": source.replace(name, name + "_unowned") }))
+  }
+  assert.throws(() => assertLinuxTestOwnership({ "unregistered-subscriptions.yml": source.replace("  workflow_dispatch:", "  pull_request:\n    branches: [dev]") }), /must join the canonical feature executor/u)
 })
 
 function serverCommand(id) {
   const name = id === "test-crates" ? "Test server block" : "Run E2E server block"
-  const step = job(id).split(`      - name: ${name}\n`)[1]?.split(/\n      - /u)[0]
+  const step = job(id, historical.ci).split(`      - name: ${name}\n`)[1]?.split(/\n      - /u)[0]
   const command = step?.match(/        run: \|\n([\s\S]*)/u)?.[1].replace(/^          /gmu, "")
   assert.ok(command)
   return command
@@ -511,7 +702,7 @@ process.exit(process.env.TEST_FAIL_KIND === kind ? 17 : 0)
   }
 }
 
-test("server library commands partition every nested namespace by its first matching filter", (t) => {
+legacyTest("server library commands partition every nested namespace by its first matching filter", (t, workflow, job, contributing) => {
   const run = serverCargoFixture(t)
   const names = ["future::unclassified::tests::case", ...serverFilters.map((filter) => `future::${filter}tests::case`)]
   for (const first of serverFilters) for (const second of serverFilters) {
@@ -540,7 +731,7 @@ test("server library commands partition every nested namespace by its first matc
   }
 })
 
-test("server Cargo target layout keeps the unfiltered integration tail complete", (t) => {
+legacyTest("server Cargo target layout keeps the unfiltered integration tail complete", (t, workflow, job, contributing) => {
   const root = "crates/app/bamboo-server"
   const python = ["python3", "python3.12", "python3.14"].find((candidate) => spawnSync(candidate, ["-c", "import tomllib"]).status === 0)
   assert.ok(python, "Cargo target policy requires Python with tomllib")
@@ -584,7 +775,7 @@ test("server Cargo target layout keeps the unfiltered integration tail complete"
   assert.equal(run("e2e-crates", "integration", "integration").status, 17)
 })
 
-test("native summaries reject failed, cancelled, skipped and missing crate results", () => {
+legacyTest("native summaries reject failed, cancelled, skipped and missing crate results", (_, workflow, job, contributing) => {
   for (const [id, stepName, variables] of [
     ["test", "Require all crate tests and the SSH fixture", ["CRATE_RESULT", "E2E_RESULT", "SSH_RESULT"]],
     ["e2e-test", "Require all E2E crate tests", ["CRATE_RESULT", "SSH_RESULT"]],
@@ -596,7 +787,9 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
     assert.ok(command)
     const results = Object.fromEntries(variables.map((name) => [name, "success"]))
     const run = (overrides = {}) => spawnSync("bash", ["-e", "-o", "pipefail", "-c", command], {
-      env: { ...process.env, FEATURE_VALIDATION: "false", ...results, ...overrides }, encoding: "utf8",
+      env: { ...process.env, SOURCE_RESULT: "success", FULL_VALIDATION: "true", FEATURE_VALIDATION: "false",
+        LINT_RESULT: "success", MSRV_RESULT: "success", SECURITY_RESULT: "success", DENY_RESULT: "success", DOCS_RESULT: "success",
+        ...results, ...overrides }, encoding: "utf8",
     })
     assert.equal(run().status, 0)
     for (const variable of variables) {
@@ -607,7 +800,7 @@ test("native summaries reject failed, cancelled, skipped and missing crate resul
   }
 })
 
-test("promotion retains required checks without repeating platform coverage", () => {
+legacyTest("promotion retains required checks without repeating platform coverage", (_, workflow, job, contributing) => {
   assert.match(job("promotion-source"), /name: Promotion Source\n/u)
   assert.match(job("lint"), /name: Lint\n/u)
 
@@ -650,14 +843,14 @@ test("promotion retains required checks without repeating platform coverage", ()
   )
 })
 
-test("all-feature E2E crates retain the workspace stack and required summary", () => {
+legacyTest("all-feature E2E crates retain the workspace stack and required summary", (_, workflow, job, contributing) => {
   assert.match(workflow, /^  RUST_MIN_STACK: "8388608"$/mu)
   assert.match(job("e2e-crates"), /--all-features --lib --tests/u)
-  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, e2e-crates, test-ssh\]/u)
+  assert.match(job("e2e-test"), /needs: \[validation-source, feature-tests, native-feature-tests, browser-runtime-tests, lint, msrv, security, deny, docs, feature-codeql, frontend-inventory, e2e-crates, test-ssh\]/u)
   assert.match(job("e2e-test"), /always\(\) && !cancelled\(\)/u)
 })
 
-test("ordinary PR caches remain reusable and frozen validation restores without saving", () => {
+legacyTest("ordinary PR caches remain reusable and frozen validation restores without saving", (_, workflow, job, contributing) => {
   assert.ok(job("test").includes(cacheSaveIf(
     "github.event_name == 'push' || (github.event_name == 'pull_request' && github.base_ref == 'dev')",
   )))
@@ -693,7 +886,7 @@ test("ordinary PR caches remain reusable and frozen validation restores without 
   assert.doesNotMatch(cacheCleanupWorkflow, /actions\/checkout|pull_request_target/u)
 })
 
-test("legacy release jobs retain explicit full-validation selection", () => {
+legacyTest("legacy release jobs retain explicit full-validation selection", (_, workflow, job, contributing) => {
   for (const id of [
     "msrv",
     "tls-fixture-test",
@@ -708,7 +901,7 @@ test("legacy release jobs retain explicit full-validation selection", () => {
   }
 })
 
-test("main promotion and manual native platform test policy stays intact", () => {
+legacyTest("main promotion and manual native platform test policy stays intact", (_, workflow, job, contributing) => {
   const promotion = job("promotion-source")
   assert.match(promotion, /github\.base_ref == 'main'/u)
   assert.match(promotion, /HEAD_REF.*github\.head_ref/u)
@@ -720,25 +913,21 @@ test("main promotion and manual native platform test policy stays intact", () =>
   assert.match(build, /os: \[ubuntu-latest, macos-latest, windows-latest\]/u)
 })
 
-test("CodeQL stays on the main and manual paths", () => {
+test("CodeQL stays on feature and manual paths without compiling Rust", () => {
   assert.match(codeqlWorkflow, /workflow_dispatch:\n/u)
-  assert.match(codeqlWorkflow, /push:\n\s+branches: \[ main \]/u)
-  assert.match(codeqlWorkflow, /pull_request:\n\s+branches: \[ main \]/u)
-  assert.doesNotMatch(codeqlWorkflow, /branches: \[[^\]]*dev/u)
-  assert.match(
-    codeqlWorkflow,
-    /language: \[ actions, javascript-typescript, python, rust \]/u,
-  )
+  assert.match(codeqlWorkflow, /pull_request:\n\s+branches: \[ dev \]/u)
+  assert.doesNotMatch(codeqlWorkflow, /push:|branches: \[[^\]]*main/u)
+  assert.match(codeqlWorkflow, /language: \[ actions, javascript-typescript, python, rust \]/u)
   assert.match(codeqlWorkflow, /build-mode: none/u)
 })
 
 const promotionScript = () => {
-  const block = job("promotion-source").match(/        run: \|\n([\s\S]*)$/u)
+  const block = job("promotion-source", historical.ci).match(/        run: \|\n([\s\S]*)$/u)
   assert.ok(block, "source proof must stay inline before any checkout")
   return block[1].split("\n").map((line) => line.replace(/^          /u, "")).join("\n")
 }
 
-test("frozen promotion bootstrap is read-only and leaves merge-tree validation intact", () => {
+legacyTest("frozen promotion bootstrap is read-only and leaves merge-tree validation intact", (_, workflow, job, contributing) => {
   const promotion = job("promotion-source")
   assert.match(promotion, /permissions:\n      contents: read\n/u)
   assert.equal((promotion.match(/^      - /gmu) || []).length, 1)
@@ -782,7 +971,7 @@ test("frozen promotion bootstrap is read-only and leaves merge-tree validation i
   assert.match(contributing, /separate `F` release-source and `U` protected-dev integration procedure/u)
   assert.match(contributing, /independent Code and Security review and run affected local tests on that\n   exact `F`/u)
   assert.match(contributing, /Run the complete release suite and Linux\/macOS\/Windows matrix on the final\n   release PR before promotion/u)
-  for (const source of [contributing, readFileSync("gitflow.md", "utf8"), readFileSync("docs/releases/ci-publication-flow.md", "utf8")]) {
+  for (const source of [contributing, historical.gitflowLegacy]) {
     assert.match(source, /manual full CI on `F`[\s\S]*?optional diagnosis,[\s\S]*?not a second mandatory\s+full run/u)
   }
   assert.match(contributing, /This exception changes ordering only, not gates,\n   protection, publication authority or the `Promotion Source` contract/u)
@@ -1028,7 +1217,8 @@ const frontendWorkflow = readFileSync(
 test("this frozen batch cannot save cache on source, integration, promotion or main push", () => {
   const actor = readFileSync(".github/workflows/actor-snapshot-windows.yml", "utf8")
   const docs = readFileSync(".github/workflows/docs.yml", "utf8")
-  const sources = [workflow, frontendWorkflow, actor, docs]
+  const sources = [workflow, frontendWorkflow, actor]
+  assert.doesNotMatch(docs, /rust-cache|cargo doc/u)
   const header = frozenCacheWriteHeader.join("\n")
   const expression = frozenCacheWriteHeader.slice(1).join("\n").trim().slice(3, -2)
   const cutRef = "release/da348a63f1d019a22df547c78575c500b6b1294e"
@@ -1077,9 +1267,8 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 15, "all planned source/dev/main cache actions remain covered")
+  assert.equal(caches, 8, "all remaining Cargo cache actions retain the frozen batch policy")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
-  assert.match(docs, /cache-on-failure: true\n          save-if: \$\{\{ env\.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' \}\}/u)
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
   const nativePublisher = publisher.split('  executables:\n')[1].split('  publish-executables:\n')[0]
   assert.match(nativePublisher, /uses: Swatinem\/rust-cache@[0-9a-f]{40}/u)
@@ -1126,14 +1315,12 @@ function assertFrontendPolicy(source) {
     "        description: Exact 40-character SHA of the selected ref for source acceptance",
     "        required: true",
     "        type: string",
-    "  pull_request:",
-    "    branches: [main]",
     "permissions:",
     "  contents: read",
     "env:",
     "  PYTHONDONTWRITEBYTECODE: \"1\"",
     ...frozenCacheWriteHeader,
-  ], "main and manual snapshot routing binds the actual source without Cargo environment overrides")
+  ], "manual snapshot routing binds the actual source without Cargo environment overrides")
   const lint = source.split("\n  lint:\n")[1].split("\n  build:\n")[0].replace(/^  #.*(?:\n|$)/gmu, "").trimEnd()
   assert.equal(lint, [
     "    name: Original release Clippy and frontend policy",
@@ -1287,7 +1474,7 @@ test("frontend acceptance preserves the locked build, focused tests and actual-h
   assertFrontendPolicy(frontendWorkflow)
   for (const [from, to] of [
     ["  workflow_dispatch:", "  workflow_dispatch:\n    inputs:\n      source:\n        type: string"],
-    ["    branches: [main]", "    branches: [dev]"],
+    ["  workflow_dispatch:", "  workflow_dispatch:\n  pull_request:\n    branches: [main]"],
     ['PYTHONDONTWRITEBYTECODE: "1"', 'PYTHONDONTWRITEBYTECODE: "0"'],
     ["contents: read", "contents: write"],
     ["permissions:\n", 'env:\n  RUST_TEST_THREADS: "1"\npermissions:\n'],
@@ -1534,13 +1721,7 @@ const actorWindowsStep = (source, name) => {
 const actorWindowsCompileName = "Compile and verify all 41 selected native tests"
 const actorWindowsRunName = "Execute 9 snapshot, 3 gateway, 19 directory, 5 scoped and 5 initial process tests"
 
-const actorWindowsPathBlock = actorWindowsWorkflow.match(/    paths:\n([\s\S]*?)(?=\n\S)/u)[1]
-const actorWindowsPaths = [...actorWindowsPathBlock.matchAll(/^      - '([^']+)'$/gmu)]
-  .map(([, pattern]) => pattern)
-const needsActorWindows = (files) => files.some((file) =>
-  actorWindowsPaths.some((pattern) => path.posix.matchesGlob(file, pattern)))
-
-test("Supervisor driver self-tests cover dev, full validation and release platforms", () => {
+legacyTest("Supervisor driver self-tests cover dev, full validation and release platforms", (_, workflow, job, contributing) => {
   const name = "Test Supervisor driver and owned loopback process binding"
   const command = "node --test scripts/supervisor-native-acceptance.test.cjs"
   const step = (source) => {
@@ -1587,77 +1768,92 @@ test("Supervisor driver self-tests cover dev, full validation and release platfo
   assert.throws(() => verify(quick, full.replace(command, "true"), platform))
 })
 
-test("native Windows paths retain native sources while policy and release edits stay fast", () => {
-  assert.match(actorWindowsWorkflow, /on:\n  workflow_dispatch:\n  pull_request:\n    branches: \[dev, main\]\n    paths:\n/u)
-  assert.match(job("quick-checks"), /run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
-  assert.match(job("test"), /Test CI workflow policy\n        if: needs\.validation-source\.outputs\.full == 'true'\n        run: node --test scripts\/ci-policy\.test\.cjs(?: |\n)/u)
-  const nativeInputs = [
-    ".github/workflows/actor-snapshot-windows.yml",
-    "scripts/actor-windows-native.ps1", "scripts/actor-windows-native.test.ps1",
-    ".cargo/config.toml", "Cargo.toml", "Cargo.lock",
-    "crates/Cargo.toml", "crates/app/bamboo-server/Cargo.toml",
-    "crates/core/bamboo-domain/Cargo.toml", "crates/infra/bamboo-storage/Cargo.toml",
-    "crates/engine/bamboo-tools/Cargo.toml", "crates/infra/bamboo-config/Cargo.toml",
-    "crates/infra/bamboo-storage/src/v2/actor_snapshot_windows_tests.rs",
-    "crates/infra/bamboo-storage/src/v2/actor_directory.rs",
-    "crates/infra/bamboo-storage/src/v2/mod.rs",
-    "crates/engine/bamboo-tools/src/local_task_resources/windows.rs",
-    "crates/engine/bamboo-tools/src/lib.rs", "crates/core/bamboo-domain/src/lib.rs",
-    "crates/app/bamboo-server/src/app_state/mod.rs", "crates/app/bamboo-server/src/lib.rs",
-    "crates/app/bamboo-server/src/routes/agent.rs", "crates/app/bamboo-server/src/routes/bamboo_v1.rs",
-    "crates/app/bamboo-server/src/routes/mod.rs", "crates/app/bamboo-server/src/codex_run_tokens.rs",
-    "crates/app/bamboo-server/src/error.rs", "crates/app/bamboo-server/src/handlers/agent/actor_snapshot.rs",
-    "crates/app/bamboo-server/src/handlers/agent/mod.rs", "crates/app/bamboo-server/src/handlers/settings/mod.rs",
-    "crates/app/bamboo-server/src/handlers/settings/access_control.rs",
-    "crates/engine/bamboo-engine/src/external_agents/actor_adapter.rs",
-    "crates/infra/bamboo-config/src/config.rs", "crates/infra/bamboo-config/src/encryption.rs",
-    "crates/infra/bamboo-config/src/lib.rs", "crates/app/bamboo-server/build.rs",
-    "crates/app/bamboo-server/frontend_build.rs",
-  ]
-  for (const file of nativeInputs) assert.equal(needsActorWindows([file]), true, file)
-  const fastInputs = [
-    "scripts/ci-policy.test.cjs", "scripts/ci-routing.test.cjs",
-    "scripts/crate-release.cjs", "scripts/crate-release.test.cjs",
-    "scripts/sidecar-release.cjs", "scripts/sidecar-release.test.cjs",
-    ".github/workflows/publish-crate.yml", "README.md", "docs/releases/shared-executable-assets.md",
-  ]
-  for (const file of fastInputs) assert.equal(needsActorWindows([file]), false, file)
-  assert.equal(needsActorWindows(fastInputs), false)
-  assert.equal(needsActorWindows([...fastInputs, nativeInputs[0]]), true)
-  assert.equal(needsActorWindows([]), false)
+test("feature Node suites keep full Quick coverage and only exact native behavior cases", () => {
+  const scripts = ["supervisor-native-acceptance.test.cjs", "lotus-next-artifact.test.cjs", "release-frontend-policy.test.cjs"]
+  const command = "node scripts/run-native-node-tests.cjs " + scripts.map(name => `scripts/${name}`).join(" ")
+  const counts = (source) => scripts.map((name) => [...source.matchAll(/run: node --test ([^\n]+)/gu)]
+    .reduce((count, [, args]) => count + args.split(/\s+/u).filter((arg) => arg === `scripts/${name}`).length, 0))
+  const verify = (quick, native, linux) => {
+    assert.deepEqual(counts(quick), [1, 1, 1], "Ubuntu Quick owns each portable suite once")
+    assert.deepEqual(counts(native), [0, 0, 0], "native runners must not repeat the complete portable suites")
+    assert.deepEqual(counts(linux), [0, 0, 0], "the Linux Cargo executor does not repeat Quick Node suites")
+    assert.match(native, /if: needs\.validation-source\.outputs\.feature == 'true'/u)
+    assert.match(native, /os: \[windows-2025, macos-latest\]/u)
+    const step = actorWindowsStep(native, "Test native Supervisor and frontend behavior")
+    assert.equal(step.match(/^        run: (.+)$/mu)?.[1], command)
+    assert.doesNotMatch(step, /\bif:|continue-on-error:|\|\|/u)
+    assert.ok(native.indexOf(step) < native.indexOf("Run fixed native ownership"), "Node failures cannot be hidden after Cargo")
+  }
+  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-shards")
+  verify(quick, native, linux)
+  for (const script of scripts) {
+    assert.throws(() => verify(quick.replace(` scripts/${script}`, ""), native, linux))
+    assert.throws(() => verify(quick, native.replace(` scripts/${script}`, ""), linux))
+  }
+  assert.throws(() => verify(quick, native, linux + "\nrun: node --test scripts/lotus-next-artifact.test.cjs"))
+  assert.throws(() => verify(quick, native.replace("os: [windows-2025, macos-latest]", "os: [macos-latest]"), linux))
+  assert.throws(() => verify(quick, native.replace(command, "node --test " + scripts.map(name => `scripts/${name}`).join(" ")), linux))
+  assert.throws(() => verify(quick, native.replace("- name: Test native Supervisor and frontend behavior", "- name: Test native Supervisor and frontend behavior\n        continue-on-error: true"), linux))
 })
 
-test("native Windows still uses cumulative PR changes after an unrelated last commit", (t) => {
-  const directory = mkdtempSync(path.join(os.tmpdir(), "bamboo-actor-paths-"))
-  t.after(() => rmSync(directory, { recursive: true, force: true }))
-  const git = (...args) => {
-    const result = spawnSync("git", args, { cwd: directory, encoding: "utf8" })
-    assert.equal(result.status, 0, result.stderr)
-    return result.stdout.trim()
-  }
-  const commit = (file, content) => {
-    const target = path.join(directory, file)
-    mkdirSync(path.dirname(target), { recursive: true })
-    writeFileSync(target, content)
-    git("add", ".")
-    git("-c", "user.name=ci-policy", "-c", "user.email=ci-policy@example.invalid", "commit", "--quiet", "-m", file)
-    return git("rev-parse", "HEAD")
-  }
-  const changes = (range) => git("diff", "--name-only", range).split("\n").filter(Boolean)
-  git("init", "--quiet")
-  const base = commit("README.md", "base\n")
-  commit("scripts/ci-policy.test.cjs", "policy assertion\n")
-  commit("scripts/crate-release.cjs", "unrelated release fix\n")
-  assert.equal(needsActorWindows(changes(`${base}...HEAD`)), false)
-  commit("crates/infra/bamboo-storage/src/v2/mod.rs", "native reader change\n")
-  commit("scripts/crate-release.cjs", "another release fix\n")
-  assert.equal(needsActorWindows(changes("HEAD^...HEAD")), false, "latest commit alone misses the native input")
-  assert.equal(needsActorWindows(changes(`${base}...HEAD`)), true, "PR three-dot diff retains the earlier native input")
+const nativeNode = require("./run-native-node-tests.cjs")
+const nativeTap = () => ["TAP version 13", ...nativeNode.CASES.map((name, index) => `ok ${index + 1} - ${name}`),
+  "1..9", "# tests 9", "# pass 9", "# fail 0", "# cancelled 0", "# skipped 0", "# todo 0", ""].join("\n")
+
+test("native Node TAP requires all nine actual successful case names and totals", () => {
+  assert.equal(nativeNode.CASES.length, 9)
+  assert.equal(new Set(nativeNode.CASES).size, 9)
+  assert.doesNotThrow(() => nativeNode.verifyTap(nativeTap()))
+  assert.doesNotThrow(() => nativeNode.verifyTap(nativeTap().replace(/\n/g, "\r\n")))
+  for (const output of [
+    "TAP version 13\n1..0\n# tests 0\n# pass 0\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n",
+    nativeTap().replace(nativeNode.CASES[0], "renamed required native case"),
+    nativeTap().replace(nativeNode.CASES[0], nativeNode.CASES[1]),
+    nativeTap().replace("ok 1 - ", "not ok 1 - "),
+    nativeTap().replace(nativeNode.CASES[0], nativeNode.CASES[0] + " # SKIP"),
+    ...["tests", "pass", "fail", "cancelled", "skipped", "todo"].flatMap(field => [
+      nativeTap().replace(new RegExp("# " + field + " [0-9]+\\n"), ""),
+      nativeTap() + "# " + field + " 0\n",
+      nativeTap().replace(new RegExp("# " + field + " [0-9]+"), "# " + field + " 1"),
+    ]),
+  ]) assert.throws(() => nativeNode.verifyTap(output))
 })
 
-const assertActorWindowsAcceptance = (source) => {
-  const compile = actorWindowsStep(source, actorWindowsCompileName)
-  const runtime = actorWindowsStep(source, actorWindowsRunName)
+test("native Node selection uses the real runner and preserves failures before reporting success", () => {
+  const stdout = { write: () => {} }, stderr = { write: () => {} }
+  const run = (result, files = nativeNode.FILES) => nativeNode.run(files, { stdout, stderr, spawn: (executable, args) => {
+    assert.equal(executable, process.execPath)
+    assert.deepEqual(args.slice(0, 2), ["--test", "--test-reporter=tap"])
+    assert.deepEqual(args.slice(3), nativeNode.FILES)
+    const pattern = new RegExp(args[2].replace("--test-name-pattern=", ""))
+    for (const name of nativeNode.CASES) assert.ok(pattern.test(name))
+    assert.equal(pattern.test("FRAMEWORK HTTP: an extra created Root cannot hide behind equal returned retry receipts"), false)
+    assert.equal(pattern.test(nativeNode.CASES[0] + " extra"), false)
+    return result
+  } })
+  assert.equal(run({ status: 0, stdout: nativeTap() }), 0)
+  assert.equal(run({ status: 7, stdout: nativeTap() }), 7)
+  assert.equal(run({ status: null, signal: "SIGTERM", stdout: nativeTap() }), 1)
+  assert.equal(run({ status: null, error: new Error("native Node could not start") }), 1)
+  assert.equal(run({ status: 0, stdout: "TAP version 13\n1..0\n" }), 1)
+  assert.equal(run({ status: 0, stdout: nativeTap() }, nativeNode.FILES.slice(1)), 1)
+})
+
+test("native Windows acceptance remains available by manual dispatch", () => {
+  const header = actorWindowsWorkflow.split("\njobs:\n")[0]
+  assert.match(header, /on:\n  workflow_dispatch:/u)
+  assert.doesNotMatch(header, /pull_request:|push:/u)
+  assert.match(job("native-feature-tests"), /run: node scripts\/native-test-owner\.cjs/u)
+  assert.match(job("native-feature-tests"), /github.event_name == 'workflow_dispatch'/u)
+})
+
+const assertActorWindowsAcceptance = (source, controller = actorWindowsController) => {
+  const compileStep = actorWindowsStep(source, actorWindowsCompileName)
+  const runtimeStep = actorWindowsStep(source, actorWindowsRunName)
+  assert.match(compileStep, /-CompileAcceptance/u)
+  assert.match(runtimeStep, /-ExecuteAcceptance/u)
+  const compile = controller.split('function Compile-ActorNativeAcceptance(')[1].split('\nfunction ')[0]
+  const runtime = controller.split('function Run-ActorNativeAcceptance(')[1].split('\nforeach ')[0]
   const groups = [...compile.matchAll(/Assert-TestList '([^']+)' '([^']+)' @\(([\s\S]*?)\n\s*\) '([^']+)'/gu)]
     .map(([, packageName, filter, body, log]) => ({
       package: packageName, filter,
@@ -1672,8 +1868,8 @@ const assertActorWindowsAcceptance = (source) => {
   assert.deepEqual(runs, groups.map(({ package: packageName, filter, names }) => ({
     package: packageName, filter, count: names.length,
   })))
-  assert.match(compile, /timeout-minutes: 20\n/u)
-  assert.match(runtime, /timeout-minutes: 5\n/u)
+  assert.match(compileStep, /timeout-minutes: 20\n/u)
+  assert.match(runtimeStep, /timeout-minutes: 5\n/u)
   assert.doesNotMatch(runtime, /(?:&\s*|run:\s*)cargo\b/iu)
   assert.match(compile, /Save-ActorNativeManifest \$nativeContext/u)
   assert.match(runtime, /Read-ActorNativeManifest \$evidence/u)
@@ -1687,18 +1883,18 @@ test("native Windows retains the exact 41-case selection and original runtime bu
   assert.match(actorWindowsWorkflow, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
   assert.match(actorWindowsWorkflow, /RUST_MIN_STACK: '8388608'/u)
   assert.match(actorWindowsWorkflow, /toolchain: 1\.99\.0-x86_64-pc-windows-msvc/u)
-  assert.match(actorWindowsWorkflow, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
-  assert.match(actorWindowsWorkflow, /mklink \/J/u)
-  assert.match(actorWindowsWorkflow, /\$junction\.LinkType -ne 'Junction'/u)
-  assert.match(actorWindowsWorkflow, /fsutil reparsepoint query/u)
-  assert.match(actorWindowsWorkflow, /'host: x86_64-pc-windows-msvc'/u)
-  assert.match(actorWindowsWorkflow, /'release: 1\.99\.0'/u)
+  assert.match(actorWindowsController, /RUNNER_OS -ne 'Windows'.*RUNNER_ARCH -ne 'X64'/u)
+  assert.match(actorWindowsController, /mklink \/J/u)
+  assert.match(actorWindowsController, /\$junction\.LinkType -ne 'Junction'/u)
+  assert.match(actorWindowsController, /fsutil reparsepoint query/u)
+  assert.match(actorWindowsController, /'host: x86_64-pc-windows-msvc'/u)
+  assert.match(actorWindowsController, /'release: 1\.99\.0'/u)
   assert.match(actorWindowsWorkflow, /Retain native Windows evidence even on failure\n        if: always\(\)/u)
-  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow, actorWindowsController.replace(
     "'background_scope_drain'", "'missing_original_case'")), "dropping or replacing a case must fail")
   assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
     "timeout-minutes: 5\n", "timeout-minutes: 15\n")), "the runtime budget must not expand")
-  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow.replace(
+  assert.throws(() => assertActorWindowsAcceptance(actorWindowsWorkflow, actorWindowsController.replace(
     "$nativeContext = Read-ActorNativeManifest $evidence",
     "$nativeContext = Read-ActorNativeManifest $evidence\n          & cargo test --locked --no-fail-fast")),
   "runtime must not re-enter Cargo")
@@ -1912,4 +2108,20 @@ test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeou
     rmSync(directory, { recursive: true, force: true })
     t.diagnostic("Source-watch module/counter/fingerprint evidence: " + evidence)
   }
+})
+
+test("Planner12/10 libraries have one canonical serial owner while API-only CLI and Clippy remain", () => {
+  const { PLANNER_SERIAL, cargoArguments } = require("./run-feature-tests.cjs")
+  assert.deepEqual(Object.keys(PLANNER_SERIAL), ["bamboo-server-tools", "bamboo-engine"])
+  assert.deepEqual(Object.values(PLANNER_SERIAL).map(recipe => recipe.names.length), [12, 10])
+  for (const [name, recipe] of Object.entries(PLANNER_SERIAL)) {
+    assert.equal(new Set(recipe.names).size, recipe.names.length)
+    assert.deepEqual(cargoArguments({ name }).slice(7), recipe.names.flatMap(name => ["--skip", name]))
+  }
+  const planner = readFileSync(".github/workflows/delegated-planner-acceptance.yml", "utf8")
+  assert.equal([...planner.matchAll(/cargo test/g)].length, 1)
+  assert.match(planner, /delegated_planner::real_cli_planner_/u)
+  assert.match(planner, /test result: ok\. 2 passed; 0 failed; 0 ignored/u)
+  assert.equal([...planner.matchAll(/cargo clippy/g)].length, 2)
+  assert.match(planner, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
 })

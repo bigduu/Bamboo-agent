@@ -310,6 +310,10 @@ pub(crate) struct ExecuteAdmission {
     pub generate_title: bool,
     /// Native route data only; the genuine reservation supplies run authority.
     pub native_main: bool,
+    /// Opt-in retry has no authoritative new input or scoped continuation.
+    pub retry_unprepared: bool,
+    /// Proven only by this call's fresh owned Inbox checkpoint and ACK.
+    pub fresh_sync: Option<crate::app_state::fresh_sync::FreshSyncWitness>,
 }
 
 // Selection is not admission: only the HTTP owner can retain a newly acquired
@@ -423,9 +427,10 @@ impl AppState {
         &self,
         id: &str,
         reservation: &mut Option<SessionExecutionReservation>,
+        protect_failed_user: bool,
     ) -> ResponseResult<ExecuteAdmission> {
         match self
-            .check_chat_for_execute_inner(id, reservation.as_ref(), true)
+            .check_chat_for_execute_inner(id, reservation.as_ref(), true, protect_failed_user)
             .await?
         {
             ExecuteAdmissionCheck::Checked(admission) => return Ok(*admission),
@@ -447,7 +452,7 @@ impl AppState {
             )
             .into());
         }
-        self.check_chat_for_execute_inner(id, reservation.as_ref(), true)
+        self.check_chat_for_execute_inner(id, reservation.as_ref(), true, protect_failed_user)
             .await?
             .into_admission()
     }
@@ -457,7 +462,7 @@ impl AppState {
         id: &str,
         reservation: Option<&SessionExecutionReservation>,
     ) -> ResponseResult<ExecuteAdmission> {
-        self.check_chat_for_execute_inner(id, reservation, false)
+        self.check_chat_for_execute_inner(id, reservation, false, false)
             .await?
             .into_admission()
     }
@@ -467,6 +472,7 @@ impl AppState {
         id: &str,
         reservation: Option<&SessionExecutionReservation>,
         require_root_owner: bool,
+        protect_failed_user: bool,
     ) -> ResponseResult<ExecuteAdmissionCheck> {
         let runners = self.agent_runners.read().await;
         if let Some(reservation) = reservation {
@@ -502,6 +508,15 @@ impl AppState {
         else {
             return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
         };
+        // A User at the history tail alone does not prove that this request
+        // owns new work: the previous run may have already consumed it, or its
+        // old status may be absent. Only a newly checkpointed inbox input can
+        // authorize this opt-in execution until a fenced handoff exists.
+        let unproven_user_tail = protect_failed_user
+            && session
+                .messages
+                .last()
+                .is_some_and(|message| message.role == bamboo_agent_core::Role::User);
         let queued_id = session.metadata.get("chat.queued_ingress.v1").cloned();
         if selected.is_some()
             && (queued_id.is_some()
@@ -532,6 +547,12 @@ impl AppState {
                     "Selected input is not currently claimable",
                 )
                 .into());
+            }
+            if unproven_user_tail {
+                return Ok(ExecuteAdmissionCheck::Checked(Box::new(ExecuteAdmission {
+                    retry_unprepared: true,
+                    ..Default::default()
+                })));
             }
             recover_user_handoff(self, &session).await?;
             return Ok(ExecuteAdmissionCheck::Checked(Box::default()));
@@ -593,6 +614,16 @@ impl AppState {
                 .into());
             }
         }
+        // Never reject after acknowledging newly checkpointed work merely
+        // because it is not a plain User envelope: Root chat instructions and
+        // ChildOutcome are legitimate new inputs too. Keep them on the existing
+        // owned admission path. An empty refresh is not evidence of new work.
+        if unproven_user_tail && refreshed.committed_messages.is_empty() {
+            return Ok(ExecuteAdmissionCheck::Checked(Box::new(ExecuteAdmission {
+                retry_unprepared: true,
+                ..Default::default()
+            })));
+        }
         let generate_title = queued_id.is_none()
             && refreshed
                 .committed_messages
@@ -629,10 +660,25 @@ impl AppState {
             )
             .into());
         }
+        // The witness is derived solely from messages this admission actually
+        // checkpointed and acknowledged under the current Root owner. It is
+        // never reconstructed from durable history or a client-supplied ID.
+        let fresh_sync = if selected.is_none() {
+            crate::app_state::fresh_sync::FreshSyncWitness::from_newly_admitted(
+                id,
+                &refreshed.committed_messages,
+                inputs.as_ref(),
+                reservation,
+            )
+        } else {
+            None
+        };
         Ok(ExecuteAdmissionCheck::Checked(Box::new(ExecuteAdmission {
             inputs,
             generate_title,
             native_main,
+            retry_unprepared: false,
+            fresh_sync,
         })))
     }
 }

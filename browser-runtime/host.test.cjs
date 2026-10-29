@@ -11,6 +11,97 @@ const { chromium } = require('playwright-core');
 const { installScriptBlobCapture, installDownloadLinkInspector } = require('./host.cjs');
 const { createHash } = require('node:crypto');
 
+// `close` follows stdout draining; `exit` alone can precede a valid final reply.
+function createHostRpc(host, timeoutMs = 30_000) {
+  const pending = new Map();
+  let nextId = 1;
+  let inputError;
+  let closed;
+  const lines = readline.createInterface({ input: host.stdout });
+  lines.on('line', line => {
+    const message = JSON.parse(line);
+    if (message.event) return;
+    const waiter = pending.get(message.id);
+    if (waiter) {
+      pending.delete(message.id);
+      clearTimeout(waiter.timer);
+      waiter.resolve(message);
+    }
+  });
+  host.stdin.on('error', error => { inputError = error; });
+  host.once('close', (code, signal) => {
+    closed = `host closed (code=${code}, signal=${signal})`;
+    for (const [id, waiter] of pending) {
+      pending.delete(id);
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error(`${waiter.action} ${closed}`));
+    }
+  });
+  return (action, args = {}) => new Promise((resolve, reject) => {
+    if (closed || host.exitCode !== null || host.signalCode !== null || host.stdin.destroyed || inputError) {
+      reject(new Error(`${action} ${closed || 'host is unavailable'}`));
+      return;
+    }
+    const id = nextId++;
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`${action} host response timed out`));
+    }, timeoutMs);
+    pending.set(id, { action, resolve, reject, timer });
+    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`, error => {
+      if (!error) return;
+      inputError = error;
+      const waiter = pending.get(id);
+      if (!waiter) return;
+      pending.delete(id);
+      clearTimeout(timer);
+      reject(new Error(`${action} host input failed: ${error.code || error.message}`));
+    });
+  });
+}
+
+test('host RPC drains a final reply and rejects calls after retirement', async () => {
+  const { EventEmitter, once } = require('node:events');
+  const { PassThrough } = require('node:stream');
+  const host = new EventEmitter();
+  host.stdout = new PassThrough();
+  host.stdin = new PassThrough();
+  host.exitCode = null;
+  host.signalCode = null;
+  const call = createHostRpc(host, 30_000);
+  const reply = call('download');
+  const unanswered = call('click_selector');
+  const rejected = assert.rejects(unanswered, /click_selector host closed/);
+  host.exitCode = 1;
+  host.emit('exit', 1, null);
+  await assert.rejects(call('new_request'), /new_request host is unavailable/);
+  host.stdout.end('{"id":1,"ok":false,"code":"download_unverifiable"}\n');
+  await once(host.stdout, 'end');
+  host.emit('close', 1, null);
+  assert.equal((await reply).code, 'download_unverifiable');
+  await rejected;
+  await assert.rejects(call('state'), /state host closed/);
+  host.stdin.destroy();
+});
+
+test('host RPC reports a failed input write without an unhandled stream error', async () => {
+  const { EventEmitter, once } = require('node:events');
+  const { PassThrough, Writable } = require('node:stream');
+  const host = new EventEmitter();
+  host.stdout = new PassThrough();
+  host.stdin = new Writable({ write(_chunk, _encoding, callback) {
+    callback(Object.assign(new Error('synthetic pipe failure'), { code: 'EPIPE' }));
+  } });
+  host.exitCode = null;
+  host.signalCode = null;
+  const call = createHostRpc(host, 30_000);
+  await assert.rejects(call('download'), /download host input failed: EPIPE/);
+  await assert.rejects(call('state'), /state host is unavailable/);
+  host.stdout.end();
+  await once(host.stdout, 'end');
+  host.emit('close', 1, null);
+});
+
 test('real Chromium captures only a selected synchronous Blob click', async () => {
   const downloadDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-script-blob-'));
   const fixture = http.createServer((_request, response) => {
@@ -495,17 +586,40 @@ const recoveryTest = stalledStop => test(
 recoveryTest(false);
 recoveryTest(true);
 
-test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async () => {
+test('bounded download returns exact bytes and cleans unsolicited, oversized, and timed-out artifacts', async t => {
   const bytes = Buffer.from(Array.from({ length: 4096 }, (_, index) => index % 256));
   const maximumBytes = Buffer.alloc(256 * 1024, 0x5a);
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-download-test-'));
+  const downloadRoot = fs.mkdtempSync(path.join(tempRoot, 'primary-'));
+  const quarantines = [];
+  const ownedDownloadDirectory = root => {
+    const entries = fs.readdirSync(root);
+    assert.equal(entries.length, 1, 'each host has exactly one private download directory');
+    assert.match(entries[0], /^bamboo-browser-download-[a-zA-Z0-9]+$/);
+    const directory = path.join(root, entries[0]);
+    const identity = fs.lstatSync(directory);
+    assert.ok(identity.isDirectory() && !identity.isSymbolicLink());
+    return { root, name: entries[0], directory, dev: identity.dev, ino: identity.ino };
+  };
+  const assertQuarantined = () => {
+    assert.equal(new Set(quarantines.map(owned => owned.root)).size, quarantines.length,
+      'retired hosts never share or reuse a scratch root');
+    for (const owned of quarantines) {
+      assert.deepEqual(fs.readdirSync(owned.root), [owned.name],
+        'abnormal retirement preserves its isolated download directory');
+      const identity = fs.lstatSync(owned.directory);
+      assert.ok(identity.isDirectory() && !identity.isSymbolicLink());
+      assert.equal(identity.dev, owned.dev);
+      assert.equal(identity.ino, owned.ino, 'quarantined scratch is never replaced or reused');
+    }
+  };
   const temporaryFilesIn = directory => fs.readdirSync(directory, { withFileTypes: true })
     .flatMap(entry => entry.isDirectory()
       ? temporaryFilesIn(path.join(directory, entry.name))
       : [path.join(directory, entry.name)]);
-  const temporaryDownloadFiles = () => fs.readdirSync(tempRoot)
+  const temporaryDownloadFiles = () => fs.readdirSync(downloadRoot)
     .filter(name => name.startsWith('bamboo-browser-download-'))
-    .flatMap(name => temporaryFilesIn(path.join(tempRoot, name)));
+    .flatMap(name => temporaryFilesIn(path.join(downloadRoot, name)));
   let oversizedChunks = 0;
   let unsolicitedRequests = 0;
   let hangingClosed = 0;
@@ -536,10 +650,36 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
   let swapReadyResponse;
   let resolveSwapReady;
   const swapReadyWaiting = new Promise(resolve => { resolveSwapReady = resolve; });
+  let asyncGateResponse;
+  let markAsyncGate;
+  let markAsyncDownload;
+  const asyncGateReached = new Promise(resolve => { markAsyncGate = resolve; });
+  const asyncDownloadRequested = new Promise(resolve => { markAsyncDownload = resolve; });
+  const waitFor = async (label, promise) => {
+    let timer;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out`)), 5_000); }),
+      ]);
+    } finally { clearTimeout(timer); }
+  };
   let spoofedRequests = 0;
   const inflightStarted = new Promise(resolve => { priorInflightStarted = resolve; });
   const completedFinished = new Promise(resolve => { priorCompletedFinished = resolve; });
   const fixture = http.createServer((request, response) => {
+    if (request.url === '/async-gate') {
+      asyncGateResponse = response;
+      markAsyncGate();
+      return;
+    }
+    if (request.url === '/async-small') {
+      response.writeHead(200, { 'content-type': 'application/octet-stream',
+        'content-disposition': 'attachment; filename="async.bin"' });
+      response.end(bytes);
+      markAsyncDownload();
+      return;
+    }
     if (request.url === '/swap-ready') {
       swapReadyResponse = response;
       resolveSwapReady();
@@ -832,7 +972,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       return;
     }
     response.end(`<a id="credential" href="http://user:password@${request.headers.host}/small">Credential</a>` +
-      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/redirect-concurrent" download>Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="redirect-307" href="/redirect-307" download>307</a><a id="meta" href="/redirect-meta" download>Meta</a><a id="credentials" href="/redirect-credentials" download>Credentials</a><a id="loop" href="/redirect-loop/0" download>Loop</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="script-exact" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([new window.Uint8Array(256*1024)]));a.download=\'exact-script.bin\';a.click()">Exact script</button><button id="script-over" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([new window.Uint8Array(256*1024+1)]));a.download=\'over-script.bin\';a.click()">Over script</button><button id="micro-blob" onclick="queueMicrotask(()=>{const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'ambient\']));a.download=\'ambient.bin\';a.click()})">Microtask Blob</button><button id="mixed-blob" onclick="{const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'valid\']));a.download=\'valid.bin\';a.click();queueMicrotask(()=>{const b=document.createElement(\'a\');b.href=window.URL.createObjectURL(new Blob([\'ambient\']));b.download=\'ambient.bin\';b.click()})}">Mixed Blob</button><button id="async-button" onclick="setTimeout(()=>{const a=document.createElement(\'a\');a.href=\'/small\';a.click()},100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob);const scriptLink=document.createElement("a");scriptLink.id="script-link";scriptLink.textContent="Script link";scriptLink.onclick=()=>{const a=document.createElement("a");a.href=window.URL.createObjectURL(new Blob(["link-blob"]));a.download="link.bin";a.click()};document.body.append(scriptLink)</script>');
+      '<a id="small" href="/small">Small</a><a id="fragment" href="/small#section">Fragment</a><a id="concurrent" href="/redirect-concurrent" download>Concurrent</a><a id="hidden" href="/small" style="display:none">Hidden</a><a id="named" href="/named-file" download="chosen.txt">Named</a><a id="redirect" href="/redirect-file" download>Redirect</a><a id="redirect-307" href="/redirect-307" download>307</a><a id="meta" href="/redirect-meta" download>Meta</a><a id="credentials" href="/redirect-credentials" download>Credentials</a><a id="loop" href="/redirect-loop/0" download>Loop</a><a id="html" href="/redirect-html" target="_blank">HTML</a><a id="html-direct" href="/html-direct">Direct HTML</a><a id="exact-limit" href="/exact-limit">Exact limit</a><a id="over-limit" href="/over-limit">Over limit</a><a id="oversized" href="/oversized">Oversized</a><a id="hanging" href="/hanging">Hanging</a><a id="failed" href="/failed">Failed</a><button id="blob-button" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'dynamic\']));a.download=\'dynamic.bin\';a.click()">Scripted Blob</button><button id="script-exact" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([new window.Uint8Array(256*1024)]));a.download=\'exact-script.bin\';a.click()">Exact script</button><button id="script-over" onclick="const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([new window.Uint8Array(256*1024+1)]));a.download=\'over-script.bin\';a.click()">Over script</button><button id="micro-blob" onclick="queueMicrotask(()=>{const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'ambient\']));a.download=\'ambient.bin\';a.click()})">Microtask Blob</button><button id="mixed-blob" onclick="{const a=document.createElement(\'a\');a.href=window.URL.createObjectURL(new Blob([\'valid\']));a.download=\'valid.bin\';a.click();queueMicrotask(()=>{const b=document.createElement(\'a\');b.href=window.URL.createObjectURL(new Blob([\'ambient\']));b.download=\'ambient.bin\';b.click()})}">Mixed Blob</button><button id="async-button" onclick="setTimeout(()=>fetch(\'/async-gate\').then(()=>{const a=document.createElement(\'a\');a.href=\'/async-small\';a.click()}),100)">Async</button><button id="after" onclick="document.querySelector(\'output\').textContent=\'Scripts restored\'">Check scripts</button><output>Page remains open</output><script>const blob=document.createElement("a");blob.id="static-blob";blob.href=URL.createObjectURL(new Blob(["static-blob-bytes"]));blob.download="static.bin";document.body.append(blob);const scriptLink=document.createElement("a");scriptLink.id="script-link";scriptLink.textContent="Script link";scriptLink.onclick=()=>{const a=document.createElement("a");a.href=window.URL.createObjectURL(new Blob(["link-blob"]));a.download="link.bin";a.click()};document.body.append(scriptLink)</script>');
   });
   fixture.listen(0, '127.0.0.1');
   await once(fixture, 'listening');
@@ -844,32 +984,15 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
       BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
       BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200',
       TMPDIR: os.tmpdir(),
-      BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
+      BAMBOO_BROWSER_DOWNLOAD_ROOT: downloadRoot,
     },
     stdio: ['pipe', 'pipe', 'inherit'],
   });
-  const pending = new Map();
-  let nextId = 1;
-  const lines = readline.createInterface({ input: host.stdout });
-  lines.on('line', line => {
-    const message = JSON.parse(line);
-    if (message.event) return;
-    const resolve = pending.get(message.id);
-    if (resolve) { pending.delete(message.id); resolve(message); }
-  });
-  const call = (action, args = {}) => new Promise((resolve, reject) => {
-    const id = nextId++;
-    const timer = setTimeout(() => {
-      pending.delete(id);
-      reject(new Error(`${action} host response timed out`));
-    }, 30_000);
-    pending.set(id, message => { clearTimeout(timer); resolve(message); });
-    host.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
-  });
+  const hostClosed = once(host, 'close');
+  const call = createHostRpc(host);
   try {
     const initial = (await call('state')).result;
-    assert.ok(fs.readdirSync(tempRoot).some(name => name.startsWith('bamboo-browser-download-')),
-      'an explicit session-owned root overrides Node platform temp defaults');
+    const ownedDownloads = ownedDownloadDirectory(downloadRoot);
     const ready = (await call('navigate', { url: base + '/', expected_epoch: initial.page_epoch })).result;
     const epoch = ready.page_epoch;
     const first = await call('download', { selector: '#small', expected_epoch: epoch });
@@ -999,7 +1122,7 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     const scriptOver = await call('download', { selector: '#script-over', expected_epoch: epoch });
     assert.equal(scriptOver.code, 'download_too_large', JSON.stringify(scriptOver));
     assert.equal(scriptOver.result, undefined);
-    for (const selector of ['#micro-blob', '#mixed-blob', '#async-button']) {
+    for (const selector of ['#micro-blob', '#mixed-blob']) {
       const scripted = await call('download', { selector, expected_epoch: epoch });
       assert.equal(scripted.code, 'download_unverifiable', JSON.stringify(scripted));
       assert.equal(scripted.result, undefined);
@@ -1176,16 +1299,103 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
     assert.equal(nativeRace.code, 'download_unverifiable', JSON.stringify(nativeRace));
     assert.equal(nativeRace.result, undefined);
     if (host.exitCode === null) await once(host, 'exit');
-    assert.deepEqual(fs.readdirSync(tempRoot), [],
-      'an ambiguous native download retires the host and its temporary directory');
+    assert.equal(host.exitCode, 1, 'an ambiguous native download retires the old host');
+    quarantines.push(ownedDownloads);
+    assertQuarantined();
 
-    // Failed cleanup/private-page creation must retire with no temp artifact.
+    // An asynchronous click can legitimately retire a host if its native
+    // download lands during script cleanup. Keep it on a separate host and
+    // hold the download until the rejection and restored-script checks finish.
+    const asyncRoot = fs.mkdtempSync(path.join(tempRoot, 'async-'));
+    const asyncHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
+      [path.join(__dirname, 'test-download-observer.cjs')], {
+        env: {
+          ...process.env, NODE_ENV: 'test', TMPDIR: os.tmpdir(),
+          BAMBOO_BROWSER_DOWNLOAD_ROOT: asyncRoot,
+          BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
+          BAMBOO_BROWSER_TEST_DOWNLOAD_CLICK_DELAY_MS: '200',
+        },
+        stdio: ['pipe', 'pipe', 'inherit', 'ipc'],
+      });
+    const asyncClosed = once(asyncHost, 'close');
+    const asyncCall = createHostRpc(asyncHost);
+    const asyncStarts = new Set();
+    const asyncTerminal = new Promise(resolve => {
+      asyncHost.on('message', message => {
+        if (message?.type === 'download-start') asyncStarts.add(message.guid);
+        if (message?.type === 'download-terminal' && asyncStarts.has(message.guid)) resolve(message);
+      });
+    });
+    try {
+      const initial = (await asyncCall('state')).result;
+      const asyncDownloads = ownedDownloadDirectory(asyncRoot);
+      assertQuarantined();
+      const ready = (await asyncCall('navigate', {
+        url: base + '/', expected_epoch: initial.page_epoch,
+      })).result;
+      const rejected = await asyncCall('download', {
+        selector: '#async-button', expected_epoch: ready.page_epoch,
+      });
+      assert.equal(rejected.code, 'download_unverifiable', JSON.stringify(rejected));
+      assert.equal(rejected.result, undefined);
+      await waitFor('async download gate', asyncGateReached);
+      assert.equal((await asyncCall('click_selector', {
+        selector: '#after', expected_epoch: ready.page_epoch,
+      })).ok, true);
+      assert.match((await asyncCall('dom')).result.snapshot, /Scripts restored/);
+      asyncGateResponse.end('released');
+      asyncGateResponse = undefined;
+      await waitFor('async download request', asyncDownloadRequested);
+      const terminal = await waitFor('async native download completion', asyncTerminal);
+      assert.equal(terminal.state, 'canceled');
+      assert.equal(asyncStarts.size, 1, 'one asynchronous native download was observed');
+      // Chromium may briefly recreate a partial file after reporting cancel.
+      // Match the host's continuous empty-directory boundary before closing it.
+      const deadline = Date.now() + 5_000;
+      let emptySince = 0;
+      while (Date.now() < deadline) {
+        assert.equal(asyncHost.exitCode, null, 'async host stayed alive during cleanup observation');
+        assert.equal(asyncHost.signalCode, null, 'async host was not signaled during cleanup observation');
+        if (temporaryFilesIn(asyncDownloads.directory).length) emptySince = 0;
+        else if (!emptySince) emptySince = Date.now();
+        else if (Date.now() - emptySince >= 100) break;
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      assert.ok(emptySince && Date.now() - emptySince >= 100,
+        'asynchronous download directory became empty and stayed empty');
+      assert.deepEqual(temporaryFilesIn(asyncDownloads.directory), [],
+        'rejected asynchronous download left no artifact');
+      assert.equal((await asyncCall('close')).ok, true);
+      const [code, signal] = await waitFor('async host close', asyncClosed);
+      assert.equal(code, 0, 'async host closed cleanly');
+      assert.equal(signal, null);
+      assert.deepEqual(fs.readdirSync(asyncRoot), [], 'clean host removed its own download directory');
+    } finally {
+      if (asyncHost.exitCode === null && asyncHost.signalCode === null) {
+        asyncHost.stdin.end();
+        asyncHost.kill();
+      }
+      try {
+        await waitFor('async host cleanup', asyncClosed);
+      } catch (error) {
+        asyncHost.stdin.destroy();
+        asyncHost.stdout.destroy();
+        if (asyncHost.connected) asyncHost.disconnect();
+        asyncHost.unref();
+        throw error;
+      }
+    }
+    assertQuarantined();
+
+    // Forced retirement quarantines its unconfirmed native writer domain.
+    // Node exit alone does not grant the test permission to erase that scratch.
     for (const mode of ['cleanup', 'reject', 'timeout', 'script-helper-tamper', 'script-navigate']) {
+      const retiringRoot = fs.mkdtempSync(path.join(tempRoot, `${mode}-`));
       const retiringHost = spawn(process.env.BAMBOO_BROWSER_NODE || process.execPath,
         [path.join(__dirname, 'host.cjs')], {
           env: {
             ...process.env, NODE_ENV: 'test', TMPDIR: os.tmpdir(),
-            BAMBOO_BROWSER_DOWNLOAD_ROOT: tempRoot,
+            BAMBOO_BROWSER_DOWNLOAD_ROOT: retiringRoot,
             BAMBOO_BROWSER_TEST_DOWNLOAD_BUDGET_MS: '5000',
             BAMBOO_BROWSER_TEST_DOWNLOAD_CLEANUP_DELAY_MS: mode === 'cleanup' ? '2000' : '0',
             BAMBOO_BROWSER_TEST_PRIVATE_PAGE_FAILURE: mode === 'cleanup' ? '' : mode,
@@ -1193,23 +1403,12 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
           },
           stdio: ['pipe', 'pipe', 'inherit'],
         });
-      const retiringPending = new Map();
-      let retiringId = 1;
-      const retiringLines = readline.createInterface({ input: retiringHost.stdout });
-      retiringLines.on('line', line => {
-        const message = JSON.parse(line);
-        if (message.event) return;
-        const resolve = retiringPending.get(message.id);
-        if (resolve) { retiringPending.delete(message.id); resolve(message); }
-      });
-      const retiringCall = (action, args = {}) => new Promise((resolve, reject) => {
-        const id = retiringId++;
-        const timer = setTimeout(() => reject(new Error(`${action} on retiring host timed out`)), 10_000);
-        retiringPending.set(id, message => { clearTimeout(timer); resolve(message); });
-        retiringHost.stdin.write(`${JSON.stringify({ id, action, args })}\n`);
-      });
+      const retiringClosed = once(retiringHost, 'close');
+      const retiringCall = createHostRpc(retiringHost, 10_000);
       try {
         const initial = (await retiringCall('state')).result;
+        const ownedDownloads = ownedDownloadDirectory(retiringRoot);
+        assertQuarantined();
         const ready = (await retiringCall('navigate', {
           url: base + (mode.startsWith('script-') ? `/${mode}` : '/'),
           expected_epoch: initial.page_epoch,
@@ -1230,21 +1429,26 @@ test('bounded download returns exact bytes and cleans unsolicited, oversized, an
         }
         assert.ok(performance.now() - startedAt <= 5_500, `${mode} exceeded total 5-second budget`);
         if (retiringHost.exitCode === null) await once(retiringHost, 'exit');
-        assert.notEqual(retiringHost.exitCode, null, `${mode} retired the old host`);
-        assert.deepEqual(fs.readdirSync(tempRoot), [], `${mode} removed private download files`);
+        assert.equal(retiringHost.exitCode, 1, `${mode} retired the old host`);
+        quarantines.push(ownedDownloads);
+        assertQuarantined();
       } finally {
-        retiringLines.close();
         retiringHost.stdin.destroy();
         retiringHost.kill();
+        await retiringClosed;
       }
     }
   } finally {
+    asyncGateResponse?.destroy();
     host.stdin.end();
     host.kill();
+    await hostClosed;
     fixture.closeAllConnections();
     fixture.close();
     await once(fixture, 'close');
-    fs.rmSync(tempRoot, { recursive: true, force: true });
+    // The direct test host has no native owner proof for all descendants.
+    // Keep its private quarantine, including on assertion failure.
+    t.diagnostic(`Retained native-writer quarantine: ${tempRoot}`);
   }
 });
 

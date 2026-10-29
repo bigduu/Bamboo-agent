@@ -1,15 +1,20 @@
 # Feature Unit and E2E execution
 
-Every feature PR to dev uses one physical Linux executor and one owned
-target/feature-tests directory. The controller selects existing Cargo
+Feature code PRs to dev use independently rerunnable Linux test shards, each
+with its own target/feature-tests directory. The controller selects existing Cargo
 default-members plus the recorder; analytics and unrelated example packages
 stay outside acceptance.
 
-Each package runs independently with its default features. Cargo's default
-target selection covers library/binary Unit cases, integration E2E cases and
-doctests once. Do not combine the selected packages into one Cargo command:
+Ordinary packages belong to one shard. Agent and server are further split by
+test target, and server library cases use disjoint namespace blocks. Library,
+binary, integration and doctest cases each run once. Do not combine the selected packages into one Cargo command:
 workspace feature unification can enable test utilities in production-default
 dependencies. Unit/E2E are logical target groups, not separate build jobs.
+
+Each additive owner shares a shard with its relevant default catalog; serial
+selections and the SSH fixture stay with their package. Dependencies may be compiled in more than one isolated runner; the
+workflow does not run a separate workspace build or repeat a test selection.
+Root and docs Markdown-only PRs run Quick Checks without product compilation.
 
 The default infrastructure context must compile and execute the telemetry
 feature-unavailable regression. Tickets retain the direct production publication
@@ -39,6 +44,13 @@ outside the mapped targets also fails admission until its ownership is reviewed.
 Update that inventory only after reviewing the default/additive case map.
 Ordinary cases in existing ungated targets join default execution automatically.
 
+Supervisor role/current-user cases remain ordinary tests in their existing
+Domain, Engine, Server, Storage, Tickets and server-tools Cargo targets. They
+join that default catalog without another automatic Linux producer. The retained
+`supervisor-role-acceptance.yml` is a manual API-only diagnostic bound to the
+exact dispatch SHA; it does not supply feature admission. Original feature-head
+receipts, including `447a1e13`, retain their original source and configuration.
+
 The original serial storage selectors retain --test-threads=1, including their
 matching session-merge regression. The Cargo invocation excludes those qualified
 selectors, then the same standalone default storage executable runs them.
@@ -59,18 +71,18 @@ advertise 14 GB SSD storage. A full cold hosted run must establish that the
 suite fits; a tiny executor fixture or cache hit does not prove capacity.
 
 Ordinary Linux orchestration, scoped-context and recorder cases already belong
-to this executor. All agents use the same ownership path. Policy rejects new
+to these shards. All agents use the same ownership path. Policy rejects new
 ordinary Linux PR Cargo-test producers, including tests hidden behind supported
 repository wrappers. Native OS, containment boundaries, explicit manual
 diagnostics and pinned legacy routes retain named scoped exceptions.
 
-Mac/Windows TLS and recorder jobs still compile common code in separate jobs.
+Mac/Windows TLS and recorder diagnostics run only on manual dispatch.
 The macOS TLS guard deliberately uses a dev profile for compact-unwind checks.
 Native consolidation needs one owner/target per OS and compatible configuration;
 this slice does not establish ecosystem-wide zero duplicate compilation.
 
 Required Test rejects failed, missing, cancelled or skipped selected results.
-E2E Tests reports the same executor result without another runtime pass. Repair
+E2E Tests reports the same shard results without another runtime pass. Repair
 failures in the feature branch before dev admission. Keep original attempt and
 source evidence when rerunning a failed job.
 

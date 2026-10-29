@@ -40,13 +40,34 @@ pub type DisabledFilterSets = (BTreeSet<String>, BTreeSet<String>);
 /// Late-bound resolver for disabled tool and skill-id filters.
 pub type DisabledFilterResolver = Arc<dyn Fn() -> DisabledFilterSets + Send + Sync>;
 
+/// A per-execution background route. `None` is authoritative for that read.
+#[doc(hidden)]
+pub type BackgroundModelResolver =
+    Arc<dyn Fn(&str) -> Option<bamboo_llm::ResolvedModel> + Send + Sync>;
+
+/// The Connect resume's summary and background routes from one Config read.
+#[doc(hidden)]
+pub type ResumeAuxiliarySelection = (
+    Result<Option<bamboo_llm::ResolvedModel>, bamboo_llm::LLMError>,
+    Option<bamboo_llm::ResolvedModel>,
+);
+
+/// Per-execution, live summary/background selection for a resumed Connect run.
+#[doc(hidden)]
+pub type ResumeAuxiliaryResolver = Arc<dyn Fn() -> ResumeAuxiliarySelection + Send + Sync>;
+
+/// One execution's explicitly selected Gold route, installed only by the Host.
+/// Resolvers must be nonblocking and free of request side effects: a managed
+/// route may re-evaluate policy before and after waiting for an auxiliary slot.
+#[doc(hidden)]
+pub type GoldTargetResolver =
+    Arc<dyn Fn(&str, Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> + Send + Sync>;
+
 #[derive(Clone, Default)]
 pub struct AuxiliaryModelConfig {
     pub fast_model_name: Option<String>,
     pub fast_model_provider: Option<Arc<dyn LLMProvider>>,
-    pub fast_model_error: Option<String>,
     pub background_model_name: Option<String>,
-    pub background_model_error: Option<String>,
     pub planning_model_name: Option<String>,
     pub search_model_name: Option<String>,
     pub summarization_model_name: Option<String>,
@@ -54,43 +75,6 @@ pub struct AuxiliaryModelConfig {
     pub summarization_model_provider: Option<Arc<dyn LLMProvider>>,
     /// A rejected explicit summary role is different from an unset model.
     pub summarization_model_error: Option<String>,
-    /// Host admission for a dedicated bare auxiliary model on the executing
-    /// account. Standalone SDK snapshots retain their supplied provider seam.
-    pub exact_model_resolver: Option<
-        Arc<
-            dyn Fn(
-                    &bamboo_domain::ProviderModelRef,
-                ) -> Result<bamboo_llm::ResolvedModel, bamboo_llm::LLMError>
-                + Send
-                + Sync,
-        >,
-    >,
-}
-
-impl AuxiliaryModelConfig {
-    pub(crate) fn fast_target(
-        &self,
-        fallback_provider: Arc<dyn LLMProvider>,
-        fallback_model: &str,
-    ) -> Result<bamboo_llm::ResolvedModel, bamboo_agent_core::AgentError> {
-        if let Some(error) = self.fast_model_error.as_ref() {
-            return Err(bamboo_agent_core::AgentError::LLM(format!(
-                "Configured Fast route is unavailable: {error}"
-            )));
-        }
-        let model = self.fast_model_name.as_deref().unwrap_or(fallback_model);
-        if model.trim().is_empty() {
-            return Err(bamboo_agent_core::AgentError::LLM(
-                "Fast/default model is required".into(),
-            ));
-        }
-        Ok(bamboo_llm::ResolvedModel::new(
-            self.fast_model_provider
-                .clone()
-                .unwrap_or(fallback_provider),
-            model,
-        ))
-    }
 }
 
 fn default_gold_max_output_tokens() -> u32 {
@@ -890,6 +874,22 @@ fn copy_checked_request(
     Ok(request)
 }
 
+/// Host-only continuation of one still-live Anthropic bootstrap. The offer is
+/// produced by the provider and cannot be reconstructed from HTTP/history.
+#[async_trait::async_trait]
+pub trait LiveBootstrapHost: Send + Sync {
+    /// The returned lifetime removes this exact offer when the provider future
+    /// ends. Implementations must bind owner, persistence and offer gate.
+    async fn register(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        proof: bamboo_domain::LiveBootstrapProof,
+        persistence: Arc<dyn RuntimeSessionPersistence>,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        offer: bamboo_llm::retry::LiveBootstrapOffer,
+    ) -> std::io::Result<Box<dyn Send>>;
+}
+
 /// Configuration for the agent loop.
 ///
 /// # One-config-per-run invariant (#44)
@@ -949,6 +949,9 @@ pub struct AgentLoopConfig {
     pub(crate) guidance_active_run_id: Option<String>,
     /// Durable logical-session inbox admitted at safe round boundaries.
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
+    pub(crate) live_bootstrap_host: Option<Arc<dyn LiveBootstrapHost>>,
+    pub(crate) gold_target_resolver: Option<GoldTargetResolver>,
+    pub(crate) host_gold_run: Option<Arc<crate::runtime::host_gold::HostGoldRun>>,
     /// Active-owner wake generation. The loop consumes this at the same safe
     /// boundary where it drains SessionInbox; it never interrupts an in-flight
     /// provider/tool operation.
@@ -1068,6 +1071,8 @@ pub struct AgentLoopConfig {
     /// Resolved LLM stream transport/semantic watchdog policy. The same value
     /// is passed to main response streams and auxiliary silent streams.
     pub(crate) stream_timeout: bamboo_config::StreamTimeoutConfig,
+    /// Main bootstrap only; never inherited by auxiliary or child requests.
+    pub(crate) upstream_retry: bamboo_llm::retry::UpstreamRetry,
     /// Permission mode for this execution (default: None = use PermissionConfig's mode).
     pub(crate) permission_mode: Option<PermissionMode>,
     /// Optional Gold observe-only evaluator configuration.
@@ -1117,6 +1122,10 @@ pub struct AgentLoopConfig {
     /// for fast/background/planning/search/summarization helpers.
     pub(crate) auxiliary_model_resolver:
         Option<Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>>,
+    /// Override only the background pair without changing other resolver semantics.
+    pub(crate) background_model_resolver: Option<BackgroundModelResolver>,
+    /// Resolve resume summary and background using the same live snapshot.
+    pub(crate) resume_auxiliary_resolver: Option<ResumeAuxiliaryResolver>,
     /// Optional per-round resolver for the disabled tool/skill sets so they follow
     /// LIVE global config instead of staying frozen for the whole run. Returns the
     /// current `(disabled_tools, disabled_skill_ids)`. When `None`, the snapshotted
@@ -1178,6 +1187,9 @@ impl Default for AgentLoopConfig {
             persistence: None,
             guidance_active_run_id: None,
             session_inbox: None,
+            live_bootstrap_host: None,
+            gold_target_resolver: None,
+            host_gold_run: None,
             session_activation_notifications: None,
             attachment_reader: None,
             metrics_collector: None,
@@ -1213,6 +1225,7 @@ impl Default for AgentLoopConfig {
             per_tool_timeout_secs: 120,
             parallel_batch_timeout_secs: 300,
             stream_timeout: bamboo_config::StreamTimeoutConfig::default(),
+            upstream_retry: Default::default(),
             permission_mode: None,
             gold_config: None,
             guardian_config: None,
@@ -1224,6 +1237,8 @@ impl Default for AgentLoopConfig {
             features_dynamic_model_routing: false,
             features_final_evidence_check: false,
             auxiliary_model_resolver: None,
+            background_model_resolver: None,
+            resume_auxiliary_resolver: None,
             disabled_filter_resolver: None,
             mcp_tool_guidance: None,
             run_budget: bamboo_config::RunBudgetConfig::default(),
@@ -1238,23 +1253,47 @@ impl AgentLoopConfig {
     /// empty result is authoritative; only callers without one use the startup
     /// fields (SDK and standalone-loop compatibility).
     pub(crate) fn resolve_auxiliary_models(&self) -> AuxiliaryModelConfig {
-        self.auxiliary_model_resolver
+        let mut models = self
+            .auxiliary_model_resolver
             .as_ref()
             .map(|resolver| resolver())
             .unwrap_or_else(|| AuxiliaryModelConfig {
                 fast_model_name: self.fast_model_name.clone(),
                 fast_model_provider: self.fast_model_provider.clone(),
-                fast_model_error: None,
                 background_model_name: self.background_model_name.clone(),
-                background_model_error: None,
                 planning_model_name: self.planning_model_name.clone(),
                 search_model_name: self.search_model_name.clone(),
                 summarization_model_name: self.summarization_model_name.clone(),
                 background_model_provider: self.background_model_provider.clone(),
                 summarization_model_provider: self.summarization_model_provider.clone(),
                 summarization_model_error: None,
-                exact_model_resolver: None,
-            })
+            });
+        if let Some(resolve) = &self.background_model_resolver {
+            let background = resolve(self.provider_name.as_deref().unwrap_or_default());
+            models.background_model_name =
+                background.as_ref().map(|model| model.model_name.clone());
+            models.background_model_provider = background.map(|model| model.provider);
+        }
+        if let Some(resolve) = &self.resume_auxiliary_resolver {
+            let (summary, background) = resolve();
+            models.background_model_name =
+                background.as_ref().map(|model| model.model_name.clone());
+            models.background_model_provider = background.map(|model| model.provider);
+            match summary {
+                Ok(summary) => {
+                    models.summarization_model_name =
+                        summary.as_ref().map(|model| model.model_name.clone());
+                    models.summarization_model_provider = summary.map(|model| model.provider);
+                    models.summarization_model_error = None;
+                }
+                Err(error) => {
+                    models.summarization_model_name = None;
+                    models.summarization_model_provider = None;
+                    models.summarization_model_error = Some(error.to_string());
+                }
+            }
+        }
+        models
     }
 
     pub fn bind_ticket_worker_plan(

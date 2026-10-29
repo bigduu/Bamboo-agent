@@ -58,6 +58,17 @@ async fn await_request(provider: &crate::model_routing_test_support::CaptureProv
 #[tokio::test]
 async fn routing_contract_schedule_dispatches_the_fast_pair_without_using_the_startup_account() {
     let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+    state
+        .config
+        .write()
+        .await
+        .defaults
+        .as_mut()
+        .unwrap()
+        .fast
+        .as_mut()
+        .unwrap()
+        .reasoning_effort = Some(bamboo_domain::ReasoningEffort::Low);
     let context = context(&state).await;
     tokio::time::timeout(
         std::time::Duration::from_secs(5),
@@ -85,6 +96,35 @@ async fn routing_contract_schedule_dispatches_the_fast_pair_without_using_the_st
     );
     assert!(providers["startup-a"].models.lock().unwrap().is_empty());
     assert!(providers["chat-b"].models.lock().unwrap().is_empty());
+    let mut scheduled = None;
+    for entry in state.session_store.list_index_entries().await {
+        let session = state
+            .storage
+            .load_session(&entry.id)
+            .await
+            .unwrap()
+            .unwrap();
+        if session
+            .metadata
+            .get("created_by_schedule_id")
+            .map(String::as_str)
+            == Some("synthetic-model-schedule")
+        {
+            scheduled = Some(session);
+        }
+    }
+    let session = scheduled.expect("the scheduled session must be persisted");
+    assert_eq!(
+        session.model_ref,
+        Some(bamboo_domain::ProviderModelRef::new(
+            "fast-c",
+            "cheap-model"
+        ))
+    );
+    assert_eq!(
+        session.reasoning_effort,
+        Some(bamboo_domain::ReasoningEffort::Low)
+    );
 }
 
 #[tokio::test]
@@ -203,5 +243,75 @@ async fn routing_contract_schedule_explicit_reasoning_wins_role_policy_at_dispat
             Some(expected)
         );
     }
+    assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn schedule_legacy_injection_keeps_host_identity_and_honors_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let provider = Arc::new(crate::model_routing_test_support::CaptureProvider::default());
+    let state = crate::AppState::new_with_provider(
+        directory.path().to_path_buf(),
+        bamboo_llm::Config::default(),
+        provider,
+    )
+    .await
+    .unwrap();
+    let context = context(&state).await;
+    let mut request = job();
+    request.run_config.model = Some("legacy-model".into());
+    let first = (context.resolve_run_config)(&request);
+    let second = (context.resolve_run_config)(&request);
+    assert!(first.model_error.is_none(), "{:?}", first.model_error);
+    assert!(first.model_is_injected);
+    let first_provider = first.model_provider.expect("injected provider");
+    let second_provider = second.model_provider.expect("same Host injection");
+    assert!(first_provider.fixed_gold_policy_delegate().is_some());
+    assert!(first_provider.resource_allocation_identity().is_some());
+    assert_eq!(
+        first_provider.resource_allocation_identity(),
+        second_provider.resource_allocation_identity()
+    );
+
+    let key = state
+        .config
+        .read()
+        .await
+        .effective_default_provider()
+        .to_string();
+    state
+        .provider_registry
+        .set_runtime_models(std::collections::HashMap::from([(
+            key,
+            vec!["other-model".into()],
+        )]));
+    let denied = (context.resolve_run_config)(&request);
+    assert!(denied.model_provider.is_none());
+    assert!(denied.model_error.is_some());
+}
+
+#[tokio::test]
+async fn schedule_uses_selected_accounts_default_reasoning() {
+    let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+    {
+        let mut config = state.config.write().await;
+        config
+            .provider_instances
+            .get_mut("startup-a")
+            .unwrap()
+            .reasoning_effort = Some(bamboo_domain::ReasoningEffort::High);
+        config
+            .provider_instances
+            .get_mut("fast-c")
+            .unwrap()
+            .reasoning_effort = Some(bamboo_domain::ReasoningEffort::Low);
+    }
+    let context = context(&state).await;
+    run_schedule_job(context, job(), None).await.unwrap();
+    await_request(&providers["fast-c"]).await;
+    assert_eq!(
+        *providers["fast-c"].efforts.lock().unwrap(),
+        vec![Some(bamboo_domain::ReasoningEffort::Low)]
+    );
     assert!(providers["startup-a"].models.lock().unwrap().is_empty());
 }

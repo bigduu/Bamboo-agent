@@ -10,6 +10,336 @@ use bamboo_agent_core::Session;
 use crate::runtime::{AgentRuntime, AgentRuntimeBuilder, ExecuteRequest};
 use bamboo_domain::RuntimeSessionPersistence;
 
+// An inherited policy may decline the supplied delegate, but an opaque new
+// wrapper/provider cannot prove it still represents the managed selected route.
+// Refuse only this Gold selection instead of dropping the inherited policy.
+struct ChildGoldPolicyRefusal {
+    dispatched: std::sync::atomic::AtomicBool,
+    rejected: Option<Arc<dyn bamboo_llm::LLMProvider>>,
+}
+
+impl ChildGoldPolicyRefusal {
+    fn unverified_error() -> bamboo_llm::LLMError {
+        bamboo_llm::LLMError::Api(
+            "Existing Gold policy returned an unverified provider for managed child resume".into(),
+        )
+    }
+
+    fn error(&self) -> bamboo_llm::LLMError {
+        if self
+            .rejected
+            .as_ref()
+            .is_some_and(|provider| provider.local_dispatch_refused())
+        {
+            return stale_gold_policy_error();
+        }
+        self.rejected
+            .as_ref()
+            .and_then(|provider| provider.known_pre_dispatch_error())
+            .unwrap_or_else(Self::unverified_error)
+    }
+}
+
+fn stale_gold_policy_error() -> bamboo_llm::LLMError {
+    bamboo_llm::LLMError::Api(
+        "Inherited Gold target already refused a dispatch; a fresh target is required".into(),
+    )
+}
+
+#[async_trait::async_trait]
+impl bamboo_llm::LLMProvider for ChildGoldPolicyRefusal {
+    fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+        Some(self.error())
+    }
+    fn queue_requires_current_route(&self) -> bool {
+        // Keep the default unique queue identity. A prior allowed queued Gold
+        // request must not compare equal when the current policy now refuses.
+        true
+    }
+    fn local_dispatch_refused(&self) -> bool {
+        self.dispatched.load(std::sync::atomic::Ordering::Acquire)
+    }
+    async fn chat_stream(
+        &self,
+        _: &[bamboo_agent_core::Message],
+        _: &[bamboo_agent_core::ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        self.dispatched
+            .store(true, std::sync::atomic::Ordering::Release);
+        Err(self.error())
+    }
+}
+
+pub(crate) fn compose_child_gold_policy(
+    inherited: Option<crate::runtime::config::GoldTargetResolver>,
+    managed: crate::runtime::config::GoldTargetResolver,
+) -> crate::runtime::config::GoldTargetResolver {
+    let Some(inherited) = inherited else {
+        return managed;
+    };
+    Arc::new(move |model, delegate| {
+        // `delegate` was already fixed to the selected provider after the
+        // optional Work decoration by bind_child_gold_delegate.
+        let result = inherited(model, delegate.clone());
+        if !gold_policy_reaches_delegate(&result, &delegate) {
+            return Arc::new(ChildGoldPolicyRefusal {
+                dispatched: std::sync::atomic::AtomicBool::new(false),
+                rejected: None,
+            }) as Arc<dyn bamboo_llm::LLMProvider>;
+        }
+        if result.local_dispatch_refused() {
+            return Arc::new(ChildGoldPolicyRefusal {
+                dispatched: std::sync::atomic::AtomicBool::new(false),
+                rejected: Some(result),
+            }) as Arc<dyn bamboo_llm::LLMProvider>;
+        }
+        let allocation_identity = gold_policy_allocation_identity(&result, &delegate);
+        let policy: Arc<dyn bamboo_llm::LLMProvider> = Arc::new(ChildGoldPolicyProvider {
+            inherited: inherited.clone(),
+            delegate,
+            allocation_identity,
+            model: model.to_owned(),
+            dispatched: std::sync::atomic::AtomicBool::new(false),
+        });
+        managed(model, policy)
+    })
+}
+
+fn gold_policy_allocation_identity(
+    policy: &Arc<dyn bamboo_llm::LLMProvider>,
+    delegate: &Arc<dyn bamboo_llm::LLMProvider>,
+) -> usize {
+    policy
+        .resource_allocation_identity()
+        .or_else(|| delegate.resource_allocation_identity())
+        .unwrap_or(Arc::as_ptr(delegate) as *const () as usize)
+}
+
+// Queue/allocation identity is intentionally not proof of dispatch provenance.
+// Only explicitly attested immutable delegate edges may reach the exact Work
+// decorated Arc supplied to the policy. Bound traversal so a bad adapter cannot
+// create an infinite cycle or unbounded inspection.
+fn gold_policy_reaches_delegate(
+    candidate: &Arc<dyn bamboo_llm::LLMProvider>,
+    delegate: &Arc<dyn bamboo_llm::LLMProvider>,
+) -> bool {
+    const MAX_WRAPPERS: usize = 32;
+    let mut seen = Vec::<Arc<dyn bamboo_llm::LLMProvider>>::new();
+    let mut current = candidate.clone();
+    for _ in 0..=MAX_WRAPPERS {
+        if Arc::ptr_eq(&current, delegate) {
+            return true;
+        }
+        if seen.iter().any(|previous| Arc::ptr_eq(previous, &current)) {
+            return false;
+        }
+        seen.push(current.clone());
+        let Some(next) = current.fixed_gold_policy_delegate() else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+// The inherited resolver is a live policy. Re-evaluate it at dispatch, after
+// any auxiliary semaphore wait, and keep the returned wrapper rather than
+// discarding its policy. A non-attested result never enters the Work delegate.
+struct ChildGoldPolicyProvider {
+    inherited: crate::runtime::config::GoldTargetResolver,
+    delegate: Arc<dyn bamboo_llm::LLMProvider>,
+    allocation_identity: usize,
+    model: String,
+    dispatched: std::sync::atomic::AtomicBool,
+}
+
+impl ChildGoldPolicyProvider {
+    fn select(
+        &self,
+        model: &str,
+    ) -> Result<Arc<dyn bamboo_llm::LLMProvider>, bamboo_llm::LLMError> {
+        if model != self.model {
+            return Err(bamboo_llm::LLMError::Api(
+                "Gold model changed after policy selection".into(),
+            ));
+        }
+        let current = (self.inherited)(model, self.delegate.clone());
+        if !gold_policy_reaches_delegate(&current, &self.delegate) {
+            return Err(ChildGoldPolicyRefusal::unverified_error());
+        }
+        // The refusal marker is per target. Reusing a target that already
+        // refused could misclassify a later upstream error as a local refusal.
+        // Refuse before the Work delegate rather than invoking that target.
+        if current.local_dispatch_refused() {
+            return Err(stale_gold_policy_error());
+        }
+        // Keep the concurrency budget chosen for this evaluation. An adapter
+        // which changes its explicit allocation identity cannot safely reuse
+        // the slot already acquired for the prior policy.
+        if gold_policy_allocation_identity(&current, &self.delegate) != self.allocation_identity {
+            return Err(bamboo_llm::LLMError::Api(
+                "Gold policy changed its allocation identity before dispatch".into(),
+            ));
+        }
+        Ok(current)
+    }
+
+    fn dispatch(
+        &self,
+        model: &str,
+    ) -> Result<Arc<dyn bamboo_llm::LLMProvider>, bamboo_llm::LLMError> {
+        let selected = self.select(model).and_then(|provider| {
+            if let Some(error) = provider.known_pre_dispatch_error() {
+                Err(error)
+            } else {
+                Ok(provider)
+            }
+        });
+        if selected.is_err() {
+            self.dispatched
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        selected
+    }
+
+    fn note_delegate_refusal<T>(
+        &self,
+        provider: &Arc<dyn bamboo_llm::LLMProvider>,
+        result: &Result<T, bamboo_llm::LLMError>,
+    ) {
+        if result.is_err() && provider.local_dispatch_refused() {
+            self.dispatched
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl bamboo_llm::LLMProvider for ChildGoldPolicyProvider {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn bamboo_llm::LLMProvider>> {
+        // Every successful dispatch is rechecked to reach this immutable
+        // delegate; a changed or opaque route is refused before dispatch.
+        Some(self.delegate.clone())
+    }
+
+    fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+        match self.select(&self.model) {
+            Ok(provider) => provider.known_pre_dispatch_error(),
+            Err(error) => Some(error),
+        }
+    }
+
+    fn queue_requires_current_route(&self) -> bool {
+        true
+    }
+
+    fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
+        bamboo_llm::provider::queued_identity_for(&self.delegate)
+    }
+
+    fn local_dispatch_refused(&self) -> bool {
+        self.dispatched.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        Some(self.allocation_identity)
+    }
+
+    async fn supports_vision(&self, model: &str) -> bool {
+        match self.select(&self.model) {
+            Ok(provider) => provider.supports_vision(model).await,
+            Err(_) => false,
+        }
+    }
+
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        match self.select(&self.model) {
+            Ok(provider) => provider.vision_support_override(model).await,
+            Err(_) => Some(false),
+        }
+    }
+
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required: Option<&str>,
+    ) -> bamboo_domain::CapabilityLoadingMode {
+        match self.select(&self.model) {
+            Ok(provider) => provider.capability_loading_mode(model, required).await,
+            Err(_) => bamboo_domain::CapabilityLoadingMode::LegacyFullCatalog,
+        }
+    }
+
+    async fn provider_visible_tool_footprint(
+        &self,
+        ir: &bamboo_llm::PromptIR,
+        tools: &[bamboo_agent_core::ToolSchema],
+        model: &str,
+        required: Option<&str>,
+    ) -> Result<bamboo_llm::ProviderVisibleToolFootprint, bamboo_llm::LLMError> {
+        self.select(model)?
+            .provider_visible_tool_footprint(ir, tools, model, required)
+            .await
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[bamboo_agent_core::Message],
+        tools: &[bamboo_agent_core::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        let provider = self.dispatch(model)?;
+        let result = provider.chat_stream(messages, tools, max, model).await;
+        self.note_delegate_refusal(&provider, &result);
+        result
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[bamboo_agent_core::Message],
+        tools: &[bamboo_agent_core::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::LLMRequestOptions>,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        let provider = self.dispatch(model)?;
+        let result = provider
+            .chat_stream_with_options(messages, tools, max, model, options)
+            .await;
+        self.note_delegate_refusal(&provider, &result);
+        result
+    }
+
+    async fn chat_stream_ir(
+        &self,
+        ir: &bamboo_llm::PromptIR,
+        tools: &[bamboo_agent_core::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::LLMRequestOptions>,
+    ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+        let provider = self.dispatch(model)?;
+        let result = provider
+            .chat_stream_ir(ir, tools, max, model, options)
+            .await;
+        self.note_delegate_refusal(&provider, &result);
+        result
+    }
+
+    async fn list_models(&self) -> Result<Vec<String>, bamboo_llm::LLMError> {
+        self.select(&self.model)?.list_models().await
+    }
+
+    async fn list_model_info(
+        &self,
+    ) -> Result<Vec<bamboo_llm::provider::ProviderModelInfo>, bamboo_llm::LLMError> {
+        self.select(&self.model)?.list_model_info().await
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Agent — stable public object
 // ---------------------------------------------------------------------------
@@ -71,6 +401,34 @@ impl Agent {
         Agent { runtime }
     }
 
+    /// Return only the Host's still-current explicitly injected provider.
+    #[doc(hidden)]
+    pub fn legacy_injected_provider_snapshot(
+        &self,
+    ) -> Result<Option<Arc<dyn bamboo_llm::LLMProvider>>, bamboo_llm::LLMError> {
+        self.runtime.provider.legacy_injected_provider_snapshot()
+    }
+
+    /// Freeze the same verified injection and retain its Host budget identity.
+    #[doc(hidden)]
+    pub fn fixed_legacy_injected_provider(
+        &self,
+        expected: &Arc<dyn bamboo_llm::LLMProvider>,
+    ) -> Result<Option<Arc<dyn bamboo_llm::LLMProvider>>, bamboo_llm::LLMError> {
+        Ok(self
+            .runtime
+            .provider
+            .legacy_injected_provider_snapshot()?
+            .and_then(|current| {
+                Arc::ptr_eq(&current, expected).then(|| {
+                    bamboo_llm::provider::fixed_injected_provider_with_identity(
+                        current,
+                        self.runtime.provider.clone(),
+                    )
+                })
+            }))
+    }
+
     /// One execution's immutable persistence capability. Shared tool/provider
     /// resources remain on the existing runtime; default callers stay unbound.
     #[doc(hidden)]
@@ -81,6 +439,116 @@ impl Agent {
         let mut runtime = (*self.runtime).clone();
         runtime.persistence = persistence;
         runtime.inherited_child_wait_captured = true;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind a live-bootstrap Host to this execution only. The Host must retain
+    /// its exact runner and writer; this method does not create authority.
+    #[doc(hidden)]
+    pub fn with_live_bootstrap_host(
+        &self,
+        host: Arc<dyn crate::runtime::config::LiveBootstrapHost>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.live_bootstrap_host = Some(host);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind a live background route to this execution without changing other roles.
+    #[doc(hidden)]
+    pub fn with_background_model_resolver(
+        &self,
+        resolver: crate::runtime::config::BackgroundModelResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.background_model_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Install a run-keyed auxiliary resolver on this Agent clone only.
+    #[doc(hidden)]
+    pub fn with_auxiliary_model_resolver_factory(
+        &self,
+        factory: Arc<
+            dyn Fn(&str) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync>
+                + Send
+                + Sync,
+        >,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.auxiliary_model_resolver_factory = Some(factory);
+        // The factory resolves background and summary with the other roles.
+        // Inherited overrides could belong to another run and would otherwise
+        // replace those selections with a second config read.
+        runtime.background_model_resolver = None;
+        runtime.resume_auxiliary_resolver = None;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind a resumed Connect run's live summary/background selection.
+    #[doc(hidden)]
+    pub fn with_resume_auxiliary_resolver(
+        &self,
+        resolver: crate::runtime::config::ResumeAuxiliaryResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.resume_auxiliary_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Opt a Host-owned non-HTTP consumer into per-attempt Gold provenance.
+    /// Direct SDK Agents keep their existing provider contract.
+    #[doc(hidden)]
+    pub fn with_host_gold_origin_resolver(
+        &self,
+        resolver: crate::runtime::host_gold::HostGoldOriginResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.host_gold_origin_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind the Host's Gold route to this execution without changing SDK defaults.
+    /// For managed child resume the synchronous resolver may be called again
+    /// at preflight and dispatch; it must not initiate a request or block.
+    #[doc(hidden)]
+    pub fn with_gold_target_resolver(
+        &self,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(resolver);
+        runtime.child_resume_gold_selected = None;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Add a managed Host policy while retaining any inherited Gold policy.
+    #[doc(hidden)]
+    pub fn with_composed_gold_target_resolver(
+        &self,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(compose_child_gold_policy(
+            runtime.gold_target_resolver.take(),
+            resolver,
+        ));
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    // Only managed child resume opts into an exact selected-main check. SDK
+    // and other Host resolvers retain their existing delegate behavior.
+    pub(crate) fn with_child_resume_gold_target_resolver(
+        &self,
+        selected: Arc<dyn bamboo_llm::LLMProvider>,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(compose_child_gold_policy(
+            runtime.gold_target_resolver.take(),
+            resolver,
+        ));
+        runtime.child_resume_gold_selected = Some(selected);
         Self::from_runtime(Arc::new(runtime))
     }
 
@@ -241,6 +709,18 @@ impl Agent {
         self.runtime.execute(session, req).await
     }
 
+    /// Execute with an explicit initial upstream request policy.
+    pub async fn execute_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
+        self.runtime
+            .execute_with_upstream_retry(session, req, upstream_retry)
+            .await
+    }
+
     /// Explicit bounded caller-data handoff; no currentness or Skill authority.
     /// Ordinary execute/direct/spawn entrypoints continue to supply None.
     pub async fn execute_with_inputs(
@@ -250,6 +730,18 @@ impl Agent {
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
         self.runtime.execute_with_inputs(session, req, inputs).await
+    }
+
+    pub(crate) async fn execute_with_inputs_and_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
+        self.runtime
+            .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+            .await
     }
 
     /// Execute a caller-owned session under a complete logical-session
@@ -267,6 +759,21 @@ impl Agent {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_direct_with_upstream_retry(
+            session,
+            req,
+            bamboo_llm::retry::UpstreamRetry::Bounded,
+        )
+        .await
+    }
+
+    /// Execute through the direct owner lifecycle with an explicit retry policy.
+    pub async fn execute_direct_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
         session
             .check_execution_compatibility()
             .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
@@ -274,7 +781,14 @@ impl Agent {
         self.check_direct_execution_admission(session, &lease)
             .await?;
         self.prepare_external_session_for_execution(session).await?;
-        self.execute_direct_registered(session, req, lease).await
+        self.execute_direct_registered_with_inputs_and_upstream_retry(
+            session,
+            req,
+            lease,
+            None,
+            upstream_retry,
+        )
+        .await
     }
 
     /// Check counted-state admission under an already acquired opaque lease.
@@ -395,6 +909,24 @@ impl Agent {
         lease: DirectExecutionLease,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_direct_registered_with_inputs_and_upstream_retry(
+            session,
+            req,
+            lease,
+            inputs,
+            bamboo_llm::retry::UpstreamRetry::Bounded,
+        )
+        .await
+    }
+
+    async fn execute_direct_registered_with_inputs_and_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        lease: DirectExecutionLease,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
         self.check_direct_execution_admission(session, &lease)
             .await?;
         let inherited = self.persistence().inherited_child_wait().or_else(|| {
@@ -419,7 +951,7 @@ impl Agent {
             self.with_execution_persistence(self.persistence().clone())
         };
         agent
-            .execute_direct_registered_bound(session, req, lease, inputs)
+            .execute_direct_registered_bound(session, req, lease, inputs, upstream_retry)
             .await
     }
 
@@ -429,6 +961,7 @@ impl Agent {
         mut req: ExecuteRequest,
         mut lease: DirectExecutionLease,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
     ) -> crate::runtime::runner::Result<()> {
         if lease.target_session_id != session.id {
             return Err(bamboo_agent_core::AgentError::LLM(format!(
@@ -437,7 +970,9 @@ impl Agent {
             )));
         }
         let Some(router) = lease.router.take() else {
-            return self.execute_with_inputs(session, req, inputs).await;
+            return self
+                .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                .await;
         };
         let mut registration = lease.registration.take().ok_or_else(|| {
             bamboo_agent_core::AgentError::LLM(
@@ -477,12 +1012,14 @@ impl Agent {
                 // Bind before the runtime is first polled, so cancellation of
                 // this observer still leaves Drop the same sticky host proof.
                 registration.bind_tool_suspension_observation(token);
-                self.execute_with_inputs(session, req, inputs).await
+                self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                    .await
             })
             .await
             .0
         } else {
-            self.execute_with_inputs(session, req, inputs).await
+            self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                .await
         };
         if registration.observed_forbidden_running() {
             // No stop receipt exists for this detached outcome, including when
@@ -785,3 +1322,101 @@ impl Default for AgentBuilder {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod auxiliary_factory_isolation_tests {
+    use super::*;
+    use bamboo_agent_core::storage::Storage;
+    use bamboo_agent_core::{Message, ToolSchema};
+    use bamboo_llm::{LLMError, LLMProvider, LLMStream};
+
+    struct UnusedProvider;
+
+    #[async_trait::async_trait]
+    impl LLMProvider for UnusedProvider {
+        async fn chat_stream(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            Err(LLMError::Api("provider must not be called".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn factory_clone_discards_only_its_inherited_route_overrides() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(dir.path().join("sessions"))
+                .await
+                .unwrap(),
+        );
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn RuntimeSessionPersistence> =
+            Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+        let metrics = bamboo_metrics::MetricsCollector::spawn(
+            Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                dir.path().join("metrics.db"),
+            )),
+            7,
+        );
+        let ordinary = Agent::builder()
+            .storage(storage)
+            .persistence(persistence)
+            .attachment_reader(store)
+            .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+            .metrics_collector(metrics)
+            .config(Arc::new(tokio::sync::RwLock::new(
+                bamboo_llm::Config::default(),
+            )))
+            .provider(Arc::new(UnusedProvider))
+            .default_tools(Arc::new(bamboo_tools::BuiltinToolExecutor::new()))
+            .build()
+            .unwrap();
+        let background: crate::runtime::config::BackgroundModelResolver = Arc::new(|_| None);
+        let resume: crate::runtime::config::ResumeAuxiliaryResolver = Arc::new(|| (Ok(None), None));
+        let bound = ordinary
+            .with_background_model_resolver(background.clone())
+            .with_resume_auxiliary_resolver(resume.clone());
+        let sibling = bound.clone();
+        let schedule = bound.with_auxiliary_model_resolver_factory(Arc::new(|key| {
+            let key = key.to_owned();
+            Arc::new(move || crate::AuxiliaryModelConfig {
+                fast_model_name: Some(key.clone()),
+                ..Default::default()
+            })
+        }));
+
+        assert!(ordinary.runtime.auxiliary_model_resolver_factory.is_none());
+        assert!(ordinary.runtime.background_model_resolver.is_none());
+        assert!(ordinary.runtime.resume_auxiliary_resolver.is_none());
+        for agent in [&bound, &sibling] {
+            assert!(agent.runtime.auxiliary_model_resolver_factory.is_none());
+            assert!(Arc::ptr_eq(
+                agent.runtime.background_model_resolver.as_ref().unwrap(),
+                &background,
+            ));
+            assert!(Arc::ptr_eq(
+                agent.runtime.resume_auxiliary_resolver.as_ref().unwrap(),
+                &resume,
+            ));
+        }
+        assert!(schedule.runtime.background_model_resolver.is_none());
+        assert!(schedule.runtime.resume_auxiliary_resolver.is_none());
+        let factory = schedule
+            .runtime
+            .auxiliary_model_resolver_factory
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            factory("run-key")().fast_model_name.as_deref(),
+            Some("run-key")
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "child_resume_gold_policy_tests.rs"]
+mod child_resume_gold_policy_tests;

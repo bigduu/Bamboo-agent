@@ -1349,3 +1349,6 @@ async fn subscription_unavailable_observer_retries_are_bounded_without_borrowing
         assert_eq!(durable.window, exhausted.window);
     }
 }
+
+#[path = "observer_fault_tests.rs"]
+mod fault;

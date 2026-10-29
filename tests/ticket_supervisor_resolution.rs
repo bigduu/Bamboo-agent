@@ -23,7 +23,7 @@ async fn actual_one_human_multi_intent_commits_groups_dispatches_and_replays_aft
     }
     let ask = command(&f.client,&f.base,"ask-A",json!([{"op":"ask","work_id":ids[0],"temp_id":"q","prompt":"A 使用什么颜色？","action":null}])).await;
     post(&f.client, &f.base, "/tickets/update", &ask).await;
-    let human = json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":"multi-human", "message":"TICKET_SUPERVISOR_E2E TICKET_MULTI_E2E；A使用绿色；B改为英文；新建并开始C；取消D", "model":"ticket-model","provider":"openai","model_ref":{"provider":"openai","model":"ticket-model"}});
+    let human = json!({"session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":"multi-human","thread_id":"ticket-resolution-e2e", "message":"TICKET_SUPERVISOR_E2E TICKET_MULTI_E2E；A使用绿色；B改为英文；新建并开始C；取消D", "model":"ticket-model","provider":"openai","model_ref":{"provider":"openai","model":"ticket-model"}});
     let admitted = post(&f.client, &f.base, "/chat", &human).await;
     post(
         &f.client,

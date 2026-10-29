@@ -53,6 +53,8 @@ pub(super) struct ReadyExecution<'a> {
     /// Optional per-run resource guardrail override from THIS execute request
     /// (issue #221). `None` uses the config-level default.
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
+    pub upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    pub live_bootstrap_resume: bool,
 }
 
 pub(super) struct ExecuteReadyContext<'a> {
@@ -85,7 +87,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     // custom instance id. Canonicalize before reserving or saving the run, and
     // require the exact target to be live. An unresolved explicit/session
     // target must never fall through to the process-wide default provider.
-    let provider_override = if let Some(mut model_ref) = session_effective_model_ref(&session) {
+    let selected_override = if let Some(mut model_ref) = session_effective_model_ref(&session) {
         let routing_key = match resolve_provider_routing_key(
             config_snapshot,
             &model_ref.provider,
@@ -108,8 +110,8 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         };
         model_ref.provider = routing_key;
         persist_model_ref(&mut session, &model_ref);
-        match state.provider_router.route(&model_ref) {
-            Ok(provider) => Some(provider),
+        match state.provider_router.route_with_origin(&model_ref) {
+            Ok((provider, managed_registry)) => (Some(provider), managed_registry),
             Err(error) => {
                 let detail = format!("provider routing failed: {error}");
                 super::fail_reserved_pending_startup(
@@ -125,8 +127,9 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             }
         }
     } else {
-        None
+        (None, None)
     };
+    let (provider_override, provider_override_managed_registry) = selected_override;
 
     // Consult the same provider/model that will execute this session. A legacy
     // Error fallback must not reject explicitly supported native image input.
@@ -396,6 +399,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         is_child_session: ready.is_child_session,
         provider_name: resolved_provider_name,
         provider_override,
+        provider_override_managed_registry,
         model_roster,
         reasoning_effort: ready.effective_reasoning_effort,
         reasoning_effort_source: ready.reasoning_source.to_string(),
@@ -408,7 +412,12 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         app_data_dir: Some(state.app_data_dir.clone()),
         run_budget: ready.run_budget,
     }
-    .spawn_with_native_inputs(ready.untrusted_inputs, native_binding);
+    .spawn_with_native_inputs_and_retry(
+        ready.untrusted_inputs,
+        native_binding,
+        ready.upstream_retry,
+        ready.live_bootstrap_resume,
+    );
 
     started_response(session_id, sync_info, run_id)
 }

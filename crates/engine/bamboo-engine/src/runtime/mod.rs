@@ -12,6 +12,8 @@ pub mod goal_state;
 pub mod gold_evaluation;
 pub mod guardian_state;
 pub mod hooks;
+#[doc(hidden)]
+pub mod host_gold;
 pub mod loop_control;
 pub mod managers;
 pub mod model_roster;
