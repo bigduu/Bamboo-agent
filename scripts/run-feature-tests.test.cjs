@@ -119,7 +119,7 @@ test("ordinary owners preserve isolated defaults and feature owners select only 
       assert.deepEqual(args.slice(args.indexOf("--") + 1), SERIAL_STORAGE_SELECTORS.flatMap((name) => ["--skip", name]));
     } else assert.ok(!args.includes("--"));
   }
-  assert.equal(FEATURE_CONTEXTS.flatMap((context) => context.targets.flatMap((target) => target.added)).length, 20);
+  assert.equal(FEATURE_CONTEXTS.flatMap((context) => context.targets.flatMap((target) => target.added)).length, 22);
   assert.ok(FEATURE_CONTEXTS.find((context) => context.package === "bamboo-infrastructure")
     .targets.find((target) => target.name === "bamboo_infrastructure").added
     .includes("telemetry::config::tests::zero_export_sampling_keeps_local_spans_without_sending_them"));

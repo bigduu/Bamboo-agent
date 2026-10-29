@@ -1,0 +1,60 @@
+name: OTLP native executable diagnostic
+
+# Manual, non-release diagnostic. Installation on the default branch is needed
+# before Actions can dispatch it; a local candidate does not install anything.
+on:
+  workflow_dispatch:
+    inputs:
+      snapshot_sha:
+        description: Exact commit selected by the dispatch ref
+        required: true
+        type: string
+      snapshot_tree:
+        description: Exact Git tree of that commit
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    if: github.repository == 'bigduu/Bamboo-agent' && github.event_name == 'workflow_dispatch'
+    name: OTLP diagnostic (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    env:
+      EXPECTED_SOURCE_SHA: ${{ inputs.snapshot_sha }}
+      EXPECTED_TREE_SHA: ${{ inputs.snapshot_tree }}
+      DISPATCH_SOURCE_SHA: ${{ github.sha }}
+      DIAGNOSTIC_TARGET: ${{ matrix.target }}
+    steps:
+      - name: Require the exact dispatch source before checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$EXPECTED_TREE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$EXPECTED_SOURCE_SHA" = "$DISPATCH_SOURCE_SHA"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build and identify the non-published native executable
+        run: node scripts/otlp-package-diagnostic.cjs

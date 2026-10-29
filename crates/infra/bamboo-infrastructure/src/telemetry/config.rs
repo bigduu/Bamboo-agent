@@ -32,6 +32,138 @@ impl opentelemetry_sdk::trace::ShouldSample for LocalSampler {
 #[derive(Debug)]
 struct SampledOnly<P>(P);
 
+/// Process-scoped pseudonyms preserve equality without exporting free-form IDs.
+/// Domain separation prevents unrelated kinds of equal input from being linked.
+#[cfg(feature = "otel-otlp")]
+fn export_reference(domain: &'static str, value: &str) -> String {
+    use hmac::{Hmac, KeyInit, Mac};
+    use std::sync::OnceLock;
+
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key
+    });
+    let mut digest = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    digest.update(b"bamboo/otlp-reference/v1\0");
+    digest.update(domain.as_bytes());
+    digest.update(b"\0");
+    digest.update(value.as_bytes());
+    format!("ref-{}", hex::encode(digest.finalize().into_bytes()))
+}
+
+/// Build a privacy-limited export copy. Local processors receive the original
+/// SpanData, as each SDK processor is called with a separate owned copy.
+#[cfg(feature = "otel-otlp")]
+fn sanitize_export_span(
+    mut span: opentelemetry_sdk::trace::SpanData,
+) -> Option<opentelemetry_sdk::trace::SpanData> {
+    use opentelemetry::trace::{SpanContext, Status, TraceState};
+    use opentelemetry::{KeyValue, Value};
+
+    if span.instrumentation_scope.name() != super::INSTRUMENTATION_NAME {
+        return None;
+    }
+    let operation: &'static str = span.attributes.iter().take(16).find_map(|attribute| {
+        if attribute.key.as_str() != "gen_ai.operation.name" {
+            return None;
+        }
+        match &attribute.value {
+            Value::String(value) => match value.as_str() {
+                "invoke_agent" => Some("invoke_agent"),
+                "chat" => Some("chat"),
+                "execute_tool" => Some("execute_tool"),
+                _ => None,
+            },
+            _ => None,
+        }
+    })?;
+    let mut attributes = vec![KeyValue::new("gen_ai.operation.name", operation)];
+    for attribute in span.attributes.into_iter().take(16) {
+        let key = attribute.key.as_str();
+        let reference = match key {
+            "gen_ai.conversation.id" => Some(("bamboo.session.ref", "session")),
+            "bamboo.root_session.id" => Some(("bamboo.root_session.ref", "session")),
+            "gen_ai.tool.call.id" => Some(("bamboo.tool_call.ref", "tool_call")),
+            "bamboo.execution.id" => Some(("bamboo.execution.ref", "execution")),
+            "bamboo.run.id" => Some(("bamboo.run.ref", "run")),
+            "bamboo.round.id" => Some(("bamboo.round.ref", "round")),
+            "bamboo.model_call.id" => Some(("bamboo.model_call.ref", "model_call")),
+            "gen_ai.request.model" => Some(("bamboo.model.ref", "model")),
+            "gen_ai.tool.name" => Some(("bamboo.tool.ref", "tool")),
+            _ => None,
+        };
+        if let Some((output_key, domain)) = reference {
+            if let Value::String(value) = &attribute.value {
+                if super::valid_identifier(value.as_str()) {
+                    attributes.push(KeyValue::new(
+                        output_key,
+                        export_reference(domain, value.as_str()),
+                    ));
+                }
+            }
+            continue;
+        }
+        let allowed = match (key, &attribute.value) {
+            ("gen_ai.provider.name", Value::String(value)) => matches!(
+                value.as_str(),
+                "openai" | "anthropic" | "gcp.gen_ai" | "github.copilot"
+            ),
+            ("bamboo.tool.observation", Value::String(value)) => value.as_str() == "dispatch",
+            ("bamboo.outcome", Value::String(value)) => {
+                matches!(value.as_str(), "success" | "cancelled" | "error")
+            }
+            ("error.type", Value::String(value)) => matches!(
+                value.as_str(),
+                "cancelled"
+                    | "provider_error"
+                    | "tool_error"
+                    | "timeout"
+                    | "context_overflow"
+                    | "empty_response"
+                    | "execution_error"
+                    | "panic"
+            ),
+            ("bamboo.session.birth", Value::String(value)) => {
+                value.as_str().len() <= 64
+                    && chrono::DateTime::parse_from_rfc3339(value.as_str()).is_ok()
+            }
+            (
+                "gen_ai.usage.input_tokens"
+                | "gen_ai.usage.output_tokens"
+                | "bamboo.usage.reasoning_tokens"
+                | "bamboo.usage.cache_read_input_tokens"
+                | "bamboo.usage.cache_creation_input_tokens"
+                | "bamboo.usage.cache_write_input_tokens",
+                Value::I64(value),
+            ) => *value >= 0,
+            _ => false,
+        };
+        if allowed {
+            attributes.push(attribute);
+        }
+    }
+    span.attributes = attributes;
+    span.name = operation.into();
+    span.instrumentation_scope = super::scope();
+    span.events = Default::default();
+    span.links = Default::default();
+    if matches!(&span.status, Status::Error { .. }) {
+        span.status = Status::error("error");
+    }
+    let context = &span.span_context;
+    span.span_context = SpanContext::new(
+        context.trace_id(),
+        context.span_id(),
+        context.trace_flags(),
+        context.is_remote(),
+        TraceState::NONE,
+    );
+    Some(span)
+}
+
 #[cfg(feature = "otel-otlp")]
 impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanProcessor
     for SampledOnly<P>
@@ -43,15 +175,11 @@ impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanP
     ) {
         self.0.on_start(span, context);
     }
-    fn on_end(&self, mut span: opentelemetry_sdk::trace::SpanData) {
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
         if span.span_context.is_sampled() {
-            span.attributes.retain(|attribute| {
-                !matches!(
-                    attribute.key.as_str(),
-                    "bamboo.local.scope" | super::LOCAL_SESSION_REFERENCE
-                )
-            });
-            self.0.on_end(span);
+            if let Some(span) = sanitize_export_span(span) {
+                self.0.on_end(span);
+            }
         }
     }
     fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
@@ -361,6 +489,239 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "otel-otlp")]
+    #[derive(Clone, Debug, Default)]
+    struct CapturedSpans(std::sync::Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>);
+
+    #[cfg(feature = "otel-otlp")]
+    impl opentelemetry_sdk::trace::SpanProcessor for CapturedSpans {
+        fn on_start(
+            &self,
+            _span: &mut opentelemetry_sdk::trace::Span,
+            _context: &opentelemetry::Context,
+        ) {
+        }
+
+        fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+            self.0.lock().unwrap().push(span);
+        }
+
+        fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+
+        fn shutdown_with_timeout(
+            &self,
+            _timeout: Duration,
+        ) -> opentelemetry_sdk::error::OTelSdkResult {
+            Ok(())
+        }
+    }
+
+    #[cfg(feature = "otel-otlp")]
+    #[test]
+    fn exported_references_hide_untrusted_ids_and_preserve_local_correlation() {
+        use opentelemetry::trace::{
+            SpanContext, SpanId, SpanKind, Status, TraceContextExt, TraceFlags, TraceId,
+            TraceState, TracerProvider,
+        };
+        use opentelemetry::{Context, InstrumentationScope, KeyValue, Value};
+        use std::sync::Arc;
+
+        let local_capture = CapturedSpans::default();
+        let export_capture = CapturedSpans::default();
+        let store = Arc::new(super::super::local::LocalTraceStore::default());
+        store.set_enabled(true);
+        let provider = SdkTracerProvider::builder()
+            .with_span_processor(SampledOnly(export_capture.clone()))
+            .with_span_processor(local_capture.clone())
+            .with_span_processor(super::super::local::LocalProcessor(store.clone()))
+            .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+            .build();
+        let scope = InstrumentationScope::builder(super::super::INSTRUMENTATION_NAME)
+            .with_attributes([KeyValue::new("untrusted.scope", "sk_SYNTHETIC_SCOPE")])
+            .build();
+        let tracer = provider.tracer_with_scope(scope);
+        let session = "sk_SYNTHETIC_SESSION";
+        let model = "sk_SYNTHETIC_MODEL";
+        let tool = "sk_SYNTHETIC_TOOL";
+        let call = "sk_SYNTHETIC_CALL";
+        let birth = chrono::Utc::now();
+        let remote_parent = SpanContext::new(
+            TraceId::from_hex("0123456789abcdef0123456789abcdef").unwrap(),
+            SpanId::from_hex("0123456789abcdef").unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::from_key_value([("vendor", "sk_SYNTHETIC_STATE")]).unwrap(),
+        );
+        let remote_guard = Context::new()
+            .with_remote_span_context(remote_parent)
+            .attach();
+        let root = super::super::Observation::start_with(
+            &tracer,
+            "invoke_agent",
+            SpanKind::Internal,
+            vec![
+                KeyValue::new("gen_ai.operation.name", "invoke_agent"),
+                KeyValue::new("gen_ai.conversation.id", session),
+                KeyValue::new("bamboo.root_session.id", session),
+                KeyValue::new("bamboo.execution.id", "sk_SYNTHETIC_EXECUTION"),
+                KeyValue::new("bamboo.run.id", "sk_SYNTHETIC_RUN"),
+            ],
+        )
+        .bind_session_lifetime(session, birth);
+        let root_ids = root.trace_ids().unwrap();
+        let root_guard = root.context.clone().attach();
+        let llm = super::super::Observation::start_with(
+            &tracer,
+            format!("chat {model}"),
+            SpanKind::Client,
+            vec![
+                KeyValue::new("gen_ai.operation.name", "chat"),
+                KeyValue::new("gen_ai.conversation.id", session),
+                KeyValue::new("gen_ai.request.model", model),
+                KeyValue::new("bamboo.model_call.id", "sk_SYNTHETIC_MODEL_CALL"),
+                KeyValue::new("gen_ai.usage.input_tokens", 100_i64),
+                KeyValue::new("bamboo.usage.cache_read_input_tokens", 0_i64),
+            ],
+        );
+        llm.context
+            .span()
+            .set_attribute(KeyValue::new("arbitrary.secret", "sk_SYNTHETIC_EXTRA"));
+        llm.context
+            .span()
+            .set_attribute(KeyValue::new("gen_ai.tool.call.id", 123_i64));
+        llm.context
+            .span()
+            .set_attribute(KeyValue::new("gen_ai.request.model", "x".repeat(129)));
+        llm.context.span().add_event("sk_SYNTHETIC_EVENT", vec![]);
+        llm.context
+            .span()
+            .set_status(Status::error("sk_SYNTHETIC_ERROR"));
+        llm.finish(super::super::Outcome::Success);
+        for _ in 0..2 {
+            super::super::Observation::start_with(
+                &tracer,
+                format!("execute_tool {tool}"),
+                SpanKind::Internal,
+                vec![
+                    KeyValue::new("gen_ai.operation.name", "execute_tool"),
+                    KeyValue::new("gen_ai.conversation.id", session),
+                    KeyValue::new("gen_ai.tool.name", tool),
+                    KeyValue::new("gen_ai.tool.call.id", call),
+                    KeyValue::new("bamboo.round.id", "sk_SYNTHETIC_ROUND"),
+                ],
+            )
+            .finish(super::super::Outcome::Success);
+        }
+        drop(root_guard);
+        root.finish(super::super::Outcome::Success);
+        drop(remote_guard);
+        let foreign = provider.tracer("foreign.tracer");
+        super::super::Observation::start_with(
+            &foreign,
+            "sk_SYNTHETIC_FOREIGN",
+            SpanKind::Internal,
+            vec![KeyValue::new("gen_ai.operation.name", "chat")],
+        )
+        .finish(super::super::Outcome::Success);
+        provider.force_flush().unwrap();
+        let original = local_capture.0.lock().unwrap().clone();
+        let exported = export_capture.0.lock().unwrap().clone();
+        assert_eq!(original.len(), 5);
+        assert_eq!(exported.len(), 4);
+        assert!(format!("{original:?}").contains(session));
+        assert!(!format!("{exported:?}").contains("sk_SYNTHETIC_"));
+        let get = |span: &opentelemetry_sdk::trace::SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|item| item.key.as_str() == key)
+                .map(|item| item.value.clone())
+        };
+        let root = exported
+            .iter()
+            .find(|span| span.name == "invoke_agent")
+            .unwrap();
+        let session_ref = get(root, "bamboo.session.ref").unwrap();
+        assert_eq!(
+            get(root, "bamboo.root_session.ref"),
+            Some(session_ref.clone())
+        );
+        let tools: Vec<_> = exported
+            .iter()
+            .filter(|span| span.name == "execute_tool")
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(
+            get(tools[0], "bamboo.session.ref"),
+            Some(session_ref.clone())
+        );
+        assert_eq!(
+            get(tools[0], "bamboo.tool_call.ref"),
+            get(tools[1], "bamboo.tool_call.ref")
+        );
+        assert_ne!(get(tools[0], "bamboo.tool_call.ref"), Some(session_ref));
+        let model_span = exported.iter().find(|span| span.name == "chat").unwrap();
+        assert_eq!(
+            get(model_span, "bamboo.usage.cache_read_input_tokens"),
+            Some(Value::I64(0))
+        );
+        assert!(get(model_span, "gen_ai.request.model").is_none());
+        assert!(get(model_span, "bamboo.tool_call.ref").is_none());
+        assert_eq!(
+            model_span
+                .attributes
+                .iter()
+                .filter(|item| item.key.as_str() == "bamboo.model.ref")
+                .count(),
+            1
+        );
+        assert!(get(model_span, "arbitrary.secret").is_none());
+        assert!(model_span.events.is_empty());
+        assert_eq!(model_span.status, Status::error("error"));
+        for span in &exported {
+            let raw = original
+                .iter()
+                .find(|item| item.span_context.span_id() == span.span_context.span_id())
+                .unwrap();
+            assert_eq!(span.span_context.trace_id(), raw.span_context.trace_id());
+            assert_eq!(
+                span.span_context.trace_flags(),
+                raw.span_context.trace_flags()
+            );
+            assert_eq!(span.span_context.is_remote(), raw.span_context.is_remote());
+            assert_eq!(span.parent_span_id, raw.parent_span_id);
+            assert_eq!(span.parent_span_is_remote, raw.parent_span_is_remote);
+            assert!(!raw.span_context.trace_state().header().is_empty());
+            assert!(span.span_context.trace_state().header().is_empty());
+        }
+        let page = store.page(session, birth, 10, None);
+        assert_eq!(page.traces.len(), 1);
+        assert_eq!(page.traces[0].trace_id, root_ids.0);
+        let detail = store.detail(session, birth, &root_ids.0).unwrap();
+        assert!(detail
+            .spans
+            .iter()
+            .any(|span| span.model.as_deref() == Some(model)));
+        assert!(detail.spans.iter().any(|span| span.name == tool));
+    }
+
+    #[cfg(feature = "otel-otlp")]
+    #[test]
+    fn export_references_are_concurrent_and_domain_separated() {
+        let value = "sk_SYNTHETIC_CORRELATION";
+        let expected = export_reference("session", value);
+        assert_ne!(expected, value);
+        assert_ne!(expected, export_reference("tool_call", value));
+        assert_ne!(expected, export_reference("session", "sk_SYNTHETIC_OTHER"));
+        let threads: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(move || export_reference("session", value)))
+            .collect();
+        for thread in threads {
+            assert_eq!(thread.join().unwrap(), expected);
+        }
+    }
+
+    #[cfg(feature = "otel-otlp")]
     #[test]
     fn zero_export_sampling_keeps_local_spans_without_sending_them() {
         use opentelemetry::trace::{SpanKind, TracerProvider};
@@ -528,7 +889,8 @@ mod tests {
     #[cfg(feature = "otel-otlp")]
     #[test]
     fn explicit_guard_shutdown_is_bounded_and_idempotent() {
-        use opentelemetry::trace::{Span, Tracer, TracerProvider};
+        use opentelemetry::trace::{SpanKind, TracerProvider};
+        use opentelemetry::KeyValue;
 
         // Keep the collector socket open without responding. Exercise the
         // exact guard API used before CLI process::exit, without installing a
@@ -543,7 +905,14 @@ mod tests {
             sample_ratio: 1.0,
         })
         .unwrap();
-        provider.tracer("guard-test").start("invoke_agent").end();
+        let tracer = provider.tracer_with_scope(super::super::scope());
+        super::super::Observation::start_with(
+            &tracer,
+            "invoke_agent",
+            SpanKind::Internal,
+            vec![KeyValue::new("gen_ai.operation.name", "invoke_agent")],
+        )
+        .finish(super::super::Outcome::Success);
         let mut guard = TelemetryGuard {
             provider: Some(provider),
         };
@@ -552,6 +921,11 @@ mod tests {
         let _ = guard.shutdown();
         assert!(started.elapsed() < Duration::from_secs(3));
         assert!(!guard.enabled());
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            listener.accept().is_ok(),
+            "shutdown never attempted the queued export"
+        );
         // Drop after explicit shutdown must not wait on the exporter again.
         guard.shutdown().unwrap();
         drop(guard);

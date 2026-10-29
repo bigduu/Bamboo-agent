@@ -26,7 +26,7 @@ Only these additive feature owners run extra cases:
 
 | Package | Explicit features | Additional cases |
 | --- | --- | --- |
-| Infrastructure | otel-otlp, test-utils | 5 OTLP, 1 shutdown, 1 public test-API |
+| Infrastructure | otel-otlp, test-utils | 5 OTLP transport, 4 export/configuration, 1 public test-API |
 | Tickets | test-utils | 5 file publication/reconciliation fault cases |
 | Server | test-utils | 1 credential Unit case, 1 env-cache integration case |
 | Agent | ticket-runtime-fixtures | 3 publication, 1 file reconciliation cases |

@@ -366,6 +366,19 @@ mod otlp {
             cache_write_input_tokens: Some(12),
         });
         llm.finish(Outcome::Success);
+        // Tool-call IDs are provider-controlled and may have a valid identifier
+        // shape while containing synthetic credential-like content.
+        let tool = Observation::start_with(
+            &tracer,
+            "execute_tool sk_SYNTHETIC_TOOL_NAME",
+            SpanKind::Internal,
+            vec![
+                KeyValue::new("gen_ai.operation.name", "execute_tool"),
+                KeyValue::new("gen_ai.tool.name", "sk_SYNTHETIC_TOOL_NAME"),
+                KeyValue::new("gen_ai.tool.call.id", "sk_SYNTHETIC_TOOL_CALL"),
+            ],
+        );
+        tool.finish(Outcome::Success);
         drop(guard);
         agent.finish(Outcome::Success);
         provider.force_flush().unwrap();
@@ -381,6 +394,8 @@ mod otlp {
             "gen_ai.operation.name",
             "bamboo.usage.cache_read_input_tokens",
             "bamboo.usage.cache_write_input_tokens",
+            "bamboo.tool_call.ref",
+            "bamboo.tool.ref",
             "service.name",
             GEN_AI_CONVENTIONS_REVISION,
         ] {
@@ -396,6 +411,9 @@ mod otlp {
             LOCAL_SESSION_REFERENCE,
             private_reference.as_str(),
             "PRIVATE_",
+            "sk_SYNTHETIC_TOOL_NAME",
+            "sk_SYNTHETIC_TOOL_CALL",
+            "gen_ai.tool.call.id",
         ] {
             assert!(!request.contains(denied), "leaked {denied}");
         }
@@ -464,8 +482,13 @@ mod otlp {
         });
         let provider = config::build_provider(&config(endpoint)).unwrap();
         let tracer = provider.tracer_with_scope(scope());
-        Observation::start_with(&tracer, "invoke_agent", SpanKind::Internal, vec![])
-            .finish(Outcome::Success);
+        Observation::start_with(
+            &tracer,
+            "invoke_agent",
+            SpanKind::Internal,
+            vec![KeyValue::new("gen_ai.operation.name", "invoke_agent")],
+        )
+        .finish(Outcome::Success);
         // A rejected export may make flush fail; its send count is the contract.
         let _ = provider.force_flush();
         let started = Instant::now();
@@ -535,8 +558,13 @@ mod otlp {
         let tracer = provider.tracer_with_scope(scope());
         let started = Instant::now();
         for _ in 0..10_000 {
-            Observation::start_with(&tracer, "invoke_agent", SpanKind::Internal, vec![])
-                .finish(Outcome::Success);
+            Observation::start_with(
+                &tracer,
+                "invoke_agent",
+                SpanKind::Internal,
+                vec![KeyValue::new("gen_ai.operation.name", "invoke_agent")],
+            )
+            .finish(Outcome::Success);
         }
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -547,6 +575,11 @@ mod otlp {
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "shutdown exceeded timeout tolerance"
+        );
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            listener.accept().is_ok(),
+            "the unavailable collector was never contacted"
         );
     }
 
@@ -561,8 +594,13 @@ mod otlp {
         config.sample_ratio = 0.0;
         let provider = config::build_provider(&config).unwrap();
         let tracer = provider.tracer_with_scope(scope());
-        Observation::start_with(&tracer, "invoke_agent", SpanKind::Internal, vec![])
-            .finish(Outcome::Success);
+        Observation::start_with(
+            &tracer,
+            "invoke_agent",
+            SpanKind::Internal,
+            vec![KeyValue::new("gen_ai.operation.name", "invoke_agent")],
+        )
+        .finish(Outcome::Success);
         provider.force_flush().unwrap();
         provider
             .shutdown_with_timeout(Duration::from_secs(2))

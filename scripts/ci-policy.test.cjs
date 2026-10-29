@@ -44,6 +44,46 @@ const job = (id, source = workflow) => {
     : source.slice(contentStart, contentStart + nextJob)
 }
 
+test("OTLP native diagnostic is manual, source-bound and read-only", () => {
+  const source = readFileSync(".github/workflows/otlp-package-diagnostic.yml", "utf8")
+  assert.match(source, /^on:\n  workflow_dispatch:\n/mu)
+  assert.doesNotMatch(source, /^  (?:pull_request|push|schedule):/mu)
+  assert.match(source, /^permissions:\n  contents: read\n/mu)
+  assert.doesNotMatch(source, /upload-artifact|cache|\$\{\{\s*secrets\.|cargo publish/iu)
+  assert.match(source, /persist-credentials: false/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \}\}/u)
+  assert.match(source, /EXPECTED_TREE_SHA: \$\{\{ inputs\.snapshot_tree \}\}/u)
+  assert.match(source, /test "\$EXPECTED_SOURCE_SHA" = "\$DISPATCH_SOURCE_SHA"/u)
+  assert.ok(source.indexOf("Require the exact dispatch source before checkout") < source.indexOf("actions/checkout@"))
+  for (const target of ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]) {
+    assert.ok(source.includes(`target: ${target}`))
+  }
+  assert.match(source, /run: node scripts\/otlp-package-diagnostic\.cjs/u)
+})
+
+test("OTLP diagnostic removes ambient credentials and requires actual feature-bearing compiler units", () => {
+  const { isolatedEnvironment, verifyFeatureMessages } = require("./otlp-package-diagnostic.cjs")
+  const child = isolatedEnvironment({ PATH: "/example", HOME: "/example", GITHUB_TOKEN: "SYNTHETIC",
+    ACTIONS_RUNTIME_TOKEN: "SYNTHETIC", GITHUB_OUTPUT: "/example/output", BAMBOO_OTEL_ENABLED: "true",
+    CARGO_REGISTRY_TOKEN: "SYNTHETIC", RUSTUP_TOOLCHAIN: "untrusted", RUSTFLAGS: "untrusted", OTHER: "untrusted" }, "/tmp/fixture")
+  for (const name of ["GITHUB_TOKEN", "ACTIONS_RUNTIME_TOKEN", "GITHUB_OUTPUT", "BAMBOO_OTEL_ENABLED",
+    "CARGO_REGISTRY_TOKEN", "RUSTFLAGS", "OTHER"]) assert.equal(child[name], undefined)
+  assert.equal(child.BAMBOO_FRONTEND_BUILD_MODE, "embedded")
+  assert.equal(child.RUSTUP_TOOLCHAIN, "stable")
+  const root = { reason: "compiler-artifact", package_id: "root", target: { name: "bamboo", kind: ["bin"] },
+    executable: "/tmp/bamboo", features: ["default", "otel-otlp"] }
+  const infra = { reason: "compiler-artifact", package_id: "infra", target: { name: "bamboo_infrastructure", kind: ["lib"] },
+    features: ["otel-otlp"] }
+  const identities = { rootPackageId: "root", infrastructurePackageId: "infra" }
+  const units = verifyFeatureMessages([root, infra], identities)
+  assert.deepEqual(units.root.features, ["default", "otel-otlp"])
+  assert.deepEqual(units.infrastructure.features, ["otel-otlp"])
+  assert.throws(() => verifyFeatureMessages([{ ...root, features: ["default"] }, infra], identities))
+  assert.throws(() => verifyFeatureMessages([root, { ...infra, features: [] }], identities))
+  assert.throws(() => verifyFeatureMessages([root, root, infra], identities))
+  assert.throws(() => verifyFeatureMessages([root, { ...infra, package_id: "other" }], identities))
+})
+
 const comprehensiveOnly =
   "if: needs.validation-source.outputs.full == 'true'"
 
@@ -287,7 +327,7 @@ test("feature shards preserve default configurations and complete explicit addit
   }
   assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
     'New feature-sensitive source requires a reviewed ownership update')
-  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 20)
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 22)
   assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
     ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
     ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])

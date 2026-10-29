@@ -63,19 +63,19 @@ Resuming the same persisted session creates another invocation; a session is not
 an indefinitely open span. Existing execution/run IDs are attached only after
 the runtime establishes them.
 
-Each primary provider dispatch gets a `chat {model}` CLIENT span, starting after
+Each primary provider dispatch gets a CLIENT span, starting after
 prompt/preflight validation and ending after stream consumption or failure. It
 includes provider-internal HTTP retry time. An outer engine retry is another
 request span. Auxiliary model calls (such as compression or task evaluation) are
 not covered by this first slice. This is not per-HTTP-attempt instrumentation.
 
-Each admitted tool-executor dispatch gets an `execute_tool {name}` INTERNAL
+Each admitted tool-executor dispatch gets an INTERNAL
 span. Denied calls before dispatch do not fabricate tool execution spans. A
 background/suspended tool's span describes dispatch and its acknowledgement,
 not eventual background completion. Both parallel tools remain children of the
 correct invocation. No tool-call arguments or results are recorded.
 
-The application attribute allowlist is:
+The local observation attributes are:
 
 - `gen_ai.operation.name`, `gen_ai.conversation.id`
 - `gen_ai.provider.name`, `gen_ai.request.model`
@@ -87,21 +87,29 @@ The application attribute allowlist is:
 - `bamboo.root_session.id`, `bamboo.execution.id`, `bamboo.run.id`, `bamboo.round.id`
 - `bamboo.tool.observation` (`dispatch`), `bamboo.outcome`, `error.type`
 
-Identifiers must be 1–128 ASCII letters, digits, underscores, hyphens or periods;
-other values are omitted, and span names fall back to the operation alone. The
-local viewer can still associate sessions outside that policy using a process-
-keyed reference; Bamboo's OTLP exporter strips that reference and omits the
-original ID. The provider family is restricted to OpenAI, Anthropic,
-Gemini/Google and Copilot;
-free-form provider instance names are omitted. These are correlation fields,
-not a place to put sensitive data. Even syntactically valid IDs/model/tool names
-must not contain secrets. This shape check cannot recognize a secret embedded in
-an otherwise valid identifier; for example, a tool-call ID may come from the
-provider. Treat the collector and its trace storage accordingly. IDs are
-high-cardinality trace metadata, not metric
-labels. Resource attributes are limited to `service.name=bamboo` and the build's
-`service.version`; there are no host, process, environment or filesystem
-resource detectors.
+The OTLP export processor sends only `bamboo.runtime` spans with a recognized
+operation. It replaces free-form session, root session, execution, run, round,
+model-call, tool-call, model and tool values with process-keyed HMAC-SHA256
+references in `bamboo.session.ref`, `bamboo.root_session.ref`,
+`bamboo.execution.ref`, `bamboo.run.ref`, `bamboo.round.ref`,
+`bamboo.model_call.ref`, `bamboo.tool_call.ref`, `bamboo.model.ref` and
+`bamboo.tool.ref`. Session and root-session references share a domain; the other
+kinds use separate domains. Equal values in one domain correlate within a
+process; references change across process restarts and cannot be used to look
+up the original value. They are pseudonyms, not authorization credentials or
+metric labels. Exported span names are the fixed operation names `invoke_agent`,
+`chat` and `execute_tool`; unknown attributes, arbitrary scope metadata,
+events, links and error descriptions are dropped. Provider family, fixed
+outcome/error categories, session birth time and numeric usage remain available.
+
+This transformation applies only to the export copy. Local observations and
+session-scoped inspection keep their existing identifiers and model/tool names;
+the shape check alone cannot identify a secret embedded in a local value. Inputs
+outside the existing 1–128 ASCII identifier policy are omitted from external
+references. The local viewer still associates other nonempty session IDs via its
+own process-keyed reference, which is not exported. Resource attributes are
+limited to `service.name=bamboo` and the build's `service.version`; there are
+no host, process, environment or filesystem resource detectors.
 
 Token attributes use authoritative provider totals, preserving omitted versus
 explicit zero. Cached input and reasoning output subsets are not added again;
@@ -124,7 +132,7 @@ own data handling requirements.
 ## Convention version
 
 GenAI conventions are **Development**, not a stable schema contract. Mapping
-version `1` follows the official
+version `2` follows the official
 [GenAI conventions at f3c6d0c9bb66ebd474668a3a0be25c61226f02c2](https://github.com/open-telemetry/semantic-conventions-genai/tree/f3c6d0c9bb66ebd474668a3a0be25c61226f02c2),
 including [agent spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/f3c6d0c9bb66ebd474668a3a0be25c61226f02c2/docs/gen-ai/gen-ai-agent-spans.md)
 and [tool spans](https://github.com/open-telemetry/semantic-conventions-genai/blob/f3c6d0c9bb66ebd474668a3a0be25c61226f02c2/docs/gen-ai/gen-ai-spans.md).
@@ -148,7 +156,10 @@ provider controls its own export behavior.
 optional `tracestate`, each bounded to 512 input bytes. Unknown carrier fields
 are rejected. Optional invalid tracestate is discarded according to W3C
 parsing. Tracestate is opaque trace metadata; do not put business data or secrets
-in it. No baggage is accepted. `TraceContext::scope(future)` restores context
+in it. The OTLP export copy removes tracestate, while in-process propagation is
+unchanged. Trace IDs, span IDs and parent IDs are retained for real trace
+correlation and may originate from an upstream peer; they are not authorization
+keys. No baggage is accepted. `TraceContext::scope(future)` restores context
 per poll, and `with_current_context(future)` captures it for an explicit task
 spawn; neither holds a thread-local guard across `await`.
 

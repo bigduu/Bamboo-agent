@@ -61,8 +61,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // bootstrap tests are cfg(test) and belong to the default storage catalog.
 // Default harnesses own 20 storage, two LLM and four Unix server live cases,
 // plus five fresh-input server regressions; none match the serial exclusions.
-// Feature cfg expressions, 31 default owners, four contexts and 20 explicit
-// additive cases remain unchanged. Default catalogs own retry and Stop tests.
+// Feature cfg expressions, 31 default owners, four contexts and 22 explicit
+// additive cases are pinned below. Default catalogs own retry and Stop tests.
 // The test-utils-gated engine semaphore helper is used by the default
 // reloadable-provider test in server-other via the server's dev dependency.
 // Gold router and reload cases belong to existing server default shards;
@@ -73,25 +73,27 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // in default engine packages-3; direct background admission stays in default
 // LLM packages-2, and the reloadable provider proof stays in server-other.
 // The injected project Dream endpoint A/B case stays in server-handlers.
-// The local trace sampler adds one otel-otlp-only test to the infrastructure
-// additive owner; local trace, API, engine and hook tests use default owners.
+// The local trace sampler and export pseudonym regressions belong to the
+// infrastructure additive owner; local trace, API, engine and hook tests use default owners.
 // The usage-presence normalization and its test are unconditional and remain
-// with the default engine owner; additive feature cases are unchanged.
+// with the default engine owner.
 // Session-reference and local-OTLP redaction tests use their existing owners.
 // Root-fenced startup/response guard cases remain in the default storage owner;
 // Connect and Schedule routing cases stay in server-other, reasoning resolution
 // in the default engine owner, and Observer cases in server-app-state.
 // Gemini replacement and budget cases remain in the default bamboo-llm and
 // bamboo-engine owners (packages-2 and packages-3); Responses cases remain in
-// the default server-handlers owner. No additive feature cases changed.
+// the default server-handlers owner.
 // The root package includes the optional OTLP transport by default.
-const FEATURE_SOURCE_SHA256 = "248437c0c12df5bc318bf7775b59bfaec7468a3c8d93c359ed646dabd9820932";
+const FEATURE_SOURCE_SHA256 = "1d2cf1a0f34aca6e26cda2b6ca8a6166811d813f8e0b22bf74915f9e54e6d4ed";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
     { name: "bamboo_infrastructure", kind: "lib", removed: [DEFAULT_TELEMETRY_CASE], added: [
       "telemetry::config::tests::explicit_guard_shutdown_is_bounded_and_idempotent",
       "telemetry::config::tests::zero_export_sampling_keeps_local_spans_without_sending_them",
+      "telemetry::config::tests::exported_references_hide_untrusted_ids_and_preserve_local_correlation",
+      "telemetry::config::tests::export_references_are_concurrent_and_domain_separated",
       ...["local_otlp_collector_receives_allowlisted_trace_bytes", "retryable_collector_status_is_sent_once",
         "ambient_otel_headers_and_resources_cannot_leak_credentials",
         "unavailable_collector_never_backpressures_spans_and_shutdown_is_bounded", "zero_sample_ratio_exports_no_roots"]

@@ -26,7 +26,7 @@ pub use timeout::with_timeout;
 /// schema URL, defines our deliberately small attribute mapping.
 pub const GEN_AI_CONVENTIONS_REVISION: &str = "f3c6d0c9bb66ebd474668a3a0be25c61226f02c2";
 pub const INSTRUMENTATION_NAME: &str = "bamboo.runtime";
-pub const MAPPING_VERSION: &str = "1";
+pub const MAPPING_VERSION: &str = "2";
 const LOCAL_SESSION_REFERENCE: &str = "bamboo.local.session_ref";
 
 fn scope() -> InstrumentationScope {

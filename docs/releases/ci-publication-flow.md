@@ -35,6 +35,19 @@ server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E
 is a separate frontend test.
 
+The proposed `otlp-package-diagnostic.yml` is a manually dispatched, read-only
+feature diagnostic for a single exact commit and tree. Once reviewed and present
+on the default branch, its three native jobs compile the unstamped embedded
+executable with default features, verify Cargo's feature-bearing compiler units,
+architecture, embedded frontend bytes and `--version`, and print source and
+binary hashes. It stores no artifact and does not save a cache; this is neither
+a formal release binary nor evidence that OTLP network behavior passed. The
+ordinary feature owner retains the synthetic collector and privacy tests.
+The compiler child receives a restricted environment without workflow tokens,
+publisher credentials or `OTEL_*` settings, not an operating-system sandbox.
+Check billing and available runner storage before a manual run. A candidate
+workflow file alone is not an installed controller or a successful run.
+
 The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
 `trusted-observer.yml` runs both Observer runtime selections in one feature job,
 reusing compatible compiled output and running the shared serde case once. The
