@@ -426,7 +426,7 @@ async fn submit_response_inner(
         );
 
     let auto_resume_outcome =
-        bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
+        bamboo_engine::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
             &resume_port,
             &session_id,
             session,

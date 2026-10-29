@@ -102,7 +102,28 @@ impl ResumeExecutionPort for AppStateResumeRef {
         Ok(())
     }
 
+    fn dispatch_configured_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = AppStateResumeRef(self.0.clone());
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_configured_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, false).await;
+    }
+
+    async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, true).await;
+    }
+}
+
+impl AppStateResumeRef {
+    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -143,6 +164,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 execution_reservation.abandon().await;
                 return;
             }
+        };
+        let workspace_agent = if from_config {
+            std::sync::Arc::new(workspace_agent.with_config_derived_image_fallback())
+        } else {
+            workspace_agent
         };
         let execution_binding = Some((
             workspace_agent,

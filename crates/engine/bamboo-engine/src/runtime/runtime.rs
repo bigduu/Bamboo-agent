@@ -141,6 +141,8 @@ pub struct AgentRuntime {
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
     /// Capturing no inherited wait is also immutable for this execution.
     pub(crate) inherited_child_wait_captured: bool,
+    /// Config-derived fallback is an explicit per-run Host choice.
+    pub(crate) legacy_image_from_config: bool,
     pub(crate) sdk_skill_execution_host:
         Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
     pub(crate) workspace_execution_host:
@@ -343,6 +345,7 @@ impl AgentRuntimeBuilder {
         }
         Ok(AgentRuntime {
             inherited_child_wait_captured: false,
+            legacy_image_from_config: false,
             sdk_skill_execution_host: None,
             workspace_execution_host: None,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
@@ -1164,6 +1167,7 @@ impl AgentRuntime {
                     llm.clone(),
                     fallback.vision_model.clone(),
                     app_data_dir.clone(),
+                    self.legacy_image_from_config,
                 )
             });
         if let Some(control) = loop_control.as_ref() {

@@ -130,6 +130,47 @@ async fn agent(c: Config, main: Arc<Capture>, dir: &std::path::Path) -> bamboo_s
         .unwrap()
 }
 
+// Exercise the engine consumer with the same explicit provenance that Host
+// adds to each config-derived run. Public SDK requests remain unmarked.
+async fn config_derived_agent(
+    c: Config,
+    main: Arc<Capture>,
+    dir: &std::path::Path,
+) -> (bamboo_engine::Agent, Arc<RwLock<Config>>) {
+    let store = Arc::new(
+        bamboo_storage::SessionStoreV2::new(dir.join("sessions"))
+            .await
+            .unwrap(),
+    );
+    let storage: Arc<dyn bamboo_agent_core::storage::Storage> = store.clone();
+    let persistence = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let metrics = bamboo_metrics::MetricsCollector::spawn(
+        Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+            dir.join("metrics.db"),
+        )),
+        7,
+    );
+    let config = Arc::new(RwLock::new(c));
+    let runtime = bamboo_engine::Agent::builder()
+        .storage(storage)
+        .persistence(persistence)
+        .attachment_reader(store)
+        .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+        .metrics_collector(metrics)
+        .config(config.clone())
+        .provider(main)
+        .memory_store(bamboo_memory::memory_store::MemoryStore::new(
+            dir.join("jiandu"),
+        ))
+        .default_tools(Arc::new(bamboo_tools::BuiltinToolExecutor::with_registry(
+            bamboo_tools::ToolRegistry::new(),
+        )))
+        .build()
+        .unwrap()
+        .with_config_derived_image_fallback();
+    (runtime, config)
+}
+
 async fn execute_gold(
     c: Config,
     override_target: Option<Arc<Capture>>,
@@ -329,11 +370,11 @@ async fn execute_legacy(
     c: Config,
     main: Arc<Capture>,
 ) -> Result<(), bamboo_agent_core::AgentError> {
-    let fallback = bamboo_engine::model_config_helper::resolve_image_fallback(&c)
+    let fallback = bamboo_engine::model_config_helper::resolve_live_image_fallback(&c)
         .unwrap()
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let agent = agent(c, main, dir.path()).await;
+    let (agent, _config) = config_derived_agent(c, main, dir.path()).await;
     let mut session = Session::new("synthetic-legacy-vision", "main-a");
     let user = Message::user_with_parts(
         "Inspect synthetic pixel",
@@ -1353,20 +1394,10 @@ async fn entrypoint_routing_legacy_stale_derived_role_never_rebinds_to_main() {
         let fallback = snapshot.image_fallback.unwrap();
         assert_eq!(fallback.vision_model, None);
 
-        let shared = Arc::new(RwLock::new(initial));
         assert!(main.supports_vision("vision-b").await);
         assert_ne!(main.vision_support_override("main-a").await, Some(true));
         let dir = tempfile::tempdir().unwrap();
-        let agent = bamboo_sdk::Agent::builder()
-            .provider(main.clone())
-            .model("main-a")
-            .config(shared.clone())
-            .tools(std::iter::empty())
-            .with_defaults_for_data_dir(dir.path().to_path_buf())
-            .await
-            .unwrap()
-            .build()
-            .unwrap();
+        let (agent, shared) = config_derived_agent(initial, main.clone(), dir.path()).await;
 
         shared.write().await.defaults.as_mut().unwrap().vision =
             Some(bamboo_domain::ProviderModelRef::new("vision-c", "vision-c"));
@@ -1833,16 +1864,7 @@ async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
         );
     let fallback = snapshot.image_fallback.unwrap();
     let dir = tempfile::tempdir().unwrap();
-    let agent = bamboo_sdk::Agent::builder()
-        .provider(main.clone())
-        .model("main-a")
-        .config(Arc::new(RwLock::new(config)))
-        .tools(std::iter::empty())
-        .with_defaults_for_data_dir(dir.path().to_path_buf())
-        .await
-        .unwrap()
-        .build()
-        .unwrap();
+    let (agent, _config) = config_derived_agent(config, main.clone(), dir.path()).await;
     let mut session = Session::new("synthetic-copilot-fallback", "main-a");
     let user = Message::user_with_parts(
         "Inspect synthetic pixel",

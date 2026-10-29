@@ -11,13 +11,21 @@ use super::LegacyVisionModelResolver;
 
 /// The legacy hook historically selects Vision -> Fast -> Chat. Retain that
 /// separate contract while preserving the selected account. A caller's bare
-/// model override belongs to its supplied active client; a matching configured
-/// role retains its complete reference (including identical model IDs).
+/// model override belongs to its supplied active client. Only a Host-marked
+/// config-derived fallback may resolve the configured complete reference.
 fn selected_target(
     config: &Config,
     active_provider: &str,
     requested_model: Option<&str>,
+    from_config: bool,
 ) -> Result<ProviderModelRef, AgentError> {
+    if requested_model.is_some_and(|model| model.trim().is_empty())
+        || (requested_model.is_none() && !from_config)
+    {
+        return Err(AgentError::LLM(
+            "Explicit legacy Vision model is missing or empty; original images were preserved and no image was sent.".into(),
+        ));
+    }
     let configured = config.defaults.as_ref().map(|defaults| {
         defaults
             .vision
@@ -30,7 +38,7 @@ fn selected_target(
         .map(str::trim)
         .filter(|model| !model.is_empty());
     if let Some(target) = configured.as_ref() {
-        if requested.is_none_or(|model| model == target.model) {
+        if requested.is_none() {
             if target.provider != active_provider
                 && config
                     .defaults
@@ -84,6 +92,7 @@ pub(crate) fn legacy_vision_resolver(
     active_client: Arc<dyn LLMProvider>,
     requested_model: Option<String>,
     app_data_dir: Option<PathBuf>,
+    from_config: bool,
 ) -> LegacyVisionModelResolver {
     Arc::new(move || {
         let config = config.clone();
@@ -92,7 +101,12 @@ pub(crate) fn legacy_vision_resolver(
         let requested_model = requested_model.clone();
         let app_data_dir = app_data_dir.clone();
         Box::pin(async move {
-            let target = selected_target(&config, &active_provider, requested_model.as_deref())?;
+            let target = selected_target(
+                &config,
+                &active_provider,
+                requested_model.as_deref(),
+                from_config,
+            )?;
             let instance = if target.provider == active_provider
                 && configured_instance(&config, &target.provider).is_none()
             {

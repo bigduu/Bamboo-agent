@@ -442,6 +442,15 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Mark this execution's legacy image fallback as derived by the Host
+    /// from configuration. The shared agent and caller-owned runs stay unchanged.
+    #[doc(hidden)]
+    pub fn with_config_derived_image_fallback(&self) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.legacy_image_from_config = true;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Adapt the default provider for this execution while retaining every
     /// other runtime capability. Explicit request-level overrides stay separate.
     #[doc(hidden)]

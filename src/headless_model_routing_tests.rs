@@ -298,3 +298,85 @@ async fn entrypoint_routing_headless_host_uses_configured_vision_role() {
         "Host fallback must use its configured Vision account: {outcomes:?}"
     );
 }
+
+#[tokio::test]
+async fn entrypoint_routing_headless_invalid_saved_ref_refuses_before_prompt_or_dispatch() {
+    let mut outcomes = Vec::new();
+    for flag in [false, true] {
+        let (dir, state, original_provider, new_default, mut original) =
+            fixture(flag, "missing-model").await;
+        original.title_generated = true;
+        original.model = "unknown".into();
+        original.model_ref = Some(bamboo_domain::ProviderModelRef::new("chat-a", "unknown"));
+        original.set_provider_name("chat-a");
+        state.storage.save_session(&original).await.unwrap();
+        state.session_store.save_session(&original).await.unwrap();
+        {
+            let mut config = state.config.write().await;
+            config.default_provider_instance = Some("broken-b".into());
+            config.defaults.as_mut().unwrap().chat =
+                bamboo_domain::ProviderModelRef::new("broken-b", "main-a");
+            config
+                .provider_instances
+                .get_mut("chat-a")
+                .unwrap()
+                .extra
+                .remove("runtime_models");
+            let new_instance = config.provider_instances.get_mut("broken-b").unwrap();
+            new_instance.model = Some("main-a".into());
+            new_instance
+                .extra
+                .insert("runtime_models".into(), serde_json::json!(["main-a"]));
+        }
+        let registry = ProviderRegistry::new(
+            HashMap::from([
+                (
+                    "chat-a".into(),
+                    original_provider.clone() as Arc<dyn LLMProvider>,
+                ),
+                (
+                    "broken-b".into(),
+                    new_default.clone() as Arc<dyn LLMProvider>,
+                ),
+            ]),
+            "broken-b".into(),
+        );
+        // An unmanaged embedded registry with no model table must not make an
+        // explicit unknown structured reference silently fall back to B.
+        state.provider_registry.replace_with(registry);
+        let storage = state.storage.clone();
+        let mut request = args(dir.path(), None);
+        request.timeout_secs = Some(10);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_with_state(request, state),
+        )
+        .await
+        .expect("synthetic invalid-ref consumer must finish");
+        let old_calls = original_provider.calls.lock().unwrap().clone();
+        let new_calls = new_default.calls.lock().unwrap().clone();
+        let saved = storage.load_session(&original.id).await.unwrap().unwrap();
+        outcomes.push((
+            flag,
+            outcome,
+            old_calls,
+            new_calls,
+            saved.messages.len(),
+            original.messages.len(),
+        ));
+    }
+    assert!(
+        outcomes.iter().all(
+            |(_, outcome, old_calls, new_calls, saved_len, original_len)| outcome
+                .as_ref()
+                .err()
+                .is_some_and(
+                    |error| error.contains("invalid headless inherited provider/model reference")
+                )
+                && old_calls.is_empty()
+                && new_calls.is_empty()
+                && saved_len == original_len
+        ),
+        "invalid saved refs must stop before prompt or provider dispatch: {outcomes:?}"
+    );
+}

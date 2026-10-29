@@ -54,9 +54,7 @@ use crate::session_app::child_session::result_projection::{
 };
 use crate::session_app::execute::consume_pending_clarification_resume;
 use crate::session_app::provider_model::{persist_model_ref, session_effective_model_ref};
-use crate::session_app::resume::{
-    resume_session_execution, ResumeExecutionPort, ResumeSpawnRequest,
-};
+use crate::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
 use crate::session_app::types::{ResumeConfigSnapshot, ResumeOutcome};
 
 const AGENT_RUNTIME_STATE_METADATA_KEY: &str = "agent.runtime.state";
@@ -964,7 +962,13 @@ impl ChildCompletionCoordinator {
             };
             let config_snapshot = self.config.read().await.clone();
             let resume_config = self.build_resume_config(&session, &config_snapshot);
-            let outcome = resume_session_execution(self, &parent_session_id, resume_config).await;
+            let outcome =
+                crate::session_app::resume::resume_session_execution_with_configured_fallback(
+                    self,
+                    &parent_session_id,
+                    resume_config,
+                )
+                .await;
             tracing::info!(
                 %parent_session_id,
                 attempt,
@@ -1991,7 +1995,28 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
         Ok(())
     }
 
+    fn dispatch_configured_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = self.clone();
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_configured_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, false).await;
+    }
+
+    async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, true).await;
+    }
+}
+
+impl ChildCompletionCoordinator {
+    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -2151,6 +2176,11 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 agent.with_child_resume_gold_target_resolver(selected_provider.clone(), resolver),
             ),
             None => agent,
+        };
+        let agent = if from_config {
+            Arc::new(agent.with_config_derived_image_fallback())
+        } else {
+            agent
         };
         let resolved_fast_provider = resolve_fast_model(
             &config_snapshot,
@@ -2501,8 +2531,11 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
                             config: *config,
                         };
                         tokio::spawn(async move {
-                            ResumeExecutionPort::spawn_resume_execution(&coordinator, request)
-                                .await;
+                            ResumeExecutionPort::spawn_configured_resume_execution(
+                                &coordinator,
+                                request,
+                            )
+                            .await;
                         });
                     },
                     move || async move {

@@ -59,6 +59,23 @@ pub trait ResumeExecutionPort: Send + Sync {
     /// and calls the server's agent execution spawner.
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest);
 
+    /// Host-only opt-in for a fallback resolved from its config snapshot.
+    /// Existing external adapters retain their original spawn behavior.
+    #[doc(hidden)]
+    async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_execution(request).await;
+    }
+
+    /// Preserve an adapter's existing detached-handoff behavior by default.
+    #[doc(hidden)]
+    #[allow(clippy::result_large_err)]
+    fn dispatch_configured_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        self.dispatch_resume_execution(request)
+    }
+
     /// Transfer a prepared resume request to an execution owner whose lifetime
     /// is independent of the caller. Implementations that support response
     /// handoffs return `Ok(())` only after the request (including its exact
@@ -186,6 +203,29 @@ pub async fn resume_session_execution_with_handoff(
     config: ResumeConfigSnapshot,
     handoff: ResponseResumeHandoff,
 ) -> ResumeOutcome {
+    resume_with_handoff_origin(port, session_id, session, config, handoff, false).await
+}
+
+/// Host-generated config snapshots carry their origin separately from values.
+#[doc(hidden)]
+pub async fn resume_session_execution_with_handoff_and_configured_fallback(
+    port: &dyn ResumeExecutionPort,
+    session_id: &str,
+    session: Session,
+    config: ResumeConfigSnapshot,
+    handoff: ResponseResumeHandoff,
+) -> ResumeOutcome {
+    resume_with_handoff_origin(port, session_id, session, config, handoff, true).await
+}
+
+async fn resume_with_handoff_origin(
+    port: &dyn ResumeExecutionPort,
+    session_id: &str,
+    session: Session,
+    config: ResumeConfigSnapshot,
+    handoff: ResponseResumeHandoff,
+    from_config: bool,
+) -> ResumeOutcome {
     if !has_pending_user_message(&session) {
         tokio::spawn(async move {
             handoff.abandon().await;
@@ -205,8 +245,17 @@ pub async fn resume_session_execution_with_handoff(
         event_sender,
         config,
     };
-    if let Err(request) = port.dispatch_resume_execution(request) {
-        port.spawn_resume_execution(request).await;
+    let dispatched = if from_config {
+        port.dispatch_configured_resume_execution(request)
+    } else {
+        port.dispatch_resume_execution(request)
+    };
+    if let Err(request) = dispatched {
+        if from_config {
+            port.spawn_configured_resume_execution(request).await;
+        } else {
+            port.spawn_resume_execution(request).await;
+        }
     }
     ResumeOutcome::Started { run_id }
 }
@@ -226,6 +275,25 @@ pub async fn resume_session_execution(
     port: &dyn ResumeExecutionPort,
     session_id: &str,
     config: ResumeConfigSnapshot,
+) -> ResumeOutcome {
+    resume_session_execution_origin(port, session_id, config, false).await
+}
+
+/// Host-generated config snapshots carry their origin separately from values.
+#[doc(hidden)]
+pub async fn resume_session_execution_with_configured_fallback(
+    port: &dyn ResumeExecutionPort,
+    session_id: &str,
+    config: ResumeConfigSnapshot,
+) -> ResumeOutcome {
+    resume_session_execution_origin(port, session_id, config, true).await
+}
+
+async fn resume_session_execution_origin(
+    port: &dyn ResumeExecutionPort,
+    session_id: &str,
+    config: ResumeConfigSnapshot,
+    from_config: bool,
 ) -> ResumeOutcome {
     // Load session.
     let Some(session) = port.load_session(session_id).await else {
@@ -249,14 +317,18 @@ pub async fn resume_session_execution(
     };
     let run_id = reservation.run_id().to_string();
 
-    port.spawn_resume_execution(ResumeSpawnRequest {
+    let request = ResumeSpawnRequest {
         session_id: session_id.to_string(),
         session,
         execution_reservation: reservation,
         event_sender,
         config,
-    })
-    .await;
+    };
+    if from_config {
+        port.spawn_configured_resume_execution(request).await;
+    } else {
+        port.spawn_resume_execution(request).await;
+    }
 
     ResumeOutcome::Started { run_id }
 }
