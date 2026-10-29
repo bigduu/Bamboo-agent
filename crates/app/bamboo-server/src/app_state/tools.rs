@@ -371,6 +371,7 @@ pub(super) fn build_root_tools(
     root_creator: Arc<
         dyn bamboo_server_tools::session_control::root_creation::SupervisedRootCreatePort,
     >,
+    root_run: Arc<dyn bamboo_server_tools::session_control::root_run::SupervisedRootRunPort>,
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -459,7 +460,8 @@ pub(super) fn build_root_tools(
             tools_with_schedule,
             Arc::new(
                 bamboo_server_tools::SessionControlTool::new(session_messenger.clone())
-                    .with_root_creator(root_creator),
+                    .with_root_creator(root_creator)
+                    .with_root_run(root_run),
             ),
         ));
 
