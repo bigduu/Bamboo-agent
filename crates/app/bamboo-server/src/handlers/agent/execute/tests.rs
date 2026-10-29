@@ -5504,6 +5504,7 @@ mod execution_input_http {
     /// Vision model taken from a newer configuration for the same provider id.
     #[actix_web::test]
     async fn vision_legacy_same_provider_reload_keeps_image_destination_bound() {
+        use bamboo_agent_core::Storage;
         use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
         const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
