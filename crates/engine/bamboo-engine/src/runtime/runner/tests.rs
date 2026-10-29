@@ -2622,6 +2622,108 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
 }
 
 #[tokio::test]
+async fn partial_provider_failure_reports_one_usage_event_and_matching_error_span() {
+    use bamboo_agent_core::AgentHook;
+    use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};
+
+    struct Capture(mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>);
+    #[async_trait]
+    impl AgentHook for Capture {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterModelCallUsage
+        }
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            if let HookPayload::ModelCallUsage { observation } = payload {
+                self.0.send(observation.clone()).unwrap();
+            }
+            HookResult::Continue
+        }
+    }
+
+    let trace = bamboo_infrastructure::telemetry::test_support::LocalTraceTest::isolated();
+    let mut session = Session::new("synthetic-partial-usage", "synthetic-model");
+    let birth = session.created_at;
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    // Keep the channel open after the dispatched observer finishes so that a
+    // timeout proves no duplicate event arrived, rather than channel closure.
+    let observer_sender_guard = observed_tx.clone();
+    let mut hooks = crate::runtime::hooks::HookRunner::new();
+    hooks.register(Arc::new(Capture(observed_tx)));
+    let config = AgentLoopConfig {
+        hook_runner: Arc::new(hooks),
+        model_name: Some("synthetic-model".into()),
+        system_prompt: Some("synthetic system".into()),
+        ..Default::default()
+    };
+    let usage = LLMChunk::ProviderUsage {
+        input_tokens: Some(100),
+        output_tokens: Some(7),
+        total_tokens: Some(107),
+        reasoning_tokens: Some(2),
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens: Some(0),
+        cache_write_input_tokens: Some(12),
+    };
+    let provider = Arc::new(MetricsQueueProvider {
+        queue: Mutex::new(vec![vec![
+            Ok(LLMChunk::Token("synthetic partial answer".into())),
+            Ok(usage.clone()),
+            Ok(usage),
+            Err(bamboo_llm::provider::LLMError::Stream(
+                "synthetic interruption".into(),
+            )),
+        ]]),
+        requested_messages: Mutex::new(Vec::new()),
+    });
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let (events, _receiver) = mpsc::channel(128);
+    let result = trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "PRIVATE_PROMPT_SENTINEL".into(),
+            events,
+            provider,
+            tools,
+            CancellationToken::new(),
+            config,
+        ))
+        .await;
+    assert!(result.is_err(), "partial stream failure must be surfaced");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), observed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status, ModelCallStatus::Error);
+    let usage = event.usage.expect("observed partial provider usage");
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(7));
+    assert_eq!(usage.reasoning_tokens, Some(2));
+    assert_eq!(usage.cache_read_input_tokens, Some(0));
+    let detail = trace
+        .store
+        .detail(&session.id, birth, &event.trace_id.unwrap())
+        .unwrap();
+    let span = detail
+        .spans
+        .iter()
+        .find(|span| span.span_id == event.span_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(span.call_id.as_deref(), Some(event.call_id.as_str()));
+    assert_eq!(span.status, "error");
+    assert_eq!(span.usage.as_ref(), Some(&usage));
+    assert!(!serde_json::to_string(&detail)
+        .unwrap()
+        .contains("PRIVATE_PROMPT_SENTINEL"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), observed_rx.recv())
+            .await
+            .is_err()
+    );
+    drop(observer_sender_guard);
+}
+
+#[tokio::test]
 async fn synthetic_anthropic_and_gemini_streams_reach_usage_hook_and_local_span() {
     use bamboo_agent_core::AgentHook;
     use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
