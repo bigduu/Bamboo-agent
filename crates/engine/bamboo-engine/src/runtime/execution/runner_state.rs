@@ -85,6 +85,15 @@ pub struct AgentRunner {
     /// Timestamp when the run completed (if finished).
     pub completed_at: Option<DateTime<Utc>>,
 
+    // Only the exact-run finalizer sets this. Legacy HTTP Stop also sets the
+    // visible status/completed_at when it signals, which is not finalization;
+    // an unqualified finalizer cannot prove which run it finalized.
+    pub(super) execution_finalized: bool,
+    // A Host may retain an observation only after exact Router ownership or
+    // the retained FreshSync owner has been checked. It is not an authority.
+    supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
+    supervisor_run_workspace: Option<Option<String>>,
+
     /// Last token budget event to replay for new subscribers.
     ///
     /// When a new client subscribes to an ongoing run, this
@@ -149,6 +158,50 @@ impl AgentRunner {
         self.last_event_at
             .max(self.event_publication.last_event_at())
     }
+
+    /// Host-only observation, set under the exact live router-owner fence.
+    pub fn bind_supervisor_run_target(
+        &mut self,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        workspace_path: Option<&str>,
+    ) {
+        self.supervisor_run_target = Some(target.clone());
+        self.supervisor_run_workspace = Some(workspace_path.map(str::to_owned));
+    }
+
+    /// This bit is set only by finalization of the matching run ID.
+    pub fn exact_execution_finalized(&self) -> bool {
+        self.execution_finalized
+    }
+
+    /// Compare an existing Host observation without treating it as a grant.
+    /// Ordinary metadata edits may advance metadata_version, while the
+    /// canonical target and Workspace are separately revalidated by the Host.
+    pub fn supervisor_run_observation_matches(
+        &self,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        workspace_path: Option<&str>,
+    ) -> Option<bool> {
+        match (&self.supervisor_run_target, &self.supervisor_run_workspace) {
+            (None, None) => None,
+            (Some(observed), Some(workspace)) => {
+                let mut observed = observed.clone();
+                observed.metadata_version = target.metadata_version;
+                Some(&observed == target && workspace.as_deref() == workspace_path)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /// Only the exact execution finalizer can establish this terminal fact.
+    pub fn supervisor_run_is_finalized_for(
+        &self,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        workspace_path: Option<&str>,
+    ) -> bool {
+        self.execution_finalized
+            && self.supervisor_run_observation_matches(target, workspace_path) == Some(true)
+    }
     /// Broadcast channel capacity for agent events.
     pub const EVENT_CHANNEL_CAPACITY: usize = 1000;
 
@@ -174,6 +227,9 @@ impl AgentRunner {
             status: AgentStatus::Pending,
             started_at: Utc::now(),
             completed_at: None,
+            execution_finalized: false,
+            supervisor_run_target: None,
+            supervisor_run_workspace: None,
             last_budget_event: None,
             last_critical_events: Vec::new(),
             last_tool_name: None,

@@ -1712,6 +1712,363 @@ mod execution_input_http {
             .unwrap();
     }
 
+    async fn supervisor_pending_run_action(
+        state: &web::Data<crate::AppState>,
+        supervisor: &bamboo_agent_core::Session,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        action: &str,
+        run: Option<&str>,
+    ) -> Result<serde_json::Value, bamboo_agent_core::tools::ToolError> {
+        use bamboo_agent_core::tools::{
+            ExecutingSupervisorObservation, FunctionCall, ToolCall, ToolOutcome,
+        };
+        use bamboo_agent_core::ToolExecutionContext;
+
+        let mut args = serde_json::json!({
+            "action": action,
+            "target_session_id": target.session_id,
+            "target_ref": target,
+        });
+        if let Some(run) = run {
+            args["expected_run_id"] = serde_json::json!(run);
+        }
+        let call = ToolCall {
+            id: "pending-sync-exact-cancel".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments: args.to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&supervisor.id);
+        ctx.root_session_id = Some(&supervisor.id);
+        ctx = ctx.with_executing_supervisor(
+            ExecutingSupervisorObservation::capture_from_executing_session(supervisor),
+        );
+        let outcome = bamboo_agent_core::tools::with_executing_session_caller(
+            Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                supervisor,
+            ))),
+            state
+                .tools_for(crate::tools::ToolSurface::Root)
+                .execute_with_context_outcome(&call, ctx),
+        )
+        .await?;
+        let ToolOutcome::Completed(result) = outcome else {
+            panic!("pending Root control must return its own result");
+        };
+        Ok(serde_json::from_str(&result.result).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn supervisor_observes_and_cancels_the_retained_fresh_sync_owner() {
+        use bamboo_domain::{Storage, SupervisorReference};
+        use bamboo_engine::session_app::supervisor::SupervisorSessionService;
+        use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "supervisor-pending-fresh-sync";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({
+                    "model": "test-model",
+                    "upstream_retry": {"mode": "until_cancelled"},
+                    "client_sync": {"client_message_count": 0, "client_has_pending_question": false}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["sync"]["need_sync"], true, "{body}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let (run_id, token) = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(id).expect("fresh input owner is retained");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            (runner.run_id.clone(), runner.cancel_token.clone())
+        };
+        assert!(state.fresh_sync.is_current_owner(id, &run_id));
+        let admitted = state.storage.load_session(id).await.unwrap().unwrap();
+        let input_id = admitted.messages.last().unwrap().id.clone();
+
+        let reference: SupervisorReference =
+            (&SupervisorSessionService::new(state.session_store.clone())
+                .get_or_create_default("supervisor-model")
+                .await
+                .unwrap())
+                .into();
+        let supervisor = state
+            .storage
+            .load_execution_admission_snapshot(&reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "pending-sync-exact-cancel".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control cancel {id}"),
+                },
+            )
+            .unwrap();
+        let target = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, id)
+            .await
+            .unwrap();
+        let observed =
+            supervisor_pending_run_action(&state, &supervisor, &target, "observe_run", None)
+                .await
+                .unwrap();
+        assert_eq!(observed["status"], "pending", "{observed}");
+        assert_eq!(observed["run_id"], run_id);
+
+        let wrong_run = uuid::Uuid::new_v4().to_string();
+        let conflict =
+            supervisor_pending_run_action(&state, &supervisor, &target, "cancel", Some(&wrong_run))
+                .await
+                .unwrap();
+        assert_eq!(conflict["status"], "run_conflict");
+        let mut stale = target.clone();
+        stale.created_at += chrono::Duration::seconds(1);
+        assert!(supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &stale,
+            "cancel",
+            Some(&run_id)
+        )
+        .await
+        .is_err());
+        assert!(!token.is_cancelled());
+
+        // Pause the real take after revalidation but before its runner lock.
+        // A winning cancel must make that same take abandon its reservation.
+        let pause = state.fresh_sync.pause_take_for_test(id);
+        let take = state.fresh_sync.take(state.get_ref(), id);
+        let cancel = async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), pause.entered.notified())
+                .await
+                .expect("the real take must reach its handoff boundary");
+            let cancelled = supervisor_pending_run_action(
+                &state,
+                &supervisor,
+                &target,
+                "cancel",
+                Some(&run_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cancelled["status"], "cancel_requested");
+            assert_eq!(cancelled["completion_verified"], false);
+            assert!(token.is_cancelled());
+            let stop = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/stop/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(stop.status(), StatusCode::OK);
+            let stopped =
+                supervisor_pending_run_action(&state, &supervisor, &target, "observe_run", None)
+                    .await
+                    .unwrap();
+            assert_eq!(stopped["status"], "cancel_requested", "{stopped}");
+            assert_eq!(stopped["completion_verified"], false);
+            pause.release.notify_one();
+        };
+        let (handoff, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(take, cancel)
+        })
+        .await
+        .expect("cancel and take must not deadlock");
+        assert!(handoff.is_none(), "a cancelled owner cannot be handed off");
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while state.fresh_sync.is_current_owner(id, &run_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled retained owner must be released");
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            after.messages.iter().filter(|m| m.id == input_id).count(),
+            1
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        // A newly selected target cannot retarget the original parked owner
+        // after its Workspace changes, even when the Root birth is unchanged.
+        let changed_id = "supervisor-pending-changed-workspace";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, changed_id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, changed_id).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{changed_id}"))
+                .set_json(serde_json::json!({
+                    "model": "test-model",
+                    "upstream_retry": {"mode": "until_cancelled"},
+                    "client_sync": {"client_message_count": 0, "client_has_pending_question": false}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["sync"]["need_sync"], true, "{body}");
+        let (changed_run, changed_token) = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(changed_id).expect("second owner is retained");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            (runner.run_id.clone(), runner.cancel_token.clone())
+        };
+        let original_target = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let originally_observed = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &original_target,
+            "observe_run",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(originally_observed["status"], "pending");
+        let original = state
+            .storage
+            .load_session(changed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let next_workspace = home.path().join("changed-workspace");
+        std::fs::create_dir_all(&next_workspace).unwrap();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{changed_id}"))
+                .insert_header((
+                    actix_web::http::header::IF_MATCH,
+                    format!("\"{}\"", original.metadata_version),
+                ))
+                .set_json(serde_json::json!({"workspace_path": next_workspace}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let fresh = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        assert_eq!(fresh.created_at, original.created_at);
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "pending-changed-workspace-cancel".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control cancel {changed_id}"),
+                },
+            )
+            .unwrap();
+        let refused = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["status"], "run_conflict", "{refused}");
+        assert!(!changed_token.is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let stop = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/stop/{changed_id}"))
+                .insert_header(("Bamboo-Run-Id", changed_run.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stop.status(), StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let finalized = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(changed_id)
+                    .is_some_and(|runner| runner.exact_execution_finalized());
+                if finalized {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old retained owner must finalize after HTTP Stop");
+        let fresh_after_stop = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let after_stop = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh_after_stop,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_stop["status"], "run_conflict", "{after_stop}");
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
     // A fresh owned input admitted before a client-sync mismatch is still pending
     // execution. A corrected execute must not require posting Chat again.
     #[actix_web::test]
