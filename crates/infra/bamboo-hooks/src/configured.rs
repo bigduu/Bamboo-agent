@@ -455,6 +455,11 @@ async fn capture_hook_child(
             .send(HookIoEvent::Stderr(read_capped(stderr).await))
             .await;
     });
+    // A caller can cancel this future before the command's own timeout (for
+    // example, the shorter model-usage observer deadline). Dropping ordinary
+    // JoinHandles detaches the tasks, which can otherwise keep inherited pipes
+    // open indefinitely. Keep their lifetime bound to this capture operation.
+    let io_tasks = HookIoTasks([input_task, stdout_task, stderr_task]);
 
     let mut io_results = HookIoResults::default();
     let completion = async {
@@ -474,9 +479,7 @@ async fn capture_hook_child(
             // detached descendant can escape a Unix process group while still
             // holding inherited descriptors, so the I/O tasks must be
             // cancellable for the wall-clock deadline to remain bounded.
-            input_task.abort();
-            stdout_task.abort();
-            stderr_task.abort();
+            io_tasks.abort();
             while let Ok(event) = io_rx.try_recv() {
                 io_results.record(event)?;
             }
@@ -497,6 +500,22 @@ async fn capture_hook_child(
         stderr,
         timed_out,
     })
+}
+
+struct HookIoTasks([tokio::task::JoinHandle<()>; 3]);
+
+impl HookIoTasks {
+    fn abort(&self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+impl Drop for HookIoTasks {
+    fn drop(&mut self) {
+        self.abort();
+    }
 }
 
 fn configure_hook_process(command: &mut Command) {
@@ -2396,6 +2415,114 @@ child.unref();
         assert_process_exits(process_id).await;
         assert!(output.timed_out, "{output:?}");
         assert!(elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_hook_capture_closes_pipes_held_by_detached_descendant() {
+        if Command::new("node")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        struct KillSyntheticChild(u32);
+        impl Drop for KillSyntheticChild {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(self.0 as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("cancelled-hook-child.pid");
+        let ready_path = dir.path().join("child-ready");
+        let trigger_path = dir.path().join("write-probe");
+        let closed_path = dir.path().join("pipe-closed");
+        let literal =
+            |path: &std::path::Path| serde_json::to_string(&path.to_string_lossy()).unwrap();
+        let child_source = r#"
+const fs = require("node:fs");
+const ready = __READY__, trigger = __TRIGGER__, closed = __CLOSED__;
+let timer;
+process.stdout.on("error", (error) => {
+  clearInterval(timer);
+  fs.writeFileSync(closed, error.code || "unknown");
+});
+fs.writeFileSync(ready, "ready");
+timer = setInterval(() => { if (fs.existsSync(trigger)) process.stdout.write("probe\n"); }, 25);
+setTimeout(() => process.exit(0), 8000);
+"#
+        .replace("__READY__", &literal(&ready_path))
+        .replace("__TRIGGER__", &literal(&trigger_path))
+        .replace("__CLOSED__", &literal(&closed_path));
+        let parent_source = r#"
+const fs = require("node:fs");
+const { spawn } = require("node:child_process");
+const child = spawn(process.execPath, ["-e", __CHILD_SOURCE__],
+  { detached: true, stdio: ["ignore", "inherit", "inherit"] });
+fs.writeFileSync(__PID__, String(child.pid));
+child.unref();
+"#
+        .replace(
+            "__CHILD_SOURCE__",
+            &serde_json::to_string(&child_source).unwrap(),
+        )
+        .replace("__PID__", &literal(&pid_path));
+        let path = write_script(&dir, "cancelled-hook.js", &parent_source);
+        let hook = script_hook(
+            LifecycleHookEvent::BambooModelCallUsage,
+            path,
+            LifecycleScriptRunner::Node,
+            10_000,
+            None,
+        );
+        let synthetic_session = session(dir.path());
+        let task =
+            tokio::spawn(async move { hook.test(&HookPayload::None, &synthetic_session).await });
+        let pid = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(value) = tokio::fs::read_to_string(&pid_path).await {
+                    if let Ok(pid) = value.parse::<u32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("synthetic child did not start");
+        let _child = KillSyntheticChild(pid);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ready_path.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("synthetic child did not become ready");
+
+        // This is the same cancellation mechanism used by the outer usage
+        // observer deadline, which is shorter than the command timeout.
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::fs::write(&trigger_path, "write").await.unwrap();
+        let error = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Ok(value) = tokio::fs::read_to_string(&closed_path).await {
+                    if !value.is_empty() {
+                        break value;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("cancelled capture left a pipe reader alive");
+        assert_eq!(error, "EPIPE");
     }
 
     #[tokio::test]
