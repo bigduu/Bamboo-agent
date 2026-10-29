@@ -47,6 +47,7 @@ pub struct GeminiStreamState {
     /// Cumulative provider fields retain absent, valid and malformed states.
     provider_usage: GeminiProviderUsage,
     pending_replacement: Option<ProviderUsageReplacement>,
+    emit_legacy_provider_usage: bool,
 }
 
 #[derive(Default)]
@@ -229,17 +230,8 @@ fn take_gemini_usage_summary(state: &mut GeminiStreamState, value: &Value) -> Op
     })
 }
 
-/// Take usage carried by a Gemini event's `usageMetadata` as an *ordered*
-/// sequence of chunks: [`LLMChunk::CacheUsage`] (cache hit) first, then
-/// [`LLMChunk::UsageSummary`] (output/thinking).
-///
-/// Gemini folds both pieces into a single final `usageMetadata`, but
-/// `streamGenerateContent?alt=sse` sends no `[DONE]` sentinel — the connection
-/// closes right after that final event. Returning both chunks from this one
-/// call (rather than deferring the second to a later parse call that never
-/// comes) guarantees usage is delivered for cached requests too. Either piece
-/// may be absent (or already emitted); only the pieces present are included.
-fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<LLMChunk> {
+/// Observe an accepted frame without consuming either legacy event.
+fn observe_gemini_provider_usage(state: &mut GeminiStreamState, value: &Value) {
     state.pending_replacement = value
         .get("usageMetadata")
         .filter(|usage| {
@@ -256,6 +248,14 @@ fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<
                 .any(|key| usage.get(key).is_some())
         })
         .map(|usage| state.provider_usage.observe(usage));
+}
+
+/// Take legacy usage from a terminal or content-free Gemini event, returning
+/// cache before summary. Each event is emitted at most once and neither is
+/// deferred past the final SSE frame, which may be followed directly by EOF.
+fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<LLMChunk> {
+    observe_gemini_provider_usage(state, value);
+    state.emit_legacy_provider_usage = true;
     let cache = take_gemini_cache_usage(state, value);
     let summary = take_gemini_usage_summary(state, value);
     let mut out = Vec::with_capacity(2);
@@ -282,7 +282,9 @@ pub(super) fn parse_with_provider_usage(
         // Preserve the existing ProviderUsage variant for older consumers.
         // Its values come from the same cumulative state to avoid a partial
         // frame replacing a valid total with a misleading component.
-        chunks.extend(replacement.legacy_chunk());
+        if state.emit_legacy_provider_usage {
+            chunks.extend(replacement.legacy_chunk());
+        }
     }
     Ok(chunks)
 }
@@ -294,8 +296,8 @@ pub(super) fn parse_with_provider_usage(
 ///
 /// Returns:
 /// - `Ok(vec![chunk, ..])` for content-bearing events (text, tool calls) and
-///   usage events. Only terminal content-bearing events consume cumulative
-///   `usageMetadata`; a final event may yield both a `CacheUsage` and a
+///   usage events. Only terminal content-bearing events emit legacy
+///   `usageMetadata` events; a final event may yield both a `CacheUsage` and a
 ///   `UsageSummary`. Chunks have deterministic order: non-empty text/reasoning
 ///   tokens in part order, one `ToolCalls` chunk containing every function call
 ///   in part order, then `CacheUsage`, then `UsageSummary`
@@ -317,6 +319,8 @@ pub fn parse_gemini_sse_event(
     _event_type: &str,
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
+    state.pending_replacement = None;
+    state.emit_legacy_provider_usage = false;
     // Trim whitespace
     let data = data.trim();
 
@@ -374,8 +378,8 @@ pub fn parse_gemini_sse_event(
     // Gemini defines an empty finishReason as "generation has not stopped".
     // Any non-empty reason is terminal (including safety/filter/tool errors, not
     // only STOP/MAX_TOKENS), so only such content-bearing events may consume the
-    // cumulative usageMetadata. Content-free usage events remain handled by the
-    // early-return paths below.
+    // legacy cache/summary metadata. Content-free usage events remain handled
+    // by the early-return paths below. Snapshots are observed on every frame.
     let is_terminal_content_event = candidate
         .get("finishReason")
         .and_then(Value::as_str)
@@ -484,6 +488,10 @@ pub fn parse_gemini_sse_event(
         // the stream closes. Intermediate cumulative totals are intentionally
         // ignored so they cannot suppress the final totals.
         chunks.extend(take_gemini_event_usage(state, &value));
+    } else {
+        // Observe only after successful content parsing, so a rejected frame
+        // cannot corrupt later usage if a caller continues after an error.
+        observe_gemini_provider_usage(state, &value);
     }
 
     Ok(chunks)
@@ -632,6 +640,102 @@ mod tests {
         assert_eq!(input.input_floor, Some(101));
     }
 
+    #[test]
+    fn nonterminal_content_frames_replace_and_invalidate_provider_usage() {
+        let mut state = GeminiStreamState::default();
+        let first = r#"{"candidates":[{"content":{"parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":25,"candidatesTokenCount":20,"thoughtsTokenCount":3}}"#;
+        let invalid = r#"{"candidates":[{"content":{"parts":[{"text":"b"}]}}],"usageMetadata":{"cachedContentTokenCount":-1,"candidatesTokenCount":41}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", first).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens == Some(25)
+                    && snapshot.output_tokens == Some(23)
+        )));
+        let chunks = parse_with_provider_usage(&mut state, "", invalid).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens.is_none()
+                    && snapshot.invalid_fields.cache_read_input_tokens
+                    && snapshot.output_tokens.is_none()
+                    && snapshot.output_floor == Some(41)
+        )));
+        assert!(!chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage { .. }
+                | LLMChunk::CacheUsage { .. }
+                | LLMChunk::UsageSummary { .. }
+        )));
+        let terminal = r#"{"candidates":[{"content":{"parts":[{"text":"c"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":5,"candidatesTokenCount":41,"thoughtsTokenCount":3}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", terminal).unwrap();
+        let cache_index = chunks
+            .iter()
+            .position(|chunk| {
+                matches!(
+                    chunk,
+                    LLMChunk::CacheUsage {
+                        cache_read_input_tokens: 5,
+                        input_tokens: 95,
+                        ..
+                    }
+                )
+            })
+            .expect("terminal cache event");
+        let summary_index = chunks
+            .iter()
+            .position(|chunk| {
+                matches!(
+                    chunk,
+                    LLMChunk::UsageSummary {
+                        output_tokens: 41,
+                        thinking_tokens: 3
+                    }
+                )
+            })
+            .expect("terminal summary event");
+        assert!(cache_index < summary_index);
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens == Some(5)
+                    && snapshot.output_tokens == Some(44)
+        )));
+        let repeated = parse_with_provider_usage(&mut state, "", terminal).unwrap();
+        assert!(!repeated.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::CacheUsage { .. } | LLMChunk::UsageSummary { .. }
+        )));
+    }
+
+    #[test]
+    fn rejected_content_frame_does_not_change_later_usage_snapshot() {
+        let mut state = GeminiStreamState::default();
+        parse_with_provider_usage(
+            &mut state,
+            "",
+            r#"{"candidates":[],"usageMetadata":{"cachedContentTokenCount":25}}"#,
+        )
+        .unwrap();
+        for invalid in [
+            r#"{"usageMetadata":{"cachedContentTokenCount":99}}"#,
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"args":{}}}]}}],"usageMetadata":{"cachedContentTokenCount":99}}"#,
+        ] {
+            assert!(parse_with_provider_usage(&mut state, "", invalid).is_err());
+        }
+        let chunks = parse_with_provider_usage(
+            &mut state,
+            "",
+            r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100}}"#,
+        )
+        .unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens == Some(25)
+        )));
+    }
+
     #[tokio::test]
     async fn production_stream_delivers_gemini_provider_usage_at_eof() {
         use futures::StreamExt;
@@ -676,10 +780,18 @@ mod tests {
     fn provider_usage_normalizes_gemini_terminal_counts_without_double_counting() {
         let mut state = GeminiStreamState::default();
         let intermediate = r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"thoughtsTokenCount":1}}"#;
-        assert!(!parse_with_provider_usage(&mut state, "", intermediate)
-            .unwrap()
-            .iter()
-            .any(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. })));
+        let intermediate_chunks = parse_with_provider_usage(&mut state, "", intermediate).unwrap();
+        assert!(intermediate_chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(usage)
+                if usage.input_tokens == Some(100) && usage.output_tokens == Some(6)
+        )));
+        assert!(!intermediate_chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage { .. }
+                | LLMChunk::CacheUsage { .. }
+                | LLMChunk::UsageSummary { .. }
+        )));
         let final_event = r#"{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":0,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}}"#;
         for _ in 0..2 {
             let chunks = parse_with_provider_usage(&mut state, "", final_event).unwrap();

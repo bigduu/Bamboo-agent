@@ -39,7 +39,9 @@ Gemini frames, omitted fields retain their previous values, while an explicitly
 malformed field becomes unknown until a valid value is reported again. A
 malformed thought count also makes the combined output unknown. If only one
 component of a previously combined count is updated, the combined count can be
-unknown until sufficient components are reported together. These
+unknown until sufficient components are reported together. Snapshots are
+observed on content-bearing nonterminal frames as well; existing legacy cache
+and summary events still follow their terminal/emit-once rules. These
 rules follow the [Anthropic prompt-cache fields](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 and [Gemini usage metadata](https://ai.google.dev/api/generate-content).
 Legacy session counters may have different availability; do not infer a
@@ -172,9 +174,11 @@ example an OpenAI-compatible response without cache usage no longer appears as
 an exact zero-percent cache hit. Use the optional hook or trace fields for the
 provider-reported value. Ticket budget settlement retains its reservation after
 malformed usage even if later frames recover, while still enforcing observed
-over-cap lower bounds. Rust stream consumers that exhaustively match the public
+over-cap lower bounds when the snapshot chunk is read. Text from that same
+provider frame may already have been delivered. Rust stream consumers that exhaustively match the public
 `LLMChunk` enum must handle its new `ProviderUsageReplace` bookkeeping variant;
-the existing `ProviderUsage` variant is still emitted for known Gemini counts.
+the existing `ProviderUsage` variant is still emitted for known Gemini counts
+available on terminal or content-free usage frames.
 
 A reviewed, runnable portable example is in
 [`crates/infra/bamboo-plugin/examples/model-usage`](../../crates/infra/bamboo-plugin/examples/model-usage).

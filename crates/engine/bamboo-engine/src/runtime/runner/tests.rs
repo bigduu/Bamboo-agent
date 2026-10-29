@@ -2952,6 +2952,16 @@ async fn gemini_usage_after_frames(
     bamboo_domain::ModelTokenUsage,
     Option<bamboo_agent_core::ProviderPromptUsage>,
 ) {
+    gemini_usage_after_frames_inner(frames, false).await
+}
+
+async fn gemini_usage_after_frames_inner(
+    frames: &[&str],
+    content_frames: bool,
+) -> (
+    bamboo_domain::ModelTokenUsage,
+    Option<bamboo_agent_core::ProviderPromptUsage>,
+) {
     use bamboo_agent_core::AgentHook;
     use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};
     use wiremock::matchers::method;
@@ -2976,10 +2986,22 @@ async fn gemini_usage_after_frames(
         "\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":25,",
         "\"candidatesTokenCount\":20,\"thoughtsTokenCount\":3,\"totalTokenCount\":123}}\n\n"
     ).to_string();
+    if content_frames {
+        body = body.replace(",\"finishReason\":\"STOP\"", "");
+    }
     for usage in frames {
-        body.push_str(&format!(
-            "data: {{\"candidates\":[],\"usageMetadata\":{usage}}}\n\n"
-        ));
+        if content_frames {
+            body.push_str(&format!(
+                "data: {{\"candidates\":[{{\"content\":{{\"parts\":[{{\"text\":\"continuing\"}}]}}}}],\"usageMetadata\":{usage}}}\n\n"
+            ));
+        } else {
+            body.push_str(&format!(
+                "data: {{\"candidates\":[],\"usageMetadata\":{usage}}}\n\n"
+            ));
+        }
+    }
+    if content_frames {
+        body.push_str("data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}]}\n\n");
     }
     let server = MockServer::start().await;
     Mock::given(method("POST"))
@@ -3055,6 +3077,26 @@ async fn gemini_usage_after_frames(
         }
     }
     (usage, final_prompt.expect("final token budget event"))
+}
+
+#[tokio::test]
+async fn gemini_nonterminal_content_frames_update_hook_and_span_usage() {
+    let (invalid, prompt) =
+        gemini_usage_after_frames_inner(&[r#"{"cachedContentTokenCount":-1}"#], true).await;
+    assert_eq!(invalid.input_tokens, Some(100));
+    assert_eq!(invalid.output_tokens, Some(23));
+    assert_eq!(invalid.cache_read_input_tokens, None);
+    assert!(prompt.is_none());
+    let (recovered, prompt) = gemini_usage_after_frames_inner(
+        &[
+            r#"{"cachedContentTokenCount":-1}"#,
+            r#"{"cachedContentTokenCount":0}"#,
+        ],
+        true,
+    )
+    .await;
+    assert_eq!(recovered.cache_read_input_tokens, Some(0));
+    assert_eq!(prompt.unwrap().cache_read_input_tokens, 0);
 }
 
 #[tokio::test]
