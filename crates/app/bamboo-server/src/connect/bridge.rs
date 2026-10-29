@@ -1829,6 +1829,37 @@ mod tests {
             saved.model_ref,
             Some(bamboo_domain::ProviderModelRef::new("chat-b", "chat-model"))
         );
+        // Rendering returns on the terminal frame; the reserved Root may
+        // still be publishing its history barrier. Wait for the runner and
+        // router to release before testing a subsequent turn on this session.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let active = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(&id)
+                    .is_some_and(|runner| {
+                        matches!(
+                            runner.status,
+                            crate::app_state::AgentStatus::Pending
+                                | crate::app_state::AgentStatus::Running
+                        )
+                    });
+                if !active
+                    && state
+                        .session_activation_router
+                        .current_run_id(&id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first Connect run must release its Root reservation");
 
         state.config.write().await.defaults.as_mut().unwrap().chat =
             bamboo_domain::ProviderModelRef::new("fast-c", "cheap-model")
