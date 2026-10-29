@@ -29,11 +29,7 @@ fn has_legacy(config: &Config, provider: &str) -> bool {
         "anthropic" => providers.anthropic.is_some(),
         "gemini" => providers.gemini.is_some(),
         "bodhi" => providers.bodhi.is_some(),
-        "copilot" => {
-            providers.copilot.is_some()
-                || (config.provider_instances.is_empty()
-                    && config.effective_default_provider() == provider)
-        }
+        "copilot" => providers.copilot.is_some() || config.effective_default_provider() == provider,
         _ => false,
     }
 }

@@ -1288,3 +1288,76 @@ async fn sdk_caller_override_rejects_new_provider_type_alias_during_admission() 
         }
     }
 }
+
+#[tokio::test]
+async fn sdk_public_implicit_copilot_keeps_client_when_unrelated_instance_is_added() {
+    let mut config = bamboo_llm::Config::default();
+    config.provider = "copilot".into();
+    config.default_provider_instance = None;
+    config.provider_instances.clear();
+    config.providers_mut().copilot = None;
+    config.defaults = None;
+    *config.memory_mut() = Some(
+        serde_json::from_value(json!({
+            "auto_dream_enabled": false, "project_prompt_injection": false,
+            "relevant_recall": false, "relevant_recall_rerank": false,
+            "project_first_dream": false, "ledger_agenda_injection": false
+        }))
+        .unwrap(),
+    );
+    let shared = Arc::new(tokio::sync::RwLock::new(config));
+    let home = tempfile::tempdir().unwrap();
+    let probe = Arc::new(Probe::default());
+    let agent = Agent::builder()
+        .provider(probe.clone())
+        .provider_name("copilot")
+        .model("model-a")
+        .config(shared.clone())
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_path_buf())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+
+    for (index, mode) in ["initial", "unrelated", "rebound"].into_iter().enumerate() {
+        if mode == "unrelated" {
+            shared.write().await.provider_instances.insert(
+                "unrelated".into(),
+                serde_json::from_value(json!({
+                    "provider_type":"openai", "enabled":true, "model":"other"
+                }))
+                .unwrap(),
+            );
+        } else if mode == "rebound" {
+            shared.write().await.provider_instances.insert(
+                "copilot".into(),
+                serde_json::from_value(json!({
+                    "provider_type":"copilot", "enabled":true, "model":"model-a"
+                }))
+                .unwrap(),
+            );
+        }
+        let before = probe.provider_calls.load(Ordering::SeqCst);
+        let mut session = Session::new(format!("synthetic-copilot-{index}"), "model-a");
+        session.model_ref = Some(bamboo_domain::ProviderModelRef::new("copilot", "model-a"));
+        session.add_message(Message::user("Synthetic Copilot control"));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            agent.run_session(&mut session),
+        )
+        .await
+        .expect("public SDK fixture must finish");
+        let after = probe.provider_calls.load(Ordering::SeqCst);
+        if mode == "rebound" {
+            assert!(
+                result.is_err(),
+                "a same-key new instance must require a matching client"
+            );
+            assert_eq!(after, before);
+        } else {
+            result.unwrap();
+            assert!(after > before, "{mode} must use the injected client");
+        }
+    }
+}
