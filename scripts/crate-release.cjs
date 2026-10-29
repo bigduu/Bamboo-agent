@@ -308,7 +308,7 @@ async function plan(context) {
   return { receipt, release: reserved }
 }
 
-async function publish(context, release, receipt) {
+async function publishCrates(context, release, receipt) {
   assert.equal(context.automatic, true, 'Receipt controller is only for automatic main publication')
   await context.assertCurrentMain()
   context.assertSigningKey()
@@ -349,6 +349,10 @@ async function publish(context, release, receipt) {
     assert.equal(existing.checksum, expected, `Registry checksum mismatch for ${crate}`)
     await context.verifyArchive(crate, receipt, expected)
   }
+}
+
+async function publish(context, release, receipt) {
+  await publishCrates(context, release, receipt)
   if (!receipt.completed || release.draft) {
     receipt.completed = true
     await context.saveReceipt(release, receipt)
@@ -689,7 +693,19 @@ function makeRecoveryContext(env = process.env) {
   return makeVerifiedContext(env, env.GITHUB_REPOSITORY, source, run, true)
 }
 
-function makeVerifiedContext(env, repository, sourceRevision, run, automatic, requireCurrentMain = false) {
+function makeFrozenRecoveryContext(env = process.env) {
+  const recovery = require('./crate-release-frozen-recovery.cjs').makeAuthority(env)
+  assert.equal(command(['git', 'rev-parse', 'HEAD']).trim(), recovery.receipt.identity.sourceRevision)
+  const context = makeVerifiedContext(env, env.GITHUB_REPOSITORY, recovery.receipt.identity.sourceRevision,
+    recovery.receipt.validation.ciRun, true, true, recovery)
+  context.validation = recovery.receipt.validation
+  assert.deepEqual(context.identity, recovery.receipt.identity)
+  assert.deepEqual(context.crates, recovery.receipt.crates)
+  assert.deepEqual(context.frontendBytes, recovery.receipt.frontendBytes, 'Recovery must restore the original frontend bytes')
+  return { context, recovery }
+}
+
+function makeVerifiedContext(env, repository, sourceRevision, run, automatic, requireCurrentMain = false, recovery) {
   assert.ok(env.CARGO_REGISTRY_TOKEN, 'Missing CARGO_REGISTRY_TOKEN')
   assertSigningConfiguration(env.BAMBOO_RELEASE_SIGNING_KEY, env.BAMBOO_RELEASE_SIGNING_KEY_SHA256)
   const frontendDirectory = 'crates/app/bamboo-server/frontend_package'
@@ -729,12 +745,12 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
   const frozen = requireCurrentMain && env.GITHUB_EVENT_NAME === 'workflow_dispatch'
   if (frozen) assert.match(env.GITHUB_RUN_ID || '', /^[1-9][0-9]*$/)
   const originals = new Map()
-  const guard = requireCurrentMain ? frozen
+  const guard = recovery ? () => recovery.guard() : requireCurrentMain ? frozen
     ? () => require('./release-source.cjs').frozenGuard(JSON.parse(env.SOURCE_VALIDATION), env)
     : () => assertCurrentMain(repository, sourceRevision) : async () => {}
   const write = (action) => currentMainWrite(guard, action)
   const context = { automatic, identity, frontendBytes, crates, receiptFile,
-    ...(frozen ? { publisherRunId: env.GITHUB_RUN_ID } : {}),
+    ...(frozen ? { publisherRunId: recovery ? recovery.receipt.publisherRunId : env.GITHUB_RUN_ID } : {}),
     assertCurrentMain: guard,
     ciRun: run.html_url,
     releases: async () => paginated('releases?per_page=100'),
@@ -789,9 +805,11 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       assert.equal(tag.object.sha, sourceRevision, 'Reserved release tag points to different source')
     },
     saveReceipt: async (release, receipt) => {
+      if (recovery) recovery.prepareSave(receipt)
       signReceipt(receipt, env.BAMBOO_RELEASE_SIGNING_KEY)
       fs.writeFileSync(receiptFile, `${JSON.stringify(receipt, null, 2)}\n`)
       await write(() => github(repository, `releases/${release.id}`, { tag_name: `v${receipt.version}`, body: receiptBody(receipt) }, 'PATCH'))
+      if (recovery) recovery.readback(receipt)
     },
     ensureFrontend: async (release, receipt, { sealed = false } = {}) => {
       const current = github(repository, `releases/${release.id}`)
@@ -818,16 +836,19 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
         const seal = bytes => {
           const metadata = require('./release-cargo-upload.cjs').describeArchive(bytes, name, version)
           fs.writeFileSync(file, bytes, { flag: 'wx' })
+          if (recovery) recovery.verifyOriginal(name, bytes, file)
           return { bytes, metadata, file, tag: release.tag_name, releaseId: release.id }
         }
         const original = await prepareFrozenCrateOriginal(expected, assets, {
           load: asset => seal(command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + asset.id,
-            '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })),
-          compile: () => {
+            '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024,
+            ...(recovery ? { timeout: 120000 } : {}) })),
+          compile: async () => {
             const reservation = authenticateReceipt(readBodyReceipt(current), env.BAMBOO_RELEASE_SIGNING_KEY)
             validateReceipt(reservation, identity, crates, version)
             assert.equal(reservation.packageChecksums[name], expected, 'Crate checksum advanced; reread the signed reservation')
-            assertCrateCompilationAllowed(reservation, env, route => github(repository, route))
+            if (recovery) await recovery.beforeCompile(name, reservation, context)
+            else assertCrateCompilationAllowed(reservation, env, route => github(repository, route))
             assert.ok(!fs.existsSync(file), 'Unexplained crate original in scratch; do not rebuild')
             command(['cargo', 'package', '--locked', '--allow-dirty', '-p', name]) // One isolated verification compile.
             const target = jsonCommand(['cargo', 'metadata', '--format-version', '1', '--no-deps']).target_directory
@@ -838,7 +859,8 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
             const matches = github(repository, 'releases/' + release.id).assets.filter(asset => asset.name === filename)
             assert.equal(matches.length, 1, 'Retained crate original did not become visible')
             return command(['gh', 'api', 'repos/' + repository + '/releases/assets/' + matches[0].id,
-              '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024 })
+              '-H', 'Accept: application/octet-stream'], { encoding: null, maxBuffer: 64 * 1024 * 1024,
+              ...(recovery ? { timeout: 120000 } : {}) })
           },
         })
         originals.set(name, original)
@@ -852,7 +874,8 @@ function makeVerifiedContext(env, repository, sourceRevision, run, automatic, re
       if (frozen) {
         const original = originals.get(name); assert.ok(original, 'Require the original verified crate Buffer')
         assert.equal(original.retained, true, 'Crate original must be retained before checksum reservation/upload')
-        return write(() => require('./release-cargo-upload.cjs').uploadArchive(original.bytes, original.metadata, env.CARGO_REGISTRY_TOKEN))
+        return write(() => require('./release-cargo-upload.cjs').uploadArchive(original.bytes, original.metadata, env.CARGO_REGISTRY_TOKEN,
+          recovery ? { fetchImpl: recovery.uploadFetch } : {}))
       }
       const result = await write(() => spawnCommand(['cargo', 'publish', '--locked', '--allow-dirty', '-p', name], {
         encoding: 'utf8', maxBuffer: 32 * 1024 * 1024,
@@ -922,7 +945,7 @@ function preparationIdentity(context, version, env = process.env) {
 }
 
 module.exports = { assertVersion, assertManualVersion, validateSource, validateReceipt, nextVersion, selectVersion,
-  plan, publish, makeContext, makeRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
+  plan, publish, publishCrates, makeContext, makeRecoveryContext, makeFrozenRecoveryContext, assertCurrentMain, currentMainWrite, sha256, githubArgs, receiptBody, readBodyReceipt,
   frontendIdentity, verifyPackageArchive, preserveFrontend, verifyPreservedFrontend, shouldMakeLatest, gitIsAncestor,
   canonicalJson, signReceipt, authenticateReceipt, readAuthenticatedReceipt, assertSigningKey, assertSigningConfiguration,
   verifyRegistrySource, highestStableVersion, spawnCommand, command, createPreparation, validatePreparation, resumePrepared,

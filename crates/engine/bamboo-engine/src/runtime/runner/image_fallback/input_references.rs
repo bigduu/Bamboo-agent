@@ -90,7 +90,7 @@ pub(crate) fn project_nonvision_images(messages: &mut [Message], session_id: &st
                          report that actual blocker instead of claiming this reference was inspected. \
                          Only a successful tool result supplies an image description. \
                          This requires an explicitly configured Vision model: defaults.vision \
-                         with features.provider_model_ref enabled, or vision_model on the active provider. If unavailable, tell the user \
+                         with an exact provider instance and model, or vision_model on the active provider. If unavailable, tell the user \
                          the original image is preserved and ask them to configure that target \
                          or select a genuinely Vision-capable main model. Do not claim to have seen it.\n"
                     ));

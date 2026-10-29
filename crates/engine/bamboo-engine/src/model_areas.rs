@@ -25,9 +25,14 @@ use bamboo_domain::ProviderModelRef;
 use bamboo_llm::{Config, ProviderRegistry, ResolvedModel};
 
 use crate::model_config_helper::{
-    resolve_background_model, resolve_fast_model, resolve_subagent_model, resolve_vision_model,
+    resolve_background_model, resolve_fast_model, resolve_fast_model_for_runner,
+    resolve_planning_model, resolve_search_model, resolve_subagent_model, resolve_vision_model,
     try_resolve_task_summary_model,
 };
+
+#[cfg(test)]
+#[path = "model_areas_live_tests.rs"]
+mod live_tests;
 
 /// The auxiliary (non-chat) models, all resolved from **global** config for a
 /// given provider routing key. None of these are session-bound.
@@ -63,17 +68,13 @@ pub fn resolve_global_area_models(
     provider_name: &str,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> GlobalAreaModels {
-    let refs = config
-        .defaults
-        .as_ref()
-        .filter(|_| config.features.provider_model_ref)
-        .map(|defaults| {
-            let fast = defaults.fast.as_ref().unwrap_or(&defaults.chat);
-            (
-                fast.clone(),
-                defaults.memory_background.as_ref().unwrap_or(fast).clone(),
-            )
-        });
+    let refs = config.defaults.as_ref().map(|defaults| {
+        let fast = defaults.fast.as_ref().unwrap_or(&defaults.chat);
+        (
+            fast.clone(),
+            defaults.memory_background.as_ref().unwrap_or(fast).clone(),
+        )
+    });
     let (summarization, summarization_error) =
         match try_resolve_task_summary_model(config, provider_name, provider_registry) {
             Ok(model) => (model, None),
@@ -98,6 +99,116 @@ pub fn resolve_global_area_models(
         }),
         summarization_error,
     }
+}
+
+/// Preserve a run's other auxiliary selections while resolving its background
+/// model and provider from the current config at every round. A busy config
+/// or a rejected route yields no background model for that round.
+#[doc(hidden)]
+pub fn live_background_model_resolver(
+    config: Arc<tokio::sync::RwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    provider_name: String,
+    fixed: crate::AuxiliaryModelConfig,
+) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync> {
+    Arc::new(move || {
+        let background = if provider_name.is_empty() {
+            None
+        } else {
+            config
+                .try_read()
+                .ok()
+                .and_then(|current| resolve_background_model(&current, &provider_name, &registry))
+        };
+        let mut models = fixed.clone();
+        models.background_model_name = background.as_ref().map(|model| model.model_name.clone());
+        models.background_model_provider = background.map(|model| model.provider);
+        models
+    })
+}
+
+/// Resolve a Connect resume's summary and background from one live Config
+/// snapshot. Rejected summary roles remain errors; an absent role stays unset.
+#[doc(hidden)]
+pub fn live_resume_auxiliary_resolver(
+    config: Arc<tokio::sync::RwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    provider_name: String,
+) -> crate::runtime::config::ResumeAuxiliaryResolver {
+    Arc::new(move || {
+        if provider_name.is_empty() {
+            return (
+                Err(bamboo_llm::LLMError::Api(
+                    "Connect resume provider is unavailable".into(),
+                )),
+                None,
+            );
+        }
+        let Ok(current) = config.try_read() else {
+            return (
+                Err(bamboo_llm::LLMError::Api(
+                    "Live model configuration is unavailable for Connect resume".into(),
+                )),
+                None,
+            );
+        };
+        let summary = try_resolve_task_summary_model(&current, &provider_name, &registry);
+        let background = resolve_background_model(&current, &provider_name, &registry);
+        (summary, background)
+    })
+}
+
+/// Resolve all live auxiliary routes using one authoritative config read.
+/// A busy lock or missing provider key fails closed instead of reusing an older
+/// snapshot or treating unavailable routes as unset.
+#[doc(hidden)]
+pub fn live_auxiliary_model_resolver(
+    config: Arc<tokio::sync::RwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    provider_name: String,
+) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync> {
+    Arc::new(move || {
+        let current = if provider_name.trim().is_empty() {
+            None
+        } else {
+            config.try_read().ok()
+        };
+        let Some(current) = current else {
+            let (fast_model_name, fast_model_provider) =
+                resolve_fast_model_for_runner(None, &provider_name, &registry);
+            return crate::AuxiliaryModelConfig {
+                fast_model_name,
+                fast_model_provider,
+                summarization_model_error: Some(
+                    "Live model configuration or provider key is unavailable".into(),
+                ),
+                ..Default::default()
+            };
+        };
+
+        let (fast_model_name, fast_model_provider) =
+            resolve_fast_model_for_runner(Some(&current), &provider_name, &registry);
+        let background = resolve_background_model(&current, &provider_name, &registry);
+        let planning = resolve_planning_model(&current, &provider_name, &registry);
+        let search = resolve_search_model(&current, &provider_name, &registry);
+        let (summary, summarization_model_error) =
+            match try_resolve_task_summary_model(&current, &provider_name, &registry) {
+                Ok(summary) => (summary, None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+
+        crate::AuxiliaryModelConfig {
+            fast_model_name,
+            fast_model_provider,
+            background_model_name: background.as_ref().map(|model| model.model_name.clone()),
+            background_model_provider: background.map(|model| model.provider),
+            planning_model_name: planning.map(|model| model.model_name),
+            search_model_name: search.map(|model| model.model_name),
+            summarization_model_name: summary.as_ref().map(|model| model.model_name.clone()),
+            summarization_model_provider: summary.map(|model| model.provider),
+            summarization_model_error,
+        }
+    })
 }
 
 /// Vision model — **global**. Resolved on demand (only when a request actually

@@ -6,8 +6,9 @@ The current workflow files and branch protection are authoritative during rollou
 
 ## Feature: test before dev
 
-Create a feature branch and PR to `dev`. Its CI runs Unit and E2E, including the
-applicable native-platform cases. Fix failures on that feature branch before
+Create a feature branch and PR to `dev`. Code CI runs Linux Unit and E2E in
+independently rerunnable test shards; native-platform cases are available by
+manual dispatch. Root and docs Markdown-only changes run Quick Checks. Fix failures on that feature branch before
 merging. Run focused local tests for changed behavior; retain the actual CI
 source and results for review.
 
@@ -16,6 +17,18 @@ compatible compiled test executables and frontend artifacts; do not add a second
 workflow that runs an already-owned selection. Different platform or feature
 configurations can require distinct outputs. A cache hit alone is not a test
 result.
+
+Ubuntu Quick Checks run the complete Supervisor, Lotus artifact and release
+frontend policy Node suites once. Manual Windows and macOS diagnostics run nine system cases:
+bounded file reading, canonical artifact paths, four process/listener binding
+cases, actual archive staging/preservation and both LF/CRLF Git/Bash guards.
+macOS checks real process ownership with `ps/lsof`; Windows checks the explicit
+unsupported-process-binding refusal instead of claiming native Host acceptance.
+The native runner selects their exact names with Node's built-in test runner and
+requires all nine successful executions with no failed, cancelled, skipped or
+todo cases. A renamed, missing or duplicated case fails the job. Platform-free
+protocol, manifest/hash and release-selection policies stay in Ubuntu Quick;
+the existing native Rust acceptance still runs separately.
 
 `frontend-acceptance.yml` checks the embedded frontend package, build scripts and
 server resources. The relevant checks belong in feature CI; a standalone manual
@@ -64,6 +77,48 @@ original archive and signed checksum cannot be confirmed, stop for recovery;
 do not rebuild it. A product fix goes through a feature branch and a new `dev`
 acceptance before a new release cut.
 
+### Fixed v2026.10.19 crate recovery
+
+Issue #2371 handles only publisher [40613036533/attempt 1](https://github.com/bigduu/Bamboo-agent/actions/runs/40613036533), frozen source
+`4786b7db862cabbebce49e288da62b284ccf5b72`, version `2026.10.19` and draft
+Release `426156779`. The server upload failed with an indeterminate transport or
+response error after its archive and signed checksum were retained. Preserve all
+27 crate originals/checksums, the sealed `@bigduu/lotus-next@2026.10.24` frontend
+and all three successful native attempt-1 artifacts. A missing registry response
+does not authorize repackaging an existing original.
+
+After normal protected-Dev review and CI admission, select the exact reviewed
+controller commit and use the single-input recovery workflow:
+
+```bash
+gh workflow run recover-frozen-crate-release.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
+
+The workflow checks out controller and product separately, preserving its real
+runner/run/attempt identity. Authorization uses the read-only `github.token`.
+Restoration uses the existing release token to read the private draft because
+draft visibility with `contents: read` is not established. It authenticates the
+original state and writes only the sealed frontend locally, with no external
+write, npm download or repack.
+The existing Cargo sandbox then owns metadata and verification compilation after
+temporary version stamping and the original external-lock check. Only the final
+publish step executes external writes and receives the Cargo registry token.
+
+The controller reuses the retained server archive, or verifies its existing
+registry version. Only `bamboo-client-core`, `bamboo-tui` and `bamboo-agent` may be
+compiled for the first time, after proving they never began in the original run.
+Each verified original is persisted before its signed checksum and registry
+upload. Unknown, changed, pending or missing prior originals stop recovery.
+
+Success requires authenticated remote readback of `recovery2371.completed=true`
+with no pending write, while the Release remains draft, `receipt.completed=false`
+and `publisherRunId=40613036533`. This workflow does not allocate a version,
+retag, publish native assets or finalize the Release. Once that readback passes,
+retry the original publisher's failed crate job and its dependent finalizer;
+they reuse the three successful native attempt-1 outputs. Do not rerun all jobs
+or treat a local/policy check as completed production recovery.
+
 ## Main and consumers
 
 Promote the release only after its required artifacts are published and checked.
@@ -84,11 +139,22 @@ time of this guide, the default is protected `dev`, so merging the listener into
 `dev` enables automatic Docker consumption even before Main is promoted. After
 the first publisher succeeds, check its corresponding Docker run before doing
 anything else. Do not manually dispatch a duplicate consumer. If a consumer run
-failed, recover its failed jobs in the same run and reuse its verified outputs.
+failed, recover its failed jobs in the same run and reuse its verified outputs
+when the installed controller can safely do so.
 
-If the expected automatic run is confirmed missing, recheck the live default
-branch and installed listener. Only when no consumer run for this release exists,
-use the existing recovery flow for its exact version and source:
+Automatic `workflow_run` events use read-only GitHub Actions cache access: they
+restore cached layers but do not export them. A protected Dev manual dispatch may
+export an optional cache; an export failure does not bypass image verification.
+If an older automatic controller failed because it attempted a cache export,
+wait for all its jobs to finish, preserve the failure and inspect each target's
+candidate and final image. After the reviewed controller fix reaches Dev, an
+exact-version/source manual recovery may reuse verified candidates and build
+only a failed target whose candidate is confirmed absent. Unknown registry state
+or a missing candidate for an already completed image stops recovery.
+
+If the expected automatic run is confirmed missing, or the failed-controller
+recovery above applies, recheck the live default branch and installed listener.
+Use the existing recovery flow for its exact version and source:
 
 ```bash
 gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \

@@ -23,9 +23,9 @@ Jiandu owns canonical persistence, derived indexes, lexical recall, and Dream sn
 Follow [Parallel Development](./gitflow.md). Give each bounded Issue one owner,
 branch and isolated worktree; only the named integrator writes a shared batch
 branch. Every feature PR to `dev` must pass required `Test`, which aggregates
-Unit, E2E and the live SSH fixture on its actual merge source. One Linux Cargo
-executor owns one target directory and preserves independent default package
-configurations. Cargo runs each package's library/binary, integration and
+Unit, E2E and the live SSH fixture on its actual merge source. Linux Cargo
+tests run in independently rerunnable shards, each owning its target
+directory and preserving independent default package configurations. Cargo runs each package's library/binary, integration and
 documentation cases once. Explicit feature owners run only their catalogued
 additional cases; new feature-sensitive cases require ownership review.
 Compatible configurations reuse compiled artifacts, with features/profile and
@@ -34,18 +34,20 @@ executable. Unit/E2E are logical target groups. All agents add ordinary cases to
 Cargo target catalog, instead of creating another Linux workflow for a covered
 case subset. CI policy rejects unregistered Rust test producers; native OS,
 containment-boundary, explicit manual diagnostics and pinned legacy routes are
-scoped exceptions with named owners. Preserve
-applicable native-platform acceptance before dev admission. Fix failures in the
+scoped exceptions with named owners. Native-platform tests remain available by
+manual dispatch. Fix failures in the
 feature branch before merging; record exact source, commands and results.
 Ubuntu `Quick Checks` owns the 46 Supervisor component/protocol registrations
-and 15 frontend artifact/policy registrations once. Each native feature job
-runs the same 61 portable Node registrations once on its own OS; retain the
-Windows unsupported-platform assertions. The `Browser Runtime Unit and E2E`
+and 15 frontend artifact/policy registrations once. Each native feature job runs
+only the nine OS behavior cases selected by `scripts/run-native-node-tests.cjs`,
+which requires every selected name to actually pass. Retain Windows unsupported
+process-binding assertions and macOS's real process/listener checks; portable
+policies run only in Quick. The `Browser Runtime Unit and E2E`
 feature job owns all `browser-runtime` Node test files on Node 24; both feature
 aggregates require it to pass. Do not add a second automatic owner for those
 tests.
-Keep the standalone default storage authority families' serial selection in that same
-executor, reusing its compiled library-test executable without repeating cases.
+Keep the standalone default storage authority families' serial selection in its
+owning shard, reusing its compiled library-test executable without repeating cases.
 Planner's 12 Plan and 10 artifact library cases are excluded from the ordinary
 parallel harness and run once serially using each package's same compiled
 canonical test executable. Preserve each default dependency graph and fail the
@@ -53,6 +55,9 @@ existing feature gate on a missing, repeated or failed case. The independent
 Delegated Planner workflow retains its distinct API-only real CLI and original
 Clippy configurations; it does not repeat these library cases.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
+For root and docs Markdown-only PRs, run Quick Checks and skip product tests;
+Markdown under source packages may be compiled into the application and must
+run the code path. A documentation-only check cannot serve as release test proof.
 
 `trusted-observer.yml` is the single automatic owner for the two original
 API-only Observer joint recipes, run sequentially in one target directory on the
@@ -64,13 +69,12 @@ recipe as an explicit manual diagnostic on the selected workflow SHA. The shared
 five-library Clippy check remains solely in `observer-api-lint.yml`; these API-only
 contexts remain distinct from canonical embedded feature tests.
 
-## Native feature ownership
+## Native diagnostics
 
-#2319 gives Windows and macOS one feature job, workspace and owned target each.
-`native-feature-tests` runs `node scripts/native-test-owner.cjs`; both required
-`Test` and `E2E Tests` require that whole matrix to succeed. Never start a second
-dev-PR Actor, Ticket, TLS or recorder producer. Their separate workflows/full
-jobs are retained for explicit diagnosis or historical recovery.
+#2319 gives Windows and macOS one diagnostic job, workspace and owned target each.
+`native-feature-tests` runs `node scripts/native-test-owner.cjs` on manual
+dispatch, not on every feature PR. Its separate workflows remain available for
+explicit diagnosis or historical recovery.
 
 Preserve these configurations; a shared directory is not permission to unify
 their features or reuse an incompatible executable:
@@ -96,9 +100,9 @@ receive no publication/provider/tunnel credentials or workflow write channels.
 Failed evidence is retained under the original source/run/attempt; do not clean
 another owner or call a cache hit runtime evidence.
 
-For this ownership change, run Node driver/policy/routing and the frozen authority
+For native ownership changes, run Node driver/policy/routing and the frozen authority
 fixtures locally. Real Windows PowerShell/process/junction and macOS unwind
-acceptance must pass on the matching native runners before dev admission.
+acceptance requires the matching native runners.
 Keep the results from the actual feature source and retain historical release
 receipts. Skipped jobs and a cache hit do not establish test acceptance.
 
@@ -152,3 +156,22 @@ dev advancement does not change it. Promote only the exact published source to
 main. A needed product repair gets a feature branch, passing tests and dev
 admission, then a fresh cut. Existing frozen release/recovery contracts remain
 unchanged during the explicitly documented cutover dependency.
+
+For the fixed `v2026.10.19` infrastructure failure, #2371 adds the manual
+`recover-frozen-crate-release.yml` controller. It requires the exact reviewed
+protected-Dev controller and keeps product source
+`4786b7db862cabbebce49e288da62b284ccf5b72`, draft `426156779` and original
+publisher `40613036533`/attempt 1. Preserve its 27 signed crate originals, sealed
+frontend and three native artifacts. Only the proven unstarted client-core,
+TUI and agent packages may receive their first verification compile; retained or
+ambiguous originals cannot be rebuilt. Authorize uses the read-only `github.token`.
+Restore uses the existing release token to read the private draft and verifies its
+signature; its script permits no external writes. Only publish executes external
+writes and receives the Cargo registry token.
+The recovery leaves the Release draft, `receipt.completed=false` and the original
+publisher ID, and verifies `recovery2371.completed=true` with no pending write.
+It performs no native build, finalization or version allocation. After authenticated
+readback, resume the original publisher's failed crate job and its finalizer using
+the attempt-1 native outputs. Keep the recovery run's real `GITHUB_*` identity;
+never impersonate the original run. See the [fixed recovery procedure](docs/releases/ci-publication-flow.md#fixed-v20261019-crate-recovery).
+Reviewed source alone does not establish a successful recovery or publication.

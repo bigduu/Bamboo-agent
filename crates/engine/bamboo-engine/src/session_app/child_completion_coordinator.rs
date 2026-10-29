@@ -42,7 +42,6 @@ use chrono::Utc;
 use sha2::{Digest, Sha256};
 use tokio::sync::{broadcast, RwLock};
 
-use crate::model_areas::resolve_global_area_models;
 use crate::model_config_helper::{
     resolve_fast_model, resolve_gold_config, resolve_provider_routing_key, GOLD_CONFIG_METADATA_KEY,
 };
@@ -417,6 +416,7 @@ async fn derive_completed_child_ids(
     completed
 }
 
+#[cfg(test)]
 fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<Config>) -> Config {
     if let Ok(config_guard) = config.try_read() {
         let snapshot = config_guard.clone();
@@ -432,6 +432,41 @@ fn read_config_snapshot(config: &Arc<RwLock<Config>>, cached_config: &StdRwLock<
             .map(|guard| guard.clone())
             .unwrap_or_default()
     }
+}
+
+// Bind the explicit Gold model to the account selected in this very resume.
+// None means the same selection snapshot was embedder-managed; do not install
+// a Host policy in that case. An incomplete managed proof is still Some and
+// is rejected by the guard, never treated as an unmanaged selection.
+fn make_child_resume_gold_resolver(
+    config: Arc<RwLock<Config>>,
+    provider_name: String,
+    expected: Arc<dyn bamboo_llm::LLMProvider>,
+    origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+) -> Option<crate::runtime::config::GoldTargetResolver> {
+    let origin = origin?;
+    Some(Arc::new(move |model, delegate| {
+        bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            config.clone(),
+            origin.clone(),
+            bamboo_domain::ProviderModelRef::new(provider_name.as_str(), model),
+            expected.clone(),
+            delegate,
+        )
+    }))
+}
+
+fn make_resume_auxiliary_model_resolver(
+    config_handle: Arc<RwLock<Config>>,
+    _config_snapshot: Config,
+    provider_registry: Arc<ProviderRegistry>,
+    provider_name_for_aux: String,
+) -> Arc<dyn Fn() -> crate::AuxiliaryModelConfig + Send + Sync> {
+    crate::model_areas::live_auxiliary_model_resolver(
+        config_handle,
+        provider_registry,
+        provider_name_for_aux,
+    )
 }
 
 /// Per-parent async locks that serialize concurrent `on_child_completed`
@@ -2072,11 +2107,11 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 return;
             }
         };
-        let provider_override = if let Some(mut model_ref) = session_model_ref {
+        let (selected_provider, managed_origin) = if let Some(mut model_ref) = session_model_ref {
             model_ref.provider = resolved_provider_name.clone();
             persist_model_ref(&mut session, &model_ref);
-            match self.provider_router.route(&model_ref) {
-                Ok(provider) => Some(provider),
+            match self.provider_router.route_with_origin(&model_ref) {
+                Ok(selection) => selection,
                 Err(error) => {
                     tracing::error!(
                         session_id = %session_id,
@@ -2090,8 +2125,11 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 }
             }
         } else {
-            match self.provider_registry.get(&resolved_provider_name) {
-                Some(provider) => Some(provider),
+            match self
+                .provider_registry
+                .get_with_origin(&resolved_provider_name)
+            {
+                Some(selection) => selection,
                 None => {
                     tracing::error!(
                         session_id = %session_id,
@@ -2102,6 +2140,17 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                     return;
                 }
             }
+        };
+        let agent = match make_child_resume_gold_resolver(
+            self.config.clone(),
+            resolved_provider_name.clone(),
+            selected_provider.clone(),
+            managed_origin,
+        ) {
+            Some(resolver) => Arc::new(
+                agent.with_child_resume_gold_target_resolver(selected_provider.clone(), resolver),
+            ),
+            None => agent,
         };
         let resolved_fast_provider = resolve_fast_model(
             &config_snapshot,
@@ -2134,33 +2183,12 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
                 root_publication,
             );
 
-        let config_handle = self.config.clone();
-        let cached_config = Arc::new(StdRwLock::new(config_snapshot.clone()));
-        let provider_registry = self.provider_registry.clone();
-        let provider_name_for_aux = resolved_provider_name.clone();
-        let auxiliary_model_resolver = std::sync::Arc::new(move || {
-            let config_snapshot = read_config_snapshot(&config_handle, cached_config.as_ref());
-            // Auxiliary models are global (config-derived), never session-bound.
-            let areas = resolve_global_area_models(
-                &config_snapshot,
-                &provider_name_for_aux,
-                &provider_registry,
-            );
-            crate::AuxiliaryModelConfig {
-                fast_model_name: areas.fast.as_ref().map(|m| m.model_name.clone()),
-                fast_model_provider: areas.fast.map(|m| m.provider),
-                background_model_name: areas.background.as_ref().map(|m| m.model_name.clone()),
-                planning_model_name: None,
-                search_model_name: None,
-                summarization_model_name: areas
-                    .summarization
-                    .as_ref()
-                    .map(|m| m.model_name.clone()),
-                background_model_provider: areas.background.map(|m| m.provider),
-                summarization_model_provider: areas.summarization.map(|m| m.provider),
-                summarization_model_error: areas.summarization_error,
-            }
-        });
+        let auxiliary_model_resolver = make_resume_auxiliary_model_resolver(
+            self.config.clone(),
+            config_snapshot.clone(),
+            self.provider_registry.clone(),
+            resolved_provider_name.clone(),
+        );
         let model_roster = crate::ModelRoster {
             model: Some(model),
             provider_name: Some(resolved_provider_name),
@@ -2190,7 +2218,7 @@ impl ResumeExecutionPort for ChildCompletionCoordinator {
             session,
             execution_reservation,
             tools_override: Some(root_tools),
-            provider_override,
+            provider_override: Some(selected_provider),
             model_roster,
             reasoning_effort,
             reasoning_effort_source,
@@ -4158,9 +4186,196 @@ impl ChildCompletionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("child_completion_gold_origin_tests.rs");
     include!("child_completion_background_tests.rs");
     include!("child_completion_exec_tests.rs");
     use bamboo_domain::session::runtime_state::SuspensionState;
+
+    // Exercise the exact auxiliary resolver installed by child-completion
+    // resume. This fixture fixes the provider publication boundary; it does
+    // not itself run a full child/parent session.
+    #[tokio::test]
+    async fn child_resume_legacy_memory_rejects_cached_route_during_publication() {
+        use bamboo_llm::LLMError;
+        use futures::StreamExt;
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn dispatch_background(
+            models: crate::AuxiliaryModelConfig,
+        ) -> Result<bool, LLMError> {
+            match (
+                models.background_model_name,
+                models.background_model_provider,
+            ) {
+                (None, None) => Ok(false),
+                (Some(model), Some(provider)) => {
+                    let mut stream = provider
+                        .chat_stream(
+                            &[Message::user("synthetic memory query")],
+                            &[],
+                            Some(32),
+                            &model,
+                        )
+                        .await?;
+                    while let Some(chunk) = stream.next().await {
+                        chunk?;
+                    }
+                    Ok(true)
+                }
+                _ => panic!("background name and provider must remain paired"),
+            }
+        }
+
+        let mock = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(concat!(
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                        "data: [DONE]\n\n",
+                    )),
+            )
+            .mount(&mock)
+            .await;
+        let home = tempfile::tempdir().expect("isolated test home");
+        let mut baseline = Config::default();
+        baseline.provider = "account-a".into();
+        baseline.default_provider_instance = Some("account-a".into());
+        baseline.defaults = None;
+        baseline.http_proxy = "http://127.0.0.1:9".into();
+        baseline.https_proxy.clear();
+        baseline.proxy_auth = None;
+        baseline
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .background_model = Some("memory-only".into());
+        baseline.provider_instances.insert(
+            "account-a".into(),
+            serde_json::from_value(json!({
+                "provider_type":"openai", "enabled":true,
+                "api_key":"synthetic-child-only", "base_url":mock.uri(), "model":"chat-a"
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&baseline, home.path().to_path_buf())
+                .await
+                .expect("initial managed generation"),
+        );
+        let live = Arc::new(RwLock::new(baseline.clone()));
+        let resolver = make_resume_auxiliary_model_resolver(
+            live.clone(),
+            baseline.clone(),
+            registry.clone(),
+            "account-a".into(),
+        );
+        let initial = resolver();
+        assert_eq!(
+            initial.background_model_name.as_deref(),
+            Some("memory-only")
+        );
+        assert!(Arc::ptr_eq(
+            initial.background_model_provider.as_ref().unwrap(),
+            &registry.get("account-a").unwrap()
+        ));
+
+        let mut denied = baseline;
+        denied
+            .provider_instances
+            .get_mut("account-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), json!(["chat-a"]));
+        let denied_registry = ProviderRegistry::from_config(&denied, home.path().to_path_buf())
+            .await
+            .expect("denied managed generation");
+        let mut writer = live.write().await;
+        *writer = denied.clone();
+        let blocked = resolver();
+        let blocked_name = blocked.background_model_name.clone();
+        let blocked_has_provider = blocked.background_model_provider.is_some();
+        registry.replace_with(denied_registry);
+        drop(writer);
+        let blocked_dispatched =
+            tokio::time::timeout(Duration::from_secs(5), dispatch_background(blocked))
+                .await
+                .expect("blocked dispatch should finish")
+                .expect("loopback response");
+        let blocked_requests = mock.received_requests().await.unwrap().len();
+        let after = resolver();
+        let after_name = after.background_model_name.clone();
+        let after_dispatched =
+            tokio::time::timeout(Duration::from_secs(5), dispatch_background(after))
+                .await
+                .expect("denied dispatch should finish")
+                .expect("loopback response");
+        let after_requests = mock.received_requests().await.unwrap().len();
+
+        let mut allowed = denied;
+        allowed
+            .provider_instances
+            .get_mut("account-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), json!(["chat-a", "memory-only"]));
+        let allowed_registry = ProviderRegistry::from_config(&allowed, home.path().to_path_buf())
+            .await
+            .expect("allowed managed generation");
+        let mut writer = live.write().await;
+        *writer = allowed;
+        registry.replace_with(allowed_registry);
+        drop(writer);
+        let restored = resolver();
+        let restored_name = restored.background_model_name.clone();
+        let same_account = restored
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|handle| Arc::ptr_eq(handle, &registry.get("account-a").unwrap()));
+        let restored_dispatched =
+            tokio::time::timeout(Duration::from_secs(5), dispatch_background(restored))
+                .await
+                .expect("restored dispatch should finish")
+                .expect("loopback response");
+        let requests = mock.received_requests().await.unwrap();
+        let new_requests = requests.len() - after_requests;
+        let final_model = requests.last().map(|request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            body["model"].as_str().unwrap().to_string()
+        });
+        assert_eq!(
+            (
+                (
+                    blocked_name,
+                    blocked_has_provider,
+                    blocked_dispatched,
+                    blocked_requests
+                ),
+                (after_name, after_dispatched, after_requests),
+                (
+                    restored_name,
+                    same_account,
+                    restored_dispatched,
+                    new_requests,
+                    final_model
+                )
+            ),
+            (
+                (None, false, false, 0),
+                (None, false, 0),
+                (
+                    Some("memory-only".to_string()),
+                    true,
+                    true,
+                    1,
+                    Some("memory-only".to_string())
+                )
+            ),
+        );
+    }
 
     #[test]
     fn skill_request_child_provider_constructor_keeps_data_absent_and_rejects_injection() {

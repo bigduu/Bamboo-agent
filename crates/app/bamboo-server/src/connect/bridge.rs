@@ -21,7 +21,7 @@ use bamboo_engine::execution::{
     create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
     spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
 };
-use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
+use bamboo_engine::{AuxiliaryModelConfig, ModelRoster, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
 
 use crate::permission_audit::record_bamboo_runtime_permission_metadata;
@@ -209,6 +209,20 @@ fn resolve_connect_run_config(
     provider_registry: &Arc<ProviderRegistry>,
 ) -> ResolvedConnectRunConfig {
     bamboo_engine::resolved_defaults::resolve_default_run_config(config_snapshot, provider_registry)
+}
+
+// Construct the same resolver used by Connect's new-run execution. The
+// provider key comes from the resolved run, not a later global default.
+pub(super) fn connect_auxiliary_model_resolver(
+    config: Arc<TokioRwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    model_roster: &ModelRoster,
+) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> {
+    bamboo_engine::model_areas::live_auxiliary_model_resolver(
+        config,
+        registry,
+        model_roster.provider_name.clone().unwrap_or_default(),
+    )
 }
 
 /// Builds a fresh session for a connect chat key. Mirrors
@@ -984,25 +998,11 @@ impl ConnectBridge {
                 root_publication,
             );
 
-        // Auxiliary (fast/background/summarization) model resolver — mirrors
-        // `schedule_app::manager::run_schedule_job` exactly.
-        let aux_fast_model = resolved.model_roster.fast_model();
-        let aux_fast_provider = resolved.model_roster.fast_model_provider();
-        let aux_background_model = resolved.model_roster.background_model();
-        let aux_background_provider = resolved.model_roster.background_model_provider();
-        let aux_summarization_model = resolved.model_roster.summarization_model();
-        let aux_summarization_provider = resolved.model_roster.summarization_model_provider();
-        let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
-            fast_model_name: aux_fast_model.clone(),
-            fast_model_provider: aux_fast_provider.clone(),
-            background_model_name: aux_background_model.clone(),
-            planning_model_name: None,
-            search_model_name: None,
-            summarization_model_name: aux_summarization_model.clone(),
-            background_model_provider: aux_background_provider.clone(),
-            summarization_model_provider: aux_summarization_provider.clone(),
-            summarization_model_error: None,
-        });
+        let auxiliary_model_resolver = connect_auxiliary_model_resolver(
+            self.ctx.config.clone(),
+            self.ctx.provider_registry.clone(),
+            &resolved.model_roster,
+        );
 
         spawn_session_execution(SessionExecutionArgs {
             agent: self.ctx.agent.clone(),
@@ -1311,6 +1311,51 @@ async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
 
 #[cfg(test)]
 mod tests {
+
+    // Exercise the exact builder installed for a Connect new run. This is a
+    // resolver-level test, not a complete platform/session execution.
+    #[tokio::test]
+    async fn connect_new_run_legacy_background_rechecks_managed_admission() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let snapshot =
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture.config.read())
+                .await
+                .expect("config snapshot timeout")
+                .clone();
+        let resolved = resolve_connect_run_config(&snapshot, &fixture.registry);
+        assert_eq!(
+            resolved.model_roster.provider_name.as_deref(),
+            Some("account-a")
+        );
+        let resolver = connect_auxiliary_model_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+            &resolved.model_roster,
+        );
+        let initial = resolver();
+        assert_eq!(initial.fast_model_name.as_deref(), Some("fast-a"));
+        assert!(initial
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+        let mut guard = fixture.config.write().await;
+        guard.default_provider_instance = Some("account-b".into());
+        let blocked = resolver();
+        assert!(blocked.background_model_provider.is_none());
+        assert!(blocked.summarization_model_error.is_some());
+        drop(guard);
+        let current = resolver();
+        assert!(current
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+
+        fixture.verify_live(resolver).await;
+    }
     use super::*;
     use crate::app_state::AppState;
     use crate::tools::ToolSurface;
@@ -1635,6 +1680,174 @@ mod tests {
             user_id: user_id.to_string(),
         }
         .as_string()
+    }
+
+    // Focused safety regression for the real Connect run_prompt path.
+    #[tokio::test]
+    async fn connect_gold_stays_with_accepted_main_origin_after_swap() {
+        use bamboo_domain::ProviderModelRef;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let model = body["model"].as_str().unwrap();
+                let delta = match model {
+                    "main-a" => serde_json::json!({"content":"synthetic answer"}),
+                    "only-a-gold" => serde_json::json!({"tool_calls":[{"index":0,
+                        "id":"fixture-gold","type":"function","function":{
+                            "name":"report_gold_evaluation","arguments":
+                            "{\"decision\":\"achieved\",\"confidence\":\"high\",\"reasoning\":\"synthetic\",\"missing_information\":[]}"}}]}),
+                    other => panic!("unexpected synthetic model {other}"),
+                };
+                let frame = serde_json::json!({"id":"fixture","object":"chat.completion.chunk","created":0,
+                    "model":model,"choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                let response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"));
+                if model == "main-a" { response.set_delay(Duration::from_secs(4)) } else { response }
+            }).mount(&a).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("synthetic refusal"))
+            .mount(&b)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state.stop_config_watcher_for_test();
+        let mut config = state.config.read().await.clone();
+        config.provider = "account-a".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.clear();
+        for (name, model, admitted, endpoint) in [
+            (
+                "account-a",
+                "main-a",
+                serde_json::json!(["main-a", "only-a-gold"]),
+                a.uri(),
+            ),
+            (
+                "account-b",
+                "main-b",
+                serde_json::json!(["main-b"]),
+                b.uri(),
+            ),
+        ] {
+            config.provider_instances.insert(
+                name.into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+                    "base_url":endpoint, "model":model, "runtime_models":admitted
+                }))
+                .unwrap(),
+            );
+        }
+        config.extra.insert(
+            "gold".into(),
+            serde_json::json!({"enabled":true,
+            "auto_continue_enabled":true,"goal":"synthetic Connect goal",
+            "model_name":"only-a-gold", "max_auto_continuations":1}),
+        );
+        state
+            .provider_registry
+            .reload_from_config(&config, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let main_a = state
+            .provider_registry
+            .provider_for_configured_model(&config, &ProviderModelRef::new("account-a", "main-a"))
+            .unwrap();
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-a", "only-a-gold")
+            )
+            .is_ok());
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-b", "only-a-gold")
+            )
+            .is_err());
+        *state.config.write().await = config;
+        *state.provider.write().await = main_a;
+        let ctx = ConnectContext {
+            agent: Arc::new(state.agent.with_host_gold_origin_resolver(
+                crate::app_state::host_gold_origin::origin_resolver(
+                    state.provider_registry.clone(),
+                    state.initial_injected_provider.clone(),
+                ),
+            )),
+            tools: state.tools_for(ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
+            permission_checker: state.permission_checker.clone(),
+        };
+        let bridge = Arc::new(ConnectBridge::new(ctx, None));
+        let task = tokio::spawn(async move {
+            let platform: Arc<dyn Platform> = FakePlatform::new("fake");
+            bridge
+                .run_prompt(
+                    "fake:chat:user",
+                    platform,
+                    &ReplyCtx(serde_json::json!({})),
+                    "synthetic Connect task",
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if !a.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed A Connect main request did not arrive");
+        *state.provider.write().await = state.provider_registry.get("account-b").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if a.received_requests().await.unwrap().iter().any(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                        == "only-a-gold"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the captured account A did not receive Gold");
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("Connect run did not settle")
+            .unwrap();
+        let seen_b = b.received_requests().await.unwrap();
+        assert!(
+            !seen_b.iter().any(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                    == "only-a-gold"
+            }),
+            "Gold must never be sent to B"
+        );
     }
 
     #[test]

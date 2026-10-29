@@ -340,7 +340,9 @@ pub enum AgentEvent {
         reasoning: String,
     },
 
-    /// Emitted when an unfinished Gold evaluation is stopped with its owning run.
+    /// Emitted when an unfinished Gold evaluation is stopped with its owning
+    /// run or locally rejected before provider dispatch. The `route_rejected`
+    /// reason ends only the evaluation; it does not cancel the owning run.
     GoldEvaluationCancelled { session_id: String, reason: String },
 
     /// Emitted whenever the runtime goal state changes — a new status

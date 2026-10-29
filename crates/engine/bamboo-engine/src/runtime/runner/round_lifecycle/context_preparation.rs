@@ -1764,11 +1764,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
             "Task-summary model resolution failed: {error}"
         )));
     }
-    // The live global resolver already applies task_summary -> fast -> chat.
-    // An unresolved explicit summary route must not fall through to a separate
-    // memory account or reuse stale startup routing. Keep background fallback
-    // only for standalone/SDK callers that have no live resolver.
-    let legacy_background_fallback = config.auxiliary_model_resolver.is_none();
+    // The global resolver already applies task_summary -> fast -> chat. A
+    // Connect resume resolver also provides its own admitted background pair:
+    // use that pair only when its summary is absent, never when it errors.
+    let legacy_background_fallback =
+        config.auxiliary_model_resolver.is_none() || config.resume_auxiliary_resolver.is_some();
     let Some(summary_model) = auxiliary_models
         .summarization_model_name
         .as_deref()

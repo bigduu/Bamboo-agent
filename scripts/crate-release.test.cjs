@@ -23,6 +23,130 @@ const checksum = 'f'.repeat(64)
 const now = new Date('2026-10-07T12:00:00Z')
 const signingKey = '7'.repeat(64)
 const signingKeyDigest = sha256(Buffer.from(signingKey, 'hex'))
+// Public original payload; authentication below always uses the inert test key.
+const original2371 = {
+  "schemaVersion": 1,
+  "version": "2026.10.19",
+  "identity": {
+    "repository": "bigduu/Bamboo-agent",
+    "sourceRevision": "4786b7db862cabbebce49e288da62b284ccf5b72",
+    "frontend": {
+      "packageName": "@bigduu/lotus-next",
+      "packageVersion": "2026.10.24",
+      "bundleHash": "sha256:cef2c6028f9ef9417a94e5a58f52c6e9f5f3f5217b0e56f51465055ad5c56d56",
+      "lock": {
+        "schemaVersion": 1,
+        "packageName": "@bigduu/lotus-next",
+        "packageVersion": "2026.10.24",
+        "sourceRevision": "73224b3f0bd6955c4c6c6095f874a951bb68f05e",
+        "sourceDirty": false,
+        "entrypoint": "index.html",
+        "resourcesSha256": "071ccbfe240cf0daf8c54a42f6a4e1d83f14f376f355f6120db3b0d6a4e94e71",
+        "manifestSha256": "db98f9716c66c4c83759c79215f151d47046a20dc9a9e50619ab0de8eb5c3ffe"
+      }
+    }
+  },
+  "crates": [
+    "bamboo-a2a",
+    "bamboo-domain",
+    "bamboo-agent-core",
+    "bamboo-subagent",
+    "bamboo-broker",
+    "bamboo-config",
+    "bamboo-compression",
+    "bamboo-infrastructure",
+    "bamboo-llm",
+    "bamboo-plugin-protocol",
+    "bamboo-plugin",
+    "bamboo-hooks",
+    "bamboo-mcp",
+    "bamboo-memory",
+    "bamboo-metrics",
+    "bamboo-skills",
+    "bamboo-storage",
+    "bamboo-tickets",
+    "bamboo-permission",
+    "bamboo-tools",
+    "bamboo-engine",
+    "bamboo-notification",
+    "bamboo-projects",
+    "bamboo-server-tools",
+    "bamboo-sdk",
+    "bamboo-orchestration",
+    "bamboo-server",
+    "bamboo-client-core",
+    "bamboo-tui",
+    "bamboo-agent"
+  ],
+  "frontendBytes": {
+    "manifestSha256": "4124626b555f6e0663886c494514a21d0ea236670f2bed0dd0a88dc273e7ed9b",
+    "archiveSha256": "1229f64a5665f69683a00facfba560d7596eacf2d387859a9bab486588386e84"
+  },
+  "automatic": true,
+  "completed": false,
+  "ciRun": "https://github.com/bigduu/Bamboo-agent/actions/runs/40588035791",
+  "packageChecksums": {
+    "bamboo-a2a": "f0a5d410d0324481a21764a4f28c94ae681ad4917f18a0a2aedd4d989887c8b6",
+    "bamboo-domain": "6c5cce9716c093cbc2736daedb4e8da9da2c4baefa7ae4b83fecf9e64170778b",
+    "bamboo-agent-core": "60a807caa62231b9cf88bb60cf3d691cc5b965e19103af13986d6a4d93e0b47d",
+    "bamboo-subagent": "73a24b38e5302a8f3c3eb49ece909a14a4ee66eed02eb59d935649440c2949d8",
+    "bamboo-broker": "42fd0920b635fd2ef39f11e92ace1669eea2ebeb29155c7cd4c69816a535869b",
+    "bamboo-config": "04e3cf67ba023e3deb9cbccd74d25d07328cf179cf20f723c6891edbafe4eaf3",
+    "bamboo-compression": "9c4c96f22ae5df2c0b258216346f45ae996382aa6f3a3f957a85cdbe81eb39b6",
+    "bamboo-infrastructure": "ea01f62092fac3cdbbf3f16bc076aacac26b8d63611abadfd6a23421a804ef05",
+    "bamboo-llm": "a6b609a6c9ed9fddd2fe447f799a9610570e6b8a52122bb66eef1cfe50b9f793",
+    "bamboo-plugin-protocol": "c8c2db13d4acb3683c52e9e4448e21961b0c06b79a3783a94470ac6504b06fd2",
+    "bamboo-plugin": "d9387e51363ce7ccfad74104f2b7cdd11687a04619738b06b5a0d2d46c4b5c8d",
+    "bamboo-hooks": "354745d3c789a44b64225cdf44931fbfad703669a29ce220f540d819cf9c02cc",
+    "bamboo-mcp": "f80f33f0c1f502bee641d032f9bb6ad5a528348a40ecfb1d212a5059cfe3d1a9",
+    "bamboo-memory": "b051a8a794f033fadfc7524eb777b2adb7412bcc17143a0de718230a64a69167",
+    "bamboo-metrics": "795864a70eb645da459a470b256fb0cd841f37509d559f1191b3028cb7a7a0a8",
+    "bamboo-skills": "5d9618c4eea3e9db746bed466a7e229fb409c7448332b8b1add483133c8df183",
+    "bamboo-storage": "559f0c505ea455c4d007ba941f6e76fff5f60a6a64af80b45d556c337609eb89",
+    "bamboo-tickets": "8f5b7b82ce6d3355284dff18329bbd4a136b18b22d672e6a916c352c5c69e056",
+    "bamboo-permission": "835aa403de57e49dde1a6599884656c149e6e1d33eeb066058daeeab2859e0c3",
+    "bamboo-tools": "b2162c1ff09ba8128da5fd9ecfa4b9f5d4ffac331f13fc05f5ccbf0d29dad3bd",
+    "bamboo-engine": "da8e1f2e4be0fd3ec32ded96db4108ca9cfc2b85281de1f0471acb2c431d469e",
+    "bamboo-notification": "03b6e612584be85e975c998dfb59afc5b7a6d272a78f161a35619eb6655d5f17",
+    "bamboo-projects": "527ab8659aa35377d00c6c1ccbabee8286aa5c9e7b5dbcde2b2c8358e21f4af0",
+    "bamboo-server-tools": "c3e7508cf3ba0765b16d0174113389af5dc5c391fbf91a2fcd1acd79d0237c83",
+    "bamboo-sdk": "031f5a4dbce6a3e495361f56d31a7d3d1a82f9a593128581e65b38509229d37d",
+    "bamboo-orchestration": "63f9bcb0b877d3d8025560d837869c5150ab3634d3711be3d46310570aab8340",
+    "bamboo-server": "e27bf09786d443f525bad90dd5579734511a59f7e36a399e6810ce38fbaceed3"
+  },
+  "publisherRunId": "40613036533",
+  "validation": {
+    "schemaVersion": 1,
+    "kind": "bamboo-frozen-dev-release/v1",
+    "repository": "bigduu/Bamboo-agent",
+    "sourceRevision": "4786b7db862cabbebce49e288da62b284ccf5b72",
+    "sourceTree": "b9735f6b88a49ee90cd2442180fd22cfcec7264b",
+    "cutRevision": "4786b7db862cabbebce49e288da62b284ccf5b72",
+    "releaseHead": "4786b7db862cabbebce49e288da62b284ccf5b72",
+    "baseRevision": "3fe8712595e2f68c06228cfb179c6436f6ce09e4",
+    "featurePr": 2369,
+    "validatedRevision": "76e8ba97d68dc38c64e0373e1575d60288485ffb",
+    "ciRun": {
+      "id": 40588035791,
+      "run_attempt": 1,
+      "workflow_id": 237621118,
+      "check_suite_id": 110015204391,
+      "name": "CI",
+      "event": "pull_request",
+      "head_sha": "7b0dd9082bdd34ff90117ffc50eeedec803edd0c",
+      "head_branch": "bamboo/ci/2318-combined-flow",
+      "status": "completed",
+      "conclusion": "success",
+      "html_url": "https://github.com/bigduu/Bamboo-agent/actions/runs/40588035791",
+      "repository": {
+        "full_name": "bigduu/Bamboo-agent"
+      },
+      "head_repository": {
+        "full_name": "bigduu/Bamboo-agent"
+      }
+    }
+  }
+}
 const makeReceipt = (extra = {}) => signReceipt({ schemaVersion: 1, version: '2026.10.8',
   identity: clone(identity), crates: [...crates], frontendBytes: { ...frontendBytes },
   automatic: true, completed: false, ciRun: null, packageChecksums: {}, ...extra }, signingKey)
@@ -1726,4 +1850,345 @@ test('frozen crate failed retention and lost signed originals fail closed instea
     compile: () => { assertCrateCompilationAllowed(readback.receipt, readback.env, readback.read); readbackCompilations++; return { bytes } },
     persist: () => Buffer.from('changed readback') }), /readback changed/)
   assert.equal(readbackCompilations, 1); assert.equal(compilations, 1)
+})
+
+const recovery2371 = require('./crate-release-frozen-recovery.cjs')
+const producer2371 = { runId: '50000000001', runAttempt: 1, controllerRevision: '1'.repeat(40) }
+function reservation2371(receipt) {
+  return { id: recovery2371.TARGET.releaseId, tag_name: 'v2026.10.19', target_commitish: original2371.identity.sourceRevision,
+    draft: true, prerelease: false, body: receiptBody(receipt), assets: [
+      ...Object.entries(receipt.packageChecksums).map(([name, checksum], index) => ({ id: 100 + index,
+        name: name + '-2026.10.19.crate', state: 'uploaded', size: 1, digest: 'sha256:' + checksum })),
+      ...[['frontend-manifest.json', receipt.frontendBytes.manifestSha256], ['lotus-frontend.zip', receipt.frontendBytes.archiveSha256]]
+        .map(([name, checksum], index) => ({ id: 200 + index, name, state: 'uploaded', size: 1, digest: 'sha256:' + checksum })),
+    ] }
+}
+function evidence2371() {
+  const { TARGET: target, JOBS, ARTIFACTS } = recovery2371
+  const routes = {
+    ['actions/runs/' + target.runId]: { id: target.runId, run_attempt: 1, workflow_id: target.workflowId,
+      check_suite_id: target.suiteId, name: 'Publish Crate', path: '.github/workflows/publish-crate.yml',
+      event: 'workflow_dispatch', head_branch: 'dev', head_sha: target.source, status: 'completed', conclusion: 'failure',
+      html_url: 'https://github.com/' + target.repository + '/actions/runs/' + target.runId,
+      repository: { full_name: target.repository }, head_repository: { full_name: target.repository } },
+    ['check-suites/' + target.suiteId]: { app: { id: 15368 }, head_sha: target.source, status: 'completed', conclusion: 'failure' },
+    'actions/workflows/publish-crate.yml': { id: target.workflowId },
+    ['actions/runs/' + target.runId + '/attempts/1/jobs?per_page=100']: { total_count: 6,
+      jobs: JOBS.map(([jobId, name, conclusion]) => ({ id: jobId, name, conclusion, status: 'completed',
+        run_id: target.runId, run_attempt: 1, head_sha: target.source, steps: jobId === target.jobId
+          ? Array.from({ length: 11 }, (_, index) => ({ number: index + 1, status: 'completed',
+            name: index === 10 ? 'Publish verified crates and complete the GitHub Release' : 'Original step ' + index,
+            conclusion: index === 10 ? 'failure' : 'success' })) : [] })) },
+    ['actions/runs/' + target.runId + '/artifacts?per_page=100']: { total_count: 4,
+      artifacts: ARTIFACTS.map(([artifactId, name, size, checksum]) => ({ id: artifactId, name, size_in_bytes: size,
+        digest: 'sha256:' + checksum, expired: false, expires_at: '2026-10-31T01:00:00Z',
+        workflow_run: { id: target.runId, repository_id: 1164779771, head_repository_id: 1164779771,
+          head_branch: 'dev', head_sha: target.source } })) },
+  }
+  return { routes, read: route => { assert.ok(routes[route], route); return clone(routes[route]) } }
+}
+
+test('2371 binds final official original attempt, jobs and retained native artifacts', () => {
+  const now = Date.parse('2026-10-28T03:00:00Z')
+  assert.equal(recovery2371.originalEvidence(evidence2371().read, now).id, 40613036533)
+  for (const change of [
+    x => { x.routes['actions/runs/40613036533'].run_attempt = 2 },
+    x => { x.routes['actions/runs/40613036533'].head_sha = 'e'.repeat(40) },
+    x => { x.routes['actions/runs/40613036533'].status = 'in_progress' },
+    x => { x.routes['check-suites/110081656847'].app.id = 9 },
+    x => { x.routes['actions/runs/40613036533/attempts/1/jobs?per_page=100'].total_count++ },
+    x => { x.routes['actions/runs/40613036533/attempts/1/jobs?per_page=100'].jobs[3].steps[10].conclusion = 'success' },
+    x => { x.routes['actions/runs/40613036533/attempts/1/jobs?per_page=100'].jobs[5].conclusion = 'success' },
+    x => { x.routes['actions/runs/40613036533/artifacts?per_page=100'].artifacts.pop() },
+    x => { x.routes['actions/runs/40613036533/artifacts?per_page=100'].artifacts[1].expired = true },
+    x => { x.routes['actions/runs/40613036533/artifacts?per_page=100'].artifacts[0].digest = 'sha256:' + 'f'.repeat(64) },
+    x => { x.routes['actions/runs/40613036533/artifacts?per_page=100'].artifacts[2].workflow_run.head_sha = 'd'.repeat(40) },
+  ]) { const x = evidence2371(); change(x); assert.throws(() => recovery2371.originalEvidence(x.read, now)) }
+  assert.throws(() => recovery2371.originalEvidence(evidence2371().read, Date.parse('2026-11-01T00:00:00Z')), /expired/)
+})
+
+test('2371 authenticates the original 27 checksums and rejects drift or unrecorded originals', () => {
+  const receipt = signReceipt(clone(original2371), signingKey), entry = reservation2371(receipt)
+  authenticateReceipt(receipt, signingKey)
+  assert.equal(recovery2371.validateReservation(entry, receipt), receipt)
+  for (const change of [
+    r => { delete r.packageChecksums['bamboo-domain'] },
+    r => { r.packageChecksums['bamboo-server'] = 'a'.repeat(64) },
+    r => { r.publisherRunId = producer2371.runId },
+    r => { r.identity.sourceRevision = 'a'.repeat(40) },
+    r => { r.validation.validatedRevision = 'e'.repeat(40) },
+    r => { r.frontendBytes.archiveSha256 = 'a'.repeat(64) },
+    r => { r.packageChecksums['bamboo-tui'] = 'b'.repeat(64) },
+  ]) { const changed = clone(receipt); change(changed); signReceipt(changed, signingKey); assert.throws(() => recovery2371.validateReservation(reservation2371(changed), changed)) }
+  for (const change of [
+    e => { e.assets.pop() }, e => { e.assets[0].digest = 'sha256:' + 'a'.repeat(64) },
+    e => { e.assets.push({ name: 'bamboo-client-core-2026.10.19.crate', digest: 'sha256:' + 'a'.repeat(64) }) },
+    e => { e.draft = false }, e => { e.target_commitish = producer2371.controllerRevision },
+  ]) { const changed = clone(entry); change(changed); assert.throws(() => recovery2371.validateReservation(changed, receipt)) }
+  receipt.recovery2371 = recovery2371.newState(producer2371)
+  assert.throws(() => authenticateReceipt(receipt, signingKey), /authentication failed/)
+  signReceipt(receipt, signingKey); authenticateReceipt(receipt, signingKey)
+  assert.doesNotThrow(() => recovery2371.validateReservation(reservation2371(receipt), receipt))
+})
+
+function admission2371(t) {
+  const x = minimalFrozenFixture(t), v = original2371.validation, repo = { full_name: identity.repository }
+  const env = { ...x.env, EXPECTED_CONTROLLER_SHA: x.C, GITHUB_REF_TYPE: 'branch', GITHUB_RUN_ID: producer2371.runId,
+    GITHUB_RUN_ATTEMPT: '1', GITHUB_WORKFLOW_REF: identity.repository + '/.github/workflows/recover-frozen-crate-release.yml@refs/heads/dev' }
+  fs.writeFileSync(env.GITHUB_EVENT_PATH, JSON.stringify({ inputs: { expected_controller_sha: x.C } }))
+  const run = { ...clone(v.ciRun), path: '.github/workflows/ci.yml' }
+  const routes = {
+    'branches/dev': { name: 'dev', protected: true, commit: { sha: x.C } },
+    ['git/ref/heads/release/' + v.sourceRevision]: { ref: 'refs/heads/release/' + v.sourceRevision, object: { type: 'commit', sha: v.sourceRevision } },
+    ['compare/' + v.sourceRevision + '...' + x.C]: { status: 'ahead', base_commit: { sha: v.sourceRevision }, merge_base_commit: { sha: v.sourceRevision } },
+    ['compare/' + x.C + '...' + x.C]: { status: 'identical', base_commit: { sha: x.C }, merge_base_commit: { sha: x.C } },
+    'pulls/2369': { number: 2369, state: 'closed', merged: true, draft: false, merge_commit_sha: v.sourceRevision,
+      merged_at: '2026-10-28T00:05:00Z', base: { ref: 'dev', repo }, head: { ref: run.head_branch, sha: run.head_sha, repo } },
+    ['actions/runs/' + run.id]: run, 'actions/workflows/ci.yml': { id: run.workflow_id },
+    ['check-suites/' + run.check_suite_id]: { app: { id: 15368 }, head_sha: run.head_sha, status: 'completed', conclusion: 'success' },
+    ['actions/runs/' + run.id + '/jobs?filter=latest&per_page=100&page=1']: x.routes['actions/runs/123/jobs?filter=latest&per_page=100&page=1'],
+    ['git/commits/' + v.sourceRevision]: { sha: v.sourceRevision, tree: { sha: v.sourceTree }, parents: [{ sha: v.baseRevision }, { sha: run.head_sha }] },
+    ['git/commits/' + v.validatedRevision]: { sha: v.validatedRevision, tree: { sha: v.sourceTree }, parents: [{ sha: v.baseRevision }, { sha: run.head_sha }] },
+  }
+  return { env, routes, read: route => { assert.ok(routes[route], route); return clone(routes[route]) },
+    featureLog: () => 'Event source: ' + v.validatedRevision + '; full validation: false\n' }
+}
+test('2371 uses its own protected physical controller and reuses the full exact feature admission', t => {
+  const source = require('./release-source.cjs'), x = admission2371(t)
+  assert.deepEqual(source.authorizeFrozenRecovery(x.env, x.read, x.featureLog), original2371.validation)
+  assert.doesNotThrow(() => recovery2371.request(x.env))
+  for (const change of [
+    env => { env.GITHUB_SHA = recovery2371.TARGET.source },
+    env => { env.GITHUB_RUN_ID = '40613036533' },
+    env => { env.GITHUB_REF_PROTECTED = 'false' },
+    env => { env.GITHUB_WORKFLOW_REF = env.GITHUB_WORKFLOW_REF.replace('recover-frozen-crate-release.yml', 'publish-crate.yml') },
+  ]) { const env = { ...x.env }; change(env); assert.throws(() => recovery2371.request(env)) }
+  x.routes['pulls/2369'].head.sha = 'f'.repeat(40)
+  assert.throws(() => source.authorizeFrozenRecovery(x.env, x.read, x.featureLog))
+  const y = admission2371(t), evidence = evidence2371()
+  for (const artifact of evidence.routes['actions/runs/40613036533/artifacts?per_page=100'].artifacts) artifact.expires_at = '2100-01-01T00:00:00Z'
+  Object.assign(y.routes, evidence.routes)
+  const secret = 'untrusted-log-body-do-not-print'
+  assert.throws(() => recovery2371.authorize(y.env, y.read, route => route === 'actions/jobs/20/logs'
+    ? Buffer.from(y.featureLog()) : Buffer.from(secret)), error => {
+    assert.match(error.message, /Original completed failure log is missing or changed/)
+    assert.equal(error.message.includes(secret), false); return true
+  })
+})
+
+test('2371 restore with a release token has no GitHub write path and altered original bytes stop before local writes', t => {
+  const x = admission2371(t), official = evidence2371(), receipt = signReceipt(clone(original2371), signingKey)
+  Object.assign(x.routes, official.routes, {
+    'releases/426156779': reservation2371(receipt),
+    'git/ref/tags/v2026.10.19': { ref: 'refs/tags/v2026.10.19', object: { type: 'commit', sha: recovery2371.TARGET.source } },
+  })
+  for (const artifact of x.routes['actions/runs/40613036533/artifacts?per_page=100'].artifacts) artifact.expires_at = '2100-01-01T00:00:00Z'
+  const originalLog = Buffer.alloc(recovery2371.TARGET.logBytes, 65), calls = [], writes = []
+  const core = require('./crate-release.cjs'), proxy = { ...core,
+    // Isolate the fixed original log's crypto boundary; real mismatched hashes
+    // are rejected by the preceding case. No production override exists.
+    sha256: bytes => bytes.equals(originalLog) ? recovery2371.TARGET.logSha256 : core.sha256(bytes),
+    command: args => {
+      calls.push(args)
+      if (args[0] === 'git') return recovery2371.TARGET.source + '\n'
+      assert.equal(args[0], 'gh'); assert.equal(args[1], 'api')
+      assert.ok(!args.some(arg => ['--method', '--input', '-f', '-F'].includes(arg)), 'Restore cannot issue an external write')
+      const route = args.find(arg => arg.startsWith('repos/')).slice(('repos/' + identity.repository + '/').length)
+      if (route === 'actions/jobs/122569588592/logs') return originalLog
+      if (route === 'actions/jobs/20/logs') return Buffer.from(x.featureLog())
+      if (route === 'actions/artifacts/12784515163/zip') return Buffer.from('altered original')
+      return JSON.stringify(x.read(route))
+    },
+  }
+  const module = { exports: {} }, realFs = require('node:fs')
+  require('node:vm').runInNewContext(fs.readFileSync('scripts/crate-release-frozen-recovery.cjs', 'utf8'), {
+    module, Buffer, JSON, console, process, require: name => name === './crate-release.cjs' ? proxy
+      : name === './release-source.cjs' ? require('./release-source.cjs') : name === 'node:fs'
+        ? { ...realFs, writeFileSync: (...args) => { writes.push(args); throw Error('Unexpected local write') } } : require(name),
+  })
+  const env = { ...x.env, GH_TOKEN: 'dummy-release-write-token', BAMBOO_RELEASE_SIGNING_KEY: signingKey,
+    BAMBOO_RELEASE_SIGNING_KEY_SHA256: signingKeyDigest }
+  // restore is intentionally reached through its CLI-independent function only
+  // in this test; production still authenticates the real official log bytes.
+  assert.throws(() => module.exports.restore(env), /Original frontend artifact bytes changed/)
+  assert.equal(writes.length, 0)
+  assert.ok(calls.some(args => args.some(arg => arg.endsWith('/releases/426156779'))))
+  assert.equal(calls.some(args => args.includes('cargo')), false)
+  assert.equal(JSON.stringify(calls).includes(env.GH_TOKEN), false)
+})
+
+function runtime2371({ stored, published, fail } = {}) {
+  const receipt = stored ? clone(stored) : signReceipt(clone(original2371), signingKey)
+  authenticateReceipt(receipt, signingKey); recovery2371.stateOf(receipt)
+  const entry = reservation2371(receipt), calls = []
+  published ||= new Map(original2371.crates.slice(0, 26).map(name => [name, { checksum: receipt.packageChecksums[name], yanked: false }]))
+  let remote = clone(receipt), writes = 0
+  const context = { automatic: true, identity: receipt.identity, crates: receipt.crates,
+    assertCurrentMain: async () => { authenticateReceipt(remote, signingKey); recovery2371.baseline(remote) },
+    assertSigningKey: () => assertSigningConfiguration(signingKey, signingKeyDigest),
+    verifyReceipt: value => authenticateReceipt(value, signingKey), readReceipt: async () => remote,
+    releases: async () => [entry], registryFrontier: async () => [],
+    registry: async name => published.get(name) || null,
+    package: async (name, version, expected) => {
+      assert.equal(version, '2026.10.19')
+      if (expected) { calls.push('reuse:' + name); return expected }
+      await recovery2371.beginCompilation(receipt, name, producer2371, () => context.saveReceipt(entry, receipt))
+      assert.equal(remote.recovery2371.pending.name, name)
+      calls.push('compile:' + name)
+      if (fail?.('compile', name)) throw Error('compile interrupted')
+      const checksum = sha256(Buffer.from(name))
+      entry.assets.push({ name: name + '-2026.10.19.crate', digest: 'sha256:' + checksum, state: 'uploaded', size: 1 })
+      calls.push('retain:' + name)
+      return checksum
+    },
+    saveReceipt: async (_release, value) => {
+      recovery2371.sealProgress(value, producer2371); signReceipt(value, signingKey)
+      writes++
+      if (fail?.('save-before', writes)) throw Error('receipt write rejected')
+      remote = clone(value); authenticateReceipt(remote, signingKey)
+      calls.push('readback:' + (remote.recovery2371.pending?.name || remote.recovery2371.sealed.length))
+      if (fail?.('save-after', writes)) throw Error('receipt acknowledgement lost')
+      assert.deepEqual(value, remote)
+    },
+    cargoPublish: async name => {
+      calls.push('upload:' + name)
+      if (fail?.('upload', name)) throw Error('upload transport unknown')
+      published.set(name, { checksum: receipt.packageChecksums[name], yanked: false }); return { status: 0, output: '' }
+    },
+    verifyArchive: async (name, value, expected) => { assert.equal(published.get(name).checksum, expected); assert.equal(value.identity.sourceRevision, recovery2371.TARGET.source); calls.push('verify:' + name) },
+    wait: async () => { throw Error('Unexpected polling') },
+    complete: async () => { throw Error('Recovery must not finalize or rebuild native') },
+  }
+  const authority = { receipt, release: entry, finish() {
+    assert.equal(recovery2371.stateOf(receipt).sealed.length, 3)
+    receipt.recovery2371.completed = true; receipt.recovery2371.completedBy = clone(producer2371)
+  }, guard() { authenticateReceipt(remote, signingKey); assert.deepEqual(remote, receipt); recovery2371.validateReservation(entry, remote); calls.push('final-readback') } }
+  return { context, authority, calls, published, remote: () => remote }
+}
+
+test('2371 reuses server original, compiles only the unstarted tail and seals before original-run handoff', async () => {
+  const x = runtime2371()
+  await recovery2371.recoveryPublish(x.context, x.authority)
+  assert.deepEqual(x.calls.filter(call => call.startsWith('compile:')), recovery2371.TAIL.map(name => 'compile:' + name))
+  assert.deepEqual(x.calls.filter(call => call.startsWith('reuse:')), ['reuse:bamboo-server'])
+  for (const name of recovery2371.TAIL) {
+    assert.ok(x.calls.indexOf('readback:' + name) < x.calls.indexOf('compile:' + name))
+    assert.ok(x.calls.indexOf('retain:' + name) < x.calls.indexOf('upload:' + name))
+  }
+  assert.equal(x.calls.filter(call => call.startsWith('verify:')).length, 30)
+  assert.equal(x.remote().publisherRunId, '40613036533'); assert.equal(x.remote().completed, false)
+  assert.equal(x.remote().recovery2371.completed, true); assert.equal(x.remote().recovery2371.pending, undefined)
+  assert.equal(x.calls.at(-1), 'final-readback')
+  const retry = runtime2371({ stored: x.remote(), published: x.published })
+  await recovery2371.recoveryPublish(retry.context, retry.authority)
+  assert.equal(retry.calls.filter(call => /^(?:compile|reuse|upload):/.test(call)).length, 0)
+  assert.equal(retry.calls.some(call => call.startsWith('readback:')), false, 'Completed recovery is read-only on retry')
+  const preparedIdentity = { ...original2371.identity, version: '2026.10.19', sourceTree: recovery2371.TARGET.tree,
+    workflowRevision: recovery2371.TARGET.source, runId: '40613036533', runAttempt: 1,
+    ciRun: original2371.ciRun, validation: original2371.validation }
+  const prepared = createPreparation({ release: reservation2371(original2371),
+    receipt: signReceipt({ ...clone(original2371), packageChecksums: {} }, signingKey) }, preparedIdentity, 2)
+  const resumed = await resumePrepared({ ...retry.context, ensureTag: async () => {}, ensureFrontend: async () => {} },
+    prepared, { ...preparedIdentity, runAttempt: 2 }, 2)
+  assert.deepEqual(resumed.receipt.recovery2371, retry.remote().recovery2371)
+  assert.equal(Object.keys(resumed.receipt.packageChecksums).length, 30)
+})
+
+test('2371 stops ambiguous write-ahead/compile failures and resumes only sealed originals', async () => {
+  const before = runtime2371({ fail: (stage, value) => stage === 'save-before' && value === 2 })
+  await assert.rejects(recovery2371.recoveryPublish(before.context, before.authority), /receipt write rejected/)
+  assert.equal(before.calls.some(call => call.startsWith('compile:')), false)
+  assert.equal(before.remote().recovery2371.pending, undefined)
+  for (const fail of [
+    (stage, value) => stage === 'save-after' && value === 2,
+    (stage, value) => stage === 'compile' && value === 'bamboo-client-core',
+    (stage, value) => stage === 'save-before' && value === 3,
+  ]) {
+    const x = runtime2371({ fail })
+    await assert.rejects(recovery2371.recoveryPublish(x.context, x.authority))
+    assert.equal(x.remote().recovery2371.pending.name, 'bamboo-client-core')
+    assert.throws(() => runtime2371({ stored: x.remote(), published: x.published }), /Ambiguous in-progress/)
+    assert.ok(x.calls.filter(call => call.startsWith('compile:')).length <= 1)
+  }
+  const x = runtime2371({ fail: (stage, value) => stage === 'upload' && value === 'bamboo-client-core' })
+  await assert.rejects(recovery2371.recoveryPublish(x.context, x.authority), /upload transport unknown/)
+  assert.equal(x.remote().recovery2371.pending, undefined)
+  const retry = runtime2371({ stored: x.remote(), published: x.published })
+  await recovery2371.recoveryPublish(retry.context, retry.authority)
+  assert.deepEqual(retry.calls.filter(call => call.startsWith('compile:')), ['compile:bamboo-tui', 'compile:bamboo-agent'])
+  assert.ok(retry.calls.includes('reuse:bamboo-client-core'))
+  const changed = clone(retry.remote()); changed.recovery2371.sealed[0].producer.runId = '40613036533'
+  signReceipt(changed, signingKey); assert.throws(() => recovery2371.stateOf(changed))
+  const foreign = runtime2371()
+  foreign.published.set('bamboo-client-core', { checksum: 'a'.repeat(64), yanked: false })
+  await assert.rejects(recovery2371.recoveryPublish(foreign.context, foreign.authority), /no reserved package checksum/)
+  assert.equal(foreign.calls.some(call => call.startsWith('compile:')), false)
+  const missing = runtime2371(); missing.published.delete('bamboo-domain')
+  await assert.rejects(recovery2371.recoveryPublish(missing.context, missing.authority), /Original published prefix disappeared/)
+  assert.equal(missing.calls.some(call => /^(?:reuse|compile|upload):/.test(call)), false)
+  const serverComplete = runtime2371()
+  serverComplete.published.set('bamboo-server', { checksum: original2371.packageChecksums['bamboo-server'], yanked: false })
+  await recovery2371.recoveryPublish(serverComplete.context, serverComplete.authority)
+  assert.equal(serverComplete.calls.some(call => /^(?:reuse|upload):bamboo-server$/.test(call)), false)
+})
+
+test('2371 registry acceptance rejects yanked and unknown yank state before publishing or compiling', async () => {
+  for (const name of ['bamboo-domain', 'bamboo-server']) {
+    for (const state of [{ yanked: true }, {}]) {
+      const x = runtime2371()
+      x.published.set(name, { checksum: original2371.packageChecksums[name], ...state })
+      await assert.rejects(recovery2371.recoveryPublish(x.context, x.authority), /Registry package must be explicitly unyanked/)
+      assert.equal(x.calls.some(call => /^(?:compile|reuse|upload|readback):/.test(call)), false)
+      assert.equal(x.remote().recovery2371, undefined)
+    }
+  }
+})
+
+test('2371 frontend verification and upload classification never substitute bytes or disclose response secrets', () => {
+  const files = { 'frontend-manifest.json': Buffer.from('original manifest'), 'lotus-frontend.zip': Buffer.from('original zip') }
+  const receipt = { frontendBytes: { manifestSha256: sha256(files['frontend-manifest.json']), archiveSha256: sha256(files['lotus-frontend.zip']) } }
+  assert.equal(recovery2371.verifyFrontendFiles(files, receipt), files)
+  assert.throws(() => recovery2371.verifyFrontendFiles({ ...files, 'lotus-frontend.zip': Buffer.from('repacked') }, receipt))
+  assert.throws(() => recovery2371.verifyFrontendFiles({ ...files, 'extra-file': Buffer.from('unexpected') }, receipt))
+  assert.throws(() => recovery2371.restoredFrontend(Buffer.from('other run artifact'), receipt), /artifact bytes changed/)
+  const secret = 'dummy-release-token-do-not-log'
+  for (const category of ['timeout', 'network', 'invalid-response', secret]) {
+    const result = recovery2371.safeUploadResult({ status: 1, output: 'crates.io upload transport or response validation failed' }, category)
+    assert.equal(result.status, 1); assert.equal(result.output.includes(secret), false)
+    assert.match(result.output, /^Recovery crates\.io upload failed \((?:timeout|network|invalid-response|generic)\)$/)
+  }
+  const child = spawnCommand(['node', '-p', 'JSON.stringify(process.env)'], { env: { PATH: process.env.PATH,
+    CARGO_REGISTRY_TOKEN: secret, BAMBOO_RELEASE_SIGNING_KEY: secret, GH_TOKEN: secret } })
+  assert.equal(child.status, 0); assert.equal(child.stdout.includes(secret), false)
+})
+
+test('2371 workflow controller guard admits only the exact protected Dev dispatch', () => {
+  const workflow = fs.readFileSync('.github/workflows/recover-frozen-crate-release.yml', 'utf8')
+  const marker = '      - name: Require the exact protected Dev controller before checkout\n'
+  assert.equal(workflow.split(marker).length, 2, 'Require one controller guard')
+  const block = workflow.split(marker)[1].split('\n      - name:')[0]
+  assert.equal(block.split('        run: |\n').length, 2, 'Require one guard script')
+  const script = block.split('        run: |\n')[1].replace(/^          /gm, '')
+  const sha = 'a'.repeat(40)
+  const env = { PATH: process.env.PATH, EXPECTED_CONTROLLER_SHA: sha,
+    GITHUB_REPOSITORY: 'bigduu/Bamboo-agent', GITHUB_EVENT_NAME: 'workflow_dispatch',
+    GITHUB_REF: 'refs/heads/dev', GITHUB_REF_TYPE: 'branch', GITHUB_REF_PROTECTED: 'true',
+    GITHUB_SHA: sha, GITHUB_WORKFLOW_SHA: sha,
+    GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/recover-frozen-crate-release.yml@refs/heads/dev' }
+  for (const [name, change, accepted] of [
+    ['exact Dev', {}, true],
+    ['foreign repository', { GITHUB_REPOSITORY: 'other/Bamboo-agent' }, false],
+    ['Main', { GITHUB_REF: 'refs/heads/main' }, false],
+    ['unprotected', { GITHUB_REF_PROTECTED: 'false' }, false],
+    ['automatic event', { GITHUB_EVENT_NAME: 'push' }, false],
+    ['moving controller', { GITHUB_SHA: 'b'.repeat(40) }, false],
+    ['workflow drift', { GITHUB_WORKFLOW_SHA: 'b'.repeat(40) }, false],
+    ['wrong workflow', { GITHUB_WORKFLOW_REF: 'bigduu/Bamboo-agent/.github/workflows/publish-crate.yml@refs/heads/dev' }, false],
+    ['malformed SHA', { EXPECTED_CONTROLLER_SHA: '$(exit 0)' }, false],
+    ['uppercase', { EXPECTED_CONTROLLER_SHA: 'A'.repeat(40) }, false],
+    ['newline', { EXPECTED_CONTROLLER_SHA: sha + '\n' }, false],
+  ]) {
+    const result = spawnSync('bash', ['-c', script], { env: { ...env, ...change }, encoding: 'utf8' })
+    assert.equal(result.status === 0, accepted, name)
+  }
 })

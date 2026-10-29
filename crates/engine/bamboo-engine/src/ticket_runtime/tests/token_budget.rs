@@ -9,6 +9,7 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod terminal;
+include!("token_budget_outer_guard_fixture.rs");
 
 enum Script {
     Known,
@@ -353,6 +354,36 @@ async fn provider(f: &Fixture, inner: Arc<Provider>) -> Arc<dyn LLMProvider> {
 }
 
 #[tokio::test]
+async fn token_budget_decorator_forwards_known_fast_refusal_without_reservation() {
+    let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+    let mut config = routing.config.read().await.clone();
+    config.provider_instances.get_mut("fast-b").unwrap().enabled = false;
+    let (_, rejected) = crate::model_config_helper::resolve_fast_model_for_runner(
+        Some(&config),
+        "chat-a",
+        &routing.registry,
+    );
+    let (fixture, _registration) = admitted().await;
+    configure(&fixture, 140);
+    let budget = NativeWorkTokenBudget::capture(
+        Some(fixture.service.clone()),
+        fixture.storage.clone(),
+        &fixture.child,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let decorated = budget.wrap(rejected.unwrap(), &AgentLoopConfig::default());
+    assert!(matches!(
+        decorated.known_pre_dispatch_error(),
+        Some(LLMError::Auth(_))
+    ));
+    assert_eq!(ledger(&fixture).total_charged, 0);
+    assert!(routing.requests("fast-b").is_empty());
+    assert!(routing.requests("chat-a").is_empty());
+}
+
+#[tokio::test]
 async fn token_budget_reserves_before_provider_and_settles_only_after_trailing_usage_eof() {
     let (f, _registration) = admitted().await;
     configure(&f, 140);
@@ -581,6 +612,49 @@ async fn token_budget_dynamic_auxiliary_and_vision_cannot_escape_shared_exhausti
 }
 
 #[tokio::test]
+async fn token_budget_background_only_override_cannot_escape_shared_exhaustion() {
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let dynamic: Arc<dyn LLMProvider> = inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        auxiliary_model_resolver: None,
+        background_model_resolver: Some(Arc::new(move |_| {
+            Some(bamboo_llm::ResolvedModel::new(
+                dynamic.clone(),
+                "fixture-model",
+            ))
+        })),
+        ..Default::default()
+    };
+    let main = budget.decorate(&mut config, inner.clone());
+    drop(
+        main.chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap(),
+    );
+    let background = config.resolve_auxiliary_models();
+    assert_eq!(
+        background.background_model_name.as_deref(),
+        Some("fixture-model")
+    );
+    assert!(background
+        .background_model_provider
+        .unwrap()
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger(&f).total_charged, 140);
+}
+
+#[tokio::test]
 async fn token_budget_unknown_model_and_revoked_root_block_before_provider() {
     let (f, _registration) = admitted().await;
     configure(&f, 500);
@@ -725,4 +799,437 @@ async fn token_budget_unconfigured_ordinary_child_preserves_legacy_and_later_con
         "late configuration cannot escape the retained capability"
     );
     assert_eq!(ledger(&f).total_charged, 0);
+}
+
+#[tokio::test]
+async fn work_budget_and_reasoning_snapshot_share_real_auxiliary_semaphore() {
+    use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+    use bamboo_llm::{provider::queued_snapshot_for, ResolvedModel};
+    use std::time::Duration;
+
+    struct Snapshotting {
+        inner: Arc<dyn LLMProvider>,
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for Snapshotting {
+        fn queued_provider_snapshot(
+            &self,
+        ) -> bamboo_llm::provider::Result<Option<Arc<dyn LLMProvider>>> {
+            Ok(Some(self.inner.clone()))
+        }
+        async fn list_model_info(&self) -> bamboo_llm::provider::Result<Vec<ProviderModelInfo>> {
+            self.inner.list_model_info().await
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_domain::Message],
+            tools: &[bamboo_domain::ToolSchema],
+            cap: Option<u32>,
+            model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.inner.chat_stream(messages, tools, cap, model).await
+        }
+    }
+
+    let (fixture, _registration) = admitted().await;
+    configure(&fixture, 140);
+    let budget = NativeWorkTokenBudget::capture(
+        Some(fixture.service.clone()),
+        fixture.storage.clone(),
+        &fixture.child,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let calls = Provider::new(Script::Known);
+    let inner: Arc<dyn LLMProvider> = Arc::new(Snapshotting {
+        inner: calls.clone(),
+    });
+    let decorated = budget.wrap(
+        inner,
+        &AgentLoopConfig {
+            app_data_dir: Some(fixture.dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let reference = ProviderModelRef::new("fixture", "fixture-model")
+        .with_reasoning_effort(ReasoningEffort::Low);
+    let original = ResolvedModel::from_ref(decorated, &reference).provider;
+    let snapshot = queued_snapshot_for(original.clone()).unwrap();
+    assert_eq!(
+        snapshot.resource_allocation_identity(),
+        original.resource_allocation_identity()
+    );
+
+    let permit =
+        crate::runtime::runner::auxiliary_budget::acquire(&original, "fixture-model", 1).await;
+    let mut waiting = Box::pin(crate::runtime::runner::auxiliary_budget::acquire(
+        &snapshot,
+        "fixture-model",
+        1,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), waiting.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 0);
+    drop(permit);
+    let _permit = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap();
+    let mut stream = snapshot
+        .chat_stream(&[], &[], Some(40), "fixture-model")
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ledger(&fixture).total_charged,
+        30,
+        "the simulated usage settles at EOF"
+    );
+}
+
+// A resumed run's two live role handles must share the canonical Work budget.
+#[tokio::test]
+async fn token_budget_resume_auxiliary_pair_cannot_escape_shared_exhaustion() {
+    use std::sync::atomic::AtomicBool;
+
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let main_inner = Provider::new(Script::Known);
+    let summary_inner = Provider::new(Script::Known);
+    let background_inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let want_summary = Arc::new(AtomicBool::new(true));
+    let callback_want_summary = Arc::clone(&want_summary);
+    let summary: Arc<dyn LLMProvider> = summary_inner.clone();
+    let background: Arc<dyn LLMProvider> = background_inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        resume_auxiliary_resolver: Some(Arc::new(move || {
+            let summary = callback_want_summary
+                .load(Ordering::SeqCst)
+                .then(|| bamboo_llm::ResolvedModel::new(summary.clone(), "fixture-model"));
+            (
+                Ok(summary),
+                Some(bamboo_llm::ResolvedModel::new(
+                    background.clone(),
+                    "fixture-model",
+                )),
+            )
+        })),
+        ..Default::default()
+    };
+    let main = budget.decorate(&mut config, main_inner.clone());
+    drop(
+        main.chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap(),
+    );
+    let before_attempts = ledger(&f);
+    let pair = config.resolve_auxiliary_models();
+    assert_eq!(
+        pair.summarization_model_name.as_deref(),
+        Some("fixture-model")
+    );
+    assert_eq!(pair.background_model_name.as_deref(), Some("fixture-model"));
+    assert!(pair.summarization_model_error.is_none());
+    for provider in [
+        pair.summarization_model_provider.unwrap(),
+        pair.background_model_provider.unwrap(),
+    ] {
+        assert!(provider
+            .chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .is_err());
+    }
+    want_summary.store(false, Ordering::SeqCst);
+    let absent = config.resolve_auxiliary_models();
+    assert!(absent.summarization_model_name.is_none());
+    assert!(absent.summarization_model_provider.is_none());
+    assert!(absent.summarization_model_error.is_none());
+    assert!(absent
+        .background_model_provider
+        .unwrap()
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(main_inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(summary_inner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(background_inner.calls.load(Ordering::SeqCst), 0);
+    let after_attempts = ledger(&f);
+    assert_eq!(after_attempts.total_charged, 140);
+    assert_eq!(
+        after_attempts.reservations.len(),
+        before_attempts.reservations.len()
+    );
+}
+
+// A locally rejected summary is not a dispatch or a Work token reservation.
+#[tokio::test]
+async fn token_budget_resume_auxiliary_rejection_has_no_reservation() {
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let main_inner = Provider::new(Script::Known);
+    let background_inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let background: Arc<dyn LLMProvider> = background_inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        resume_auxiliary_resolver: Some(Arc::new(move || {
+            (
+                Err(LLMError::Api("synthetic resume route rejected".into())),
+                Some(bamboo_llm::ResolvedModel::new(
+                    background.clone(),
+                    "fixture-model",
+                )),
+            )
+        })),
+        ..Default::default()
+    };
+    let _main = budget.decorate(&mut config, main_inner.clone());
+    let before_selection = ledger(&f);
+    let selected = config.resolve_auxiliary_models();
+    assert!(selected.summarization_model_name.is_none());
+    assert!(selected.summarization_model_provider.is_none());
+    assert!(selected
+        .summarization_model_error
+        .as_deref()
+        .is_some_and(|error| error.contains("synthetic resume route rejected")));
+    assert!(selected.background_model_provider.is_some());
+    assert_eq!(main_inner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(background_inner.calls.load(Ordering::SeqCst), 0);
+    let after_selection = ledger(&f);
+    assert_eq!(after_selection.total_charged, 0);
+    assert_eq!(
+        after_selection.reservations.len(),
+        before_selection.reservations.len()
+    );
+}
+
+// A trusted fixed policy wrapper must still reach the same Work decorator.
+struct FixedGoldPolicyWrapper {
+    inner: Arc<dyn LLMProvider>,
+    calls: Arc<AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl LLMProvider for FixedGoldPolicyWrapper {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
+        Some(self.inner.clone())
+    }
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        self.inner.resource_allocation_identity()
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[bamboo_domain::Message],
+        tools: &[bamboo_domain::ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.chat_stream(messages, tools, max, model).await
+    }
+}
+
+// The same Work decorator used by execute_bound remains inside the fixed Gold
+// delegate. The later caller cannot replace it with a different provider.
+#[tokio::test]
+async fn child_resume_gold_delegate_keeps_work_budget_and_selected_provider() {
+    let (fixture, _registration) = admitted().await;
+    configure(&fixture, 140);
+    let budget = NativeWorkTokenBudget::capture(
+        Some(fixture.service.clone()),
+        fixture.storage.clone(),
+        &fixture.child,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let selected = Provider::new(Script::Known);
+    let other = Provider::new(Script::Known);
+    let main: Arc<dyn LLMProvider> = selected.clone();
+    let other_handle: Arc<dyn LLMProvider> = other.clone();
+    // A managed registry with a missing factory binding must refuse before the
+    // exact same Work decorator can reserve or contact either fake provider.
+    let mut host_config = bamboo_llm::Config::default();
+    host_config.provider = "relay".into();
+    host_config.default_provider_instance = Some("relay".into());
+    host_config.http_proxy = "http://127.0.0.1:9".into();
+    host_config.https_proxy.clear();
+    host_config.proxy_auth = None;
+    host_config.provider_instances.insert(
+        "relay".into(),
+        serde_json::from_value(serde_json::json!({
+            "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+            "base_url":"http://127.0.0.1:9", "model":"fixture-model",
+            "runtime_models":["fixture-model"]
+        }))
+        .unwrap(),
+    );
+    let registry = Arc::new(
+        bamboo_llm::ProviderRegistry::from_config(&host_config, fixture.dir.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    registry.insert("relay".into(), main.clone());
+    let (expected, origin) = registry.get_with_origin("relay").unwrap();
+    let origin = origin.expect("missing binding still has managed origin");
+    let live = Arc::new(tokio::sync::RwLock::new(host_config));
+    let resolver: crate::runtime::config::GoldTargetResolver = Arc::new(move |model, delegate| {
+        bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            live.clone(),
+            origin.clone(),
+            bamboo_domain::ProviderModelRef::new("relay", model),
+            expected.clone(),
+            delegate,
+        )
+    });
+    let mut denied_config = AgentLoopConfig {
+        app_data_dir: Some(fixture.dir.path().to_path_buf()),
+        gold_target_resolver: Some(resolver),
+        ..Default::default()
+    };
+    let denied_decorated = budget.decorate(&mut denied_config, main.clone());
+    crate::runtime::runtime::bind_child_gold_delegate(
+        &mut denied_config,
+        Some(&main),
+        &main,
+        &denied_decorated,
+    )
+    .unwrap();
+    let denied =
+        denied_config.gold_target_resolver.as_ref().unwrap()("fixture-model", other_handle.clone());
+    assert!(denied
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert!(denied.local_dispatch_refused());
+    assert_eq!(selected.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(other.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger(&fixture).total_charged, 0);
+    assert!(ledger(&fixture).reservations.is_empty());
+
+    // An inherited policy cannot redirect a managed Gold request past Work.
+    // Its refusal occurs before either provider call or a budget reservation.
+    let replacement = other_handle.clone();
+    let inherited: crate::runtime::config::GoldTargetResolver =
+        Arc::new(move |_, _| replacement.clone());
+    let managed: crate::runtime::config::GoldTargetResolver = Arc::new(|_, delegate| delegate);
+    let mut denied_policy = AgentLoopConfig {
+        app_data_dir: Some(fixture.dir.path().to_path_buf()),
+        gold_target_resolver: Some(crate::runtime::agent::compose_child_gold_policy(
+            Some(inherited),
+            managed,
+        )),
+        ..Default::default()
+    };
+    let policy_decorated = budget.decorate(&mut denied_policy, main.clone());
+    crate::runtime::runtime::bind_child_gold_delegate(
+        &mut denied_policy,
+        Some(&main),
+        &main,
+        &policy_decorated,
+    )
+    .unwrap();
+    let refused =
+        denied_policy.gold_target_resolver.as_ref().unwrap()("fixture-model", other_handle.clone());
+    assert!(refused.known_pre_dispatch_error().is_some());
+    assert!(refused
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(selected.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(other.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger(&fixture).total_charged, 0);
+    assert!(ledger(&fixture).reservations.is_empty());
+
+    // A changed inherited policy must refuse at dispatch before the Work
+    // decorator reserves, even when preflight had admitted the prior policy.
+    let permitted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let policy_state = permitted.clone();
+    let replacement = other_handle.clone();
+    let changing: crate::runtime::config::GoldTargetResolver = Arc::new(move |_, delegate| {
+        if policy_state.load(Ordering::SeqCst) {
+            delegate
+        } else {
+            replacement.clone()
+        }
+    });
+    let mut changing_config = AgentLoopConfig {
+        app_data_dir: Some(fixture.dir.path().to_path_buf()),
+        gold_target_resolver: Some(crate::runtime::agent::compose_child_gold_policy(
+            Some(changing),
+            Arc::new(|_, delegate| delegate),
+        )),
+        ..Default::default()
+    };
+    let changing_delegate = budget.decorate(&mut changing_config, main.clone());
+    crate::runtime::runtime::bind_child_gold_delegate(
+        &mut changing_config,
+        Some(&main),
+        &main,
+        &changing_delegate,
+    )
+    .unwrap();
+    let changing_gold =
+        changing_config.gold_target_resolver.as_ref().unwrap()("fixture-model", main.clone());
+    assert!(changing_gold.known_pre_dispatch_error().is_none());
+    permitted.store(false, Ordering::SeqCst);
+    assert!(changing_gold
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert!(changing_gold.local_dispatch_refused());
+    assert_eq!(selected.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(other.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(ledger(&fixture).total_charged, 0);
+    assert!(ledger(&fixture).reservations.is_empty());
+
+    // An admitted transparent wrapper must remain in the path and settle
+    // exactly the one shared Work reservation around the selected provider.
+    let wrapper_calls = Arc::new(AtomicUsize::new(0));
+    let policy_calls = wrapper_calls.clone();
+    let policy: crate::runtime::config::GoldTargetResolver = Arc::new(move |_, delegate| {
+        Arc::new(FixedGoldPolicyWrapper {
+            inner: delegate,
+            calls: policy_calls.clone(),
+        })
+    });
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(fixture.dir.path().to_path_buf()),
+        gold_target_resolver: Some(crate::runtime::agent::compose_child_gold_policy(
+            Some(policy),
+            Arc::new(|_model, delegate| delegate),
+        )),
+        ..Default::default()
+    };
+    let decorated = budget.decorate(&mut config, main.clone());
+    crate::runtime::runtime::bind_child_gold_delegate(&mut config, Some(&main), &main, &decorated)
+        .unwrap();
+    let gold = config.gold_target_resolver.as_ref().unwrap()("fixture-model", other_handle);
+    let mut stream = gold
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .unwrap();
+    assert_eq!(selected.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(other.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(wrapper_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger(&fixture).total_charged, 140);
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    assert_eq!(ledger(&fixture).total_charged, 30);
 }

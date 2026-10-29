@@ -10,9 +10,12 @@ use crate::runtime::goal_state::{
 };
 use crate::runtime::gold_evaluation::{
     apply_gold_evaluation_result, build_async_gold_evaluation_request, evaluate_gold_with_dispatch,
-    execute_async_gold_evaluation, AsyncGoldEvaluationRequest, GoldEvaluationResult,
+    execute_async_gold_evaluation_with_terminal, AsyncGoldEvaluationRequest, GoldEvaluationResult,
+    GoldEvaluationTerminal,
 };
-use crate::runtime::runner::loop_execution::startup::{InFlightGoldEvaluation, LoopRunState};
+use crate::runtime::runner::loop_execution::startup::{
+    InFlightGoldEvaluation, LoopRunState, QueuedEvaluation,
+};
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::{
     AgentError, AgentEvent, GoldCheckpoint, GoldConfidence, GoldDecision, Message, Session,
@@ -20,6 +23,30 @@ use bamboo_agent_core::{
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::RoundStatus as MetricsRoundStatus;
+
+/// Preserve the account paired with a Gold model selection. A dedicated Gold
+/// model belongs to the executing account; otherwise use the Fast provider,
+/// including a rejecting provider when Fast routing failed. SDK callers that
+/// only specify a model continue to use the executing provider.
+pub(super) fn select_gold_evaluation_provider(
+    config: &AgentLoopConfig,
+    main: &Arc<dyn LLMProvider>,
+    fast: Option<&Arc<dyn LLMProvider>>,
+) -> Arc<dyn LLMProvider> {
+    if let Some(model) = config
+        .gold_config
+        .as_ref()
+        .and_then(|gold| gold.model_name.as_deref())
+    {
+        config
+            .gold_target_resolver
+            .as_ref()
+            .map(|resolve| resolve(model, main.clone()))
+            .unwrap_or_else(|| main.clone())
+    } else {
+        fast.cloned().unwrap_or_else(|| main.clone())
+    }
+}
 
 /// Outcome of the terminal goal gate evaluated when the agent produces no tool
 /// calls (i.e. it would otherwise complete the run).
@@ -108,10 +135,33 @@ pub(super) async fn evaluate_gold_terminal(
         return GoldTerminalDecision::Stop;
     }
 
-    // Side-channel double-check: re-verify achievement at the stop boundary.
-    let model_name = gold_config.model_name.as_deref().unwrap_or(eval_model);
+    // Take a new complete Fast pair at the terminal boundary. An explicitly
+    // selected Gold model still uses the execution's original Gold guard.
+    // Without a live resolver the SDK keeps its previously supplied pair.
+    let (model_name, llm) = if config.auxiliary_model_resolver.is_some() {
+        let auxiliary = config.resolve_auxiliary_models();
+        let model = gold_config
+            .model_name
+            .as_deref()
+            .or(auxiliary.fast_model_name.as_deref())
+            .or(config.model_name.as_deref())
+            .unwrap_or(&session.model)
+            .to_string();
+        let provider =
+            select_gold_evaluation_provider(config, &llm, auxiliary.fast_model_provider.as_ref());
+        (model, provider)
+    } else {
+        (
+            gold_config
+                .model_name
+                .as_deref()
+                .unwrap_or(eval_model)
+                .to_string(),
+            llm,
+        )
+    };
     let budget_provider = llm.clone();
-    let budget_model = model_name.to_string();
+    let budget_model = model_name.clone();
     let acquire_dispatch_guard = async move {
         crate::runtime::runner::auxiliary_budget::acquire(
             &budget_provider,
@@ -128,11 +178,11 @@ pub(super) async fn evaluate_gold_terminal(
         &crate::runtime::gold_evaluation::GoldEvalFrame {
             event_tx,
             session_id,
-            model: model_name,
+            model: &model_name,
             timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::new(
                 config.stream_timeout,
                 config.provider_name.as_deref(),
-                Some(model_name),
+                Some(&model_name),
             ),
             reasoning_effort,
             checkpoint: GoldCheckpoint::Terminal,
@@ -331,8 +381,16 @@ pub(super) async fn poll_completed_gold_evaluation(state: &mut LoopRunState) {
     };
 
     match in_flight.join_handle.await {
-        Ok(Some(result)) => {
+        Ok(Some(Ok(result))) => {
             state.gold_evaluation.completed = Some(result);
+        }
+        Ok(Some(Err(error))) => {
+            tracing::warn!(
+                "[{}] Async Gold evaluation refused for round {}: {}",
+                state.session_id,
+                in_flight.request.round_number,
+                error
+            );
         }
         Ok(None) => {
             // The run was cancelled while this Gold evaluation was in flight; the
@@ -422,6 +480,8 @@ fn spawn_gold_evaluation_request(
     let session_id = state.session_id.clone();
     let event_tx = event_tx.clone();
     let request_for_spawn = request.clone();
+    let terminal_claimed = Arc::new(GoldEvaluationTerminal::default());
+    let task_terminal_claimed = terminal_claimed.clone();
     // Thread the run's cancel token into the detached eval. A cancel makes the
     // `select!` resolve to `None` at the first await point, dropping the in-flight
     // LLM request future so a cancelled run stops the wasted spend instead of
@@ -432,11 +492,12 @@ fn spawn_gold_evaluation_request(
         tokio::select! {
             biased;
             _ = cancel_token.cancelled() => None,
-            result = execute_async_gold_evaluation(
+            result = execute_async_gold_evaluation_with_terminal(
                 request_for_spawn,
                 llm,
                 event_tx,
                 configured_limit,
+                task_terminal_claimed,
             ) => Some(result),
         }
     });
@@ -449,6 +510,7 @@ fn spawn_gold_evaluation_request(
 
     state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
         request,
+        terminal_claimed,
         join_handle,
     });
 }
@@ -457,6 +519,7 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
     state: &mut LoopRunState,
     event_tx: &mpsc::Sender<AgentEvent>,
     llm: Arc<dyn LLMProvider>,
+    config: &AgentLoopConfig,
     cancel_token: CancellationToken,
     configured_limit: usize,
 ) {
@@ -464,15 +527,35 @@ pub(super) fn start_queued_gold_evaluation_if_idle(
         return;
     }
 
-    let Some(request) = state.gold_evaluation.queued_request.take() else {
+    let Some(queued) = state.gold_evaluation.queued_request.take() else {
         return;
     };
-
+    // A dedicated Gold model belongs to the executing provider. Without one,
+    // the target is the current complete Fast pair, with main fallback only
+    // when the SDK left that part unset.
+    let current_model = config
+        .gold_config
+        .as_ref()
+        .filter(|gold| gold.enabled)
+        .map(|gold| {
+            gold.model_name
+                .as_deref()
+                .or(state.auxiliary_models.fast_model_name.as_deref())
+                .unwrap_or(state.model_name.as_str())
+        });
+    let Some(_admitted) = current_model.and_then(|model| queued.current_provider(llm, model))
+    else {
+        tracing::warn!(
+            "[{}] Dropped queued Gold evaluation after its model or provider changed",
+            state.session_id
+        );
+        return;
+    };
     spawn_gold_evaluation_request(
         state,
         event_tx,
-        request,
-        llm,
+        queued.request,
+        queued.provider,
         cancel_token,
         configured_limit,
     );
@@ -519,12 +602,20 @@ pub(super) fn spawn_gold_evaluation_if_needed(
     };
 
     if state.gold_evaluation.in_flight.is_some() {
-        state.gold_evaluation.queued_request = Some(request);
-        tracing::debug!(
-            "[{}] Queued latest async Gold evaluation snapshot for round {} while another evaluation is still in flight",
-            state.session_id,
-            turn + 1
-        );
+        let model_name = request.model_name.clone();
+        state.gold_evaluation.queued_request = QueuedEvaluation::new(request, llm, model_name);
+        if state.gold_evaluation.queued_request.is_some() {
+            tracing::debug!(
+                "[{}] Queued latest async Gold evaluation for round {}",
+                state.session_id,
+                turn + 1
+            );
+        } else {
+            tracing::warn!(
+                "[{}] Could not bind the queued Gold evaluation to a stable provider",
+                state.session_id
+            );
+        }
         return Ok(());
     }
 
@@ -643,6 +734,191 @@ mod tests {
             }),
             ..AgentLoopConfig::default()
         }
+    }
+
+    async fn synthetic_rejected_fast() -> (String, Arc<dyn LLMProvider>) {
+        let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+        let mut config = routing.config.read().await.clone();
+        config.provider_instances.get_mut("fast-b").unwrap().enabled = false;
+        let (model, provider) = crate::model_config_helper::resolve_fast_model_for_runner(
+            Some(&config),
+            "chat-a",
+            &routing.registry,
+        );
+        (model.unwrap(), provider.unwrap())
+    }
+
+    #[tokio::test]
+    async fn terminal_refused_fast_uses_existing_failure_path_before_gold_started() {
+        let (model, provider) = synthetic_rejected_fast().await;
+        let mut session = Session::new("s", "model");
+        let config = gold_continue_config();
+        let (tx, mut rx) = mpsc::channel(16);
+        let decision = evaluate_gold_terminal(
+            &mut session,
+            &None,
+            &config,
+            &model,
+            None,
+            "s",
+            1,
+            provider,
+            &tx,
+        )
+        .await;
+        assert!(matches!(decision, GoldTerminalDecision::Stop));
+        let state = read_goal_state(&session).unwrap();
+        assert_eq!(state.status, GoalRuntimeStatus::NeedInput);
+        assert!(
+            state.eval_history.is_empty(),
+            "a refusal is not a Gold verdict"
+        );
+        while let Ok(event) = rx.try_recv() {
+            assert!(!matches!(
+                event,
+                AgentEvent::GoldEvaluationStarted { .. }
+                    | AgentEvent::GoldEvaluationCompleted { .. }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_refused_fast_is_not_harvested_or_persisted_as_gold_success() {
+        use futures::StreamExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CallableProvider(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LLMProvider for CallableProvider {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::pin(stream::iter([Ok(LLMChunk::Done)])))
+            }
+        }
+
+        let (model, provider) = synthetic_rejected_fast().await;
+        let mut session = Session::new("queued-gold-fixture", "model");
+        let metadata_before = session.metadata.clone();
+        let config = AgentLoopConfig {
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let request = build_async_gold_evaluation_request(
+            &None,
+            &session,
+            &session.id,
+            1,
+            Some(&model),
+            None,
+            GoldCheckpoint::PostRound,
+            &GoldConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut state = crate::runtime::runner::loop_execution::startup::LoopRunState {
+            session_id: session.id.clone(),
+            execution_id: "queued-gold-fixture-run".into(),
+            current_inputs: None,
+            model_name: "model".into(),
+            metrics_collector: None,
+            debug_logger: crate::runtime::runner::logging::DebugLogger::new(false),
+            task_context: None,
+            overflow_recovery: Default::default(),
+            task_evaluation: Default::default(),
+            gold_evaluation: crate::runtime::runner::loop_execution::startup::GoldEvaluationState {
+                queued_request: QueuedEvaluation::new(
+                    request.clone(),
+                    provider.clone(),
+                    model.clone(),
+                ),
+                ..Default::default()
+            },
+            auxiliary_models: crate::runtime::config::AuxiliaryModelConfig {
+                fast_model_name: Some(model.clone()),
+                ..Default::default()
+            },
+            runtime_state: bamboo_domain::AgentRuntimeState::new(session.id.clone()),
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let held = crate::runtime::runner::auxiliary_budget::acquire(&provider, &model, 1).await;
+        start_queued_gold_evaluation_if_idle(
+            &mut state,
+            &tx,
+            provider.clone(),
+            &config,
+            CancellationToken::new(),
+            1,
+        );
+        // The refusal is handled synchronously while the permit remains held;
+        // no evaluation is spawned or left waiting for that permit.
+        assert!(state.gold_evaluation.queued_request.is_none());
+        assert!(state.gold_evaluation.in_flight.is_none());
+        poll_completed_gold_evaluation(&mut state).await;
+        apply_completed_gold_evaluation(&mut session, &config, &mut state).await;
+        assert!(state.gold_evaluation.completed.is_none());
+        assert_eq!(session.metadata, metadata_before);
+        assert!(rx.try_recv().is_err());
+        drop(held);
+
+        // Prove the next provider can actually be called before checking
+        // cancellation. Its zero count below cannot be a routing refusal.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callable: Arc<dyn LLMProvider> = Arc::new(CallableProvider(calls.clone()));
+        assert!(callable.known_pre_dispatch_error().is_none());
+        let mut stream = callable.chat_stream(&[], &[], None, &model).await.unwrap();
+        assert!(matches!(stream.next().await, Some(Ok(LLMChunk::Done))));
+        assert!(stream.next().await.is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        calls.store(0, Ordering::SeqCst);
+
+        // A run already cancelled before the queued task is polled must not
+        // dispatch or emit a Gold Started/Completed event either.
+        state.gold_evaluation.queued_request =
+            QueuedEvaluation::new(request, callable.clone(), model.clone());
+        assert!(state.gold_evaluation.queued_request.is_some());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        start_queued_gold_evaluation_if_idle(&mut state, &tx, callable, &config, cancelled, 1);
+        assert!(
+            state.gold_evaluation.in_flight.is_some(),
+            "the valid route reaches the cancellable task"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .unwrap()
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        poll_completed_gold_evaluation(&mut state).await;
+        assert!(state.gold_evaluation.completed.is_none());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "cancelled work never calls the valid provider"
+        );
+        assert_eq!(session.metadata, metadata_before);
+        assert!(rx.try_recv().is_err());
     }
 
     /// Seed the durable goal state so a test can exercise a specific declared

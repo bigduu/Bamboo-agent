@@ -116,19 +116,8 @@ pub(crate) async fn collect_model_json(
 pub(crate) fn resolve_background_model(
     ctx: &AutoDreamContext,
     config_snapshot: &Config,
-) -> Option<(Arc<dyn LLMProvider>, String)> {
-    if config_snapshot.features.provider_model_ref && config_snapshot.defaults.is_some() {
-        crate::model_config_helper::resolve_background_model(
-            config_snapshot,
-            config_snapshot.effective_default_provider(),
-            &ctx.provider_registry,
-        )
-        .map(|resolved| (resolved.provider, resolved.model_name))
-    } else {
-        config_snapshot
-            .get_memory_background_model()
-            .map(|model| (ctx.provider.clone(), model))
-    }
+) -> Result<Option<(Arc<dyn LLMProvider>, String)>, String> {
+    crate::auto_dream::resolve_background_target(ctx, config_snapshot)
 }
 
 pub async fn run_gardener_once(
@@ -230,7 +219,11 @@ async fn run_gardener_once_with_store_and_resolver(
         return Ok(Some(result));
     }
 
-    let Some((provider, model)) = resolve_background_model(ctx, &config_snapshot) else {
+    let resolved_background = {
+        let current_config = ctx.config.read().await;
+        resolve_background_model(ctx, &current_config)?
+    };
+    let Some((provider, model)) = resolved_background else {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "run_skip",
@@ -374,7 +367,11 @@ async fn run_dedup_gardener_once_with_store_and_resolver(
         return Ok(Some(result));
     }
 
-    let Some((provider, model)) = resolve_background_model(ctx, &config_snapshot) else {
+    let resolved_background = {
+        let current_config = ctx.config.read().await;
+        resolve_background_model(ctx, &current_config)?
+    };
+    let Some((provider, model)) = resolved_background else {
         tracing::warn!(
             target: GARDENER_TRACING_TARGET,
             event = "dedup_run_skip",
@@ -769,6 +766,154 @@ mod tests {
         let mut config = Config::default();
         *config.memory_mut() = Some(memory);
         config
+    }
+
+    struct PausedProjects {
+        reached: tokio::sync::Barrier,
+        release: tokio::sync::Barrier,
+    }
+
+    #[async_trait]
+    impl crate::project_context::ProjectContextSource for PausedProjects {
+        async fn find_project(
+            &self,
+            _id: &bamboo_domain::ProjectId,
+        ) -> Result<
+            Option<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            Ok(None)
+        }
+        async fn list_projects(
+            &self,
+        ) -> Result<
+            Vec<crate::project_context::ProjectDescriptor>,
+            crate::project_context::ProjectContextError,
+        > {
+            self.reached.wait().await;
+            self.release.wait().await;
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn gardeners_use_current_background_route_after_candidate_scan() {
+        use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+        for dedup in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let state = RoutingContext::new(None);
+            {
+                let mut config = state.config.write().await;
+                let memory = config.memory_mut().get_or_insert_with(Default::default);
+                memory.gardener_enabled = true;
+                memory.gardener_min_sections = 2;
+                memory.dedup_gardener_enabled = true;
+                memory.dedup_gardener_min_score = 0.3;
+            }
+            *state.providers["memory-c"].failure.lock().unwrap() = Some(Failure::Auth);
+            let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+            let memory = MemoryStore::new(temp.path().join("jiandu"));
+            if dedup {
+                for (title, body) in [
+                    (
+                        "freeze v1",
+                        "Mobile release freeze begins Tuesday for the cut.",
+                    ),
+                    (
+                        "freeze v2",
+                        "Mobile release freeze starts Tuesday for the release cut.",
+                    ),
+                ] {
+                    memory
+                        .write_memory(
+                            MemoryScope::Global,
+                            None,
+                            DurableMemoryType::Project,
+                            title,
+                            body,
+                            &[],
+                            Some("fixture"),
+                            "test",
+                            false,
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+            } else {
+                let blob = memory
+                    .write_memory(
+                        MemoryScope::Global,
+                        None,
+                        DurableMemoryType::User,
+                        "fixture blob",
+                        "fact one",
+                        &[],
+                        Some("fixture"),
+                        "test",
+                        false,
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                for text in ["fact two", "fact three", "fact four"] {
+                    memory
+                        .merge_memory(
+                            &blob.frontmatter.id,
+                            None,
+                            text,
+                            &[],
+                            Some("fixture"),
+                            "test",
+                            &[],
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let ctx = AutoDreamContext {
+                session_store: store.clone(),
+                storage: store,
+                memory: memory.clone(),
+                provider: state.providers["chat-a"].clone(),
+                config: state.config.clone(),
+                provider_registry: state.registry.clone(),
+            };
+            let paused = Arc::new(PausedProjects {
+                reached: tokio::sync::Barrier::new(2),
+                release: tokio::sync::Barrier::new(2),
+            });
+            let resolver = crate::project_context::ProjectContextResolver::new(paused.clone());
+            let run = async {
+                if dedup {
+                    run_dedup_gardener_once_with_store_and_resolver(&ctx, &memory, Some(&resolver))
+                        .await
+                        .map(|_| ())
+                } else {
+                    run_gardener_once_with_store_and_resolver(&ctx, &memory, Some(&resolver))
+                        .await
+                        .map(|_| ())
+                }
+            };
+            let update = async {
+                tokio::time::timeout(Duration::from_secs(5), paused.reached.wait())
+                    .await
+                    .unwrap();
+                state
+                    .config
+                    .write()
+                    .await
+                    .defaults
+                    .as_mut()
+                    .unwrap()
+                    .memory_background =
+                    Some(bamboo_domain::ProviderModelRef::new("missing", "unknown"));
+                paused.release.wait().await;
+            };
+            let (result, ()) = tokio::join!(run, update);
+            assert!(result.is_err(), "dedup={dedup}");
+            state.assert_no_requests();
+        }
     }
 
     #[test]

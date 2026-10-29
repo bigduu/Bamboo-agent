@@ -567,6 +567,18 @@ struct ConnectResumePort {
     ctx: ConnectContext,
 }
 
+fn connect_resume_auxiliary_model_resolver(
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    registry: Arc<bamboo_llm::ProviderRegistry>,
+    provider_name: &str,
+) -> Arc<dyn Fn() -> bamboo_engine::AuxiliaryModelConfig + Send + Sync> {
+    bamboo_engine::model_areas::live_auxiliary_model_resolver(
+        config,
+        registry,
+        provider_name.to_owned(),
+    )
+}
+
 #[async_trait::async_trait]
 impl ResumeExecutionPort for ConnectResumePort {
     async fn prepare_response_execution(
@@ -675,6 +687,23 @@ impl ResumeExecutionPort for ConnectResumePort {
             ),
         };
 
+        // Both continuation paths keep Fast tied to the resumed run's key.
+        let auxiliary_model_resolver = connect_resume_auxiliary_model_resolver(
+            self.ctx.config.clone(),
+            self.ctx.provider_registry.clone(),
+            &config.provider_name,
+        );
+        let resume_resolver = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
+            self.ctx.config.clone(),
+            self.ctx.provider_registry.clone(),
+            config.provider_name.clone(),
+        );
+        let resume_agent = Arc::new(
+            self.ctx
+                .agent
+                .with_resume_auxiliary_resolver(resume_resolver),
+        );
+
         let (mpsc_tx, _forwarder_handle, mut history_commit_barrier) =
             create_event_forwarder_with_root_actor(
                 session_id.clone(),
@@ -728,7 +757,7 @@ impl ResumeExecutionPort for ConnectResumePort {
             }
             consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
-                agent: self.ctx.agent.clone(),
+                agent: resume_agent.clone(),
                 session_id,
                 session,
                 execution_reservation,
@@ -737,7 +766,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source: "connect_resume".to_string(),
-                auxiliary_model_resolver: None,
+                auxiliary_model_resolver: Some(auxiliary_model_resolver.clone()),
                 disabled_filter_resolver: None,
                 disabled_tools: Some(config.disabled_tools.clone()),
                 disabled_skill_ids: Some(config.disabled_skill_ids.clone()),
@@ -1111,7 +1140,7 @@ impl ResumeExecutionPort for ConnectResumePort {
 
             consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
-                agent: ctx.agent.clone(),
+                agent: resume_agent,
                 session_id,
                 session,
                 execution_reservation,
@@ -1120,7 +1149,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source: "connect_resume".to_string(),
-                auxiliary_model_resolver: None,
+                auxiliary_model_resolver: Some(auxiliary_model_resolver),
                 disabled_filter_resolver: None,
                 disabled_tools: Some(config.disabled_tools.clone()),
                 disabled_skill_ids: Some(config.disabled_skill_ids.clone()),
@@ -1170,6 +1199,188 @@ fn apply_tool_result(
 
 #[cfg(test)]
 mod tests {
+
+    // Consumer-level resolver/dispatch regression; it does not launch an
+    // approval session or claim an end-to-end Connect resume.
+    #[tokio::test]
+    async fn connect_resume_fast_rejects_invalid_or_busy_route_without_main_fallback() {
+        use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions, LLMStream, ProviderRegistry};
+        use futures::StreamExt;
+        use serde_json::json;
+        use std::time::Duration;
+        use tokio::sync::RwLock;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        async fn dispatch(
+            selected: bamboo_engine::AuxiliaryModelConfig,
+            main: Arc<dyn LLMProvider>,
+        ) -> Result<(), LLMError> {
+            let model = selected.fast_model_name.unwrap_or_else(|| "main-a".into());
+            let provider = selected.fast_model_provider.unwrap_or(main);
+            let options = LLMRequestOptions {
+                request_purpose: Some("task_evaluation".into()),
+                ..Default::default()
+            };
+            let mut stream: LLMStream = provider
+                .chat_stream_with_options(
+                    &[Message::user("synthetic Connect resume Fast")],
+                    &[],
+                    Some(32),
+                    &model,
+                    Some(&options),
+                )
+                .await?;
+            while let Some(chunk) = stream.next().await {
+                chunk?;
+            }
+            Ok(())
+        }
+
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        for server in [&a, &b] {
+            Mock::given(method("POST"))
+                .and(path("/chat/completions"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(concat!(
+                            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                            "data: [DONE]\n\n",
+                        )),
+                )
+                .mount(server)
+                .await;
+        }
+        let home = tempfile::tempdir().unwrap();
+        let mut baseline = bamboo_llm::Config::default();
+        baseline.provider = "account-a".into();
+        baseline.default_provider_instance = Some("account-a".into());
+        baseline.http_proxy = "http://127.0.0.1:9".into();
+        baseline.https_proxy.clear();
+        baseline.proxy_auth = None;
+        baseline.defaults = Some(
+            serde_json::from_value(json!({
+                "chat": {"provider": "account-a", "model": "main-a"},
+                "fast": {"provider": "account-b", "model": "cheap-b"}
+            }))
+            .unwrap(),
+        );
+        for (name, model, server) in [("account-a", "main-a", &a), ("account-b", "cheap-b", &b)] {
+            baseline.provider_instances.insert(
+                name.into(),
+                serde_json::from_value(json!({
+                    "provider_type": "openai", "enabled": true,
+                    "api_key": "synthetic-connect-only", "base_url": server.uri(),
+                    "model": model, "runtime_models": [model]
+                }))
+                .unwrap(),
+            );
+        }
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&baseline, home.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let main = registry.get("account-a").unwrap();
+        let mut session = Session::new("connect-resume-fast", "main-a");
+        session.set_provider_name("account-a");
+        let resume = resolve_resume_config_snapshot(&baseline, &registry, &session, None);
+        assert_eq!(resume.provider_name, "account-a");
+        let live = Arc::new(RwLock::new(baseline.clone()));
+        let resolver = connect_resume_auxiliary_model_resolver(
+            live.clone(),
+            registry.clone(),
+            &resume.provider_name,
+        );
+        let selected = resolver();
+        assert_eq!(selected.fast_model_name.as_deref(), Some("cheap-b"));
+        tokio::time::timeout(Duration::from_secs(5), dispatch(selected, main.clone()))
+            .await
+            .expect("valid Fast dispatch timeout")
+            .expect("valid Fast reaches B");
+        assert_eq!(a.received_requests().await.unwrap().len(), 0);
+        assert_eq!(b.received_requests().await.unwrap().len(), 1);
+
+        let guard = live.write().await;
+        let blocked = resolver();
+        drop(guard);
+        let result = tokio::time::timeout(Duration::from_secs(5), dispatch(blocked, main.clone()))
+            .await
+            .expect("busy Fast dispatch timeout");
+        assert!(matches!(result, Err(LLMError::Api(_))));
+        assert_eq!(a.received_requests().await.unwrap().len(), 0);
+        assert_eq!(b.received_requests().await.unwrap().len(), 1);
+
+        for invalid in ["disabled", "not_admitted"] {
+            let mut current = baseline.clone();
+            let instance = current.provider_instances.get_mut("account-b").unwrap();
+            if invalid == "disabled" {
+                instance.enabled = false;
+            } else {
+                instance
+                    .extra
+                    .insert("runtime_models".into(), json!(["other-b"]));
+            }
+            *live.write().await = current;
+            let result =
+                tokio::time::timeout(Duration::from_secs(5), dispatch(resolver(), main.clone()))
+                    .await
+                    .expect("invalid Fast dispatch timeout");
+            assert!(result.is_err(), "{invalid} must reject");
+            assert_eq!(a.received_requests().await.unwrap().len(), 0);
+            assert_eq!(b.received_requests().await.unwrap().len(), 1);
+        }
+        let requests = b.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], "cheap-b");
+    }
+
+    // Exercise the resolver constructed for a Connect resume. This stops at
+    // the resolver boundary; it is not an approval-session E2E test.
+    #[tokio::test]
+    async fn connect_resume_legacy_background_keeps_session_provider_live() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let mut session = bamboo_agent_core::Session::new("resume-fixture", "chat-b");
+        session.model_ref = Some(bamboo_domain::ProviderModelRef::new("account-b", "chat-b"));
+        session.set_provider_name("account-b");
+        let snapshot =
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture.config.read())
+                .await
+                .expect("config snapshot timeout")
+                .clone();
+        assert_eq!(snapshot.effective_default_provider(), "account-a");
+        let resume = resolve_resume_config_snapshot(&snapshot, &fixture.registry, &session, None);
+        assert_eq!(resume.provider_name, "account-b");
+        assert_eq!(resume.background_model.as_deref(), Some("memory-only"));
+        assert!(resume
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                fixture
+                    .registry
+                    .get("account-b")
+                    .is_some_and(|b| Arc::ptr_eq(provider, &b))
+            }));
+        let missing = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+            "account-missing".into(),
+        );
+        let (_, missing_background) = missing();
+        assert!(missing_background.is_none());
+        let resolver = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+            resume.provider_name,
+        );
+        // The callback captures the session's B key, not the global A key.
+        fixture
+            .verify_resume_background(Arc::new(move || resolver().1))
+            .await;
+    }
+
     use bamboo_agent_core::tools::{FunctionCall, ToolCall};
     use bamboo_agent_core::Message;
 
