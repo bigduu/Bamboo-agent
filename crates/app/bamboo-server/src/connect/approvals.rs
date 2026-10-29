@@ -2699,33 +2699,60 @@ mod tests {
         use crate::app_state::resume_adapter::supervisor_tests::{Fixture, CALL};
         for inherited in [false, true] {
             let fixture = Box::pin(Fixture::pending()).await;
-            fixture.state.config.write().await.provider_instances.insert(
-                "test-provider".into(),
-                serde_json::from_value(serde_json::json!({
-                    "provider_type":"openai", "enabled":true, "model":"test-model",
-                    "runtime_models":["test-model"]
-                })).unwrap(),
-            );
+            fixture
+                .state
+                .config
+                .write()
+                .await
+                .provider_instances
+                .insert(
+                    "test-provider".into(),
+                    serde_json::from_value(serde_json::json!({
+                        "provider_type":"openai", "enabled":true, "model":"test-model",
+                        "runtime_models":["test-model"]
+                    }))
+                    .unwrap(),
+                );
             let mut session = fixture.reload().await;
             bamboo_engine::session_app::provider_model::persist_model_ref(
                 &mut session,
                 &bamboo_domain::ProviderModelRef::new("test-provider", "test-model"),
             );
             if inherited {
-                let runtime = session.agent_runtime_state.get_or_insert_with(||
-                    bamboo_domain::AgentRuntimeState::new("legacy-supervisor"));
-                runtime.waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
-                    vec!["ordinary-child".into()], bamboo_domain::ChildWaitPolicy::All, chrono::Utc::now(),
-                ));
+                let runtime = session.agent_runtime_state.get_or_insert_with(|| {
+                    bamboo_domain::AgentRuntimeState::new("legacy-supervisor")
+                });
+                runtime.waiting_for_children =
+                    Some(bamboo_domain::WaitingForChildrenState::for_children(
+                        vec!["ordinary-child".into()],
+                        bamboo_domain::ChildWaitPolicy::All,
+                        chrono::Utc::now(),
+                    ));
             }
             fixture.state.session_repo.save(&mut session).await.unwrap();
+            let stored = fixture.reload().await;
+            assert_eq!(
+                bamboo_domain::InheritedChildWait::capture(&stored).is_some(),
+                inherited
+            );
             let responder = EngineResponder::new(supervisor_context(&fixture.state));
-            let outcome = responder.respond_and_resume(&session.id, Some(CALL), "Approve".into()).await;
+            let outcome = responder
+                .respond_and_resume(&session.id, Some(CALL), "Approve".into())
+                .await;
             assert!(matches!(outcome, Err(ResponderError::Other(ref message))
                 if message.contains("no bound startup writer") && message.contains("answer not consumed")));
             let saved = fixture.reload().await;
-            assert_eq!(saved.pending_question.as_ref().map(|ask| ask.tool_call_id.as_str()), Some(CALL));
-            assert!(saved.messages.iter().rev()
+            assert_eq!(
+                saved
+                    .pending_question
+                    .as_ref()
+                    .map(|ask| ask.tool_call_id.as_str()),
+                Some(CALL)
+            );
+            assert!(saved
+                .messages
+                .iter()
+                .rev()
                 .find(|message| message.tool_call_id.as_deref() == Some(CALL))
                 .and_then(|message| message.metadata.as_ref())
                 .is_none_or(|metadata| metadata.get("permission_decision_receipt").is_none()));
