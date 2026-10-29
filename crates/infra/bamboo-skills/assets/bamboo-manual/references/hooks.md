@@ -12,8 +12,9 @@ their schemas or translate timeout units implicitly.
 Native lifecycle handlers support command and external script execution, JSON
 stdin and event-specific responses. Their timeout field is `timeout_ms` in
 milliseconds. Events include SessionStart, SessionEnd, UserPromptSubmit,
-PreToolUse, PostToolUse, Stop, PreCompact and Notification. The global native
-lifecycle switch defaults to disabled. Runs snapshot lifecycle configuration
+PreToolUse, PostToolUse, Stop, PreCompact, Notification and the Bamboo-specific
+observer BambooModelCallUsage. The global native lifecycle switch defaults to
+disabled. Runs snapshot lifecycle configuration
 at their established runtime boundary; changing settings is not proof that an
 already running loop has adopted them.
 
@@ -69,10 +70,18 @@ events cannot change a settled result. An authorized settings dry-run can
 check the selected runtime and captured output without persisting the handler;
 review the code first because that check actually executes it.
 
+For `BambooModelCallUsage`, native handlers read usage from
+`payload.observation.usage`; `cache_read_input_tokens` and
+`cache_creation_input_tokens` are input subsets. Missing or null counts mean
+unknown, not zero. The event is a best-effort observer and its output cannot
+change the model call. Deduplicate deliveries by `observation.event_id`.
+
 ## Portable plugin command hooks
 
-The supported phase-one subset is synchronous command hooks on
-UserPromptSubmit, PreToolUse, PostToolUse and Stop. The portable `timeout` is an
+The phase-one control subset is synchronous command hooks on UserPromptSubmit,
+PreToolUse, PostToolUse and Stop. Bamboo also supports the read-only,
+best-effort `BambooModelCallUsage` observer extension for reviewed plugins;
+its usage observation is at the top-level `observation` key. The portable `timeout` is an
 explicit 1–600 seconds. Native `timeout_ms` does not apply to that schema.
 Unsupported events, output shapes and matcher features must be reported rather
 than treated as general Claude/Codex compatibility. There is no automatic
@@ -95,6 +104,7 @@ Enabling a hook, posting a review receipt or executing a test requires its own
 authorization; reading this chapter never provides it.
 
 Source: `docs/lifecycle-hooks.md`, `docs/plugin-command-hooks.md`,
+`docs/guides/LOCAL_TRACE_INSPECTION.md`,
 `crates/infra/bamboo-hooks/src/configured.rs`,
 `crates/infra/bamboo-plugin/examples/portable-hooks`,
 `crates/app/bamboo-server/src/handlers/settings/lifecycle_hooks.rs`.

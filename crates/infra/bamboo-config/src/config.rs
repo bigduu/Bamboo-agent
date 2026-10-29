@@ -2552,7 +2552,7 @@ pub const MIN_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 1;
 pub const MAX_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 600_000;
 
 /// Stable user-facing event keys accepted by `lifecycle_hooks`.
-pub const LIFECYCLE_HOOK_EVENT_NAMES: [&str; 8] = [
+pub const LIFECYCLE_HOOK_EVENT_NAMES: [&str; 9] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -2561,6 +2561,7 @@ pub const LIFECYCLE_HOOK_EVENT_NAMES: [&str; 8] = [
     "SessionEnd",
     "PreCompact",
     "Notification",
+    "BambooModelCallUsage",
 ];
 
 fn default_lifecycle_hook_timeout_ms() -> u64 {

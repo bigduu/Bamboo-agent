@@ -575,6 +575,64 @@ fn provider_issue(
 mod tests {
     use super::*;
 
+    #[actix_web::test]
+    async fn lifecycle_usage_event_validation_accepts_valid_and_rejects_invalid_handlers() {
+        use actix_web::{http::StatusCode, test, App};
+
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(App::new().app_data(state).route(
+            "/config/validate",
+            web::post().to(validate_bamboo_config_patch),
+        ))
+        .await;
+
+        for (command, expected_valid) in [("true", true), ("", false)] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri("/config/validate")
+                    .set_json(serde_json::json!({
+                        "lifecycle_hooks": {
+                            "enabled": true,
+                            "BambooModelCallUsage": [{
+                                "hooks": [{"type": "command", "command": command}]
+                            }]
+                        }
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["valid"], expected_valid, "{body}");
+            if !expected_valid {
+                assert_eq!(
+                    body["errors"]["lifecycle_hooks"][0]["path"],
+                    "lifecycle_hooks.BambooModelCallUsage[0].hooks[0].command"
+                );
+            }
+        }
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/config/validate")
+                .set_json(serde_json::json!({
+                    "lifecycle_hooks": {"UnrecognizedUsage": []}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["valid"], false, "{body}");
+        assert_eq!(
+            body["errors"]["lifecycle_hooks"][0]["path"],
+            "lifecycle_hooks.UnrecognizedUsage"
+        );
+    }
+
     #[test]
     fn lifecycle_script_shape_accepts_documented_runners() {
         for (path, runner) in [
