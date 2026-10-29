@@ -393,6 +393,15 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
                     }
                 }
                 if let Some(mut target) = inherited {
+                    if target.provider.trim().is_empty()
+                        || target.model.trim().is_empty()
+                        || target.model.trim() == "unknown"
+                    {
+                        return Err(
+                            "invalid headless inherited provider/model reference".to_string()
+                        );
+                    }
+                    target.model = target.model.trim().to_string();
                     target.provider =
                         bamboo_engine::model_config_helper::resolve_provider_routing_key(
                             &config_snapshot,
