@@ -436,6 +436,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // the exact same handlers — old clients (Lotus, bamboo CLI/SDK, magpie)
         // keep working unchanged. New callers should prefer the nested form.
         .route(
+            "/sessions/{session_id}/execute/retry",
+            web::get().to(agent::execute::retry_waiting_handler),
+        )
+        .route(
             "/sessions/{session_id}/execute",
             web::post().to(agent::execute::handler),
         )
@@ -484,6 +488,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // ── Legacy flat aliases (#251 finding 4) — kept byte-identical to their
         // pre-refactor paths, wired to the SAME handlers as the nested routes
         // above, so no existing client breaks.
+        .route(
+            "/execute/{session_id}/retry",
+            web::get().to(agent::execute::retry_waiting_handler),
+        )
         .route(
             "/execute/{session_id}",
             web::post().to(agent::execute::handler),

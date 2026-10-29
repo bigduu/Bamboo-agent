@@ -519,6 +519,15 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn test_memory_store(
+        mut self,
+        store: bamboo_memory::memory_store::MemoryStore,
+    ) -> Self {
+        self.inner = self.inner.memory_store(store);
+        self
+    }
+
     /// Inject a pre-built default tool executor.
     pub fn default_tools(mut self, tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>) -> Self {
         self.default_tools_override = Some(tools);
