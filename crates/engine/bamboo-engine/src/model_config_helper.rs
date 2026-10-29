@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::GoldConfig;
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_llm::Config;
-use bamboo_llm::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
+use bamboo_llm::{LLMError, ProviderRegistry, ResolvedModel};
 
 pub const GOLD_CONFIG_METADATA_KEY: &str = "gold_config";
 
