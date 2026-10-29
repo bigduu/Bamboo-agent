@@ -155,7 +155,6 @@ pub struct AgentBuilder {
     /// `provider`. `None` keeps the configured default.
     provider_name: Option<String>,
     assembled_provider_scope: Option<String>,
-    assembled_chat_reasoning: Option<bamboo_domain::ReasoningEffort>,
     /// API key applied to the active provider's config before provider creation.
     api_key: Option<String>,
     /// MCP servers to connect and merge into the tool surface in
@@ -218,7 +217,6 @@ impl AgentBuilder {
             project_id: None,
             provider_name: None,
             assembled_provider_scope: None,
-            assembled_chat_reasoning: None,
             api_key: None,
             mcp_servers: Vec::new(),
             permission_checker: None,
@@ -545,23 +543,6 @@ impl AgentBuilder {
             // currently write-locked, fail closed for `new_session` (model=None)
             // rather than retaining a stale model from the displaced config.
             self.session_model = config.try_read().ok().and_then(|config| config.get_model());
-            if self.assembled_provider_scope.is_some()
-                && self.provider_override.is_none()
-                && self.provider_name.is_none()
-            {
-                self.assembled_chat_reasoning = config.try_read().ok().and_then(|config| {
-                    config
-                        .defaults
-                        .as_ref()
-                        .filter(|_| config.features.provider_model_ref)
-                        .map(|defaults| &defaults.chat)
-                        .filter(|target| {
-                            Some(&target.provider) == self.assembled_provider_scope.as_ref()
-                                && Some(&target.model) == self.session_model.as_ref()
-                        })
-                        .and_then(|target| target.reasoning_effort)
-                });
-            }
         }
         self.config_override = Some(config);
         self
@@ -648,9 +629,6 @@ impl AgentBuilder {
         }
         let provider_scope = provider_config.effective_default_provider().to_string();
         self.assembled_provider_scope = Some(provider_scope.clone());
-        self.assembled_chat_reasoning = chat_target
-            .as_ref()
-            .and_then(|target| target.reasoning_effort);
 
         // Capture the effective configured model for `Agent::new_session` when
         // the caller did not provide a stronger `.model(...)` override.
@@ -820,16 +798,6 @@ impl AgentBuilder {
                         config, scope,
                     )
                     .ok();
-                self.assembled_chat_reasoning = config
-                    .defaults
-                    .as_ref()
-                    .filter(|_| config.features.provider_model_ref)
-                    .map(|defaults| &defaults.chat)
-                    .filter(|target| {
-                        &target.provider == scope
-                            && Some(&target.model) == self.session_model.as_ref()
-                    })
-                    .and_then(|target| target.reasoning_effort);
             }
         }
         if self.provider_override.is_none() && self.model.is_none() && self.provider_name.is_none()
@@ -1054,7 +1022,6 @@ impl AgentBuilder {
         agent.sdk_skills = sdk_skills;
         agent.provider_scope = provider_scope;
         agent.routing_config = routing_config;
-        agent.primary_reasoning_effort = self.assembled_chat_reasoning;
         Ok(agent)
     }
 }

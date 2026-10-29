@@ -164,7 +164,6 @@ pub struct Agent {
     provider_scope: Option<String>,
     /// Live metadata used to resolve aliases against the assembled client identity.
     routing_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
-    primary_reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
     /// Default first-class Project membership for newly-created/unassigned sessions.
     project_id: Option<bamboo_domain::ProjectId>,
     /// Concrete session-index handle, present only when assembled via
@@ -315,7 +314,6 @@ impl Agent {
             session_model: None,
             provider_scope: None,
             routing_config: None,
-            primary_reasoning_effort: None,
             project_id: None,
             session_store: None,
             permission_checker: None,
@@ -343,7 +341,6 @@ impl Agent {
             session_model,
             provider_scope: None,
             routing_config: None,
-            primary_reasoning_effort: None,
             project_id,
             session_store,
             permission_checker,
@@ -941,18 +938,23 @@ impl Agent {
             session
                 .check_execution_compatibility()
                 .map_err(|error| AgentError::Tool(error.to_string()))?;
-            let session_target = match self.sdk_bound_session_target(session) {
-                Ok(target) => target,
-                Err(error) => {
-                    if let Some(snapshot) = preappend_snapshot {
-                        *session = snapshot;
+            let (routing_snapshot, session_target) =
+                match self.sdk_routing_snapshot().and_then(|snapshot| {
+                    let target =
+                        self.sdk_bound_session_target_with_config(session, snapshot.as_ref())?;
+                    Ok((snapshot, target))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Some(snapshot) = preappend_snapshot {
+                            *session = snapshot;
+                        }
+                        if let Some(lease) = supplied_lease {
+                            lease.abandon().await;
+                        }
+                        return Err(error);
                     }
-                    if let Some(lease) = supplied_lease {
-                        lease.abandon().await;
-                    }
-                    return Err(error);
-                }
-            };
+                };
             // One execution-private view covers Project assignment, approved
             // tool replay and all later runtime checkpoints. Freeze None too.
             let mut execution = self.clone();
@@ -1171,12 +1173,12 @@ impl Agent {
             if let (Some(target), Some(model)) =
                 (session.model_ref.as_mut(), execution.model.as_ref())
             {
-                if target.model != *model {
+                if target.model.trim() != model.trim() {
                     // A per-model setting belongs to the previous target and
                     // cannot be carried onto an explicitly different model.
-                    target.model = model.clone();
                     target.reasoning_effort = None;
                 }
+                target.model = model.clone();
             }
             bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
                 session,
@@ -1217,20 +1219,30 @@ impl Agent {
             #[cfg(test)]
             constructor_parity_tests::observe_inputs(&session.id, inputs.as_ref());
             let mut request = builder.build();
-            // The saved Session choice is authoritative. A typed target's
-            // effort belongs to its own model, and the builder's Chat-role
-            // effort is valid only when that same model is being executed.
+            // The saved Session choice is authoritative. Take a Chat-role
+            // setting from the same config snapshot used to admit this run,
+            // and only when both its account and model match the actual target.
             let model_effort = session
                 .model_ref
                 .as_ref()
-                .filter(|target| target.model == session.model)
+                .filter(|target| target.model.trim() == session.model.trim())
                 .and_then(|target| target.reasoning_effort);
-            let role_effort = if execution.session_model.as_deref() == Some(session.model.as_str())
-            {
-                execution.primary_reasoning_effort
-            } else {
-                None
-            };
+            let role_effort = routing_snapshot.as_ref().and_then(|config| {
+                if !config.features.provider_model_ref {
+                    return None;
+                }
+                let target = &config.defaults.as_ref()?.chat;
+                if target.model.trim() != session.model.trim() {
+                    return None;
+                }
+                let scope = execution.provider_scope.as_deref()?;
+                let provider = execution
+                    .sdk_canonical_provider(&target.provider, Some(config))
+                    .ok()?;
+                (provider == scope)
+                    .then_some(target.reasoning_effort)
+                    .flatten()
+            });
             request.reasoning_effort = session.reasoning_effort.or(model_effort).or(role_effort);
             execution
                 .inner
