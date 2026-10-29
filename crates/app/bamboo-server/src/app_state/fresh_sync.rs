@@ -124,7 +124,7 @@ struct PendingFreshSync {
     inputs: Option<UntrustedExecutionInputs>,
     witness: FreshSyncWitness,
     snapshot: Session,
-    control_scope: Option<PendingControlScope>,
+    control_scope: Option<Arc<PendingControlScope>>,
     backlog: SessionInboxBacklog,
     proof: bamboo_domain::LiveBootstrapProof,
     generate_title: bool,
@@ -177,7 +177,7 @@ enum FreshSyncEntry {
     InFlight {
         nonce: Uuid,
         run_id: String,
-        control_scope: Option<PendingControlScope>,
+        control_scope: Option<Arc<PendingControlScope>>,
     },
 }
 
@@ -438,7 +438,7 @@ impl FreshSyncRegistry {
         let token = owner.cancel_token().clone();
         let nonce = Uuid::new_v4();
         let deadline = Instant::now() + PENDING_SYNC_LIFETIME;
-        let control_scope = PendingControlScope::capture(&snapshot);
+        let control_scope = PendingControlScope::capture(&snapshot).map(Arc::new);
         {
             // No await while both guards are held. Stop and take serialize on
             // the same runner slot; the map stores the non-clonable owner.

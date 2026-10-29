@@ -174,25 +174,33 @@ impl AgentRunner {
         self.execution_finalized
     }
 
-    /// A terminal observation is available only for the selected target
-    /// lifetime/authority and only after the existing finalizer actually ran.
-    /// Ordinary checkpoint saves may advance metadata_version; the current
-    /// selector was independently revalidated by the caller before this read.
+    /// Compare an existing Host observation without treating it as a grant.
+    /// Ordinary metadata edits may advance metadata_version, while the
+    /// canonical target and Workspace are separately revalidated by the Host.
+    pub fn supervisor_run_observation_matches(
+        &self,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        workspace_path: Option<&str>,
+    ) -> Option<bool> {
+        match (&self.supervisor_run_target, &self.supervisor_run_workspace) {
+            (None, None) => None,
+            (Some(observed), Some(workspace)) => {
+                let mut observed = observed.clone();
+                observed.metadata_version = target.metadata_version;
+                Some(&observed == target && workspace.as_deref() == workspace_path)
+            }
+            _ => Some(false),
+        }
+    }
+
+    /// Only the exact execution finalizer can establish this terminal fact.
     pub fn supervisor_run_is_finalized_for(
         &self,
         target: &bamboo_domain::SupervisorCurrentUserTarget,
         workspace_path: Option<&str>,
     ) -> bool {
         self.execution_finalized
-            && self
-                .supervisor_run_workspace
-                .as_ref()
-                .is_some_and(|observed| observed.as_deref() == workspace_path)
-            && self.supervisor_run_target.as_ref().is_some_and(|observed| {
-                let mut observed = observed.clone();
-                observed.metadata_version = target.metadata_version;
-                &observed == target
-            })
+            && self.supervisor_run_observation_matches(target, workspace_path) == Some(true)
     }
     /// Broadcast channel capacity for agent events.
     pub const EVENT_CHANNEL_CAPACITY: usize = 1000;

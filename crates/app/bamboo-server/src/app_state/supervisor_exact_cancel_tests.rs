@@ -322,6 +322,104 @@ async fn legacy_stop_status_is_not_exact_finalization_proof() {
 }
 
 #[actix_web::test]
+async fn stopped_bound_run_cannot_be_rebound_to_a_changed_workspace() {
+    for previously_observed in [true, false] {
+        let fixture = Box::pin(Fixture::new()).await;
+        grant_cancel(&fixture);
+        let original = current_target(&fixture).await;
+        let mut runner = crate::app_state::AgentRunner::new();
+        runner.status = crate::app_state::AgentStatus::Running;
+        let run_id = runner.run_id.clone();
+        let token = runner.cancel_token.clone();
+        let owner = fixture
+            .state
+            .session_activation_router
+            .register_session_run(&fixture.original, &run_id)
+            .await
+            .unwrap();
+        fixture
+            .state
+            .agent_runners
+            .write()
+            .await
+            .insert(TARGET.into(), runner);
+        let workspace = fixture._home.path().join("changed-target-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        if previously_observed {
+            let observation = invoke(&fixture, args("observe_run", &original, None))
+                .await
+                .unwrap();
+            assert_eq!(observation["status"], "running");
+            // A Root may itself switch Workspace while still running. This
+            // slice conservatively refuses to rebind the old observation.
+            let mut changed = fixture.reload().await;
+            let original_workspace = changed.workspace_path_meta().unwrap();
+            changed.set_workspace_path_meta(workspace.canonicalize().unwrap().to_string_lossy());
+            changed.metadata_version += 1;
+            fixture.state.storage.save_session(&changed).await.unwrap();
+            let switched = current_target(&fixture).await;
+            let refused = invoke(&fixture, args("observe_run", &switched, None))
+                .await
+                .unwrap();
+            assert_eq!(refused["status"], "run_conflict");
+            assert!(!token.is_cancelled());
+            changed.set_workspace_path_meta(original_workspace);
+            changed.metadata_version += 1;
+            fixture.state.storage.save_session(&changed).await.unwrap();
+        }
+        assert!(crate::handlers::agent::stop::cancel_session(&fixture.state, TARGET).await);
+        assert!(token.is_cancelled());
+        assert!(!fixture
+            .state
+            .agent_runners
+            .read()
+            .await
+            .get(TARGET)
+            .unwrap()
+            .exact_execution_finalized());
+        if !previously_observed {
+            let unproven = invoke(&fixture, args("observe_run", &original, None))
+                .await
+                .unwrap();
+            assert_eq!(unproven["status"], "run_conflict");
+        }
+
+        let mut changed = fixture.reload().await;
+        changed.set_workspace_path_meta(workspace.canonicalize().unwrap().to_string_lossy());
+        changed.metadata_version += 1;
+        fixture.state.storage.save_session(&changed).await.unwrap();
+        let fresh = current_target(&fixture).await;
+        let observed = invoke(&fixture, args("observe_run", &fresh, None))
+            .await
+            .unwrap();
+        assert_eq!(observed["status"], "run_conflict");
+        let cancelled = invoke(&fixture, args("cancel", &fresh, Some(&run_id)))
+            .await
+            .unwrap();
+        assert_eq!(cancelled["status"], "run_conflict");
+
+        let result: Result<(), bamboo_agent_core::AgentError> =
+            Err(bamboo_agent_core::AgentError::Cancelled);
+        assert!(
+            bamboo_engine::execution::finalize_runner_exact(
+                &fixture.state.agent_runners,
+                TARGET,
+                &run_id,
+                &result,
+            )
+            .await
+        );
+        owner.finish(0).await.unwrap();
+        let finished = invoke(&fixture, args("cancel", &fresh, Some(&run_id)))
+            .await
+            .unwrap();
+        assert_eq!(finished["status"], "run_conflict");
+        assert!(fixture.probe.requests.lock().unwrap().is_empty());
+        fixture.state.shutdown().await;
+    }
+}
+
+#[actix_web::test]
 async fn supervisor_cancel_rejects_old_owner_after_same_id_root_recreation() {
     let fixture = Box::pin(Fixture::new()).await;
     grant_cancel(&fixture);

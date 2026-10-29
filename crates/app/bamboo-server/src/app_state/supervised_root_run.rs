@@ -138,6 +138,29 @@ fn run_control(
             "pending_owner_changed",
         ));
     }
+    match runner.supervisor_run_observation_matches(target, workspace_path) {
+        Some(false) => {
+            return Ok(conflict(
+                &target.session_id,
+                expected,
+                "observed_scope_changed",
+            ));
+        }
+        None if owner.is_some()
+            && (!matches!(runner.status, AgentStatus::Running)
+                || runner.cancel_token.is_cancelled()) =>
+        {
+            // A bound owner which was never observed cannot acquire a new
+            // scope after Stop has exposed it as non-running. FreshSync has
+            // its own original scope proof and is handled above instead.
+            return Ok(conflict(
+                &target.session_id,
+                expected,
+                "unobserved_nonrunning_owner",
+            ));
+        }
+        _ => {}
+    }
     if !matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
         && !runner.cancel_token.is_cancelled()
     {
