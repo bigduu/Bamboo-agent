@@ -1282,3 +1282,396 @@ async fn entrypoint_routing_sdk_native_reasoning_tracks_provider_source() {
         "{second_body:?}"
     );
 }
+
+/// A default-on capture supports the synthetic Vision model but leaves
+/// `vision_support_override(main-a)` unspecified. An explicit `Some(true)`
+/// for the main model bypasses the legacy transform, so it cannot witness it.
+fn routing_review_allow_a_models(c: &mut Config, model: &str) {
+    let account = c.provider_instances.get_mut("chat-a").unwrap();
+    account.extra.insert(
+        "runtime_models".into(),
+        serde_json::json!(["main-a", "cheap", model]),
+    );
+    let mut capabilities = serde_json::Map::new();
+    capabilities.insert(
+        model.to_string(),
+        serde_json::json!({"supports_vision": true}),
+    );
+    account.extra.insert(
+        "model_capabilities".into(),
+        serde_json::Value::Object(capabilities),
+    );
+}
+
+/// The server-style fallback was derived from B/vision-b. Before execution,
+/// the live role moves to C/vision-c. Either a consistent old snapshot, a
+/// consistent new snapshot, or a refusal is acceptable; sending the image
+/// to the unrelated main account A is not.
+#[tokio::test]
+async fn entrypoint_routing_legacy_stale_derived_role_never_rebinds_to_main() {
+    for flag in [false, true] {
+        let b = vision_server(200).await;
+        let c_server = vision_server(200).await;
+        let mut initial = legacy_config(flag, &b.uri());
+        routing_review_allow_a_models(&mut initial, "vision-b");
+        initial.provider_instances.insert(
+            "vision-c".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": true,
+                "api_key": "synthetic-no-real-key", "base_url": c_server.uri(),
+                "model": "vision-c", "runtime_models": ["vision-c"],
+                "model_capabilities": {"vision-c": {"supports_vision": true}}
+            }))
+            .unwrap(),
+        );
+        // Connect/child resume obtains the host-derived image fallback from
+        // an earlier config snapshot, before the runtime reads live config.
+        let main = Arc::new(Capture::default());
+        let main_provider: Arc<dyn LLMProvider> = main.clone();
+        let registry = Arc::new(bamboo_llm::ProviderRegistry::new(
+            std::collections::HashMap::from([("chat-a".to_string(), main_provider)]),
+            "chat-a".to_string(),
+        ));
+        let snapshot = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
+            &initial,
+            &registry,
+            &Session::new("synthetic-resume-snapshot", "main-a"),
+            None,
+        );
+        let fallback = snapshot.image_fallback.unwrap();
+
+        let shared = Arc::new(RwLock::new(initial));
+        assert!(main.supports_vision("vision-b").await);
+        assert_ne!(main.vision_support_override("main-a").await, Some(true));
+        let dir = tempfile::tempdir().unwrap();
+        let agent = bamboo_sdk::Agent::builder()
+            .provider(main.clone())
+            .model("main-a")
+            .config(shared.clone())
+            .tools(std::iter::empty())
+            .with_defaults_for_data_dir(dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+
+        shared.write().await.defaults.as_mut().unwrap().vision =
+            Some(bamboo_domain::ProviderModelRef::new("vision-c", "vision-c"));
+        let mut session = Session::new(format!("synthetic-stale-role-{flag}"), "main-a");
+        let user = Message::user_with_parts(
+            "Inspect synthetic pixel",
+            vec![bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef {
+                    url: PIXEL.into(),
+                    detail: None,
+                },
+            }],
+        );
+        let original = user.clone();
+        session.add_message(user);
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request =
+            ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
+                .model("main-a")
+                .provider_name("chat-a")
+                .image_fallback(fallback)
+                .app_data_dir(dir.path().to_path_buf())
+                .build();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            agent.execute(&mut session, request),
+        )
+        .await
+        .expect("controlled legacy consumer must finish");
+        drain.abort();
+        let a_calls = main.calls.lock().unwrap().clone();
+        let b_calls = b.received_requests().await.unwrap();
+        let c_calls = c_server.received_requests().await.unwrap();
+        let b_saw_pixel = b_calls
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body).contains(PIXEL));
+        let c_saw_pixel = c_calls
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body).contains(PIXEL));
+        assert_eq!(
+            session
+                .messages
+                .iter()
+                .find(|message| message.id == original.id)
+                .unwrap()
+                .content_parts,
+            original.content_parts,
+            "the original synthetic image must remain in session history"
+        );
+        assert!(
+            a_calls.iter().all(|(_, _, has_images)| !has_images),
+            "flag={flag} A received a synthetic image: {a_calls:?}; B={}, C={}, outcome={outcome:?}",
+            b_calls.len(),
+            c_calls.len(),
+        );
+        assert!(outcome.is_ok(), "flag={flag}: {outcome:?}");
+        assert!(
+            !b_saw_pixel && c_saw_pixel,
+            "current Vision role must receive the synthetic image: flag={flag}, B={}, C={}",
+            b_calls.len(),
+            c_calls.len()
+        );
+    }
+}
+
+/// A real caller-supplied bare model override still belongs to its explicitly
+/// supplied active client; it must not be confused with a derived role.
+#[tokio::test]
+async fn entrypoint_routing_legacy_explicit_bare_override_stays_on_active_client() {
+    let b = vision_server(200).await;
+    let mut c = legacy_config(true, &b.uri());
+    routing_review_allow_a_models(&mut c, "vision-on-a");
+    let dir = tempfile::tempdir().unwrap();
+    let main = Arc::new(Capture::default());
+    let agent = agent(c, main.clone(), dir.path()).await;
+    let mut session = Session::new("synthetic-bare-vision-override", "main-a");
+    let user = Message::user_with_parts(
+        "Inspect synthetic pixel",
+        vec![bamboo_domain::MessagePart::ImageUrl {
+            image_url: bamboo_domain::ImageUrlRef {
+                url: PIXEL.into(),
+                detail: None,
+            },
+        }],
+    );
+    let original = user.clone();
+    session.add_message(user);
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request =
+        ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
+            .model("main-a")
+            .provider_name("chat-a")
+            .image_fallback(bamboo_engine::ImageFallbackConfig {
+                mode: bamboo_engine::ImageFallbackMode::Vision,
+                vision_model: Some("vision-on-a".into()),
+            })
+            .app_data_dir(dir.path().to_path_buf())
+            .build();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.execute(&mut session, request),
+    )
+    .await
+    .expect("controlled bare override must finish")
+    .unwrap();
+    drain.abort();
+    let calls = main.calls.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(model, _, images)| model == "vision-on-a" && *images),
+        "explicit override did not reach active client: {calls:?}"
+    );
+    assert!(b.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .find(|message| message.id == original.id)
+            .unwrap()
+            .content_parts,
+        original.content_parts,
+    );
+}
+
+/// A native SDK client was made from instance A named `openai`. Replacing that
+/// instance with a legacy `openai` pointing to B does not change the name but
+/// does change the account. A later configured Vision target must not reuse A.
+#[tokio::test]
+async fn entrypoint_routing_legacy_same_key_changed_origin_never_reuses_native_client() {
+    let a = vision_server(200).await;
+    let b = vision_server(200).await;
+    let mut c = config(true, "openai");
+    c.provider = "openai".into();
+    c.default_provider_instance = Some("openai".into());
+    c.provider_instances.clear();
+    c.provider_instances.insert(
+        "openai".into(),
+        serde_json::from_value(serde_json::json!({
+            "provider_type": "openai", "enabled": true,
+            "api_key": "synthetic-a", "base_url": a.uri(),
+            "model": "main-a", "runtime_models": ["main-a", "vision-b"],
+            "model_capabilities": {"vision-b": {"supports_vision": true}}
+        }))
+        .unwrap(),
+    );
+    c.defaults.as_mut().unwrap().chat = bamboo_domain::ProviderModelRef::new("openai", "main-a");
+    c.defaults.as_mut().unwrap().vision =
+        Some(bamboo_domain::ProviderModelRef::new("openai", "vision-b"));
+    c.hooks.image_fallback.enabled = true;
+    c.hooks.image_fallback.mode = "vision".into();
+    let shared = Arc::new(RwLock::new(c));
+    let dir = tempfile::tempdir().unwrap();
+    let agent = bamboo_sdk::Agent::builder()
+        .config(shared.clone())
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(dir.path().to_path_buf())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let fallback = {
+        let mut next = shared.write().await;
+        next.provider_instances.remove("openai");
+        next.default_provider_instance = None;
+        next.providers_mut().openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "api_key": "synthetic-b", "base_url": b.uri(),
+                "model": "main-a", "vision_model": "vision-b",
+                "runtime_models": ["main-a", "vision-b"],
+                "model_capabilities": {"vision-b": {"supports_vision": true}}
+            }))
+            .unwrap(),
+        );
+        bamboo_engine::model_config_helper::resolve_image_fallback(&next)
+            .unwrap()
+            .unwrap()
+    };
+    let mut session = Session::new("synthetic-origin-replaced", "main-a");
+    let user = Message::user_with_parts(
+        "Inspect synthetic pixel",
+        vec![bamboo_domain::MessagePart::ImageUrl {
+            image_url: bamboo_domain::ImageUrlRef {
+                url: PIXEL.into(),
+                detail: None,
+            },
+        }],
+    );
+    let original = user.clone();
+    session.add_message(user);
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request =
+        ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
+            .model("main-a")
+            .provider_name("openai")
+            .image_fallback(fallback)
+            .app_data_dir(dir.path().to_path_buf())
+            .build();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.execute(&mut session, request),
+    )
+    .await
+    .expect("controlled changed-origin consumer must finish");
+    drain.abort();
+    let a_requests = a.received_requests().await.unwrap();
+    let b_requests = b.received_requests().await.unwrap();
+    let a_saw_pixel = a_requests
+        .iter()
+        .any(|request| String::from_utf8_lossy(&request.body).contains(PIXEL));
+    let b_saw_pixel = b_requests
+        .iter()
+        .any(|request| String::from_utf8_lossy(&request.body).contains(PIXEL));
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .find(|message| message.id == original.id)
+            .unwrap()
+            .content_parts,
+        original.content_parts,
+    );
+    assert!(
+        !a_saw_pixel,
+        "removed instance A received the image after legacy B took the same key: A={}, B={}, outcome={outcome:?}",
+        a_requests.len(),
+        b_requests.len(),
+    );
+    assert!(
+        outcome.is_err() || b_saw_pixel,
+        "successful conversion must use legacy B or report refusal: A={}, B={}",
+        a_requests.len(),
+        b_requests.len(),
+    );
+}
+
+#[tokio::test]
+async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
+    let mut config = config(false, "copilot");
+    config.provider = "copilot".into();
+    config.default_provider_instance = None;
+    config.provider_instances.clear();
+    config.defaults = None;
+    config.hooks.image_fallback.enabled = true;
+    config.hooks.image_fallback.mode = "vision".into();
+    assert_eq!(config.get_vision_model().as_deref(), Some("gpt-4o"));
+
+    let main = Arc::new(Capture::default());
+    let main_provider: Arc<dyn LLMProvider> = main.clone();
+    let registry = Arc::new(bamboo_llm::ProviderRegistry::new(
+        std::collections::HashMap::from([("copilot".to_string(), main_provider)]),
+        "copilot".to_string(),
+    ));
+    let snapshot = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
+        &config,
+        &registry,
+        &Session::new("synthetic-copilot-snapshot", "main-a"),
+        None,
+    );
+    let fallback = snapshot.image_fallback.unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let agent = bamboo_sdk::Agent::builder()
+        .provider(main.clone())
+        .model("main-a")
+        .config(Arc::new(RwLock::new(config)))
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(dir.path().to_path_buf())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut session = Session::new("synthetic-copilot-fallback", "main-a");
+    let user = Message::user_with_parts(
+        "Inspect synthetic pixel",
+        vec![bamboo_domain::MessagePart::ImageUrl {
+            image_url: bamboo_domain::ImageUrlRef {
+                url: PIXEL.into(),
+                detail: None,
+            },
+        }],
+    );
+    let original = user.clone();
+    session.add_message(user);
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request =
+        ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
+            .model("main-a")
+            .provider_name("copilot")
+            .image_fallback(fallback)
+            .app_data_dir(dir.path().to_path_buf())
+            .build();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.execute(&mut session, request),
+    )
+    .await
+    .expect("controlled Copilot fallback must finish")
+    .unwrap();
+    drain.abort();
+    let calls = main.calls.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(model, _, images)| model == "gpt-4o" && *images),
+        "the default must stay on the active client: {calls:?}"
+    );
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .find(|message| message.id == original.id)
+            .unwrap()
+            .content_parts,
+        original.content_parts,
+    );
+}
