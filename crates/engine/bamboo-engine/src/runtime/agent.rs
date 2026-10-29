@@ -442,6 +442,38 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Mark this execution's legacy image fallback as derived by the Host
+    /// from configuration. The shared agent and caller-owned runs stay unchanged.
+    #[doc(hidden)]
+    pub fn with_config_derived_image_fallback(&self) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.legacy_image_from_config = true;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Replace the per-run evidence for the selected legacy Vision client.
+    #[doc(hidden)]
+    pub fn with_legacy_vision_provider_source(
+        &self,
+        source: Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.legacy_image_provider_source = source;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Adapt the default provider for this execution while retaining every
+    /// other runtime capability. Explicit request-level overrides stay separate.
+    #[doc(hidden)]
+    pub fn with_default_provider_adapter(
+        &self,
+        adapter: impl FnOnce(Arc<dyn bamboo_llm::LLMProvider>) -> Arc<dyn bamboo_llm::LLMProvider>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.provider = adapter(runtime.provider.clone());
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Bind a live-bootstrap Host to this execution only. The Host must retain
     /// its exact runner and writer; this method does not create authority.
     #[doc(hidden)]
