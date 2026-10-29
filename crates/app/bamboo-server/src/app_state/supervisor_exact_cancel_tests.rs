@@ -357,6 +357,7 @@ async fn supervisor_cancel_rejects_old_owner_after_same_id_root_recreation() {
         .unwrap();
     replacement.set_project_id_meta(fixture.original.project_id_meta().unwrap());
     replacement.set_workspace_path_meta(fixture.original.workspace_path_meta().unwrap());
+    replacement.metadata_version += 1;
     replacement.add_message(Message::user("replacement Root content"));
     fixture
         .state
