@@ -8484,6 +8484,89 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 5);
     }
 
+    struct MixedSubAgentLoopProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for MixedSubAgentLoopProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let round = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == 4 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("Delegation corrected.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            let arguments = if round < 2 {
+                r#"{"intent":"inspect","target":"child","message":"result"}"#
+            } else {
+                r#"{"role":"implementer","message":"Complete bounded work"}"#
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: format!("mixed-subagent-{round}"),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "SubAgent".into(),
+                            arguments: arguments.into(),
+                        },
+                    },
+                ])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_inspections_do_not_stop_a_corrected_delegation_in_the_real_loop() {
+        use std::sync::atomic::Ordering;
+        let mut session = Session::new("mixed-subagent-circuit-loop", "model");
+        session.add_message(Message::user("Complete bounded work"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let provider = Arc::new(MixedSubAgentLoopProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(DelegationLoopExecutor {
+            calls: AtomicUsize::new(0),
+            success_on: Some(3),
+        });
+        let mut state = e2e_loop_state(&session.id);
+        let complete = super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            executor.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            &delegation_loop_config(),
+            &mut state,
+        )
+        .await
+        .expect("inspection failures must not terminate the corrected delegation");
+        assert!(complete);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
+        for round in 0..4 {
+            assert_eq!(
+                session
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.as_deref()
+                        == Some(format!("mixed-subagent-{round}").as_str()))
+                    .count(),
+                1,
+                "each call needs one durable response"
+            );
+        }
+    }
+
     struct CancelAfterThirdDelegationRound(tokio_util::sync::CancellationToken);
 
     #[async_trait::async_trait]
