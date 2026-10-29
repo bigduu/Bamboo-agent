@@ -19,6 +19,14 @@ listed in local inspection. Completed children can appear before their parent;
 or insertion contention has caused a drop. It cannot prove an entire trace was
 observed, and remote or separately managed spans may be missing.
 
+This first slice consumes the engine's authoritative `ProviderUsage` snapshots.
+The OpenAI-compatible Chat and Responses paths emit them. At this source
+revision, Anthropic and Gemini primarily emit legacy `CacheUsage` and
+`UsageSummary` chunks instead, which do not preserve whether zero was reported
+or omitted. Their hook and local-span `usage` can therefore be `null`, even when
+legacy session counters show activity. Provider-specific snapshot emission and
+fixtures remain follow-up work; do not infer missing values from those counters.
+
 External OTLP still requires an explicit endpoint and opt-in. Local recording
 remains enabled when exporter setup fails. When export sampling drops a span,
 that span remains locally recorded but is not sent to the exporter. See
