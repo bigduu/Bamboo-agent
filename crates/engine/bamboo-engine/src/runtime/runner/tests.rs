@@ -2524,14 +2524,23 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
     struct Capture(mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>);
     #[async_trait]
     impl AgentHook for Capture {
-        fn point(&self) -> AgentHookPoint { AgentHookPoint::AfterModelCallUsage }
-        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, session: &Session) -> HookResult {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterModelCallUsage
+        }
+        async fn run(
+            &self,
+            _: AgentHookPoint,
+            payload: &HookPayload,
+            session: &Session,
+        ) -> HookResult {
             assert!(session.messages.is_empty());
             assert!(session.workspace.is_none());
             if let HookPayload::ModelCallUsage { observation } = payload {
                 self.0.send(observation.clone()).unwrap();
             }
-            HookResult::Abort { reason: "observer must not affect the call".into() }
+            HookResult::Abort {
+                reason: "observer must not affect the call".into(),
+            }
         }
     }
     let trace = bamboo_infrastructure::telemetry::test_support::LocalTraceTest::isolated();
@@ -2547,24 +2556,40 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
     let provider = Arc::new(MetricsQueueProvider {
         queue: Mutex::new(vec![vec![
             Ok(LLMChunk::ProviderUsage {
-                input_tokens: Some(100), output_tokens: Some(20), total_tokens: Some(120),
-                reasoning_tokens: Some(3), cache_creation_input_tokens: None,
-                cache_read_input_tokens: Some(0), cache_write_input_tokens: Some(12),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                total_tokens: Some(120),
+                reasoning_tokens: Some(3),
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(0),
+                cache_write_input_tokens: Some(12),
             }),
-            Ok(LLMChunk::Token("synthetic answer".into())), Ok(LLMChunk::Done),
+            Ok(LLMChunk::Token("synthetic answer".into())),
+            Ok(LLMChunk::Done),
         ]]),
         requested_messages: Mutex::new(Vec::new()),
     });
-    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new());
     let mut session = Session::new("synthetic-usage-hook", "synthetic-model");
     let birth = session.created_at;
     let (events, _receiver) = mpsc::channel(128);
-    trace.scope(super::run_agent_loop_with_config(
-        &mut session, "PRIVATE_PROMPT_SENTINEL".into(), events, provider, tools,
-        CancellationToken::new(), config,
-    )).await.expect("observer abort cannot reject the model call");
+    trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "PRIVATE_PROMPT_SENTINEL".into(),
+            events,
+            provider,
+            tools,
+            CancellationToken::new(),
+            config,
+        ))
+        .await
+        .expect("observer abort cannot reject the model call");
     let event = tokio::time::timeout(std::time::Duration::from_secs(2), observed_rx.recv())
-        .await.unwrap().unwrap();
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(event.status, ModelCallStatus::Success);
     let usage = event.usage.unwrap();
     assert_eq!(usage.cache_read_input_tokens, Some(0));
@@ -2576,8 +2601,14 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
     assert_eq!(page.traces.len(), 1);
     assert_eq!(page.traces[0].trace_id, trace_id);
     let detail = trace.store.detail(&session.id, birth, &trace_id).unwrap();
-    let span = detail.spans.iter().find(|span| span.span_id == event.span_id.as_deref().unwrap()).unwrap();
+    let span = detail
+        .spans
+        .iter()
+        .find(|span| span.span_id == event.span_id.as_deref().unwrap())
+        .unwrap();
     assert_eq!(span.call_id.as_deref(), Some(event.call_id.as_str()));
     assert_eq!(span.usage.as_ref(), Some(&usage));
-    assert!(!serde_json::to_string(&detail).unwrap().contains("PRIVATE_PROMPT_SENTINEL"));
+    assert!(!serde_json::to_string(&detail)
+        .unwrap()
+        .contains("PRIVATE_PROMPT_SENTINEL"));
 }

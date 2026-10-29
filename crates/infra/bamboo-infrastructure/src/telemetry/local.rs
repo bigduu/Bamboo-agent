@@ -108,9 +108,11 @@ impl LocalTraceStore {
     pub(super) fn set_enabled(&self, enabled: bool) {
         self.enabled.store(enabled, Ordering::Release);
         if !enabled {
-            if let Ok(mut inner) = self.inner.lock() {
-                *inner = Inner::default();
-            }
+            let mut inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *inner = Inner::default();
             self.dropped.store(false, Ordering::Release);
         }
     }
@@ -131,6 +133,9 @@ impl LocalTraceStore {
             self.dropped.store(true, Ordering::Release);
             return;
         };
+        if !self.enabled() {
+            return;
+        }
         let prior_sequence = inner
             .records
             .iter()
@@ -180,6 +185,7 @@ impl LocalTraceStore {
         limit: usize,
         cursor: Option<u64>,
     ) -> TracePage {
+        let limit = limit.clamp(1, MAX_LOCAL_SPANS);
         let inner = self
             .inner
             .lock()
@@ -252,15 +258,31 @@ impl LocalTraceStore {
             return None;
         }
         let key = (session_id.to_owned(), birth);
-        let evicted = inner.evictions.get(&key).copied().or_else(|| (!inner.retired_eviction_scopes).then_some(0));
-        let partial = is_partial(&records) || self.dropped.load(Ordering::Acquire) || evicted != Some(0);
-        let inherited_run = records.iter().find_map(|r| r.span.run_id.clone());
+        let evicted = inner
+            .evictions
+            .get(&key)
+            .copied()
+            .or_else(|| (!inner.retired_eviction_scopes).then_some(0));
+        let partial =
+            is_partial(&records) || self.dropped.load(Ordering::Acquire) || evicted != Some(0);
+        let by_id: HashMap<&str, &LocalSpan> = records
+            .iter()
+            .map(|record| (record.span.span_id.as_str(), &record.span))
+            .collect();
         let mut spans: Vec<_> = records
             .iter()
             .map(|r| {
                 let mut span = r.span.clone();
-                if span.run_id.is_none() {
-                    span.run_id.clone_from(&inherited_run);
+                let mut parent = span.parent_span_id.as_deref();
+                let mut visited = HashSet::new();
+                while span.run_id.is_none() {
+                    let Some(id) = parent else { break };
+                    if !visited.insert(id) {
+                        break;
+                    }
+                    let Some(ancestor) = by_id.get(id) else { break };
+                    span.run_id.clone_from(&ancestor.run_id);
+                    parent = ancestor.parent_span_id.as_deref();
                 }
                 span
             })
@@ -436,31 +458,60 @@ mod tests {
     async fn real_spans_preserve_presence_parentage_and_exact_session_lifetime() {
         let trace = LocalTraceTest::isolated();
         let birth = Utc::now();
-        trace.scope(async {
-            let root = Observation::agent("local-session", "local-session")
-                .bind_session_lifetime("local-session", birth);
-            root.scope(async {
-                crate::telemetry::record_execution_identity("execution-1", "run-1");
-                tracing::warn!(prompt = "PRIVATE_PROMPT_SENTINEL", "ordinary log is not a span event");
-                let llm = Observation::llm(Some("openai"), "synthetic-model", "local-session");
-                llm.model_call_id("call-1");
-                llm.model_usage(&ModelTokenUsage {
-                    input_tokens: Some(100), output_tokens: Some(0), reasoning_tokens: None,
-                    cache_read_input_tokens: Some(0), cache_creation_input_tokens: None,
-                    cache_write_input_tokens: Some(12),
-                });
-                llm.finish(Outcome::Success);
-            }).await;
-            root.finish(Outcome::Success);
-        }).await;
+        trace
+            .scope(async {
+                let root = Observation::agent("local-session", "local-session")
+                    .bind_session_lifetime("local-session", birth);
+                root.scope(async {
+                    crate::telemetry::record_execution_identity("execution-1", "run-1");
+                    tracing::warn!(
+                        prompt = "PRIVATE_PROMPT_SENTINEL",
+                        "ordinary log is not a span event"
+                    );
+                    let llm = Observation::llm(Some("openai"), "synthetic-model", "local-session");
+                    llm.model_call_id("call-1");
+                    llm.model_usage(&ModelTokenUsage {
+                        input_tokens: Some(100),
+                        output_tokens: Some(0),
+                        reasoning_tokens: None,
+                        cache_read_input_tokens: Some(0),
+                        cache_creation_input_tokens: None,
+                        cache_write_input_tokens: Some(12),
+                    });
+                    llm.finish(Outcome::Success);
+                })
+                .await;
+                root.finish(Outcome::Success);
+            })
+            .await;
         let page = trace.store.page("local-session", birth, 50, None);
         assert_eq!(page.traces.len(), 1);
         assert!(!page.traces[0].partial);
         assert_eq!(page.traces[0].span_count, 2);
-        assert!(trace.store.page("other-session", birth, 50, None).traces.is_empty());
-        assert!(trace.store.page("local-session", birth + chrono::Duration::seconds(1), 50, None).traces.is_empty());
-        let detail = trace.store.detail("local-session", birth, &page.traces[0].trace_id).unwrap();
-        let root = detail.spans.iter().find(|span| span.kind == "agent").unwrap();
+        assert!(trace
+            .store
+            .page("other-session", birth, 50, None)
+            .traces
+            .is_empty());
+        assert!(trace
+            .store
+            .page(
+                "local-session",
+                birth + chrono::Duration::seconds(1),
+                50,
+                None
+            )
+            .traces
+            .is_empty());
+        let detail = trace
+            .store
+            .detail("local-session", birth, &page.traces[0].trace_id)
+            .unwrap();
+        let root = detail
+            .spans
+            .iter()
+            .find(|span| span.kind == "agent")
+            .unwrap();
         let llm = detail.spans.iter().find(|span| span.kind == "llm").unwrap();
         assert_eq!(llm.parent_span_id.as_deref(), Some(root.span_id.as_str()));
         assert_eq!(llm.run_id.as_deref(), Some("run-1"));
@@ -470,26 +521,85 @@ mod tests {
         assert_eq!(usage.cache_read_input_tokens, Some(0));
         assert_eq!(usage.cache_creation_input_tokens, None);
         assert_eq!(usage.cache_write_input_tokens, Some(12));
-        assert!(!serde_json::to_string(&detail).unwrap().contains("PRIVATE_PROMPT_SENTINEL"));
+        assert!(!serde_json::to_string(&detail)
+            .unwrap()
+            .contains("PRIVATE_PROMPT_SENTINEL"));
     }
 
     #[tokio::test]
     async fn pagination_and_retention_are_bounded_to_the_requested_lifetime() {
         let trace = LocalTraceTest::isolated();
         let birth = Utc::now();
-        trace.scope(async {
-            for _ in 0..(MAX_LOCAL_SPANS + 2) {
-                Observation::agent("retention-session", "retention-session")
-                    .bind_session_lifetime("retention-session", birth)
-                    .finish(Outcome::Success);
-            }
-        }).await;
+        trace
+            .scope(async {
+                for _ in 0..(MAX_LOCAL_SPANS + 2) {
+                    Observation::agent("retention-session", "retention-session")
+                        .bind_session_lifetime("retention-session", birth)
+                        .finish(Outcome::Success);
+                }
+            })
+            .await;
         let first = trace.store.page("retention-session", birth, 1, None);
         assert_eq!(first.traces.len(), 1);
         assert_eq!(first.retention.evicted_spans, Some(2));
         let cursor = first.next_cursor.unwrap().parse().unwrap();
-        let second = trace.store.page("retention-session", birth, 1, Some(cursor));
+        let second = trace
+            .store
+            .page("retention-session", birth, 1, Some(cursor));
         assert_ne!(first.traces[0].trace_id, second.traces[0].trace_id);
-        assert_eq!(trace.store.page("another-session", birth, 1, None).retention.evicted_spans, Some(0));
+        assert_eq!(
+            trace
+                .store
+                .page("another-session", birth, 1, None)
+                .retention
+                .evicted_spans,
+            Some(0)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_id_is_inherited_only_from_the_actual_ancestor() {
+        let trace = LocalTraceTest::isolated();
+        let birth = Utc::now();
+        trace
+            .scope(async {
+                let outer = Observation::agent("nested-session", "nested-session")
+                    .bind_session_lifetime("nested-session", birth);
+                outer
+                    .scope(async {
+                        crate::telemetry::record_execution_identity("execution-outer", "run-outer");
+                        let inner = Observation::agent("nested-session", "nested-session")
+                            .bind_session_lifetime("nested-session", birth);
+                        inner
+                            .scope(async {
+                                crate::telemetry::record_execution_identity(
+                                    "execution-inner",
+                                    "run-inner",
+                                );
+                                Observation::llm(Some("openai"), "inner-model", "nested-session")
+                                    .finish(Outcome::Success);
+                            })
+                            .await;
+                        inner.finish(Outcome::Success);
+                        Observation::llm(Some("openai"), "outer-model", "nested-session")
+                            .finish(Outcome::Success);
+                    })
+                    .await;
+                outer.finish(Outcome::Success);
+            })
+            .await;
+        let page = trace.store.page("nested-session", birth, 10, None);
+        let detail = trace
+            .store
+            .detail("nested-session", birth, &page.traces[0].trace_id)
+            .unwrap();
+        for (model, expected) in [("inner-model", "run-inner"), ("outer-model", "run-outer")] {
+            let span = detail
+                .spans
+                .iter()
+                .find(|span| span.model.as_deref() == Some(model))
+                .unwrap();
+            assert_eq!(span.run_id.as_deref(), Some(expected));
+        }
     }
 }

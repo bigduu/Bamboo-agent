@@ -1347,7 +1347,8 @@ fn build_hook_envelope(
         workspace_path: if matches!(payload, HookPayload::ModelCallUsage { .. }) {
             String::new()
         } else {
-            cwd.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
+            cwd.map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
         },
         model: session.model.clone(),
         payload: payload.clone(),
@@ -1476,7 +1477,10 @@ pub(super) fn register_configured_hooks(
         (LifecycleHookEvent::SessionEnd, &config.session_end),
         (LifecycleHookEvent::PreCompact, &config.pre_compact),
         (LifecycleHookEvent::Notification, &config.notification),
-        (LifecycleHookEvent::BambooModelCallUsage, &config.model_call_usage),
+        (
+            LifecycleHookEvent::BambooModelCallUsage,
+            &config.model_call_usage,
+        ),
     ];
     let mut sequence = 0_usize;
     for (event, groups) in events {

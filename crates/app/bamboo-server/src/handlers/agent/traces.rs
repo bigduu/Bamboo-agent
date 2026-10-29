@@ -126,42 +126,84 @@ mod tests {
     async fn authenticates_and_isolates_real_local_spans_with_pagination() {
         let _key = bamboo_config::encryption::set_test_encryption_key([0x5a; 32]);
         let temp = tempfile::tempdir().unwrap();
-        let state = web::Data::new(AppState::new(temp.path().canonicalize().unwrap()).await.unwrap());
+        let state = web::Data::new(
+            AppState::new(temp.path().canonicalize().unwrap())
+                .await
+                .unwrap(),
+        );
         let one = Session::new("trace-api-one", "synthetic-model");
         let two = Session::new("trace-api-two", "synthetic-model");
         state.session_store.save_session(&one).await.unwrap();
         state.session_store.save_session(&two).await.unwrap();
         let tracer = LocalTraceTest::global();
-        tracer.scope(async {
-            for _ in 0..2 {
-                let root = Observation::agent(&one.id, &one.id).bind_session_lifetime(&one.id, one.created_at);
-                root.scope(async {
-                    let llm = Observation::llm(Some("openai"), "synthetic-model", &one.id);
-                    llm.model_usage(&ModelTokenUsage { input_tokens: Some(100), cache_read_input_tokens: Some(0), ..Default::default() });
-                    llm.finish(Outcome::Success);
-                }).await;
-                root.finish(Outcome::Success);
-            }
-            Observation::agent(&two.id, &two.id).bind_session_lifetime(&two.id, two.created_at).finish(Outcome::Success);
-        }).await;
-        let app = test::init_service(App::new().app_data(state.clone()).configure(crate::agent_routes)).await;
+        tracer
+            .scope(async {
+                for _ in 0..2 {
+                    let root = Observation::agent(&one.id, &one.id)
+                        .bind_session_lifetime(&one.id, one.created_at);
+                    root.scope(async {
+                        let llm = Observation::llm(Some("openai"), "synthetic-model", &one.id);
+                        llm.model_usage(&ModelTokenUsage {
+                            input_tokens: Some(100),
+                            cache_read_input_tokens: Some(0),
+                            ..Default::default()
+                        });
+                        llm.finish(Outcome::Success);
+                    })
+                    .await;
+                    root.finish(Outcome::Success);
+                }
+                Observation::agent(&two.id, &two.id)
+                    .bind_session_lifetime(&two.id, two.created_at)
+                    .finish(Outcome::Success);
+            })
+            .await;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::agent_routes),
+        )
+        .await;
         let uri = "/api/v1/sessions/trace-api-one/traces?limit=1";
-        let request = |uri: &str| test::TestRequest::get().uri(uri)
-            .peer_addr("127.0.0.1:1234".parse().unwrap()).insert_header((header::HOST, "localhost")).to_request();
-        let remote = test::call_service(&app, test::TestRequest::get().uri(uri)
-            .peer_addr("203.0.113.9:1234".parse().unwrap()).insert_header((header::HOST, "localhost")).to_request()).await;
+        let request = |uri: &str| {
+            test::TestRequest::get()
+                .uri(uri)
+                .peer_addr("127.0.0.1:1234".parse().unwrap())
+                .insert_header((header::HOST, "localhost"))
+                .to_request()
+        };
+        let remote = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(uri)
+                .peer_addr("203.0.113.9:1234".parse().unwrap())
+                .insert_header((header::HOST, "localhost"))
+                .to_request(),
+        )
+        .await;
         assert_eq!(remote.status(), StatusCode::UNAUTHORIZED);
         let response = test::call_service(&app, request(uri)).await;
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "private, no-store");
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
+        );
         let page: serde_json::Value = test::read_body_json(response).await;
         assert_eq!(page["schema_version"], 1);
         assert_eq!(page["collection_state"], "enabled");
         assert_eq!(page["traces"].as_array().unwrap().len(), 1);
         let trace_id = page["traces"][0]["trace_id"].as_str().unwrap();
         let cursor = page["next_cursor"].as_str().unwrap();
-        let second: serde_json::Value = test::read_body_json(test::call_service(&app,
-            request(&format!("/api/v1/sessions/trace-api-one/traces?limit=1&cursor={cursor}"))).await).await;
+        let second: serde_json::Value = test::read_body_json(
+            test::call_service(
+                &app,
+                request(&format!(
+                    "/api/v1/sessions/trace-api-one/traces?limit=1&cursor={cursor}"
+                )),
+            )
+            .await,
+        )
+        .await;
         assert_ne!(second["traces"][0]["trace_id"], trace_id);
         let detail_uri = format!("/api/v1/sessions/trace-api-one/traces/{trace_id}");
         let detail_response = test::call_service(&app, request(&detail_uri)).await;
@@ -172,8 +214,24 @@ mod tests {
         assert_eq!(llm["usage"]["cache_read_input_tokens"], 0);
         assert!(llm["usage"]["cache_creation_input_tokens"].is_null());
         let other_uri = format!("/api/v1/sessions/trace-api-two/traces/{trace_id}");
-        assert_eq!(test::call_service(&app, request(&other_uri)).await.status(), StatusCode::NOT_FOUND);
-        assert_eq!(test::call_service(&app, request("/api/v1/sessions/trace-api-one/traces?limit=101")).await.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(test::call_service(&app, request("/api/v1/sessions/missing/traces")).await.status(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            test::call_service(&app, request(&other_uri)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            test::call_service(
+                &app,
+                request("/api/v1/sessions/trace-api-one/traces?limit=101")
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            test::call_service(&app, request("/api/v1/sessions/missing/traces"))
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

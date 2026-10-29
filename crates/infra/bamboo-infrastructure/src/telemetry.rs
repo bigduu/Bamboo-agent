@@ -351,7 +351,9 @@ pub fn record_execution_identity(execution_id: &str, run_id: &str) {
 pub fn current_run_id(session_id: &str) -> Option<String> {
     let context = Context::current();
     let lifetime = context.get::<SessionLifetime>()?;
-    if lifetime.session_id != session_id { return None; }
+    if lifetime.session_id != session_id {
+        return None;
+    }
     let run_id = lifetime.run_id.lock().ok()?.clone();
     run_id
 }

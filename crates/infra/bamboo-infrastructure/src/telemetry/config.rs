@@ -18,7 +18,9 @@ impl opentelemetry_sdk::trace::ShouldSample for LocalSampler {
         links: &[opentelemetry::trace::Link],
     ) -> opentelemetry_sdk::trace::SamplingResult {
         use opentelemetry_sdk::trace::SamplingDecision;
-        let mut result = self.0.should_sample(parent, trace_id, name, kind, attributes, links);
+        let mut result = self
+            .0
+            .should_sample(parent, trace_id, name, kind, attributes, links);
         if result.decision == SamplingDecision::Drop {
             result.decision = SamplingDecision::RecordOnly;
         }
@@ -31,18 +33,30 @@ impl opentelemetry_sdk::trace::ShouldSample for LocalSampler {
 struct SampledOnly<P>(P);
 
 #[cfg(feature = "otel-otlp")]
-impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanProcessor for SampledOnly<P> {
-    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, context: &opentelemetry::Context) {
+impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanProcessor
+    for SampledOnly<P>
+{
+    fn on_start(
+        &self,
+        span: &mut opentelemetry_sdk::trace::Span,
+        context: &opentelemetry::Context,
+    ) {
         self.0.on_start(span, context);
     }
     fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
-        if span.span_context.is_sampled() { self.0.on_end(span); }
+        if span.span_context.is_sampled() {
+            self.0.on_end(span);
+        }
     }
-    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult { self.0.force_flush() }
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.force_flush()
+    }
     fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
         self.0.shutdown_with_timeout(timeout)
     }
-    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) { self.0.set_resource(resource); }
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) {
+        self.0.set_resource(resource);
+    }
 }
 
 /// Explicit opt-in. Neither `RUST_LOG` nor standard `OTEL_*` variables enable
@@ -239,7 +253,9 @@ fn build_local_provider(store: std::sync::Arc<super::local::LocalTraceStore>) ->
     use opentelemetry_sdk::trace::Sampler;
     SdkTracerProvider::builder()
         .with_span_processor(super::local::LocalProcessor(store))
-        .with_sampler(LocalSampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn))))
+        .with_sampler(LocalSampler(Sampler::ParentBased(Box::new(
+            Sampler::AlwaysOn,
+        ))))
         .with_max_attributes_per_span(16)
         .with_max_events_per_span(0)
         .with_max_links_per_span(0)
@@ -348,20 +364,39 @@ mod tests {
         let store = std::sync::Arc::new(super::super::local::LocalTraceStore::default());
         store.set_enabled(true);
         let birth = chrono::Utc::now();
-        let provider = build_provider_with_local(&TelemetryConfig {
-            enabled: true,
-            endpoint: Some(format!("http://{}/v1/traces", listener.local_addr().unwrap())),
-            sample_ratio: 0.0,
-        }, Some(store.clone())).unwrap();
+        let provider = build_provider_with_local(
+            &TelemetryConfig {
+                enabled: true,
+                endpoint: Some(format!(
+                    "http://{}/v1/traces",
+                    listener.local_addr().unwrap()
+                )),
+                sample_ratio: 0.0,
+            },
+            Some(store.clone()),
+        )
+        .unwrap();
         let tracer = provider.tracer_with_scope(super::super::scope());
-        super::super::Observation::start_with(&tracer, "invoke_agent", SpanKind::Internal, vec![
-            KeyValue::new("gen_ai.operation.name", "invoke_agent"),
-            KeyValue::new("gen_ai.conversation.id", "sample-zero"),
-        ]).bind_session_lifetime("sample-zero", birth).finish(super::super::Outcome::Success);
+        super::super::Observation::start_with(
+            &tracer,
+            "invoke_agent",
+            SpanKind::Internal,
+            vec![
+                KeyValue::new("gen_ai.operation.name", "invoke_agent"),
+                KeyValue::new("gen_ai.conversation.id", "sample-zero"),
+            ],
+        )
+        .bind_session_lifetime("sample-zero", birth)
+        .finish(super::super::Outcome::Success);
         assert_eq!(store.page("sample-zero", birth, 10, None).traces.len(), 1);
         provider.force_flush().unwrap();
-        provider.shutdown_with_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        provider
+            .shutdown_with_timeout(Duration::from_secs(2))
+            .unwrap();
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
     }
 
     #[test]

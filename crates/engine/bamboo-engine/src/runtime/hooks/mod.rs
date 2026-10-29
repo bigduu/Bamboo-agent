@@ -51,16 +51,29 @@ impl HookRunner {
         if !self.dispatcher.has_hooks_for(point) && self.plugin_root.is_none() {
             return;
         }
-        let Ok(permit) = SLOTS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
-            .clone().try_acquire_owned() else { return };
-        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+        let Ok(permit) = SLOTS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+            .clone()
+            .try_acquire_owned()
+        else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
         let runner = self.clone();
         handle.spawn(async move {
             let _permit = permit;
-            let session = Session::new(&observation.session_id, observation.model.as_deref().unwrap_or("unknown"));
+            let session = Session::new(
+                &observation.session_id,
+                observation.model.as_deref().unwrap_or("unknown"),
+            );
             let payload = HookPayload::ModelCallUsage { observation };
             let work = async {
-                let _ = runner.dispatcher.run_observer_hooks(point, &payload, &session).await;
+                let _ = runner
+                    .dispatcher
+                    .run_observer_hooks(point, &payload, &session)
+                    .await;
                 if let Some(root) = &runner.plugin_root {
                     let _ = bamboo_hooks::portable::run(root, point, &payload, &session).await;
                 }
@@ -306,6 +319,7 @@ impl HookRunner {
                     AgentHookPoint::BeforeToolExecution,
                     AgentHookPoint::AfterToolExecution,
                     AgentHookPoint::BeforeFinalize,
+                    AgentHookPoint::AfterModelCallUsage,
                 ]
                 .into_iter()
                 .any(|point| bamboo_hooks::portable::has_active_hooks_for(root, point))

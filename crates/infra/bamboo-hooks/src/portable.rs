@@ -146,8 +146,12 @@ fn envelope_with_tool_input(
     original_tool_input: Option<&Value>,
     final_assistant_content: Option<&str>,
 ) -> Result<Value, String> {
-    if let (PortableEvent::BambooModelCallUsage, HookPayload::ModelCallUsage { observation }) = (event, payload) {
-        return Ok(json!({"schema_version":1,"hook_event_name":event,"session_id":session.id,"observation":observation}));
+    if let (PortableEvent::BambooModelCallUsage, HookPayload::ModelCallUsage { observation }) =
+        (event, payload)
+    {
+        return Ok(
+            json!({"schema_version":1,"hook_event_name":event,"session_id":session.id,"observation":observation}),
+        );
     }
     let mut value = json!({"session_id":session.id,"transcript_path":null,"cwd":cwd,"hook_event_name":event,"permission_mode":"default"});
     match (event, payload) {
@@ -658,14 +662,29 @@ mod tests {
         session.workspace = Some("/PRIVATE_WORKSPACE_SENTINEL".into());
         let payload = HookPayload::ModelCallUsage {
             observation: bamboo_domain::ModelCallUsage {
-                schema_version: 1, event_id: "event-1".into(), call_id: "call-1".into(),
-                session_id: session.id.clone(), run_id: None, provider: Some("openai".into()),
-                model: Some("synthetic-model".into()), status: bamboo_domain::ModelCallStatus::Success,
-                trace_id: None, span_id: None,
-                usage: Some(bamboo_domain::ModelTokenUsage { cache_read_input_tokens: Some(0), ..Default::default() }),
+                schema_version: 1,
+                event_id: "event-1".into(),
+                call_id: "call-1".into(),
+                session_id: session.id.clone(),
+                run_id: None,
+                provider: Some("openai".into()),
+                model: Some("synthetic-model".into()),
+                status: bamboo_domain::ModelCallStatus::Success,
+                trace_id: None,
+                span_id: None,
+                usage: Some(bamboo_domain::ModelTokenUsage {
+                    cache_read_input_tokens: Some(0),
+                    ..Default::default()
+                }),
             },
         };
-        let value = envelope(PortableEvent::BambooModelCallUsage, &payload, &session, std::path::Path::new("/PRIVATE_CWD_SENTINEL")).unwrap();
+        let value = envelope(
+            PortableEvent::BambooModelCallUsage,
+            &payload,
+            &session,
+            std::path::Path::new("/PRIVATE_CWD_SENTINEL"),
+        )
+        .unwrap();
         assert_eq!(value["observation"]["usage"]["cache_read_input_tokens"], 0);
         assert!(value["observation"]["usage"]["cache_creation_input_tokens"].is_null());
         assert!(!value.to_string().contains("PRIVATE_"));
@@ -877,6 +896,74 @@ mod tests {
                 timed_out: false,
             })
         }
+    }
+
+    #[tokio::test]
+    async fn reviewed_portable_usage_extension_receives_only_the_snapshot() {
+        let command = json!({"type":"command", "command":"record-envelope", "timeout":1});
+        let (temp, session, _) = fixture(vec![command.clone()]).await;
+        let root = temp.path();
+        let bundle = root.join("plugin with spaces");
+        tokio::fs::write(
+            bundle.join("hooks.json"),
+            serde_json::to_vec(&json!({"hooks": {
+                "BambooModelCallUsage":[{"hooks":[command]}]
+            }}))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        let manifest: PluginManifest =
+            serde_json::from_slice(&tokio::fs::read(bundle.join("plugin.json")).await.unwrap())
+                .unwrap();
+        let mut store = InstalledPlugins::load(&root.join("installed.json"))
+            .await
+            .unwrap();
+        store.plugins[0].registered.hooks = registrations(&manifest, &bundle).unwrap();
+        store.save(&root.join("installed.json")).await.unwrap();
+        trust(root).await;
+        let payload = HookPayload::ModelCallUsage {
+            observation: bamboo_domain::ModelCallUsage {
+                schema_version: 1,
+                event_id: "event-1".into(),
+                call_id: "call-1".into(),
+                session_id: session.id.clone(),
+                run_id: None,
+                provider: Some("openai".into()),
+                model: Some("synthetic-model".into()),
+                status: bamboo_domain::ModelCallStatus::Success,
+                trace_id: None,
+                span_id: None,
+                usage: Some(bamboo_domain::ModelTokenUsage {
+                    cache_read_input_tokens: Some(0),
+                    ..Default::default()
+                }),
+            },
+        };
+        let recorder =
+            std::sync::Arc::new(RecordingTerminalExecutor(std::sync::Mutex::new(Vec::new())));
+        let report = crate::with_hook_command_executor(
+            recorder.clone(),
+            run(
+                root,
+                AgentHookPoint::AfterModelCallUsage,
+                &payload,
+                &session,
+            ),
+        )
+        .await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let seen = recorder.0.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0]["hook_event_name"], "BambooModelCallUsage");
+        assert_eq!(
+            seen[0]["observation"]["usage"]["cache_read_input_tokens"],
+            0
+        );
+        assert!(seen[0].get("cwd").is_none());
+        assert!(!seen[0]
+            .to_string()
+            .contains(&root.to_string_lossy().to_string()));
     }
 
     #[tokio::test]
