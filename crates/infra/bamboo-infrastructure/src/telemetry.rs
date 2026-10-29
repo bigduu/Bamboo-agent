@@ -377,7 +377,7 @@ fn valid_session_reference(value: &str) -> bool {
         })
 }
 
-/// A content-free session reference for usage observers and local inspection.
+/// A session reference for usage observers and local inspection.
 /// Syntactically safe IDs remain unchanged. Other nonempty IDs receive an
 /// HMAC-based alias that is stable only for this process; the `~` prefix keeps
 /// aliases disjoint from IDs accepted unchanged. It is not an authorization key.
