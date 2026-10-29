@@ -215,6 +215,7 @@ pub(super) async fn run_stream_worker(mut args: StreamWorkerArgs) {
                 saw_done = true;
                 break;
             }
+            Ok(LLMChunk::ProviderUsageReplace(usage)) => provider_usage.replace(usage),
             Ok(LLMChunk::ProviderUsage {
                 input_tokens,
                 output_tokens,

@@ -34,9 +34,12 @@ Gemini reports prompt and cached content separately from candidate and thought
 tokens. Its snapshot combines candidate and thought tokens once for output
 only when both are present; otherwise output remains unknown. When reported,
 tool-use prompt tokens are included in input. The current adapter sends
-client-side function declarations, not Google-managed server tools. If a later
-Gemini usage frame explicitly contains a malformed field, an earlier value for
-that field can remain in the snapshot. These
+client-side function declarations, not Google-managed server tools. In repeated
+Gemini frames, omitted fields retain their previous values, while an explicitly
+malformed field becomes unknown until a valid value is reported again. A
+malformed thought count also makes the combined output unknown. If only one
+component of a previously combined count is updated, the combined count can be
+unknown until sufficient components are reported together. These
 rules follow the [Anthropic prompt-cache fields](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 and [Gemini usage metadata](https://ai.google.dev/api/generate-content).
 Legacy session counters may have different availability; do not infer a
@@ -160,6 +163,16 @@ usage observation itself.
 Deduplicate on `event_id`; retain IDs according to your plugin's own policy.
 When present, `trace_id` and `span_id` identify the real model-call span and can
 be matched with the authenticated local trace API. They do not grant access.
+
+The existing legacy numeric session counters cannot represent an unknown
+value; when malformed provider evidence clears a count, compatibility paths
+may use zero or a local estimate. The optional prompt/cache ratio is omitted
+when either provider input or cache read is unknown. Use the optional hook or
+trace fields for the provider-reported value. Ticket budget settlement retains its reservation after
+malformed usage even if later frames recover, while still enforcing observed
+over-cap lower bounds. Rust stream consumers that exhaustively match the public
+`LLMChunk` enum must handle its new `ProviderUsageReplace` bookkeeping variant;
+the existing `ProviderUsage` variant is still emitted for known Gemini counts.
 
 A reviewed, runnable portable example is in
 [`crates/infra/bamboo-plugin/examples/model-usage`](../../crates/infra/bamboo-plugin/examples/model-usage).

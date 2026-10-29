@@ -19,7 +19,7 @@
 
 use crate::provider::{LLMError, Result};
 use crate::providers::common::sse::sse_error_is_present;
-use crate::types::LLMChunk;
+use crate::types::{LLMChunk, ProviderUsageInvalidFields, ProviderUsageReplacement};
 use bamboo_domain::{FunctionCall, ToolCall};
 use serde_json::Value;
 
@@ -44,9 +44,140 @@ pub struct GeminiStreamState {
     /// Whether an [`LLMChunk::UsageSummary`] has already been emitted for this
     /// stream. It follows the same terminal/content-free and emit-once rules.
     usage_summary_emitted: bool,
-    /// Production stream emits the optional snapshot alongside the legacy
-    /// chunks without changing the public single-event parser's contract.
-    pending_provider_usage: Option<LLMChunk>,
+    /// Cumulative provider fields retain absent, valid and malformed states.
+    provider_usage: GeminiProviderUsage,
+    pending_replacement: Option<ProviderUsageReplacement>,
+}
+
+#[derive(Default)]
+struct GeminiProviderUsage {
+    snapshot: ProviderUsageReplacement,
+    invalid_tool_prompt: bool,
+    last_tool_prompt: Option<u64>,
+}
+
+impl GeminiProviderUsage {
+    fn observe(&mut self, usage: &Value) -> ProviderUsageReplacement {
+        if !usage.is_object() {
+            self.snapshot = ProviderUsageReplacement {
+                invalid_fields: ProviderUsageInvalidFields {
+                    input_tokens: true,
+                    output_tokens: true,
+                    total_tokens: true,
+                    reasoning_tokens: true,
+                    cache_read_input_tokens: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            self.invalid_tool_prompt = true;
+            self.last_tool_prompt = None;
+            return self.snapshot;
+        }
+        // The outer Option represents field presence; the inner Option
+        // distinguishes a valid integer from an explicitly malformed value.
+        let field = |key: &str| usage.get(key).map(Value::as_u64);
+        let prompt = field("promptTokenCount");
+        let tool = field("toolUsePromptTokenCount");
+        let candidates = field("candidatesTokenCount");
+        let thoughts = field("thoughtsTokenCount");
+        if let Some(tool) = tool {
+            self.invalid_tool_prompt = tool.is_none();
+            self.last_tool_prompt = tool;
+        }
+        let (input, invalid_input) = match (prompt, tool) {
+            (Some(None), _) | (_, Some(None)) => (None, true),
+            (Some(Some(prompt)), Some(Some(tool))) => {
+                let input = prompt.checked_add(tool);
+                (input, input.is_none())
+            }
+            (Some(Some(prompt)), None)
+                if !self.invalid_tool_prompt && self.last_tool_prompt.unwrap_or(0) == 0 =>
+            {
+                (Some(prompt), false)
+            }
+            (Some(Some(_)), None) => (None, self.snapshot.invalid_fields.input_tokens),
+            (None, Some(Some(_))) => (None, self.snapshot.invalid_fields.input_tokens),
+            (None, None) => (
+                self.snapshot.input_tokens,
+                self.snapshot.invalid_fields.input_tokens,
+            ),
+        };
+        self.snapshot.input_tokens = input;
+        self.snapshot.invalid_fields.input_tokens = invalid_input;
+        if let Some(thoughts) = thoughts {
+            self.snapshot.reasoning_tokens = thoughts;
+            self.snapshot.invalid_fields.reasoning_tokens = thoughts.is_none();
+        }
+        let (output, invalid_output) = match (candidates, thoughts) {
+            (Some(None), _) | (_, Some(None)) => (None, true),
+            (Some(Some(candidates)), Some(Some(thoughts))) => {
+                let output = candidates.checked_add(thoughts);
+                (output, output.is_none())
+            }
+            (Some(Some(_)), None) | (None, Some(Some(_))) => {
+                (None, self.snapshot.invalid_fields.output_tokens)
+            }
+            (None, None) => (
+                self.snapshot.output_tokens,
+                self.snapshot.invalid_fields.output_tokens,
+            ),
+        };
+        self.snapshot.output_tokens = output;
+        self.snapshot.invalid_fields.output_tokens = invalid_output;
+        if let Some(cached) = field("cachedContentTokenCount") {
+            self.snapshot.cache_read_input_tokens = cached;
+            self.snapshot.invalid_fields.cache_read_input_tokens = cached.is_none();
+        }
+        if let Some(total) = field("totalTokenCount") {
+            self.snapshot.total_tokens = total;
+            self.snapshot.invalid_fields.total_tokens = total.is_none();
+        }
+        let frame_input_sum = match (prompt.flatten(), tool.flatten()) {
+            (Some(prompt), Some(tool)) => prompt.checked_add(tool),
+            (Some(prompt), None) => Some(prompt),
+            (None, Some(tool)) => Some(tool),
+            (None, None) => None,
+        };
+        let frame_output_sum = match (candidates.flatten(), thoughts.flatten()) {
+            (Some(candidates), Some(thoughts)) => candidates.checked_add(thoughts),
+            (Some(candidates), None) => Some(candidates),
+            (None, Some(thoughts)) => Some(thoughts),
+            (None, None) => None,
+        };
+        let input_overflow =
+            prompt.flatten().is_some() && tool.flatten().is_some() && frame_input_sum.is_none();
+        let output_overflow = candidates.flatten().is_some()
+            && thoughts.flatten().is_some()
+            && frame_output_sum.is_none();
+        let input_floor = self
+            .snapshot
+            .input_tokens
+            .unwrap_or(0)
+            .max(self.snapshot.cache_read_input_tokens.unwrap_or(0))
+            .max(prompt.flatten().unwrap_or(0))
+            .max(tool.flatten().unwrap_or(0))
+            .max(frame_input_sum.unwrap_or(0));
+        let output_floor = self
+            .snapshot
+            .output_tokens
+            .unwrap_or(0)
+            .max(self.snapshot.reasoning_tokens.unwrap_or(0))
+            .max(candidates.flatten().unwrap_or(0))
+            .max(frame_output_sum.unwrap_or(0));
+        self.snapshot.input_floor = Some(input_floor);
+        self.snapshot.output_floor = Some(output_floor);
+        let minimum = input_floor.checked_add(output_floor);
+        if self.snapshot.total_tokens.is_some_and(|total| {
+            input_overflow || output_overflow || minimum.is_none_or(|minimum| minimum > total)
+        }) {
+            // Once inconsistent, a total stays unknown until the provider
+            // reports a new valid total; smaller partial frames cannot revive it.
+            self.snapshot.total_tokens = None;
+            self.snapshot.invalid_fields.total_tokens = true;
+        }
+        self.snapshot
+    }
 }
 
 impl GeminiStreamState {
@@ -109,9 +240,22 @@ fn take_gemini_usage_summary(state: &mut GeminiStreamState, value: &Value) -> Op
 /// comes) guarantees usage is delivered for cached requests too. Either piece
 /// may be absent (or already emitted); only the pieces present are included.
 fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<LLMChunk> {
-    state.pending_provider_usage = value
+    state.pending_replacement = value
         .get("usageMetadata")
-        .and_then(provider_usage_from_gemini);
+        .filter(|usage| {
+            !usage.is_object()
+                || [
+                    "promptTokenCount",
+                    "toolUsePromptTokenCount",
+                    "candidatesTokenCount",
+                    "thoughtsTokenCount",
+                    "cachedContentTokenCount",
+                    "totalTokenCount",
+                ]
+                .iter()
+                .any(|key| usage.get(key).is_some())
+        })
+        .map(|usage| state.provider_usage.observe(usage));
     let cache = take_gemini_cache_usage(state, value);
     let summary = take_gemini_usage_summary(state, value);
     let mut out = Vec::with_capacity(2);
@@ -124,54 +268,6 @@ fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<
     out
 }
 
-/// Normalize Gemini's cumulative terminal usage. The API reports candidate and
-/// thought tokens separately; the schema's output is their combined total,
-/// while reasoning is a subset. Missing thoughts remain unknown, not zero.
-fn provider_usage_from_gemini(usage: &Value) -> Option<LLMChunk> {
-    let prompt = usage.get("promptTokenCount").and_then(Value::as_u64);
-    let input_tokens = match usage.get("toolUsePromptTokenCount") {
-        Some(value) => prompt
-            .zip(value.as_u64())
-            .and_then(|(a, b)| a.checked_add(b)),
-        // Bamboo currently sends client-side function declarations, not
-        // Google-managed server tools. The reported prompt remains the input
-        // when no separate tool-use prompt is present.
-        None => prompt,
-    };
-    let candidates = usage.get("candidatesTokenCount").and_then(Value::as_u64);
-    let reasoning_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
-    let output_tokens = candidates
-        .zip(reasoning_tokens)
-        .and_then(|(a, b)| a.checked_add(b));
-    let cache_read_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
-    let tool_input = usage.get("toolUsePromptTokenCount").and_then(Value::as_u64);
-    let known_minimum = [prompt, tool_input, candidates, reasoning_tokens]
-        .into_iter()
-        .flatten()
-        .try_fold(0_u64, u64::checked_add);
-    let total_tokens = usage
-        .get("totalTokenCount")
-        .and_then(Value::as_u64)
-        .filter(|total| known_minimum.is_some_and(|minimum| minimum <= *total));
-    if input_tokens.is_none()
-        && output_tokens.is_none()
-        && total_tokens.is_none()
-        && reasoning_tokens.is_none()
-        && cache_read_input_tokens.is_none()
-    {
-        return None;
-    }
-    Some(LLMChunk::ProviderUsage {
-        input_tokens,
-        output_tokens,
-        total_tokens,
-        reasoning_tokens,
-        cache_creation_input_tokens: None,
-        cache_read_input_tokens,
-        cache_write_input_tokens: None,
-    })
-}
-
 /// Production adapter adds the snapshot after the existing compatibility
 /// chunks. Repeated cumulative events replace values downstream, never add.
 pub(super) fn parse_with_provider_usage(
@@ -179,9 +275,15 @@ pub(super) fn parse_with_provider_usage(
     event_type: &str,
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
-    state.pending_provider_usage = None;
+    state.pending_replacement = None;
     let mut chunks = parse_gemini_sse_event(state, event_type, data)?;
-    chunks.extend(state.pending_provider_usage.take());
+    if let Some(replacement) = state.pending_replacement.take() {
+        chunks.push(LLMChunk::ProviderUsageReplace(replacement));
+        // Preserve the existing ProviderUsage variant for older consumers.
+        // Its values come from the same cumulative state to avoid a partial
+        // frame replacing a valid total with a misleading component.
+        chunks.extend(replacement.legacy_chunk());
+    }
     Ok(chunks)
 }
 
@@ -391,6 +493,145 @@ pub fn parse_gemini_sse_event(
 mod tests {
     use super::*;
 
+    #[test]
+    fn repeated_usage_tracks_invalid_missing_zero_and_recovery() {
+        let mut state = GeminiStreamState::default();
+        let mut observe = |usage: &str| {
+            let data = format!(r#"{{"candidates":[],"usageMetadata":{usage}}}"#);
+            parse_with_provider_usage(&mut state, "", &data)
+                .unwrap()
+                .into_iter()
+                .find_map(|chunk| match chunk {
+                    LLMChunk::ProviderUsageReplace(usage) => Some(usage),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let first = observe(
+            r#"{"promptTokenCount":100,"cachedContentTokenCount":25,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}"#,
+        );
+        assert_eq!(first.cache_read_input_tokens, Some(25));
+        assert!(!first.invalid_fields.any());
+        let invalid = observe(r#"{"cachedContentTokenCount":-1,"thoughtsTokenCount":null}"#);
+        assert_eq!(invalid.input_tokens, Some(100));
+        assert_eq!(invalid.cache_read_input_tokens, None);
+        assert_eq!(invalid.output_tokens, None);
+        assert_eq!(invalid.reasoning_tokens, None);
+        assert!(invalid.invalid_fields.cache_read_input_tokens);
+        assert!(invalid.invalid_fields.output_tokens);
+        assert!(invalid.invalid_fields.reasoning_tokens);
+        let omitted = observe(r#"{"promptTokenCount":100}"#);
+        assert_eq!(omitted.cache_read_input_tokens, None);
+        assert!(omitted.invalid_fields.cache_read_input_tokens);
+        let restored = observe(
+            r#"{"cachedContentTokenCount":0,"candidatesTokenCount":20,"thoughtsTokenCount":3}"#,
+        );
+        assert_eq!(restored.cache_read_input_tokens, Some(0));
+        assert_eq!(restored.output_tokens, Some(23));
+        assert!(!restored.invalid_fields.any());
+        assert_eq!(observe(r#"{"cachedContentTokenCount":0}"#), restored);
+    }
+
+    #[test]
+    fn repeated_usage_invalidates_cross_frame_total_and_overflows() {
+        let mut usage = GeminiProviderUsage::default();
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        let first = usage.observe(&parse(r#"{"promptTokenCount":100,"toolUsePromptTokenCount":2,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":125}"#));
+        assert_eq!(first.input_tokens, Some(102));
+        assert_eq!(first.total_tokens, Some(125));
+        let inconsistent = usage.observe(&parse(r#"{"totalTokenCount":10}"#));
+        assert_eq!(inconsistent.total_tokens, None);
+        assert!(inconsistent.invalid_fields.total_tokens);
+        let smaller = usage.observe(&parse(r#"{"promptTokenCount":0,"toolUsePromptTokenCount":0,"candidatesTokenCount":0,"thoughtsTokenCount":0}"#));
+        assert_eq!(smaller.total_tokens, None);
+        assert!(smaller.invalid_fields.total_tokens);
+        usage.observe(&parse(r#"{"promptTokenCount":100,"toolUsePromptTokenCount":2,"candidatesTokenCount":20,"thoughtsTokenCount":3}"#));
+        let tool_invalid = usage.observe(&parse(r#"{"toolUsePromptTokenCount":"bad"}"#));
+        assert_eq!(tool_invalid.input_tokens, None);
+        assert!(tool_invalid.invalid_fields.input_tokens);
+        let prompt_only = usage.observe(&parse(r#"{"promptTokenCount":101}"#));
+        assert_eq!(prompt_only.input_tokens, None);
+        let overflow = usage.observe(&parse(
+            r#"{"promptTokenCount":101,"toolUsePromptTokenCount":18446744073709551615}"#,
+        ));
+        assert_eq!(overflow.input_tokens, None);
+        assert!(overflow.invalid_fields.input_tokens);
+        let recovered = usage.observe(&parse(
+            r#"{"promptTokenCount":101,"toolUsePromptTokenCount":0,"totalTokenCount":124}"#,
+        ));
+        assert_eq!(recovered.input_tokens, Some(101));
+        assert_eq!(recovered.total_tokens, Some(124));
+        assert!(!recovered.invalid_fields.any());
+        let all_invalid = usage.observe(&Value::Null);
+        assert!(all_invalid.invalid_fields.any());
+        assert!(all_invalid.legacy_chunk().is_none());
+    }
+
+    #[test]
+    fn partial_component_updates_do_not_retain_contradictory_totals() {
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        for partial in [
+            r#"{"candidatesTokenCount":30}"#,
+            r#"{"thoughtsTokenCount":30}"#,
+            r#"{"toolUsePromptTokenCount":101}"#,
+        ] {
+            let mut usage = GeminiProviderUsage::default();
+            usage.observe(&parse(r#"{"promptTokenCount":100,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}"#));
+            let next = usage.observe(&parse(partial));
+            if partial.contains("toolUsePromptTokenCount") {
+                assert_eq!(next.input_tokens, None);
+                assert!(!next.invalid_fields.input_tokens);
+            } else {
+                assert_eq!(next.output_tokens, None);
+                assert!(!next.invalid_fields.output_tokens);
+            }
+            assert_eq!(next.total_tokens, None);
+            assert!(next.invalid_fields.total_tokens);
+        }
+        let mut usage = GeminiProviderUsage::default();
+        usage.observe(&parse(
+            r#"{"promptTokenCount":100,"toolUsePromptTokenCount":3}"#,
+        ));
+        let prompt_only = usage.observe(&parse(r#"{"promptTokenCount":101}"#));
+        assert_eq!(prompt_only.input_tokens, None);
+        assert!(!prompt_only.invalid_fields.input_tokens);
+    }
+
+    #[test]
+    fn empty_usage_metadata_does_not_emit_a_replacement() {
+        let mut state = GeminiStreamState::default();
+        let chunks =
+            parse_with_provider_usage(&mut state, "", r#"{"candidates":[],"usageMetadata":{}}"#)
+                .unwrap();
+        assert!(!chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(_) | LLMChunk::ProviderUsage { .. }
+        )));
+    }
+
+    #[test]
+    fn component_overflow_invalidates_total_and_partial_frames_keep_floors() {
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        for frame in [
+            r#"{"promptTokenCount":18446744073709551615,"toolUsePromptTokenCount":1,"totalTokenCount":18446744073709551615}"#,
+            r#"{"candidatesTokenCount":18446744073709551615,"thoughtsTokenCount":1,"totalTokenCount":18446744073709551615}"#,
+        ] {
+            let snapshot = GeminiProviderUsage::default().observe(&parse(frame));
+            assert_eq!(snapshot.total_tokens, None);
+            assert!(snapshot.invalid_fields.total_tokens);
+        }
+        let mut usage = GeminiProviderUsage::default();
+        usage.observe(&parse(
+            r#"{"promptTokenCount":20,"candidatesTokenCount":20,"thoughtsTokenCount":3}"#,
+        ));
+        let output = usage.observe(&parse(r#"{"candidatesTokenCount":100}"#));
+        assert_eq!(output.output_tokens, None);
+        assert_eq!(output.output_floor, Some(100));
+        let input = usage.observe(&parse(r#"{"toolUsePromptTokenCount":101}"#));
+        assert_eq!(input.input_tokens, None);
+        assert_eq!(input.input_floor, Some(101));
+    }
+
     #[tokio::test]
     async fn production_stream_delivers_gemini_provider_usage_at_eof() {
         use futures::StreamExt;
@@ -474,6 +715,7 @@ mod tests {
             }
         )));
         let malformed = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"toolUsePromptTokenCount":3,"candidatesTokenCount":20,"thoughtsTokenCount":5,"totalTokenCount":10}}"#;
+        let mut state = GeminiStreamState::default();
         let chunks = parse_with_provider_usage(&mut state, "", malformed).unwrap();
         assert!(chunks.iter().any(|chunk| matches!(
             chunk,
@@ -487,6 +729,7 @@ mod tests {
             }
         )));
         let overflow = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":18446744073709551615,"thoughtsTokenCount":1,"totalTokenCount":18446744073709551615}}"#;
+        let mut state = GeminiStreamState::default();
         let chunks = parse_with_provider_usage(&mut state, "", overflow).unwrap();
         assert!(chunks.iter().any(|chunk| matches!(
             chunk,

@@ -509,6 +509,38 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
 }
 
 #[tokio::test]
+async fn replacement_clears_previous_flat_values_when_components_become_unknown() {
+    use bamboo_llm::types::ProviderUsageReplacement;
+
+    let output = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsageReplace(ProviderUsageReplacement {
+                input_tokens: Some(100),
+                output_tokens: Some(23),
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                ..Default::default()
+            })),
+            Ok(LLMChunk::ProviderUsageReplace(ProviderUsageReplacement {
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                ..Default::default()
+            })),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-replacement",
+    )
+    .await
+    .expect("replacement snapshot");
+    assert_eq!(output.provider_usage.unwrap().input_tokens, None);
+    assert_eq!(output.provider_usage.unwrap().output_tokens, None);
+    assert_eq!(output.input_tokens, 0);
+    assert_eq!(output.output_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 25);
+}
+
+#[tokio::test]
 async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field() {
     let omitted = consume_llm_stream_silent(
         build_stream(vec![

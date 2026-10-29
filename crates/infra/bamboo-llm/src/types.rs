@@ -1,5 +1,74 @@
 use bamboo_domain::ToolCall;
 
+/// Fields a provider explicitly reported in an invalid form. Missing fields
+/// are distinct from invalid fields and do not by themselves set these flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderUsageInvalidFields {
+    pub input_tokens: bool,
+    pub output_tokens: bool,
+    pub total_tokens: bool,
+    pub reasoning_tokens: bool,
+    pub cache_creation_input_tokens: bool,
+    pub cache_read_input_tokens: bool,
+    pub cache_write_input_tokens: bool,
+}
+
+impl ProviderUsageInvalidFields {
+    pub fn any(self) -> bool {
+        self.input_tokens
+            || self.output_tokens
+            || self.total_tokens
+            || self.reasoning_tokens
+            || self.cache_creation_input_tokens
+            || self.cache_read_input_tokens
+            || self.cache_write_input_tokens
+    }
+}
+
+/// Complete provider-local usage state. `None` replaces an earlier value;
+/// `invalid_fields` distinguishes malformed evidence from never-reported
+/// fields for conservative budget settlement.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderUsageReplacement {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub total_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+    pub cache_write_input_tokens: Option<u64>,
+    /// Safe lower bounds from the current provider frame. Unlike exact
+    /// counters, they can remain known when a combined count is incomplete.
+    pub input_floor: Option<u64>,
+    pub output_floor: Option<u64>,
+    pub invalid_fields: ProviderUsageInvalidFields,
+}
+
+impl ProviderUsageReplacement {
+    /// Legacy snapshot for consumers that do not yet handle replacement.
+    pub fn legacy_chunk(self) -> Option<LLMChunk> {
+        if self.input_tokens.is_none()
+            && self.output_tokens.is_none()
+            && self.total_tokens.is_none()
+            && self.reasoning_tokens.is_none()
+            && self.cache_creation_input_tokens.is_none()
+            && self.cache_read_input_tokens.is_none()
+            && self.cache_write_input_tokens.is_none()
+        {
+            return None;
+        }
+        Some(LLMChunk::ProviderUsage {
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
+            total_tokens: self.total_tokens,
+            reasoning_tokens: self.reasoning_tokens,
+            cache_creation_input_tokens: self.cache_creation_input_tokens,
+            cache_read_input_tokens: self.cache_read_input_tokens,
+            cache_write_input_tokens: self.cache_write_input_tokens,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum LLMChunk {
     /// A valid provider transport frame that intentionally carried no semantic
@@ -84,6 +153,10 @@ pub enum LLMChunk {
         /// folded into Bamboo's historical fresh/read/creation counters.
         cache_write_input_tokens: Option<u64>,
     },
+    /// Complete, presence-aware usage state that replaces the prior snapshot.
+    /// Consumers must not forward this bookkeeping event as model content.
+    /// A compatible [`LLMChunk::ProviderUsage`] follows when any value is known.
+    ProviderUsageReplace(ProviderUsageReplacement),
     /// Token usage summary at the end of an Anthropic response.
     UsageSummary {
         output_tokens: u64,
@@ -108,6 +181,7 @@ impl LLMChunk {
             | Self::ReasoningSignature(_)
             | Self::CacheUsage { .. }
             | Self::ProviderUsage { .. }
+            | Self::ProviderUsageReplace(_)
             | Self::UsageSummary { .. }
             | Self::Done => false,
         }

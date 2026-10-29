@@ -91,6 +91,7 @@ pub(super) async fn handle_non_streaming_chat(
             Ok(bamboo_llm::types::LLMChunk::ProviderTranscriptItem(_)) => {}
             Ok(bamboo_llm::types::LLMChunk::CacheUsage { .. }) => {}
             Ok(bamboo_llm::types::LLMChunk::ProviderUsage { .. }) => {}
+            Ok(bamboo_llm::types::LLMChunk::ProviderUsageReplace(_)) => {}
             Ok(bamboo_llm::types::LLMChunk::ReasoningSignature(_)) => {}
             Ok(bamboo_llm::types::LLMChunk::UsageSummary { .. }) => {}
             Ok(bamboo_llm::types::LLMChunk::Done) => break,

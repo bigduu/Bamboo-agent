@@ -232,6 +232,70 @@ async fn synthesized_worker_emits_usage_and_complete_message_lifecycle() {
 }
 
 #[tokio::test]
+async fn synthesized_worker_does_not_restore_invalid_replacement_values() {
+    use super::worker::{run_stream_worker, StreamWorkerArgs};
+    use bamboo_llm::provider::LLMStream;
+    use bamboo_llm::types::{LLMChunk, ProviderUsageInvalidFields, ProviderUsageReplacement};
+    use futures::stream;
+
+    let first = ProviderUsageReplacement {
+        input_tokens: Some(100),
+        output_tokens: Some(23),
+        total_tokens: Some(123),
+        reasoning_tokens: Some(3),
+        cache_read_input_tokens: Some(25),
+        ..Default::default()
+    };
+    let invalid = ProviderUsageReplacement {
+        output_tokens: None,
+        reasoning_tokens: None,
+        cache_read_input_tokens: None,
+        invalid_fields: ProviderUsageInvalidFields {
+            output_tokens: true,
+            reasoning_tokens: true,
+            cache_read_input_tokens: true,
+            ..Default::default()
+        },
+        ..first
+    };
+    let stream_result: LLMStream = Box::pin(stream::iter(vec![
+        Ok(LLMChunk::Token("synthetic".into())),
+        Ok(LLMChunk::ProviderUsageReplace(first)),
+        Ok(first.legacy_chunk().unwrap()),
+        Ok(LLMChunk::ProviderUsageReplace(invalid)),
+        Ok(invalid.legacy_chunk().unwrap()),
+        Ok(LLMChunk::Done),
+    ]));
+    let (metrics, _dir) = test_metrics();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    run_stream_worker(StreamWorkerArgs {
+        stream_result,
+        tx,
+        metrics,
+        forward_id: "forward-replacement".into(),
+        fallback_response_id: "resp_replacement".into(),
+        message_id: "msg_replacement".into(),
+        created_at: 123,
+        resolved_model: "synthetic-model".into(),
+        estimated_prompt_tokens: 999,
+    })
+    .await;
+
+    let frames = drain_frames(&mut rx);
+    let (_, completed) = frames
+        .iter()
+        .filter(|frame| frame.starts_with("event: response.completed"))
+        .map(|frame| decode_sse_event(bytes::Bytes::copy_from_slice(frame.as_bytes())))
+        .next()
+        .expect("response completed");
+    let usage = &completed["response"]["usage"];
+    assert_eq!(usage["input_tokens"], 100);
+    assert!(usage["output_tokens"].is_null());
+    assert!(usage["input_tokens_details"]["cached_tokens"].is_null());
+    assert!(usage["output_tokens_details"]["reasoning_tokens"].is_null());
+}
+
+#[tokio::test]
 async fn raw_worker_preserves_mixed_item_identity_and_order() {
     use super::worker::{run_stream_worker, StreamWorkerArgs};
     use bamboo_llm::provider::LLMStream;

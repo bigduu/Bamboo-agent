@@ -2042,8 +2042,15 @@ pub(super) async fn execute_llm_stream(
             cache_read_input_tokens: stream_output.cache_read_input_tokens,
             retained_from_previous_call: false,
         };
-        usage.provider_prompt_usage =
-            (provider_prompt_usage.total_input_tokens() > 0).then_some(provider_prompt_usage);
+        // This legacy DTO has no per-field unknown representation. Avoid
+        // publishing an exact-looking cache ratio when the authoritative
+        // provider snapshot omitted or invalidated its input or cache count.
+        let prompt_fields_known = stream_output.provider_usage.is_none_or(|snapshot| {
+            snapshot.input_tokens.is_some() && snapshot.cache_read_input_tokens.is_some()
+        });
+        usage.provider_prompt_usage = (prompt_fields_known
+            && provider_prompt_usage.total_input_tokens() > 0)
+            .then_some(provider_prompt_usage);
     }
 
     if let Some(usage) = session.token_usage.clone() {

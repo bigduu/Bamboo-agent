@@ -2946,7 +2946,12 @@ async fn anthropic_sse_error_preserves_reported_partial_usage() {
     }
 }
 
-async fn gemini_usage_after_frames(frames: &[&str]) -> bamboo_domain::ModelTokenUsage {
+async fn gemini_usage_after_frames(
+    frames: &[&str],
+) -> (
+    bamboo_domain::ModelTokenUsage,
+    Option<bamboo_agent_core::ProviderPromptUsage>,
+) {
     use bamboo_agent_core::AgentHook;
     use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};
     use wiremock::matchers::method;
@@ -3005,7 +3010,7 @@ async fn gemini_usage_after_frames(frames: &[&str]) -> bamboo_domain::ModelToken
     };
     let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
         Arc::new(bamboo_tools::BuiltinToolExecutor::new());
-    let (events, _receiver) = mpsc::channel(128);
+    let (events, mut event_receiver) = mpsc::channel(128);
     trace
         .scope(super::run_agent_loop_with_config(
             &mut session,
@@ -3043,21 +3048,31 @@ async fn gemini_usage_after_frames(frames: &[&str]) -> bamboo_domain::ModelToken
             .is_err()
     );
     drop(sender_guard);
-    usage
+    let mut final_prompt = None;
+    while let Ok(event) = event_receiver.try_recv() {
+        if let bamboo_agent_core::AgentEvent::TokenBudgetUpdated { usage } = event {
+            final_prompt = Some(usage.provider_prompt_usage);
+        }
+    }
+    (usage, final_prompt.expect("final token budget event"))
 }
 
 #[tokio::test]
 async fn gemini_malformed_repeated_cache_is_unknown_in_hook_and_span() {
-    let usage = gemini_usage_after_frames(&[r#"{"cachedContentTokenCount":-1}"#]).await;
+    let (usage, prompt) = gemini_usage_after_frames(&[r#"{"cachedContentTokenCount":-1}"#]).await;
     assert_eq!(usage.input_tokens, Some(100));
     assert_eq!(usage.output_tokens, Some(23));
     assert_eq!(usage.reasoning_tokens, Some(3));
     assert_eq!(usage.cache_read_input_tokens, None);
+    assert!(
+        prompt.is_none(),
+        "unknown cache must not look like a zero-percent ratio"
+    );
 }
 
 #[tokio::test]
 async fn gemini_malformed_repeated_reasoning_invalidates_output_in_hook_and_span() {
-    let usage = gemini_usage_after_frames(&[r#"{"thoughtsTokenCount":null}"#]).await;
+    let (usage, _) = gemini_usage_after_frames(&[r#"{"thoughtsTokenCount":null}"#]).await;
     assert_eq!(usage.input_tokens, Some(100));
     assert_eq!(usage.cache_read_input_tokens, Some(25));
     assert_eq!(usage.reasoning_tokens, None);
@@ -3066,15 +3081,19 @@ async fn gemini_malformed_repeated_reasoning_invalidates_output_in_hook_and_span
 
 #[tokio::test]
 async fn gemini_malformed_repeated_input_is_unknown_in_hook_and_span() {
-    let usage = gemini_usage_after_frames(&[r#"{"promptTokenCount":"invalid"}"#]).await;
+    let (usage, prompt) = gemini_usage_after_frames(&[r#"{"promptTokenCount":"invalid"}"#]).await;
     assert_eq!(usage.input_tokens, None);
     assert_eq!(usage.output_tokens, Some(23));
     assert_eq!(usage.cache_read_input_tokens, Some(25));
+    assert!(
+        prompt.is_none(),
+        "unknown input must not be an exact prompt"
+    );
 }
 
 #[tokio::test]
 async fn gemini_later_zero_restores_invalid_cache_without_erasing_omitted_fields() {
-    let usage = gemini_usage_after_frames(&[
+    let (usage, prompt) = gemini_usage_after_frames(&[
         r#"{"cachedContentTokenCount":-1}"#,
         r#"{"cachedContentTokenCount":0}"#,
     ])
@@ -3083,6 +3102,7 @@ async fn gemini_later_zero_restores_invalid_cache_without_erasing_omitted_fields
     assert_eq!(usage.output_tokens, Some(23));
     assert_eq!(usage.reasoning_tokens, Some(3));
     assert_eq!(usage.cache_read_input_tokens, Some(0));
+    assert_eq!(prompt.unwrap().cache_read_input_tokens, 0);
 }
 
 #[tokio::test]
