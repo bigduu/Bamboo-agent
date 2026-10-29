@@ -89,15 +89,12 @@ pub fn resolve_default_run_config(
         capability_provider_name,
         provider_registry,
     );
-    let reasoning_effort = target
-        .as_ref()
-        .and_then(|target| target.reasoning_effort)
-        .or_else(|| {
-            target
-                .as_ref()
-                .and_then(|target| config_snapshot.reasoning_effort_for_key(&target.provider))
-        })
-        .or_else(|| config_snapshot.get_reasoning_effort());
+    let reasoning_effort = match target.as_ref() {
+        Some(target) => target
+            .reasoning_effort
+            .or_else(|| config_snapshot.reasoning_effort_for_key(&target.provider)),
+        None => config_snapshot.get_reasoning_effort(),
+    };
     let base_system_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
     let workspace_path = config_snapshot
         .get_default_work_area_path()
@@ -239,6 +236,63 @@ mod tests {
             resolved.model_roster.summarization_model().as_deref(),
             Some("gpt-summary")
         );
+    }
+
+    #[test]
+    fn alias_routing_uses_selected_instance_reasoning_without_legacy_fallback() {
+        let mut config = config_with_area_defaults();
+        config
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .reasoning_effort = Some(ReasoningEffort::High);
+        config.default_provider_instance = Some("work-openai".into());
+        config.provider_instances.insert(
+            "work-openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": true, "model": "gpt-chat",
+                "runtime_models": ["gpt-chat"]
+            }))
+            .unwrap(),
+        );
+        let providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::from([(
+            "work-openai".into(),
+            Arc::new(NoopProvider) as Arc<dyn LLMProvider>,
+        )]);
+        let registry = Arc::new(ProviderRegistry::new(providers, "work-openai".into()));
+
+        let selected = resolve_default_run_config(&config, &registry);
+        assert!(selected.model_error.is_none(), "{:?}", selected.model_error);
+        assert_eq!(
+            selected.model_roster.provider_name.as_deref(),
+            Some("work-openai")
+        );
+        assert_eq!(selected.reasoning_effort, None);
+
+        config
+            .provider_instances
+            .get_mut("work-openai")
+            .unwrap()
+            .reasoning_effort = Some(ReasoningEffort::Low);
+        let selected = resolve_default_run_config(&config, &registry);
+        assert_eq!(selected.reasoning_effort, Some(ReasoningEffort::Low));
+        config.defaults.as_mut().unwrap().chat.reasoning_effort = Some(ReasoningEffort::Medium);
+        let selected = resolve_default_run_config(&config, &registry);
+        assert_eq!(selected.reasoning_effort, Some(ReasoningEffort::Medium));
+    }
+
+    #[test]
+    fn missing_chat_target_retains_legacy_reasoning_default() {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(OpenAIConfig {
+            reasoning_effort: Some(ReasoningEffort::High),
+            ..Default::default()
+        });
+        let resolved = resolve_default_run_config(&config, &test_registry());
+        assert!(resolved.model_roster.model.is_none());
+        assert_eq!(resolved.reasoning_effort, Some(ReasoningEffort::High));
     }
 
     #[test]

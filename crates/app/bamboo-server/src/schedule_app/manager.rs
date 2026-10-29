@@ -793,7 +793,7 @@ async fn run_schedule_job(
         let saved = match execution_reservation.execution_persistence() {
             Some(persistence) => {
                 persistence
-                    .save_scheduled_startup_session(&mut session, &scheduled_startup_expected)
+                    .save_bound_startup_session(&mut session, &scheduled_startup_expected)
                     .await
             }
             None => Err(std::io::Error::new(
@@ -1470,14 +1470,12 @@ fn resolve_run_config_from_config(
     );
 
     let requested_reasoning_effort = job.run_config.reasoning_effort;
-    let reasoning_effort = requested_reasoning_effort
-        .or_else(|| target.as_ref().and_then(|target| target.reasoning_effort))
-        .or_else(|| {
-            target
-                .as_ref()
-                .and_then(|target| config_snapshot.reasoning_effort_for_key(&target.provider))
-        })
-        .or_else(|| config_snapshot.get_reasoning_effort());
+    let reasoning_effort = requested_reasoning_effort.or_else(|| match target.as_ref() {
+        Some(target) => target
+            .reasoning_effort
+            .or_else(|| config_snapshot.reasoning_effort_for_key(&target.provider)),
+        None => config_snapshot.get_reasoning_effort(),
+    });
 
     let global_default_prompt =
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();

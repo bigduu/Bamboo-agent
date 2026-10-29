@@ -351,11 +351,11 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     ) {
         (Some(expected), Some(persistence)) => {
             persistence
-                .save_scheduled_startup_session(&mut session, expected)
+                .save_bound_startup_session(&mut session, expected)
                 .await
         }
         (Some(expected), None) => {
-            bamboo_domain::RuntimeSessionPersistence::save_scheduled_startup_session(
+            bamboo_domain::RuntimeSessionPersistence::save_bound_startup_session(
                 state.persistence.as_ref(),
                 &mut session,
                 expected,

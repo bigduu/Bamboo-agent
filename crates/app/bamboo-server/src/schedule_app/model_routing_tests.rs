@@ -317,6 +317,69 @@ async fn schedule_uses_selected_accounts_default_reasoning() {
 }
 
 #[tokio::test]
+async fn schedule_fast_without_reasoning_does_not_use_chat_or_startup_account_default() {
+    for enabled in [false, true] {
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        {
+            let mut config = state.config.write().await;
+            config.features.provider_model_ref = enabled;
+            config.defaults.as_mut().unwrap().chat.reasoning_effort =
+                Some(bamboo_domain::ReasoningEffort::High);
+            config
+                .provider_instances
+                .get_mut("startup-a")
+                .unwrap()
+                .reasoning_effort = Some(bamboo_domain::ReasoningEffort::High);
+            assert!(config.provider_instances["fast-c"]
+                .reasoning_effort
+                .is_none());
+            assert!(config
+                .defaults
+                .as_ref()
+                .unwrap()
+                .fast
+                .as_ref()
+                .unwrap()
+                .reasoning_effort
+                .is_none());
+        }
+        run_schedule_job(context(&state).await, job(), None)
+            .await
+            .unwrap();
+        await_request(&providers["fast-c"]).await;
+        assert_eq!(
+            *providers["fast-c"].models.lock().unwrap(),
+            vec!["cheap-model"]
+        );
+        assert_eq!(*providers["fast-c"].efforts.lock().unwrap(), vec![None]);
+        assert!(providers["chat-b"].models.lock().unwrap().is_empty());
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        state.shutdown().await;
+    }
+}
+
+#[test]
+fn schedule_missing_target_retains_legacy_reasoning_default() {
+    let mut config = bamboo_llm::Config::default();
+    config.provider = "openai".into();
+    config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+        reasoning_effort: Some(bamboo_domain::ReasoningEffort::High),
+        ..Default::default()
+    });
+    let registry = Arc::new(bamboo_llm::ProviderRegistry::new(
+        std::collections::HashMap::new(),
+        "openai".into(),
+    ));
+    let config = Arc::new(tokio::sync::RwLock::new(config));
+    let resolved = resolve_run_config_from_config(&job(), &config, &registry, None);
+    assert!(resolved.model_roster.model.is_none());
+    assert_eq!(
+        resolved.reasoning_effort,
+        Some(bamboo_domain::ReasoningEffort::High)
+    );
+}
+
+#[tokio::test]
 async fn manual_scheduled_session_executes_its_bound_pair_and_rechecks_live_config() {
     use actix_web::{test, web, App};
     for scenario in ["allowed", "disabled", "unadmitted", "managed-stale"] {
@@ -582,7 +645,7 @@ async fn scheduled_startup_rejects_concurrent_model_patch_before_provider_call()
     );
     assert_eq!(execute.status(), actix_web::http::StatusCode::CONFLICT);
     let body = test::read_body(execute).await;
-    assert!(String::from_utf8_lossy(&body).contains("scheduled startup execution profile changed"));
+    assert!(String::from_utf8_lossy(&body).contains("bound startup execution profile changed"));
     let durable = state
         .storage
         .load_session(&entry.id)
@@ -638,7 +701,7 @@ async fn scheduled_startup_automatic_rejects_concurrent_model_patch_before_provi
     );
     let error = run.err().expect("a changed Schedule profile must not run");
     assert!(
-        error.contains("scheduled startup execution profile changed"),
+        error.contains("bound startup execution profile changed"),
         "{error}"
     );
     let durable = state
