@@ -2946,6 +2946,145 @@ async fn anthropic_sse_error_preserves_reported_partial_usage() {
     }
 }
 
+async fn gemini_usage_after_frames(frames: &[&str]) -> bamboo_domain::ModelTokenUsage {
+    use bamboo_agent_core::AgentHook;
+    use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct Capture(mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>);
+    #[async_trait]
+    impl AgentHook for Capture {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterModelCallUsage
+        }
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            if let HookPayload::ModelCallUsage { observation } = payload {
+                self.0.send(observation.clone()).unwrap();
+            }
+            HookResult::Continue
+        }
+    }
+
+    let mut body = concat!(
+        "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"synthetic answer\"}]},\"finishReason\":\"STOP\"}],",
+        "\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":25,",
+        "\"candidatesTokenCount\":20,\"thoughtsTokenCount\":3,\"totalTokenCount\":123}}\n\n"
+    ).to_string();
+    for usage in frames {
+        body.push_str(&format!(
+            "data: {{\"candidates\":[],\"usageMetadata\":{usage}}}\n\n"
+        ));
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+    let provider: Arc<dyn LLMProvider> = Arc::new(
+        bamboo_llm::providers::gemini::GeminiProvider::new("synthetic-key")
+            .with_base_url(server.uri()),
+    );
+    let trace = bamboo_infrastructure::telemetry::test_support::LocalTraceTest::isolated();
+    let mut session = Session::new("synthetic-gemini-repeated-usage", "synthetic-model");
+    let birth = session.created_at;
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let sender_guard = sender.clone();
+    let mut hooks = crate::runtime::hooks::HookRunner::new();
+    hooks.register(Arc::new(Capture(sender)));
+    let config = AgentLoopConfig {
+        hook_runner: Arc::new(hooks),
+        provider_type: Some("gemini".into()),
+        model_name: Some("synthetic-model".into()),
+        system_prompt: Some("synthetic system".into()),
+        ..Default::default()
+    };
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let (events, _receiver) = mpsc::channel(128);
+    trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "PRIVATE_PROMPT_SENTINEL".into(),
+            events,
+            provider,
+            tools,
+            CancellationToken::new(),
+            config,
+        ))
+        .await
+        .expect("synthetic Gemini call");
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status, ModelCallStatus::Success);
+    let usage = event.usage.expect("other provider counters remain known");
+    let detail = trace
+        .store
+        .detail(&session.id, birth, event.trace_id.as_deref().unwrap())
+        .unwrap();
+    let span = detail
+        .spans
+        .iter()
+        .find(|span| span.span_id == event.span_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(span.usage.as_ref(), Some(&usage));
+    assert!(!serde_json::to_string(&detail)
+        .unwrap()
+        .contains("PRIVATE_PROMPT_SENTINEL"));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err()
+    );
+    drop(sender_guard);
+    usage
+}
+
+#[tokio::test]
+async fn gemini_malformed_repeated_cache_is_unknown_in_hook_and_span() {
+    let usage = gemini_usage_after_frames(&[r#"{"cachedContentTokenCount":-1}"#]).await;
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(23));
+    assert_eq!(usage.reasoning_tokens, Some(3));
+    assert_eq!(usage.cache_read_input_tokens, None);
+}
+
+#[tokio::test]
+async fn gemini_malformed_repeated_reasoning_invalidates_output_in_hook_and_span() {
+    let usage = gemini_usage_after_frames(&[r#"{"thoughtsTokenCount":null}"#]).await;
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.cache_read_input_tokens, Some(25));
+    assert_eq!(usage.reasoning_tokens, None);
+    assert_eq!(usage.output_tokens, None);
+}
+
+#[tokio::test]
+async fn gemini_malformed_repeated_input_is_unknown_in_hook_and_span() {
+    let usage = gemini_usage_after_frames(&[r#"{"promptTokenCount":"invalid"}"#]).await;
+    assert_eq!(usage.input_tokens, None);
+    assert_eq!(usage.output_tokens, Some(23));
+    assert_eq!(usage.cache_read_input_tokens, Some(25));
+}
+
+#[tokio::test]
+async fn gemini_later_zero_restores_invalid_cache_without_erasing_omitted_fields() {
+    let usage = gemini_usage_after_frames(&[
+        r#"{"cachedContentTokenCount":-1}"#,
+        r#"{"cachedContentTokenCount":0}"#,
+    ])
+    .await;
+    assert_eq!(usage.input_tokens, Some(100));
+    assert_eq!(usage.output_tokens, Some(23));
+    assert_eq!(usage.reasoning_tokens, Some(3));
+    assert_eq!(usage.cache_read_input_tokens, Some(0));
+}
+
 #[tokio::test]
 async fn synthetic_anthropic_and_gemini_streams_reach_usage_hook_and_local_span() {
     use bamboo_agent_core::AgentHook;
