@@ -549,3 +549,386 @@ async fn cancelled_root_control_admission_cannot_signal_late_owner() {
     owner.abandon().await;
     fixture.state.shutdown().await;
 }
+
+#[actix_web::test]
+async fn default_supervisor_cancel_observes_root_but_requires_operation_approval() {
+    let fixture = Box::pin(Fixture::new_with_legacy_setup(false)).await;
+    let target = current_target(&fixture).await;
+    let supervisor = fixture
+        .state
+        .storage
+        .load_execution_admission_snapshot(&fixture.reference.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = bamboo_domain::SessionCallerReference::from(&supervisor);
+    assert!(fixture
+        .state
+        .storage
+        .find_host_session_scope(&caller)
+        .await
+        .unwrap()
+        .is_none());
+    let scope = SupervisorSessionService::new(fixture.state.session_store.clone())
+        .inspect_scope(&fixture.reference)
+        .await
+        .unwrap();
+    assert!(scope.allowed_projects.is_empty());
+    assert!(fixture
+        .state
+        .storage
+        .inspect_supervisor_link(&fixture.reference, TARGET)
+        .await
+        .unwrap()
+        .link
+        .is_none());
+
+    let mut runner = crate::app_state::AgentRunner::new();
+    runner.status = crate::app_state::AgentStatus::Running;
+    let run_id = runner.run_id.clone();
+    let token = runner.cancel_token.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &run_id)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), runner);
+
+    let observed = invoke(&fixture, args("observe_run", &target, None))
+        .await
+        .unwrap();
+    assert_eq!(observed["run_id"], run_id);
+    let rejected = invoke(&fixture, args("cancel", &target, Some(&run_id)))
+        .await
+        .unwrap_err();
+    assert!(rejected
+        .to_string()
+        .contains("Permission approval required"));
+    assert!(!token.is_cancelled());
+    assert_eq!(
+        fixture
+            .state
+            .session_inbox
+            .inspect(TARGET)
+            .await
+            .unwrap()
+            .generation,
+        0
+    );
+    // The same first-run policy becomes an interactive request when the
+    // actual executor has an event sink. It is still not a cancel receipt.
+    let call = ToolCall {
+        id: "unapproved-model-cancel".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "session_control".into(),
+            arguments: args("cancel", &target, Some(&run_id)).to_string(),
+        },
+    };
+    let (events, mut received) = tokio::sync::mpsc::channel(4);
+    let mut context = ToolExecutionContext::none(&call.id);
+    context.session_id = Some(&supervisor.id);
+    context.root_session_id = Some(&supervisor.id);
+    context.event_tx = Some(&events);
+    context = context.with_executing_supervisor(
+        ExecutingSupervisorObservation::capture_from_executing_session(&supervisor),
+    );
+    let outcome = bamboo_agent_core::tools::with_executing_session_caller(
+        Some(Arc::new(caller)),
+        fixture
+            .state
+            .tools_for(ToolSurface::Root)
+            .execute_with_context_outcome(&call, context),
+    )
+    .await
+    .unwrap();
+    let ToolOutcome::Completed(approval) = outcome else {
+        panic!("the unapproved request must not invoke Root cancellation");
+    };
+    let payload: Value = serde_json::from_str(&approval.result).unwrap();
+    assert_eq!(payload["status"], "awaiting_permission_approval");
+    let event = tokio::time::timeout(Duration::from_secs(5), received.recv())
+        .await
+        .expect("the approval event must be delivered");
+    assert!(matches!(
+        event,
+        Some(bamboo_agent_core::AgentEvent::ToolApprovalRequested { tool_call_id, .. })
+            if tool_call_id == call.id
+    ));
+    assert!(!token.is_cancelled());
+    grant_cancel(&fixture);
+    let requested = invoke(&fixture, args("cancel", &target, Some(&run_id)))
+        .await
+        .unwrap();
+    assert_eq!(requested["status"], "cancel_requested");
+    assert!(token.is_cancelled());
+    owner.abandon().await;
+    fixture.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn installed_or_revoked_finite_host_scope_cannot_cancel_even_with_send_right() {
+    use bamboo_domain::{
+        HostScopeSessionObservation, HostSessionRight, HostSessionScopeBinding,
+        HostSessionTargetScope, HOST_SESSION_SCOPE_VERSION,
+    };
+
+    let fixture = Box::pin(Fixture::new_with_legacy_setup(false)).await;
+    grant_cancel(&fixture);
+    let supervisor = fixture
+        .state
+        .storage
+        .load_session(&fixture.reference.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let current = fixture.reload().await;
+    let target = current_target(&fixture).await;
+    let mut runner = crate::app_state::AgentRunner::new();
+    runner.status = crate::app_state::AgentStatus::Running;
+    let run_id = runner.run_id.clone();
+    let token = runner.cancel_token.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&current, &run_id)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), runner);
+    fixture
+        .state
+        .session_store
+        .install_host_session_scope(
+            0,
+            HostSessionScopeBinding {
+                schema_version: HOST_SESSION_SCOPE_VERSION,
+                grant_id: uuid::Uuid::new_v4(),
+                revision: 1,
+                caller: HostScopeSessionObservation::capture(&supervisor, vec![]).unwrap(),
+                targets: [(
+                    current.id.clone(),
+                    HostSessionTargetScope {
+                        observation: HostScopeSessionObservation::capture(&current, vec![])
+                            .unwrap(),
+                        rights: [HostSessionRight::ListMetadata, HostSessionRight::SendPeer].into(),
+                    },
+                )]
+                .into(),
+                creates: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+
+    for revoked in [false, true] {
+        if revoked {
+            fixture
+                .state
+                .session_store
+                .revoke_host_session_scope(&fixture.reference.session_id, 1)
+                .await
+                .unwrap();
+        }
+        let error = invoke(&fixture, args("cancel", &target, Some(&run_id)))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("host_session_scope_legacy_namespace_changed"),
+            "{error}"
+        );
+        assert!(!token.is_cancelled());
+        assert_eq!(
+            fixture
+                .state
+                .session_inbox
+                .inspect(TARGET)
+                .await
+                .unwrap()
+                .generation,
+            0
+        );
+    }
+    owner.abandon().await;
+    fixture.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn native_supervisor_dispatch_reaches_exact_cancel_in_standard_and_ultra() {
+    for (ultra, explicit_deny) in [(false, false), (true, false), (false, true), (true, true)] {
+        // An isolated Host, its real tool factory, Router and storage are used.
+        // Auto is selected in this synthetic Supervisor only; it is not bypass.
+        let fixture = Box::pin(Fixture::new_with_legacy_setup(false)).await;
+        let mut supervisor = fixture
+            .state
+            .storage
+            .load_session(&fixture.reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        supervisor
+            .agent_runtime_state
+            .get_or_insert_with(Default::default)
+            .set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
+        let workspace = fixture._home.path().join("supervisor-workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        supervisor.set_workspace_path_meta(workspace.to_string_lossy());
+        fixture
+            .state
+            .storage
+            .save_session(&supervisor)
+            .await
+            .unwrap();
+        let flags = bamboo_agent_core::tools::ToolExecutionSessionFlags::from_session(&supervisor);
+        assert!(flags.auto_approve_permissions);
+        assert!(!flags.bypass_permissions);
+        let caller = bamboo_domain::SessionCallerReference::from(&supervisor);
+        assert!(fixture
+            .state
+            .storage
+            .find_host_session_scope(&caller)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            SupervisorSessionService::new(fixture.state.session_store.clone())
+                .inspect_scope(&fixture.reference)
+                .await
+                .unwrap()
+                .allowed_projects
+                .is_empty()
+        );
+        assert!(fixture
+            .state
+            .storage
+            .inspect_supervisor_link(&fixture.reference, TARGET)
+            .await
+            .unwrap()
+            .link
+            .is_none());
+
+        let mut runner = crate::app_state::AgentRunner::new();
+        runner.status = crate::app_state::AgentStatus::Running;
+        let run_id = runner.run_id.clone();
+        let token = runner.cancel_token.clone();
+        let owner = fixture
+            .state
+            .session_activation_router
+            .register_session_run(&fixture.original, &run_id)
+            .await
+            .unwrap();
+        fixture
+            .state
+            .agent_runners
+            .write()
+            .await
+            .insert(TARGET.into(), runner);
+        let target = current_target(&fixture).await;
+        let observation = invoke(&fixture, args("observe_run", &target, None))
+            .await
+            .unwrap();
+        assert_eq!(observation["run_id"], run_id);
+        if explicit_deny {
+            fixture
+                .state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .deny_scoped_session_permission(
+                    &fixture.reference.session_id,
+                    PermissionType::ExecuteCommand,
+                    format!("session_control cancel {TARGET}"),
+                );
+        }
+        let call_id = format!("model-exact-cancel-{ultra}-{explicit_deny}");
+        *fixture.probe.next.lock().unwrap() = Some(ToolCall {
+            id: call_id.clone(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments: args("cancel", &target, Some(&run_id)).to_string(),
+            },
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(100);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            fixture.state.agent.execute_direct(
+                &mut supervisor,
+                bamboo_engine::ExecuteRequestBuilder::new(
+                    "Cancel the observed Root run",
+                    tx,
+                    tokio_util::sync::CancellationToken::new(),
+                )
+                .tools(fixture.state.tools_for(ToolSurface::Root))
+                .provider_override(fixture.probe.clone())
+                .model("supervisor-model")
+                .build(),
+            ),
+        )
+        .await
+        .expect("bounded synthetic Supervisor run")
+        .unwrap();
+        drain.await.unwrap();
+        {
+            let schemas = fixture.probe.control_schemas.lock().unwrap();
+            let offered = schemas.first().and_then(Option::as_ref).unwrap();
+            assert!(offered["properties"]["action"]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("cancel")));
+        }
+        let durable = fixture
+            .state
+            .storage
+            .load_session(&fixture.reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let result = durable
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(call_id.as_str()))
+            .expect("the real Supervisor dispatcher must persist its tool result");
+        assert_eq!(result.tool_success, Some(!explicit_deny));
+        if explicit_deny {
+            assert!(
+                result.content.contains("permission denied"),
+                "{}",
+                result.content
+            );
+            assert!(!token.is_cancelled());
+        } else {
+            let receipt: Value = serde_json::from_str(&result.content).expect(&result.content);
+            assert_eq!(receipt["status"], "cancel_requested");
+            assert_eq!(receipt["run_id"], run_id);
+            assert_eq!(receipt["completion_verified"], false);
+            assert!(token.is_cancelled());
+        }
+        assert_eq!(
+            fixture
+                .state
+                .session_inbox
+                .inspect(TARGET)
+                .await
+                .unwrap()
+                .generation,
+            0
+        );
+        owner.abandon().await;
+        fixture.state.shutdown().await;
+    }
+}
