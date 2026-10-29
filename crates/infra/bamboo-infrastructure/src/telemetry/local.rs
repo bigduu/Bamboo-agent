@@ -590,8 +590,9 @@ mod tests {
         let birth = Utc::now();
         let scope_path = std::path::Path::new("/synthetic-trace-scope");
         let scope = scope_for_path(scope_path);
-        let other_scope = scope_for_path(std::path::Path::new("/synthetic-other-scope"));
-        let ids = ["用户 会话", "用户 会话二"];
+        let other_scope_path = std::path::Path::new("/synthetic-other-scope");
+        let other_scope = scope_for_path(other_scope_path);
+        let ids = ["用户 会话", "space session"];
         trace
             .scope(async {
                 for id in ids {
@@ -606,6 +607,10 @@ mod tests {
                     .await;
                     root.finish(Outcome::Success);
                 }
+                Observation::agent(ids[0], ids[0])
+                    .bind_session_lifetime(ids[0], birth)
+                    .bind_local_scope(other_scope_path)
+                    .finish(Outcome::Success);
             })
             .await;
         let first = trace
@@ -622,11 +627,15 @@ mod tests {
             .store
             .detail_scoped(Some(&scope), ids[1], birth, &first.traces[0].trace_id)
             .is_none());
+        let other = trace
+            .store
+            .page_scoped(Some(&other_scope), ids[0], birth, 10, None);
+        assert_eq!(other.traces.len(), 1);
+        assert_ne!(first.traces[0].trace_id, other.traces[0].trace_id);
         assert!(trace
             .store
-            .page_scoped(Some(&other_scope), ids[0], birth, 10, None)
-            .traces
-            .is_empty());
+            .detail_scoped(Some(&other_scope), ids[0], birth, &first.traces[0].trace_id)
+            .is_none());
         let detail = trace
             .store
             .detail_scoped(Some(&scope), ids[0], birth, &first.traces[0].trace_id)
