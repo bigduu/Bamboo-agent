@@ -789,12 +789,22 @@ impl AgentBuilder {
             .config_override
             .clone()
             .or_else(|| self.assembled_config.clone());
-        let declared_scope = effective_config.as_ref().and_then(|shared| {
-            shared
-                .try_read()
-                .ok()
-                .map(|config| config.effective_default_provider().to_string())
-        });
+        // Use one coherent snapshot. A locked replacement must not silently
+        // bypass the client/account and Chat admission checks.
+        let config_snapshot = effective_config
+            .as_ref()
+            .map(|shared| {
+                shared.try_read().map(|config| config.clone()).map_err(|_| {
+                    SdkError::Config(
+                        "SDK provider configuration is busy; retry after the update".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let routing_config = effective_config.clone();
+        let declared_scope = config_snapshot
+            .as_ref()
+            .map(|config| config.effective_default_provider().to_string());
         let provider_scope = if self.provider_override.is_some() && self.provider_name.is_none() {
             declared_scope
         } else {
@@ -803,48 +813,45 @@ impl AgentBuilder {
         if self.provider_override.is_some() && self.model.is_none() {
             // An injected client is authoritative for its declared account.
             // A different global Chat role cannot lend its model name to it.
-            if let (Some(scope), Some(shared)) =
-                (provider_scope.as_ref(), effective_config.as_ref())
+            if let (Some(scope), Some(config)) = (provider_scope.as_ref(), config_snapshot.as_ref())
             {
-                self.session_model = shared.try_read().ok().and_then(|config| {
+                self.session_model =
                     bamboo_engine::model_config_helper::get_default_model_for_provider(
-                        &config, scope,
+                        config, scope,
                     )
-                    .ok()
-                });
-                self.assembled_chat_reasoning = shared.try_read().ok().and_then(|config| {
-                    config
-                        .defaults
-                        .as_ref()
-                        .filter(|_| config.features.provider_model_ref)
-                        .map(|defaults| &defaults.chat)
-                        .filter(|target| {
-                            &target.provider == scope
-                                && Some(&target.model) == self.session_model.as_ref()
-                        })
-                        .and_then(|target| target.reasoning_effort)
-                });
+                    .ok();
+                self.assembled_chat_reasoning = config
+                    .defaults
+                    .as_ref()
+                    .filter(|_| config.features.provider_model_ref)
+                    .map(|defaults| &defaults.chat)
+                    .filter(|target| {
+                        &target.provider == scope
+                            && Some(&target.model) == self.session_model.as_ref()
+                    })
+                    .and_then(|target| target.reasoning_effort);
             }
         }
         if self.provider_override.is_none() && self.model.is_none() && self.provider_name.is_none()
         {
-            if let (Some(scope), Some(shared)) =
-                (provider_scope.as_ref(), self.config_override.as_ref())
-            {
-                if let Ok(config) = shared.try_read() {
-                    if let Some(target) =
-                        bamboo_engine::resolved_defaults::default_chat_model_ref(&config)
-                    {
-                        if &target.provider != scope {
-                            return Err(SdkError::Config(format!(
-                                "SDK client is bound to provider '{scope}', but replacement Chat configuration targets '{}'; rebuild defaults or supply a matching client", target.provider
-                            )));
-                        }
-                        if config.features.provider_model_ref && config.defaults.is_some() {
-                            // The native client was created earlier. Replacing
-                            // its metadata must still pass exact admission.
-                            select_configured_chat_target(&mut config.clone(), &target)?;
-                        }
+            if let (Some(scope), Some(config)) = (
+                provider_scope.as_ref(),
+                config_snapshot
+                    .as_ref()
+                    .filter(|_| self.config_override.is_some()),
+            ) {
+                if let Some(target) =
+                    bamboo_engine::resolved_defaults::default_chat_model_ref(config)
+                {
+                    if &target.provider != scope {
+                        return Err(SdkError::Config(format!(
+                            "SDK client is bound to provider '{scope}', but replacement Chat configuration targets '{}'; rebuild defaults or supply a matching client", target.provider
+                        )));
+                    }
+                    if config.features.provider_model_ref && config.defaults.is_some() {
+                        // The native client was created earlier. Replacing
+                        // its metadata must still pass exact admission.
+                        select_configured_chat_target(&mut config.clone(), &target)?;
                     }
                 }
             }
@@ -1046,6 +1053,7 @@ impl AgentBuilder {
         );
         agent.sdk_skills = sdk_skills;
         agent.provider_scope = provider_scope;
+        agent.routing_config = routing_config;
         agent.primary_reasoning_effort = self.assembled_chat_reasoning;
         Ok(agent)
     }

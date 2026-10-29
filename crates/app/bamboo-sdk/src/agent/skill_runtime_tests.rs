@@ -4,6 +4,8 @@
 use super::*;
 use bamboo_agent_core::tools::{FunctionCall, ToolSchema};
 use bamboo_domain::{ImageUrlRef, MessagePart, TokenBudget};
+use bamboo_engine::ExecuteRequestBuilder;
+use bamboo_llm::retry::UpstreamRetry;
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -2021,5 +2023,135 @@ async fn sdk_typed_cancel_wakes_real_public_router_reservation_wait_without_appe
                 .pending,
             1
         );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sdk_typed_account_mismatch_stops_before_portable_hook_or_append() {
+    let home = tempfile::tempdir().unwrap();
+    let hook_count = install_prompt_hook(home.path(), false);
+    let provider = Arc::new(PassiveProvider::default());
+    let agent = build(home.path(), provider.clone()).await;
+    let mut session = agent.new_session("sdk-typed-unpaired-account").unwrap();
+    session.model = "other-model".into();
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+        "other-provider",
+        "other-model",
+    ));
+    let before = serde_json::to_value(&session).unwrap();
+    let result = agent
+        .run_with_skills(
+            &mut session,
+            SdkSkillInput::new("Synthetic typed account witness", vec![]),
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(
+        !hook_count.exists(),
+        "prompt hook must not run on a mismatched account"
+    );
+    assert!(provider.0.lock().unwrap().is_empty());
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    assert!(agent
+        .storage()
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[derive(Default)]
+struct SdkIdentityCapture(Mutex<Vec<String>>);
+
+#[async_trait]
+impl LLMProvider for SdkIdentityCapture {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.0.lock().unwrap().push(model.to_string());
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Synthetic completion".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn sdk_wrapped_runtime_requires_client_for_bound_accounts_but_keeps_bare_sessions() {
+    let home = tempfile::tempdir().unwrap();
+    let main = Arc::new(SdkIdentityCapture::default());
+    let scoped = build(home.path(), main.clone()).await;
+    let agent = Agent::from_runtime(scoped.inner.clone());
+
+    let mut bare = Session::new("sdk-wrapped-bare", "claude-test");
+    bare.add_message(Message::user("Synthetic bare request"));
+    agent.run_session(&mut bare).await.unwrap();
+    let bare_calls = main.0.lock().unwrap().clone();
+    assert!(!bare_calls.is_empty() && bare_calls.iter().all(|model| model == "claude-test"));
+    main.0.lock().unwrap().clear();
+
+    let mut bound = Session::new("sdk-wrapped-bound", "model-b");
+    bound.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+        "synthetic-b",
+        "model-b",
+    ));
+    bound.add_message(Message::user("Synthetic bound request"));
+    let before = serde_json::to_value(&bound).unwrap();
+    assert!(agent.run_session(&mut bound).await.is_err());
+    assert_eq!(serde_json::to_value(&bound).unwrap(), before);
+    assert!(main.0.lock().unwrap().is_empty());
+
+    for retry_entry in [false, true] {
+        let mut session = Session::new(format!("sdk-wrapped-named-{retry_entry}"), "model-b");
+        session.add_message(Message::user("Synthetic named request"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request =
+            ExecuteRequestBuilder::new("Synthetic named request", tx, CancellationToken::new())
+                .model("model-b")
+                .provider_name("synthetic-b")
+                .build();
+        let result = if retry_entry {
+            agent
+                .execute_with_upstream_retry(&mut session, request, UpstreamRetry::Bounded)
+                .await
+        } else {
+            agent.execute(&mut session, request).await
+        };
+        drain.abort();
+        assert!(result.is_err());
+        assert!(main.0.lock().unwrap().is_empty());
+
+        let other = Arc::new(SdkIdentityCapture::default());
+        let mut paired = Session::new(format!("sdk-wrapped-paired-{retry_entry}"), "model-b");
+        paired.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+            "synthetic-b",
+            "model-b",
+        ));
+        paired.add_message(Message::user("Synthetic explicit pair"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request =
+            ExecuteRequestBuilder::new("Synthetic explicit pair", tx, CancellationToken::new())
+                .provider_name("synthetic-b")
+                .provider_override(other.clone())
+                .build();
+        let result = if retry_entry {
+            agent
+                .execute_with_upstream_retry(&mut paired, request, UpstreamRetry::Bounded)
+                .await
+        } else {
+            agent.execute(&mut paired, request).await
+        };
+        drain.abort();
+        result.unwrap();
+        assert!(main.0.lock().unwrap().is_empty());
+        let other_calls = other.0.lock().unwrap().clone();
+        assert!(!other_calls.is_empty() && other_calls.iter().all(|model| model == "model-b"));
     }
 }
