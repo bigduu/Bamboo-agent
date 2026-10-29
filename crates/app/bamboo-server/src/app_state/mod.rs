@@ -674,3 +674,4 @@ mod local_task_conversation_tests;
 mod supervised_root_create_tests;
 
 pub(super) mod supervised_root_create;
+mod supervised_root_run;

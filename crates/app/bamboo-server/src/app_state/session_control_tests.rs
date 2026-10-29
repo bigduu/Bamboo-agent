@@ -137,6 +137,7 @@ struct Probe {
     entered: Notify,
     release: Notify,
     requests: Mutex<Vec<(String, Vec<Message>)>>,
+    control_schemas: Mutex<Vec<Option<Value>>>,
 }
 
 #[async_trait::async_trait]
@@ -144,7 +145,7 @@ impl LLMProvider for Probe {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: &[ToolSchema],
+        tools: &[ToolSchema],
         _max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
@@ -152,6 +153,12 @@ impl LLMProvider for Probe {
             .lock()
             .unwrap()
             .push((model.into(), messages.to_vec()));
+        self.control_schemas.lock().unwrap().push(
+            tools
+                .iter()
+                .find(|schema| schema.function.name == "session_control")
+                .map(|schema| schema.function.parameters.clone()),
+        );
         let output = self.next.lock().unwrap().take();
         if self
             .blocked
@@ -188,8 +195,15 @@ struct Fixture {
     followup_targets: Mutex<HashMap<String, Value>>,
 }
 
+#[path = "supervisor_exact_cancel_tests.rs"]
+mod exact_cancel_tests;
+
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_legacy_setup(true).await
+    }
+
+    async fn new_with_legacy_setup(legacy_setup: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe::default());
         let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
@@ -247,27 +261,28 @@ impl Fixture {
             .await
             .unwrap())
             .into();
-        service
-            .configure_project_scope(&reference, 0, [project.id.clone()].into())
-            .await
-            .unwrap();
-        service.attach(&reference, 1, TARGET).await.unwrap();
-        // This fixture's Supervisor has approval only for this one target
-        // operation. Target permissions and every bypass flag remain unchanged.
-        state
-            .permission_checker
-            .permission_config()
-            .unwrap()
-            .grant_typed_scoped_session_permission(
-                &reference.session_id,
-                bamboo_tools::permission::PermissionType::ExecuteCommand,
-                bamboo_tools::permission::PermissionMatcher {
-                    id: "approved-followup-target".into(),
-                    kind: bamboo_tools::permission::PermissionMatcherKind::ExactResource,
-                    value: format!("session_control followup {TARGET}"),
-                },
-            )
-            .unwrap();
+        if legacy_setup {
+            service
+                .configure_project_scope(&reference, 0, [project.id.clone()].into())
+                .await
+                .unwrap();
+            service.attach(&reference, 1, TARGET).await.unwrap();
+            // Older followup fixtures explicitly use their target grant.
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .grant_typed_scoped_session_permission(
+                    &reference.session_id,
+                    bamboo_tools::permission::PermissionType::ExecuteCommand,
+                    bamboo_tools::permission::PermissionMatcher {
+                        id: "approved-followup-target".into(),
+                        kind: bamboo_tools::permission::PermissionMatcherKind::ExactResource,
+                        value: format!("session_control followup {TARGET}"),
+                    },
+                )
+                .unwrap();
+        }
         // Prewarm the exact Project/workspace store used by the Root runner.
         // Warming only the workspace store leaves a second watcher registration
         // in the bounded execution path.
