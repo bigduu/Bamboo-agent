@@ -382,8 +382,15 @@ async fn vision_server(status: u16) -> wiremock::MockServer {
     let response = if status == 200 {
         ResponseTemplate::new(status).set_body_raw(sse, "text/event-stream")
     } else {
-        ResponseTemplate::new(status)
-            .set_body_json(serde_json::json!({"error":{"message":"synthetic refusal"}}))
+        let response = ResponseTemplate::new(status)
+            .set_body_json(serde_json::json!({"error":{"message":"synthetic refusal"}}));
+        if matches!(status, 429 | 503) {
+            // The server hint exceeds every supported finite test budget, so
+            // this routing test exercises the error without a long backoff.
+            response.insert_header("Retry-After", "7200")
+        } else {
+            response
+        }
     };
     Mock::given(method("POST"))
         .respond_with(response)
@@ -541,7 +548,11 @@ async fn entrypoint_routing_legacy_auth_quota_and_server_failure_never_switch_im
             "legacy omission marker must remain explicit: status={status}"
         );
         let requests = server.received_requests().await.unwrap();
-        assert!(!requests.is_empty(), "status={status}");
+        assert_eq!(
+            requests.len(),
+            1,
+            "status={status}: server hint must not be retried early"
+        );
         assert!(requests
             .iter()
             .all(|r| r.body_json::<serde_json::Value>().unwrap()["model"] == "vision-b"));
