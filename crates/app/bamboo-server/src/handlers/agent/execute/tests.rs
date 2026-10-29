@@ -5509,7 +5509,14 @@ mod execution_input_http {
 
         const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
         let mut observations = Vec::new();
-        for (changed, replace_registry) in [(false, false), (true, false), (true, true)] {
+        for (changed, replace_registry, is_managed) in [
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+        ] {
             let a = MockServer::start().await;
             let b = MockServer::start().await;
             let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic image description\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
@@ -5568,14 +5575,23 @@ mod execution_input_http {
             .await
             .unwrap();
             app.stop_config_watcher_for_test();
-            app.provider_registry.replace_with(
-                ProviderRegistry::from_config(&old, home.path().to_path_buf())
-                    .await
-                    .unwrap(),
-            );
+            let built = ProviderRegistry::from_config(&old, home.path().to_path_buf())
+                .await
+                .unwrap();
+            let selected_registry = if is_managed {
+                built
+            } else {
+                let selected = built.get("openai").unwrap();
+                ProviderRegistry::new(
+                    std::collections::HashMap::from([("openai".into(), selected)]),
+                    "openai".into(),
+                )
+            };
+            app.provider_registry.replace_with(selected_registry);
             app.provider_router = Arc::new(ProviderModelRouter::new(app.provider_registry.clone()));
             let state = web::Data::new(app);
-            let id = format!("synthetic-legacy-vision-reload-{changed}-{replace_registry}");
+            let id =
+                format!("synthetic-legacy-vision-reload-{changed}-{replace_registry}-{is_managed}");
             let mut session = owned_http_session(&state, &id);
             session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "test-model"));
             let image = bamboo_agent_core::Message::user_with_parts(
@@ -5632,9 +5648,9 @@ mod execution_input_http {
                 managed
             };
             let ((status, body), managed) = tokio::join!(execute(&state, &id, None), update);
-            assert!(
-                managed,
-                "the original selected A1 client must have managed provenance"
+            assert_eq!(
+                managed, is_managed,
+                "the selected A1 client must have the expected provenance"
             );
             assert_eq!(status, StatusCode::ACCEPTED, "{body}");
             let run = body["run_id"].as_str().expect("accepted run").to_string();
@@ -5703,28 +5719,32 @@ mod execution_input_http {
                 failure,
                 preserved,
                 image_routes,
+                is_managed,
             ));
             tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
                 .await
                 .expect("shutdown synthetic Host");
         }
-        let control = &observations[0];
-        assert!(
-            control.2
-                && !control.3
-                && !control.4
-                && control.5.is_none()
-                && control.6
-                && control.7 == [("A1".to_string(), "vision-old".to_string())],
-            "unchanged A1 must receive vision-old and succeed: {observations:?}"
-        );
-        assert!(observations.iter().skip(1).all(|(_, _, a_old, a_new, b_new, failure, preserved, routes)| {
+        for control in [&observations[0], &observations[3]] {
+            assert!(
+                control.2
+                    && !control.3
+                    && !control.4
+                    && control.5.is_none()
+                    && control.6
+                    && !control.7.is_empty()
+                    && control
+                        .7
+                        .iter()
+                        .all(|(endpoint, model)| endpoint == "A1" && model == "vision-old"),
+                "unchanged A1 must receive vision-old and succeed: {observations:?}"
+            );
+        }
+        assert!(observations.iter().filter(|entry| entry.0).all(|(_, _, a_old, a_new, b_new, failure, preserved, routes, _)| {
             let source_refused = failure.as_ref().is_some_and(|error|
                 error.contains("Legacy Vision provider source changed"));
-            let valid_routes = routes.len() <= 1 && routes.iter().all(|(endpoint, model)|
-                (endpoint == "A1" && model == "vision-old") || (endpoint == "A2" && model == "vision-new"));
-            !a_new && valid_routes && (((*a_old || *b_new) && failure.is_none()) || source_refused) && *preserved
-        }), "a configuration reload must not send a new Vision model through old A1: {observations:?}");
+            source_refused && !a_old && !a_new && !b_new && routes.is_empty() && *preserved
+        }), "a selected client with a changed source must be refused before any image is sent: {observations:?}");
     }
 
     #[actix_web::test]

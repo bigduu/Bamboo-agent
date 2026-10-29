@@ -40,6 +40,8 @@ pub(crate) struct SpawnAgentExecution {
     /// Opaque managed-origin proof captured with the selected provider handle.
     pub(crate) provider_override_managed_registry:
         Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+    pub(crate) legacy_vision_provider_source:
+        Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
     /// Cohesive primary + auxiliary model/provider selection.
     pub(crate) model_roster: ModelRoster,
     pub(crate) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
@@ -232,6 +234,10 @@ fn spawn_agent_execution_with_inputs(
     } else {
         agent
     };
+    // Replace, including clearing, per-run evidence on the execution clone.
+    let agent = Arc::new(
+        agent.with_legacy_vision_provider_source(args.legacy_vision_provider_source.clone()),
+    );
     let gold_target_resolver = gold_route::make_gold_target_resolver(
         args.state.as_ref(),
         &args.provider_name,

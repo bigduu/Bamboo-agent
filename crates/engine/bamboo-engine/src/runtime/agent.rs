@@ -451,6 +451,17 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Replace the per-run evidence for the selected legacy Vision client.
+    #[doc(hidden)]
+    pub fn with_legacy_vision_provider_source(
+        &self,
+        source: Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.legacy_image_provider_source = source;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Adapt the default provider for this execution while retaining every
     /// other runtime capability. Explicit request-level overrides stay separate.
     #[doc(hidden)]

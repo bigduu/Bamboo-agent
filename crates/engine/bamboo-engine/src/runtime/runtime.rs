@@ -143,6 +143,8 @@ pub struct AgentRuntime {
     pub(crate) inherited_child_wait_captured: bool,
     /// Config-derived fallback is an explicit per-run Host choice.
     pub(crate) legacy_image_from_config: bool,
+    pub(crate) legacy_image_provider_source:
+        Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
     pub(crate) sdk_skill_execution_host:
         Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
     pub(crate) workspace_execution_host:
@@ -346,6 +348,7 @@ impl AgentRuntimeBuilder {
         Ok(AgentRuntime {
             inherited_child_wait_captured: false,
             legacy_image_from_config: false,
+            legacy_image_provider_source: None,
             sdk_skill_execution_host: None,
             workspace_execution_host: None,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
@@ -1168,6 +1171,7 @@ impl AgentRuntime {
                     fallback.vision_model.clone(),
                     app_data_dir.clone(),
                     self.legacy_image_from_config,
+                    self.legacy_image_provider_source.clone(),
                 )
             });
         if let Some(control) = loop_control.as_ref() {

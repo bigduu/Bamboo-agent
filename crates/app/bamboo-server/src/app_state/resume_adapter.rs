@@ -224,6 +224,15 @@ impl AppStateResumeRef {
                 return;
             }
         };
+        let legacy_vision_provider_source =
+            bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+                &config_snapshot,
+                &resolved_provider_name,
+                provider_override.clone(),
+                provider_override_managed_registry.clone(),
+            )
+            .ok()
+            .map(std::sync::Arc::new);
         let resolved_provider_type = resolve_provider_type(
             &config_snapshot,
             &resolved_provider_name,
@@ -358,6 +367,7 @@ impl AppStateResumeRef {
                     provider_name: resolved_provider_name,
                     provider_override: Some(provider_override.clone()),
                     provider_override_managed_registry,
+                    legacy_vision_provider_source,
                     model_roster,
                     reasoning_effort,
                     reasoning_effort_source,
@@ -739,6 +749,7 @@ impl AppStateResumeRef {
                 provider_name: resolved_provider_name,
                 provider_override: Some(provider_override),
                 provider_override_managed_registry,
+                legacy_vision_provider_source,
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source,

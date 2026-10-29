@@ -93,6 +93,7 @@ pub(crate) fn legacy_vision_resolver(
     requested_model: Option<String>,
     app_data_dir: Option<PathBuf>,
     from_config: bool,
+    source: Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
 ) -> LegacyVisionModelResolver {
     Arc::new(move || {
         let config = config.clone();
@@ -100,6 +101,7 @@ pub(crate) fn legacy_vision_resolver(
         let active_client = active_client.clone();
         let requested_model = requested_model.clone();
         let app_data_dir = app_data_dir.clone();
+        let source = source.clone();
         Box::pin(async move {
             let target = selected_target(
                 &config,
@@ -117,6 +119,18 @@ pub(crate) fn legacy_vision_resolver(
                 Some(validate_target(&config, &target)?)
             };
             let provider = if target.provider == active_provider {
+                if from_config && requested_model.is_none() {
+                    let changed = || {
+                        AgentError::LLM(
+                        "Legacy Vision provider source changed; original images were preserved and no image was sent.".into(),
+                    )
+                    };
+                    source
+                        .as_ref()
+                        .ok_or_else(changed)?
+                        .validate(&config, &active_provider, &active_client)
+                        .map_err(|_| changed())?;
+                }
                 active_client
             } else {
                 bamboo_llm::provider_factory::create_provider_from_instance(

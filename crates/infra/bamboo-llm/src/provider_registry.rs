@@ -76,6 +76,36 @@ pub struct ManagedProviderOrigin {
 }
 
 impl ManagedProviderOrigin {
+    fn validate_legacy_vision_source(
+        &self,
+        config: &Config,
+        provider_id: &str,
+        expected: &Arc<dyn LLMProvider>,
+    ) -> Result<(), LLMError> {
+        if self.provider_id != provider_id || !Arc::ptr_eq(&self.selected, expected) {
+            return Err(stale_binding());
+        }
+        let original = self.original_binding.as_ref().ok_or_else(stale_binding)?;
+        let current = configured_binding(config, provider_id, &self.key)?;
+        // An implicit Copilot client remains the same source when unrelated
+        // provider instances are added. Source tags still distinguish an
+        // explicit instance or stanza from this implicit form.
+        let current = if current.is_none()
+            && provider_id == "copilot"
+            && !config.provider_instances.contains_key(provider_id)
+            && config.providers().copilot.is_none()
+        {
+            configured_binding_with_mode(config, provider_id, &self.key, true, false)?
+        } else {
+            current
+        };
+        let current = current.ok_or_else(stale_binding)?;
+        if !bool::from(original.as_slice().ct_eq(current.0.as_slice())) {
+            return Err(stale_binding());
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_gold_target(
         &self,
         config: &Config,
@@ -1165,6 +1195,64 @@ impl SdkProviderBinding {
     }
 }
 
+/// Per-run evidence tying a selected Host client to one config source. For
+/// embedder-managed clients this proves only that the source has not changed
+/// since selection, not how that client was constructed. Never serialize it.
+#[doc(hidden)]
+pub struct LegacyVisionProviderSource {
+    provider_id: String,
+    selected: Arc<dyn LLMProvider>,
+    proof: LegacyVisionProviderProof,
+}
+
+enum LegacyVisionProviderProof {
+    Managed(Arc<ManagedProviderOrigin>),
+    Injected(SdkProviderBinding),
+}
+
+impl LegacyVisionProviderSource {
+    pub fn capture(
+        config: &Config,
+        provider_id: &str,
+        selected: Arc<dyn LLMProvider>,
+        managed_origin: Option<Arc<ManagedProviderOrigin>>,
+    ) -> Result<Self, LLMError> {
+        let proof = match managed_origin {
+            Some(origin) => {
+                origin.validate_legacy_vision_source(config, provider_id, &selected)?;
+                LegacyVisionProviderProof::Managed(origin)
+            }
+            None => LegacyVisionProviderProof::Injected(SdkProviderBinding::capture(
+                config,
+                provider_id,
+                false,
+            )?),
+        };
+        Ok(Self {
+            provider_id: provider_id.to_string(),
+            selected,
+            proof,
+        })
+    }
+
+    pub fn validate(
+        &self,
+        config: &Config,
+        provider_id: &str,
+        selected: &Arc<dyn LLMProvider>,
+    ) -> Result<(), LLMError> {
+        if self.provider_id != provider_id || !Arc::ptr_eq(&self.selected, selected) {
+            return Err(stale_binding());
+        }
+        match &self.proof {
+            LegacyVisionProviderProof::Managed(origin) => {
+                origin.validate_legacy_vision_source(config, provider_id, selected)
+            }
+            LegacyVisionProviderProof::Injected(binding) => binding.validate(config),
+        }
+    }
+}
+
 fn sdk_provider_binding(
     config: &Config,
     provider: &str,
@@ -2099,6 +2187,92 @@ mod tests {
             .unwrap(),
         );
         config
+    }
+
+    #[tokio::test]
+    async fn legacy_vision_source_binds_client_and_config_without_model_overbinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = managed_config();
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().into())
+                .await
+                .unwrap(),
+        );
+        let (client, origin) = registry.get_with_origin("relay").unwrap();
+        let managed =
+            LegacyVisionProviderSource::capture(&config, "relay", client.clone(), origin).unwrap();
+        let injected =
+            LegacyVisionProviderSource::capture(&config, "relay", client.clone(), None).unwrap();
+        let mut model_only = config.clone();
+        let instance = model_only.provider_instances.get_mut("relay").unwrap();
+        instance.vision_model = Some("synthetic-new-vision".into());
+        instance.extra.insert(
+            "runtime_models".into(),
+            serde_json::json!(["chat", "synthetic-new-vision"]),
+        );
+        for source in [&managed, &injected] {
+            assert!(source.validate(&config, "relay", &client).is_ok());
+            assert!(source.validate(&model_only, "relay", &client).is_ok());
+            assert!(source.validate(&config, "other", &client).is_err());
+            let mut changed = config.clone();
+            changed
+                .provider_instances
+                .get_mut("relay")
+                .unwrap()
+                .base_url = Some("http://127.0.0.1:32102".into());
+            assert!(source.validate(&changed, "relay", &client).is_err());
+            let mut disabled = config.clone();
+            disabled
+                .provider_instances
+                .get_mut("relay")
+                .unwrap()
+                .enabled = false;
+            assert!(source.validate(&disabled, "relay", &client).is_err());
+        }
+        let rebuilt = ProviderRegistry::from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        let other = rebuilt.get("relay").unwrap();
+        assert!(managed.validate(&config, "relay", &other).is_err());
+        assert!(injected.validate(&config, "relay", &other).is_err());
+        registry.insert("relay".into(), client.clone());
+        let (_, missing) = registry.get_with_origin("relay").unwrap();
+        assert!(missing.is_some());
+        assert!(
+            LegacyVisionProviderSource::capture(&config, "relay", client.clone(), missing).is_err()
+        );
+
+        // A managed implicit Copilot source is still the same source when an
+        // unrelated instance is added. No Copilot client or network is used.
+        let mut copilot = Config::default();
+        copilot.provider = "copilot".into();
+        copilot.default_provider_instance = None;
+        copilot.provider_instances.clear();
+        let key =
+            ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+                .unwrap();
+        let tag = configured_binding(&copilot, "copilot", &key)
+            .unwrap()
+            .unwrap()
+            .0;
+        let origin = Arc::new(ManagedProviderOrigin {
+            registry: registry.clone(),
+            provider_id: "copilot".into(),
+            key,
+            original_binding: Some(tag),
+            selected: client.clone(),
+        });
+        let implicit =
+            LegacyVisionProviderSource::capture(&copilot, "copilot", client.clone(), Some(origin))
+                .unwrap();
+        copilot.provider_instances.insert(
+            "other".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic"
+            }))
+            .unwrap(),
+        );
+        assert!(implicit.validate(&copilot, "copilot", &client).is_ok());
     }
 
     async fn assert_changed_static_inputs_are_rejected(original: &Config, changed: &Config) {

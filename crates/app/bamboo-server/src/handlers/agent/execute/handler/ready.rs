@@ -187,6 +187,22 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         (None, None)
     };
     let (provider_override, provider_override_managed_registry) = selected_override;
+    let selected_provider_name = session_effective_model_ref(&session)
+        .map(|target| target.provider)
+        .unwrap_or_else(|| config.provider_name.clone());
+    // Capture at selection, before any live config can be observed by runtime.
+    // Failure is retained as absent evidence and rejected only if the legacy
+    // same-account image conversion actually needs the source.
+    let legacy_vision_provider_source = provider_override.as_ref().and_then(|selected| {
+        bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+            config_snapshot,
+            &selected_provider_name,
+            selected.clone(),
+            provider_override_managed_registry.clone(),
+        )
+        .ok()
+        .map(std::sync::Arc::new)
+    });
 
     #[cfg(test)]
     super::super::tests::after_legacy_vision_provider_selection(
@@ -493,6 +509,7 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         provider_name: resolved_provider_name,
         provider_override,
         provider_override_managed_registry,
+        legacy_vision_provider_source,
         model_roster,
         reasoning_effort: ready.effective_reasoning_effort,
         reasoning_effort_source: ready.reasoning_source.to_string(),

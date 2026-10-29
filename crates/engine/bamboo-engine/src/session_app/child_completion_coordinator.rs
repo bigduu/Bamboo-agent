@@ -2166,6 +2166,15 @@ impl ChildCompletionCoordinator {
                 }
             }
         };
+        let legacy_vision_provider_source =
+            bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+                &config_snapshot,
+                &resolved_provider_name,
+                selected_provider.clone(),
+                managed_origin.clone(),
+            )
+            .ok()
+            .map(Arc::new);
         let agent = match make_child_resume_gold_resolver(
             self.config.clone(),
             resolved_provider_name.clone(),
@@ -2182,6 +2191,8 @@ impl ChildCompletionCoordinator {
         } else {
             agent
         };
+        let agent =
+            Arc::new(agent.with_legacy_vision_provider_source(legacy_vision_provider_source));
         let resolved_fast_provider = resolve_fast_model(
             &config_snapshot,
             &resolved_provider_name,

@@ -150,6 +150,15 @@ async fn config_derived_agent(
         )),
         7,
     );
+    let source = Some(Arc::new(
+        bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+            &c,
+            c.effective_default_provider(),
+            main.clone(),
+            None,
+        )
+        .expect("synthetic active client source must be captured"),
+    ));
     let config = Arc::new(RwLock::new(c));
     let runtime = bamboo_engine::Agent::builder()
         .storage(storage)
@@ -173,7 +182,8 @@ async fn config_derived_agent(
         )))
         .build()
         .unwrap()
-        .with_config_derived_image_fallback();
+        .with_config_derived_image_fallback()
+        .with_legacy_vision_provider_source(source);
     (runtime, config)
 }
 
@@ -521,6 +531,12 @@ async fn entrypoint_routing_legacy_rejects_ungranted_or_invalid_targets_before_a
                 error.to_string().contains("preserved"),
                 "{case}, flag={flag}: {error}"
             );
+            if case == "same-account-unsupported" {
+                assert!(
+                    error.to_string().contains("does not support Vision"),
+                    "{error}"
+                );
+            }
             assert!(main.calls.lock().unwrap().is_empty(), "{case}, flag={flag}");
             assert!(
                 server.received_requests().await.unwrap().is_empty(),
