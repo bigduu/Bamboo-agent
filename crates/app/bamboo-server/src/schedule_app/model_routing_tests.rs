@@ -315,3 +315,347 @@ async fn schedule_uses_selected_accounts_default_reasoning() {
     );
     assert!(providers["startup-a"].models.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn manual_scheduled_session_executes_its_bound_pair_and_rechecks_live_config() {
+    use actix_web::{test, web, App};
+    for scenario in ["allowed", "disabled", "unadmitted", "managed-stale"] {
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let state = web::Data::new(state);
+        {
+            let mut config = state.config.write().await;
+            config.features.provider_model_ref = false;
+            config
+                .provider_instances
+                .get_mut("startup-a")
+                .unwrap()
+                .extra
+                .insert(
+                    "runtime_models".into(),
+                    serde_json::json!(["startup-model", "cheap-model"]),
+                );
+        }
+        if scenario == "managed-stale" {
+            let snapshot = {
+                let mut config = state.config.write().await;
+                for instance in config.provider_instances.values_mut() {
+                    instance.api_key = "synthetic-key".into();
+                    instance.base_url = Some("http://127.0.0.1:9".into());
+                }
+                config.clone()
+            };
+            let managed =
+                bamboo_llm::ProviderRegistry::from_config(&snapshot, state.app_data_dir.clone())
+                    .await
+                    .unwrap();
+            state.provider_registry.replace_with(managed);
+        } else {
+            state
+                .provider_registry
+                .set_runtime_models(std::collections::HashMap::from([
+                    (
+                        "startup-a".into(),
+                        vec!["startup-model".into(), "cheap-model".into()],
+                    ),
+                    ("chat-b".into(), vec!["chat-model".into()]),
+                    ("fast-c".into(), vec!["cheap-model".into()]),
+                ]));
+        }
+        let mut request = job();
+        request.run_config.auto_execute = false;
+        run_schedule_job(context(&state).await, request, None)
+            .await
+            .unwrap();
+        let entry = state
+            .session_store
+            .list_index_entries()
+            .await
+            .into_iter()
+            .find(|entry| {
+                entry.created_by_schedule_id.as_deref() == Some("synthetic-model-schedule")
+            })
+            .expect("scheduled session");
+        let saved = state
+            .storage
+            .load_session(&entry.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            saved.model_ref,
+            Some(bamboo_domain::ProviderModelRef::new(
+                "fast-c",
+                "cheap-model"
+            ))
+        );
+        {
+            let mut config = state.config.write().await;
+            let fast = config.provider_instances.get_mut("fast-c").unwrap();
+            if scenario == "disabled" {
+                fast.enabled = false;
+            } else if scenario == "unadmitted" {
+                fast.extra.insert(
+                    "runtime_models".into(),
+                    serde_json::json!(["another-model"]),
+                );
+            } else if scenario == "managed-stale" {
+                fast.api_key = "changed-synthetic-key".into();
+            }
+        }
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{}", entry.id))
+                .set_json(serde_json::json!({}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        if scenario == "allowed" {
+            assert_eq!(status, actix_web::http::StatusCode::ACCEPTED);
+            await_request(&providers["fast-c"]).await;
+            assert_eq!(
+                *providers["fast-c"].models.lock().unwrap(),
+                vec!["cheap-model"]
+            );
+        } else {
+            assert_eq!(
+                status,
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "{scenario}"
+            );
+            assert!(providers["fast-c"].models.lock().unwrap().is_empty());
+        }
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        state.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn manual_schedule_rejects_explicit_unavailable_configured_target() {
+    let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+    state
+        .config
+        .write()
+        .await
+        .provider_instances
+        .get_mut("fast-c")
+        .unwrap()
+        .enabled = false;
+    let mut request = job();
+    request.run_config.auto_execute = false;
+    let error = run_schedule_job(context(&state).await, request, None)
+        .await
+        .err()
+        .unwrap();
+    assert!(error.contains("Configured schedule model is unavailable"));
+    for provider in providers.values() {
+        assert!(provider.models.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn legacy_scheduled_session_rechecks_binding_after_model_only_change() {
+    use actix_web::{test, web, App};
+    for scenario in ["legacy-b", "removed-model", "invalid-binding"] {
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let state = web::Data::new(state);
+        state.config.write().await.features.provider_model_ref = false;
+        // Registry still admits the old model even if the live config revokes it.
+        state
+            .provider_registry
+            .set_runtime_models(std::collections::HashMap::from([
+                (
+                    "startup-a".into(),
+                    vec!["startup-model".into(), "cheap-model".into()],
+                ),
+                ("chat-b".into(), vec!["chat-model".into()]),
+                ("fast-c".into(), vec!["cheap-model".into()]),
+            ]));
+        let mut session =
+            bamboo_agent_core::Session::new(format!("legacy-{scenario}"), "cheap-model");
+        session
+            .metadata
+            .insert("created_by_schedule_id".into(), "legacy-schedule".into());
+        session.add_message(bamboo_agent_core::Message::user("execute legacy schedule"));
+        if scenario == "legacy-b" {
+            session.set_provider_name("fast-c");
+        } else if scenario == "invalid-binding" {
+            session.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+                "fast-c",
+                "different-model",
+            ));
+            state
+                .config
+                .write()
+                .await
+                .provider_instances
+                .get_mut("startup-a")
+                .unwrap()
+                .enabled = false;
+        }
+        state.storage.save_session(&session).await.unwrap();
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{}", session.id))
+                .set_json(serde_json::json!({}))
+                .to_request(),
+        )
+        .await;
+        if scenario == "legacy-b" {
+            assert_eq!(response.status(), actix_web::http::StatusCode::ACCEPTED);
+            await_request(&providers["fast-c"]).await;
+        } else {
+            assert_eq!(
+                response.status(),
+                actix_web::http::StatusCode::BAD_REQUEST,
+                "{scenario}"
+            );
+            assert!(providers["fast-c"].models.lock().unwrap().is_empty());
+        }
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        state.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn scheduled_startup_rejects_concurrent_model_patch_before_provider_call() {
+    use actix_web::{test, web, App};
+    let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+    let state = web::Data::new(state);
+    state.config.write().await.features.provider_model_ref = false;
+    let mut request = job();
+    request.run_config.auto_execute = false;
+    run_schedule_job(context(&state).await, request, None)
+        .await
+        .unwrap();
+    let entry = state
+        .session_store
+        .list_index_entries()
+        .await
+        .into_iter()
+        .find(|entry| entry.created_by_schedule_id.as_deref() == Some("synthetic-model-schedule"))
+        .expect("scheduled session");
+    let hook = crate::handlers::agent::execute::scheduled_startup_test_hooks::install(&entry.id);
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let execute = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{}", entry.id))
+            .set_json(serde_json::json!({}))
+            .to_request(),
+    );
+    let patch = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
+            .await
+            .expect("execute must reach the startup gate");
+        let response = test::call_service(&app, test::TestRequest::patch()
+            .uri(&format!("/api/v1/sessions/{}", entry.id))
+            .set_json(serde_json::json!({"model_ref": {"provider": "startup-a", "model": "startup-model"}}))
+            .to_request()).await;
+        hook.resume.notify_one();
+        response
+    };
+    let (execute, patch) = tokio::join!(execute, patch);
+    assert!(
+        patch.status().is_success(),
+        "PATCH status: {}",
+        patch.status()
+    );
+    assert_eq!(execute.status(), actix_web::http::StatusCode::CONFLICT);
+    let body = test::read_body(execute).await;
+    assert!(String::from_utf8_lossy(&body).contains("scheduled startup execution profile changed"));
+    let durable = state
+        .storage
+        .load_session(&entry.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.model_ref,
+        Some(bamboo_domain::ProviderModelRef::new(
+            "startup-a",
+            "startup-model"
+        ))
+    );
+    for provider in providers.values() {
+        assert!(provider.models.lock().unwrap().is_empty());
+    }
+    state.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_startup_automatic_rejects_concurrent_model_patch_before_provider_call() {
+    use actix_web::{test, web, App};
+    let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+    let state = web::Data::new(state);
+    let mut request = job();
+    request.run_id = "auto-scheduled-patch-race".into();
+    let hook = startup_test_hooks::install(&request.run_id);
+    let context = context(&state).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let run = run_schedule_job(context, request, None);
+    let patch = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
+            .await
+            .expect("schedule must reach the startup gate");
+        let session_id = hook.session_id.lock().unwrap().clone().unwrap();
+        let response = test::call_service(&app, test::TestRequest::patch()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .set_json(serde_json::json!({"model_ref": {"provider": "startup-a", "model": "startup-model"}}))
+            .to_request()).await;
+        hook.resume.notify_one();
+        (session_id, response)
+    };
+    let (run, (session_id, patch)) = tokio::join!(run, patch);
+    assert!(
+        patch.status().is_success(),
+        "PATCH status: {}",
+        patch.status()
+    );
+    let error = run.err().expect("a changed Schedule profile must not run");
+    assert!(
+        error.contains("scheduled startup execution profile changed"),
+        "{error}"
+    );
+    let durable = state
+        .storage
+        .load_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.model_ref,
+        Some(bamboo_domain::ProviderModelRef::new(
+            "startup-a",
+            "startup-model"
+        ))
+    );
+    for provider in providers.values() {
+        assert!(provider.models.lock().unwrap().is_empty());
+    }
+    state.shutdown().await;
+}

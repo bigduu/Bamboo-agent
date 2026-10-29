@@ -616,3 +616,165 @@ async fn root_mode_rechecks_actor_witness_at_actual_filesystem_publication() {
     assert_eq!(canonical(&directory), before);
     store.flush_search_index().await;
 }
+
+fn scheduled_startup_root(id: &str) -> Session {
+    let mut session = Session::new(id, "model-a");
+    session
+        .metadata
+        .insert("created_by_schedule_id".into(), "schedule-a".into());
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new("account-a", "model-a"));
+    session.set_provider_name("account-a");
+    session.add_message(bamboo_domain::Message::user("scheduled work"));
+    session
+}
+
+#[tokio::test]
+async fn scheduled_startup_profile_conflict_does_not_write_or_publish() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = tempfile::tempdir().unwrap();
+    let first = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let root = scheduled_startup_root("scheduled-startup-conflict");
+    first.save_session(&root).await.unwrap();
+    let original = first.load_session(&root.id).await.unwrap().unwrap();
+    let owner = activate(&first, &original).await;
+    let expected = first.load_session(&root.id).await.unwrap().unwrap();
+    let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let mut changed = second.load_session(&root.id).await.unwrap().unwrap();
+    changed.model = "model-b".into();
+    changed.model_ref = Some(bamboo_domain::ProviderModelRef::new("account-b", "model-b"));
+    changed.set_provider_name("account-b");
+    changed.metadata_version += 1;
+    second.save_session(&changed).await.unwrap();
+
+    let directory = first.sessions_dir.join(&root.id);
+    let files_before: Vec<_> = ["session.json", RUNTIME_SIDECAR_FILE]
+        .into_iter()
+        .map(|name| std::fs::read(directory.join(name)).unwrap())
+        .collect();
+    let durable_before = second.load_session(&root.id).await.unwrap().unwrap();
+    let root_publications = Arc::new(AtomicUsize::new(0));
+    let root_count = root_publications.clone();
+    let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |_| {
+        root_count.fetch_add(1, Ordering::SeqCst);
+    });
+    let storage: Arc<dyn Storage> = first.clone();
+    let bound = crate::session_merge::LockedSessionStore::new(storage)
+        .bind_root_actor_writer(owner, publisher)
+        .unwrap();
+    let mut candidate = expected.clone();
+    candidate.set_last_run_status("running");
+    let candidate_before = serde_json::to_value(&candidate).unwrap();
+    let local_publications = Arc::new(AtomicUsize::new(0));
+    let local_count = local_publications.clone();
+    let error = bound
+        .merge_save_scheduled_startup_and_publish(&mut candidate, &expected, move |_, _| {
+            local_count.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+    assert!(error
+        .to_string()
+        .contains("scheduled startup execution profile changed"));
+    assert_eq!(serde_json::to_value(&candidate).unwrap(), candidate_before);
+    assert_eq!(root_publications.load(Ordering::SeqCst), 0);
+    assert_eq!(local_publications.load(Ordering::SeqCst), 0);
+    let durable_after = second.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(durable_after).unwrap(),
+        serde_json::to_value(durable_before).unwrap()
+    );
+    let files_after: Vec<_> = ["session.json", RUNTIME_SIDECAR_FILE]
+        .into_iter()
+        .map(|name| std::fs::read(directory.join(name)).unwrap())
+        .collect();
+    assert_eq!(files_after, files_before);
+}
+
+#[tokio::test]
+async fn scheduled_startup_commits_and_publishes_with_inherited_wait() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let mut root = scheduled_startup_root("scheduled-startup-success");
+    let mut runtime = bamboo_domain::AgentRuntimeState::new("previous-run");
+    runtime.waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
+        vec!["ordinary-child".into()],
+        bamboo_domain::ChildWaitPolicy::All,
+        Utc::now(),
+    ));
+    root.agent_runtime_state = Some(runtime);
+    store.save_session(&root).await.unwrap();
+    let original = store.load_session(&root.id).await.unwrap().unwrap();
+    let owner = activate(&store, &original).await;
+    let expected = store.load_session(&root.id).await.unwrap().unwrap();
+    let inherited = bamboo_domain::InheritedChildWait::capture(&expected).unwrap();
+    let root_publications = Arc::new(AtomicUsize::new(0));
+    let root_count = root_publications.clone();
+    let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |_| {
+        root_count.fetch_add(1, Ordering::SeqCst);
+    });
+    let storage: Arc<dyn Storage> = store.clone();
+    let bound = crate::session_merge::LockedSessionStore::new(storage)
+        .bind_root_actor_writer(owner, publisher)
+        .unwrap()
+        .bind_inherited_child_wait(inherited);
+    let mut candidate = expected.clone();
+    candidate.set_last_run_status("running");
+    let local_publications = Arc::new(AtomicUsize::new(0));
+    let local_count = local_publications.clone();
+    bound
+        .merge_save_scheduled_startup_and_publish(&mut candidate, &expected, move |_, committed| {
+            assert!(committed);
+            local_count.fetch_add(1, Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+    let saved = store.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(saved.last_run_status().as_deref(), Some("running"));
+    assert_eq!(saved.model_ref, expected.model_ref);
+    assert_eq!(saved.provider_name(), expected.provider_name());
+    assert_eq!(
+        saved
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .waiting_for_children,
+        expected
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .waiting_for_children
+    );
+    assert_eq!(root_publications.load(Ordering::SeqCst), 1);
+    assert_eq!(local_publications.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn scheduled_startup_without_root_writer_fails_closed() {
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let root = scheduled_startup_root("scheduled-startup-unbound");
+    store.save_session(&root).await.unwrap();
+    let expected = store.load_session(&root.id).await.unwrap().unwrap();
+    let mut candidate = expected.clone();
+    candidate.set_last_run_status("running");
+    let storage: Arc<dyn Storage> = store.clone();
+    let unbound = crate::session_merge::LockedSessionStore::new(storage);
+    let error = unbound
+        .merge_save_scheduled_startup(&mut candidate, &expected)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+    let saved = store.load_session(&root.id).await.unwrap().unwrap();
+    assert_eq!(saved.last_run_status(), expected.last_run_status());
+    assert_eq!(saved.model_ref, expected.model_ref);
+}

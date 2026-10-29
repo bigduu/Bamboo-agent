@@ -42,6 +42,32 @@ pub fn session_effective_model_ref(session: &Session) -> Option<ProviderModelRef
     )
 }
 
+/// A scheduled session with an explicit structured target retains that pair
+/// even when the primary-chat rollout flag is disabled. Reject corrupt or
+/// inconsistent bindings instead of silently deriving a different account.
+pub fn schedule_bound_model_ref(session: &Session) -> Result<Option<ProviderModelRef>, String> {
+    if !session.metadata.contains_key("created_by_schedule_id") {
+        return Ok(None);
+    }
+    let target = match session.model_ref.as_ref() {
+        Some(target) => target.clone(),
+        None => match session.provider_name() {
+            Some(provider) => ProviderModelRef::new(provider, &session.model),
+            None => return Ok(None),
+        },
+    };
+    if target.provider.trim().is_empty()
+        || target.model.trim().is_empty()
+        || target.provider.trim() != target.provider
+        || target.model.trim() != target.model
+        || target.model == "unknown"
+        || target.model != session.model
+    {
+        return Err("Scheduled session model and provider binding is invalid".to_string());
+    }
+    Ok(Some(target))
+}
+
 pub fn persist_model_ref(session: &mut Session, model_ref: &ProviderModelRef) {
     session.model = model_ref.model.clone();
     session.model_ref = Some(model_ref.clone());

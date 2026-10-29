@@ -73,8 +73,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // in default engine packages-3; direct background admission stays in default
 // LLM packages-2, and the reloadable provider proof stays in server-other.
 // The injected project Dream endpoint A/B case stays in server-handlers.
+// Scheduled startup's physical guard cases remain in the default storage owner;
+// Schedule routing races remain in server-other and Observer cases in server-app-state.
 // No additive feature cases changed.
-const FEATURE_SOURCE_SHA256 = "5cd9167643884197b6165bcc2100d256b40550db1d1400599c39585ebaf1126c";
+const FEATURE_SOURCE_SHA256 = "709533cd0614e6d658848eca2df253b01709b7f4d3d97a85e0afdbf3221603e9";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

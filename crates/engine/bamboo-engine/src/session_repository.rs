@@ -647,6 +647,21 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    async fn save_scheduled_startup_session(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_scheduled_startup_and_publish(session, expected, |saved, _| {
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.persistence
             .merge_save_finalized_runtime_and_publish(session, |saved, _| {
