@@ -12,9 +12,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const PORTABLE_CONTEXT_BYTES: usize = 8192;
 
-// A cancelled spawn_blocking task can continue reading and hashing a bundle.
-// Keep its permit inside the blocking closure so repeated usage-observer
-// timeouts cannot create an unbounded number of those tasks.
+// A cancelled spawn_blocking task can continue its filesystem work. Keep its
+// permit inside the blocking closure so repeated usage-observer timeouts cannot
+// create an unbounded number of these usage-specific tasks.
 fn usage_review_slot() -> Result<OwnedSemaphorePermit, String> {
     static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     SLOTS
@@ -69,6 +69,56 @@ async fn resolve_working_directory(
     Ok(workspace
         .map(PathBuf::from)
         .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?))
+}
+
+async fn load_plugins(event: PortableEvent, path: &Path) -> Result<InstalledPlugins, String> {
+    if event != PortableEvent::BambooModelCallUsage {
+        return InstalledPlugins::load(path)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    let permit = usage_review_slot()?;
+    let path = path.to_owned();
+    let runtime = tokio::runtime::Handle::current();
+    // Keep the slot until the registry's internally spawned filesystem work
+    // has actually completed, even if the observer future is cancelled.
+    spawn_review(Some(permit), move || {
+        runtime
+            .block_on(InstalledPlugins::load(&path))
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn read_plugin_file(event: PortableEvent, path: &Path) -> Result<Vec<u8>, String> {
+    if event != PortableEvent::BambooModelCallUsage {
+        return tokio::fs::read(path)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    let permit = usage_review_slot()?;
+    let path = path.to_owned();
+    spawn_review(Some(permit), move || {
+        std::fs::read(path).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn create_plugin_data_dir(event: PortableEvent, path: &Path) -> Result<(), String> {
+    if event != PortableEvent::BambooModelCallUsage {
+        return tokio::fs::create_dir_all(path)
+            .await
+            .map_err(|error| error.to_string());
+    }
+    let permit = usage_review_slot()?;
+    let path = path.to_owned();
+    spawn_review(Some(permit), move || {
+        std::fs::create_dir_all(path).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 #[derive(Clone, Copy, Default)]
@@ -406,7 +456,7 @@ pub async fn run_with_inputs(
     let Some(event) = event(point) else {
         return report;
     };
-    let store = match InstalledPlugins::load(&root.join("installed.json")).await {
+    let store = match load_plugins(event, &root.join("installed.json")).await {
         Ok(s) => s,
         Err(e) => {
             report.errors.push(e.to_string());
@@ -420,19 +470,20 @@ pub async fn run_with_inputs(
         {
             continue;
         }
-        let manifest: PluginManifest = match tokio::fs::read(plugin.plugin_dir.join("plugin.json"))
-            .await
-            .and_then(|b| {
-                serde_json::from_slice::<PluginManifest>(&b).map_err(std::io::Error::other)
-            }) {
-            Ok(m) if m.id == plugin.id && m.version == plugin.version => m,
-            _ => {
-                report
-                    .errors
-                    .push(format!("{}: invalid hook manifest identity", plugin.id));
-                continue;
-            }
-        };
+        let manifest: PluginManifest =
+            match read_plugin_file(event, &plugin.plugin_dir.join("plugin.json"))
+                .await
+                .and_then(|b| {
+                    serde_json::from_slice::<PluginManifest>(&b).map_err(|error| error.to_string())
+                }) {
+                Ok(m) if m.id == plugin.id && m.version == plugin.version => m,
+                _ => {
+                    report
+                        .errors
+                        .push(format!("{}: invalid hook manifest identity", plugin.id));
+                    continue;
+                }
+            };
         if plugin.registered.hooks.is_empty() {
             continue;
         }
@@ -516,7 +567,7 @@ async fn run_config(
     final_assistant_content: Option<&str>,
 ) -> Result<PortableReport, String> {
     let path = resolve_bundle_path(event, reviewed.root, reviewed.config).await?;
-    let config_bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+    let config_bytes = read_plugin_file(event, &path).await?;
     run_config_snapshot(
         event,
         payload,
@@ -601,9 +652,7 @@ async fn run_config_snapshot(
                     // A preceding command may have changed its bundle. Recheck at
                     // every spawn boundary, not merely once at the lifecycle seam.
                     let review_check: Result<(), String> = async {
-                        let store = InstalledPlugins::load(&reviewed.registry_path)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        let store = load_plugins(event, &reviewed.registry_path).await?;
                         let installed = store
                             .get_unique(&reviewed.receipt.plugin_id)
                             .map_err(|e| e.to_string())?
@@ -620,9 +669,7 @@ async fn run_config_snapshot(
                             return Err("plugin hook execution trust revoked before spawn".into());
                         }
                         let current_manifest: PluginManifest = serde_json::from_slice(
-                            &tokio::fs::read(root.join("plugin.json"))
-                                .await
-                                .map_err(|e| e.to_string())?,
+                            &read_plugin_file(event, &root.join("plugin.json")).await?,
                         )
                         .map_err(|e| e.to_string())?;
                         let bundle = root.to_owned();
@@ -649,17 +696,13 @@ async fn run_config_snapshot(
                         // but commands captured from its candidate are not trusted.
                         let current_path =
                             resolve_bundle_path(event, root, reviewed.config).await?;
-                        let current_bytes = tokio::fs::read(current_path)
-                            .await
-                            .map_err(|e| e.to_string())?;
+                        let current_bytes = read_plugin_file(event, &current_path).await?;
                         if current_bytes != config_bytes {
                             return Err(
                                 "hook configuration changed before command execution".into()
                             );
                         }
-                        tokio::fs::create_dir_all(data)
-                            .await
-                            .map_err(|e| e.to_string())
+                        create_plugin_data_dir(event, data).await
                     }
                     .await;
                     if let Err(error) = review_check {
@@ -772,6 +815,39 @@ mod tests {
                 .unwrap(),
             PathBuf::from("synthetic-workspace")
         );
+    }
+
+    #[tokio::test]
+    async fn usage_filesystem_helpers_preserve_registry_and_io_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("installed.json");
+        let event = PortableEvent::BambooModelCallUsage;
+        assert!(load_plugins(event, &registry)
+            .await
+            .unwrap()
+            .plugins
+            .is_empty());
+        std::fs::write(&registry, b" ").unwrap();
+        assert!(load_plugins(event, &registry)
+            .await
+            .unwrap()
+            .plugins
+            .is_empty());
+        std::fs::write(&registry, b"invalid json").unwrap();
+        assert!(load_plugins(event, &registry).await.is_err());
+        std::fs::write(&registry, br#"{"plugins":[]}"#).unwrap();
+        assert!(load_plugins(event, &registry)
+            .await
+            .unwrap()
+            .plugins
+            .is_empty());
+        assert_eq!(
+            read_plugin_file(event, &registry).await.unwrap(),
+            br#"{"plugins":[]}"#
+        );
+        let data = dir.path().join("nested").join("data");
+        create_plugin_data_dir(event, &data).await.unwrap();
+        assert!(data.is_dir());
     }
 
     #[test]

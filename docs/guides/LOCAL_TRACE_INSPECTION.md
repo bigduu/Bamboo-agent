@@ -126,12 +126,13 @@ gets a new ID. If a stream fails after reporting usage, its error observation
 retains the reported counters. Repeated cumulative snapshots update known
 counters instead of adding them. Hook execution is best effort: a process-wide
 maximum of 32 queued/running observers and a two-second deadline can drop work.
-Return values never control the model call. Up to four usage-plugin path
-resolutions and bundle hash checks may remain active after a timeout; further
-checks are dropped until a slot becomes free. Native handlers receive the
-existing envelope with a `payload` of type `model_call_usage`; portable
-handlers receive `observation` at top level. Both contain the same schema-1
-snapshot and no workspace path in the event payload.
+Return values never control the model call. Up to four usage-plugin registry
+and file reads, path resolutions, bundle hash checks and data-directory
+creations may remain active after a timeout; further such work is dropped until
+a slot becomes free. Native handlers receive the existing envelope with a
+`payload` of type `model_call_usage`; portable handlers receive `observation`
+at top level. Both contain the same schema-1 snapshot and no workspace path in
+the event payload.
 Programmatic native observers receive a deliberately minimal Session: its id,
 birth and valid root id identify the original lifetime, but other Session fields
 are not a snapshot of runtime state. Consume the usage observation itself.
