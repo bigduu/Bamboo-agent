@@ -311,7 +311,7 @@ async fn entrypoint_routing_sdk_default_constructor_keeps_chat_role_account_and_
     }
 }
 
-fn legacy_config(flag: bool, endpoint: &str) -> Config {
+pub(crate) fn legacy_config(flag: bool, endpoint: &str) -> Config {
     let mut c = config(flag, "chat-a");
     c.hooks.image_fallback.enabled = true;
     c.hooks.image_fallback.mode = "vision".into();
@@ -375,7 +375,7 @@ async fn execute_legacy(
     outcome
 }
 
-async fn vision_server(status: u16) -> wiremock::MockServer {
+pub(crate) async fn vision_server(status: u16) -> wiremock::MockServer {
     use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
     let server = MockServer::start().await;
     let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"vision-b\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic pixel\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";

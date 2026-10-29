@@ -228,3 +228,64 @@ async fn entrypoint_routing_headless_missing_model_uses_saved_account_default() 
         "resuming must retain the original account for both flag values: {outcomes:?}"
     );
 }
+
+#[tokio::test]
+async fn entrypoint_routing_headless_host_uses_configured_vision_role() {
+    let mut outcomes = Vec::new();
+    for flag in [false, true] {
+        let server = crate::model_entrypoint_routing_tests::vision_server(200).await;
+        let (dir, state, main, _, mut original) = fixture(flag, "missing-model").await;
+        *state.config.write().await =
+            crate::model_entrypoint_routing_tests::legacy_config(flag, &server.uri());
+        original.title_generated = true;
+        let image = Message::user_with_parts(
+            "Inspect synthetic pixel",
+            vec![bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef {
+                    url: crate::model_entrypoint_routing_tests::PIXEL.into(),
+                    detail: None,
+                },
+            }],
+        );
+        let original_image = image.clone();
+        original.add_message(image);
+        state.storage.save_session(&original).await.unwrap();
+        state.session_store.save_session(&original).await.unwrap();
+        let storage = state.storage.clone();
+        let mut request = args(dir.path(), None);
+        request.timeout_secs = Some(10);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_with_state(request, state),
+        )
+        .await
+        .expect("synthetic Host consumer must finish");
+        let calls = main.calls.lock().unwrap().clone();
+        let requests = server.received_requests().await.unwrap();
+        let b_saw_pixel = requests.iter().any(|request| {
+            String::from_utf8_lossy(&request.body)
+                .contains(crate::model_entrypoint_routing_tests::PIXEL)
+        });
+        let b_models = requests
+            .iter()
+            .map(|request| request.body_json::<serde_json::Value>().unwrap()["model"].clone())
+            .collect::<Vec<_>>();
+        let saved = storage.load_session(&original.id).await.unwrap().unwrap();
+        let preserved = saved
+            .messages
+            .iter()
+            .find(|message| message.id == original_image.id)
+            .is_some_and(|message| message.content_parts == original_image.content_parts);
+        outcomes.push((flag, outcome, calls, b_models, b_saw_pixel, preserved));
+    }
+    assert!(
+        outcomes.iter().all(
+            |(_, outcome, calls, b_models, b_saw_pixel, preserved)| outcome.is_ok()
+                && calls.iter().all(|(_, _, images)| !images)
+                && b_models.iter().any(|model| model == "vision-b")
+                && *b_saw_pixel
+                && *preserved
+        ),
+        "Host fallback must use its configured Vision account: {outcomes:?}"
+    );
+}
