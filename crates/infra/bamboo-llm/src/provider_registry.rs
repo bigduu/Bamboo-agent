@@ -1116,10 +1116,68 @@ fn hash_factory_inputs<T: Serialize>(
 // legacy alias distinct even when they happen to share an ID and credentials.
 // Ambient system-proxy state and Copilot's dynamic authentication are not
 // represented by Config and are intentionally outside this binding.
+/// Opaque in-memory identity of the factory inputs used by an SDK client.
+/// It stores only a keyed tag, never serialized credentials or an endpoint.
+#[doc(hidden)]
+pub struct SdkProviderBinding {
+    provider: String,
+    key: ring::hmac::Key,
+    tag: [u8; 32],
+}
+
+impl SdkProviderBinding {
+    /// Capture the selected key's source from one factory-input snapshot.
+    /// Unlike registry defaults, an explicit SDK key can legitimately
+    /// select a non-default legacy provider or an initially empty key slot.
+    pub fn capture(config: &Config, provider: &str) -> Result<Self, LLMError> {
+        let key =
+            ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+                .map_err(|_| LLMError::Api("Could not bind SDK provider configuration".into()))?;
+        let tag = sdk_provider_binding(config, provider, &key)?;
+        Ok(Self {
+            provider: provider.to_string(),
+            key,
+            tag,
+        })
+    }
+
+    /// Check the exact configured source and factory inputs without exposing
+    /// credentials. Dynamic environment and Copilot auth remain owned by the
+    /// provider and are not represented by this Config proof.
+    pub fn validate(&self, config: &Config) -> Result<(), LLMError> {
+        let current = sdk_provider_binding(config, &self.provider, &self.key)?;
+        if !bool::from(self.tag.as_slice().ct_eq(current.as_slice())) {
+            return Err(LLMError::Api("SDK provider configuration changed".into()));
+        }
+        Ok(())
+    }
+}
+
+fn sdk_provider_binding(
+    config: &Config,
+    provider: &str,
+    key: &ring::hmac::Key,
+) -> Result<[u8; 32], LLMError> {
+    let binding = match configured_binding_with_mode(config, provider, key, true)? {
+        Some(binding) => binding,
+        None => hash_factory_inputs(key, config, provider, "sdk-unconfigured", &())?,
+    };
+    Ok(binding.0)
+}
+
 fn configured_binding(
     config: &Config,
     id: &str,
     key: &ring::hmac::Key,
+) -> Result<Option<Binding>, LLMError> {
+    configured_binding_with_mode(config, id, key, false)
+}
+
+fn configured_binding_with_mode(
+    config: &Config,
+    id: &str,
+    key: &ring::hmac::Key,
+    sdk_mode: bool,
 ) -> Result<Option<Binding>, LLMError> {
     if let Some(instance) = config.provider_instances.get(id) {
         if !instance.enabled {
@@ -1146,7 +1204,7 @@ fn configured_binding(
     }
 
     let hybrid = config.has_provider_instances();
-    if hybrid && config.effective_default_provider() != id {
+    if !sdk_mode && hybrid && config.effective_default_provider() != id {
         return Ok(None);
     }
 
@@ -1155,7 +1213,7 @@ fn configured_binding(
         "openai" => match providers
             .openai
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1179,7 +1237,7 @@ fn configured_binding(
         "anthropic" => match providers
             .anthropic
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1204,7 +1262,7 @@ fn configured_binding(
         "gemini" => match providers
             .gemini
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1227,7 +1285,7 @@ fn configured_binding(
         "bodhi" => match providers
             .bodhi
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1247,7 +1305,7 @@ fn configured_binding(
             None => Ok(None),
         },
         "copilot" => match providers.copilot.as_ref() {
-            Some(entry) if !hybrid || entry.enabled || config.provider == "copilot" => {
+            Some(entry) if sdk_mode || !hybrid || entry.enabled || config.provider == "copilot" => {
                 hash_factory_inputs(
                     key,
                     config,
@@ -1264,7 +1322,7 @@ fn configured_binding(
                 )
                 .map(Some)
             }
-            None if !hybrid => {
+            None if sdk_mode || !hybrid => {
                 hash_factory_inputs(key, config, id, "implicit-copilot", &config.headless_auth)
                     .map(Some)
             }

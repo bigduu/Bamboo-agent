@@ -44,6 +44,7 @@ mod approval_replay;
 mod builder;
 mod error;
 mod execute_request;
+mod sdk_provider_guard;
 mod skill_runtime;
 mod tools;
 
@@ -164,6 +165,8 @@ pub struct Agent {
     provider_scope: Option<String>,
     /// Whether the bound client originated from an explicit provider instance.
     provider_scope_is_instance: Option<bool>,
+    /// Opaque factory-input witness only for an SDK-created native client.
+    native_provider_binding: Option<Arc<bamboo_llm::provider_registry::SdkProviderBinding>>,
     /// Live metadata used to resolve aliases against the assembled client identity.
     routing_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
     /// Default first-class Project membership for newly-created/unassigned sessions.
@@ -316,6 +319,7 @@ impl Agent {
             session_model: None,
             provider_scope: None,
             provider_scope_is_instance: None,
+            native_provider_binding: None,
             routing_config: None,
             project_id: None,
             session_store: None,
@@ -344,6 +348,7 @@ impl Agent {
             session_model,
             provider_scope: None,
             provider_scope_is_instance: None,
+            native_provider_binding: None,
             routing_config: None,
             project_id,
             session_store,
@@ -610,6 +615,51 @@ impl Agent {
             .transpose()
     }
 
+    fn sdk_validate_native_binding(
+        &self,
+        config: Option<&bamboo_llm::Config>,
+        model: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let Some(binding) = self.native_provider_binding.as_ref() else {
+            return Ok(());
+        };
+        let config = config.ok_or_else(|| {
+            Self::sdk_binding_error("native provider configuration is unavailable")
+        })?;
+        binding.validate(config).map_err(|_| {
+            Self::sdk_binding_error("native provider configuration changed; rebuild the SDK client")
+        })?;
+        if let (Some(scope), Some(model)) = (self.provider_scope.as_deref(), model) {
+            self.sdk_admit_model(Some(config), scope, model)?;
+        }
+        Ok(())
+    }
+
+    fn sdk_guarded_inner(&self, inner: &bamboo_engine::Agent) -> bamboo_engine::Agent {
+        match (
+            &self.native_provider_binding,
+            &self.routing_config,
+            &self.provider_scope,
+        ) {
+            (Some(binding), Some(config), Some(provider)) => {
+                let binding = binding.clone();
+                let config = config.clone();
+                let provider = provider.clone();
+                inner.with_default_provider_adapter(move |delegate| {
+                    Arc::new(sdk_provider_guard::BoundSdkProvider {
+                        delegate,
+                        config,
+                        binding,
+                        provider,
+                        single_use: false,
+                        refused: std::sync::atomic::AtomicBool::new(false),
+                    })
+                })
+            }
+            _ => inner.clone(),
+        }
+    }
+
     /// Resolve a named account without manufacturing a client for it. Exact
     /// instance IDs win; built-in type aliases follow the Host resolution order.
     fn sdk_canonical_provider(
@@ -752,6 +802,7 @@ impl Agent {
         config: Option<&bamboo_llm::Config>,
     ) -> Result<Option<bamboo_domain::ProviderModelRef>, AgentError> {
         let target = self.sdk_session_target(session)?;
+        self.sdk_validate_native_binding(config, None)?;
         if let Some(target) = target.as_ref() {
             self.sdk_require_bound_provider(target, config)?;
         }
@@ -810,6 +861,9 @@ impl Agent {
             }
         } else if !explicit_model && !session.model.trim().is_empty() {
             request.model_roster.model = Some(session.model.clone());
+        }
+        if request.provider_override.is_none() {
+            self.sdk_validate_native_binding(config, request.model_roster.model.as_deref())?;
         }
         if request.provider_override.is_some() {
             if !explicit_provider
@@ -892,7 +946,9 @@ impl Agent {
         self.prepare_sdk_direct_request(session, &mut request)?;
         #[cfg(test)]
         constructor_parity_tests::observe_inputs(&session.id, None);
-        self.inner.execute_direct(session, request).await
+        self.sdk_guarded_inner(&self.inner)
+            .execute_direct(session, request)
+            .await
     }
 
     /// Execute with an explicit per-run upstream retry policy through the same
@@ -906,7 +962,7 @@ impl Agent {
         self.prepare_sdk_direct_request(session, &mut request)?;
         #[cfg(test)]
         constructor_parity_tests::observe_inputs(&session.id, None);
-        self.inner
+        self.sdk_guarded_inner(&self.inner)
             .execute_direct_with_upstream_retry(session, request, upstream_retry)
             .await
     }
@@ -973,7 +1029,8 @@ impl Agent {
             } else {
                 self.persistence().clone()
             };
-            execution.inner = self.inner.with_execution_persistence(persistence);
+            execution.inner =
+                self.sdk_guarded_inner(&self.inner.with_execution_persistence(persistence));
             // Own the logical session before any pre-execution mutation or approved
             // tool replay. Two cloned SDK Session values must collide before either
             // can duplicate a mutating side effect.
@@ -999,6 +1056,26 @@ impl Agent {
                         *session = snapshot;
                     }
                 }
+                return Err(error);
+            }
+            // Configuration may have changed while durable admission was
+            // awaiting. Refuse before approved-tool replay as well as at each
+            // provider dispatch; never silently reuse the old native client.
+            let current = execution.sdk_routing_snapshot().and_then(|snapshot| {
+                let model = execution
+                    .model
+                    .as_deref()
+                    .or_else(|| session_target.as_ref().map(|target| target.model.as_str()))
+                    .or_else(|| {
+                        (!session.model.trim().is_empty()).then_some(session.model.as_str())
+                    });
+                execution.sdk_validate_native_binding(snapshot.as_ref(), model)
+            });
+            if let Err(error) = current {
+                if let Some(snapshot) = preappend_snapshot {
+                    *session = snapshot;
+                }
+                direct_lease.abandon().await;
                 return Err(error);
             }
             drop(preappend_snapshot);

@@ -937,7 +937,7 @@ struct RoutingOriginRacePersistence {
     inner: Arc<dyn RuntimeSessionPersistence>,
     config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     legacy_base_url: String,
-    switch_source: bool,
+    change: &'static str,
     reads: AtomicUsize,
 }
 
@@ -952,17 +952,36 @@ impl RuntimeSessionPersistence for RoutingOriginRacePersistence {
     }
 
     async fn load_runtime_admission_snapshot(&self, id: &str) -> std::io::Result<Option<Session>> {
-        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 && self.switch_source {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
             let mut live = self.config.write().await;
-            assert!(live.provider_instances.remove("openai").is_some());
-            live.default_provider_instance = None;
-            live.providers_mut().openai = Some(
-                serde_json::from_value(json!({
-                    "api_key": "synthetic-b", "base_url": self.legacy_base_url.as_str(),
-                    "model": "main-a", "runtime_models": ["main-a"]
-                }))
-                .unwrap(),
-            );
+            match self.change {
+                "none" => {}
+                "legacy" => {
+                    assert!(live.provider_instances.remove("openai").is_some());
+                    live.default_provider_instance = None;
+                    live.providers_mut().openai = Some(
+                        serde_json::from_value(json!({
+                            "api_key": "synthetic-b", "base_url": self.legacy_base_url.as_str(),
+                            "model": "main-a", "runtime_models": ["main-a"]
+                        }))
+                        .unwrap(),
+                    );
+                }
+                "same-instance" => {
+                    let instance = live.provider_instances.get_mut("openai").unwrap();
+                    instance.base_url = Some(self.legacy_base_url.clone());
+                    instance.api_key = "synthetic-b".into();
+                }
+                "disabled" => live.provider_instances.get_mut("openai").unwrap().enabled = false,
+                "unadmitted" => {
+                    live.provider_instances
+                        .get_mut("openai")
+                        .unwrap()
+                        .extra
+                        .insert("runtime_models".into(), json!([]));
+                }
+                _ => unreachable!(),
+            }
         }
         self.inner.load_runtime_admission_snapshot(id).await
     }
@@ -1007,7 +1026,7 @@ async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source
     for entry in ["run_session", "execute"] {
         // The unswitched control establishes that this exact fixture actually
         // reaches A; an unrelated startup failure cannot count as race coverage.
-        for switch_source in [false, true] {
+        for change in ["none", "legacy", "same-instance", "disabled", "unadmitted"] {
             let (old_url, old_calls, old_server) = routing_review_loopback_endpoint().await;
             let (new_url, new_calls, new_server) = routing_review_loopback_endpoint().await;
             let mut config = bamboo_llm::Config::default();
@@ -1052,7 +1071,7 @@ async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source
                 inner: agent.persistence().clone(),
                 config: shared,
                 legacy_base_url: new_url,
-                switch_source,
+                change,
                 reads: AtomicUsize::new(0),
             });
             agent.inner = agent.inner.with_execution_persistence(race.clone());
@@ -1093,7 +1112,7 @@ async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source
             old_server.abort();
             new_server.abort();
             assert!(race.reads.load(Ordering::SeqCst) > 0, "race did not fire");
-            if !switch_source {
+            if change == "none" {
                 assert!(outcome.is_ok(), "{entry} control failed: {outcome:?}");
                 assert!(
                     old > 0 && new == 0,

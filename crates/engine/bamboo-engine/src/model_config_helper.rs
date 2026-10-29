@@ -1046,6 +1046,30 @@ pub fn resolve_image_fallback(
     Ok(Some(crate::ImageFallbackConfig { mode, vision_model }))
 }
 
+/// Mark a Host-derived fallback for selection from the execution-time config.
+/// The public low-level resolver retains its snapshot-model behavior; only a
+/// caller that knows this value came from config should use this conversion.
+#[doc(hidden)]
+pub fn live_config_image_fallback(
+    mut fallback: Option<crate::ImageFallbackConfig>,
+) -> Option<crate::ImageFallbackConfig> {
+    if let Some(fallback) = fallback.as_mut() {
+        if fallback.mode == crate::ImageFallbackMode::Vision {
+            fallback.vision_model = None;
+        }
+    }
+    fallback
+}
+
+/// Resolve a Host-derived mode, leaving the Vision pair to the runtime's one
+/// execution-time config snapshot rather than retaining a model-only value.
+#[doc(hidden)]
+pub fn resolve_live_image_fallback(
+    config: &Config,
+) -> Result<Option<crate::ImageFallbackConfig>, String> {
+    resolve_image_fallback(config).map(live_config_image_fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

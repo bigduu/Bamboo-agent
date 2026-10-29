@@ -417,12 +417,13 @@ async fn submit_response_inner(
 
     // Build resume config snapshot from server config via the single-source-of-
     // truth resolver (provider-name derivation + global auxiliary models + gold).
-    let resume_config = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
-        &config_snapshot,
-        &state.provider_registry,
-        &session,
-        None,
-    );
+    let resume_config =
+        bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
+            &config_snapshot,
+            &state.provider_registry,
+            &session,
+            None,
+        );
 
     let auto_resume_outcome =
         bamboo_engine::session_app::resume::resume_session_execution_with_handoff(

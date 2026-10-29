@@ -54,6 +54,13 @@ fn selected_target(
                     .or(instance.model)
             })
         })
+        .or_else(|| {
+            // Copilot has a built-in default even with no explicit instance
+            // fields. Never borrow another account's default.
+            (config.defaults.is_none() && config.effective_default_provider() == active_provider)
+                .then(|| config.get_vision_model())
+                .flatten()
+        })
         .ok_or_else(|| {
             AgentError::LLM(
                 "Legacy Vision fallback requires a selected model; original images were preserved."

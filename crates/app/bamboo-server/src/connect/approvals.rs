@@ -39,7 +39,7 @@ use bamboo_engine::session_app::approval_replay::{
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::repository::SessionAccess;
-use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
+use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution as resolve_resume_config_snapshot;
 use bamboo_engine::session_app::respond::{
     acquire_pending_response_guard, inspect_pending_response_guarded,
     submit_pending_response_checked_guarded, validate_pending_response,

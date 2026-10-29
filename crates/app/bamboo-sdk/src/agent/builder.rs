@@ -158,6 +158,7 @@ pub struct AgentBuilder {
     // Remember which source produced the native client, even if later config
     // introduces or removes an explicit instance with the same identifier.
     assembled_provider_is_instance: Option<bool>,
+    assembled_native_bindings: Vec<Arc<bamboo_llm::provider_registry::SdkProviderBinding>>,
     /// API key applied to the active provider's config before provider creation.
     api_key: Option<String>,
     /// MCP servers to connect and merge into the tool surface in
@@ -221,6 +222,7 @@ impl AgentBuilder {
             provider_name: None,
             assembled_provider_scope: None,
             assembled_provider_is_instance: None,
+            assembled_native_bindings: Vec::new(),
             api_key: None,
             mcp_servers: Vec::new(),
             permission_checker: None,
@@ -628,10 +630,32 @@ impl AgentBuilder {
         if let Some(target) = chat_target.as_ref() {
             select_configured_chat_target(&mut provider_config, target)?;
         }
+        let provider_scope = provider_config.effective_default_provider().to_string();
+        // Keep opaque witnesses for both the original Config and the
+        // effective Config after an API-key overlay. A later `.config(...)`
+        // may choose either already-authorized input without retaining keys.
+        self.assembled_native_bindings.clear();
+        if self.provider_override.is_none() {
+            self.assembled_native_bindings.push(Arc::new(
+                bamboo_llm::provider_registry::SdkProviderBinding::capture(
+                    &provider_config,
+                    &provider_scope,
+                )
+                .map_err(|error| SdkError::Config(error.to_string()))?,
+            ));
+        }
         if let Some(api_key) = self.api_key.clone() {
             apply_api_key(&mut provider_config, &api_key)?;
+            if self.provider_override.is_none() {
+                self.assembled_native_bindings.push(Arc::new(
+                    bamboo_llm::provider_registry::SdkProviderBinding::capture(
+                        &provider_config,
+                        &provider_scope,
+                    )
+                    .map_err(|error| SdkError::Config(error.to_string()))?,
+                ));
+            }
         }
-        let provider_scope = provider_config.effective_default_provider().to_string();
         self.assembled_provider_scope = Some(provider_scope.clone());
         self.assembled_provider_is_instance = Some(
             provider_config
@@ -806,6 +830,20 @@ impl AgentBuilder {
                 .map(|(scope, config)| config.provider_instances.contains_key(scope))
         } else {
             self.assembled_provider_is_instance
+        };
+        let native_binding = if self.provider_override.is_none()
+            && !self.assembled_native_bindings.is_empty()
+        {
+            let config = config_snapshot.as_ref().ok_or_else(|| {
+                SdkError::Config("SDK native provider configuration is unavailable".into())
+            })?;
+            Some(self.assembled_native_bindings.iter()
+                .find(|binding| binding.validate(config).is_ok())
+                .cloned().ok_or_else(|| SdkError::Config(
+                    "SDK native provider configuration changed; rebuild defaults or supply a matching client".into(),
+                ))?)
+        } else {
+            None
         };
         if self.provider_override.is_some() && self.model.is_none() {
             // An injected client is authoritative for its declared account.
@@ -1041,6 +1079,7 @@ impl AgentBuilder {
         agent.sdk_skills = sdk_skills;
         agent.provider_scope = provider_scope;
         agent.provider_scope_is_instance = provider_scope_is_instance;
+        agent.native_provider_binding = native_binding;
         agent.routing_config = routing_config;
         Ok(agent)
     }

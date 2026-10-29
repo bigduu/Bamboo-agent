@@ -937,7 +937,7 @@ impl ChildCompletionCoordinator {
         session: &Session,
         config_snapshot: &Config,
     ) -> ResumeConfigSnapshot {
-        crate::session_app::resolution::resolve_resume_config_snapshot(
+        crate::session_app::resolution::resolve_resume_config_snapshot_for_execution(
             config_snapshot,
             &self.provider_registry,
             session,

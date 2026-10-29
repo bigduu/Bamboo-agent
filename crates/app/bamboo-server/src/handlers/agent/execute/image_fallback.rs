@@ -5,4 +5,4 @@
 //! `crate::handlers::agent::execute::image_fallback::resolve_image_fallback`
 //! path used across the server crate.
 
-pub(crate) use bamboo_engine::model_config_helper::resolve_image_fallback;
+pub(crate) use bamboo_engine::model_config_helper::resolve_live_image_fallback as resolve_image_fallback;

@@ -1255,8 +1255,8 @@ async fn entrypoint_routing_sdk_native_reasoning_tracks_provider_source() {
     assert_eq!(first_body["model"], "main-a");
     assert_eq!(first_body["reasoning_effort"], "low");
 
-    // Removing the instance does not replace the already assembled native
-    // client. The later legacy role must not lend its effort to that client.
+    // Removing the instance does not replace the assembled native client.
+    // Refuse the changed source before any second request can reach it.
     {
         let mut changed = live.write().await;
         changed.provider_instances.remove("openai");
@@ -1266,21 +1266,18 @@ async fn entrypoint_routing_sdk_native_reasoning_tracks_provider_source() {
     let mut second = Session::new("synthetic-native-origin-second", "main-a");
     second.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
     second.add_message(Message::user("Synthetic changed origin witness"));
-    tokio::time::timeout(
+    let error = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         agent.run_session(&mut second),
     )
     .await
     .unwrap()
-    .unwrap();
-    let requests = server.received_requests().await.unwrap();
-    assert_eq!(requests.len(), 2);
-    let second_body = requests[1].body_json::<serde_json::Value>().unwrap();
-    assert_eq!(second_body["model"], "main-a");
+    .expect_err("changed source cannot use the old native client");
     assert!(
-        second_body.get("reasoning_effort").is_none(),
-        "{second_body:?}"
+        error.to_string().contains("sdk_provider_binding:"),
+        "{error}"
     );
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 /// A default-on capture supports the synthetic Vision model but leaves
@@ -1332,13 +1329,29 @@ async fn entrypoint_routing_legacy_stale_derived_role_never_rebinds_to_main() {
             std::collections::HashMap::from([("chat-a".to_string(), main_provider)]),
             "chat-a".to_string(),
         ));
-        let snapshot = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
+        let compatibility = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
             &initial,
             &registry,
-            &Session::new("synthetic-resume-snapshot", "main-a"),
+            &Session::new("synthetic-resume-compatibility", "main-a"),
             None,
         );
+        assert_eq!(
+            compatibility
+                .image_fallback
+                .unwrap()
+                .vision_model
+                .as_deref(),
+            Some("vision-b")
+        );
+        let snapshot =
+            bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
+                &initial,
+                &registry,
+                &Session::new("synthetic-resume-snapshot", "main-a"),
+                None,
+            );
         let fallback = snapshot.image_fallback.unwrap();
+        assert_eq!(fallback.vision_model, None);
 
         let shared = Arc::new(RwLock::new(initial));
         assert!(main.supports_vision("vision-b").await);
@@ -1611,12 +1624,13 @@ async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
         std::collections::HashMap::from([("copilot".to_string(), main_provider)]),
         "copilot".to_string(),
     ));
-    let snapshot = bamboo_engine::session_app::resolution::resolve_resume_config_snapshot(
-        &config,
-        &registry,
-        &Session::new("synthetic-copilot-snapshot", "main-a"),
-        None,
-    );
+    let snapshot =
+        bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
+            &config,
+            &registry,
+            &Session::new("synthetic-copilot-snapshot", "main-a"),
+            None,
+        );
     let fallback = snapshot.image_fallback.unwrap();
     let dir = tempfile::tempdir().unwrap();
     let agent = bamboo_sdk::Agent::builder()
@@ -1674,4 +1688,81 @@ async fn entrypoint_routing_legacy_live_snapshot_keeps_copilot_default() {
             .content_parts,
         original.content_parts,
     );
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_native_overlay_keeps_selected_client_in_both_builder_orders() {
+    for config_before_defaults in [false, true] {
+        let server = vision_server(200).await;
+        let mut config = config(true, "openai");
+        config.provider = "openai".into();
+        config.default_provider_instance = Some("openai".into());
+        config.provider_instances.clear();
+        config.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": true,
+                "api_key": "synthetic-config-key", "base_url": server.uri(),
+                "model": "main-a", "runtime_models": ["main-a"]
+            }))
+            .unwrap(),
+        );
+        config.defaults.as_mut().unwrap().chat =
+            bamboo_domain::ProviderModelRef::new("openai", "main-a");
+        let shared = Arc::new(RwLock::new(config.clone()));
+        let dir = tempfile::tempdir().unwrap();
+        // Config serialization omits keys; restore only this synthetic fixture
+        // key in its isolated temporary data root for the disk-first order.
+        let mut disk = serde_json::to_value(&config).unwrap();
+        disk["provider_instances"]["openai"]["api_key"] = "synthetic-config-key".into();
+        tokio::fs::write(
+            dir.path().join("config.json"),
+            serde_json::to_vec(&disk).unwrap(),
+        )
+        .await
+        .unwrap();
+        let builder = bamboo_sdk::Agent::builder()
+            .provider_name("openai")
+            .api_key("synthetic-overlay-key")
+            .model("main-a")
+            .tools(std::iter::empty());
+        let builder = if config_before_defaults {
+            builder
+                .config(shared.clone())
+                .with_defaults_for_data_dir(dir.path().to_path_buf())
+                .await
+                .unwrap()
+        } else {
+            builder
+                .with_defaults_for_data_dir(dir.path().to_path_buf())
+                .await
+                .unwrap()
+                .config(shared.clone())
+        };
+        let agent = builder.build().unwrap();
+        let mut session = Session::new("synthetic-native-overlay", "main-a");
+        session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
+        session.add_message(Message::user("Synthetic overlay control"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            agent.run_session(&mut session),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests.len(),
+            1,
+            "config_before_defaults={config_before_defaults}"
+        );
+        assert_eq!(
+            requests[0].body_json::<serde_json::Value>().unwrap()["model"],
+            "main-a"
+        );
+        assert_eq!(
+            shared.read().await.provider_instances["openai"].api_key,
+            "synthetic-config-key"
+        );
+    }
 }

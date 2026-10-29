@@ -442,6 +442,18 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Adapt the default provider for this execution while retaining every
+    /// other runtime capability. Explicit request-level overrides stay separate.
+    #[doc(hidden)]
+    pub fn with_default_provider_adapter(
+        &self,
+        adapter: impl FnOnce(Arc<dyn bamboo_llm::LLMProvider>) -> Arc<dyn bamboo_llm::LLMProvider>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.provider = adapter(runtime.provider.clone());
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Bind a live-bootstrap Host to this execution only. The Host must retain
     /// its exact runner and writer; this method does not create authority.
     #[doc(hidden)]
