@@ -348,8 +348,12 @@ async fn supervisor_cancel_rejects_old_owner_after_same_id_root_recreation() {
     // Simulate a stale old Host owner outliving the canonical deletion; the
     // new Root is real storage with the same ID and a different birth.
     fixture.state.storage.delete_session(TARGET).await.unwrap();
-    let mut replacement = Session::new(TARGET, "replacement-model");
-    replacement.created_at = fixture.original.created_at + chrono::Duration::seconds(1);
+    let mut replacement = fixture
+        .state
+        .session_store
+        .recreate_root_session(TARGET, "replacement-model")
+        .await
+        .unwrap();
     replacement.set_project_id_meta(fixture.original.project_id_meta().unwrap());
     replacement.set_workspace_path_meta(fixture.original.workspace_path_meta().unwrap());
     replacement.add_message(Message::user("replacement Root content"));
