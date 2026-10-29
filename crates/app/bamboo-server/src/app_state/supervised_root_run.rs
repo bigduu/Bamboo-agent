@@ -9,8 +9,8 @@ use std::{collections::HashMap, io, sync::Arc};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
 use bamboo_domain::{
-    SessionActivationPort, SessionAuthorityIdentity, SessionCallerReference,
-    SupervisorCurrentUserTarget, SupervisorReference,
+    AdmissionCommit, AdmissionGate, SessionActivationPort, SessionAuthorityIdentity,
+    SessionCallerReference, SupervisorCurrentUserTarget, SupervisorReference,
 };
 use bamboo_server_tools::session_control::root_run::SupervisedRootRunPort;
 use bamboo_storage::SessionStoreV2;
@@ -44,6 +44,7 @@ fn finalized(target: &SupervisorCurrentUserTarget, runner: &AgentRunner) -> Valu
 fn run_control(
     target: &SupervisorCurrentUserTarget,
     expected: Option<&str>,
+    gate: Option<&AdmissionGate>,
     router: &bamboo_engine::SessionActivationRouter,
     runners: &RwLock<HashMap<String, AgentRunner>>,
     live_retry: &LiveRetryBridge,
@@ -112,16 +113,34 @@ fn run_control(
             "terminal_unconfirmed",
         ));
     }
-    runner.bind_supervisor_run_target(target);
     if expected.is_some() {
         // This is the existing exact Retry/runner cancellation signal. Do not
         // set a terminal status or discard any pending Inbox input here.
-        live_retry.cancel_and_token(&target.session_id, &candidate, &runner.cancel_token);
+        let gate = gate.ok_or_else(|| io::Error::other("missing Root cancel admission"))?;
+        match gate.commit(|| {
+            runner.bind_supervisor_run_target(target);
+            live_retry.cancel_and_token(&target.session_id, &candidate, &runner.cancel_token);
+            Ok::<(), io::Error>(())
+        })? {
+            AdmissionCommit::Committed(()) => {}
+            AdmissionCommit::Cancelled => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Root cancel caller dropped before signal",
+                ));
+            }
+            AdmissionCommit::AlreadyCommitted => {
+                return Err(io::Error::other(
+                    "Root cancel admission was already consumed",
+                ));
+            }
+        }
         Ok(
             json!({"status":"cancel_requested", "accepted":true, "target_session_id":target.session_id,
             "run_id":candidate, "completion_verified":false}),
         )
     } else {
+        runner.bind_supervisor_run_target(target);
         let status = if runner.cancel_token.is_cancelled() {
             "cancel_requested"
         } else {
@@ -140,6 +159,7 @@ impl SupervisedRootRunController {
         caller: &SessionCallerReference,
         target: &SupervisorCurrentUserTarget,
         expected: Option<&str>,
+        gate: Option<AdmissionGate>,
     ) -> Result<ToolResult, ToolError> {
         let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
         else {
@@ -160,6 +180,7 @@ impl SupervisedRootRunController {
                 run_control(
                     &selected,
                     expected.as_deref(),
+                    gate.as_ref(),
                     &router,
                     &runners,
                     &live_retry,
@@ -179,7 +200,7 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         caller: &SessionCallerReference,
         target: &SupervisorCurrentUserTarget,
     ) -> Result<ToolResult, ToolError> {
-        self.control(caller, target, None).await
+        self.control(caller, target, None, None).await
     }
 
     async fn cancel_run(
@@ -187,7 +208,9 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         caller: &SessionCallerReference,
         target: &SupervisorCurrentUserTarget,
         expected_run_id: &str,
+        gate: AdmissionGate,
     ) -> Result<ToolResult, ToolError> {
-        self.control(caller, target, Some(expected_run_id)).await
+        self.control(caller, target, Some(expected_run_id), Some(gate))
+            .await
     }
 }

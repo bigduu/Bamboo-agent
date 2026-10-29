@@ -6,7 +6,7 @@
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
-use bamboo_domain::{SessionCallerReference, SupervisorCurrentUserTarget};
+use bamboo_domain::{AdmissionGate, SessionCallerReference, SupervisorCurrentUserTarget};
 
 #[async_trait]
 pub trait SupervisedRootRunPort: Send + Sync {
@@ -21,5 +21,6 @@ pub trait SupervisedRootRunPort: Send + Sync {
         caller: &SessionCallerReference,
         target: &SupervisorCurrentUserTarget,
         expected_run_id: &str,
+        gate: AdmissionGate,
     ) -> Result<ToolResult, ToolError>;
 }

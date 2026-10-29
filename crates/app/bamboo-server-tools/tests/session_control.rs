@@ -43,6 +43,7 @@ impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort
         _caller: &SessionCallerReference,
         _target: &bamboo_domain::SupervisorCurrentUserTarget,
         expected_run_id: &str,
+        _gate: bamboo_domain::AdmissionGate,
     ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(bamboo_agent_core::tools::ToolResult::text(
@@ -94,6 +95,79 @@ async fn exact_root_run_schema_requires_observed_target_and_run_without_granting
         assert!(tool.invoke(invalid, fixture.ctx.clone()).await.is_err());
     }
     assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+}
+
+#[derive(Default)]
+struct DetachedCancelPort {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<tokio::sync::Notify>,
+    signalled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort for DetachedCancelPort {
+    async fn observe_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        unreachable!("this fixture exercises only the cancel admission")
+    }
+
+    async fn cancel_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+        _expected_run_id: &str,
+        gate: bamboo_domain::AdmissionGate,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        let completed = self.completed.clone();
+        let signalled = self.signalled.clone();
+        tokio::spawn(async move {
+            entered.notify_one();
+            release.notified().await;
+            gate.commit(|| {
+                signalled.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            completed.notify_one();
+        });
+        // The owned job outlives this awaiter, like a started blocking signal.
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn dropping_cancel_awaiter_closes_gate_before_detached_signal() {
+    let fixture = Fixture::new().await;
+    let port = Arc::new(DetachedCancelPort::default());
+    let tool =
+        Arc::new(SessionControlTool::new(fixture.messenger.clone()).with_root_run(port.clone()));
+    let target = fixture
+        .targets
+        .iter()
+        .find(|target| target.session_id == "a")
+        .unwrap();
+    let args = json!({"action":"cancel", "target_session_id":"a", "target_ref":target,
+        "expected_run_id":"run-1"});
+    let context = fixture.ctx.clone();
+    let entered = port.entered.notified();
+    let completed = port.completed.notified();
+    let call = tokio::spawn(async move { tool.invoke(args, context).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .unwrap();
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    port.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), completed)
+        .await
+        .unwrap();
+    assert!(!port.signalled.load(Ordering::SeqCst));
 }
 
 #[derive(Default)]

@@ -557,6 +557,14 @@ pub struct SessionControlTool {
     root_run: Option<Arc<dyn SupervisedRootRunPort>>,
 }
 
+struct CancelPendingRootRun(bamboo_domain::AdmissionGate);
+
+impl Drop for CancelPendingRootRun {
+    fn drop(&mut self) {
+        self.0.cancel_if_pending();
+    }
+}
+
 impl SessionControlTool {
     pub fn new(messenger: Arc<SessionMessenger>) -> Self {
         Self {
@@ -808,8 +816,10 @@ impl Tool for SessionControlTool {
                 let port = self.root_run.as_ref().ok_or_else(|| {
                     ToolError::Execution("supervised_root_run_unavailable".into())
                 })?;
+                let gate = bamboo_domain::AdmissionGate::default();
+                let _pending = CancelPendingRootRun(gate.clone());
                 return port
-                    .cancel_run(original, &target_ref, &expected_run_id)
+                    .cancel_run(original, &target_ref, &expected_run_id, gate)
                     .await
                     .map(ToolOutcome::Completed);
             }

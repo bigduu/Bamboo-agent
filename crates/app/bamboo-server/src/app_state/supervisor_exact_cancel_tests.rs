@@ -493,3 +493,59 @@ async fn supervisor_exact_cancel_uses_the_same_boundary_in_standard_and_ultra() 
         fixture.state.shutdown().await;
     }
 }
+
+#[actix_web::test]
+async fn cancelled_root_control_admission_cannot_signal_late_owner() {
+    use bamboo_server_tools::session_control::root_run::SupervisedRootRunPort;
+    let fixture = Box::pin(Fixture::new()).await;
+    let target = current_target(&fixture).await;
+    let supervisor = fixture
+        .state
+        .storage
+        .load_execution_admission_snapshot(&fixture.reference.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = bamboo_domain::SessionCallerReference::from(&supervisor);
+    let mut runner = crate::app_state::AgentRunner::new();
+    runner.status = crate::app_state::AgentStatus::Running;
+    let run_id = runner.run_id.clone();
+    let token = runner.cancel_token.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &run_id)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), runner);
+    let port = crate::app_state::supervised_root_run::SupervisedRootRunController {
+        store: fixture.state.session_store.clone(),
+        router: fixture.state.session_activation_router.clone(),
+        runners: fixture.state.agent_runners.clone(),
+        live_retry: fixture.state.live_retry.clone(),
+    };
+    let gate = bamboo_domain::AdmissionGate::default();
+    gate.cancel_if_pending();
+    assert!(port
+        .cancel_run(&caller, &target, &run_id, gate)
+        .await
+        .is_err());
+    assert!(!token.is_cancelled());
+    assert_eq!(
+        fixture
+            .state
+            .session_inbox
+            .inspect(TARGET)
+            .await
+            .unwrap()
+            .generation,
+        0
+    );
+    owner.abandon().await;
+    fixture.state.shutdown().await;
+}
