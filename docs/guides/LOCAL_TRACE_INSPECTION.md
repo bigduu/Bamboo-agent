@@ -24,7 +24,12 @@ The OpenAI-compatible Chat and Responses, Anthropic Messages and Gemini
 GenerateContent paths supply optional per-call snapshots. Anthropic reports
 fresh input, cache creation and cache read as disjoint components; the snapshot
 forms input total only when all three are present and the sum fits. It emits the
-snapshot at `message_stop`, so an interrupted stream can have unknown usage.
+snapshot at `message_stop`, or immediately before a reported stream error if
+usage was observed. Direct cancellation or watchdog timeout can still leave
+usage unknown; at the semantic deadline, an error preceded by a usage snapshot
+can be reported as a timeout without retaining that snapshot. A clean EOF
+before `message_stop` retains the existing stream
+completion behavior and may be treated as success without a usage snapshot.
 Gemini reports prompt and cached content separately from candidate and thought
 tokens. Its snapshot combines candidate and thought tokens once for output
 only when both are present; otherwise output remains unknown. When reported,
@@ -133,14 +138,18 @@ retains the reported counters. Repeated cumulative snapshots update known
 counters instead of adding them. Hook execution is best effort: a process-wide
 maximum of 32 queued/running observers and a two-second deadline can drop work.
 Return values never control the model call. Up to four usage-plugin registry
-and file reads, path resolutions, bundle hash checks and data-directory
-creations may remain active after a timeout; further such work is dropped until
-a slot becomes free. For this event, registry and manifest reads are limited to
-64 MiB and hook configuration reads to 64 KiB; exceeding a limit drops that
-portable delivery. Native handlers receive the existing envelope with a
-`payload` of type `model_call_usage`; portable handlers receive `observation`
-at top level. Both contain the same schema-1 snapshot and no workspace path in
-the event payload.
+and file reads, manifest parsing and validation, path resolutions, bundle hash
+checks and data-directory creations may remain active after a timeout; further
+such work is dropped until a slot becomes free. For this event, registry and
+manifest reads are limited to 64 MiB and hook configuration reads to 64 KiB;
+exceeding a limit drops that portable delivery. Native handlers receive the
+existing envelope with a `payload` of type `model_call_usage`; portable
+handlers receive `observation` at top level. Both contain the same schema-1
+snapshot and no workspace path in the event payload.
+Portable usage commands retain the existing plugin-operation trust lock while
+they run, so a foreground portable hook or plugin update may wait for the
+observer's two-second deadline. Releasing that lock early would weaken update
+and revocation checks; foreground-priority cancellation remains future work.
 Programmatic native observers receive a deliberately minimal Session: its id and
 root id follow the same reference policy, and its birth identifies the original
 lifetime. Other Session fields are not a snapshot of runtime state. Consume the

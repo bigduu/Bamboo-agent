@@ -15,6 +15,7 @@ pub use stream::{
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use crate::providers::common::log_identity;
 use async_trait::async_trait;
@@ -547,19 +548,16 @@ impl AnthropicProvider {
             )));
         }
 
-        let mut state = AnthropicStreamState {
+        let state = Arc::new(Mutex::new(AnthropicStreamState {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
             request_thinking_budget_tokens: thinking_budget_tokens,
             ..Default::default()
-        };
-
-        let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+        }));
+        Ok(anthropic_stream_with_usage_on_error(
             response.into_response(),
-            move |event, data| parse_anthropic_sse_event_multi(&mut state, event, data),
-        );
-
-        Ok(stream)
+            state,
+        ))
     }
 }
 
@@ -1769,6 +1767,57 @@ impl AnthropicUsageSnapshot {
             cache_write_input_tokens: None,
         })
     }
+}
+
+fn anthropic_stream_with_usage_on_error(
+    response: reqwest::Response,
+    state: Arc<Mutex<AnthropicStreamState>>,
+) -> LLMStream {
+    let parser_state = Arc::clone(&state);
+    let stream =
+        crate::providers::common::sse::llm_stream_from_sse_multi(response, move |event, data| {
+            let mut state = parser_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            parse_anthropic_sse_event_multi(&mut state, event, data)
+        });
+    usage_before_anthropic_stream_error(stream, state)
+}
+
+// Preserve the latest presence-aware snapshot before propagating an actual
+// stream error. Success remains terminal-only, so a later malformed field can
+// invalidate an earlier value without changing the shared chunk contract.
+fn usage_before_anthropic_stream_error(
+    upstream: LLMStream,
+    state: Arc<Mutex<AnthropicStreamState>>,
+) -> LLMStream {
+    use futures::StreamExt;
+
+    Box::pin(futures::stream::unfold(
+        (upstream, state, None),
+        |(mut upstream, state, pending_error)| async move {
+            if let Some(error) = pending_error {
+                return Some((Err(error), (upstream, state, None)));
+            }
+            match upstream.next().await {
+                Some(Err(error)) => {
+                    let snapshot = {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.usage_snapshot.take_terminal()
+                    };
+                    if let Some(snapshot) = snapshot {
+                        Some((Ok(snapshot), (upstream, state, Some(error))))
+                    } else {
+                        Some((Err(error), (upstream, state, None)))
+                    }
+                }
+                Some(item) => Some((item, (upstream, state, None))),
+                None => None,
+            }
+        },
+    ))
 }
 
 impl AnthropicStreamState {
@@ -5996,6 +6045,105 @@ mod anthropic_stream_parse {
         assert!(!repeated
             .iter()
             .any(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. })));
+    }
+
+    #[tokio::test]
+    async fn interrupted_usage_flushes_once_before_transport_error() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        for (delta, expected_input, expected_read) in [
+            (r#"{"usage":{"output_tokens":7}}"#, Some(15), Some(3)),
+            (
+                r#"{"usage":{"output_tokens":7,"cache_read_input_tokens":-1}}"#,
+                None,
+                None,
+            ),
+        ] {
+            let state = Arc::new(Mutex::new(super::AnthropicStreamState::default()));
+            {
+                let mut state = state.lock().unwrap();
+                super::parse_anthropic_sse_event_multi(
+                    &mut state,
+                    "message_start",
+                    r#"{"message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}"#,
+                )
+                .unwrap();
+                super::parse_anthropic_sse_event_multi(&mut state, "message_delta", delta).unwrap();
+            }
+            let upstream: super::LLMStream = Box::pin(futures::stream::iter(vec![Err(
+                super::LLMError::Stream("synthetic interruption".into()),
+            )]));
+            let mut stream = super::usage_before_anthropic_stream_error(upstream, state);
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                LLMChunk::ProviderUsage {
+                    input_tokens,
+                    output_tokens: Some(7),
+                    cache_creation_input_tokens: Some(2),
+                    cache_read_input_tokens,
+                    ..
+                } if input_tokens == expected_input && cache_read_input_tokens == expected_read
+            ));
+            assert!(matches!(
+                stream.next().await.unwrap(),
+                Err(super::LLMError::Stream(message)) if message == "synthetic interruption"
+            ));
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_body_error_flushes_reported_usage_before_error() {
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let sse = concat!(
+            "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":3}}}\n\n",
+            "event: message_delta\ndata: {\"usage\":{\"output_tokens\":7}}\n\n",
+        );
+        let parts = vec![
+            Ok(Bytes::from(sse)),
+            Err(std::io::Error::other("synthetic body interruption")),
+        ];
+        let body_stream = futures::stream::unfold(parts.into_iter(), |mut parts| async move {
+            tokio::task::yield_now().await;
+            parts.next().map(|part| (part, parts))
+        });
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(reqwest::Body::wrap_stream(body_stream))
+                .unwrap(),
+        );
+        let state = Arc::new(Mutex::new(super::AnthropicStreamState::default()));
+        let mut stream = super::anthropic_stream_with_usage_on_error(response, state);
+        let mut usage_count = 0;
+        let mut saw_error = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(LLMChunk::ProviderUsage {
+                    input_tokens: Some(13),
+                    output_tokens: Some(7),
+                    cache_creation_input_tokens: Some(0),
+                    cache_read_input_tokens: Some(3),
+                    ..
+                }) => {
+                    assert!(!saw_error);
+                    usage_count += 1;
+                }
+                Err(_) => {
+                    assert!(!saw_error);
+                    assert_eq!(usage_count, 1);
+                    saw_error = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_error);
+        assert_eq!(usage_count, 1);
     }
 
     #[test]

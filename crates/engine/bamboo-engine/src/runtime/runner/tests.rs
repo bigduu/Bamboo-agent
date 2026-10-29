@@ -2823,6 +2823,130 @@ async fn partial_provider_failure_reports_one_usage_event_and_matching_error_spa
 }
 
 #[tokio::test]
+async fn anthropic_sse_error_preserves_reported_partial_usage() {
+    use bamboo_agent_core::AgentHook;
+    use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct Capture(mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>);
+    #[async_trait]
+    impl AgentHook for Capture {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterModelCallUsage
+        }
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            if let HookPayload::ModelCallUsage { observation } = payload {
+                self.0.send(observation.clone()).unwrap();
+            }
+            HookResult::Continue
+        }
+    }
+
+    for (start, delta, expected_input, expected_creation, expected_read) in [
+        (
+            r#"{"message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":3}}}"#,
+            r#"{"usage":{"output_tokens":7}}"#,
+            Some(13),
+            Some(0),
+            Some(3),
+        ),
+        (
+            r#"{"message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}"#,
+            r#"{"usage":{"output_tokens":7,"cache_read_input_tokens":-1}}"#,
+            None,
+            Some(2),
+            None,
+        ),
+    ] {
+        let body = format!(
+            "event: message_start\ndata: {start}\n\n\
+             event: content_block_start\ndata: {{\"index\":0,\"content_block\":{{\"type\":\"text\",\"text\":\"\"}}}}\n\n\
+             event: content_block_delta\ndata: {{\"index\":0,\"delta\":{{\"type\":\"text_delta\",\"text\":\"synthetic partial\"}}}}\n\n\
+             event: message_delta\ndata: {delta}\n\n\
+             event: message_delta\ndata: {delta}\n\n\
+             event: error\ndata: {{\"type\":\"error\",\"error\":{{\"type\":\"synthetic_error\"}}}}\n\n"
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let provider: Arc<dyn LLMProvider> = Arc::new(
+            bamboo_llm::providers::anthropic::AnthropicProvider::new("synthetic-key")
+                .with_base_url(server.uri()),
+        );
+        let trace = bamboo_infrastructure::telemetry::test_support::LocalTraceTest::isolated();
+        let mut session = Session::new("synthetic-anthropic-interruption", "synthetic-model");
+        let birth = session.created_at;
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sender_guard = sender.clone();
+        let mut hooks = crate::runtime::hooks::HookRunner::new();
+        hooks.register(Arc::new(Capture(sender)));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(hooks),
+            provider_type: Some("anthropic".into()),
+            model_name: Some("synthetic-model".into()),
+            system_prompt: Some("synthetic system".into()),
+            ..Default::default()
+        };
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+        let (events, _receiver) = mpsc::channel(128);
+        let result = trace
+            .scope(super::run_agent_loop_with_config(
+                &mut session,
+                "PRIVATE_PROMPT_SENTINEL".into(),
+                events,
+                provider,
+                tools,
+                CancellationToken::new(),
+                config,
+            ))
+            .await;
+        assert!(matches!(
+            result,
+            Err(bamboo_agent_core::AgentError::LLMNonRetryable(message))
+                if message.contains("synthetic_error")
+        ));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.status, ModelCallStatus::Error);
+        let usage = event.usage.as_ref().expect("reported partial usage");
+        assert_eq!(usage.input_tokens, expected_input);
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cache_creation_input_tokens, expected_creation);
+        assert_eq!(usage.cache_read_input_tokens, expected_read);
+        let detail = trace
+            .store
+            .detail(&session.id, birth, event.trace_id.as_deref().unwrap())
+            .unwrap();
+        let span = detail
+            .spans
+            .iter()
+            .find(|span| span.span_id == event.span_id.as_deref().unwrap())
+            .unwrap();
+        assert_eq!(span.status, "error");
+        assert_eq!(span.usage.as_ref(), Some(usage));
+        assert!(!serde_json::to_string(&detail)
+            .unwrap()
+            .contains("PRIVATE_PROMPT_SENTINEL"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv())
+                .await
+                .is_err()
+        );
+        drop(sender_guard);
+    }
+}
+
+#[tokio::test]
 async fn synthetic_anthropic_and_gemini_streams_reach_usage_hook_and_local_span() {
     use bamboo_agent_core::AgentHook;
     use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};

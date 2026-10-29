@@ -2,7 +2,9 @@
 //! short-circuit aggregation, and no trusted native context output.
 use bamboo_agent_core::Session;
 use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
-use bamboo_plugin::hooks::{bundle_path, registrations, HookState, PortableConfig, PortableEvent};
+use bamboo_plugin::hooks::{
+    bundle_path, registrations, HookRegistration, HookState, PortableConfig, PortableEvent,
+};
 use bamboo_plugin::{InstalledPlugins, PluginInstallStatus, PluginManifest};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -77,7 +79,11 @@ async fn resolve_working_directory(
         .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?))
 }
 
-async fn load_plugins(event: PortableEvent, path: &Path) -> Result<InstalledPlugins, String> {
+async fn load_plugins(
+    event: PortableEvent,
+    path: &Path,
+    only_id: Option<&str>,
+) -> Result<InstalledPlugins, String> {
     if event != PortableEvent::BambooModelCallUsage {
         return InstalledPlugins::load(path)
             .await
@@ -85,6 +91,7 @@ async fn load_plugins(event: PortableEvent, path: &Path) -> Result<InstalledPlug
     }
     let permit = usage_review_slot()?;
     let path = path.to_owned();
+    let only_id = only_id.map(str::to_owned);
     spawn_review(Some(permit), move || {
         if !path.try_exists().map_err(|error| error.to_string())? {
             return Ok(InstalledPlugins::default());
@@ -94,7 +101,24 @@ async fn load_plugins(event: PortableEvent, path: &Path) -> Result<InstalledPlug
         if raw.trim().is_empty() {
             return Ok(InstalledPlugins::default());
         }
-        serde_json::from_str(raw).map_err(|error| error.to_string())
+        let mut store: InstalledPlugins =
+            serde_json::from_str(raw).map_err(|error| error.to_string())?;
+        // The observer must not repeatedly scan the full registry on an async
+        // runtime worker. Count before filtering so any duplicate (including
+        // an incomplete install) rejects every row with that ID.
+        let mut counts = std::collections::HashMap::<String, usize>::new();
+        for plugin in &store.plugins {
+            *counts.entry(plugin.id.clone()).or_default() += 1;
+        }
+        store.plugins.retain(|plugin| {
+            plugin.status == PluginInstallStatus::Installed
+                && counts.get(&plugin.id) == Some(&1)
+                // The plugin registry cannot legitimately contain more hook
+                // registrations than registrations() accepts for a bundle.
+                && plugin.registered.hooks.len() <= 16
+                && only_id.as_deref().is_none_or(|id| plugin.id == id)
+        });
+        Ok(store)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -127,6 +151,71 @@ async fn read_plugin_file(
     spawn_review(Some(permit), move || read_usage_file(&path, max_bytes))
         .await
         .map_err(|error| error.to_string())?
+}
+
+fn read_usage_manifest(root: &Path) -> Result<PluginManifest, String> {
+    let bytes = read_usage_file(&root.join("plugin.json"), USAGE_PLUGIN_METADATA_BYTES)?;
+    let manifest: PluginManifest =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    manifest.validate().map_err(|error| error.to_string())?;
+    Ok(manifest)
+}
+
+async fn load_plugin_manifest(event: PortableEvent, root: &Path) -> Result<PluginManifest, String> {
+    if event != PortableEvent::BambooModelCallUsage {
+        let bytes = read_plugin_file(
+            event,
+            &root.join("plugin.json"),
+            USAGE_PLUGIN_METADATA_BYTES,
+        )
+        .await?;
+        return serde_json::from_slice(&bytes).map_err(|error| error.to_string());
+    }
+    let permit = usage_review_slot()?;
+    let root = root.to_owned();
+    spawn_review(Some(permit), move || read_usage_manifest(&root))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+async fn review_plugin_manifest(
+    event: PortableEvent,
+    root: &Path,
+) -> Result<Vec<HookRegistration>, String> {
+    if event != PortableEvent::BambooModelCallUsage {
+        let manifest = load_plugin_manifest(event, root).await?;
+        let root = root.to_owned();
+        return spawn_review(None, move || {
+            manifest.validate().map_err(|error| error.to_string())?;
+            registrations(&manifest, &root).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| error.to_string())?;
+    }
+    let permit = usage_review_slot()?;
+    let root = root.to_owned();
+    spawn_review(Some(permit), move || {
+        let manifest = read_usage_manifest(&root)?;
+        registrations(&manifest, &root).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn parse_portable_config(
+    event: PortableEvent,
+    bytes: &[u8],
+) -> Result<PortableConfig, String> {
+    if event != PortableEvent::BambooModelCallUsage {
+        return PortableConfig::parse(bytes).map_err(|error| error.to_string());
+    }
+    let permit = usage_review_slot()?;
+    let bytes = bytes.to_vec();
+    spawn_review(Some(permit), move || {
+        PortableConfig::parse(&bytes).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }
 
 async fn create_plugin_data_dir(event: PortableEvent, path: &Path) -> Result<(), String> {
@@ -479,7 +568,7 @@ pub async fn run_with_inputs(
     let Some(event) = event(point) else {
         return report;
     };
-    let store = match load_plugins(event, &root.join("installed.json")).await {
+    let store = match load_plugins(event, &root.join("installed.json"), None).await {
         Ok(s) => s,
         Err(e) => {
             report.errors.push(e.to_string());
@@ -487,21 +576,19 @@ pub async fn run_with_inputs(
         }
     };
     let mut remaining = PORTABLE_CONTEXT_BYTES;
-    for plugin in &store.plugins {
-        if plugin.status != PluginInstallStatus::Installed
-            || store.plugins.iter().filter(|p| p.id == plugin.id).count() != 1
+    for (index, plugin) in store.plugins.iter().enumerate() {
+        if event == PortableEvent::BambooModelCallUsage && index % 64 == 0 {
+            // A saturated blocking budget may make each attempted lookup return
+            // immediately. Keep the observer deadline and other tasks pollable.
+            tokio::task::yield_now().await;
+        }
+        if event != PortableEvent::BambooModelCallUsage
+            && (plugin.status != PluginInstallStatus::Installed
+                || store.plugins.iter().filter(|p| p.id == plugin.id).count() != 1)
         {
             continue;
         }
-        let manifest: PluginManifest = match read_plugin_file(
-            event,
-            &plugin.plugin_dir.join("plugin.json"),
-            USAGE_PLUGIN_METADATA_BYTES,
-        )
-        .await
-        .and_then(|b| {
-            serde_json::from_slice::<PluginManifest>(&b).map_err(|error| error.to_string())
-        }) {
+        let manifest: PluginManifest = match load_plugin_manifest(event, &plugin.plugin_dir).await {
             Ok(m) if m.id == plugin.id && m.version == plugin.version => m,
             _ => {
                 report
@@ -513,9 +600,11 @@ pub async fn run_with_inputs(
         if plugin.registered.hooks.is_empty() {
             continue;
         }
-        if let Err(error) = manifest.validate() {
-            report.errors.push(error.to_string());
-            continue;
+        if event != PortableEvent::BambooModelCallUsage {
+            if let Err(error) = manifest.validate() {
+                report.errors.push(error.to_string());
+                continue;
+            }
         }
         if manifest.platforms.as_ref().is_some_and(|platforms| {
             !bamboo_plugin::Platform::current().is_some_and(|p| platforms.contains(&p))
@@ -620,7 +709,7 @@ async fn run_config_snapshot(
     let data = &reviewed.data;
     let source = &reviewed.source;
     let reviewed_digest = reviewed.digest;
-    let config = PortableConfig::parse(config_bytes).map_err(|e| e.to_string())?;
+    let config = parse_portable_config(event, config_bytes).await?;
     let cwd = resolve_working_directory(event, session.workspace.as_deref()).await?;
     let input = envelope_with_tool_input(
         event,
@@ -678,7 +767,12 @@ async fn run_config_snapshot(
                     // A preceding command may have changed its bundle. Recheck at
                     // every spawn boundary, not merely once at the lifecycle seam.
                     let review_check: Result<(), String> = async {
-                        let store = load_plugins(event, &reviewed.registry_path).await?;
+                        let store = load_plugins(
+                            event,
+                            &reviewed.registry_path,
+                            Some(&reviewed.receipt.plugin_id),
+                        )
+                        .await?;
                         let installed = store
                             .get_unique(&reviewed.receipt.plugin_id)
                             .map_err(|e| e.to_string())?
@@ -694,28 +788,7 @@ async fn run_config_snapshot(
                         {
                             return Err("plugin hook execution trust revoked before spawn".into());
                         }
-                        let current_manifest: PluginManifest = serde_json::from_slice(
-                            &read_plugin_file(
-                                event,
-                                &root.join("plugin.json"),
-                                USAGE_PLUGIN_METADATA_BYTES,
-                            )
-                            .await?,
-                        )
-                        .map_err(|e| e.to_string())?;
-                        let bundle = root.to_owned();
-                        let permit = if event == PortableEvent::BambooModelCallUsage {
-                            Some(usage_review_slot()?)
-                        } else {
-                            None
-                        };
-                        let current = spawn_review(permit, move || {
-                            current_manifest.validate()?;
-                            registrations(&current_manifest, &bundle)
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?;
+                        let current = review_plugin_manifest(event, root).await?;
                         if !current.iter().any(|r| r.digest == reviewed_digest) {
                             return Err(
                                 "reviewed plugin bytes changed before command execution".into()
@@ -793,6 +866,7 @@ async fn run_config_snapshot(
 mod tests {
     use super::*;
     use bamboo_plugin::{InstalledPlugin, PluginSource, RegisteredCapabilities};
+    static USAGE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn cancelled_usage_review_keeps_its_slot_until_blocking_work_finishes() {
@@ -826,8 +900,58 @@ mod tests {
         .expect("completed blocking review did not release its slot");
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_usage_manifest_read_keeps_its_real_review_slot() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
+        let temp = tempfile::tempdir().unwrap();
+        let fifo = temp.path().join("plugin.json");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+
+        let (opened, observed) = tokio::sync::oneshot::channel::<()>();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let file = std::fs::OpenOptions::new().write(true).open(fifo).unwrap();
+            let _ = opened.send(());
+            let _ = wait.recv();
+            drop(file);
+        });
+        let root = temp.path().to_owned();
+        let task = tokio::spawn(async move {
+            load_plugin_manifest(PortableEvent::BambooModelCallUsage, &root).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), observed)
+            .await
+            .expect("actual manifest read did not start")
+            .unwrap();
+        let reserved: Vec<_> = (0..3).map(|_| usage_review_slot().unwrap()).collect();
+        assert!(usage_review_slot().is_err());
+        task.abort();
+        let _ = task.await;
+        assert!(usage_review_slot().is_err());
+        drop(release);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(permit) = usage_review_slot() {
+                    drop(permit);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual manifest read did not release its slot");
+        drop(reserved);
+        writer.join().unwrap();
+    }
+
     #[tokio::test]
     async fn usage_bundle_resolution_preserves_the_existing_path_boundary() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("hooks.json");
         std::fs::write(&file, b"{}").unwrap();
@@ -851,24 +975,25 @@ mod tests {
 
     #[tokio::test]
     async fn usage_filesystem_helpers_preserve_registry_and_io_behavior() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
         let dir = tempfile::tempdir().unwrap();
         let registry = dir.path().join("installed.json");
         let event = PortableEvent::BambooModelCallUsage;
-        assert!(load_plugins(event, &registry)
+        assert!(load_plugins(event, &registry, None)
             .await
             .unwrap()
             .plugins
             .is_empty());
         std::fs::write(&registry, b" ").unwrap();
-        assert!(load_plugins(event, &registry)
+        assert!(load_plugins(event, &registry, None)
             .await
             .unwrap()
             .plugins
             .is_empty());
         std::fs::write(&registry, b"invalid json").unwrap();
-        assert!(load_plugins(event, &registry).await.is_err());
+        assert!(load_plugins(event, &registry, None).await.is_err());
         std::fs::write(&registry, br#"{"plugins":[]}"#).unwrap();
-        assert!(load_plugins(event, &registry)
+        assert!(load_plugins(event, &registry, None)
             .await
             .unwrap()
             .plugins
@@ -889,6 +1014,115 @@ mod tests {
         let data = dir.path().join("nested").join("data");
         create_plugin_data_dir(event, &data).await.unwrap();
         assert!(data.is_dir());
+    }
+
+    #[tokio::test]
+    async fn usage_registry_filters_all_duplicate_rows_before_async_iteration() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
+        let (temp, _, _) =
+            fixture(vec![json!({"type":"command","command":"true","timeout":1})]).await;
+        let path = temp.path().join("installed.json");
+        assert_eq!(
+            load_plugins(PortableEvent::BambooModelCallUsage, &path, Some("fixture"))
+                .await
+                .unwrap()
+                .plugins
+                .len(),
+            1
+        );
+        let mut store = InstalledPlugins::load(&path).await.unwrap();
+        let mut duplicate = store.plugins[0].clone();
+        duplicate.status = PluginInstallStatus::Installing;
+        for _ in 0..512 {
+            store.plugins.push(duplicate.clone());
+        }
+        store.save(&path).await.unwrap();
+        let usage = load_plugins(PortableEvent::BambooModelCallUsage, &path, None)
+            .await
+            .unwrap();
+        assert!(usage.plugins.is_empty());
+        assert!(
+            load_plugins(PortableEvent::BambooModelCallUsage, &path, Some("fixture"))
+                .await
+                .unwrap()
+                .plugins
+                .is_empty()
+        );
+        let legacy = load_plugins(PortableEvent::PreToolUse, &path, None)
+            .await
+            .unwrap();
+        assert_eq!(legacy.plugins.len(), 513);
+    }
+
+    #[tokio::test]
+    async fn usage_registry_rejects_more_than_the_reviewed_hook_limit() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
+        let (temp, _, _) =
+            fixture(vec![json!({"type":"command","command":"true","timeout":1})]).await;
+        let path = temp.path().join("installed.json");
+        let mut store = InstalledPlugins::load(&path).await.unwrap();
+        let registration = store.plugins[0].registered.hooks[0].clone();
+        store.plugins[0].registered.hooks = vec![registration; 17];
+        store.save(&path).await.unwrap();
+        assert!(
+            load_plugins(PortableEvent::BambooModelCallUsage, &path, None)
+                .await
+                .unwrap()
+                .plugins
+                .is_empty()
+        );
+        assert_eq!(
+            load_plugins(PortableEvent::PreToolUse, &path, None)
+                .await
+                .unwrap()
+                .plugins
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_manifest_load_and_review_validate_inside_the_budget() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
+        let (temp, _, _) =
+            fixture(vec![json!({"type":"command","command":"true","timeout":1})]).await;
+        let root = temp.path().join("plugin with spaces");
+        let event = PortableEvent::BambooModelCallUsage;
+        let mut manifest = load_plugin_manifest(event, &root).await.unwrap();
+        assert_eq!(manifest.id, "fixture");
+        assert_eq!(review_plugin_manifest(event, &root).await.unwrap().len(), 1);
+        manifest.id.clear();
+        std::fs::write(
+            root.join("plugin.json"),
+            serde_json::to_vec(&manifest).unwrap(),
+        )
+        .unwrap();
+        assert!(load_plugin_manifest(event, &root).await.is_err());
+        assert!(review_plugin_manifest(event, &root).await.is_err());
+        // Legacy events keep parsing before their existing separate validation.
+        assert!(load_plugin_manifest(PortableEvent::PreToolUse, &root)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn usage_config_still_validates_other_event_matchers() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
+        let valid = br#"{"hooks":{"PreToolUse":[{"matcher":"^Bash$","hooks":[{"type":"command","command":"true","timeout":1}]}]}}"#;
+        let invalid = br#"{"hooks":{"PreToolUse":[{"matcher":"(","hooks":[{"type":"command","command":"true","timeout":1}]}]}}"#;
+        assert!(
+            parse_portable_config(PortableEvent::BambooModelCallUsage, valid)
+                .await
+                .is_ok()
+        );
+        assert!(
+            parse_portable_config(PortableEvent::BambooModelCallUsage, invalid)
+                .await
+                .is_err()
+        );
+        assert!(parse_portable_config(PortableEvent::PreToolUse, invalid)
+            .await
+            .is_err());
     }
 
     #[test]
@@ -1135,6 +1369,7 @@ mod tests {
 
     #[tokio::test]
     async fn reviewed_portable_usage_extension_receives_only_the_snapshot() {
+        let _guard = USAGE_TEST_LOCK.lock().await;
         let command = json!({"type":"command", "command":"record-envelope", "timeout":1});
         let (temp, session, _) = fixture(vec![command.clone()]).await;
         let root = temp.path();
