@@ -129,7 +129,9 @@ maximum of 32 queued/running observers and a two-second deadline can drop work.
 Return values never control the model call. Up to four usage-plugin registry
 and file reads, path resolutions, bundle hash checks and data-directory
 creations may remain active after a timeout; further such work is dropped until
-a slot becomes free. Native handlers receive the existing envelope with a
+a slot becomes free. For this event, registry and manifest reads are limited to
+64 MiB and hook configuration reads to 64 KiB; exceeding a limit drops that
+portable delivery. Native handlers receive the existing envelope with a
 `payload` of type `model_call_usage`; portable handlers receive `observation`
 at top level. Both contain the same schema-1 snapshot and no workspace path in
 the event payload.

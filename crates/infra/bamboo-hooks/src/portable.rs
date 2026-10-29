@@ -6,11 +6,17 @@ use bamboo_plugin::hooks::{bundle_path, registrations, HookState, PortableConfig
 use bamboo_plugin::{InstalledPlugins, PluginInstallStatus, PluginManifest};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const PORTABLE_CONTEXT_BYTES: usize = 8192;
+// The existing bundle hashing budget is 64 MiB and PortableConfig::parse
+// accepts at most 64 KiB. Apply equivalent limits before reading for the
+// best-effort usage observer, including its installed-plugin registry.
+const USAGE_PLUGIN_METADATA_BYTES: usize = 64 * 1024 * 1024;
+const USAGE_HOOK_CONFIG_BYTES: usize = 64 * 1024;
 
 // A cancelled spawn_blocking task can continue its filesystem work. Keep its
 // permit inside the blocking closure so repeated usage-observer timeouts cannot
@@ -79,19 +85,38 @@ async fn load_plugins(event: PortableEvent, path: &Path) -> Result<InstalledPlug
     }
     let permit = usage_review_slot()?;
     let path = path.to_owned();
-    let runtime = tokio::runtime::Handle::current();
-    // Keep the slot until the registry's internally spawned filesystem work
-    // has actually completed, even if the observer future is cancelled.
     spawn_review(Some(permit), move || {
-        runtime
-            .block_on(InstalledPlugins::load(&path))
-            .map_err(|error| error.to_string())
+        if !path.try_exists().map_err(|error| error.to_string())? {
+            return Ok(InstalledPlugins::default());
+        }
+        let bytes = read_usage_file(&path, USAGE_PLUGIN_METADATA_BYTES)?;
+        let raw = std::str::from_utf8(&bytes).map_err(|error| error.to_string())?;
+        if raw.trim().is_empty() {
+            return Ok(InstalledPlugins::default());
+        }
+        serde_json::from_str(raw).map_err(|error| error.to_string())
     })
     .await
     .map_err(|error| error.to_string())?
 }
 
-async fn read_plugin_file(event: PortableEvent, path: &Path) -> Result<Vec<u8>, String> {
+fn read_usage_file(path: &Path, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > max_bytes {
+        return Err("model usage plugin metadata exceeds read limit".to_string());
+    }
+    Ok(bytes)
+}
+
+async fn read_plugin_file(
+    event: PortableEvent,
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     if event != PortableEvent::BambooModelCallUsage {
         return tokio::fs::read(path)
             .await
@@ -99,11 +124,9 @@ async fn read_plugin_file(event: PortableEvent, path: &Path) -> Result<Vec<u8>, 
     }
     let permit = usage_review_slot()?;
     let path = path.to_owned();
-    spawn_review(Some(permit), move || {
-        std::fs::read(path).map_err(|error| error.to_string())
-    })
-    .await
-    .map_err(|error| error.to_string())?
+    spawn_review(Some(permit), move || read_usage_file(&path, max_bytes))
+        .await
+        .map_err(|error| error.to_string())?
 }
 
 async fn create_plugin_data_dir(event: PortableEvent, path: &Path) -> Result<(), String> {
@@ -470,20 +493,23 @@ pub async fn run_with_inputs(
         {
             continue;
         }
-        let manifest: PluginManifest =
-            match read_plugin_file(event, &plugin.plugin_dir.join("plugin.json"))
-                .await
-                .and_then(|b| {
-                    serde_json::from_slice::<PluginManifest>(&b).map_err(|error| error.to_string())
-                }) {
-                Ok(m) if m.id == plugin.id && m.version == plugin.version => m,
-                _ => {
-                    report
-                        .errors
-                        .push(format!("{}: invalid hook manifest identity", plugin.id));
-                    continue;
-                }
-            };
+        let manifest: PluginManifest = match read_plugin_file(
+            event,
+            &plugin.plugin_dir.join("plugin.json"),
+            USAGE_PLUGIN_METADATA_BYTES,
+        )
+        .await
+        .and_then(|b| {
+            serde_json::from_slice::<PluginManifest>(&b).map_err(|error| error.to_string())
+        }) {
+            Ok(m) if m.id == plugin.id && m.version == plugin.version => m,
+            _ => {
+                report
+                    .errors
+                    .push(format!("{}: invalid hook manifest identity", plugin.id));
+                continue;
+            }
+        };
         if plugin.registered.hooks.is_empty() {
             continue;
         }
@@ -567,7 +593,7 @@ async fn run_config(
     final_assistant_content: Option<&str>,
 ) -> Result<PortableReport, String> {
     let path = resolve_bundle_path(event, reviewed.root, reviewed.config).await?;
-    let config_bytes = read_plugin_file(event, &path).await?;
+    let config_bytes = read_plugin_file(event, &path, USAGE_HOOK_CONFIG_BYTES).await?;
     run_config_snapshot(
         event,
         payload,
@@ -669,7 +695,12 @@ async fn run_config_snapshot(
                             return Err("plugin hook execution trust revoked before spawn".into());
                         }
                         let current_manifest: PluginManifest = serde_json::from_slice(
-                            &read_plugin_file(event, &root.join("plugin.json")).await?,
+                            &read_plugin_file(
+                                event,
+                                &root.join("plugin.json"),
+                                USAGE_PLUGIN_METADATA_BYTES,
+                            )
+                            .await?,
                         )
                         .map_err(|e| e.to_string())?;
                         let bundle = root.to_owned();
@@ -696,7 +727,8 @@ async fn run_config_snapshot(
                         // but commands captured from its candidate are not trusted.
                         let current_path =
                             resolve_bundle_path(event, root, reviewed.config).await?;
-                        let current_bytes = read_plugin_file(event, &current_path).await?;
+                        let current_bytes =
+                            read_plugin_file(event, &current_path, USAGE_HOOK_CONFIG_BYTES).await?;
                         if current_bytes != config_bytes {
                             return Err(
                                 "hook configuration changed before command execution".into()
@@ -842,9 +874,18 @@ mod tests {
             .plugins
             .is_empty());
         assert_eq!(
-            read_plugin_file(event, &registry).await.unwrap(),
+            read_plugin_file(event, &registry, USAGE_PLUGIN_METADATA_BYTES)
+                .await
+                .unwrap(),
             br#"{"plugins":[]}"#
         );
+        assert!(read_usage_file(&registry, 4).is_err());
+        assert!(read_plugin_file(event, &registry, 4).await.is_err());
+        let config = dir.path().join("hooks.json");
+        std::fs::write(&config, vec![b' '; USAGE_HOOK_CONFIG_BYTES + 1]).unwrap();
+        assert!(read_plugin_file(event, &config, USAGE_HOOK_CONFIG_BYTES)
+            .await
+            .is_err());
         let data = dir.path().join("nested").join("data");
         create_plugin_data_dir(event, &data).await.unwrap();
         assert!(data.is_dir());
