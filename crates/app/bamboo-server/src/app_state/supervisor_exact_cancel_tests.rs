@@ -4,7 +4,7 @@
 use super::*;
 use std::sync::atomic::Ordering;
 
-use bamboo_domain::SupervisorCurrentUserTarget;
+use bamboo_domain::{Storage, SupervisorCurrentUserTarget};
 use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
 async fn current_target(fixture: &Fixture) -> SupervisorCurrentUserTarget {
