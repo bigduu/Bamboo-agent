@@ -361,6 +361,54 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
                     ));
                 }
             }
+            if session_model_ref.is_none() {
+                // A saved target remains authoritative for this resumed run,
+                // even when the legacy model-ref feature is disabled. Re-admit
+                // it before appending the new prompt; never borrow a new default.
+                let mut inherited = existing.model_ref.clone().or_else(|| {
+                    bamboo_engine::session_app::provider_model::session_effective_model_ref(
+                        &existing,
+                    )
+                });
+                if inherited.is_none() {
+                    if let Some(provider) = existing.provider_name() {
+                        let provider =
+                            bamboo_engine::model_config_helper::resolve_provider_routing_key(
+                                &config_snapshot,
+                                &provider,
+                                &state.provider_registry,
+                            )
+                            .map_err(|error| {
+                                format!("resolve headless inherited provider: {error}")
+                            })?;
+                        let model =
+                            bamboo_engine::model_config_helper::get_default_model_for_provider(
+                                &config_snapshot,
+                                &provider,
+                            )
+                            .map_err(|error| {
+                                format!("resolve headless inherited model: {error}")
+                            })?;
+                        inherited = Some(bamboo_domain::ProviderModelRef::new(provider, model));
+                    }
+                }
+                if let Some(mut target) = inherited {
+                    target.provider =
+                        bamboo_engine::model_config_helper::resolve_provider_routing_key(
+                            &config_snapshot,
+                            &target.provider,
+                            &state.provider_registry,
+                        )
+                        .map_err(|error| format!("resolve headless inherited provider: {error}"))?;
+                    bamboo_engine::model_config_helper::try_resolve_exact_model(
+                        &config_snapshot,
+                        &state.provider_registry,
+                        &target,
+                    )
+                    .map_err(|error| format!("admit headless inherited model: {error}"))?;
+                    session_model_ref = Some(target);
+                }
+            }
             id.clone()
         }
         None => {
@@ -508,8 +556,13 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
         session_id.clone(),
         web::Json(ExecuteRequest {
             model: model_selection.model.clone(),
-            provider: model_selection.provider.clone(),
-            model_ref: model_selection.model_ref.clone(),
+            provider: session_model_ref
+                .as_ref()
+                .map(|target| target.provider.clone())
+                .or_else(|| model_selection.provider.clone()),
+            model_ref: session_model_ref
+                .clone()
+                .or_else(|| model_selection.model_ref.clone()),
             skill_mode: args.skill_mode.clone(),
             reasoning_effort,
             client_sync: None,
@@ -659,8 +712,13 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
                 response,
                 expected_tool_call_id: Some(pending.tool_call_id.clone()),
                 model: model_selection.model.clone(),
-                provider: model_selection.provider.clone(),
-                model_ref: model_selection.model_ref.clone(),
+                provider: session_model_ref
+                    .as_ref()
+                    .map(|target| target.provider.clone())
+                    .or_else(|| model_selection.provider.clone()),
+                model_ref: session_model_ref
+                    .clone()
+                    .or_else(|| model_selection.model_ref.clone()),
                 reasoning_effort,
             }),
         )
