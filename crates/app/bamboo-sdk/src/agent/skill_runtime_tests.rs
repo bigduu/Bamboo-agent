@@ -2544,4 +2544,57 @@ async fn sdk_reasoning_legacy_scope_does_not_take_new_instance_alias() {
     }
     sdk_expect_reasoning_for_provider(&agent, &capture, "hybrid-instance-default", "openai", None)
         .await;
+    {
+        let mut config = live.write().await;
+        config.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(json!({
+                "provider_type": "openai", "enabled": true, "model": "main-a",
+                "runtime_models": ["main-a"]
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("openai".into());
+    }
+    sdk_expect_reasoning_for_provider(&agent, &capture, "same-id-new-instance", "openai", None)
+        .await;
+}
+
+#[tokio::test]
+async fn sdk_reasoning_instance_scope_does_not_take_same_id_legacy_role() {
+    use bamboo_domain::ReasoningEffort::{Low, Max};
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let mut config = sdk_reasoning_config();
+    config.provider = "openai".into();
+    config.provider_instances.clear();
+    config.provider_instances.insert(
+        "openai".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai", "enabled": true, "model": "main-a",
+            "runtime_models": ["main-a"]
+        }))
+        .unwrap(),
+    );
+    config.default_provider_instance = Some("openai".into());
+    config.defaults.as_mut().unwrap().chat.provider = "openai".into();
+    let live = Arc::new(tokio::sync::RwLock::new(config));
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .model("main-a")
+        .config(live.clone())
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    sdk_expect_reasoning_for_provider(&agent, &capture, "instance-only", "openai", Some(Low)).await;
+    {
+        let mut config = live.write().await;
+        config.provider_instances.remove("openai");
+        config.default_provider_instance = None;
+        config.defaults.as_mut().unwrap().chat.reasoning_effort = Some(Max);
+    }
+    sdk_expect_reasoning_for_provider(&agent, &capture, "same-id-new-legacy", "openai", None).await;
 }
