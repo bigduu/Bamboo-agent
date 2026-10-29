@@ -653,6 +653,9 @@ async fn default_supervisor_cancel_observes_root_but_requires_operation_approval
     };
     let payload: Value = serde_json::from_str(&approval.result).unwrap();
     assert_eq!(payload["status"], "awaiting_permission_approval");
+    let question = payload["question"].as_str().unwrap();
+    assert!(question.contains("request cancellation of the selected Session run"));
+    assert!(!question.contains("shell"));
     let event = tokio::time::timeout(Duration::from_secs(5), received.recv())
         .await
         .expect("the approval event must be delivered");
