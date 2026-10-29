@@ -692,4 +692,36 @@ mod tests {
             .unwrap()
             .contains("private-scope"));
     }
+
+    #[tokio::test]
+    async fn nested_agent_without_its_own_scope_cannot_inherit_parent_authority() {
+        let trace = LocalTraceTest::isolated();
+        let birth = Utc::now();
+        let path = Path::new("/parent-authority");
+        trace
+            .scope(async {
+                let outer = Observation::agent("same-session", "same-session")
+                    .bind_session_lifetime("same-session", birth)
+                    .bind_local_scope(path);
+                outer
+                    .scope(async {
+                        Observation::agent("same-session", "same-session")
+                            .bind_session_lifetime("same-session", birth)
+                            .finish(Outcome::Success);
+                    })
+                    .await;
+                outer.finish(Outcome::Success);
+            })
+            .await;
+        let scoped =
+            trace
+                .store
+                .page_scoped(Some(&scope_for_path(path)), "same-session", birth, 10, None);
+        assert_eq!(scoped.traces.len(), 1);
+        assert_eq!(scoped.traces[0].span_count, 1);
+        let unscoped = trace.store.page("same-session", birth, 10, None);
+        assert_eq!(unscoped.traces.len(), 1);
+        assert_eq!(unscoped.traces[0].span_count, 1);
+        assert!(unscoped.traces[0].partial);
+    }
 }

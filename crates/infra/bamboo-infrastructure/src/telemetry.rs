@@ -116,7 +116,13 @@ impl Observation {
                 attribute.key.as_str() == "gen_ai.conversation.id"
                     && attribute.value == opentelemetry::Value::from(lifetime.session_id.clone())
             });
-            if same_session {
+            let is_new_agent = attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "gen_ai.operation.name"
+                    && attribute.value == opentelemetry::Value::from("invoke_agent")
+            });
+            // An invocation must bind its own data authority and birth; an
+            // ambient same-id parent does not establish either one.
+            if same_session && !is_new_agent {
                 attributes.push(KeyValue::new(
                     "bamboo.session.birth",
                     lifetime.birth.clone(),
