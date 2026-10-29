@@ -7963,6 +7963,88 @@ async fn compact_owned_inspection_correction_and_control_keep_one_logical_child(
 }
 
 #[tokio::test]
+async fn compact_result_adapts_page_size_and_keeps_cursor_snapshot_checks() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut child = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let ordinary = "界".repeat(888);
+    assert_eq!(ordinary.len(), 2664);
+    child.add_message(Message::assistant(ordinary.clone(), None));
+    child.set_last_run_status("completed");
+    child.metadata_version += 1;
+    h.storage.save_session(&child).await.unwrap();
+
+    let result = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect", "target":h.child_session_id, "message":"result"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-result-single-page"),
+    )
+    .await
+    .unwrap();
+    assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+    let page: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(page["text"], ordinary);
+    assert!(page["next_cursor"].is_null());
+
+    // Control characters expand when the projected result is JSON-encoded
+    // twice. The compact read must reduce the page without losing content.
+    let escaped = "\0".repeat(4096);
+    child.add_message(Message::assistant(escaped.clone(), None));
+    child.metadata_version += 1;
+    h.storage.save_session(&child).await.unwrap();
+    let mut cursor: Option<String> = None;
+    let mut first_cursor: Option<String> = None;
+    let mut observed = String::new();
+    for _ in 0..32 {
+        let query = match &cursor {
+            Some(value) => json!({"view":"result", "cursor":value}).to_string(),
+            None => "result".to_string(),
+        };
+        let result = invoke_completed(
+            &h.tool,
+            json!({"intent":"inspect", "target":h.child_session_id, "message":query}),
+            subagent_test_ctx(&h.parent_session_id, "compact-result-escaped-page"),
+        )
+        .await
+        .unwrap();
+        assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
+        let page: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(
+            page["byte_start"].as_u64().unwrap() as usize,
+            observed.len()
+        );
+        let text = page["text"].as_str().unwrap();
+        assert!(!text.is_empty());
+        observed.push_str(text);
+        assert_eq!(page["byte_end"].as_u64().unwrap() as usize, observed.len());
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if first_cursor.is_none() {
+            first_cursor = cursor.clone();
+        }
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(observed, escaped);
+    let first_cursor = first_cursor.expect("escaped result needs more than one page");
+    child.messages.last_mut().unwrap().content.push('x');
+    child.metadata_version += 1;
+    h.storage.save_session(&child).await.unwrap();
+    let error = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect", "target":h.child_session_id,
+            "message":json!({"view":"result", "cursor":first_cursor}).to_string()}),
+        subagent_test_ctx(&h.parent_session_id, "compact-result-stale-cursor"),
+    )
+    .await;
+    assert!(error.is_err());
+}
+
+#[tokio::test]
 async fn compact_tree_bounds_owned_observations_without_physical_identity() {
     let h = build_test_harness_with_storage(None, None, true).await;
     for n in 0..35 {

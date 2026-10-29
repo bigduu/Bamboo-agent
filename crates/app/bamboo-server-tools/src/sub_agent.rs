@@ -925,6 +925,30 @@ impl Tool for SubAgentTool {
             test_diagnostics::record(&diagnostic, &result);
             return facade::finish(projection, result);
         }
+        if projection == Some(Projection::Content) {
+            // Retry only this read with a smaller slice when JSON escaping makes
+            // the projected result exceed the wire budget. Each attempt repeats
+            // the normal authorization and cursor/snapshot checks; no effects
+            // or caller-supplied cursor are changed.
+            let mut page_args = args;
+            loop {
+                let result = self
+                    .invoke_inner(page_args.clone(), ctx.clone(), None, true)
+                    .await;
+                #[cfg(feature = "test-utils")]
+                test_diagnostics::record(&diagnostic, &result);
+                let projected = facade::finish(projection, result);
+                let current = page_args["max_bytes"].as_u64().unwrap_or(4);
+                match projected {
+                    Err(ToolError::InvalidArguments(ref message))
+                        if message == facade::OBSERVATION_LIMIT_ERROR && current > 4 =>
+                    {
+                        page_args["max_bytes"] = json!((current / 2).max(4));
+                    }
+                    other => return other,
+                }
+            }
+        }
         let result = self
             .invoke_inner(args, ctx, None, projection.is_some())
             .await;
