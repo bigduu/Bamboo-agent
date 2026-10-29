@@ -370,6 +370,28 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Probe before consuming a response that needs a bound profile check.
+    fn supports_root_actor_bound_startup(&self) -> bool {
+        false
+    }
+
+    /// Conditionally commit one bound startup through the exact existing
+    /// Root writer. Comparison and publication must share the physical guard.
+    async fn save_root_actor_bound_startup(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&crate::InheritedChildWait>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, expected, inherited, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict("conditional Root bound startup is unsupported".into()),
+        ))
+    }
+
     /// Re-read and reconcile an execution's inherited child wait under the
     /// physical session lock, retain birth/fence checks, then save and publish.
     async fn save_inherited_child_wait_finalized(

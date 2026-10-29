@@ -205,6 +205,10 @@ fn build_manager_with_schedule_storage(
                 model: Some(model),
                 ..Default::default()
             },
+            model_provider: None,
+            model_gold_resolver: None,
+            model_is_injected: false,
+            model_error: None,
             reasoning_effort: None,
             gold_config: None,
             system_prompt: String::new(),

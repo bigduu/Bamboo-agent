@@ -331,6 +331,14 @@ impl Session {
             .insert(keys::REASONING_EFFORT.to_string(), value);
     }
 
+    pub fn clear_reasoning_effort_meta(&mut self) {
+        if let Some(metadata) = self.runtime_metadata.as_mut() {
+            metadata.reasoning_effort = None;
+        }
+        self.metadata.remove(keys::REASONING_EFFORT);
+        self.prune_runtime_metadata();
+    }
+
     // ------------------------------------------------------------------
     // enhance_prompt
     // ------------------------------------------------------------------

@@ -453,7 +453,7 @@ fn try_resolve_role_ref_chain_with_origin<'a>(
         || model_ref.model.trim() != model_ref.model
     {
         return Err(LLMError::Api(
-            "Configured auxiliary provider/model reference is invalid".into(),
+            "Configured provider/model reference is invalid".into(),
         ));
     }
     if let Some(instance) = config.provider_instances.get(&model_ref.provider) {
@@ -481,13 +481,58 @@ fn try_resolve_role_ref_chain_with_origin<'a>(
     )))
 }
 
-pub(crate) fn try_resolve_exact_model(
+pub fn try_resolve_exact_model(
     config: &Config,
     registry: &Arc<ProviderRegistry>,
     target: &bamboo_domain::ProviderModelRef,
 ) -> Result<ResolvedModel, LLMError> {
     try_resolve_role_ref_chain(config, registry, [Some(target)])?
         .ok_or_else(|| LLMError::Api("Configured model target is required".into()))
+}
+
+/// A primary route retains the canonical account, its unwrapped provider and
+/// the managed proof captured for that same provider generation.
+pub struct ResolvedPrimaryModel {
+    pub target: bamboo_domain::ProviderModelRef,
+    pub provider: Arc<dyn bamboo_llm::LLMProvider>,
+    pub managed_origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+}
+
+pub fn try_resolve_primary_model(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    requested: &bamboo_domain::ProviderModelRef,
+) -> Result<ResolvedPrimaryModel, LLMError> {
+    if requested.provider.trim().is_empty()
+        || requested.model.trim().is_empty()
+        || requested.provider.trim() != requested.provider
+        || requested.model.trim() != requested.model
+    {
+        return Err(LLMError::Api(
+            "Configured provider/model reference is invalid".into(),
+        ));
+    }
+    let mut target = requested.clone();
+    target.provider = resolve_provider_routing_key(config, &target.provider, registry)?;
+    // Primary reasoning is carried by the run request; using a role wrapper
+    // here would hide the selected registry Arc from managed Gold admission.
+    let mut raw_target = target.clone();
+    raw_target.reasoning_effort = None;
+    let (admitted, was_managed) =
+        try_resolve_role_ref_chain_with_origin(config, registry, [Some(&raw_target)])?
+            .ok_or_else(|| LLMError::Api("Configured model target is required".into()))?;
+    let (provider, managed_origin) =
+        registry.provider_for_configured_model_with_managed_origin(config, &raw_target)?;
+    if !Arc::ptr_eq(&admitted.provider, &provider) || (was_managed && managed_origin.is_none()) {
+        return Err(LLMError::Api(
+            "Provider route changed during model admission; retry".into(),
+        ));
+    }
+    Ok(ResolvedPrimaryModel {
+        target,
+        provider,
+        managed_origin,
+    })
 }
 
 fn try_resolve_legacy_role(
@@ -1193,6 +1238,46 @@ mod tests {
             }
             state.assert_no_requests();
         }
+    }
+
+    #[test]
+    fn primary_route_canonicalizes_alias_and_keeps_raw_provider_and_effort() {
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "work-openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "model":"chat-model",
+                "runtime_models":["chat-model"]
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work-openai".into());
+        let registry = registry_with_provider_ids(&["work-openai"], "work-openai");
+        let target = bamboo_domain::ProviderModelRef::new("openai", "chat-model")
+            .with_reasoning_effort(ReasoningEffort::High);
+        let selected = try_resolve_primary_model(&config, &registry, &target).unwrap();
+        assert_eq!(selected.target.provider, "work-openai");
+        assert_eq!(
+            selected.target.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert!(Arc::ptr_eq(
+            &selected.provider,
+            &registry.get("work-openai").unwrap()
+        ));
+        assert!(selected.managed_origin.is_none());
+
+        config.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":false, "model":"chat-model"
+            }))
+            .unwrap(),
+        );
+        let error = try_resolve_primary_model(&config, &registry, &target)
+            .err()
+            .expect("a disabled exact ID must not route to an alias");
+        assert!(error.to_string().contains("disabled"));
     }
 
     #[test]

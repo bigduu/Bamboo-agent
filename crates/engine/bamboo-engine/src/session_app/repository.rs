@@ -28,6 +28,21 @@ pub trait SessionAccess: Send + Sync {
         Ok(None)
     }
 
+    /// Bind a response writer while retaining the successor's captured wait.
+    /// Implementations that cannot retain this provenance must fail closed.
+    fn bind_response_writer_with_inherited(
+        &self,
+        owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+        inherited: Option<bamboo_domain::InheritedChildWait>,
+    ) -> Result<Option<std::sync::Arc<dyn SessionAccess>>, SessionSaveError> {
+        if inherited.is_some() {
+            return Err(SessionSaveError::StorageError(
+                "inherited response writer is unsupported".into(),
+            ));
+        }
+        self.bind_response_writer(owner)
+    }
+
     /// Load a session by ID (from cache or storage).
     async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionLoadError>;
 
@@ -99,6 +114,23 @@ impl SessionAccess for SessionRepository {
                     .map_err(|error| SessionSaveError::StorageError(error.to_string()))
             })
             .transpose()
+    }
+
+    fn bind_response_writer_with_inherited(
+        &self,
+        owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+        inherited: Option<bamboo_domain::InheritedChildWait>,
+    ) -> Result<Option<std::sync::Arc<dyn SessionAccess>>, SessionSaveError> {
+        match owner {
+            Some(owner) => self
+                .bind_root_response_writer_with_inherited(owner, inherited)
+                .map(|bound| Some(std::sync::Arc::new(bound) as std::sync::Arc<dyn SessionAccess>))
+                .map_err(|error| SessionSaveError::StorageError(error.to_string())),
+            None if inherited.is_some() => Err(SessionSaveError::StorageError(
+                "inherited response writer requires its Root owner".into(),
+            )),
+            None => Ok(None),
+        }
     }
 
     async fn load_session(&self, id: &str) -> Result<Option<Session>, SessionLoadError> {

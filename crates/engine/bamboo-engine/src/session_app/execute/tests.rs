@@ -690,3 +690,36 @@ fn billable_user_turn_count_skips_runtime_messages() {
 
     assert_eq!(billable_user_turn_count(&session), 2);
 }
+
+#[test]
+fn scheduled_binding_survives_disabled_primary_rollout_and_rejects_corruption() {
+    let mut session = make_session("shared-model");
+    session
+        .metadata
+        .insert("created_by_schedule_id".into(), "schedule".into());
+    session.model_ref = Some(ProviderModelRef::new("account-b", "shared-model"));
+    session.set_provider_name("account-b");
+    let mut config = make_config();
+    config.provider_name = "account-a".into();
+    let input = make_input();
+    for enabled in [false, true] {
+        config.provider_model_ref_enabled = enabled;
+        let (target, model, source) = resolve_execution_model(&session, &input, &config).unwrap();
+        assert_eq!(target, session.model_ref);
+        assert_eq!(model.as_deref(), Some("shared-model"));
+        assert_eq!(source, "session");
+    }
+    session.model = "different-model".into();
+    assert!(matches!(
+        resolve_execution_model(&session, &input, &config),
+        Err(ExecutePreparationError::InvalidModelReference(_))
+    ));
+    // A model-only PATCH clears the structured ref but retains provider B.
+    session.model_ref = None;
+    let (target, model, _) = resolve_execution_model(&session, &input, &config).unwrap();
+    assert_eq!(
+        target,
+        Some(ProviderModelRef::new("account-b", "different-model"))
+    );
+    assert_eq!(model.as_deref(), Some("different-model"));
+}

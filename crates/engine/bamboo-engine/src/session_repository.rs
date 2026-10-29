@@ -200,6 +200,19 @@ impl SessionRepository {
         Ok(bound)
     }
 
+    /// Preserve the exact inherited wait carried by the reserved successor.
+    pub(crate) fn bind_root_response_writer_with_inherited(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        inherited: Option<bamboo_domain::InheritedChildWait>,
+    ) -> std::io::Result<Self> {
+        let mut bound = self.bind_root_response_writer(owner)?;
+        if let Some(inherited) = inherited {
+            bound.persistence = Arc::new(bound.persistence.bind_inherited_child_wait(inherited));
+        }
+        Ok(bound)
+    }
+
     /// Enable durable ordinary Root execution ownership in a Host whose
     /// storage implements the named final writer boundary.
     pub fn with_root_actor_directory(
@@ -639,6 +652,27 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .merge_save_runtime_and_publish(session, |saved, _| {
                 #[cfg(test)]
                 self.run_post_durable_hook("save_runtime_session", &saved.id);
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
+    fn supports_bound_startup_session(&self) -> bool {
+        bamboo_domain::RuntimeSessionPersistence::supports_bound_startup_session(
+            self.persistence.as_ref(),
+        )
+    }
+
+    async fn save_bound_startup_session(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_bound_startup_and_publish(session, expected, |saved, _| {
                 self.cache.insert(
                     saved.id.clone(),
                     Arc::new(crate::SessionSnapshot::new(saved.clone())),
