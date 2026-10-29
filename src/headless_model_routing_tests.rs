@@ -170,7 +170,7 @@ async fn entrypoint_routing_headless_resume_keeps_original_account_when_default_
             |(_, outcome, old_calls, new_calls, provider)| outcome.is_ok()
                 && old_calls
                     .iter()
-                    .any(|(model, purpose, _)| model == "main-a" && purpose != "gold_evaluation")
+                    .any(|(model, purpose, _)| model == "main-a" && purpose == "agent_loop")
                 && new_calls.is_empty()
                 && provider.as_deref() == Some("chat-a")
         ),
