@@ -666,3 +666,215 @@ async fn entrypoint_routing_sdk_native_client_rejects_replacement_invalid_chat_b
         "{observations:?}"
     );
 }
+
+async fn sdk_request_with_retry_mode(
+    agent: &bamboo_sdk::Agent,
+    session: &mut Session,
+    request: bamboo_engine::ExecuteRequest,
+    retry_entry: bool,
+) -> Result<(), bamboo_agent_core::AgentError> {
+    if retry_entry {
+        agent
+            .execute_with_upstream_retry(
+                session,
+                request,
+                bamboo_sdk::agent::UpstreamRetry::Bounded,
+            )
+            .await
+    } else {
+        agent.execute(session, request).await
+    }
+}
+
+fn add_synthetic_chat_b(config: &mut Config) {
+    config.provider_instances.insert(
+        "chat-b".into(),
+        serde_json::from_value(serde_json::json!({
+            "provider_type":"openai","enabled":true,
+            "model":"main-b","runtime_models":["main-b","cheap"]
+        }))
+        .unwrap(),
+    );
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_rejects_unpaired_account_for_both_execute_entries() {
+    for retry_entry in [false, true] {
+        for override_without_name in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut c = config(true, "chat-a");
+            add_synthetic_chat_b(&mut c);
+            let main = Arc::new(Capture::default());
+            let other = Arc::new(Capture::default());
+            let agent = agent(c, main.clone(), dir.path()).await;
+            let mut session = Session::new("synthetic-unpaired-client", "main-b");
+            session.add_message(Message::user("Synthetic account identity witness"));
+            let before = serde_json::to_value(&session).unwrap();
+            let (tx, mut rx) = mpsc::channel(256);
+            let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+            let mut builder = ExecuteRequestBuilder::new(
+                "Synthetic account identity witness",
+                tx,
+                CancellationToken::new(),
+            )
+            .model("main-b");
+            builder = if override_without_name {
+                builder.provider_override(other.clone())
+            } else {
+                builder.provider_name("chat-b")
+            };
+            let result =
+                sdk_request_with_retry_mode(&agent, &mut session, builder.build(), retry_entry)
+                    .await;
+            drain.abort();
+            assert!(result.is_err(), "unpaired target was accepted: retry={retry_entry}, override_only={override_without_name}");
+            assert!(main.calls.lock().unwrap().is_empty());
+            assert!(other.calls.lock().unwrap().is_empty());
+            assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        }
+    }
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_accepts_explicit_matching_override_for_both_execute_entries() {
+    for retry_entry in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config(true, "chat-a");
+        add_synthetic_chat_b(&mut c);
+        let main = Arc::new(Capture::default());
+        let other = Arc::new(Capture::default());
+        let agent = agent(c, main.clone(), dir.path()).await;
+        let mut session = Session::new("synthetic-paired-client", "main-b");
+        session.add_message(Message::user("Synthetic explicit paired override"));
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request = ExecuteRequestBuilder::new(
+            "Synthetic explicit paired override",
+            tx,
+            CancellationToken::new(),
+        )
+        .model("main-b")
+        .provider_name("chat-b")
+        .provider_override(other.clone())
+        .build();
+        sdk_request_with_retry_mode(&agent, &mut session, request, retry_entry)
+            .await
+            .unwrap();
+        drain.abort();
+        assert!(main.calls.lock().unwrap().is_empty());
+        let calls = other.calls.lock().unwrap().clone();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|(model, _, _)| model == "main-b"),
+            "{calls:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_same_account_alias_preserves_gold_on_both_execute_entries() {
+    for retry_entry in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut c = config(true, "chat-a");
+        add_synthetic_chat_b(&mut c);
+        let main = Arc::new(Capture::default());
+        let agent = agent(c, main.clone(), dir.path()).await;
+        let mut session = Session::new("synthetic-provider-alias", "main-a");
+        session.add_message(Message::user("Synthetic same-account alias"));
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let mut request = ExecuteRequestBuilder::new(
+            "Synthetic same-account alias",
+            tx,
+            CancellationToken::new(),
+        )
+        .model("main-a")
+        .provider_name("openai")
+        .build();
+        request.gold_config = Some(GoldConfig {
+            enabled: true,
+            auto_continue_enabled: true,
+            goal: Some("Synthetic goal".into()),
+            ..Default::default()
+        });
+        request.app_data_dir = Some(dir.path().to_path_buf());
+        sdk_request_with_retry_mode(&agent, &mut session, request, retry_entry)
+            .await
+            .unwrap();
+        drain.abort();
+        let calls = main.calls.lock().unwrap().clone();
+        assert!(
+            calls
+                .iter()
+                .any(|(model, purpose, _)| model == "cheap" && purpose == "gold_evaluation"),
+            "{calls:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_session_ref_cannot_switch_the_bound_client() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config(true, "chat-a");
+    add_synthetic_chat_b(&mut c);
+    let main = Arc::new(Capture::default());
+    let agent = bamboo_sdk::Agent::builder()
+        .provider(main.clone())
+        .config(Arc::new(RwLock::new(c)))
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(dir.path().to_path_buf())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut session = Session::new("synthetic-session-account", "main-b");
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new("chat-b", "main-b"));
+    session.add_message(Message::user("Synthetic saved target"));
+    let before = serde_json::to_value(&session).unwrap();
+    assert!(agent.run_session(&mut session).await.is_err());
+    assert!(main.calls.lock().unwrap().is_empty());
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_locked_replacement_config_fails_closed() {
+    let server = vision_server(200).await;
+    let dir = tempfile::tempdir().unwrap();
+    let mut c = config(true, "chat-a");
+    let mut value = serde_json::to_value(c.provider_instances.get("chat-a").unwrap()).unwrap();
+    value["api_key"] = "synthetic-no-real-key".into();
+    value["base_url"] = server.uri().into();
+    c.provider_instances
+        .insert("chat-a".into(), serde_json::from_value(value).unwrap());
+    let mut persisted = serde_json::to_value(&c).unwrap();
+    persisted["provider_instances"]["chat-a"]["api_key"] = "synthetic-no-real-key".into();
+    std::fs::write(
+        dir.path().join("config.json"),
+        serde_json::to_vec(&persisted).unwrap(),
+    )
+    .unwrap();
+    let shared = Arc::new(RwLock::new(c));
+    let builder = bamboo_sdk::Agent::builder()
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(dir.path().to_path_buf())
+        .await
+        .unwrap();
+    let lock = shared.write().await;
+    let locked_result = builder.config(shared.clone()).build();
+    assert!(
+        locked_result.is_err(),
+        "locked replacement config bypassed admission"
+    );
+    drop(lock);
+    let unlocked_result = bamboo_sdk::Agent::builder()
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(dir.path().to_path_buf())
+        .await
+        .unwrap()
+        .config(shared)
+        .build();
+    assert!(
+        unlocked_result.is_ok(),
+        "unlocked matching config should remain usable"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
