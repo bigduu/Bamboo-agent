@@ -84,7 +84,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Gemini replacement and budget cases remain in the default bamboo-llm and
 // bamboo-engine owners (packages-2 and packages-3); Responses cases remain in
 // the default server-handlers owner. No additive feature cases changed.
-const FEATURE_SOURCE_SHA256 = "af92f34f9284402df3d34d308127b42d74e406f417d20b809869f3f42a69a327";
+// The root package includes the optional OTLP transport by default.
+const FEATURE_SOURCE_SHA256 = "248437c0c12df5bc318bf7775b59bfaec7468a3c8d93c359ed646dabd9820932";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

@@ -9,20 +9,31 @@ metrics or logs, install a `tracing` subscriber bridge, or change permissions.
 
 ## Enable a local collector
 
-Build with the optional transport feature, then explicitly select a collector:
+The standard Bamboo executable includes the OTLP/HTTP trace transport. Export
+remains disabled until both `BAMBOO_OTEL_ENABLED` and a collector endpoint are
+configured. For an API-only source build and a local collector:
 
 ```sh
-BAMBOO_FRONTEND_BUILD_MODE=api-only cargo build --locked --features otel-otlp --bin bamboo
+BAMBOO_FRONTEND_BUILD_MODE=api-only cargo build --locked --bin bamboo
 BAMBOO_OTEL_ENABLED=true \
 BAMBOO_OTEL_ENDPOINT=http://127.0.0.1:4318/v1/traces \
 BAMBOO_OTEL_SAMPLE_RATIO=1 \
   target/debug/bamboo serve
 ```
 
+The root `bamboo-agent` package also includes this transport in its default
+feature set, including source builds and library consumers. To omit it when
+building the root package, use `--no-default-features`. A previously configured
+enable flag and endpoint will begin exporting after upgrading from a build that
+did not include the transport.
+
 The API-only example has no bundled browser UI. Use the normal locked frontend
 staging procedure for a UI build. An OTLP/HTTP protobuf receiver must already be
 running at the chosen endpoint; Bamboo does not install or launch a collector.
 No tests call a paid model or an external telemetry service.
+
+This transport exports traces. Token usage is attached to spans; Bamboo does not
+currently initialize an OpenTelemetry metrics exporter.
 
 - `BAMBOO_OTEL_ENABLED`: `true`/`1` enables; absent, `false` or `0` disables.
 - `BAMBOO_OTEL_ENDPOINT`: complete trace URL ending in `/v1/traces`, optionally
@@ -84,7 +95,10 @@ original ID. The provider family is restricted to OpenAI, Anthropic,
 Gemini/Google and Copilot;
 free-form provider instance names are omitted. These are correlation fields,
 not a place to put sensitive data. Even syntactically valid IDs/model/tool names
-must not contain secrets. IDs are high-cardinality trace metadata, not metric
+must not contain secrets. This shape check cannot recognize a secret embedded in
+an otherwise valid identifier; for example, a tool-call ID may come from the
+provider. Treat the collector and its trace storage accordingly. IDs are
+high-cardinality trace metadata, not metric
 labels. Resource attributes are limited to `service.name=bamboo` and the build's
 `service.version`; there are no host, process, environment or filesystem
 resource detectors.
