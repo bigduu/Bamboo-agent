@@ -101,6 +101,34 @@ impl NativeWorkTokenBudget {
                 models
             }));
         }
+        if let Some(resolve) = loop_config.background_model_resolver.take() {
+            let budget = budget.clone();
+            let limits = limits.clone();
+            loop_config.background_model_resolver = Some(Arc::new(move |provider_name| {
+                resolve(provider_name).map(|mut model| {
+                    model.provider = budget.wrap(model.provider, &limits);
+                    model
+                })
+            }));
+        }
+        if let Some(resolve) = loop_config.resume_auxiliary_resolver.take() {
+            let budget = budget.clone();
+            let limits = limits.clone();
+            loop_config.resume_auxiliary_resolver = Some(Arc::new(move || {
+                let (summary, background) = resolve();
+                let summary = summary.map(|target| {
+                    target.map(|mut model| {
+                        model.provider = budget.wrap(model.provider, &limits);
+                        model
+                    })
+                });
+                let background = background.map(|mut model| {
+                    model.provider = budget.wrap(model.provider, &limits);
+                    model
+                });
+                (summary, background)
+            }));
+        }
         if let Some(resolve) = loop_config.vision_model_resolver.take() {
             let budget = budget.clone();
             let limits = limits.clone();
@@ -466,6 +494,32 @@ impl Usage {
 
 #[async_trait::async_trait]
 impl LLMProvider for BudgetedProvider {
+    fn local_dispatch_refused(&self) -> bool {
+        self.inner.local_dispatch_refused()
+    }
+
+    fn queue_requires_current_route(&self) -> bool {
+        self.inner.queue_requires_current_route()
+    }
+    fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
+        bamboo_llm::provider::queued_identity_for(&self.inner)
+    }
+    fn queued_provider_snapshot(
+        &self,
+    ) -> bamboo_llm::provider::Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(inner) = self.inner.queued_provider_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            inner,
+            budget: self.budget.clone(),
+            limits: self.limits.clone(),
+        })))
+    }
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+
     fn resource_allocation_identity(&self) -> Option<usize> {
         Some(
             self.inner

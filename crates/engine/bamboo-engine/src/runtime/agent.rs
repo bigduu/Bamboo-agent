@@ -96,6 +96,39 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Bind a live background route to this execution without changing other roles.
+    #[doc(hidden)]
+    pub fn with_background_model_resolver(
+        &self,
+        resolver: crate::runtime::config::BackgroundModelResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.background_model_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind a resumed Connect run's live summary/background selection.
+    #[doc(hidden)]
+    pub fn with_resume_auxiliary_resolver(
+        &self,
+        resolver: crate::runtime::config::ResumeAuxiliaryResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.resume_auxiliary_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind the Host's Gold route to this execution without changing SDK defaults.
+    #[doc(hidden)]
+    pub fn with_gold_target_resolver(
+        &self,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Install the registered SDK adapter on this execution's runtime only.
     #[doc(hidden)]
     pub fn with_sdk_skill_execution_host(

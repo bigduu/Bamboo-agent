@@ -203,6 +203,7 @@ mod execution_input_http {
     use std::sync::Arc;
 
     include!("live_retry_vertical_fixture.rs");
+    include!("gold_host_admission_fixture.rs");
 
     struct RetryHttpProvider {
         url: String,
