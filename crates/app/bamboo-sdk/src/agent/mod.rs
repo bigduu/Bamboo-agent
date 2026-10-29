@@ -162,6 +162,8 @@ pub struct Agent {
     session_model: Option<String>,
     /// Account identity of the assembled client, independent of live defaults.
     provider_scope: Option<String>,
+    /// Whether the bound client originated from an explicit provider instance.
+    provider_scope_is_instance: Option<bool>,
     /// Live metadata used to resolve aliases against the assembled client identity.
     routing_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
     /// Default first-class Project membership for newly-created/unassigned sessions.
@@ -313,6 +315,7 @@ impl Agent {
             model: None,
             session_model: None,
             provider_scope: None,
+            provider_scope_is_instance: None,
             routing_config: None,
             project_id: None,
             session_store: None,
@@ -340,6 +343,7 @@ impl Agent {
             model,
             session_model,
             provider_scope: None,
+            provider_scope_is_instance: None,
             routing_config: None,
             project_id,
             session_store,
@@ -1244,6 +1248,13 @@ impl Agent {
                     return None;
                 }
                 let scope = execution.provider_scope.as_deref()?;
+                // An explicit instance and a legacy client can have the same
+                // key but still represent different accounts.
+                if execution.provider_scope_is_instance
+                    != Some(config.provider_instances.contains_key(scope))
+                {
+                    return None;
+                }
                 // A legacy type key can name the old client or an instance
                 // selected by newer config. Without a registry binding, do not
                 // treat the two as the same account after the default moved.

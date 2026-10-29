@@ -155,6 +155,9 @@ pub struct AgentBuilder {
     /// `provider`. `None` keeps the configured default.
     provider_name: Option<String>,
     assembled_provider_scope: Option<String>,
+    // Remember which source produced the native client, even if later config
+    // introduces or removes an explicit instance with the same identifier.
+    assembled_provider_is_instance: Option<bool>,
     /// API key applied to the active provider's config before provider creation.
     api_key: Option<String>,
     /// MCP servers to connect and merge into the tool surface in
@@ -217,6 +220,7 @@ impl AgentBuilder {
             project_id: None,
             provider_name: None,
             assembled_provider_scope: None,
+            assembled_provider_is_instance: None,
             api_key: None,
             mcp_servers: Vec::new(),
             permission_checker: None,
@@ -629,6 +633,11 @@ impl AgentBuilder {
         }
         let provider_scope = provider_config.effective_default_provider().to_string();
         self.assembled_provider_scope = Some(provider_scope.clone());
+        self.assembled_provider_is_instance = Some(
+            provider_config
+                .provider_instances
+                .contains_key(&provider_scope),
+        );
 
         // Capture the effective configured model for `Agent::new_session` when
         // the caller did not provide a stronger `.model(...)` override.
@@ -787,6 +796,16 @@ impl AgentBuilder {
             declared_scope
         } else {
             self.assembled_provider_scope.clone().or(declared_scope)
+        };
+        // A caller-injected client owns the provider pairing declared by its
+        // final config. Native clients retain their original assembly source.
+        let provider_scope_is_instance = if self.provider_override.is_some() {
+            provider_scope
+                .as_deref()
+                .zip(config_snapshot.as_ref())
+                .map(|(scope, config)| config.provider_instances.contains_key(scope))
+        } else {
+            self.assembled_provider_is_instance
         };
         if self.provider_override.is_some() && self.model.is_none() {
             // An injected client is authoritative for its declared account.
@@ -1021,6 +1040,7 @@ impl AgentBuilder {
         );
         agent.sdk_skills = sdk_skills;
         agent.provider_scope = provider_scope;
+        agent.provider_scope_is_instance = provider_scope_is_instance;
         agent.routing_config = routing_config;
         Ok(agent)
     }
