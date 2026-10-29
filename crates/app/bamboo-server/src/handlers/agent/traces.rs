@@ -25,12 +25,15 @@ fn error(status: StatusCode, code: &'static str) -> HttpResponse {
         .json(json!({"schema_version": 1, "error": crate::error::error_value(code)}))
 }
 
-async fn lifetime(state: &AppState, session_id: &str) -> Result<DateTime<Utc>, HttpResponse> {
+async fn lifetime(
+    state: &AppState,
+    session_id: &str,
+) -> Result<DateTime<Utc>, (StatusCode, &'static str)> {
     match state.storage.load_session(session_id).await {
         Ok(Some(session)) if session.id == session_id => Ok(session.created_at),
-        Ok(None) => Err(error(StatusCode::NOT_FOUND, "session_not_found")),
-        Ok(Some(_)) => Err(error(StatusCode::CONFLICT, "session_identity_conflict")),
-        Err(_) => Err(error(
+        Ok(None) => Err((StatusCode::NOT_FOUND, "session_not_found")),
+        Ok(Some(_)) => Err((StatusCode::CONFLICT, "session_identity_conflict")),
+        Err(_) => Err((
             StatusCode::SERVICE_UNAVAILABLE,
             "session_storage_unavailable",
         )),
@@ -70,7 +73,7 @@ pub async fn list(
     let session_id = path.into_inner();
     let birth = match lifetime(&state, &session_id).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err((status, code)) => return error(status, code),
     };
     HttpResponse::Ok()
         .insert_header((header::CACHE_CONTROL, "private, no-store"))
@@ -108,7 +111,7 @@ pub async fn detail(
     }
     let birth = match lifetime(&state, &session_id).await {
         Ok(value) => value,
-        Err(response) => return response,
+        Err((status, code)) => return error(status, code),
     };
     let Some(trace) = bamboo_infrastructure::telemetry::local::store().detail_scoped(
         Some(&bamboo_infrastructure::telemetry::local::scope_for_path(
@@ -273,11 +276,14 @@ mod tests {
             .status(),
             StatusCode::BAD_REQUEST
         );
+        let missing = test::call_service(&app, request("/api/v1/sessions/missing/traces")).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
         assert_eq!(
-            test::call_service(&app, request("/api/v1/sessions/missing/traces"))
-                .await
-                .status(),
-            StatusCode::NOT_FOUND
+            missing.headers().get(header::CACHE_CONTROL).unwrap(),
+            "private, no-store"
         );
+        let missing: serde_json::Value = test::read_body_json(missing).await;
+        assert_eq!(missing["schema_version"], 1);
+        assert_eq!(missing["error"]["message"], "session_not_found");
     }
 }
