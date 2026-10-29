@@ -401,6 +401,34 @@ impl Agent {
         Agent { runtime }
     }
 
+    /// Return only the Host's still-current explicitly injected provider.
+    #[doc(hidden)]
+    pub fn legacy_injected_provider_snapshot(
+        &self,
+    ) -> Result<Option<Arc<dyn bamboo_llm::LLMProvider>>, bamboo_llm::LLMError> {
+        self.runtime.provider.legacy_injected_provider_snapshot()
+    }
+
+    /// Freeze the same verified injection and retain its Host budget identity.
+    #[doc(hidden)]
+    pub fn fixed_legacy_injected_provider(
+        &self,
+        expected: &Arc<dyn bamboo_llm::LLMProvider>,
+    ) -> Result<Option<Arc<dyn bamboo_llm::LLMProvider>>, bamboo_llm::LLMError> {
+        Ok(self
+            .runtime
+            .provider
+            .legacy_injected_provider_snapshot()?
+            .and_then(|current| {
+                Arc::ptr_eq(&current, expected).then(|| {
+                    bamboo_llm::provider::fixed_injected_provider_with_identity(
+                        current,
+                        self.runtime.provider.clone(),
+                    )
+                })
+            }))
+    }
+
     /// One execution's immutable persistence capability. Shared tool/provider
     /// resources remain on the existing runtime; default callers stay unbound.
     #[doc(hidden)]
@@ -491,6 +519,20 @@ impl Agent {
         let mut runtime = (*self.runtime).clone();
         runtime.gold_target_resolver = Some(resolver);
         runtime.child_resume_gold_selected = None;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Add a managed Host policy while retaining any inherited Gold policy.
+    #[doc(hidden)]
+    pub fn with_composed_gold_target_resolver(
+        &self,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(compose_child_gold_policy(
+            runtime.gold_target_resolver.take(),
+            resolver,
+        ));
         Self::from_runtime(Arc::new(runtime))
     }
 

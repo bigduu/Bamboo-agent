@@ -78,7 +78,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // The usage-presence normalization and its test are unconditional and remain
 // with the default engine owner; additive feature cases are unchanged.
 // Session-reference and local-OTLP redaction tests use their existing owners.
-const FEATURE_SOURCE_SHA256 = "a0a008601158039bfdcf38d764e9b93ef44483632dcc41e8d8b6cb6f893e38fc";
+// Root-fenced startup/response guard cases remain in the default storage owner;
+// Connect and Schedule routing cases stay in server-other, reasoning resolution
+// in the default engine owner, and Observer cases in server-app-state.
+const FEATURE_SOURCE_SHA256 = "1c9ab2d073e0e2558b5cee02d75e4d25372305e73387264b9f23ea548e6cc1b6";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

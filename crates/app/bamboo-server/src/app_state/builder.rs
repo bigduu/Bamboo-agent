@@ -1146,7 +1146,7 @@ impl AppState {
                         let config_snap = config_for_resolver.read().await.clone();
                         bamboo_engine::model_config_helper::resolve_subagent_model_ref(
                             &config_snap,
-                            &config_snap.provider,
+                            config_snap.effective_default_provider(),
                             &registry,
                             &subagent_type,
                         )

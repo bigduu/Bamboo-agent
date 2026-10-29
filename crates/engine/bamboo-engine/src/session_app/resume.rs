@@ -105,6 +105,13 @@ impl ResponseResumeHandoff {
         self.execution_reservation.root_actor_writer()
     }
 
+    /// The private fenced persistence captured by this exact successor.
+    pub fn execution_persistence(
+        &self,
+    ) -> Option<std::sync::Arc<dyn bamboo_domain::RuntimeSessionPersistence>> {
+        self.execution_reservation.execution_persistence()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<AgentEvent> {
         self.event_sender.subscribe()
     }

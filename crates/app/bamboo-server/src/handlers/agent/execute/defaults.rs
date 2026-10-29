@@ -51,6 +51,9 @@ pub struct ExecuteDefaultsResponse {
     pub provider: Option<String>,
     /// Underlying provider type (e.g. `openai`, `anthropic`, `copilot`).
     pub provider_type: Option<String>,
+    /// Present when a saved explicit primary target fails admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_error: Option<String>,
     /// Resolved reasoning effort, if any.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The session-scoped permission mode a NEW session would be stamped with
@@ -100,6 +103,7 @@ pub async fn handler(state: web::Data<AppState>) -> impl Responder {
         model: resolved.model_roster.model.clone(),
         provider: resolved.model_roster.provider_name.clone(),
         provider_type: resolved.model_roster.provider_type.clone(),
+        model_error: resolved.model_error,
         reasoning_effort: resolved.reasoning_effort,
         default_session_permission_mode,
         system_prompt: resolved.system_prompt,

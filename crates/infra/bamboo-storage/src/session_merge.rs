@@ -990,7 +990,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.save_session_rebasing_task_conflicts_with_input(session, None, None)
+        self.save_session_rebasing_task_conflicts_with_input(session, None, None, None)
             .await
     }
 
@@ -1002,12 +1002,40 @@ impl LockedSessionStore {
             bamboo_domain::SessionInboxOwnedClaim,
         )>,
         inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
+        startup_expected: Option<&Session>,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if let Some(provenance) = self.inherited_for_session(session) {
                 provenance.validate_session(session)?;
             }
-            let result = if self.child_actor_writer.is_some() {
+            let result = if let Some(expected) = startup_expected {
+                if self.child_actor_writer.is_some() || input.is_some() || inherited.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        bamboo_domain::SessionAuthorityConflict(
+                            "bound startup requires its Root execution writer".into(),
+                        ),
+                    ));
+                }
+                let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        bamboo_domain::SessionAuthorityConflict(
+                            "bound startup has no bound Root execution writer".into(),
+                        ),
+                    )
+                })?;
+                let carried_wait = self.inherited_for_session(session).cloned();
+                self.storage
+                    .save_root_actor_bound_startup(
+                        owner,
+                        session,
+                        expected,
+                        carried_wait.as_ref(),
+                        publish.clone(),
+                    )
+                    .await
+            } else if self.child_actor_writer.is_some() {
                 self.save_child_snapshot(session, false, input.cloned(), inherited)
                     .await
             } else if inherited.is_none() && self.inherited_for_session(session).is_some() {
@@ -1604,8 +1632,39 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, false, None, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, false, None, None, publish)
             .await
+    }
+
+    /// Persist a bound startup only while its original profile remains
+    /// current. The bound Root writer and its physical authority are required.
+    pub async fn merge_save_bound_startup(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.merge_save_bound_startup_and_publish(session, expected, |_, _| {})
+            .await
+    }
+
+    pub async fn merge_save_bound_startup_and_publish<F>(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(
+            session,
+            true,
+            false,
+            None,
+            Some(expected),
+            publish,
+        )
+        .await
     }
 
     /// Final runner save with a lock-scoped check for a synchronous child
@@ -1625,7 +1684,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, true, None, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, true, None, None, publish)
             .await
     }
 
@@ -1638,8 +1697,15 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, true, Some(inherited), publish)
-            .await
+        self.merge_save_runtime_inner_and_publish(
+            session,
+            true,
+            true,
+            Some(inherited),
+            None,
+            publish,
+        )
+        .await
     }
 
     /// Forward only this execution's captured Root writer; never accept one
@@ -1797,7 +1863,7 @@ impl LockedSessionStore {
                 .insert(0, bamboo_domain::Message::system(prompt));
         }
         let mut result = self
-            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
+            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None, None)
             .await;
         for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if !result
@@ -1824,7 +1890,12 @@ impl LockedSessionStore {
                     .insert(0, bamboo_domain::Message::system(prompt));
             }
             result = self
-                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
+                .save_session_rebasing_task_conflicts_with_input(
+                    session,
+                    input.as_ref(),
+                    None,
+                    None,
+                )
                 .await;
         }
         if may_publish_runtime_result(&result) {
@@ -2006,7 +2077,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.merge_save_runtime_inner_and_publish(session, false, false, None, |_, _| {})
+        self.merge_save_runtime_inner_and_publish(session, false, false, None, None, |_, _| {})
             .await
     }
 
@@ -2016,6 +2087,7 @@ impl LockedSessionStore {
         adopt_bypass: bool,
         finalize_child_wait: bool,
         inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
+        startup_expected: Option<&Session>,
         publish: F,
     ) -> std::io::Result<()>
     where
@@ -2097,7 +2169,12 @@ impl LockedSessionStore {
             adopt_fresher_durable_model_context_state(session, latest);
         }
         let result = self
-            .save_session_rebasing_task_conflicts_with_input(session, None, inherited)
+            .save_session_rebasing_task_conflicts_with_input(
+                session,
+                None,
+                inherited,
+                startup_expected,
+            )
             .await;
         if may_publish_runtime_result(&result) {
             *original = candidate;
@@ -2445,11 +2522,28 @@ impl LockedSessionStore {
         else {
             return Ok(Ok(None));
         };
+        // Backends with the profile CAS prevent a Root-bound response from
+        // overwriting a cross-instance profile or pending-question change.
+        // Older backends retain their original fenced response save; Connect
+        // verifies this capability before consuming a non-terminal answer.
+        let expected = (self.root_actor_writer.is_some()
+            && self.storage.supports_root_actor_bound_startup())
+        .then(|| session.clone());
         if let Err(error) = mutate(&mut session) {
             return Ok(Err(error));
         }
-        self.save_session_rebasing_task_conflicts(&mut session)
+        if let Some(expected) = expected.as_ref() {
+            self.save_session_rebasing_task_conflicts_with_input(
+                &mut session,
+                None,
+                None,
+                Some(expected),
+            )
             .await?;
+        } else {
+            self.save_session_rebasing_task_conflicts(&mut session)
+                .await?;
+        }
         publish(&session);
         Ok(Ok(Some(session)))
     }
@@ -2583,6 +2677,20 @@ impl RuntimeSessionPersistence for LockedSessionStore {
 
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_runtime(session).await
+    }
+
+    fn supports_bound_startup_session(&self) -> bool {
+        self.root_actor_writer.is_some()
+            && self.child_actor_writer.is_none()
+            && self.storage.supports_root_actor_bound_startup()
+    }
+
+    async fn save_bound_startup_session(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.merge_save_bound_startup(session, expected).await
     }
 
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {

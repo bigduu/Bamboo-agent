@@ -573,6 +573,20 @@ impl ProviderRegistry {
         Ok(Some(provider))
     }
 
+    /// Select the configured model and its managed proof from one registry
+    /// generation. An unmanaged embedder selection has no managed proof.
+    #[doc(hidden)]
+    pub fn provider_for_configured_model_with_managed_origin(
+        self: &Arc<Self>,
+        config: &Config,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<(Arc<dyn LLMProvider>, Option<Arc<ManagedProviderOrigin>>), LLMError> {
+        let state = self.state.read().recover_poison();
+        let provider = Self::configured_model_in_snapshot(&state, config, target)?;
+        let origin = self.managed_origin_for_snapshot(&state, &target.provider, &provider);
+        Ok((provider, origin))
+    }
+
     /// Return a coherent configured handle and whether its registry generation
     /// is Host-managed under the same lock. The keyed binding does not retain
     /// or expose plaintext credentials.
