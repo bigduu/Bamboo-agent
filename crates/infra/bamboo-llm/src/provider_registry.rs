@@ -1158,6 +1158,15 @@ fn sdk_provider_binding(
     provider: &str,
     key: &ring::hmac::Key,
 ) -> Result<[u8; 32], LLMError> {
+    // Disabled is a refusal, not the same source as an absent legacy slot
+    // whose credentials were supplied by an SDK API-key overlay.
+    if config
+        .provider_instances
+        .get(provider)
+        .is_some_and(|instance| !instance.enabled)
+    {
+        return Err(LLMError::Api("SDK provider instance is disabled".into()));
+    }
     let binding = match configured_binding_with_mode(config, provider, key, true)? {
         Some(binding) => binding,
         None => hash_factory_inputs(key, config, provider, "sdk-unconfigured", &())?,

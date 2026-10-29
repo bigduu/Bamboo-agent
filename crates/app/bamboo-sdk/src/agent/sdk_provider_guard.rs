@@ -270,6 +270,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sdk_absent_overlay_source_never_treats_disabled_instance_as_absent() {
+        let mut original = Config::default();
+        original.provider = "openai".into();
+        original.default_provider_instance = None;
+        original.provider_instances.clear();
+        original.providers_mut().openai = None;
+        let binding = Arc::new(SdkProviderBinding::capture(&original, "openai").unwrap());
+        let config = Arc::new(RwLock::new(original));
+        let probe = Arc::new(Probe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let provider = BoundSdkProvider {
+            delegate: probe.clone(),
+            config: config.clone(),
+            binding,
+            provider: "openai".into(),
+            single_use: false,
+            refused: AtomicBool::new(false),
+        };
+        config.write().await.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": false, "model": "main-a"
+            }))
+            .unwrap(),
+        );
+        assert!(provider.known_pre_dispatch_error().is_some());
+        assert!(provider.list_model_info().await.is_err());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn sdk_queued_source_guard_preserves_real_upstream_errors() {
         let (root, _, probe) = fixture(true);
         let target = root.queued_provider_snapshot().unwrap().unwrap();
