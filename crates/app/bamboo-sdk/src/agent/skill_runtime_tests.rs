@@ -2376,9 +2376,19 @@ async fn sdk_expect_reasoning(
     label: &str,
     expected: Option<bamboo_domain::ReasoningEffort>,
 ) {
+    sdk_expect_reasoning_for_provider(agent, capture, label, "chat-a", expected).await;
+}
+
+async fn sdk_expect_reasoning_for_provider(
+    agent: &Agent,
+    capture: &SdkReasoningCapture,
+    label: &str,
+    provider: &str,
+    expected: Option<bamboo_domain::ReasoningEffort>,
+) {
     capture.0.lock().unwrap().clear();
     let mut session = Session::new(format!("sdk-reasoning-{label}"), "main-a");
-    session.model_ref = Some(bamboo_domain::ProviderModelRef::new("chat-a", "main-a"));
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new(provider, "main-a"));
     session.add_message(Message::user("Synthetic config snapshot witness"));
     agent.run_session(&mut session).await.unwrap();
     let calls = capture.0.lock().unwrap().clone();
@@ -2473,4 +2483,65 @@ async fn sdk_reasoning_follows_current_config_and_builder_order() {
         role.reasoning_effort = Some(Max);
     }
     sdk_expect_reasoning(&agent, &capture, "live-other-account", None).await;
+    {
+        let mut config = live.write().await;
+        let role = &mut config.defaults.as_mut().unwrap().chat;
+        role.provider = " chat-a ".into();
+        role.model = "main-a".into();
+    }
+    sdk_expect_reasoning(&agent, &capture, "invalid-role-provider", None).await;
+    {
+        let mut config = live.write().await;
+        let role = &mut config.defaults.as_mut().unwrap().chat;
+        role.provider = "chat-a".into();
+        role.model = " main-a ".into();
+    }
+    sdk_expect_reasoning(&agent, &capture, "invalid-role-model", None).await;
+}
+
+#[tokio::test]
+async fn sdk_reasoning_legacy_scope_does_not_take_new_instance_alias() {
+    use bamboo_domain::ReasoningEffort::{Low, Max};
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let mut config = sdk_reasoning_config();
+    config.provider = "openai".into();
+    config.provider_instances.clear();
+    config.default_provider_instance = None;
+    config.defaults.as_mut().unwrap().chat.provider = "openai".into();
+    let live = Arc::new(tokio::sync::RwLock::new(config));
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .model("main-a")
+        .config(live.clone())
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    sdk_expect_reasoning_for_provider(&agent, &capture, "legacy-only", "openai", Some(Low)).await;
+    live.write().await.provider_instances.insert(
+        "chat-b".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai", "enabled": true, "model": "main-a",
+            "runtime_models": ["main-a"]
+        }))
+        .unwrap(),
+    );
+    sdk_expect_reasoning_for_provider(
+        &agent,
+        &capture,
+        "hybrid-legacy-default",
+        "openai",
+        Some(Low),
+    )
+    .await;
+    {
+        let mut config = live.write().await;
+        config.default_provider_instance = Some("chat-b".into());
+        config.defaults.as_mut().unwrap().chat.reasoning_effort = Some(Max);
+    }
+    sdk_expect_reasoning_for_provider(&agent, &capture, "hybrid-instance-default", "openai", None)
+        .await;
 }
