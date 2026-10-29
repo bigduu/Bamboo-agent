@@ -19,6 +19,7 @@ pub(super) enum SdkBinding {
     Native(Arc<SdkProviderBinding>),
     Instance,
     Legacy { alias_sensitive: bool },
+    ImplicitCopilot,
     Opaque { alias_sensitive: bool },
 }
 
@@ -29,7 +30,7 @@ fn has_legacy(config: &Config, provider: &str) -> bool {
         "anthropic" => providers.anthropic.is_some(),
         "gemini" => providers.gemini.is_some(),
         "bodhi" => providers.bodhi.is_some(),
-        "copilot" => providers.copilot.is_some() || config.effective_default_provider() == provider,
+        "copilot" => providers.copilot.is_some(),
         _ => false,
     }
 }
@@ -52,6 +53,13 @@ pub(super) fn caller_binding(
         bamboo_llm::AVAILABLE_PROVIDERS.contains(&provider) && active_scope != Some(provider);
     if config.provider_instances.contains_key(provider) {
         SdkBinding::Instance
+    } else if provider == "copilot"
+        && active_scope == Some(provider)
+        && !has_legacy(config, provider)
+    {
+        // The named, caller-owned Copilot client is fixed at assembly; a later
+        // change to the global default does not change its implicit source.
+        SdkBinding::ImplicitCopilot
     } else if has_legacy(config, provider) {
         SdkBinding::Legacy { alias_sensitive }
     } else {
@@ -85,6 +93,9 @@ pub(super) fn validate_binding(
             .provider_instances
             .get(provider)
             .is_some_and(|instance| instance.enabled),
+        SdkBinding::ImplicitCopilot => {
+            provider == "copilot" && instance.is_none() && config.providers().copilot.is_none()
+        }
         SdkBinding::Legacy { alias_sensitive } => {
             !config.provider_instances.contains_key(provider)
                 && has_legacy(config, provider)
@@ -440,9 +451,7 @@ mod tests {
             delegate: switching.clone(),
             config,
             provider: "copilot".into(),
-            binding: SdkBinding::Legacy {
-                alias_sensitive: false,
-            },
+            binding: SdkBinding::ImplicitCopilot,
             single_use: false,
             refused: AtomicBool::new(false),
         });
