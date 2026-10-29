@@ -99,6 +99,9 @@ pub(crate) fn empty_live_bootstrap_generation_locked(
     Ok(generation)
 }
 
+#[path = "session_inbox_anchor.rs"]
+mod anchor;
+
 #[path = "session_inbox_owned.rs"]
 mod owned;
 use owned::{AckAuthority, StoredLease};
@@ -4609,6 +4612,10 @@ mod tests {
             let (temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
             let mut root = sessions.load_session("session-1").await.unwrap().unwrap();
             root.set_project_id_meta("synthetic-project");
+            // A Project change must advance the canonical metadata revision, or
+            // the Root context CAS rejects the save before this fixture reaches
+            // the Inbox boundary it is meant to exercise.
+            root.metadata_version += 1;
             sessions.save_session(&root).await.unwrap();
             let parent = sessions
                 .get_or_create_default_supervisor("model")

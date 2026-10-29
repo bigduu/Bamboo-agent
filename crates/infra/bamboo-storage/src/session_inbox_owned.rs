@@ -201,6 +201,9 @@ struct OwnedScope {
 }
 struct OwnedGuards {
     _file: FileOperationLock,
+    // Retained handle to the canonical Inbox directory. Field order releases the
+    // lock, then the Inbox FD, then the process and original authority.
+    _dir: super::anchor::InboxAnchor,
     _scope: Arc<OwnedScope>,
 }
 
@@ -690,16 +693,15 @@ impl FileSessionInbox {
             if let Some(hook) = &hook {
                 hook("acquire", &path)?;
             }
-            std::fs::create_dir_all(&path)?;
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path.join(OPERATION_LOCK_FILE))?;
+            // Retain the canonical Inbox directory and open its advisory lock
+            // relative to that handle. A link at either name now fails closed
+            // instead of creating or locking an object outside the Inbox.
+            let anchor = super::anchor::InboxAnchor::acquire(&path)?;
+            let file = anchor.open_lock(OPERATION_LOCK_FILE)?;
             file.lock_exclusive()?;
             Ok::<_, std::io::Error>(Arc::new(OwnedGuards {
                 _file: FileOperationLock(file),
+                _dir: anchor,
                 _scope: scope,
             }))
         })
