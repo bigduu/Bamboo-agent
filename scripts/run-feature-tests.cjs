@@ -61,7 +61,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // bootstrap tests are cfg(test) and belong to the default storage catalog.
 // Default harnesses own 20 storage, two LLM and four Unix server live cases,
 // plus five fresh-input server regressions; none match the serial exclusions.
-// Feature cfg expressions, 31 default owners, four contexts and 19 explicit
+// Feature cfg expressions, 31 default owners, four contexts and 20 explicit
 // additive cases remain unchanged. Default catalogs own retry and Stop tests.
 // The test-utils-gated engine semaphore helper is used by the default
 // reloadable-provider test in server-other via the server's dev dependency.
@@ -73,13 +73,15 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // in default engine packages-3; direct background admission stays in default
 // LLM packages-2, and the reloadable provider proof stays in server-other.
 // The injected project Dream endpoint A/B case stays in server-handlers.
-// No additive feature cases changed.
-const FEATURE_SOURCE_SHA256 = "5cd9167643884197b6165bcc2100d256b40550db1d1400599c39585ebaf1126c";
+// The local trace sampler adds one otel-otlp-only test to the infrastructure
+// additive owner; local trace, API, engine and hook tests use default owners.
+const FEATURE_SOURCE_SHA256 = "1e768451edc4a85f9e706b6cb56c953fe9bd01bca795f62dad67bb81ef872c39";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
     { name: "bamboo_infrastructure", kind: "lib", removed: [DEFAULT_TELEMETRY_CASE], added: [
       "telemetry::config::tests::explicit_guard_shutdown_is_bounded_and_idempotent",
+      "telemetry::config::tests::zero_export_sampling_keeps_local_spans_without_sending_them",
       ...["local_otlp_collector_receives_allowlisted_trace_bytes", "retryable_collector_status_is_sent_once",
         "ambient_otel_headers_and_resources_cannot_leak_credentials",
         "unavailable_collector_never_backpressures_spans_and_shutdown_is_bounded", "zero_sample_ratio_exports_no_roots"]
