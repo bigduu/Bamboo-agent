@@ -3077,6 +3077,21 @@ mod tests {
             .unwrap();
         assert_eq!(after.new_session("after").unwrap().model, "gpt-4o");
 
+        let mismatch_dir = tempfile::tempdir().unwrap();
+        write_test_config(mismatch_dir.path());
+        let mismatch = AgentBuilder::new()
+            .model("explicit-model")
+            .with_defaults_for_data_dir(mismatch_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .config(copilot_config())
+            .build();
+        assert!(
+            matches!(mismatch, Err(super::SdkError::Config(message))
+            if message.contains("SDK native provider configuration changed")),
+            "a native Anthropic client must not be retained for Copilot configuration"
+        );
+
         let explicit_dir = tempfile::tempdir().unwrap();
         write_test_config(explicit_dir.path());
         let explicit = AgentBuilder::new()
@@ -3084,6 +3099,7 @@ mod tests {
             .with_defaults_for_data_dir(explicit_dir.path().to_path_buf())
             .await
             .unwrap()
+            .provider(Arc::new(NeverCalledProvider))
             .config(copilot_config())
             .build()
             .unwrap();
