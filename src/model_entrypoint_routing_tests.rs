@@ -155,7 +155,13 @@ async fn config_derived_agent(
         .storage(storage)
         .persistence(persistence)
         .attachment_reader(store)
-        .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+        .skill_manager(Arc::new(bamboo_skills::SkillManager::with_config(
+            bamboo_skills::SkillStoreConfig {
+                skills_dir: dir.join("skills"),
+                project_dir: None,
+                active_mode: None,
+            },
+        )))
         .metrics_collector(metrics)
         .config(config.clone())
         .provider(main)
