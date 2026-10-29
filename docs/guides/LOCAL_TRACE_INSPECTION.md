@@ -145,6 +145,8 @@ root id follow the same reference policy, and its birth identifies the original
 lifetime. Other Session fields are not a snapshot of runtime state. Consume the
 usage observation itself.
 Deduplicate on `event_id`; retain IDs according to your plugin's own policy.
+When present, `trace_id` and `span_id` identify the real model-call span and can
+be matched with the authenticated local trace API. They do not grant access.
 
 A reviewed, runnable portable example is in
 [`crates/infra/bamboo-plugin/examples/model-usage`](../../crates/infra/bamboo-plugin/examples/model-usage).
