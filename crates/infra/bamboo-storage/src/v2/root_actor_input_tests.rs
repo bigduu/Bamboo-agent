@@ -201,7 +201,8 @@ async fn supervised_root_input_and_final_outcome_share_owned_main_and_receipt() 
     for finite in [false, true] {
         let temp = tempfile::tempdir().unwrap();
         let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
-        let root = Session::new(ROOT, "controlled-model");
+        let mut root = Session::new(ROOT, "controlled-model");
+        root.set_project_id_meta("synthetic-project");
         store.save_session(&root).await.unwrap();
         let supervisor: bamboo_domain::SupervisorReference = (&store
             .get_or_create_default_supervisor("model")

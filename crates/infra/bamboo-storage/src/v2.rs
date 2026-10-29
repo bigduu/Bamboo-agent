@@ -85,7 +85,7 @@ mod actor_snapshot;
 mod actor_snapshot_reader;
 #[cfg(windows)]
 #[path = "v2/actor_snapshot_reader_windows.rs"]
-mod actor_snapshot_reader;
+pub(crate) mod actor_snapshot_reader;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod actor_snapshot_tests;
 #[cfg(all(test, windows))]

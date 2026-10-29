@@ -1530,6 +1530,30 @@ pub(in crate::app_state) async fn offline_observer_recovers_both_native_root_out
         vec![1, 1],
         "the checked transcript snapshot must not contain duplicate outcomes"
     );
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let visible = {
+                let requests = probe.parent_inputs.lock().unwrap();
+                expected.iter().all(|(receipt, run, _, _, operation)| {
+                    requests.iter().flatten().any(|message| {
+                        message.content.contains(&format!("- Root: {ROOT_A}"))
+                            && message.content.contains(run.as_str())
+                            && message.content.contains(receipt.as_str())
+                            && message.content.contains(*operation)
+                            && message
+                                .content
+                                .contains("- Last persisted status: completed")
+                    })
+                })
+            };
+            if visible {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both Root outcome identities must reach the Supervisor provider input");
     assert_eq!(
         probe.source_calls.load(Ordering::SeqCst),
         0,

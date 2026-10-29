@@ -357,7 +357,8 @@ pub fn observer_root_outcome_status(outcome: &ObserverSupervisedRootOutcome) -> 
             ));
         }
     }
-    let mut output = format!("# Session status\n\nRecorded Root outcome; not live progress.\n\n- Last persisted status: {}\n\n## Recorded Root outcome\n", outcome.status.observer_status());
+    let mut output = format!("# Session status\n\nRecorded Root outcome; not live progress.\n\n- Root: {}\n- Last persisted status: {}\n\n## Recorded Root outcome\n", preview(&outcome.target_session_id), outcome.status.observer_status());
+    identity(&mut output, "Root identity", &outcome.target_session_id);
     identity(&mut output, "Run", &outcome.run_id);
     if let Some(input) = outcome.inputs.first() {
         identity(&mut output, "Input receipt", input.receipt_id.as_str());

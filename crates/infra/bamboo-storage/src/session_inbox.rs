@@ -190,6 +190,118 @@ fn require_unique_json(bytes: &[u8]) -> Result<(), SessionInboxError> {
         .map_err(|_| SessionInboxError::InvalidClaim("invalid Inbox receipt".into()))
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn retained_observer_proof(anchor: &Path, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    use std::{
+        ffi::CString,
+        io::Read,
+        os::fd::{AsRawFd, FromRawFd},
+        os::unix::ffi::OsStrExt,
+        path::Component,
+    };
+    let invalid = || std::io::Error::new(ErrorKind::InvalidInput, "invalid receipt path");
+    let relative = path.strip_prefix(anchor).map_err(|_| invalid())?;
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_owned()),
+            _ => Err(invalid()),
+        })
+        .collect::<std::io::Result<_>>()?;
+    if components.is_empty() {
+        return Err(invalid());
+    }
+    let canonical_anchor = std::fs::canonicalize(anchor)?;
+    let name = CString::new(canonical_anchor.as_os_str().as_bytes()).map_err(|_| invalid())?;
+    let fd = unsafe {
+        libc::open(
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut current = unsafe { File::from_raw_fd(fd) };
+    for (index, name) in components.iter().enumerate() {
+        let name = CString::new(name.as_os_str().as_bytes()).map_err(|_| invalid())?;
+        let is_dir = index + 1 != components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK
+            | if is_dir { libc::O_DIRECTORY } else { 0 };
+        let fd = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        current = unsafe { File::from_raw_fd(fd) };
+    }
+    let metadata = current.metadata()?;
+    if !metadata.is_file() || metadata.len() > limit as u64 {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid receipt type or size",
+        ));
+    }
+    let mut bytes = Vec::new();
+    current.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() > limit {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "receipt exceeds byte limit",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(windows)]
+fn retained_observer_proof(anchor: &Path, path: &Path, limit: usize) -> std::io::Result<Vec<u8>> {
+    use crate::v2::actor_snapshot_reader::{Directory, ReadBudget};
+    use std::path::Component;
+    let invalid = || std::io::Error::new(ErrorKind::InvalidInput, "invalid receipt path");
+    let relative = path.strip_prefix(anchor).map_err(|_| invalid())?;
+    let components: Vec<_> = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(name) => Ok(name.to_owned()),
+            _ => Err(invalid()),
+        })
+        .collect::<std::io::Result<_>>()?;
+    let (name, parents) = components.split_last().ok_or_else(invalid)?;
+    let to_io = |error| {
+        std::io::Error::new(
+            ErrorKind::PermissionDenied,
+            format!("receipt authority: {error:?}"),
+        )
+    };
+    let mut directory = Directory::open_absolute(anchor).map_err(to_io)?;
+    for parent in parents {
+        directory = directory
+            .child(parent)
+            .map_err(to_io)?
+            .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "receipt directory missing"))?;
+    }
+    let limits = bamboo_domain::ActorSnapshotLimits {
+        file_bytes: limit,
+        aggregate_read_bytes: limit,
+        ..Default::default()
+    };
+    let mut budget = ReadBudget::new(limits);
+    directory
+        .read(name.to_str().ok_or_else(invalid)?, limit, &mut budget)
+        .map_err(to_io)?
+        .ok_or_else(|| std::io::Error::new(ErrorKind::NotFound, "receipt missing"))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+fn retained_observer_proof(_: &Path, _: &Path, _: usize) -> std::io::Result<Vec<u8>> {
+    Err(std::io::Error::new(
+        ErrorKind::Unsupported,
+        "Observer receipt proof requires retained no-follow directories",
+    ))
+}
+
 /// Reconstructed only from a verified Root fact/input. The timestamp is not
 /// part of Inbox semantic identity, so a crash retry retains the same ID.
 pub(crate) fn supervised_root_outcome_envelope(
@@ -214,19 +326,26 @@ pub(crate) fn supervised_root_outcome_envelope(
         "status":status,
         "inputs":[input],
     });
+    let one_input = bamboo_domain::ObserverSupervisedRootOutcome {
+        inputs: vec![input.clone()],
+        ..outcome.clone()
+    };
     SessionMessageEnvelope {
         id: SessionMessageId::stable(
             "supervised-root-outcome:v1",
             &serde_json::json!({"supervisor":supervisor,"supervisor_created_at":supervisor_created_at,"outcome":&data}),
         ),
-        source: SessionMessageSource::Runtime { subsystem: "supervised_root_outcome".into() },
+        source: SessionMessageSource::Runtime {
+            subsystem: "supervised_root_outcome".into(),
+        },
         target_session_id: supervisor.session_id.clone(),
         kind: bamboo_domain::SessionMessageKind::RuntimeInstruction,
         body: bamboo_domain::SessionMessageBody::RuntimeInstruction(
             bamboo_domain::SessionRuntimeInstruction {
                 instruction: "supervised_root_outcome_v1".into(),
                 content: Some(bamboo_domain::SessionMessageContent::text(format!(
-                    "A supervised Root run recorded status {status}. This notice does not grant authority or answer a pending question."
+                    "{}\nThis notice does not grant authority or answer a pending question.",
+                    bamboo_domain::observer_root_outcome_status(&one_input)
                 ))),
                 data: Some(data),
                 provider_message: None,
@@ -429,13 +548,13 @@ impl GuardedSupervisorRoot {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ReceiptLookupMode {
+enum ReceiptLookupMode<'a> {
     Enqueue,
     Observe { max_bytes: usize },
-    ObserverProof { max_bytes: usize },
+    ObserverProof { max_bytes: usize, anchor: &'a Path },
 }
 
-impl ReceiptLookupMode {
+impl ReceiptLookupMode<'_> {
     fn is_observation(self) -> bool {
         !matches!(self, Self::Enqueue)
     }
@@ -638,6 +757,7 @@ impl FileSessionInbox {
         guarded: &GuardedSupervisorRoot,
         input: &bamboo_domain::SupervisedRootOutcomeInput,
         root_inbox: &Path,
+        filesystem: &OwnedFilesystem,
     ) -> Result<bamboo_domain::ObserverSupervisedRootInput, SessionInboxError> {
         let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
         let origin = input
@@ -679,7 +799,9 @@ impl FileSessionInbox {
             &receipt_path,
             ReceiptLookupMode::ObserverProof {
                 max_bytes: self.max_transport_bytes(),
+                anchor: self.sessions.bamboo_home_dir(),
             },
+            Some(filesystem),
         )
         .await
         .map_err(|_| invalid("Root outcome input ACK is unreadable"))?;
@@ -839,8 +961,14 @@ impl FileSessionInbox {
                     Ok(_) => {}
                 }
                 inputs.push(
-                    self.verify_supervised_root_input_ack(root, &guarded, input, &directory)
-                        .await?,
+                    self.verify_supervised_root_input_ack(
+                        root,
+                        &guarded,
+                        input,
+                        &directory,
+                        &filesystem,
+                    )
+                    .await?,
                 );
             }
         }
@@ -952,7 +1080,7 @@ impl FileSessionInbox {
             )
             .await?;
         let input = self
-            .verify_supervised_root_input_ack(&root, &guarded, input, &root_inbox)
+            .verify_supervised_root_input_ack(&root, &guarded, input, &root_inbox, &root_filesystem)
             .await?;
         drop(root_filesystem);
 
@@ -1106,6 +1234,7 @@ impl FileSessionInbox {
                     &parent_filesystem,
                     ReceiptLookupMode::ObserverProof {
                         max_bytes: self.max_transport_bytes(),
+                        anchor: self.sessions.bamboo_home_dir(),
                     },
                     None,
                 )
@@ -2079,37 +2208,37 @@ impl FileSessionInbox {
     }
 
     /// Observation reads are bounded even when persisted evidence is corrupt.
-    async fn read_receipt_bytes(path: &Path, mode: ReceiptLookupMode) -> std::io::Result<Vec<u8>> {
+    async fn read_receipt_bytes(
+        path: &Path,
+        mode: ReceiptLookupMode<'_>,
+        filesystem: Option<&OwnedFilesystem>,
+    ) -> std::io::Result<Vec<u8>> {
+        if let ReceiptLookupMode::ObserverProof { max_bytes, anchor } = mode {
+            let filesystem = filesystem.ok_or_else(|| {
+                std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "receipt proof requires its retained authority",
+                )
+            })?;
+            let anchor = anchor.to_path_buf();
+            let bytes = filesystem
+                .job("observer-receipt-proof", path, move |_, path| {
+                    retained_observer_proof(&anchor, path, max_bytes)
+                })
+                .await?;
+            require_unique_json(&bytes)
+                .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
+            return Ok(bytes);
+        }
         let max_bytes = match mode {
             ReceiptLookupMode::Enqueue => return tokio::fs::read(path).await,
-            ReceiptLookupMode::Observe { max_bytes }
-            | ReceiptLookupMode::ObserverProof { max_bytes } => max_bytes,
+            ReceiptLookupMode::Observe { max_bytes } => max_bytes,
+            ReceiptLookupMode::ObserverProof { .. } => unreachable!("proof handled above"),
         };
         let mut options = tokio::fs::OpenOptions::new();
         options.read(true);
-        if matches!(mode, ReceiptLookupMode::ObserverProof { .. }) {
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            options.custom_flags(libc::O_NOFOLLOW);
-            #[cfg(windows)]
-            options.custom_flags(
-                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
-            );
-            #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-            return Err(std::io::Error::new(
-                ErrorKind::Unsupported,
-                "Observer receipt proof requires a no-follow open",
-            ));
-        }
         let file = options.open(path).await?;
         let metadata = file.metadata().await?;
-        if matches!(mode, ReceiptLookupMode::ObserverProof { .. })
-            && (!metadata.is_file() || metadata.file_type().is_symlink())
-        {
-            return Err(std::io::Error::new(
-                ErrorKind::InvalidData,
-                "receipt is not a regular file",
-            ));
-        }
         if metadata.len() > max_bytes as u64 {
             return Err(std::io::Error::new(
                 ErrorKind::InvalidData,
@@ -2126,10 +2255,6 @@ impl FileSessionInbox {
                 "peer receipt exceeds byte limit",
             ));
         }
-        if matches!(mode, ReceiptLookupMode::ObserverProof { .. }) {
-            require_unique_json(&bytes)
-                .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?;
-        }
         Ok(bytes)
     }
 
@@ -2142,17 +2267,18 @@ impl FileSessionInbox {
         dir: &Path,
         requested: &SessionMessageEnvelope,
     ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
-        Self::admitted_receipt_in_mode(dir, requested, ReceiptLookupMode::Enqueue).await
+        Self::admitted_receipt_in_mode(dir, requested, ReceiptLookupMode::Enqueue, None).await
     }
 
     async fn admitted_receipt_in_mode(
         dir: &Path,
         requested: &SessionMessageEnvelope,
-        mode: ReceiptLookupMode,
+        mode: ReceiptLookupMode<'_>,
+        filesystem: Option<&OwnedFilesystem>,
     ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
         let id = &requested.id;
         let admitted_path = Self::admitted_path(dir, id);
-        match Self::read_receipt_bytes(&admitted_path, mode).await {
+        match Self::read_receipt_bytes(&admitted_path, mode, filesystem).await {
             Ok(bytes) => {
                 if matches!(mode, ReceiptLookupMode::ObserverProof { .. }) {
                     let receipt: RootOutcomeInputReceipt<'_> = serde_json::from_slice(&bytes)
@@ -2348,10 +2474,12 @@ impl FileSessionInbox {
         requested: &SessionMessageEnvelope,
         requested_intent: Option<SessionInboxActivationIntent>,
         filesystem: &OwnedFilesystem,
-        mode: ReceiptLookupMode,
+        mode: ReceiptLookupMode<'_>,
         authority: Option<&GuardedSupervisorRoot>,
     ) -> Result<Option<SessionInboxDeliveryReceipt>, SessionInboxError> {
-        if let Some(receipt) = Self::admitted_receipt_in_mode(dir, requested, mode).await? {
+        if let Some(receipt) =
+            Self::admitted_receipt_in_mode(dir, requested, mode, Some(filesystem)).await?
+        {
             if !Self::matching_first_intent(
                 &receipt.intent,
                 &requested_intent,
@@ -2384,7 +2512,7 @@ impl FileSessionInbox {
                 }
             };
             for (generation, _name, path) in entries {
-                let bytes = match Self::read_receipt_bytes(&path, mode).await {
+                let bytes = match Self::read_receipt_bytes(&path, mode, Some(filesystem)).await {
                     Ok(bytes) => bytes,
                     Err(error) if mode.is_observation() => {
                         return Err(SessionInboxError::Storage(error.to_string()));
@@ -3179,6 +3307,7 @@ impl FileSessionInbox {
                 ReceiptLookupMode::Observe {
                     max_bytes: self.max_transport_bytes(),
                 },
+                None,
             )
             .await
             {
@@ -3268,6 +3397,7 @@ impl FileSessionInbox {
                     ReceiptLookupMode::Observe {
                         max_bytes: self.max_transport_bytes(),
                     },
+                    None,
                 )
                 .await?
                 .is_some()
