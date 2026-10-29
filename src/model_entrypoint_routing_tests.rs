@@ -1526,22 +1526,26 @@ async fn entrypoint_routing_legacy_explicit_same_name_override_stays_on_active_c
             })
             .app_data_dir(dir.path().to_path_buf())
             .build();
-    tokio::time::timeout(
+    let outcome = tokio::time::timeout(
         std::time::Duration::from_secs(20),
         agent.execute(&mut session, request),
     )
     .await
-    .expect("controlled bare override must finish")
-    .unwrap();
+    .expect("controlled bare override must finish");
     drain.abort();
     let calls = main.calls.lock().unwrap().clone();
-    assert!(
-        calls
-            .iter()
-            .any(|(model, _, images)| model == "vision-b" && *images),
-        "explicit override did not reach active client: {calls:?}"
-    );
-    assert!(b.received_requests().await.unwrap().is_empty());
+    let requests = b.received_requests().await.unwrap();
+    let b_saw_pixel = requests
+        .iter()
+        .any(|request| String::from_utf8_lossy(&request.body).contains(PIXEL));
+    let b_models = requests
+        .iter()
+        .map(|request| request.body_json::<serde_json::Value>().unwrap()["model"].clone())
+        .collect::<Vec<_>>();
+    assert!(outcome.is_ok()
+        && calls.iter().any(|(model, _, images)| model == "vision-b" && *images)
+        && requests.is_empty(),
+        "explicit override must use A: outcome={outcome:?}, A={calls:?}, B_models={b_models:?}, B_saw_pixel={b_saw_pixel}");
     assert_eq!(
         session
             .messages

@@ -132,9 +132,13 @@ async fn entrypoint_routing_headless_unset_override_keeps_legitimate_parent_inhe
 
 #[tokio::test]
 async fn entrypoint_routing_headless_resume_keeps_original_account_when_default_changes() {
+    let mut outcomes = Vec::new();
     for flag in [false, true] {
-        let (dir, state, original_provider, new_default, original) =
+        let (dir, state, original_provider, new_default, mut original) =
             fixture(flag, "missing-model").await;
+        original.title_generated = true;
+        state.storage.save_session(&original).await.unwrap();
+        state.session_store.save_session(&original).await.unwrap();
         {
             let mut config = state.config.write().await;
             config.default_provider_instance = Some("broken-b".into());
@@ -156,18 +160,20 @@ async fn entrypoint_routing_headless_resume_keeps_original_account_when_default_
         let old_calls = original_provider.calls.lock().unwrap().clone();
         let new_calls = new_default.calls.lock().unwrap().clone();
         let saved = storage.load_session(&original.id).await.unwrap().unwrap();
-        assert!(outcome.is_ok(), "flag={flag}: {outcome:?}");
-        assert!(old_calls.iter().any(|(model, _, _)| model == "main-a"),
-            "original account must receive its saved model: flag={flag}, A={old_calls:?}, B={new_calls:?}");
-        assert!(
-            new_calls.is_empty(),
-            "new default must not receive the old session: flag={flag}, B={new_calls:?}"
-        );
-        assert_eq!(
+        let provider =
             bamboo_engine::session_app::provider_model::session_effective_model_ref(&saved)
-                .unwrap()
-                .provider,
-            "chat-a"
-        );
+                .map(|target| target.provider);
+        outcomes.push((flag, outcome, old_calls, new_calls, provider));
     }
+    assert!(
+        outcomes.iter().all(
+            |(_, outcome, old_calls, new_calls, provider)| outcome.is_ok()
+                && old_calls
+                    .iter()
+                    .any(|(model, purpose, _)| model == "main-a" && purpose != "gold_evaluation")
+                && new_calls.is_empty()
+                && provider.as_deref() == Some("chat-a")
+        ),
+        "resuming must retain the original account for both flag values: {outcomes:?}"
+    );
 }
