@@ -4604,6 +4604,7 @@ mod tests {
     async fn supervised_root_outcome_does_not_follow_inbox_or_lock_symlinks() {
         use std::os::unix::fs::symlink;
 
+        let mut violations = Vec::new();
         for link in ["inbox", "lock"] {
             let (temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
             let mut root = sessions.load_session("session-1").await.unwrap().unwrap();
@@ -4644,12 +4645,14 @@ mod tests {
                 .await;
             let rejected = result.is_err();
             drop(result);
-            assert!(
-                !escaped.exists(),
-                "{link} link wrote outside the canonical Inbox"
-            );
-            assert!(rejected, "{link} link must fail closed");
+            if escaped.exists() {
+                violations.push(format!("{link} link wrote outside the canonical Inbox"));
+            }
+            if !rejected {
+                violations.push(format!("{link} link did not fail closed"));
+            }
         }
+        assert!(violations.is_empty(), "{}", violations.join("; "));
     }
 
     #[tokio::test]
