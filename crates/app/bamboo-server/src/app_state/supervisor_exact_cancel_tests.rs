@@ -432,3 +432,64 @@ async fn supervisor_cancel_real_root_keeps_queued_followup_for_successor() {
     assert_eq!(fixture.probe.requests.lock().unwrap().len(), 2);
     fixture.state.shutdown().await;
 }
+
+#[actix_web::test]
+async fn supervisor_exact_cancel_uses_the_same_boundary_in_standard_and_ultra() {
+    for ultra in [false, true] {
+        let fixture = Box::pin(Fixture::new()).await;
+        let mut supervisor = fixture
+            .state
+            .storage
+            .load_session(&fixture.reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        fixture
+            .state
+            .storage
+            .save_session(&supervisor)
+            .await
+            .unwrap();
+        grant_cancel(&fixture);
+        let selected = current_target(&fixture).await;
+        let mut runner = crate::app_state::AgentRunner::new();
+        runner.status = crate::app_state::AgentStatus::Running;
+        let run_id = runner.run_id.clone();
+        let token = runner.cancel_token.clone();
+        let owner = fixture
+            .state
+            .session_activation_router
+            .register_session_run(&fixture.original, &run_id)
+            .await
+            .unwrap();
+        fixture
+            .state
+            .agent_runners
+            .write()
+            .await
+            .insert(TARGET.into(), runner);
+        let observed = invoke(&fixture, args("observe_run", &selected, None))
+            .await
+            .unwrap();
+        assert_eq!(observed["run_id"], run_id, "ultra={ultra}");
+        let requested = invoke(&fixture, args("cancel", &selected, Some(&run_id)))
+            .await
+            .unwrap();
+        assert_eq!(requested["status"], "cancel_requested", "ultra={ultra}");
+        assert!(token.is_cancelled(), "ultra={ultra}");
+        let result: Result<(), bamboo_agent_core::AgentError> =
+            Err(bamboo_agent_core::AgentError::Cancelled);
+        assert!(
+            bamboo_engine::execution::finalize_runner_exact(
+                &fixture.state.agent_runners,
+                TARGET,
+                &run_id,
+                &result,
+            )
+            .await
+        );
+        owner.finish(0).await.unwrap();
+        fixture.state.shutdown().await;
+    }
+}
