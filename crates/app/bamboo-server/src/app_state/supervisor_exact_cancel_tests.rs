@@ -144,7 +144,16 @@ async fn supervisor_exact_cancel_reports_request_then_finalization_and_fences_su
         .await
     );
     old_owner.finish(0).await.unwrap();
-    let finished = invoke(&fixture, args("cancel", &target, Some(&old_run)))
+    // An ordinary metadata-only save may advance the selector while the
+    // Root lifetime and authority remain intact.
+    let mut updated = fixture.reload().await;
+    updated.title = "metadata updated after finalization".into();
+    updated.metadata_version += 1;
+    fixture.state.storage.save_session(&updated).await.unwrap();
+    let fresh = current_target(&fixture).await;
+    assert_ne!(fresh.metadata_version, target.metadata_version);
+    let after_metadata = serde_json::to_value(fixture.reload().await).unwrap();
+    let finished = invoke(&fixture, args("cancel", &fresh, Some(&old_run)))
         .await
         .unwrap();
     assert_eq!(finished["status"], "already_finished");
@@ -165,7 +174,7 @@ async fn supervisor_exact_cancel_reports_request_then_finalization_and_fences_su
         .register_session_run(&fixture.original, &successor_id)
         .await
         .unwrap();
-    let stale = invoke(&fixture, args("cancel", &target, Some(&old_run)))
+    let stale = invoke(&fixture, args("cancel", &fresh, Some(&old_run)))
         .await
         .unwrap();
     assert_eq!(stale["status"], "run_conflict");
@@ -176,7 +185,7 @@ async fn supervisor_exact_cancel_reports_request_then_finalization_and_fences_su
     );
     assert_eq!(
         serde_json::to_value(fixture.reload().await).unwrap(),
-        before
+        after_metadata
     );
     let successor_result: Result<(), bamboo_agent_core::AgentError> = Ok(());
     assert!(
