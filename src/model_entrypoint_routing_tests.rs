@@ -1207,3 +1207,78 @@ async fn entrypoint_routing_sdk_explicit_fast_client_replaces_rejected_saved_rou
         "{fast_calls:?}"
     );
 }
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_native_reasoning_tracks_provider_source() {
+    use bamboo_domain::ReasoningEffort::{Low, Max};
+
+    let server = vision_server(200).await;
+    let mut config = config(true, "openai");
+    config.provider = "openai".into();
+    config.default_provider_instance = Some("openai".into());
+    config.provider_instances.clear();
+    config.provider_instances.insert(
+        "openai".into(),
+        serde_json::from_value(serde_json::json!({
+            "provider_type": "openai", "enabled": true,
+            "api_key": "synthetic-no-real-key", "base_url": server.uri(),
+            "model": "main-a", "runtime_models": ["main-a"]
+        }))
+        .unwrap(),
+    );
+    config.defaults.as_mut().unwrap().chat =
+        bamboo_domain::ProviderModelRef::new("openai", "main-a").with_reasoning_effort(Low);
+    let live = Arc::new(RwLock::new(config));
+    let dir = tempfile::tempdir().unwrap();
+    let agent = bamboo_sdk::Agent::builder()
+        .config(live.clone())
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(dir.path().to_path_buf())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+
+    let mut first = Session::new("synthetic-native-origin-first", "main-a");
+    first.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
+    first.add_message(Message::user("Synthetic native origin witness"));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.run_session(&mut first),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let first_requests = server.received_requests().await.unwrap();
+    assert_eq!(first_requests.len(), 1);
+    let first_body = first_requests[0].body_json::<serde_json::Value>().unwrap();
+    assert_eq!(first_body["model"], "main-a");
+    assert_eq!(first_body["reasoning_effort"], "low");
+
+    // Removing the instance does not replace the already assembled native
+    // client. The later legacy role must not lend its effort to that client.
+    {
+        let mut changed = live.write().await;
+        changed.provider_instances.remove("openai");
+        changed.default_provider_instance = None;
+        changed.defaults.as_mut().unwrap().chat.reasoning_effort = Some(Max);
+    }
+    let mut second = Session::new("synthetic-native-origin-second", "main-a");
+    second.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
+    second.add_message(Message::user("Synthetic changed origin witness"));
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        agent.run_session(&mut second),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let second_body = requests[1].body_json::<serde_json::Value>().unwrap();
+    assert_eq!(second_body["model"], "main-a");
+    assert!(
+        second_body.get("reasoning_effort").is_none(),
+        "{second_body:?}"
+    );
+}
