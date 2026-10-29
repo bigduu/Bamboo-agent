@@ -509,4 +509,56 @@ mod tests {
             assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
         }
     }
+    #[tokio::test]
+    async fn sdk_caller_implicit_copilot_survives_unrelated_instance_but_rejects_rebinding() {
+        let mut config = Config::default();
+        config.provider = "copilot".into();
+        config.default_provider_instance = None;
+        config.provider_instances.clear();
+        config.providers_mut().copilot = None;
+        let binding = caller_binding(&config, "copilot", Some("copilot"));
+        let shared = Arc::new(RwLock::new(config));
+        let probe = Arc::new(Probe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let provider = BoundSdkProvider {
+            delegate: probe.clone(),
+            config: shared.clone(),
+            binding,
+            provider: "copilot".into(),
+            single_use: false,
+            refused: AtomicBool::new(false),
+        };
+        let _stream = provider
+            .chat_stream(&[], &[], None, "model-a")
+            .await
+            .unwrap();
+        shared.write().await.provider_instances.insert(
+            "unrelated".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "model":"unrelated"
+            }))
+            .unwrap(),
+        );
+        let _stream = provider
+            .chat_stream(&[], &[], None, "model-a")
+            .await
+            .unwrap();
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+        for enabled in [true, false] {
+            shared.write().await.provider_instances.insert(
+                "copilot".into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"copilot", "enabled":enabled
+                }))
+                .unwrap(),
+            );
+            assert!(provider
+                .chat_stream(&[], &[], None, "model-a")
+                .await
+                .is_err());
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 2);
+        }
+    }
 }
