@@ -242,6 +242,11 @@ pub struct AppState {
     /// This avoids stale provider snapshots after runtime config updates.
     provider_handle: Arc<dyn LLMProvider>,
 
+    /// Exact Arc supplied by an injection constructor, never inferred from a
+    /// nearby registry. Future Host run factories capture and compare this tag.
+    #[allow(dead_code)]
+    pub(crate) initial_injected_provider: Option<Arc<dyn LLMProvider>>,
+
     /// Active conversation sessions (in-memory cache)
     ///
     /// Maps session IDs to Session objects. Persisted to storage
@@ -438,6 +443,12 @@ pub struct AppState {
     /// for an active agent execution.
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
 
+    /// Offers tied to the exact live Root execution and producer future.
+    pub(crate) live_retry: Arc<live_retry::LiveRetryBridge>,
+
+    /// Retains only a genuinely admitted owner during a client resync.
+    pub(crate) fresh_sync: Arc<fresh_sync::FreshSyncRegistry>,
+
     /// Reference-counted execute handlers still preparing a runner, keyed by
     /// session. This server-scoped registry closes the durable pending-turn
     /// expiry race without leaking state across AppState instances/tests.
@@ -591,6 +602,9 @@ pub(crate) mod actor_events;
 mod agent_session_context;
 mod builder;
 mod config_application;
+pub(crate) mod fresh_sync;
+pub(crate) mod host_gold_origin;
+pub(crate) mod live_retry;
 pub(crate) use config_application::ConfigApplicationState;
 mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
@@ -631,6 +645,9 @@ mod tests;
 
 #[cfg(test)]
 mod model_limit_snapshot_tests;
+
+#[cfg(test)]
+mod supervisor_epic_acceptance_tests;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigUpdateEffects {

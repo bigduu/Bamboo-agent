@@ -60,17 +60,43 @@ fn config(context: &RoutingContext) -> AgentLoopConfig {
 
 async fn finish_evaluations(state: &mut LoopRunState) {
     if let Some(task) = state.task_evaluation.in_flight.take() {
-        tokio::time::timeout(Duration::from_secs(2), task.join_handle)
+        let result = tokio::time::timeout(Duration::from_secs(2), task.join_handle)
             .await
             .expect("synthetic task evaluation must finish")
-            .unwrap();
+            .expect("Task evaluator must not panic")
+            .expect("Task evaluation was not cancelled");
+        assert!(result.error.is_some(), "the synthetic Task provider failed");
     }
     if let Some(task) = state.gold_evaluation.in_flight.take() {
-        tokio::time::timeout(Duration::from_secs(2), task.join_handle)
+        let result = tokio::time::timeout(Duration::from_secs(2), task.join_handle)
             .await
             .expect("synthetic Gold evaluation must finish")
-            .unwrap();
+            .expect("Gold evaluator must not panic")
+            .expect("Gold evaluation was not cancelled")
+            .expect("an upstream failure retains Gold's fallback result");
+        assert!(result
+            .evaluation_result
+            .reasoning
+            .starts_with("Gold evaluation failed:"));
     }
+}
+
+fn selected_providers(
+    state: &LoopRunState,
+    config: &AgentLoopConfig,
+    main: &Arc<dyn LLMProvider>,
+) -> (Arc<dyn LLMProvider>, Arc<dyn LLMProvider>) {
+    let fast = state
+        .auxiliary_models
+        .fast_model_provider
+        .clone()
+        .unwrap_or_else(|| main.clone());
+    let gold = select_gold_evaluation_provider(
+        config,
+        main,
+        state.auxiliary_models.fast_model_provider.as_ref(),
+    );
+    (fast, gold)
 }
 
 #[tokio::test]
@@ -94,43 +120,72 @@ async fn routing_contract_task_and_gold_reject_invalid_fast_without_dispatch() {
             let mut session = RoutingContext::session();
             let mut state = fixture(&mut session);
             refresh_auxiliary_models_for_round(&mut state, &config);
-            let (tx, _rx) = mpsc::channel(32);
-            assert!(
-                spawn_task_evaluation_if_needed(
-                    0,
-                    &session,
-                    &tx,
-                    &config,
-                    &mut state,
-                    context.providers["chat-a"].clone(),
-                    CancellationToken::new(),
-                )
-                .is_err(),
-                "Task must reject {rejection}"
-            );
-            assert!(
-                spawn_gold_evaluation_if_needed(
-                    0,
-                    &session,
-                    &tx,
-                    &config,
-                    &mut state,
-                    context.providers["chat-a"].clone(),
-                    CancellationToken::new(),
-                )
-                .is_err(),
-                "Gold must reject {rejection}"
-            );
-            assert!(state.task_evaluation.in_flight.is_none());
-            assert!(state.gold_evaluation.in_flight.is_none());
+            let main: Arc<dyn LLMProvider> = context.providers["chat-a"].clone();
+            let (fast, gold) = selected_providers(&state, &config, &main);
+            assert!(fast.known_pre_dispatch_error().is_some());
+            assert!(gold.known_pre_dispatch_error().is_some());
+            let (tx, mut rx) = mpsc::channel(32);
+            spawn_task_evaluation_if_needed(
+                0,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                fast,
+                CancellationToken::new(),
+            )
+            .expect("the rejected Task route is handled by the evaluator");
+            spawn_gold_evaluation_if_needed(
+                0,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                gold,
+                CancellationToken::new(),
+            )
+            .expect("the rejected Gold route is handled by the evaluator");
+
+            let task = state
+                .task_evaluation
+                .in_flight
+                .take()
+                .expect("Task evaluation");
+            let task = tokio::time::timeout(Duration::from_secs(2), task.join_handle)
+                .await
+                .expect("rejected Task evaluation must finish")
+                .expect("Task evaluator must not panic")
+                .expect("Task evaluation was not cancelled");
+            assert!(task.error.is_some(), "Task must report {rejection}");
+            assert!(task.evaluation_result.updates.is_empty());
+            let gold = state
+                .gold_evaluation
+                .in_flight
+                .take()
+                .expect("Gold evaluation");
+            let gold = tokio::time::timeout(Duration::from_secs(2), gold.join_handle)
+                .await
+                .expect("rejected Gold evaluation must finish")
+                .expect("Gold evaluator must not panic");
+            assert!(matches!(gold, Some(Err(_))), "Gold must reject {rejection}");
             context.assert_no_requests();
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(
+                    event,
+                    AgentEvent::TaskEvaluationCompleted { .. }
+                        | AgentEvent::GoldEvaluationStarted { .. }
+                        | AgentEvent::GoldEvaluationCompleted { .. }
+                ));
+            }
         }
     }
 }
 
 #[tokio::test]
-async fn routing_contract_queued_task_and_gold_keep_their_admitted_provider_model_pair() {
+async fn routing_contract_queued_unmanaged_task_and_gold_keep_their_provider_model_pair() {
     for failure in [Failure::Auth, Failure::Quota, Failure::Network] {
+        // RoutingContext uses an unmanaged registry and opaque SDK providers.
+        // Real managed routes must be checked against the current generation.
         let context = RoutingContext::new(Some(false));
         for provider in context.providers.values() {
             *provider.failure.lock().unwrap() = Some(failure);
@@ -139,14 +194,17 @@ async fn routing_contract_queued_task_and_gold_keep_their_admitted_provider_mode
         let mut session = RoutingContext::session();
         let mut state = fixture(&mut session);
         let (tx, _rx) = mpsc::channel(64);
+        let main: Arc<dyn LLMProvider> = context.providers["chat-a"].clone();
         refresh_auxiliary_models_for_round(&mut state, &config);
+        let (fast, gold) = selected_providers(&state, &config, &main);
+        assert!(!fast.queue_requires_current_route());
         spawn_task_evaluation_if_needed(
             0,
             &session,
             &tx,
             &config,
             &mut state,
-            context.providers["chat-a"].clone(),
+            fast.clone(),
             CancellationToken::new(),
         )
         .unwrap();
@@ -156,7 +214,7 @@ async fn routing_contract_queued_task_and_gold_keep_their_admitted_provider_mode
             &tx,
             &config,
             &mut state,
-            context.providers["chat-a"].clone(),
+            gold.clone(),
             CancellationToken::new(),
         )
         .unwrap();
@@ -167,7 +225,7 @@ async fn routing_contract_queued_task_and_gold_keep_their_admitted_provider_mode
             &tx,
             &config,
             &mut state,
-            context.providers["chat-a"].clone(),
+            fast,
             CancellationToken::new(),
         )
         .unwrap();
@@ -177,7 +235,7 @@ async fn routing_contract_queued_task_and_gold_keep_their_admitted_provider_mode
             &tx,
             &config,
             &mut state,
-            context.providers["chat-a"].clone(),
+            gold,
             CancellationToken::new(),
         )
         .unwrap();
@@ -187,8 +245,22 @@ async fn routing_contract_queued_task_and_gold_keep_their_admitted_provider_mode
             Some(ProviderModelRef::new("memory-c", "background-c"));
         refresh_auxiliary_models_for_round(&mut state, &config);
         finish_evaluations(&mut state).await;
-        start_queued_task_evaluation_if_idle(&mut state, &tx, CancellationToken::new(), 1);
-        start_queued_gold_evaluation_if_idle(&mut state, &tx, CancellationToken::new(), 1);
+        start_queued_task_evaluation_if_idle(
+            &mut state,
+            &tx,
+            main.clone(),
+            CancellationToken::new(),
+            1,
+        );
+        let (_, current_gold) = selected_providers(&state, &config, &main);
+        start_queued_gold_evaluation_if_idle(
+            &mut state,
+            &tx,
+            current_gold,
+            &config,
+            CancellationToken::new(),
+            1,
+        );
         finish_evaluations(&mut state).await;
         assert_eq!(context.models("fast-b"), vec!["cheap-b"; 4]);
         assert!(context.requests("memory-c").is_empty());
@@ -197,38 +269,149 @@ async fn routing_contract_queued_task_and_gold_keep_their_admitted_provider_mode
 }
 
 #[tokio::test]
-async fn routing_contract_gold_dedicated_model_uses_executing_account_and_validates_admission() {
+async fn routing_contract_gold_dedicated_unmanaged_sdk_uses_executing_provider() {
     for selected in ["explicit-gold", "unadmitted-gold"] {
         let context = RoutingContext::new(Some(false));
         context.config.write().await.defaults.as_mut().unwrap().fast =
             Some(ProviderModelRef::new("missing-account", "invalid-fast"));
         let mut config = config(&context);
         config.gold_config.as_mut().unwrap().model_name = Some(selected.into());
+        assert!(config.gold_target_resolver.is_none());
         let mut session = RoutingContext::session();
         let mut state = fixture(&mut session);
         refresh_auxiliary_models_for_round(&mut state, &config);
+        let main: Arc<dyn LLMProvider> = context.providers["chat-a"].clone();
+        let (_, gold) = selected_providers(&state, &config, &main);
+        assert!(Arc::ptr_eq(&gold, &main));
         let (tx, _rx) = mpsc::channel(64);
-        let result = spawn_gold_evaluation_if_needed(
+        spawn_gold_evaluation_if_needed(
             0,
             &session,
             &tx,
             &config,
             &mut state,
-            context.providers["chat-a"].clone(),
+            gold,
             CancellationToken::new(),
+        )
+        .unwrap();
+        let gold = state
+            .gold_evaluation
+            .in_flight
+            .take()
+            .expect("Gold evaluation");
+        let result = tokio::time::timeout(Duration::from_secs(2), gold.join_handle)
+            .await
+            .expect("SDK Gold evaluation must finish")
+            .expect("Gold evaluator must not panic")
+            .expect("Gold evaluation was not cancelled")
+            .expect("unmanaged SDK provider owns its admission");
+        assert_eq!(result.model_name, selected);
+        assert_eq!(context.models("chat-a"), vec![selected]);
+        assert!(context.requests("fast-b").is_empty());
+        assert!(context.requests("memory-c").is_empty());
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_gold_dedicated_managed_guard_checks_admission() {
+    for selected in ["explicit-gold", "unadmitted-gold"] {
+        let context = RoutingContext::new(Some(false));
+        context.config.write().await.defaults.as_mut().unwrap().fast =
+            Some(ProviderModelRef::new("missing-account", "invalid-fast"));
+        let mut config = config(&context);
+        config.gold_config.as_mut().unwrap().model_name = Some(selected.into());
+
+        // Bind a real managed origin and use the capture provider only as the
+        // synthetic dispatch delegate; a name-only registry is not a Host guard.
+        let mut managed_config = bamboo_llm::Config::default();
+        managed_config.provider = "chat-a".into();
+        managed_config.default_provider_instance = Some("chat-a".into());
+        managed_config.http_proxy = "http://127.0.0.1:9".into();
+        managed_config.https_proxy.clear();
+        managed_config.proxy_auth = None;
+        managed_config.provider_instances.insert(
+            "chat-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": true,
+                "api_key": "synthetic-only", "base_url": "http://127.0.0.1:1",
+                "model": "main-a", "runtime_models": ["main-a", "explicit-gold"]
+            }))
+            .unwrap(),
         );
-        assert_eq!(result.is_ok(), selected == "explicit-gold");
-        finish_evaluations(&mut state).await;
+        let data = tempfile::tempdir().unwrap();
+        let registry = Arc::new(
+            bamboo_llm::ProviderRegistry::from_config(&managed_config, data.path().into())
+                .await
+                .expect("managed registry"),
+        );
+        let (expected, origin) = registry
+            .provider_for_model_with_origin(&ProviderModelRef::new("chat-a", "main-a"))
+            .expect("managed executing provider");
+        let origin = origin.expect("a real managed origin is required");
+        let live = Arc::new(tokio::sync::RwLock::new(managed_config));
+        config.gold_target_resolver = Some(Arc::new(move |model, delegate| {
+            bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+                live.clone(),
+                origin.clone(),
+                ProviderModelRef::new("chat-a", model),
+                expected.clone(),
+                delegate,
+            )
+        }));
+        let mut session = RoutingContext::session();
+        let mut state = fixture(&mut session);
+        refresh_auxiliary_models_for_round(&mut state, &config);
+        let main: Arc<dyn LLMProvider> = context.providers["chat-a"].clone();
+        let (_, gold) = selected_providers(&state, &config, &main);
+        assert!(gold.queue_requires_current_route());
+        assert_eq!(
+            gold.known_pre_dispatch_error().is_none(),
+            selected == "explicit-gold"
+        );
+        let (tx, mut rx) = mpsc::channel(64);
+        spawn_gold_evaluation_if_needed(
+            0,
+            &session,
+            &tx,
+            &config,
+            &mut state,
+            gold,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        let gold = state
+            .gold_evaluation
+            .in_flight
+            .take()
+            .expect("Gold evaluation");
+        let result = tokio::time::timeout(Duration::from_secs(2), gold.join_handle)
+            .await
+            .expect("guarded Gold evaluation must finish")
+            .expect("Gold evaluator must not panic");
+        match (selected, result) {
+            ("explicit-gold", Some(Ok(result))) => assert_eq!(result.model_name, selected),
+            ("unadmitted-gold", Some(Err(_))) => {}
+            _ => panic!("unexpected managed Gold evaluation outcome for {selected}"),
+        }
         assert_eq!(
             context.models("chat-a"),
             if selected == "explicit-gold" {
-                vec!["explicit-gold"]
+                vec![selected]
             } else {
                 vec![]
             }
         );
         assert!(context.requests("fast-b").is_empty());
         assert!(context.requests("memory-c").is_empty());
+        if selected == "unadmitted-gold" {
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(
+                    event,
+                    AgentEvent::GoldEvaluationStarted { .. }
+                        | AgentEvent::GoldEvaluationCompleted { .. }
+                ));
+            }
+        }
     }
 }
 
@@ -284,4 +467,51 @@ async fn routing_contract_gold_terminal_reads_live_fast_and_preserves_unverified
             .status,
         crate::runtime::goal_state::GoalRuntimeStatus::NeedInput
     );
+}
+
+#[test]
+fn child_gold_policy_denial_drops_previously_allowed_queued_target() {
+    use crate::runtime::agent::compose_child_gold_policy;
+    use crate::runtime::config::GoldTargetResolver;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let context = RoutingContext::new(None);
+    let selected: Arc<dyn LLMProvider> = context.providers["chat-a"].clone();
+    let other: Arc<dyn LLMProvider> = context.providers["fast-b"].clone();
+    let allowed = Arc::new(AtomicBool::new(true));
+    let checks = Arc::new(AtomicUsize::new(0));
+    let state = allowed.clone();
+    let calls = checks.clone();
+    let replacement = other.clone();
+    let inherited: GoldTargetResolver = Arc::new(move |_, delegate| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        if state.load(Ordering::SeqCst) {
+            delegate
+        } else {
+            replacement.clone()
+        }
+    });
+    let managed: GoldTargetResolver =
+        Arc::new(|_, delegate| bamboo_llm::provider::mark_host_queued_route(delegate));
+    let resolver = compose_child_gold_policy(Some(inherited), managed);
+    let config = AgentLoopConfig {
+        gold_config: Some(GoldConfig {
+            enabled: true,
+            model_name: None,
+            ..Default::default()
+        }),
+        gold_target_resolver: Some(resolver.clone()),
+        ..Default::default()
+    };
+    // No explicit Gold model keeps the Fast path and does not invoke policy.
+    let fast = select_gold_evaluation_provider(&config, &selected, Some(&other));
+    assert!(Arc::ptr_eq(&fast, &other));
+    assert_eq!(checks.load(Ordering::SeqCst), 0);
+    let initial = resolver("gold", selected.clone());
+    assert!(initial.queue_requires_current_route());
+    let queued = QueuedEvaluation::new((), initial, "gold".into()).unwrap();
+    allowed.store(false, Ordering::SeqCst);
+    let current = resolver("gold", selected);
+    assert!(current.known_pre_dispatch_error().is_some());
+    assert!(queued.current_provider(current, "gold").is_none());
+    context.assert_no_requests();
 }

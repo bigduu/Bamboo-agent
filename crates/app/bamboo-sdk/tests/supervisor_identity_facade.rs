@@ -79,6 +79,13 @@ async fn supervisor_facade_reuses_identity_without_replacing_model_or_history() 
         "independent target history",
     ));
     agent.storage().save_session(&target).await.unwrap();
+    assert!(
+        service
+            .inspect_link(&supervisor, &target.id)
+            .await
+            .unwrap()
+            .authorized
+    );
     assert!(service.attach(&supervisor, 0, &target.id).await.is_err());
     let configured: bamboo_sdk::SupervisorManagementReceipt = service
         .configure_project_scope(&supervisor, 0, ["sdk-project".parse().unwrap()].into())
@@ -98,8 +105,9 @@ async fn supervisor_facade_reuses_identity_without_replacing_model_or_history() 
         .detach(&supervisor, attached.state_revision, &target.id)
         .await
         .unwrap();
+    // Legacy detach changes retained relationship metadata, not default management.
     assert!(
-        !service
+        service
             .inspect_link(&supervisor, &target.id)
             .await
             .unwrap()

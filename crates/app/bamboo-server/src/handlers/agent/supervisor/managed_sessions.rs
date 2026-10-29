@@ -1,5 +1,5 @@
-//! Owner-selected existing Roots over the canonical Supervisor management ports.
-//! A listed relationship is an observation, never a retained execution grant.
+//! Current-user discovery plus retained legacy link annotations.
+//! A listed selector is an observation, never a retained execution grant.
 use std::{collections::BTreeMap, io};
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
@@ -9,7 +9,7 @@ use bamboo_domain::{
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_projects::ProjectStoreError;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::json;
 
 use super::project_scope::{canonical_reference, publication_error, storage_error};
@@ -23,23 +23,10 @@ pub struct ManagedSessionUpdate {
     pub enabled: bool,
 }
 
-#[derive(Serialize)]
-struct ManagedSessionView {
-    session_id: String,
-    link_revision: u64,
-    enabled: bool,
-    authorized: bool,
-    target_created_at: chrono::DateTime<chrono::Utc>,
-    target_project_id: ProjectId,
-    target_metadata_version: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    authorization_error: Option<&'static str>,
-}
-
 fn error(status: StatusCode, code: &str, message: impl ToString) -> HttpResponse {
     HttpResponse::build(status).json(json!({
         "error":crate::error::error_value(message.to_string()), "code":code,
-        "recovery":"Reload the managed Sessions and explicitly select the intended existing Root in its allowed Project. Refresh incarnation/revision after a conflict. An uncertain mutation needs canonical readback, never an automatic retry. This operation starts no task and changes no target permissions."
+        "recovery":"Refresh canonical incarnation/revision after a legacy annotation conflict. Default Supervisor current-user access needs no Project authorization or attachment. An uncertain mutation needs canonical readback, never an automatic retry. This operation starts no task and changes no target permissions."
     }))
 }
 
@@ -49,12 +36,6 @@ fn changed_scope() -> HttpResponse {
         "scope_revision_conflict",
         "Supervisor identity or management scope changed; reload the managed Sessions",
     )
-}
-
-fn same_scope(left: &SupervisorScopeObservation, right: &SupervisorScopeObservation) -> bool {
-    left.supervisor == right.supervisor
-        && left.state_revision == right.state_revision
-        && left.allowed_projects == right.allowed_projects
 }
 
 async fn management_snapshot(
@@ -111,8 +92,16 @@ async fn management_snapshot(
     ))
 }
 
-/// Bounded owner-only relationship metadata. No target transcript is returned;
-/// current delivery/execution still performs its independent final checks.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentUserDirectoryQuery {
+    query: Option<String>,
+    after: Option<String>,
+    limit: Option<usize>,
+}
+
+/// The authenticated user's default management directory. Legacy links remain
+/// observable separately; they cannot restrict or grant the current role.
 pub async fn inspect_managed_sessions(
     state: web::Data<AppState>,
     request: HttpRequest,
@@ -124,74 +113,61 @@ pub async fn inspect_managed_sessions(
         Ok(reference) => reference,
         Err(response) => return Ok(*response),
     };
+    let query = match web::Query::<CurrentUserDirectoryQuery>::from_query(request.query_string()) {
+        Ok(query) => query.into_inner(),
+        Err(failure) => {
+            return Ok(error(
+                StatusCode::BAD_REQUEST,
+                "invalid_directory_query",
+                failure,
+            ))
+        }
+    };
+    let page = match state
+        .storage
+        .list_supervisor_current_user_targets(
+            &reference,
+            query.query.as_deref(),
+            query.after.as_deref(),
+            query.limit.unwrap_or(20),
+        )
+        .await
+    {
+        Ok(page) => page,
+        Err(failure) => return Ok(storage_error(failure)),
+    };
     let (scope, links) = match management_snapshot(&state, &reference).await {
         Ok(snapshot) => snapshot,
         Err(response) => return Ok(*response),
     };
-    let service = SupervisorSessionService::new(state.storage.clone());
-    let observed = match service.inspect_scope(&reference).await {
-        Ok(scope) => scope,
-        Err(failure) => return Ok(storage_error(failure)),
-    };
-    if !same_scope(&scope, &observed) {
+    if scope.state_revision != page.scope.legacy_state_revision {
         return Ok(changed_scope());
     }
-    // The canonical management schema bounds this map to 256 entries and its
-    // BTreeMap order is stable. Disabled tombstones remain visible/revocable.
-    let mut sessions = Vec::with_capacity(links.len());
-    for (session_id, link) in links {
-        // Attribute only an explicit target-reader failure to this row. An
-        // inspect_link error can originate from the Supervisor itself and must
-        // fail the whole read. A valid target racing to corruption can cause one
-        // whole-read refusal; the next read can diagnose the damaged target.
-        let target_unavailable = if link.enabled {
-            state
-                .storage
-                .load_root_authority(&session_id)
-                .await
-                .is_err()
-        } else {
-            false
-        };
-        let authorized = if target_unavailable {
-            false
-        } else {
-            let observed = match service.inspect_link(&reference, &session_id).await {
-                Ok(observation) => observation,
-                Err(failure) => return Ok(storage_error(failure)),
-            };
-            if observed.supervisor != reference
-                || observed.state_revision != scope.state_revision
-                || observed.target_session_id != session_id
-                || observed.link.as_ref() != Some(&link)
-            {
-                return Ok(changed_scope());
-            }
-            observed.authorized
-        };
-        sessions.push(ManagedSessionView {
-            session_id,
-            link_revision: link.revision,
-            enabled: link.enabled,
-            authorized,
-            target_created_at: link.target_created_at,
-            target_project_id: link.target_project_id,
-            target_metadata_version: link.target_metadata_version,
-            authorization_error: target_unavailable.then_some("target_authority_unavailable"),
-        });
-    }
-    let final_scope = match service.inspect_scope(&reference).await {
-        Ok(scope) => scope,
+    let sessions: Vec<_> = page.targets.into_iter().map(|target| json!({
+        "session_id":target.session_id,"kind":target.kind,"root_session_id":target.root_session_id,
+        "parent_session_id":target.parent_session_id,"link_revision":0,
+        "enabled":true,"authorized":true,"target_created_at":target.created_at,
+        "target_project_id":target.project_id,"target_metadata_version":target.metadata_version,
+        "current_user_target":target,"authorization_error":null,
+    })).collect();
+    let after = match state
+        .storage
+        .inspect_supervisor_current_user_scope(&reference)
+        .await
+    {
+        Ok(after) => after,
         Err(failure) => return Ok(storage_error(failure)),
     };
-    if !same_scope(&scope, &final_scope) {
+    if after != page.scope {
         return Ok(changed_scope());
     }
     Ok(HttpResponse::Ok()
-        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
-        .insert_header((actix_web::http::header::VARY, "Origin, Cookie, Authorization"))
+        .insert_header((actix_web::http::header::CACHE_CONTROL,"no-store"))
+        .insert_header((actix_web::http::header::VARY,"Origin, Cookie, Authorization"))
         .json(json!({
-            "capabilities":{"managed_sessions_http_v1":true}, "scope":scope, "sessions":sessions,
+            "capabilities":{"managed_sessions_http_v1":true,"supervisor_current_user_scope_v1":true},
+            "scope":scope,"sessions":sessions,"next_after":page.next_after,"legacy_links":links,
+            "management_access":{"kind":"current_user","requires_session_attachment":false},
             "owner_authorization":{"available":true,"required":true,"kind":"existing_access","http_registration":false,"code":null}
         })))
 }

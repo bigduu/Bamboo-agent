@@ -3,8 +3,7 @@ use super::*;
 use bamboo_domain::ProviderModelRef;
 use bamboo_llm::{Config, ProviderRegistry};
 
-async fn routing_harness(flag: Option<bool>) -> TestHarness {
-    let slot = Arc::new(StdRwLock::new(None::<Arc<RwLock<Config>>>));
+fn routing_registry() -> Arc<ProviderRegistry> {
     let providers = ["chat-a", "fast-b", "child-c"]
         .into_iter()
         .map(|id| (id.into(), Arc::new(NoopProvider) as Arc<dyn LLMProvider>))
@@ -18,6 +17,12 @@ async fn routing_harness(flag: Option<bool>) -> TestHarness {
         ("fast-b".into(), vec!["cheap-b".into()]),
         ("child-c".into(), vec!["child-model".into()]),
     ]));
+    registry
+}
+
+async fn routing_harness(flag: Option<bool>) -> TestHarness {
+    let slot = Arc::new(StdRwLock::new(None::<Arc<RwLock<Config>>>));
+    let registry = routing_registry();
     let resolver_slot = slot.clone();
     let resolver: crate::tools::SubagentModelResolver = Arc::new(move |kind| {
         let config = resolver_slot.read().unwrap().as_ref().unwrap().clone();
@@ -184,6 +189,190 @@ async fn routing_contract_subagent_precedence_and_hot_changes_preserve_exact_ref
 }
 
 #[tokio::test]
+async fn routing_contract_saved_provider_alias_does_not_select_another_account() {
+    for flag in [None, Some(false), Some(true)] {
+        let harness = routing_harness(flag).await;
+        {
+            let mut config = harness.adapter.config.write().await;
+            config.default_provider_instance = Some("fast-b".into());
+            config.defaults.as_mut().unwrap().sub_agent =
+                Some(ProviderModelRef::new("openai", "cheap-b"));
+        }
+        let registry = routing_registry();
+        let router = bamboo_llm::ProviderModelRouter::new(registry);
+        assert!(router
+            .route(&ProviderModelRef::new("openai", "cheap-b"))
+            .is_err());
+        assert!(router
+            .route(&ProviderModelRef::new("fast-b", "cheap-b"))
+            .is_ok());
+
+        for hybrid_legacy in [false, true] {
+            if hybrid_legacy {
+                let mut config = harness.adapter.config.write().await;
+                let mut legacy = bamboo_config::OpenAIConfig::default();
+                legacy.model = Some("cheap-b".into());
+                config.providers_mut().openai = Some(legacy);
+            }
+            let before = harness
+                .adapter
+                .session_store
+                .list_index_entries()
+                .await
+                .len();
+            let error = invoke_completed(
+                &harness.tool,
+                create_args(&harness),
+                subagent_test_ctx(&harness.parent_session_id, "synthetic-provider-alias"),
+            )
+            .await
+            .expect_err("a saved alias must not silently select a different provider account");
+            assert!(error.to_string().contains("not admitted"), "{error}");
+            assert_eq!(
+                harness
+                    .adapter
+                    .session_store
+                    .list_index_entries()
+                    .await
+                    .len(),
+                before
+            );
+            assert!(harness.agent_runners.read().await.is_empty());
+            let plan = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
+            let error = invoke_plan_completed(
+                &plan,
+                json!({"task":"Inspect synthetic routing only", "workspace":harness.workspace_path}),
+                subagent_test_ctx(&harness.parent_session_id, "synthetic-planner-provider-alias"),
+            )
+            .await
+            .expect_err("Plan must not use a different provider account for the alias");
+            assert!(error.to_string().contains("not admitted"), "{error}");
+            assert_eq!(
+                harness
+                    .adapter
+                    .session_store
+                    .list_index_entries()
+                    .await
+                    .len(),
+                before
+            );
+            assert!(harness.agent_runners.read().await.is_empty());
+        }
+
+        harness
+            .adapter
+            .config
+            .write()
+            .await
+            .defaults
+            .as_mut()
+            .unwrap()
+            .sub_agent = Some(
+            ProviderModelRef::new("fast-b", "cheap-b")
+                .with_reasoning_effort(bamboo_domain::ReasoningEffort::Low),
+        );
+        let result = invoke_completed(
+            &harness.tool,
+            create_args(&harness),
+            subagent_test_ctx(&harness.parent_session_id, "synthetic-exact-provider"),
+        )
+        .await
+        .expect("the exact admitted instance should still create a child");
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let child = harness
+            .storage
+            .load_session(payload["child_session_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.model_ref,
+            Some(
+                ProviderModelRef::new("fast-b", "cheap-b")
+                    .with_reasoning_effort(bamboo_domain::ReasoningEffort::Low)
+            )
+        );
+        assert_eq!(
+            child.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Low)
+        );
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_hybrid_legacy_alias_requires_the_effective_default() {
+    for flag in [None, Some(false), Some(true)] {
+        let harness = routing_harness(flag).await;
+        {
+            let mut config = harness.adapter.config.write().await;
+            config.provider_instances.clear();
+            config.provider_instances.insert(
+                "anthropic-work".into(),
+                serde_json::from_value(json!({
+                    "provider_type":"anthropic", "enabled":true,
+                    "model":"other-model", "runtime_models":["other-model"]
+                }))
+                .unwrap(),
+            );
+            config.default_provider_instance = Some("anthropic-work".into());
+            let mut legacy = bamboo_config::OpenAIConfig::default();
+            legacy.model = Some("legacy-model".into());
+            config.providers_mut().openai = Some(legacy);
+            config.defaults.as_mut().unwrap().sub_agent =
+                Some(ProviderModelRef::new("openai", "legacy-model"));
+        }
+        let before = harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len();
+        let error = invoke_completed(
+            &harness.tool,
+            create_args(&harness),
+            subagent_test_ctx(&harness.parent_session_id, "synthetic-stale-legacy-alias"),
+        )
+        .await
+        .expect_err("a nondefault legacy alias must not be persisted as a live route");
+        assert!(error.to_string().contains("not admitted"), "{error}");
+        assert_eq!(
+            harness
+                .adapter
+                .session_store
+                .list_index_entries()
+                .await
+                .len(),
+            before
+        );
+        assert!(harness.agent_runners.read().await.is_empty());
+
+        {
+            let mut config = harness.adapter.config.write().await;
+            config.default_provider_instance = None;
+            config.provider = "openai".into();
+        }
+        let result = invoke_completed(
+            &harness.tool,
+            create_args(&harness),
+            subagent_test_ctx(&harness.parent_session_id, "synthetic-live-legacy-alias"),
+        )
+        .await
+        .expect("the effective legacy default remains an admitted routing key");
+        let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        let child = harness
+            .storage
+            .load_session(payload["child_session_id"].as_str().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            child.model_ref,
+            Some(ProviderModelRef::new("openai", "legacy-model"))
+        );
+    }
+}
+
+#[tokio::test]
 async fn routing_contract_explicit_child_override_wins_invalid_default_role() {
     let harness = routing_harness(Some(false)).await;
     harness
@@ -248,6 +437,188 @@ async fn routing_contract_plan_rejects_unknown_explicit_type_role_before_parent_
     .await;
     let error = result
         .expect_err("the explicitly rejected planner route must not inherit the parent's model");
+    assert!(error.to_string().contains("not admitted"), "{error}");
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len(),
+        before
+    );
+    assert!(harness.agent_runners.read().await.is_empty());
+}
+
+#[tokio::test]
+async fn routing_contract_legacy_instance_normalizes_and_falls_back_before_child_admission() {
+    for flag in [None, Some(false), Some(true)] {
+        let harness = routing_harness(flag).await;
+        for (fast, default_model, expected_model) in [
+            (Some(""), "child-model", "child-model"),
+            (Some("  "), "child-model", "child-model"),
+            (Some("  child-fast  "), "child-model", "child-fast"),
+            (None, "  child-model  ", "child-model"),
+        ] {
+            {
+                let mut config = harness.adapter.config.write().await;
+                config.defaults = None;
+                config.default_provider_instance = Some("child-c".into());
+                let instance = config.provider_instances.get_mut("child-c").unwrap();
+                instance.fast_model = fast.map(str::to_string);
+                instance.model = Some(default_model.into());
+                instance.extra.insert(
+                    "runtime_models".into(),
+                    json!(["child-model", "child-fast"]),
+                );
+            }
+            let result = invoke_completed(
+                &harness.tool,
+                create_args(&harness),
+                subagent_test_ctx(&harness.parent_session_id, "synthetic-legacy-fallback"),
+            )
+            .await
+            .expect("the configured legacy child model should be admitted");
+            let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            let child = harness
+                .storage
+                .load_session(payload["child_session_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(child.model, expected_model, "flag {flag:?}, fast {fast:?}");
+            assert_eq!(
+                child.model_ref,
+                Some(ProviderModelRef::new("child-c", expected_model)),
+                "flag {flag:?}, fast {fast:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_legacy_provider_blank_fast_inherits_parent_but_keeps_real_selections() {
+    for flag in [None, Some(false), Some(true)] {
+        let harness = routing_harness(flag).await;
+        {
+            let mut config = harness.adapter.config.write().await;
+            config.defaults = None;
+            config.provider_instances.clear();
+            config.default_provider_instance = None;
+            config.provider = "openai".into();
+            *config.providers_mut() = Default::default();
+            let mut openai = bamboo_config::OpenAIConfig::default();
+            openai.model = Some("legacy-default".into());
+            openai.extra.insert(
+                "runtime_models".into(),
+                json!(["gpt-5", "legacy-default", "legacy-fast"]),
+            );
+            config.providers_mut().openai = Some(openai);
+        }
+        for (fast, expected_model, expected_ref) in [
+            (Some(""), "gpt-5", None),
+            (Some("  "), "gpt-5", None),
+            (None, "legacy-default", Some("legacy-default")),
+            (Some("legacy-fast"), "legacy-fast", Some("legacy-fast")),
+        ] {
+            harness
+                .adapter
+                .config
+                .write()
+                .await
+                .providers_mut()
+                .openai
+                .as_mut()
+                .unwrap()
+                .fast_model = fast.map(str::to_string);
+            let result = invoke_completed(
+                &harness.tool,
+                create_args(&harness),
+                subagent_test_ctx(&harness.parent_session_id, "synthetic-legacy-provider"),
+            )
+            .await
+            .expect("the legacy selection or inherited parent must be admitted");
+            let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            let child = harness
+                .storage
+                .load_session(payload["child_session_id"].as_str().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(child.model, expected_model, "flag {flag:?}, fast {fast:?}");
+            assert_eq!(
+                child.model_ref,
+                expected_ref.map(|model| ProviderModelRef::new("openai", model)),
+                "flag {flag:?}, fast {fast:?}"
+            );
+        }
+        harness
+            .adapter
+            .config
+            .write()
+            .await
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .fast_model = Some("unadmitted-legacy".into());
+        let before = harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len();
+        let error = invoke_completed(
+            &harness.tool,
+            create_args(&harness),
+            subagent_test_ctx(
+                &harness.parent_session_id,
+                "synthetic-unadmitted-legacy-provider",
+            ),
+        )
+        .await
+        .expect_err("an explicit unadmitted legacy model must not inherit the parent");
+        assert!(error.to_string().contains("not admitted"), "{error}");
+        assert_eq!(
+            harness
+                .adapter
+                .session_store
+                .list_index_entries()
+                .await
+                .len(),
+            before
+        );
+        assert!(harness.agent_runners.read().await.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_disabled_legacy_instance_does_not_inherit_parent() {
+    let harness = routing_harness(Some(false)).await;
+    {
+        let mut config = harness.adapter.config.write().await;
+        config.defaults = None;
+        config.default_provider_instance = Some("child-c".into());
+        let instance = config.provider_instances.get_mut("child-c").unwrap();
+        instance.enabled = false;
+        instance.fast_model = Some("child-model".into());
+    }
+    let before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .len();
+    let error = invoke_completed(
+        &harness.tool,
+        create_args(&harness),
+        subagent_test_ctx(
+            &harness.parent_session_id,
+            "synthetic-disabled-legacy-child",
+        ),
+    )
+    .await
+    .expect_err("a disabled configured instance must not inherit the parent's model");
     assert!(error.to_string().contains("not admitted"), "{error}");
     assert_eq!(
         harness

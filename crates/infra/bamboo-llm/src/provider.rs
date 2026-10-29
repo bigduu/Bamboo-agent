@@ -11,8 +11,49 @@ use bamboo_domain::{CapabilityLoadingMode, ReasoningEffort};
 use bamboo_domain::{Message, ModelContextResetReason};
 use futures::Stream;
 use serde::Serialize;
+use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use thiserror::Error;
+
+/// Observes the concrete provider selected for one scoped main dispatch.
+/// Observation does not authorize the provider or prove a managed origin.
+#[doc(hidden)]
+pub type MainDispatchObserver = Arc<dyn Fn(Arc<dyn LLMProvider>) + Send + Sync>;
+
+tokio::task_local! {
+    static MAIN_DISPATCH_OBSERVER: MainDispatchObserver;
+}
+
+/// Scope one actual main dispatch attempt. The observer is not inherited by
+/// spawned tasks; a Host caller must reject a missing receipt rather than
+/// inferring an unmanaged route. Nested scopes restore their outer observer.
+#[doc(hidden)]
+pub async fn scope_main_dispatch<F: Future>(
+    observer: MainDispatchObserver,
+    future: F,
+) -> F::Output {
+    MAIN_DISPATCH_OBSERVER.scope(observer, future).await
+}
+
+/// Report the exact Arc selected by a forwarding boundary. Returns false if
+/// no observer was scoped in the current task; ordinary SDK calls keep their
+/// existing behavior and the Host owns the missing-receipt failure policy.
+#[doc(hidden)]
+pub fn observe_main_dispatch(selected: Arc<dyn LLMProvider>) -> bool {
+    MAIN_DISPATCH_OBSERVER
+        .try_with(|observer| observer(selected))
+        .is_ok()
+}
+
+/// Allocation identity for pairing delayed requests. Dynamic credentials
+/// inside an existing provider remain the provider owner’s responsibility.
+#[doc(hidden)]
+#[derive(Clone)]
+pub enum QueuedRouteIdentity {
+    Stable(Arc<dyn LLMProvider>),
+    Unmanaged,
+}
 
 /// Errors that can occur when working with LLM providers
 #[derive(Error, Debug)]
@@ -274,10 +315,75 @@ pub(crate) fn required_tool_from_options<'a>(
 /// ```
 #[async_trait]
 pub trait LLMProvider: Send + Sync {
+    /// An immutable downstream handle through which this wrapper sends every
+    /// chat request. This is separate from queue and allocation identity.
+    ///
+    /// Return `Some` only when every chat and IR method forwards the exact
+    /// unchanged model to this same handle, or refuses locally before any
+    /// dispatch, for the wrapper's entire lifetime. It must not replace the
+    /// model, bypass the handle, or asynchronously change the destination.
+    /// A mutable router or provider that can choose a different account must
+    /// return `None`.
+    /// Implementations are trusted in-process adapters: this is a behavior
+    /// contract, not a security boundary against dishonest implementations.
+    #[doc(hidden)]
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
+        None
+    }
+
+    /// Return the fixed provider explicitly injected into a Host while it is
+    /// still current. Mutable routers must never identify an inferred provider
+    /// as an injection; the default preserves existing SDK implementations.
+    #[doc(hidden)]
+    fn legacy_injected_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        Ok(None)
+    }
+
+    /// An already-known local routing refusal, when no request may be sent.
+    /// This query must be nonblocking and must not initiate a request.
+    /// The default preserves existing providers and SDK implementations.
+    /// Transparent provider wrappers should forward this to their inner handle.
+    #[doc(hidden)]
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        None
+    }
+
+    /// Whether this single-use target refused its request locally.
+    /// This is for evaluation lifecycle classification, never accounting or
+    /// authorization evidence. Implementations must not infer it from later state.
+    #[doc(hidden)]
+    fn local_dispatch_refused(&self) -> bool {
+        false
+    }
+
     /// Transparent Host decorators retain the original provider allocation's
     /// process-wide concurrency identity. This is never a model/client ID.
     fn resource_allocation_identity(&self) -> Option<usize> {
         None
+    }
+
+    /// True only for a Host route whose managed registry admitted the target.
+    /// An opaque SDK provider defaults to retaining its original Arc. This
+    /// cannot freeze credentials or other mutable state inside that provider;
+    /// SDK owners must keep those stable or implement the snapshot hook.
+    #[doc(hidden)]
+    fn queue_requires_current_route(&self) -> bool {
+        false
+    }
+
+    /// Underlying allocation used for pairing a delayed model and provider.
+    /// Transparent decorators should forward this unchanged. This identity
+    /// does not establish that dynamic credentials inside a provider are fixed.
+    #[doc(hidden)]
+    fn queued_route_identity(&self) -> QueuedRouteIdentity {
+        QueuedRouteIdentity::Unmanaged
+    }
+
+    /// Freeze only transparent mutable handles for delayed dispatch. An SDK
+    /// provider defaults to its existing Arc; it owns changes behind that Arc.
+    #[doc(hidden)]
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        Ok(None)
     }
 
     /// Effective Vision support. Missing declarations default to enabled;
@@ -439,6 +545,193 @@ pub trait LLMProvider: Send + Sync {
             .into_iter()
             .map(ProviderModelInfo::from_id)
             .collect())
+    }
+}
+
+/// Produce a stable, process-local identity for a known wrapper's inner Arc.
+#[doc(hidden)]
+pub fn queued_identity_for(provider: &Arc<dyn LLMProvider>) -> QueuedRouteIdentity {
+    match provider.queued_route_identity() {
+        QueuedRouteIdentity::Unmanaged => QueuedRouteIdentity::Stable(provider.clone()),
+        identity => identity,
+    }
+}
+
+/// Resolve a transparent mutable wrapper once, retaining the original outer
+/// Arc and its existing process-wide auxiliary-budget identity.
+#[doc(hidden)]
+pub fn queued_snapshot_for(provider: Arc<dyn LLMProvider>) -> Result<Arc<dyn LLMProvider>> {
+    match provider.queued_provider_snapshot()? {
+        Some(inner) => Ok(Arc::new(QueuedBudgetProvider {
+            inner,
+            require_current: provider.queue_requires_current_route(),
+            original: provider,
+            fixed_inner: false,
+        })),
+        None => Ok(provider),
+    }
+}
+
+/// Mark only a route admitted from a Host-managed registry snapshot.
+/// The original handle and its concurrency identity remain unchanged.
+#[doc(hidden)]
+pub fn mark_host_queued_route(provider: Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> {
+    Arc::new(QueuedBudgetProvider {
+        inner: provider.clone(),
+        original: provider,
+        require_current: true,
+        fixed_inner: false,
+    })
+}
+
+/// Retain the provider selected by a dispatch while using the original outer
+/// provider's process-wide auxiliary semaphore identity. This function does
+/// not prove origin or admission: callers must use an independent Host guard.
+/// It freezes the selected Arc, not mutable state or credentials inside it.
+#[doc(hidden)]
+pub fn fixed_provider_with_identity(
+    selected: Arc<dyn LLMProvider>,
+    original: Arc<dyn LLMProvider>,
+) -> Arc<dyn LLMProvider> {
+    Arc::new(QueuedBudgetProvider {
+        inner: selected,
+        original,
+        require_current: true,
+        fixed_inner: true,
+    })
+}
+
+/// Freeze the selected Arc for an explicitly injected provider while keeping
+/// its own queue policy and the original outer semaphore identity. This is not
+/// evidence of injection: the Host must have independently classified the
+/// exact selected Arc as injected before using this helper.
+#[doc(hidden)]
+pub fn fixed_injected_provider_with_identity(
+    selected: Arc<dyn LLMProvider>,
+    original: Arc<dyn LLMProvider>,
+) -> Arc<dyn LLMProvider> {
+    Arc::new(QueuedBudgetProvider {
+        inner: selected,
+        original,
+        require_current: false,
+        fixed_inner: true,
+    })
+}
+
+struct QueuedBudgetProvider {
+    inner: Arc<dyn LLMProvider>,
+    original: Arc<dyn LLMProvider>,
+    require_current: bool,
+    // A receipt-bound delegate must not later resnapshot a mutable wrapper.
+    fixed_inner: bool,
+}
+
+#[async_trait]
+impl LLMProvider for QueuedBudgetProvider {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
+        Some(self.inner.clone())
+    }
+
+    fn local_dispatch_refused(&self) -> bool {
+        self.inner.local_dispatch_refused()
+    }
+
+    fn queue_requires_current_route(&self) -> bool {
+        self.require_current || self.inner.queue_requires_current_route()
+    }
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        if self.fixed_inner {
+            return Ok(None);
+        }
+        let Some(inner) = self.inner.queued_provider_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            inner,
+            original: self.original.clone(),
+            require_current: self.require_current,
+            fixed_inner: false,
+        })))
+    }
+    fn queued_route_identity(&self) -> QueuedRouteIdentity {
+        queued_identity_for(&self.inner)
+    }
+    fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        Some(
+            self.original
+                .resource_allocation_identity()
+                .unwrap_or(Arc::as_ptr(&self.original) as *const () as usize),
+        )
+    }
+    async fn supports_vision(&self, model: &str) -> bool {
+        self.inner.supports_vision(model).await
+    }
+    async fn vision_support_override(&self, model: &str) -> Option<bool> {
+        self.inner.vision_support_override(model).await
+    }
+    async fn capability_loading_mode(
+        &self,
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> CapabilityLoadingMode {
+        self.inner
+            .capability_loading_mode(model, required_tool)
+            .await
+    }
+    async fn provider_visible_tool_footprint(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        model: &str,
+        required_tool: Option<&str>,
+    ) -> Result<ProviderVisibleToolFootprint> {
+        self.inner
+            .provider_visible_tool_footprint(ir, tools, model, required_tool)
+            .await
+    }
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream> {
+        self.inner
+            .chat_stream(messages, tools, max_output_tokens, model)
+            .await
+    }
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        self.inner
+            .chat_stream_with_options(messages, tools, max_output_tokens, model, options)
+            .await
+    }
+    async fn chat_stream_ir(
+        &self,
+        ir: &PromptIR,
+        tools: &[ToolSchema],
+        max_output_tokens: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream> {
+        self.inner
+            .chat_stream_ir(ir, tools, max_output_tokens, model, options)
+            .await
+    }
+    async fn list_models(&self) -> Result<Vec<String>> {
+        self.inner.list_models().await
+    }
+    async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>> {
+        self.inner.list_model_info().await
     }
 }
 
@@ -604,6 +897,162 @@ mod tests {
 
             Ok(Box::pin(stream::empty()))
         }
+    }
+
+    #[tokio::test]
+    async fn main_dispatch_scope_is_attempt_local_and_not_inherited_by_spawned_tasks() {
+        let a: Arc<dyn LLMProvider> = Arc::new(RecordingProvider::default());
+        let b: Arc<dyn LLMProvider> = Arc::new(RecordingProvider::default());
+        let outer_seen = Arc::new(Mutex::new(Vec::<Arc<dyn LLMProvider>>::new()));
+        let inner_seen = Arc::new(Mutex::new(Vec::<Arc<dyn LLMProvider>>::new()));
+        let outer_copy = outer_seen.clone();
+        let inner_copy = inner_seen.clone();
+        let outer: MainDispatchObserver =
+            Arc::new(move |provider| outer_copy.lock().unwrap().push(provider));
+        let inner: MainDispatchObserver =
+            Arc::new(move |provider| inner_copy.lock().unwrap().push(provider));
+
+        assert!(!observe_main_dispatch(a.clone()));
+        scope_main_dispatch(outer, async {
+            assert!(observe_main_dispatch(a.clone()));
+            let spawned_b = b.clone();
+            assert!(
+                !tokio::spawn(async move { observe_main_dispatch(spawned_b) })
+                    .await
+                    .unwrap(),
+                "a new task must not silently inherit an attempt receipt"
+            );
+            scope_main_dispatch(inner, async {
+                assert!(observe_main_dispatch(b.clone()));
+            })
+            .await;
+            assert!(observe_main_dispatch(a.clone()), "outer scope is restored");
+        })
+        .await;
+        assert!(
+            !observe_main_dispatch(b.clone()),
+            "scope must not leak after completion"
+        );
+        let outer = outer_seen.lock().unwrap();
+        assert_eq!(outer.len(), 2);
+        assert!(outer.iter().all(|provider| Arc::ptr_eq(provider, &a)));
+        let inner = inner_seen.lock().unwrap();
+        assert_eq!(inner.len(), 1);
+        assert!(Arc::ptr_eq(&inner[0], &b));
+    }
+
+    #[tokio::test]
+    async fn cancelling_scoped_main_attempt_does_not_install_a_later_observer() {
+        let selected: Arc<dyn LLMProvider> = Arc::new(RecordingProvider::default());
+        let observed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_copy = observed.clone();
+        let observer: MainDispatchObserver = Arc::new(move |_| {
+            observed_copy.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let run = tokio::spawn(scope_main_dispatch(observer, async move {
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        }));
+        ready.await.unwrap();
+        run.abort();
+        assert!(run.await.unwrap_err().is_cancelled());
+        assert!(!observe_main_dispatch(selected));
+        assert_eq!(observed.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    struct ResnapshottingProvider {
+        alternate: Arc<dyn LLMProvider>,
+        calls: std::sync::atomic::AtomicUsize,
+        require_current: bool,
+    }
+
+    #[async_trait]
+    impl LLMProvider for ResnapshottingProvider {
+        fn queue_requires_current_route(&self) -> bool {
+            self.require_current
+        }
+
+        fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+            Ok(Some(self.alternate.clone()))
+        }
+
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fixed_dispatch_delegate_keeps_selected_arc_and_outer_budget_identity() {
+        let b = Arc::new(RecordingProvider::default());
+        let a = Arc::new(ResnapshottingProvider {
+            alternate: b.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            require_current: false,
+        });
+        let selected: Arc<dyn LLMProvider> = a.clone();
+        let original: Arc<dyn LLMProvider> = Arc::new(RecordingProvider::default());
+        let expected_identity = Arc::as_ptr(&original) as *const () as usize;
+        let fixed = fixed_provider_with_identity(selected, original);
+        assert_eq!(
+            fixed.resource_allocation_identity(),
+            Some(expected_identity)
+        );
+        assert!(fixed.queue_requires_current_route());
+        let queued = queued_snapshot_for(fixed.clone()).unwrap();
+        assert!(
+            Arc::ptr_eq(&queued, &fixed),
+            "receipt-bound Arc must not be resnapshotted"
+        );
+        let _ = queued.chat_stream(&[], &[], None, "gold").await.unwrap();
+        assert_eq!(a.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(b.requested_models.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn injected_fixed_queue_keeps_a_when_current_selection_becomes_b() {
+        let a = Arc::new(RecordingProvider::default());
+        let b = Arc::new(RecordingProvider::default());
+        let original: Arc<dyn LLMProvider> = Arc::new(RecordingProvider::default());
+        let expected_identity = Arc::as_ptr(&original) as *const () as usize;
+        let queued = fixed_injected_provider_with_identity(a.clone(), original.clone());
+        let current = fixed_injected_provider_with_identity(b.clone(), original.clone());
+        assert!(!queued.queue_requires_current_route());
+        assert!(!current.queue_requires_current_route());
+        assert_eq!(
+            queued.resource_allocation_identity(),
+            Some(expected_identity)
+        );
+        assert_eq!(
+            current.resource_allocation_identity(),
+            Some(expected_identity)
+        );
+        let captured = queued_snapshot_for(queued.clone()).unwrap();
+        assert!(Arc::ptr_eq(&captured, &queued));
+        let _ = captured.chat_stream(&[], &[], None, "gold").await.unwrap();
+        assert_eq!(
+            *a.requested_models.lock().unwrap(),
+            vec!["gold".to_string()]
+        );
+        assert!(b.requested_models.lock().unwrap().is_empty());
+
+        let guarded_inner: Arc<dyn LLMProvider> = Arc::new(ResnapshottingProvider {
+            alternate: b,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            require_current: true,
+        });
+        let guarded = fixed_injected_provider_with_identity(guarded_inner, original);
+        assert!(
+            guarded.queue_requires_current_route(),
+            "the selected provider's own policy remains authoritative"
+        );
     }
 
     #[tokio::test]

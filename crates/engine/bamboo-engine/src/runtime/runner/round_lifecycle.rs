@@ -174,6 +174,7 @@ pub(crate) struct RoundLlmExecutionOutput {
     /// The pipeline must absorb `attempt_usage` before surfacing this error so
     /// a billed response is not turned into a zero-usage terminal round.
     pub terminal_validation_error: Option<AgentError>,
+    pub(crate) host_gold_attempt: Option<Arc<crate::runtime::host_gold::HostGoldAttempt>>,
 }
 
 /// Trusted execution-local prompt-memory snapshot paired with the stable
@@ -247,6 +248,8 @@ pub(crate) async fn execute_llm_round(
     observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
+    // Clear the previous receipt even when preflight or admission fails.
+    let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
     let request_tool_schemas =
         context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
@@ -281,15 +284,20 @@ pub(crate) async fn execute_llm_round(
         prompt_memory_exposure,
     };
 
-    let (stream_output, llm_duration, prompt_tokens) = stream_execution::execute_llm_stream(
+    let execution = stream_execution::execute_llm_stream(
         session,
         config,
         llm,
         &prepared.prepared_context,
         tool_schemas,
         &frame,
-    )
-    .await?;
+    );
+    let (stream_output, llm_duration, prompt_tokens) = match host_gold_attempt.as_ref() {
+        Some(attempt) => {
+            bamboo_llm::provider::scope_main_dispatch(attempt.observer(), execution).await?
+        }
+        None => execution.await?,
+    };
 
     // This is a terminal validation error, but the completed stream was still
     // billed. Return it alongside the canonical attempt usage so the runner can
@@ -323,6 +331,7 @@ pub(crate) async fn execute_llm_round(
         completion_tokens,
         attempt_usage,
         terminal_validation_error,
+        host_gold_attempt,
     })
 }
 
@@ -477,9 +486,9 @@ mod tests {
                 let offered =
                     request_tool_schemas_for_loading_mode(&supervisor, &schemas, mode, None);
                 let expected = if mode == CapabilityLoadingMode::StickyFallback {
-                    vec!["Read", "discover_capabilities"]
+                    vec!["discover_capabilities"]
                 } else {
-                    vec!["Read", "SubAgent", "session_control", "session_history"]
+                    vec!["SubAgent", "session_control", "session_history"]
                 };
                 assert_eq!(
                     offered

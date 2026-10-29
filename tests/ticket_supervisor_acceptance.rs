@@ -520,10 +520,10 @@ async fn actual_supervisor_rejects_reworks_verifies_and_waits_for_exact_user_acc
     f.finish().await;
 }
 
-// Standard permits ordinary chat. An explicit thread requests formal Ticket
-// ingress, which still requires Supervisor orchestration authority.
+// Standard permits plain chat and explicitly referenced Work ingress under the
+// same canonical Supervisor role. Admission alone must not execute a Worker.
 #[actix_web::test]
-async fn standard_supervisor_ticket_gate_refuses_formal_chat_without_publishing_work_or_human() {
+async fn standard_supervisor_keeps_plain_chat_separate_and_replays_explicit_work_ingress() {
     let f = Fixture::new().await;
     select_mode(&f, "standard").await;
     let store = SessionStoreV2::new(f.data.clone()).await.unwrap();
@@ -532,6 +532,8 @@ async fn standard_supervisor_ticket_gate_refuses_formal_chat_without_publishing_
         .await
         .unwrap()
         .unwrap();
+    assert!(!before.root_orchestration_only_enabled());
+    assert_eq!(before.supervisor_orchestration_revision(), Some(1));
     let head = f
         .data
         .join("tickets")
@@ -539,35 +541,62 @@ async fn standard_supervisor_ticket_gate_refuses_formal_chat_without_publishing_
         .join("HEAD");
     let published_before = std::fs::read(&head).unwrap();
     let scope = get(&f.client, &f.base, "/tickets/scope").await;
-    assert_eq!(scope["available"], false);
+    assert_eq!(scope["available"], true, "{scope}");
+
+    let plain = post(
+        &f.client,
+        &f.base,
+        "/chat",
+        &json!({
+            "session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":"standard-plain-human",
+            "message":"Ordinary Standard chat without a Work reference.",
+            "model":"ticket-model","provider":"openai"
+        }),
+    )
+    .await;
+    assert_eq!(plain["message_id"], "standard-plain-human");
+    assert!(plain["ingress_seq"].is_u64());
     assert_eq!(
-        scope["availability"]["reason_code"],
-        "supervisor_mode_required"
+        std::fs::read(&head).unwrap(),
+        published_before,
+        "plain Standard chat cannot manufacture a formal Work Human"
     );
-    let response = f
-        .client
-        .post(format!("{}/chat", f.base))
-        .json(&json!({
-            "session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":"standard-refused-human",
-            "thread_id":"standard-refused-formal-thread",
-            "message":format!("Create and start {TITLE}"),"model":"ticket-model","provider":"openai"
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
-    let body: Value = response.json().await.unwrap();
-    assert!(body["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("Supervisor orchestration authority required"));
+
+    let request = json!({
+        "session_id":DEFAULT_SUPERVISOR_SESSION_ID,"message_id":"standard-formal-human",
+        "thread_id":"standard-formal-thread",
+        "message":format!("Create and start {TITLE}"),"model":"ticket-model","provider":"openai"
+    });
+    let admitted = post(&f.client, &f.base, "/chat", &request).await;
+    assert_eq!(admitted["message_id"], "standard-formal-human");
+    assert!(admitted["ingress_seq"].is_u64());
+    let published_formal = std::fs::read(&head).unwrap();
+    assert_ne!(
+        published_formal, published_before,
+        "explicit Work ingress must durably register its Human before execution"
+    );
+    let replay = post(&f.client, &f.base, "/chat", &request).await;
+    assert_eq!(replay["message_id"], admitted["message_id"]);
+    assert_eq!(replay["ingress_seq"], admitted["ingress_seq"]);
+    assert_eq!(
+        std::fs::read(&head).unwrap(),
+        published_formal,
+        "an exact referenced retry cannot publish another Human or Ticket commit"
+    );
+
     let after = store
         .load_session(DEFAULT_SUPERVISOR_SESSION_ID)
         .await
         .unwrap()
         .unwrap();
-    // First chat may initialize the ordinary system prompt before admission.
-    // It must not publish the refused Human, assistant/tool work, or Ticket state.
+    assert_eq!(
+        after.supervisor_incarnation_id(),
+        before.supervisor_incarnation_id()
+    );
+    assert_eq!(after.supervisor_orchestration_revision(), Some(1));
+    assert!(!after.root_orchestration_only_enabled());
+    // The real Inbox owns these pending User turns. HTTP admission must not
+    // append a second transcript turn or execute formal Work by itself.
     let transcript = |session: &bamboo_domain::Session| {
         serde_json::to_value(
             session
@@ -579,7 +608,8 @@ async fn standard_supervisor_ticket_gate_refuses_formal_chat_without_publishing_
         .unwrap()
     };
     assert_eq!(transcript(&after), transcript(&before));
-    assert_eq!(std::fs::read(&head).unwrap(), published_before);
+    let overview = get(&f.client, &f.base, "/tickets/overview").await;
+    assert_eq!(overview["data"]["work_count"], 0);
     assert_eq!(f.probe.root_calls.load(Ordering::SeqCst), 0);
     assert_eq!(f.probe.calls.load(Ordering::SeqCst), 0);
     f.finish().await;

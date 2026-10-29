@@ -55,8 +55,9 @@ impl ChildSessionAdapter {
             ));
         }
         dispatch.max_rounds = policy.max_rounds;
-        let (binding, parent) = ticket_runtime::verified_scope_binding(
+        let (binding, parent) = ticket_runtime::verified_scope_binding_for_service(
             self.storage.as_ref(),
+            &service,
             &dispatch.binding.supervisor_session_id,
         )
         .await?;

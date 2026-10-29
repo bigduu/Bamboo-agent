@@ -90,7 +90,7 @@ async fn linked(store: &SessionStoreV2, reference: &SupervisorReference, id: &st
 }
 
 #[tokio::test]
-async fn supervisor_management_requires_explicit_scope_and_preserves_two_existing_roots() {
+async fn supervisor_management_preserves_legacy_metadata_and_default_two_project_access() {
     let (_home, store, reference) = fixture().await;
     let a = target(&store, "target-a", "project-a").await;
     let b = target(&store, "target-b", "project-b").await;
@@ -147,7 +147,10 @@ async fn supervisor_management_requires_explicit_scope_and_preserves_two_existin
     assert_eq!(link.target_metadata_version, a.metadata_version);
     assert_eq!(link.target_project_id.as_str(), "project-a");
     change(&store, &reference, 3, detach(&a.id)).await.unwrap();
-    assert!(!linked(&store, &reference, &a.id).await);
+    assert!(
+        linked(&store, &reference, &a.id).await,
+        "legacy detach does not revoke the current-user role"
+    );
     assert!(linked(&store, &reference, &b.id).await);
     assert_eq!(files(&store, &a.id).await, before_a);
     assert_eq!(files(&store, &b.id).await, before_b);
@@ -218,7 +221,8 @@ async fn supervisor_management_independent_store_cas_has_one_winner_and_explicit
 }
 
 #[tokio::test]
-async fn supervisor_management_scope_regrant_metadata_aba_and_new_birth_require_reattach() {
+async fn supervisor_management_legacy_links_remain_historical_while_default_reads_resolve_current_birth(
+) {
     let (_home, store, reference) = fixture().await;
     let mut a = target(&store, "target-a", "project-a").await;
     change(&store, &reference, 0, scope(&["project-a", "project-b"]))
@@ -239,7 +243,7 @@ async fn supervisor_management_scope_regrant_metadata_aba_and_new_birth_require_
     change(&store, &reference, 3, scope(&["project-a", "project-b"]))
         .await
         .unwrap();
-    assert!(!linked(&store, &reference, &a.id).await);
+    assert!(linked(&store, &reference, &a.id).await);
     assert_eq!(
         change(&store, &reference, 4, attach(&a.id))
             .await
@@ -251,17 +255,24 @@ async fn supervisor_management_scope_regrant_metadata_aba_and_new_birth_require_
         a.set_project_id_meta(project);
         a.metadata_version += 1;
         store.save_session(&a).await.unwrap();
-        assert!(!linked(&store, &reference, &a.id).await);
+        assert!(linked(&store, &reference, &a.id).await);
     }
     change(&store, &reference, 5, attach(&a.id)).await.unwrap();
     assert!(linked(&store, &reference, &a.id).await);
     a.title = "unrelated metadata change".into();
     a.metadata_version += 1;
     store.save_session(&a).await.unwrap();
-    assert!(!linked(&store, &reference, &a.id).await);
+    assert!(linked(&store, &reference, &a.id).await);
     change(&store, &reference, 6, attach(&a.id)).await.unwrap();
+    let original_target = store
+        .inspect_supervisor_current_user_target(&reference, &a.id)
+        .await
+        .unwrap();
     store.delete_session(&a.id).await.unwrap();
-    assert!(!linked(&store, &reference, &a.id).await);
+    assert!(store
+        .inspect_supervisor_link(&reference, &a.id)
+        .await
+        .is_err());
     let mut replacement = store
         .recreate_root_session(&a.id, "new-model")
         .await
@@ -269,7 +280,11 @@ async fn supervisor_management_scope_regrant_metadata_aba_and_new_birth_require_
     replacement.set_project_id_meta("project-a");
     replacement.metadata_version += 1;
     store.save_session(&replacement).await.unwrap();
-    assert!(!linked(&store, &reference, &a.id).await);
+    assert!(linked(&store, &reference, &a.id).await);
+    assert!(
+        !original_target.matches(&replacement),
+        "a current default read does not revive an old target intent"
+    );
     change(&store, &reference, 7, attach(&a.id)).await.unwrap();
     assert!(linked(&store, &reference, &a.id).await);
     assert_eq!(
@@ -412,7 +427,7 @@ async fn supervisor_management_stale_raw_saves_fail_merges_adopt_and_copies_drop
         }
         assert!(published.load(Ordering::SeqCst));
         assert_eq!(candidate.supervisor_management, expected);
-        assert!(!linked(&store, &reference, "target-a").await);
+        assert!(linked(&store, &reference, "target-a").await);
     }
     let copy = store
         .copy_session(&reference.session_id, "ordinary-copy")
@@ -459,7 +474,10 @@ async fn supervisor_management_damage_fails_closed_but_target_damage_cannot_bloc
             let revoked = change(&store, &reference, 2, detach("target-a")).await;
             assert_eq!(revoked.is_err(), supervisor_damaged);
             if !supervisor_damaged {
-                assert!(!linked(&store, &reference, "target-a").await);
+                assert!(store
+                    .inspect_supervisor_link(&reference, "target-a")
+                    .await
+                    .is_err());
                 let unchanged = change(&store, &reference, 3, detach("target-a"))
                     .await
                     .unwrap();

@@ -185,6 +185,817 @@ async fn agent_loop_passes_session_id_into_tool_execution_context() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn agent_loop_explicit_gold_requires_managed_account_admission() {
+    use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+    use bamboo_domain::ProviderModelRef;
+    use bamboo_llm::{Config, ProviderRegistry};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    let account_a = MockServer::start().await;
+    let account_b = MockServer::start().await;
+    let main_calls = Arc::new(AtomicUsize::new(0));
+    let main_counter = main_calls.clone();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(move |request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let model = body["model"].as_str().unwrap();
+            let (delta, delay) = match model {
+                "main-a" if main_counter.fetch_add(1, Ordering::SeqCst) % 2 == 0 => (
+                    json!({"tool_calls": [{
+                        "index": 0, "id": "fixture-update-goal", "type": "function",
+                        "function": {
+                            "name": "update_goal",
+                            "arguments": json!({"status": "complete"}).to_string()
+                        }
+                    }]}),
+                    false,
+                ),
+                "main-a" => (json!({"content": "synthetic done"}), true),
+                "explicit-gold" => (
+                    json!({"tool_calls": [{
+                        "index": 0, "id": "fixture-gold", "type": "function",
+                        "function": {
+                            "name": "report_gold_evaluation",
+                            "arguments": json!({
+                                "decision": "achieved",
+                                "confidence": "high",
+                                "reasoning": "synthetic goal verified",
+                                "missing_information": []
+                            }).to_string()
+                        }
+                    }]}),
+                    false,
+                ),
+                _ => panic!("unexpected model in synthetic account A: {model}"),
+            };
+            let frame = json!({
+                "id": "synthetic-routing",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": model,
+                "choices": [{"index": 0, "delta": delta, "finish_reason": null}]
+            });
+            let response = ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"));
+            if delay {
+                // The post-round evaluation is detached. Hold the second main
+                // response so it can be observed before run finalization.
+                response.set_delay(Duration::from_secs(1))
+            } else {
+                response
+            }
+        })
+        .mount(&account_a)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&account_b)
+        .await;
+
+    let root = tempfile::tempdir().expect("isolated provider data directory");
+    let mut config = Config::default();
+    config.provider = "chat-a".into();
+    config.default_provider_instance = Some("chat-a".into());
+    config.http_proxy = "http://127.0.0.1:9".into();
+    config.https_proxy.clear();
+    config.proxy_auth = None;
+    config.defaults = Some(
+        serde_json::from_value(json!({
+            "chat": {"provider": "chat-a", "model": "main-a"},
+            "fast": {"provider": "fast-b", "model": "cheap-b"}
+        }))
+        .unwrap(),
+    );
+    for (id, model, endpoint, admitted) in [
+        (
+            "chat-a",
+            "main-a",
+            account_a.uri(),
+            vec!["main-a", "explicit-gold"],
+        ),
+        ("fast-b", "cheap-b", account_b.uri(), vec!["cheap-b"]),
+    ] {
+        config.provider_instances.insert(
+            id.into(),
+            serde_json::from_value(json!({
+                "provider_type": "openai",
+                "enabled": true,
+                "api_key": "synthetic-only-not-a-credential",
+                "base_url": endpoint,
+                "model": model,
+                "runtime_models": admitted
+            }))
+            .unwrap(),
+        );
+    }
+    let registry = Arc::new(
+        ProviderRegistry::from_config(&config, root.path().to_path_buf())
+            .await
+            .expect("synthetic managed registry"),
+    );
+    let main_ref = ProviderModelRef::new("chat-a", "main-a");
+    let gold_ref = ProviderModelRef::new("chat-a", "explicit-gold");
+    let main = registry
+        .provider_for_configured_model(&config, &main_ref)
+        .expect("main model is admitted on A");
+    assert!(registry
+        .provider_for_configured_model(&config, &gold_ref)
+        .is_ok());
+
+    // The closure exercises the same shared role resolvers as the Host, while
+    // the genuine runner executes both Gold checkpoint consumers.
+    let live_config = Arc::new(tokio::sync::RwLock::new(config));
+    let resolver_config = live_config.clone();
+    let resolver_registry = registry.clone();
+    let resolver = Arc::new(move || {
+        let config = resolver_config.try_read().unwrap();
+        let areas =
+            crate::model_areas::resolve_global_area_models(&config, "chat-a", &resolver_registry);
+        let (fast_model_name, fast_model_provider) =
+            crate::model_config_helper::resolve_fast_model_for_runner(
+                Some(&config),
+                "chat-a",
+                &resolver_registry,
+            );
+        AuxiliaryModelConfig {
+            fast_model_name,
+            fast_model_provider,
+            background_model_name: areas
+                .background
+                .as_ref()
+                .map(|target| target.model_name.clone()),
+            background_model_provider: areas.background.map(|target| target.provider),
+            summarization_model_name: areas
+                .summarization
+                .as_ref()
+                .map(|target| target.model_name.clone()),
+            summarization_model_provider: areas.summarization.map(|target| target.provider),
+            summarization_model_error: areas.summarization_error,
+            ..Default::default()
+        }
+    });
+    // Model the Host's per-run binding using the exact same guarded target,
+    // leaving SDK runs without this hook unchanged.
+    let gold_config_handle = live_config.clone();
+    let gold_registry = registry.clone();
+    let gold_expected = main.clone();
+    let gold_resolver = Arc::new(move |model: &str, delegate: Arc<dyn LLMProvider>| {
+        bamboo_llm::gold_admission::guarded_gold_target(
+            gold_config_handle.clone(),
+            gold_registry.clone(),
+            ProviderModelRef::new("chat-a", model),
+            gold_expected.clone(),
+            delegate,
+        )
+    });
+    let mut request_offset = 0usize;
+    for revoked in [false, true] {
+        if revoked {
+            let mut current = live_config.write().await;
+            current
+                .provider_instances
+                .get_mut("chat-a")
+                .unwrap()
+                .extra
+                .insert("runtime_models".into(), json!(["main-a"]));
+            assert!(registry
+                .provider_for_configured_model(&current, &main_ref)
+                .is_ok());
+            assert!(registry
+                .provider_for_configured_model(&current, &gold_ref)
+                .is_err());
+            assert!(Arc::ptr_eq(&main, &registry.get("chat-a").unwrap()));
+        }
+        let before_main = main_calls.load(Ordering::SeqCst);
+        let mut session = Session::new(
+            if revoked {
+                "gold-revoked"
+            } else {
+                "gold-admitted"
+            },
+            "main-a",
+        );
+        session.model_ref = Some(main_ref.clone());
+        let (event_tx, _event_rx) = mpsc::channel(128);
+        let loop_config = AgentLoopConfig {
+            model_name: Some("main-a".into()),
+            provider_name: Some("chat-a".into()),
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("synthetic goal".into()),
+                model_name: Some("explicit-gold".into()),
+                ..Default::default()
+            }),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            auxiliary_model_resolver: Some(resolver.clone()),
+            gold_target_resolver: Some(gold_resolver.clone()),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(4),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            super::run_agent_loop_with_config(
+                &mut session,
+                "synthetic request".into(),
+                event_tx,
+                main.clone(),
+                Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+                CancellationToken::new(),
+                loop_config,
+            ),
+        )
+        .await
+        .expect("synthetic real runner must finish")
+        .expect("synthetic foreground run must succeed");
+        assert_eq!(main_calls.load(Ordering::SeqCst) - before_main, 2);
+        let requests = account_a.received_requests().await.unwrap();
+        let recent = &requests[request_offset..];
+        request_offset = requests.len();
+        let gold: Vec<_> = recent
+            .iter()
+            .filter(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                    == "explicit-gold"
+            })
+            .collect();
+        assert!(account_b.received_requests().await.unwrap().is_empty());
+        if revoked {
+            assert!(
+                gold.is_empty(),
+                "revoked explicit Gold model must not dispatch; got {} requests",
+                gold.len()
+            );
+        } else {
+            for checkpoint in ["checkpoint=post_round", "checkpoint=terminal"] {
+                assert!(
+                    gold.iter().any(|request| {
+                        String::from_utf8_lossy(&request.body).contains(checkpoint)
+                    }),
+                    "admitted explicit Gold must reach {checkpoint} on A"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn agent_loop_gold_checkpoints_keep_provider_and_model_paired() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+    use bamboo_domain::ProviderModelRef;
+    use bamboo_llm::{LLMRequestOptions, ProviderRegistry};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PairProvider {
+        account: &'static str,
+        main_calls: AtomicUsize,
+        evaluations: Arc<std::sync::Mutex<Vec<(String, String, String)>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for PairProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.chat_stream_with_options(messages, tools, max, model, None)
+                .await
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            let purpose = options
+                .and_then(|value| value.request_purpose.as_deref())
+                .unwrap_or("agent_loop");
+            if purpose == "gold_evaluation" {
+                let checkpoint = messages
+                    .iter()
+                    .find_map(|message| {
+                        if message.content.contains("checkpoint=post_round") {
+                            Some("post_round")
+                        } else if message.content.contains("checkpoint=terminal") {
+                            Some("terminal")
+                        } else {
+                            None
+                        }
+                    })
+                    .expect("Gold request has its checkpoint in the synthetic prompt");
+                self.evaluations.lock().unwrap().push((
+                    self.account.into(),
+                    model.into(),
+                    checkpoint.into(),
+                ));
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "synthetic-gold".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "report_gold_evaluation".into(),
+                        arguments: serde_json::json!({
+                            "decision": "achieved", "confidence": "high",
+                            "reasoning": "synthetic goal verified", "missing_information": []
+                        })
+                        .to_string(),
+                    },
+                };
+                return Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            assert_eq!(
+                self.account, "chat-a",
+                "only A may run the foreground agent"
+            );
+            assert_eq!(model, "main-a");
+            if self.main_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "synthetic-goal".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "update_goal".into(),
+                        arguments: r#"{"status":"complete"}"#.into(),
+                    },
+                };
+                return Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            // The real post-round evaluator is detached. Keep the foreground
+            // turn open until it calls a synthetic provider, so finalization
+            // cannot cancel it before this test observes the actual target.
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    let seen = self
+                        .evaluations
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(_, _, checkpoint)| checkpoint == "post_round");
+                    if seen {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("post-round Gold evaluation reaches a synthetic provider");
+            Ok(Box::pin(stream::iter([
+                Ok(LLMChunk::Token("synthetic done".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    let mut observations = Vec::new();
+    for explicit_gold in [false, true] {
+        let context = RoutingContext::new(None);
+        let snapshot = context.config.read().await.clone();
+        let evaluations = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let main = Arc::new(PairProvider {
+            account: "chat-a",
+            main_calls: AtomicUsize::new(0),
+            evaluations: evaluations.clone(),
+        });
+        let fast = Arc::new(PairProvider {
+            account: "fast-b",
+            main_calls: AtomicUsize::new(0),
+            evaluations: evaluations.clone(),
+        });
+        let providers: HashMap<String, Arc<dyn LLMProvider>> = HashMap::from([
+            ("chat-a".into(), main.clone() as Arc<dyn LLMProvider>),
+            ("fast-b".into(), fast as Arc<dyn LLMProvider>),
+        ]);
+        let registry = Arc::new(ProviderRegistry::new(providers, "chat-a".into()));
+        registry.set_runtime_models(HashMap::from([
+            (
+                "chat-a".into(),
+                vec!["main-a".into(), "explicit-gold".into()],
+            ),
+            ("fast-b".into(), vec!["cheap-b".into()]),
+        ]));
+        let resolver = Arc::new(move || {
+            let areas =
+                crate::model_areas::resolve_global_area_models(&snapshot, "chat-a", &registry);
+            AuxiliaryModelConfig {
+                fast_model_name: areas.fast.as_ref().map(|target| target.model_name.clone()),
+                fast_model_provider: areas.fast.map(|target| target.provider),
+                background_model_name: areas
+                    .background
+                    .as_ref()
+                    .map(|target| target.model_name.clone()),
+                background_model_provider: areas.background.map(|target| target.provider),
+                summarization_model_name: areas
+                    .summarization
+                    .as_ref()
+                    .map(|target| target.model_name.clone()),
+                summarization_model_provider: areas.summarization.map(|target| target.provider),
+                summarization_model_error: areas.summarization_error,
+                ..Default::default()
+            }
+        });
+        let mut session = Session::new("synthetic-gold-pair-session", "main-a");
+        session.model_ref = Some(ProviderModelRef::new("chat-a", "main-a"));
+        let (event_tx, _event_rx) = mpsc::channel(128);
+        let config = AgentLoopConfig {
+            model_name: Some("main-a".into()),
+            provider_name: Some("chat-a".into()),
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                auto_continue_enabled: true,
+                goal: Some("synthetic goal".into()),
+                model_name: explicit_gold.then(|| "explicit-gold".into()),
+                ..Default::default()
+            }),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            auxiliary_model_resolver: Some(resolver),
+            run_budget: bamboo_config::RunBudgetConfig {
+                max_rounds: Some(4),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        super::run_agent_loop_with_config(
+            &mut session,
+            "synthetic request".into(),
+            event_tx,
+            main.clone(),
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+            CancellationToken::new(),
+            config,
+        )
+        .await
+        .expect("synthetic goal loop should complete");
+        assert!(main.main_calls.load(Ordering::SeqCst) >= 2);
+        let mut observed = evaluations.lock().unwrap().clone();
+        observed.sort();
+        let (account, model) = if explicit_gold {
+            ("chat-a", "explicit-gold")
+        } else {
+            ("fast-b", "cheap-b")
+        };
+        let mut expected = vec![
+            (
+                account.to_string(),
+                model.to_string(),
+                "post_round".to_string(),
+            ),
+            (
+                account.to_string(),
+                model.to_string(),
+                "terminal".to_string(),
+            ),
+        ];
+        expected.sort();
+        observations.push((explicit_gold, observed, expected));
+    }
+    assert!(
+        observations
+            .iter()
+            .all(|(_, actual, expected)| actual == expected),
+        "each Gold checkpoint must use its configured account/model pair: {observations:#?}"
+    );
+}
+
+#[tokio::test]
+async fn agent_loop_rejects_explicit_invalid_fast_for_task_and_gold_evaluations() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig};
+    use bamboo_llm::LLMRequestOptions;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct SyntheticMain {
+        main_calls: AtomicUsize,
+        evaluations: std::sync::Mutex<Vec<(String, String)>>,
+        fast: Arc<crate::app_context::model_routing_test_support::CaptureProvider>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for SyntheticMain {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[bamboo_agent_core::tools::ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.chat_stream_with_options(messages, tools, max, model, None)
+                .await
+        }
+
+        async fn chat_stream_with_options(
+            &self,
+            _messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            model: &str,
+            options: Option<&LLMRequestOptions>,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            let purpose = options
+                .and_then(|value| value.request_purpose.as_deref())
+                .unwrap_or("agent_loop");
+            if matches!(purpose, "task_evaluation" | "gold_evaluation") {
+                self.evaluations
+                    .lock()
+                    .unwrap()
+                    .push((model.to_string(), purpose.to_string()));
+                return Err(LLMError::Api("synthetic evaluation refusal".into()));
+            }
+            if self.main_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                let call = bamboo_agent_core::tools::ToolCall {
+                    id: "task-write".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "Task".into(),
+                        arguments: serde_json::json!({
+                            "tasks": [{"content": "Synthetic work", "status": "in_progress",
+                                "activeForm": "Doing synthetic work"}]
+                        })
+                        .to_string(),
+                    },
+                };
+                return Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::ToolCalls(vec![call])),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            // Keep the real foreground loop alive until both post-round tasks
+            // have had a chance to reach their fake provider. A correct repair
+            // may dispatch neither, so the bounded wait must also expire.
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+                loop {
+                    let main_count = self.evaluations.lock().unwrap().len();
+                    let fast_count = self.fast.requests.lock().unwrap().len();
+                    if main_count + fast_count >= 2 {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            })
+            .await;
+            Ok(Box::pin(stream::iter([
+                Ok(LLMChunk::Token("synthetic done".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    for flag in [None, Some(false), Some(true)] {
+        for invalid in [false, true] {
+            let routing = RoutingContext::new(flag);
+            let mut config_snapshot = routing.config.read().await.clone();
+            // Preserve the old registry and target while the live config now
+            // rejects Fast; the valid run is the actual-consumer positive.
+            if invalid {
+                config_snapshot
+                    .provider_instances
+                    .get_mut("fast-b")
+                    .unwrap()
+                    .enabled = false;
+            }
+            assert!(routing.registry.get("fast-b").is_some());
+            let snapshot = Arc::new(std::sync::Mutex::new(config_snapshot));
+            let resolver_snapshot = snapshot.clone();
+            let registry = routing.registry.clone();
+            let resolver = Arc::new(move || {
+                let config = resolver_snapshot.lock().unwrap();
+                let areas =
+                    crate::model_areas::resolve_global_area_models(&config, "chat-a", &registry);
+                let (fast_model_name, fast_model_provider) =
+                    crate::model_config_helper::resolve_fast_model_for_runner(
+                        Some(&config),
+                        "chat-a",
+                        &registry,
+                    );
+                AuxiliaryModelConfig {
+                    fast_model_name,
+                    fast_model_provider,
+                    background_model_name: areas
+                        .background
+                        .as_ref()
+                        .map(|target| target.model_name.clone()),
+                    background_model_provider: areas.background.map(|target| target.provider),
+                    summarization_model_name: areas
+                        .summarization
+                        .as_ref()
+                        .map(|target| target.model_name.clone()),
+                    summarization_model_provider: areas.summarization.map(|target| target.provider),
+                    summarization_model_error: areas.summarization_error,
+                    ..Default::default()
+                }
+            });
+            let main = Arc::new(SyntheticMain {
+                main_calls: AtomicUsize::new(0),
+                evaluations: std::sync::Mutex::new(Vec::new()),
+                fast: routing.providers["fast-b"].clone(),
+            });
+            let tools = BuiltinToolExecutorBuilder::new()
+                .with_command_tool("Task")
+                .expect("register Task tool")
+                .build();
+            let mut session = Session::new("synthetic-evaluation-session", "main-a");
+            session.set_task_list(task_list_with_in_progress_item(
+                &session.id,
+                "Synthetic work",
+            ));
+            let (event_tx, _event_rx) = mpsc::channel(128);
+            let loop_config = AgentLoopConfig {
+                system_prompt: Some("synthetic system".into()),
+                model_name: Some("main-a".into()),
+                gold_config: Some(GoldConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                auxiliary_model_resolver: Some(resolver),
+                run_budget: bamboo_config::RunBudgetConfig {
+                    max_rounds: Some(3),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let outcome = super::run_agent_loop_with_config(
+                &mut session,
+                "synthetic goal".into(),
+                event_tx,
+                main.clone(),
+                Arc::new(tools),
+                CancellationToken::new(),
+                loop_config,
+            )
+            .await;
+            // Fail the fixture on unrelated runner errors: without an actual
+            // foreground round, a no-dispatch observation would be meaningless.
+            outcome.expect("synthetic foreground loop should complete");
+            assert!(main.main_calls.load(Ordering::SeqCst) >= 2);
+            let on_main = main.evaluations.lock().unwrap().clone();
+            let on_fast = routing.requests("fast-b");
+            if invalid {
+                assert!(on_main.is_empty() && on_fast.is_empty(),
+                    "explicit disabled Fast must not dispatch: flag={flag:?}, main={on_main:?}, fast={on_fast:?}");
+            } else {
+                assert!(
+                    on_main.is_empty(),
+                    "valid Fast must not use main account: {on_main:?}"
+                );
+                for purpose in ["task_evaluation", "gold_evaluation"] {
+                    assert!(
+                        on_fast
+                            .iter()
+                            .any(|(model, actual)| model == "cheap-b" && actual == purpose),
+                        "valid Fast must reach {purpose}: flag={flag:?}, fast={on_fast:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn runner_fast_selection_distinguishes_unset_from_rejected_route() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use crate::model_config_helper::resolve_fast_model_for_runner;
+
+    let routing = RoutingContext::new(None);
+    let config = routing.config.read().await.clone();
+    let (name, provider) =
+        resolve_fast_model_for_runner(Some(&config), "chat-a", &routing.registry);
+    let expected_provider: Arc<dyn LLMProvider> = routing.providers["fast-b"].clone();
+    assert_eq!(name.as_deref(), Some("cheap-b"));
+    assert!(Arc::ptr_eq(&provider.unwrap(), &expected_provider));
+
+    let mut disabled = config.clone();
+    disabled
+        .provider_instances
+        .get_mut("fast-b")
+        .unwrap()
+        .enabled = false;
+    let (name, provider) =
+        resolve_fast_model_for_runner(Some(&disabled), "chat-a", &routing.registry);
+    assert_eq!(name.as_deref(), Some("cheap-b"));
+    let provider = provider.expect("explicit refusal must not become an unset role");
+    for _ in 0..2 {
+        assert!(matches!(
+            provider.chat_stream(&[], &[], None, "cheap-b").await,
+            Err(LLMError::Auth(message)) if message.contains("disabled")
+        ));
+    }
+    assert!(matches!(
+        provider
+            .chat_stream_with_options(&[], &[], None, "cheap-b", None)
+            .await,
+        Err(LLMError::Auth(_))
+    ));
+    assert!(!provider.supports_vision("cheap-b").await);
+    assert!(provider.list_models().await.is_err());
+
+    let mut unadmitted = config.clone();
+    unadmitted
+        .provider_instances
+        .get_mut("fast-b")
+        .unwrap()
+        .extra
+        .insert(
+            "runtime_models".into(),
+            serde_json::json!(["different-model"]),
+        );
+    let (_, provider) =
+        resolve_fast_model_for_runner(Some(&unadmitted), "chat-a", &routing.registry);
+    assert!(matches!(
+        provider
+            .unwrap()
+            .chat_stream(&[], &[], None, "cheap-b")
+            .await,
+        Err(LLMError::Api(_))
+    ));
+
+    let mut missing = config.clone();
+    missing
+        .defaults
+        .as_mut()
+        .unwrap()
+        .fast
+        .as_mut()
+        .unwrap()
+        .provider = "missing-b".into();
+    let (_, provider) = resolve_fast_model_for_runner(Some(&missing), "chat-a", &routing.registry);
+    assert!(matches!(
+        provider
+            .unwrap()
+            .chat_stream(&[], &[], None, "cheap-b")
+            .await,
+        Err(LLMError::Auth(_))
+    ));
+
+    let mut malformed = config.clone();
+    malformed
+        .defaults
+        .as_mut()
+        .unwrap()
+        .fast
+        .as_mut()
+        .unwrap()
+        .model
+        .clear();
+    let (_, provider) =
+        resolve_fast_model_for_runner(Some(&malformed), "chat-a", &routing.registry);
+    assert!(matches!(
+        provider.unwrap().chat_stream(&[], &[], None, "").await,
+        Err(LLMError::Api(_))
+    ));
+
+    let empty = bamboo_llm::Config::default();
+    let (name, provider) =
+        resolve_fast_model_for_runner(Some(&empty), "no-such-provider", &routing.registry);
+    assert!(
+        name.is_none() && provider.is_none(),
+        "unset preserves legacy fallback"
+    );
+    let (name, provider) = resolve_fast_model_for_runner(None, "chat-a", &routing.registry);
+    assert!(name.is_none());
+    assert!(matches!(
+        provider
+            .unwrap()
+            .chat_stream(&[], &[], None, "main-a")
+            .await,
+        Err(LLMError::Api(_))
+    ));
+    routing.assert_no_requests();
+}
+
 #[tokio::test]
 async fn agent_loop_uses_refreshed_fast_model_for_between_round_task_evaluation() {
     struct RecordingRoundProvider {

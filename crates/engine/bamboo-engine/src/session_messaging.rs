@@ -1142,19 +1142,55 @@ impl SessionMessenger {
         }))
     }
 
-    /// Follow an already-attached Ordinary Root from the original executing
-    /// Supervisor. The concrete inbox revalidates and retains all authority
-    /// locks through durable admission; a prior inspect_link is never a grant.
+    /// Current-user management always retains the immutable selected target
+    /// and full original caller through the existing physical Inbox writer.
+    pub async fn supervisor_current_user_followup(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        operation_id: &str,
+        message: &str,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        Self::validate_peer_input(operation_id, message)?;
+        let envelope = SessionMessageEnvelope {
+            id: bamboo_domain::supervisor_current_user_message_id(supervisor, target, operation_id),
+            source: SessionMessageSource::Session {
+                session_id: caller.session_id.clone(),
+            },
+            target_session_id: target.session_id.clone(),
+            kind: SessionMessageKind::PeerMessage,
+            body: SessionMessageBody::Content(SessionMessageContent::text(message)),
+            created_at: chrono::Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: Some(operation_id.to_string()),
+        };
+        let started = Instant::now();
+        let delivery = self
+            .inbox
+            .deliver_supervisor_current_user_followup(caller, supervisor, target, &envelope)
+            .await
+            .map_err(SessionMessengerError::Inbox)?;
+        let admission = self.record_admission(envelope, delivery, started);
+        self.activate_prepared(&admission).await
+    }
+
+    /// Follow an originally observed Session from the canonical Supervisor.
+    /// Retain its birth across retries. The concrete Inbox revalidates all
+    /// authority under physical locks; a fresh ID lookup cannot replace it.
     pub async fn supervisor_followup(
         &self,
         supervisor: &SupervisorReference,
-        target_session_id: &str,
+        target: &Session,
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         self.supervisor_followup_delivery(
             supervisor,
-            target_session_id,
+            &target.id,
+            target.created_at,
             operation_id,
             message,
             None,
@@ -1168,13 +1204,14 @@ impl SessionMessenger {
         &self,
         caller: &SessionCallerReference,
         supervisor: &SupervisorReference,
-        target_session_id: &str,
+        target: &Session,
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         self.supervisor_followup_delivery(
             supervisor,
-            target_session_id,
+            &target.id,
+            target.created_at,
             operation_id,
             message,
             Some(caller),
@@ -1186,6 +1223,7 @@ impl SessionMessenger {
         &self,
         supervisor: &SupervisorReference,
         target_session_id: &str,
+        target_created_at: chrono::DateTime<chrono::Utc>,
         operation_id: &str,
         message: &str,
         original_caller: Option<&SessionCallerReference>,
@@ -1221,12 +1259,17 @@ impl SessionMessenger {
         let result = match original_caller {
             Some(caller) => {
                 self.inbox
-                    .deliver_unscoped_supervisor_followup(caller, supervisor, &envelope)
+                    .deliver_unscoped_supervisor_followup(
+                        caller,
+                        supervisor,
+                        target_created_at,
+                        &envelope,
+                    )
                     .await
             }
             None => {
                 self.inbox
-                    .deliver_supervisor_followup(supervisor, &envelope)
+                    .deliver_supervisor_followup(supervisor, target_created_at, &envelope)
                     .await
             }
         };

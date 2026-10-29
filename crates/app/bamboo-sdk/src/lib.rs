@@ -16,7 +16,7 @@ pub mod agent;
 // Mirror the public facade re-exports the root crate previously exposed.
 pub use agent::{
     inspect_loop, CountedLoopConfig, ExecuteRequestBuilder, LoopControlConfig, LoopControlReceipt,
-    LoopStatusSnapshot,
+    LoopStatusSnapshot, UpstreamRetry,
 };
 pub use agent::{
     Agent, AgentBuilder, AgentHook, AgentHookPoint, HookPayload, HookResult, HookRunner,

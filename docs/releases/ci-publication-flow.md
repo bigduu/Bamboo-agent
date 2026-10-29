@@ -1,227 +1,171 @@
 # CI and publication flow
 
-Read the complete local [delivery-flow/v1](../delivery-workflow.md) and
-[Actions audit](../ci-workflow-audit.md) first. These shared copies come from
-Zenith `28b6e0e`; this guide adds Bamboo's commands, configurations and test map.
-Use the same source checkpoint and original evidence when another agent takes
-over. Check current activation and actual runs; a prepared owner is not an
-accepted or published artifact.
+Use the same [delivery workflow](../delivery-workflow.md) and
+[Actions audit](../ci-workflow-audit.md) regardless of which agent owns the work.
+The current workflow files and branch protection are authoritative during rollout.
 
-This is the operating guide for Bamboo's CI and automatic release path. The
-[Release Process](../../CONTRIBUTING.md#release-process) remains authoritative
-for cuts, original-source repairs, protected admission and credentials.
-[Parallel Development](../../gitflow.md) defines ownership and local evidence.
+## Feature: test before dev
 
-## Phase contracts and activation
+Create a feature branch and PR to `dev`. Code CI runs Linux Unit and E2E in
+independently rerunnable test shards; native-platform cases are available by
+manual dispatch. Root and docs Markdown-only changes run Quick Checks. Fix failures on that feature branch before
+merging. Run focused local tests for changed behavior; retain the actual CI
+source and results for review.
 
-Feature admission is implemented by #2311. Required `Test` aggregates Unit, E2E
-and SSH runtime results on every dev PR. One physical Linux executor preserves
-independent default package configurations plus the recorder in one owned target
-directory. Ordinary library/binary, integration and documentation cases run once;
-explicit feature owners run only catalogued additions. The controller records
-each configuration's features/profile and actual compiled-artifact freshness.
-Serial storage and ignored SSH reuse their default context executables.
-Unit/E2E remain logical reporting groups. Applicable native acceptance runs before dev
-admission; the recorder's Linux lifecycle is already in the canonical executor.
-Ordinary Linux orchestration/context tests do not get separate compilation jobs.
-Fix failures in feature branches.
+Run each selection once for the same source, platform and configuration. Reuse
+compatible compiled test executables and frontend artifacts; do not add a second
+workflow that runs an already-owned selection. Different platform or feature
+configurations can require distinct outputs. A cache hit alone is not a test
+result.
 
-| Phase | Target contract | Activation |
-| --- | --- | --- |
-| Feature -> dev | Disjoint Unit/E2E, native acceptance and current review pass on the feature merge source. | Implemented by #2311. |
-| Release source | Freeze the exact tested dev cut and reserve one formal version with the existing allocator. | Pending release-source admission. |
-| Release artifacts | Stamp disposable checkouts; build/package/publish each native product once. No Unit/E2E repetition or product repairs. | Pending release-source admission. |
-| Main promotion | Verify the exact published source and retain tag, manifest/provenance hashes and publisher run in the promotion description. No build/test. | Pending release-source admission. |
+Ubuntu Quick Checks run the complete Supervisor, Lotus artifact and release
+frontend policy Node suites once. Manual Windows and macOS diagnostics run nine system cases:
+bounded file reading, canonical artifact paths, four process/listener binding
+cases, actual archive staging/preservation and both LF/CRLF Git/Bash guards.
+macOS checks real process ownership with `ps/lsof`; Windows checks the explicit
+unsupported-process-binding refusal instead of claiming native Host acceptance.
+The native runner selects their exact names with Node's built-in test runner and
+requires all nine successful executions with no failed, cancelled, skipped or
+todo cases. A renamed, missing or duplicated case fails the job. Platform-free
+protocol, manifest/hash and release-selection policies stay in Ubuntu Quick;
+the existing native Rust acceptance still runs separately.
 
-Keep source manifests at `0.0.0`. Immutable tags and Release manifests/provenance
-are the version/artifact record; do not move release HEAD to add a post-build
-JSON record. Before the first new cut, normally integrate current main ancestry
-into dev through a feature PR passing Unit/E2E. A repair returns through
-feature/dev and creates a fresh cut.
+`frontend-acceptance.yml` checks the embedded frontend package, build scripts and
+server resources. The relevant checks belong in feature CI; a standalone manual
+run is diagnosis, not another automatic release or Main test. Lotus browser E2E
+is a separate frontend test.
 
-The existing release suite and main-triggered publisher remain active until the
-separate source-admission cutover is accepted. The remaining sections document
-that temporary legacy route and historical recovery, not permission to skip its
-live gates. In that route release PRs still run complete acceptance, main CI
-reuses it, and the canonical publisher reserves the version and builds native
-assets after main. Preserve original proof/source/run identities throughout the
-migration. Do not trigger an unimplemented release route or add another publisher.
+The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
+`trusted-observer.yml` runs both Observer runtime selections in one feature job,
+reusing compatible compiled output and running the shared serde case once. The
+original subscription workflow remains available for manual diagnosis.
 
-Keep required check names stable. A missing, skipped, cancelled or failed
-selected dependency fails required `Test`. Native Cargo matrices keep
-`fail-fast: false` and independent failed-job reruns. More jobs or a cache hit
-alone do not prove a speedup; report compile/execution/queue timing separately.
+The canonical feature driver owns Planner's 12 Plan and 10 artifact library
+cases. It excludes only those ordinary library cases from the parallel run and
+executes each once with one test thread from the same package's already compiled
+binary. Each library keeps its own default dependency graph; no second Cargo
+compile is introduced. The independent Delegated Planner workflow still owns
+the distinct API-only real CLI pair and its original Clippy graphs.
 
-## Temporary legacy release and recovery procedure
+## Release: build the final artifacts
 
-## Freeze once and preserve source identities
+Create `release/<SHA>` at the accepted `dev` commit and keep that source fixed.
+The release workflow reserves an unused version, stamps it into a disposable
+publishing checkout, and builds each required platform binary once. Package the
+locked frontend and managed crates, then publish the original assets with the
+same version and tag. Do not run Unit/E2E or rebuild the frontend here.
 
-1. Finish the bounded changes through protected `dev` admission. Freshly read
-   actual dev HEAD, then record its UTC time, full SHA, tree and finite scope.
-2. Create `release/<that-40-character-SHA>` normally at that exact commit. Keep
-   dev open while the release owner validates this frozen candidate.
-3. Complete current-head/base review, the full promotion suite and the separate
-   original frontend-head contract: strict Clippy, the full locked build and the
-   three frontend packaging/build/runtime test targets. Backend test suites
-   belong to canonical CI. Record run URLs, actual tested source/tree, toolchain,
-   lockfile, features, profile and results.
-4. Use the normal two-parent release merge. Main admission authenticates that
-   exact merge and its completed pre-merge evidence. Do not update the release
-   with unrelated dev changes merely because dev advanced.
-5. For a necessary repair, record original fix `F`'s exact SHA/tree, affected local
-   tests and independent Code and Security review. Preserve `F` through normal
-   protected-dev integration `U`, then fast-forward the release to `F`. Complete
-   the mandatory full CI on the final release PR; an extra manual full CI on `F`
-   is optional diagnosis, not a second mandatory full run. Keep each source's
-   evidence separate and preserve the cut and original failure evidence.
+Once the new workflow is installed, dispatch it from protected `dev` with the
+frozen source and the feature PR and CI run that accepted that source:
 
-The release head, PR synthetic merge, final main merge and workflow controller
-are separate Git identities. Equal trees alone do not make their binaries or
-runtime metadata interchangeable. In particular, version stamping and
-commit-derived generated metadata remain bound to the actual formal build.
-This process reuses acceptance evidence; it does not publish an unversioned CI
-binary or a binary produced from another commit.
+```bash
+gh workflow run publish-crate.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_source_sha=$CUT_SHA" -f "feature_pr=$FEATURE_PR" \
+  -f "accepted_ci_run=$FEATURE_CI_RUN"
+```
 
-## Authenticate acceptance before publication
+The controller checks `release/<cut-sha>` and builds that source, even if `dev`
+has advanced. It does not build or test the controller revision. The allocator
+chooses the release version; use the resulting tag and original artifacts for
+promotion.
 
-The controller for `workflow_run` comes from protected default `dev`; the
-product source comes from the successful main-push CI event. Never assume the
-controller SHA is the product SHA. Establish authority before checking out or
-executing product code and before exposing publication credentials.
+Use the existing release allocator, credentials and recovery mechanisms. Keep
+publishing credentials out of test and build children that do not need them.
+If infrastructure fails, retain successful outputs and retry only the missing
+work with the same source/version. If a crate build may have started but its
+original archive and signed checksum cannot be confirmed, stop for recovery;
+do not rebuild it. A product fix goes through a feature branch and a new `dev`
+acceptance before a new release cut.
 
-Main admission and the automatic publisher must independently verify:
+### Fixed v2026.10.19 crate recovery
 
-- The same repository's normal merged release PR, exact base/head, ordered
-  two-parent main merge, unchanged reviewed release tree and cut ancestry.
-- The release head's normal admission into protected dev and current main
-  freshness. A direct main push or stale queued source cannot publish.
-- The actual latest applicable full release CI result, all required platform
-  jobs and `Promotion Source`, with completion strictly before the merge.
-  Never search past a newer failed exact-input run to find an older green one.
-- Original job/run attempts when successful jobs are retained by a failed-only
-  rerun. A partial rerun does not make earlier jobs execute again.
-- Historical empty-PR-association evidence only through the reviewed producer,
-  official check suite, executed workflow and checkout-free source-job proof.
-  A conflicting association, arbitrary log or self-described receipt cannot
-  grant publication authority.
+Issue #2371 handles only publisher [40613036533/attempt 1](https://github.com/bigduu/Bamboo-agent/actions/runs/40613036533), frozen source
+`4786b7db862cabbebce49e288da62b284ccf5b72`, version `2026.10.19` and draft
+Release `426156779`. The server upload failed with an indeterminate transport or
+response error after its archive and signed checksum were retained. Preserve all
+27 crate originals/checksums, the sealed `@bigduu/lotus-next@2026.10.24` frontend
+and all three successful native attempt-1 artifacts. A missing registry response
+does not authorize repackaging an existing original.
 
-API errors and unknown, missing, ambiguous or changed evidence fail closed.
-Historical full main CI keeps its original evidence contract. A skipped heavy
-job on the new main route cannot be accepted as an executed full test.
+After normal protected-Dev review and CI admission, select the exact reviewed
+controller commit and use the single-input recovery workflow:
 
-## One version and one publisher
+```bash
+gh workflow run recover-frozen-crate-release.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "expected_controller_sha=$REVIEWED_CONTROLLER_SHA"
+```
 
-Keep source manifests at `0.0.0`. The existing allocator reserves an unused
-`YYYY.M.N` version for one accepted source and frontend identity. Stamp only
-disposable publication/build checkouts and preserve external dependency locks.
-The locked frontend package, version, archive and manifest hashes remain fixed;
-registry fetch failures must not select a moving `latest` or another bundle.
+The workflow checks out controller and product separately, preserving its real
+runner/run/attempt identity. Authorization uses the read-only `github.token`.
+Restoration uses the existing release token to read the private draft because
+draft visibility with `contents: read` is not established. It authenticates the
+original state and writes only the sealed frontend locally, with no external
+write, npm download or repack.
+The existing Cargo sandbox then owns metadata and verification compilation after
+temporary version stamping and the original external-lock check. Only the final
+publish step executes external writes and receives the Cargo registry token.
 
-All production attempts share `bamboo-crate-publication`, with queued entries
-retained and cancellation disabled. Parallel platform jobs are build workers,
-not independent publishers or version allocators. Native workers receive no
-GitHub publication token, Cargo registry token or signing key.
+The controller reuses the retained server archive, or verifies its existing
+registry version. Only `bamboo-client-core`, `bamboo-tui` and `bamboo-agent` may be
+compiled for the first time, after proving they never began in the original run.
+Each verified original is persisted before its signed checksum and registry
+upload. Unknown, changed, pending or missing prior originals stop recovery.
 
-The current v2 executable contract requires macOS ARM, Linux x64 and Windows
-x64. Historical v1 sources retain their four-platform contract, including macOS
-Intel. The accepted source selects the contract; a dispatch or retry cannot
-remove a target. See [Shared Bamboo executables](shared-executable-assets.md).
+Success requires authenticated remote readback of `recovery2371.completed=true`
+with no pending write, while the Release remains draft, `receipt.completed=false`
+and `publisherRunId=40613036533`. This workflow does not allocate a version,
+retag, publish native assets or finalize the Release. Once that readback passes,
+retry the original publisher's failed crate job and its dependent finalizer;
+they reuse the three successful native attempt-1 outputs. Do not rerun all jobs
+or treat a local/policy check as completed production recovery.
 
-### Parallel execution and cache boundaries
+## Main and consumers
 
-`automatic` authenticates the main source, reserves the signed identity, and
-uploads `bamboo-prepared-frontend-attempt-<preparation-attempt>`. The independent
-`prepared_release` job output binds the original attempt, same run/controller,
-Release ID, source/tree, version, frontend hashes and selected platform contract.
-The transport itself grants no authority.
+Promote the release only after its required artifacts are published and checked.
+Main stores the stable source and version/tag references without another product
+build, Unit/E2E run or publication. Documentation and Docker consumers use the
+original release or feature artifacts where applicable; they must not rebuild a
+successful output simply to consume it.
 
-After preparation succeeds, `publish-crates` and `executables` both depend only
-on `automatic` and run concurrently. The crate worker authenticates fresh signed
-progress for that exact reservation without calling the allocator again. It
-cannot replace sealed frontend assets once workers have started. Native workers
-validate exactly two bounded regular frontend files, reject extras or symlinks,
-and verify the independent hashes before building. They need no draft-Release
-API access, signing key or publication token.
+After publication completes, Docker consumes the original Linux x64 binary.
+Linux ARM64 remains a separate image architecture and is built once from the
+same frozen source. Retried image jobs reuse their verified candidate digests.
 
-`publish-executables` joins `automatic`, `publish-crates` and `executables`.
-It still authenticates the completed public crate receipt and all required
-native outputs before publishing the final manifest. Failure in either branch
-cannot advertise a complete binary release.
+## Rollout and historical releases
 
-Native caches map `RUNNER_TEMP/bamboo-executable-target`. Cache compatibility
-includes the source profile, producer contract and target, together with the
-action's Rust toolchain, environment and Cargo input keys. Restore dependencies,
-then evict workspace executables, fingerprints and generated build outputs so
-the actual source/version regenerates its embedded frontend evidence. Preserve
-the source's compiler/profile/wrapper restrictions. Historical v1 and frozen
-restore-only sources do not write these caches.
+Land the feature and release workflow changes through the normal reviewed PR
+flow. GitHub selects a `workflow_run` listener from the default branch. At the
+time of this guide, the default is protected `dev`, so merging the listener into
+`dev` enables automatic Docker consumption even before Main is promoted. After
+the first publisher succeeds, check its corresponding Docker run before doing
+anything else. Do not manually dispatch a duplicate consumer. If a consumer run
+failed, recover its failed jobs in the same run and reuse its verified outputs
+when the installed controller can safely do so.
 
-Crate readiness and binary readiness are separate. A public crate Release is
-insufficient for desktop consumption until every asset required by its source
-contract and the final manifest have been uploaded and verified. Downstream
-consumers pin the actual version, source and hashes after that point.
+Automatic `workflow_run` events use read-only GitHub Actions cache access: they
+restore cached layers but do not export them. A protected Dev manual dispatch may
+export an optional cache; an export failure does not bypass image verification.
+If an older automatic controller failed because it attempted a cache export,
+wait for all its jobs to finish, preserve the failure and inspect each target's
+candidate and final image. After the reviewed controller fix reaches Dev, an
+exact-version/source manual recovery may reuse verified candidates and build
+only a failed target whose candidate is confirmed absent. Unknown registry state
+or a missing candidate for an already completed image stops recovery.
 
-### Crate worker disk lifecycle
+If the expected automatic run is confirmed missing, or the failed-controller
+recovery above applies, recheck the live default branch and installed listener.
+Use the existing recovery flow for its exact version and source:
 
-The credential-free Cargo worker measures free space and its private debug
-scratch before and after packaging. It reclaims only that worker's
-`data/target/debug` tree when free space drops below 2 GiB or debug scratch
-exceeds 8 GiB. It preserves source, staged `.crate` archives, package output,
-registry cache and signed publication receipts. Startup measurements describe
-the same private target filesystem; this is separate from GitHub's persistent
-Actions cache storage.
+```bash
+gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "version=$RELEASE_VERSION" -f "source=$CUT_SHA"
+```
 
-A package command that exits normally with Cargo status 101 and an explicit
-ENOSPC diagnostic may reclaim debug scratch and retry the same package once.
-Other errors, interrupted or unknown container outcomes, and a second ENOSPC
-remain failures. This recovery does not repeat an upload, reserve a version or
-change the archive checksum. Worker permission cleanup covers only its own
-non-symlink files and preserves Cargo's exit status.
+Recheck the live default branch, installed listener and actual runs before
+recovery; a staged branch alone does not activate a listener.
 
-`Release Cargo Isolation` exercises this path with a tiny Cargo package and a
-private 128 MiB Linux tmpfs. It fills that mount to real ENOSPC, checks one
-successful recovery and exact reserved bytes, and replaces only the final
-network uploader with a fixture. Ordinary sandbox tests also cover bounded
-retry, non-space failures and symlink rejection. Release timing improvements
-must be measured on a later accepted production run.
-
-## Failure and recovery
-
-- Preserve the original failed run, source and reservation. Retry the same
-  identity; do not allocate a new version to hide a partial failure.
-- Prefer failed-job reruns when supported, retaining successful native outputs
-  and their actual attempt numbers. A full rerun must respect existing signed
-  checkpoints and immutable asset identities.
-- Select frontend transport using the successful preparation's original attempt,
-  not the retrying job's current attempt. Native transport retention is bounded;
-  missing expired inputs require the normal verified rebuild route.
-- If the same main CI run is retried, fresh admission may advance only that
-  run's attempt while preserving all source and pre-merge bindings. Keep original
-  signed reservation/checkpoint attempts intact; never relabel them as new work.
-- After an uncertain upload, read back the exact remote identity before retrying.
-  Existing identical bytes may be reused; conflicting bytes stop publication.
-- Complete only missing authorized assets. Never replace an uploaded asset,
-  move a frozen tag, re-sign foreign evidence or substitute a locally rebuilt
-  binary for the original accepted one.
-- Cancel only runs owned by this workstream or explicitly handed to its owner.
-  Do not borrow another release's runner window, output directory or cache writer.
-
-## Activate and measure
-
-Land workflow and verifier changes through a reviewed PR to protected dev,
-including executable positive/negative policy and authority tests. Preserve
-current full acceptance on the next normally scoped frozen release; do not
-advance an active frozen branch just to activate tooling.
-
-Before promotion, verify the actual current required checks and workflow
-definitions. Review changes to pinned historical producers as authority changes.
-After promotion, record the lightweight main run, canonical publisher run,
-reserved source/version/frontend, platform receipts and final manifest identity.
-
-Compare actual critical-path and step timings against a recorded baseline.
-Cache restoration alone is not acceleration evidence, and synthetic policy tests
-do not establish native builds or production publication. This document records
-the workflow contract; each release still needs its own real acceptance evidence.
+Keep old release tags, source identities, signed receipts and recovery inputs.
+Their original instructions remain in the [historical guide](https://github.com/bigduu/Bamboo-agent/blob/ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2/docs/releases/ci-publication-flow.md).
 
 ### Recorded baseline
 

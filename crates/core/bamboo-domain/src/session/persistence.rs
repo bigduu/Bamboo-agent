@@ -456,6 +456,32 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         self.save_runtime_session(session).await
     }
 
+    /// Bound execution only; unsupported/custom adapters cannot authorize a
+    /// continuation by falling back to generic checkpoint or snapshot reads.
+    async fn checkpoint_live_bootstrap(
+        &self,
+        _session: &Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _gate: crate::AdmissionGate,
+    ) -> io::Result<crate::LiveBootstrapProof> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live bootstrap checkpoint unsupported",
+        ))
+    }
+
+    async fn confirm_live_bootstrap(
+        &self,
+        _proof: &crate::LiveBootstrapProof,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _publish: crate::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live bootstrap confirmation unsupported",
+        ))
+    }
+
     /// Only the existing owner may claim structured Loop inputs. Unsupported
     /// adapters do not fall back to ordinary provider-message admission.
     async fn claim_scoped_loop_controls(
@@ -815,6 +841,26 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).checkpoint_runtime_session(session).await
+    }
+
+    async fn checkpoint_live_bootstrap(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        gate: crate::AdmissionGate,
+    ) -> io::Result<crate::LiveBootstrapProof> {
+        (**self)
+            .checkpoint_live_bootstrap(session, inbox, gate)
+            .await
+    }
+
+    async fn confirm_live_bootstrap(
+        &self,
+        proof: &crate::LiveBootstrapProof,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        publish: crate::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        (**self).confirm_live_bootstrap(proof, inbox, publish).await
     }
 
     async fn claim_scoped_loop_controls(
