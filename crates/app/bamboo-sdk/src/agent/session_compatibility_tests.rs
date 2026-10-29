@@ -1023,7 +1023,7 @@ async fn routing_review_loopback_endpoint(
 
 #[tokio::test]
 async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source_race() {
-    for entry in ["run_session", "execute"] {
+    for entry in ["run_session", "execute", "execute_override"] {
         // The unswitched control establishes that this exact fixture actually
         // reaches A; an unrelated startup failure cannot count as race coverage.
         for change in ["none", "legacy", "same-instance", "disabled", "unadmitted"] {
@@ -1079,6 +1079,7 @@ async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source
             let mut session = Session::new(format!("synthetic-routing-race-{entry}"), "main-a");
             session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
             session.add_message(Message::user("Synthetic routing race"));
+            let override_probe = Arc::new(Probe::default());
             let outcome = if entry == "run_session" {
                 tokio::time::timeout(
                     std::time::Duration::from_secs(20),
@@ -1089,15 +1090,20 @@ async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source
             } else {
                 let (tx, mut rx) = mpsc::channel(256);
                 let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
-                let request = ExecuteRequestBuilder::new(
+                let builder = ExecuteRequestBuilder::new(
                     "Synthetic routing race",
                     tx,
                     CancellationToken::new(),
                 )
                 .model("main-a")
                 .provider_name("openai")
-                .app_data_dir(home.path().to_path_buf())
-                .build();
+                .app_data_dir(home.path().to_path_buf());
+                let builder = if entry == "execute_override" {
+                    builder.provider_override(override_probe.clone())
+                } else {
+                    builder
+                };
+                let request = builder.build();
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(20),
                     agent.execute(&mut session, request),
@@ -1109,17 +1115,31 @@ async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source
             };
             let old = old_calls.load(Ordering::SeqCst);
             let new = new_calls.load(Ordering::SeqCst);
+            let override_calls = override_probe.provider_calls.load(Ordering::SeqCst);
             old_server.abort();
             new_server.abort();
             assert!(race.reads.load(Ordering::SeqCst) > 0, "race did not fire");
-            if change == "none" {
-                assert!(outcome.is_ok(), "{entry} control failed: {outcome:?}");
+            let caller_owned = entry == "execute_override";
+            if change == "none" || (caller_owned && change == "same-instance") {
                 assert!(
-                    old > 0 && new == 0,
-                    "{entry} control did not reach A: A={old}, B={new}"
+                    outcome.is_ok(),
+                    "{entry}/{change} control failed: {outcome:?}"
                 );
+                if caller_owned {
+                    assert!(old == 0 && new == 0 && override_calls > 0,
+                        "caller-owned control must use its own client: A={old}, B={new}, override={override_calls}");
+                } else {
+                    assert!(
+                        old > 0 && new == 0 && override_calls == 0,
+                        "{entry} control did not reach A: A={old}, B={new}"
+                    );
+                }
                 continue;
             }
+            assert_eq!(
+                override_calls, 0,
+                "{entry}/{change}: refused override dispatched"
+            );
             assert_eq!(
             old, 0,
             "{entry} dispatched to removed instance A after legacy B took the same key; B={new}, outcome={outcome:?}"
