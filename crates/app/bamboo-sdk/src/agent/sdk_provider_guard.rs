@@ -25,6 +25,11 @@ pub(super) struct BoundSdkProvider {
 
 impl BoundSdkProvider {
     fn validate(&self, model: Option<&str>) -> Result<(), LLMError> {
+        if self.single_use && self.refused.load(Ordering::Acquire) {
+            return Err(LLMError::Api(
+                "sdk_provider_binding: this queued target already refused dispatch".into(),
+            ));
+        }
         let config = self.config.try_read().map_err(|_| {
             LLMError::Api("sdk_provider_binding: live provider configuration is busy".into())
         })?;
@@ -84,8 +89,11 @@ impl LLMProvider for BoundSdkProvider {
     }
 
     fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>, LLMError> {
-        // Each queued evaluation owns a separate refusal marker. Keep the
-        // guard around the selected client instead of extracting its delegate.
+        // Each queued evaluation owns a separate refusal marker. Once a
+        // target is single-use, never replace it with a fresh marker.
+        if self.single_use {
+            return Ok(None);
+        }
         Ok(Some(Arc::new(Self {
             delegate: self.delegate.clone(),
             config: self.config.clone(),
@@ -182,5 +190,96 @@ impl LLMProvider for BoundSdkProvider {
     async fn list_model_info(&self) -> Result<Vec<ProviderModelInfo>, LLMError> {
         self.dispatch(None)?;
         self.delegate.list_model_info().await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_llm::LLMChunk;
+
+    struct Probe {
+        calls: std::sync::atomic::AtomicUsize,
+        fail: bool,
+    }
+
+    #[async_trait]
+    impl LLMProvider for Probe {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(LLMError::Api("synthetic upstream error".into()));
+            }
+            Ok(Box::pin(futures::stream::iter([Ok(LLMChunk::Done)])))
+        }
+    }
+
+    fn fixture(fail: bool) -> (Arc<BoundSdkProvider>, Arc<RwLock<Config>>, Arc<Probe>) {
+        let mut config = Config::default();
+        config.provider = "copilot".into();
+        config.provider_instances.clear();
+        config.default_provider_instance = None;
+        let binding = Arc::new(SdkProviderBinding::capture(&config, "copilot").unwrap());
+        let config = Arc::new(RwLock::new(config));
+        let probe = Arc::new(Probe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail,
+        });
+        let provider = Arc::new(BoundSdkProvider {
+            delegate: probe.clone(),
+            config: config.clone(),
+            binding,
+            provider: "copilot".into(),
+            single_use: false,
+            refused: AtomicBool::new(false),
+        });
+        (provider, config, probe)
+    }
+
+    #[tokio::test]
+    async fn sdk_queued_source_guard_refusal_is_single_use_and_does_not_poison_next_target() {
+        let (root, config, probe) = fixture(false);
+        let refused = root.queued_provider_snapshot().unwrap().unwrap();
+        let hold = config.write().await;
+        let error = refused.known_pre_dispatch_error().unwrap();
+        assert!(error.to_string().contains("sdk_provider_binding:"));
+        assert!(refused.local_dispatch_refused());
+        drop(hold);
+
+        // A second snapshot cannot clear this evaluation's refusal marker.
+        assert!(refused.queued_provider_snapshot().unwrap().is_none());
+        let error = refused
+            .chat_stream(&[], &[], None, "main-a")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("sdk_provider_binding:"));
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+
+        // A later independent evaluation gets a fresh marker and can run.
+        let next = root.queued_provider_snapshot().unwrap().unwrap();
+        assert!(next.chat_stream(&[], &[], None, "main-a").await.is_ok());
+        assert!(!next.local_dispatch_refused());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn sdk_queued_source_guard_preserves_real_upstream_errors() {
+        let (root, _, probe) = fixture(true);
+        let target = root.queued_provider_snapshot().unwrap().unwrap();
+        let error = target
+            .chat_stream(&[], &[], None, "main-a")
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("synthetic upstream error"));
+        assert!(!target.local_dispatch_refused());
+        assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
     }
 }
