@@ -39,7 +39,7 @@ use bamboo_engine::session_app::approval_replay::{
 };
 use bamboo_engine::session_app::execute::consume_pending_clarification_resume;
 use bamboo_engine::session_app::repository::SessionAccess;
-use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot;
+use bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution as resolve_resume_config_snapshot;
 use bamboo_engine::session_app::respond::{
     acquire_pending_response_guard, inspect_pending_response_guarded,
     submit_pending_response_checked_guarded, validate_pending_response,
@@ -487,6 +487,7 @@ impl Responder for EngineResponder {
             ctx: self.ctx.clone(),
             provider_override: None,
             model_origin: None,
+            legacy_vision_provider_source: None,
             selected_provider_name: None,
             model_reasoning_effort: None,
         };
@@ -568,6 +569,15 @@ impl Responder for EngineResponder {
                 target,
             ) {
                 Ok(selected) => {
+                    port.legacy_vision_provider_source =
+                        bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+                            &config_snapshot,
+                            &selected.target.provider,
+                            selected.provider.clone(),
+                            selected.managed_origin.clone(),
+                        )
+                        .ok()
+                        .map(Arc::new);
                     port.model_reasoning_effort = selected.target.reasoning_effort.or_else(|| {
                         config_snapshot.reasoning_effort_for_key(&selected.target.provider)
                     });
@@ -764,7 +774,7 @@ impl Responder for EngineResponder {
                 None,
             );
 
-            let outcome = bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
+            let outcome = bamboo_engine::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
                 &port,
                 session_id,
                 session,
@@ -908,6 +918,8 @@ struct ConnectResumePort {
     ctx: ConnectContext,
     provider_override: Option<Arc<dyn bamboo_llm::LLMProvider>>,
     model_origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+    legacy_vision_provider_source:
+        Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
     selected_provider_name: Option<String>,
     model_reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
 }
@@ -980,6 +992,7 @@ impl ResumeExecutionPort for ConnectResumePort {
             ctx: self.ctx.clone(),
             provider_override: self.provider_override.clone(),
             model_origin: self.model_origin.clone(),
+            legacy_vision_provider_source: self.legacy_vision_provider_source.clone(),
             selected_provider_name: self.selected_provider_name.clone(),
             model_reasoning_effort: self.model_reasoning_effort,
         };
@@ -989,7 +1002,35 @@ impl ResumeExecutionPort for ConnectResumePort {
         Ok(())
     }
 
+    fn dispatch_configured_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = ConnectResumePort {
+            ctx: self.ctx.clone(),
+            provider_override: self.provider_override.clone(),
+            model_origin: self.model_origin.clone(),
+            legacy_vision_provider_source: self.legacy_vision_provider_source.clone(),
+            selected_provider_name: self.selected_provider_name.clone(),
+            model_reasoning_effort: self.model_reasoning_effort,
+        };
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_configured_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, false).await;
+    }
+
+    async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, true).await;
+    }
+}
+
+impl ConnectResumePort {
+    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -1060,7 +1101,15 @@ impl ResumeExecutionPort for ConnectResumePort {
         ) {
             resume_agent = resume_agent.with_composed_gold_target_resolver(policy);
         }
-        let resume_agent = Arc::new(resume_agent);
+        let resume_agent = if from_config {
+            resume_agent.with_config_derived_image_fallback()
+        } else {
+            resume_agent
+        };
+        let resume_agent = Arc::new(
+            resume_agent
+                .with_legacy_vision_provider_source(self.legacy_vision_provider_source.clone()),
+        );
 
         let (mpsc_tx, _forwarder_handle, mut history_commit_barrier) =
             create_event_forwarder_with_root_actor(
@@ -1779,6 +1828,7 @@ mod tests {
                 ctx: ctx.clone(),
                 provider_override: None,
                 model_origin: None,
+                legacy_vision_provider_source: None,
                 selected_provider_name: None,
                 model_reasoning_effort: None,
             };
@@ -2566,6 +2616,7 @@ mod tests {
             ctx,
             provider_override: Some(selected.provider),
             model_origin: selected.managed_origin,
+            legacy_vision_provider_source: None,
             selected_provider_name: Some(selected.target.provider),
             model_reasoning_effort: None,
         };
@@ -2606,6 +2657,7 @@ mod tests {
                     ctx,
                     provider_override: None,
                     model_origin: None,
+                    legacy_vision_provider_source: None,
                     selected_provider_name: None,
                     model_reasoning_effort: None,
                 },
@@ -2641,6 +2693,7 @@ mod tests {
                 ctx,
                 provider_override: None,
                 model_origin: None,
+                legacy_vision_provider_source: None,
                 selected_provider_name: None,
                 model_reasoning_effort: None,
             },
@@ -2810,6 +2863,7 @@ mod tests {
                 ctx,
                 provider_override: None,
                 model_origin: None,
+                legacy_vision_provider_source: None,
                 selected_provider_name: None,
                 model_reasoning_effort: None,
             },
