@@ -228,6 +228,22 @@ async fn supervisor_exact_cancel_rejects_stale_target_and_invalid_run_without_ef
     assert!(invoke(&fixture, args("cancel", &target, None))
         .await
         .is_err());
+    // Bypass the executor's permission layer to verify that the native tool
+    // still rejects an ordinary caller with no Supervisor observation.
+    let tool = fixture
+        .state
+        .tools_for(ToolSurface::Root)
+        .tool_instance_for_exact("session_control")
+        .unwrap();
+    let mut ordinary = ToolCtx::none("ordinary-cancel-attempt");
+    ordinary.session_id = Some(Arc::from(TARGET));
+    ordinary.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+        &fixture.original,
+    )));
+    assert!(tool
+        .invoke(args("cancel", &target, Some(&run_id)), ordinary)
+        .await
+        .is_err());
     assert!(!token.is_cancelled());
     assert_eq!(
         fixture.state.session_inbox.inspect(TARGET).await.unwrap(),
@@ -236,5 +252,49 @@ async fn supervisor_exact_cancel_rejects_stale_target_and_invalid_run_without_ef
     assert_eq!(fixture.probe.requests.lock().unwrap().len(), 0);
     assert!(!fixture.probe.blocked.load(Ordering::SeqCst));
     owner.abandon().await;
+    fixture.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn supervisor_cancel_real_root_keeps_queued_followup_for_successor() {
+    let fixture = Box::pin(Fixture::new()).await;
+    grant_cancel(&fixture);
+    fixture.probe.blocked.store(true, Ordering::SeqCst);
+    let entered = fixture.probe.entered.notified();
+    fixture
+        .followup("cancel-start", "start the original work")
+        .await;
+    tokio::time::timeout(Duration::from_secs(20), entered)
+        .await
+        .expect("the actual local provider must enter its held first run");
+    let selected = current_target(&fixture).await;
+    let observed = invoke(&fixture, args("observe_run", &selected, None))
+        .await
+        .unwrap();
+    let run_id = observed["run_id"].as_str().unwrap().to_owned();
+    let queued = fixture
+        .followup("cancel-queued", "preserve this queued followup")
+        .await;
+    let fresh = current_target(&fixture).await;
+    let requested = invoke(&fixture, args("cancel", &fresh, Some(&run_id)))
+        .await
+        .unwrap();
+    assert_eq!(requested["status"], "cancel_requested");
+    assert_eq!(requested["completion_verified"], false);
+    fixture.probe.release.notify_one();
+    fixture.settled(2).await;
+
+    let after = fixture.reload().await;
+    fixture.assert_context(&after);
+    assert_eq!(
+        after
+            .messages
+            .iter()
+            .filter(|message| message.id == queued["receipt_id"].as_str().unwrap())
+            .count(),
+        1,
+        "cancelling the old run must not discard or duplicate the queued input"
+    );
+    assert_eq!(fixture.probe.requests.lock().unwrap().len(), 2);
     fixture.state.shutdown().await;
 }
