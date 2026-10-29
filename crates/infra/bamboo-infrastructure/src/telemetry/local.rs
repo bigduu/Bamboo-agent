@@ -16,7 +16,10 @@ use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::trace::{Span, SpanData, SpanProcessor};
 use serde::Serialize;
 
-use super::{valid_identifier, INSTRUMENTATION_NAME};
+use super::{
+    session_reference, valid_identifier, valid_session_reference, INSTRUMENTATION_NAME,
+    LOCAL_SESSION_REFERENCE,
+};
 
 pub const MAX_LOCAL_SPANS: usize = 2048;
 const MAX_EVICTION_SCOPES: usize = 2048;
@@ -217,13 +220,14 @@ impl LocalTraceStore {
         cursor: Option<u64>,
     ) -> TracePage {
         let limit = limit.clamp(1, MAX_LOCAL_SPANS);
+        let reference = session_reference(session_id).unwrap_or_default();
         let inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut groups: HashMap<&str, Vec<&Record>> = HashMap::new();
         for record in inner.records.iter().filter(|r| {
-            r.scope.as_deref() == scope && r.session_id == session_id && r.birth == birth
+            r.scope.as_deref() == scope && r.session_id == reference && r.birth == birth
         }) {
             groups.entry(&record.trace_id).or_default().push(record);
         }
@@ -235,7 +239,7 @@ impl LocalTraceStore {
         let has_more = groups.len() > limit;
         groups.truncate(limit);
         let next_cursor = has_more.then(|| groups.last().unwrap().1[0].trace_sequence.to_string());
-        let key = (scope.map(str::to_owned), session_id.to_owned(), birth);
+        let key = (scope.map(str::to_owned), reference, birth);
         let evicted_spans = inner
             .evictions
             .get(&key)
@@ -284,6 +288,7 @@ impl LocalTraceStore {
         birth: DateTime<Utc>,
         trace_id: &str,
     ) -> Option<TraceDetail> {
+        let reference = session_reference(session_id)?;
         let inner = self
             .inner
             .lock()
@@ -293,7 +298,7 @@ impl LocalTraceStore {
             .iter()
             .filter(|r| {
                 r.scope.as_deref() == scope
-                    && r.session_id == session_id
+                    && r.session_id == reference
                     && r.birth == birth
                     && r.trace_id == trace_id
             })
@@ -301,7 +306,7 @@ impl LocalTraceStore {
         if records.is_empty() {
             return None;
         }
-        let key = (scope.map(str::to_owned), session_id.to_owned(), birth);
+        let key = (scope.map(str::to_owned), reference, birth);
         let evicted = inner
             .evictions
             .get(&key)
@@ -388,6 +393,14 @@ fn identifier(data: &SpanData, key: &str) -> Option<String> {
         .filter(|value| valid_identifier(value))
         .map(str::to_owned)
 }
+
+fn session_identifier(data: &SpanData) -> Option<String> {
+    identifier(data, "gen_ai.conversation.id").or_else(|| {
+        string_attr(data, LOCAL_SESSION_REFERENCE)
+            .filter(|value| value.starts_with('~') && valid_session_reference(value))
+            .map(str::to_owned)
+    })
+}
 fn count(data: &SpanData, key: &str) -> Option<u64> {
     data.attributes
         .iter()
@@ -399,7 +412,7 @@ fn count(data: &SpanData, key: &str) -> Option<u64> {
 }
 
 fn project(data: SpanData) -> Option<Record> {
-    let session_id = identifier(&data, "gen_ai.conversation.id")?;
+    let session_id = session_identifier(&data)?;
     let birth = DateTime::parse_from_rfc3339(string_attr(&data, "bamboo.session.birth")?)
         .ok()?
         .with_timezone(&Utc);
@@ -569,6 +582,61 @@ mod tests {
         assert!(!serde_json::to_string(&detail)
             .unwrap()
             .contains("PRIVATE_PROMPT_SENTINEL"));
+    }
+
+    #[tokio::test]
+    async fn non_ascii_and_spaced_session_ids_keep_scoped_trace_isolation() {
+        let trace = LocalTraceTest::isolated();
+        let birth = Utc::now();
+        let scope_path = std::path::Path::new("/synthetic-trace-scope");
+        let scope = scope_for_path(scope_path);
+        let other_scope = scope_for_path(std::path::Path::new("/synthetic-other-scope"));
+        let ids = ["用户 会话", "用户 会话二"];
+        trace
+            .scope(async {
+                for id in ids {
+                    let root = Observation::agent(id, id)
+                        .bind_session_lifetime(id, birth)
+                        .bind_local_scope(scope_path);
+                    root.scope(async {
+                        crate::telemetry::record_execution_identity("execution-1", "run-1");
+                        Observation::llm(Some("openai"), "synthetic-model", id)
+                            .finish(Outcome::Success);
+                    })
+                    .await;
+                    root.finish(Outcome::Success);
+                }
+            })
+            .await;
+        let first = trace
+            .store
+            .page_scoped(Some(&scope), ids[0], birth, 10, None);
+        let second = trace
+            .store
+            .page_scoped(Some(&scope), ids[1], birth, 10, None);
+        assert_eq!(first.session_id, ids[0]);
+        assert_eq!(first.traces.len(), 1);
+        assert_eq!(second.traces.len(), 1);
+        assert_ne!(first.traces[0].trace_id, second.traces[0].trace_id);
+        assert!(trace
+            .store
+            .detail_scoped(Some(&scope), ids[1], birth, &first.traces[0].trace_id)
+            .is_none());
+        assert!(trace
+            .store
+            .page_scoped(Some(&other_scope), ids[0], birth, 10, None)
+            .traces
+            .is_empty());
+        let detail = trace
+            .store
+            .detail_scoped(Some(&scope), ids[0], birth, &first.traces[0].trace_id)
+            .unwrap();
+        assert_eq!(detail.spans.len(), 2);
+        assert!(detail
+            .spans
+            .iter()
+            .any(|span| span.run_id.as_deref() == Some("run-1")));
+        assert!(!serde_json::to_string(&detail).unwrap().contains(ids[0]));
     }
 
     #[tokio::test]

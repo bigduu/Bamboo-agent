@@ -1731,11 +1731,11 @@ pub(super) async fn execute_llm_stream(
     let mut usage_guard = ModelUsageGuard {
         runner: config.hook_runner.clone(),
         session_birth: session.created_at,
-        root_session_id: bamboo_infrastructure::telemetry::safe_identifier(
+        root_session_id: bamboo_infrastructure::telemetry::session_reference(
             &session.root_session_id,
         ),
-        snapshot: bamboo_infrastructure::telemetry::safe_identifier(session_id).map(|session_id| {
-            bamboo_domain::ModelCallUsage {
+        snapshot: bamboo_infrastructure::telemetry::session_reference(session_id).map(
+            |session_id| bamboo_domain::ModelCallUsage {
                 schema_version: 1,
                 event_id: call_id.clone(),
                 call_id,
@@ -1747,8 +1747,8 @@ pub(super) async fn execute_llm_stream(
                 trace_id: trace_ids.as_ref().map(|ids| ids.0.clone()),
                 span_id: trace_ids.map(|ids| ids.1),
                 usage: None,
-            }
-        }),
+            },
+        ),
     };
     let (http_retry_observer, live_offer) = if live_bootstrap.is_some() {
         let (observer, receiver) =

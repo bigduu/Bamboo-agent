@@ -146,8 +146,10 @@ mod tests {
         );
         let one = Session::new("trace-api-one", "synthetic-model");
         let two = Session::new("trace-api-two", "synthetic-model");
+        let unicode = Session::new("用户 会话", "synthetic-model");
         state.session_store.save_session(&one).await.unwrap();
         state.session_store.save_session(&two).await.unwrap();
+        state.session_store.save_session(&unicode).await.unwrap();
         let other_temp = tempfile::tempdir().unwrap();
         let other_state = web::Data::new(
             AppState::new(other_temp.path().canonicalize().unwrap())
@@ -178,6 +180,10 @@ mod tests {
                 }
                 Observation::agent(&two.id, &two.id)
                     .bind_session_lifetime(&two.id, two.created_at)
+                    .bind_local_scope(&state.app_data_dir)
+                    .finish(Outcome::Success);
+                Observation::agent(&unicode.id, &unicode.id)
+                    .bind_session_lifetime(&unicode.id, unicode.created_at)
                     .bind_local_scope(&state.app_data_dir)
                     .finish(Outcome::Success);
                 Observation::agent(&one.id, &one.id)
@@ -265,6 +271,24 @@ mod tests {
         let other_uri = format!("/api/v1/sessions/trace-api-two/traces/{trace_id}");
         assert_eq!(
             test::call_service(&app, request(&other_uri)).await.status(),
+            StatusCode::NOT_FOUND
+        );
+        let unicode_path = "/api/v1/sessions/%E7%94%A8%E6%88%B7%20%E4%BC%9A%E8%AF%9D/traces";
+        let unicode_page: serde_json::Value =
+            test::read_body_json(test::call_service(&app, request(unicode_path)).await).await;
+        assert_eq!(unicode_page["session_id"], unicode.id);
+        assert_eq!(unicode_page["traces"].as_array().unwrap().len(), 1);
+        let unicode_trace_id = unicode_page["traces"][0]["trace_id"].as_str().unwrap();
+        assert_eq!(
+            test::call_service(&app, request(&format!("{unicode_path}/{unicode_trace_id}")))
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            test::call_service(&app, request(&format!("{unicode_path}/{trace_id}")))
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
         assert_eq!(

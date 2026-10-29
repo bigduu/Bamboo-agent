@@ -2622,6 +2622,101 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
 }
 
 #[tokio::test]
+async fn unsafe_session_id_keeps_usage_hook_and_local_span_correlated() {
+    use bamboo_agent_core::AgentHook;
+    use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};
+
+    struct Capture(mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>);
+    #[async_trait]
+    impl AgentHook for Capture {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterModelCallUsage
+        }
+        async fn run(
+            &self,
+            _: AgentHookPoint,
+            payload: &HookPayload,
+            session: &Session,
+        ) -> HookResult {
+            if let HookPayload::ModelCallUsage { observation } = payload {
+                assert_eq!(session.id, observation.session_id);
+                self.0.send(observation.clone()).unwrap();
+            }
+            HookResult::Continue
+        }
+    }
+
+    let trace = bamboo_infrastructure::telemetry::test_support::LocalTraceTest::isolated();
+    let mut session = Session::new("用户 会话", "synthetic-model");
+    let birth = session.created_at;
+    let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+    let mut hooks = crate::runtime::hooks::HookRunner::new();
+    hooks.register(Arc::new(Capture(observed_tx)));
+    let config = AgentLoopConfig {
+        hook_runner: Arc::new(hooks),
+        model_name: Some("synthetic-model".into()),
+        system_prompt: Some("synthetic system".into()),
+        ..Default::default()
+    };
+    let provider = Arc::new(MetricsQueueProvider {
+        queue: Mutex::new(vec![vec![
+            Ok(LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(7),
+                total_tokens: Some(107),
+                reasoning_tokens: None,
+                cache_creation_input_tokens: None,
+                cache_read_input_tokens: Some(0),
+                cache_write_input_tokens: None,
+            }),
+            Ok(LLMChunk::Token("synthetic answer".into())),
+            Ok(LLMChunk::Done),
+        ]]),
+        requested_messages: Mutex::new(Vec::new()),
+    });
+    let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let (events, _receiver) = mpsc::channel(128);
+    trace
+        .scope(super::run_agent_loop_with_config(
+            &mut session,
+            "synthetic prompt".into(),
+            events,
+            provider,
+            tools,
+            CancellationToken::new(),
+            config,
+        ))
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(std::time::Duration::from_secs(2), observed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.status, ModelCallStatus::Success);
+    assert_eq!(
+        event.session_id,
+        bamboo_infrastructure::telemetry::session_reference(&session.id).unwrap()
+    );
+    assert!(event.session_id.starts_with('~'));
+    let detail = trace
+        .store
+        .detail(&session.id, birth, event.trace_id.as_deref().unwrap())
+        .unwrap();
+    let span = detail
+        .spans
+        .iter()
+        .find(|span| span.span_id == event.span_id.as_deref().unwrap())
+        .unwrap();
+    assert_eq!(span.call_id.as_deref(), Some(event.call_id.as_str()));
+    assert_eq!(span.usage, event.usage);
+    assert!(!serde_json::to_string(&event).unwrap().contains(&session.id));
+    assert!(!serde_json::to_string(&detail)
+        .unwrap()
+        .contains(&session.id));
+}
+
+#[tokio::test]
 async fn partial_provider_failure_reports_one_usage_event_and_matching_error_span() {
     use bamboo_agent_core::AgentHook;
     use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};

@@ -30,6 +30,9 @@ pub struct ModelCallUsage {
     pub schema_version: u8,
     pub event_id: String,
     pub call_id: String,
+    /// Safe session IDs are unchanged. Other nonempty IDs are represented by
+    /// a `~`-prefixed, process-local reference that changes after restart;
+    /// it is not a persisted ID or an authorization credential.
     pub session_id: String,
     pub run_id: Option<String>,
     pub provider: Option<String>,

@@ -27,6 +27,7 @@ pub use timeout::with_timeout;
 pub const GEN_AI_CONVENTIONS_REVISION: &str = "f3c6d0c9bb66ebd474668a3a0be25c61226f02c2";
 pub const INSTRUMENTATION_NAME: &str = "bamboo.runtime";
 pub const MAPPING_VERSION: &str = "1";
+const LOCAL_SESSION_REFERENCE: &str = "bamboo.local.session_ref";
 
 fn scope() -> InstrumentationScope {
     InstrumentationScope::builder(INSTRUMENTATION_NAME)
@@ -113,8 +114,10 @@ impl Observation {
         // A propagated trace context alone is never an authorization boundary.
         if let Some(lifetime) = parent.get::<SessionLifetime>() {
             let same_session = attributes.iter().any(|attribute| {
-                attribute.key.as_str() == "gen_ai.conversation.id"
-                    && attribute.value == opentelemetry::Value::from(lifetime.session_id.clone())
+                matches!(
+                    attribute.key.as_str(),
+                    "gen_ai.conversation.id" | LOCAL_SESSION_REFERENCE
+                ) && attribute.value == opentelemetry::Value::from(lifetime.session_id.clone())
             });
             let is_new_agent = attributes.iter().any(|attribute| {
                 attribute.key.as_str() == "gen_ai.operation.name"
@@ -148,7 +151,7 @@ impl Observation {
     /// One actual agent-loop invocation, not the lifetime of a persisted Session.
     pub fn agent(session_id: &str, root_session_id: &str) -> Self {
         let mut attributes = vec![KeyValue::new("gen_ai.operation.name", "invoke_agent")];
-        add_identifier(&mut attributes, "gen_ai.conversation.id", session_id);
+        add_session_identifier(&mut attributes, session_id);
         add_identifier(&mut attributes, "bamboo.root_session.id", root_session_id);
         Self::start("invoke_agent", SpanKind::Internal, attributes)
     }
@@ -160,9 +163,9 @@ impl Observation {
         session_id: &str,
         birth: chrono::DateTime<chrono::Utc>,
     ) -> Self {
-        if valid_identifier(session_id) {
+        if let Some(session_id) = session_reference(session_id) {
             let lifetime = SessionLifetime {
-                session_id: session_id.to_owned(),
+                session_id,
                 birth: birth.to_rfc3339(),
                 local_scope: None,
                 run_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
@@ -192,7 +195,7 @@ impl Observation {
     /// One provider request, including stream consumption and internal retry.
     pub fn llm(provider_type: Option<&str>, model: &str, session_id: &str) -> Self {
         let mut attributes = vec![KeyValue::new("gen_ai.operation.name", "chat")];
-        add_identifier(&mut attributes, "gen_ai.conversation.id", session_id);
+        add_session_identifier(&mut attributes, session_id);
         add_identifier(&mut attributes, "gen_ai.request.model", model);
         // Configured provider names are free text. Export only known families.
         if let Some(provider) = provider_type.and_then(provider_family) {
@@ -211,7 +214,7 @@ impl Observation {
         let mut attributes = vec![KeyValue::new("gen_ai.operation.name", "execute_tool")];
         add_identifier(&mut attributes, "gen_ai.tool.name", name);
         add_identifier(&mut attributes, "gen_ai.tool.call.id", call_id);
-        add_identifier(&mut attributes, "gen_ai.conversation.id", session_id);
+        add_session_identifier(&mut attributes, session_id);
         add_identifier(&mut attributes, "bamboo.round.id", round_id);
         attributes.push(KeyValue::new("bamboo.tool.observation", "dispatch"));
         let name = if valid_identifier(name) {
@@ -347,12 +350,58 @@ fn add_identifier(attributes: &mut Vec<KeyValue>, key: &'static str, value: &str
     }
 }
 
+fn add_session_identifier(attributes: &mut Vec<KeyValue>, value: &str) {
+    if valid_identifier(value) {
+        add_identifier(attributes, "gen_ai.conversation.id", value);
+    } else if let Some(reference) = session_reference(value) {
+        // This local-only attribute is stripped before OTLP export.
+        attributes.push(KeyValue::new(LOCAL_SESSION_REFERENCE, reference));
+    }
+}
+
 fn valid_identifier(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn valid_session_reference(value: &str) -> bool {
+    valid_identifier(value)
+        || value.strip_prefix('~').is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+}
+
+/// A content-free session reference for usage observers and local inspection.
+/// Syntactically safe IDs remain unchanged. Other nonempty IDs receive an
+/// HMAC-based alias that is stable only for this process; the `~` prefix keeps
+/// aliases disjoint from IDs accepted unchanged. It is not an authorization key.
+pub fn session_reference(value: &str) -> Option<String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use std::sync::OnceLock;
+
+    if value.is_empty() {
+        return None;
+    }
+    if valid_identifier(value) {
+        return Some(value.to_owned());
+    }
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut key = [0; 32];
+        key[..16].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key[16..].copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        key
+    });
+    let mut digest = Hmac::<sha2::Sha256>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    digest.update(b"bamboo/local-session-reference/v1\0");
+    digest.update(value.as_bytes());
+    Some(format!("~{}", hex::encode(digest.finalize().into_bytes())))
 }
 
 /// Correlate the existing runtime identity with the current invocation span.
@@ -371,7 +420,8 @@ pub fn record_execution_identity(execution_id: &str, run_id: &str) {
     }
 }
 
-/// The real invocation's run identifier, when its runtime has established one.
+/// The real invocation's run identifier for a session reference, when its
+/// runtime has established one. This is not an authorization check.
 pub fn current_run_id(session_id: &str) -> Option<String> {
     let context = Context::current();
     let lifetime = context.get::<SessionLifetime>()?;

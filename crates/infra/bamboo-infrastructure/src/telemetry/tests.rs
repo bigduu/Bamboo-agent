@@ -189,9 +189,32 @@ async fn payload_shaped_identifiers_and_ambient_logs_are_never_exported() {
         assert!(span.links.is_empty());
         assert!(span.attributes.iter().all(|kv| matches!(
             kv.key.as_str(),
-            "gen_ai.operation.name" | "bamboo.tool.observation" | "error.type" | "bamboo.outcome"
+            "gen_ai.operation.name"
+                | "bamboo.tool.observation"
+                | "error.type"
+                | "bamboo.outcome"
+                | LOCAL_SESSION_REFERENCE
         )));
     }
+}
+
+#[test]
+fn session_references_preserve_safe_ids_and_separate_unsafe_ids() {
+    assert_eq!(session_reference("session-1").as_deref(), Some("session-1"));
+    assert_eq!(session_reference(""), None);
+    let first = session_reference("用户 会话").unwrap();
+    let second = session_reference("用户 会话二").unwrap();
+    assert_eq!(
+        session_reference("用户 会话").as_deref(),
+        Some(first.as_str())
+    );
+    assert_ne!(first, second);
+    assert!(first.starts_with('~'));
+    assert!(valid_session_reference(&first));
+    assert!(!first.contains("用户"));
+    // A stored ID that looks like an alias is hashed again instead of being
+    // accepted as an already-computed reference.
+    assert_ne!(session_reference(&first).unwrap(), first);
 }
 
 #[tokio::test]
@@ -314,28 +337,23 @@ mod otlp {
         });
         let provider = config::build_provider(&config(endpoint)).unwrap();
         let tracer = provider.tracer_with_scope(scope());
+        let private_session = "PRIVATE_SESSION 空格";
+        let private_reference = session_reference(private_session).unwrap();
+        let mut agent_attributes = vec![KeyValue::new("gen_ai.operation.name", "invoke_agent")];
+        add_session_identifier(&mut agent_attributes, private_session);
         let agent = Observation::start_with(
             &tracer,
             "invoke_agent",
             SpanKind::Internal,
-            vec![
-                KeyValue::new("gen_ai.operation.name", "invoke_agent"),
-                KeyValue::new("gen_ai.conversation.id", "synthetic-session"),
-            ],
+            agent_attributes,
         )
-        .bind_session_lifetime("synthetic-session", chrono::Utc::now())
+        .bind_session_lifetime(private_session, chrono::Utc::now())
         .bind_local_scope(std::path::Path::new("/PRIVATE_SCOPE_SENTINEL"));
         let root_ids = agent.trace_ids().unwrap();
         let guard = agent.context.clone().attach();
-        let llm = Observation::start_with(
-            &tracer,
-            "chat",
-            SpanKind::Client,
-            vec![
-                KeyValue::new("gen_ai.operation.name", "chat"),
-                KeyValue::new("gen_ai.conversation.id", "synthetic-session"),
-            ],
-        );
+        let mut llm_attributes = vec![KeyValue::new("gen_ai.operation.name", "chat")];
+        add_session_identifier(&mut llm_attributes, private_session);
+        let llm = Observation::start_with(&tracer, "chat", SpanKind::Client, llm_attributes);
         let child_ids = llm.trace_ids().unwrap();
         assert_eq!(child_ids.0, root_ids.0);
         assert_ne!(child_ids.1, root_ids.1);
@@ -375,6 +393,8 @@ mod otlp {
             "host.name",
             "telemetry.sdk",
             "bamboo.local.scope",
+            LOCAL_SESSION_REFERENCE,
+            private_reference.as_str(),
             "PRIVATE_",
         ] {
             assert!(!request.contains(denied), "leaked {denied}");

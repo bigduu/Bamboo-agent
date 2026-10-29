@@ -12,9 +12,10 @@ Only fixed operation names, validated identifiers, timestamps, fixed outcome
 categories and provider-reported token counts are projected. No prompts,
 responses, tool arguments/results, paths, credentials, span events or raw error
 messages are stored. As with the existing OTel mapping, operators must not place
-secrets in syntactically valid session, model or tool identifiers. IDs that do
-not match the documented identifier policy are omitted; such a session cannot be
-listed in local inspection. Completed children can appear before their parent;
+secrets in syntactically valid session, model or tool identifiers. For a session
+ID outside that policy, local inspection uses a process-keyed HMAC reference
+instead of retaining the original in spans; request the API with the original,
+URL-encoded session ID. Completed children can appear before their parent;
 `partial` is conservative when a parent is absent, retention has evicted data,
 or insertion contention has caused a drop. It cannot prove an entire trace was
 observed, and remote or separately managed spans may be missing.
@@ -117,9 +118,13 @@ input and read are known, input is positive, and read does not exceed input.
 ## Read-only hook event
 
 Configured native hooks and reviewed portable plugins may subscribe to the
-Bamboo extension `BambooModelCallUsage`. For session IDs that satisfy the
-identifier policy above, it is emitted once per dispatched primary model call
-after success or a reported error. Other session IDs produce no usage event.
+Bamboo extension `BambooModelCallUsage`. It is emitted once per dispatched
+primary model call after success or a reported error. A `session_id` that meets
+the identifier policy is unchanged. Other nonempty session IDs are represented
+by `~` followed by a 64-digit lowercase HMAC reference. That reference is
+stable within one process only, changes after restart, is not intended to be
+reversed or used as an authorization credential, and must not be treated as
+the persisted session ID.
 Dropping an in-flight call emits a best-effort cancelled/error observation with
 unknown usage. Internal transport retries share a call ID; a new outer dispatch
 gets a new ID. If a stream fails after reporting usage, its error observation
@@ -135,9 +140,10 @@ portable delivery. Native handlers receive the existing envelope with a
 `payload` of type `model_call_usage`; portable handlers receive `observation`
 at top level. Both contain the same schema-1 snapshot and no workspace path in
 the event payload.
-Programmatic native observers receive a deliberately minimal Session: its id,
-birth and valid root id identify the original lifetime, but other Session fields
-are not a snapshot of runtime state. Consume the usage observation itself.
+Programmatic native observers receive a deliberately minimal Session: its id and
+root id follow the same reference policy, and its birth identifies the original
+lifetime. Other Session fields are not a snapshot of runtime state. Consume the
+usage observation itself.
 Deduplicate on `event_id`; retain IDs according to your plugin's own policy.
 
 A reviewed, runnable portable example is in

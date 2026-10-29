@@ -78,7 +78,10 @@ The application attribute allowlist is:
 
 Identifiers must be 1–128 ASCII letters, digits, underscores, hyphens or periods;
 other values are omitted, and span names fall back to the operation alone. The
-provider family is restricted to OpenAI, Anthropic, Gemini/Google and Copilot;
+local viewer can still associate sessions outside that policy using a process-
+keyed reference; Bamboo's OTLP exporter strips that reference and omits the
+original ID. The provider family is restricted to OpenAI, Anthropic,
+Gemini/Google and Copilot;
 free-form provider instance names are omitted. These are correlation fields,
 not a place to put sensitive data. Even syntactically valid IDs/model/tool names
 must not contain secrets. IDs are high-cardinality trace metadata, not metric

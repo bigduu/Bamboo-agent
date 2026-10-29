@@ -45,8 +45,12 @@ impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanP
     }
     fn on_end(&self, mut span: opentelemetry_sdk::trace::SpanData) {
         if span.span_context.is_sampled() {
-            span.attributes
-                .retain(|attribute| attribute.key.as_str() != "bamboo.local.scope");
+            span.attributes.retain(|attribute| {
+                !matches!(
+                    attribute.key.as_str(),
+                    "bamboo.local.scope" | super::LOCAL_SESSION_REFERENCE
+                )
+            });
             self.0.on_end(span);
         }
     }
