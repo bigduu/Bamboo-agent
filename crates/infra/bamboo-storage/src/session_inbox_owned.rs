@@ -145,6 +145,9 @@ pub(crate) enum InboxAuthority {
     Supervisor {
         _guard: crate::v2::SupervisorFollowupGuard,
     },
+    CurrentSupervisor {
+        _guard: Box<crate::v2::CurrentUserTargetGuard>,
+    },
     Peer {
         _guard: crate::v2::PeerDeliveryGuard,
     },
@@ -627,6 +630,7 @@ impl FileSessionInbox {
             InboxAuthority::HostScoped { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::HostCreation { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Unscoped { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::CurrentSupervisor { _guard } => Ok(_guard.inbox_dir.clone()),
             _ => self.inbox_dir(target).await,
         }
     }

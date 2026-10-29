@@ -43,6 +43,9 @@ WORKDIR /app
 # placeholders in this dependency-only layer; the real bamboo-server build
 # script and its required frontend package run only after the full COPY below.
 COPY --from=planner /app/recipe.json recipe.json
+# The workspace lock references this local patch even when Analytics is not
+# selected. Cargo must be able to resolve its manifest during chef cook.
+COPY --from=planner /app/third_party/libduckdb-sys /app/third_party/libduckdb-sys
 RUN cargo chef cook --release --locked --bin bamboo --recipe-path recipe.json
 
 # Now copy the full workspace (same .dockerignore exclusions as above) and

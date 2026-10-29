@@ -2,10 +2,12 @@ name: CodeQL
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
+    branches: [ dev ]
+    paths-ignore:
+      - '*.md'
+      - 'docs/*.md'
+      - 'docs/**/*.md'
 
 concurrency:
   group: codeql-${{ github.event.pull_request.number || github.ref }}

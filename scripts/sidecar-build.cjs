@@ -139,12 +139,39 @@ function evictWorkspaceArtifacts(metadata, targetDirectory, target) {
   return removed
 }
 
+// Failed-only Actions reruns retain successful jobs' original outputs/artifacts.
+// A full rerun must not recompile a successful target or hide lost evidence.
+function assertNoNativeRebuild(identity, target, read, preparation) {
+  if (identity.validation?.kind !== 'bamboo-frozen-dev-release/v1') return
+  require('./crate-release.cjs').assertFrozenPublisherRun(preparation.receipt, identity.runId, false)
+  for (let attempt = 1; attempt < identity.runAttempt; attempt++) {
+    const jobs = []; let total
+    for (let page = 1; page <= 20; page++) {
+      const data = read('actions/runs/' + identity.runId + '/attempts/' + attempt + '/jobs?per_page=100&page=' + page)
+      total ??= data.total_count; assert.equal(data.total_count, total); assert.ok(total > 0 && total <= 2000)
+      jobs.push(...data.jobs); if (jobs.length === total) break
+      assert.equal(data.jobs.length, 100)
+    }
+    assert.equal(jobs.length, total)
+    const prior = jobs.filter(job => job.name === 'Complete executable (' + target + ')')
+    assert.equal(prior.length, 1, 'Unknown previous native target history')
+    const build = prior[0].steps.find(step => step.name === 'Build and verify the standard versioned Bamboo executable')
+    assert.ok(!build || build.conclusion === 'skipped' || build.conclusion === 'failure',
+      'Native build already succeeded or remains unknown; use failed-jobs-only recovery')
+  }
+}
+
 async function main() {
   const identity = workflowIdentity()
   const contractVersion = boundSourceContract()
   const target = process.env.BAMBOO_RELEASE_TARGET
   assert.ok(contractForVersion(contractVersion).targets.includes(target))
   assert.equal(nativeTarget(), target, 'Build and runtime verification require a native target')
+  if (process.argv[2] === 'guard') {
+    assertNoNativeRebuild(identity, target, route => JSON.parse(execute('gh', ['api', '--hostname', 'github.com',
+      'repos/' + identity.repository + '/' + route])), JSON.parse(process.env.PREPARED_RELEASE))
+    return
+  }
   if (process.argv[2] === 'cache-policy') {
     const policy = nativeCachePolicy({ root: process.cwd(), temporary: process.env.RUNNER_TEMP, contractVersion, target,
       cutRevision: identity.validation?.cutRevision,
@@ -219,6 +246,6 @@ async function main() {
     version: identity.version, sourceRevision: identity.sourceRevision, sha256: provenance.sha256 }))
 }
 
-module.exports = { nativeTarget, buildEnvironment, verifyBuildMessages, sourceState, verifyStampedVersions,
+module.exports = { assertNoNativeRebuild, nativeTarget, buildEnvironment, verifyBuildMessages, sourceState, verifyStampedVersions,
   nativeCachePolicy, evictWorkspaceArtifacts }
 if (require.main === module) main().catch((error) => { console.error(error.message); process.exitCode = 1 })

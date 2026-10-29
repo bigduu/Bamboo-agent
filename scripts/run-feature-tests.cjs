@@ -7,6 +7,7 @@ const path = require("node:path");
 const os = require("node:os");
 const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
+const { parseCounts } = require("./test-groups.cjs");
 const SERIAL_STORAGE_FAMILIES = ["root_birth_tests", "host_root_create::tests", "supervisor_management_tests",
   "supervisor_management_lifetime_tests", "supervisor_proof_tests", "supervisor_management::observer_lock_order_tests"].map((name) => "v2::" + name + "::");
 const SERIAL_STORAGE_FILTERS = ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"];
@@ -15,8 +16,65 @@ const SERIAL_STORAGE_SELECTORS = [...SERIAL_STORAGE_FAMILIES,
 const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_remain_shared",
   "root_birth_all_entrypoints_wait_for_retained_shared_authority", "root_birth_final_shared_writer_guard_and_missing_title_fail_closed",
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
+// Planner library cases have one canonical default compiler and serial owner.
+const PLANNER_SERIAL = {
+  "bamboo-server-tools": {
+    "target": "bamboo_server_tools",
+    "filter": "plan::tests::",
+    "names": [
+      "plan::tests::actor_runtime_is_required_for_typed_read_only_enforcement",
+      "plan::tests::assignment_forbids_implementation_and_interactive_questions",
+      "plan::tests::invalid_selected_context_never_saves_a_child_or_arms_a_wait",
+      "plan::tests::planner_enqueue_failure_rolls_back_wait_and_deletes_unstarted_child",
+      "plan::tests::planner_wait_is_armed_before_the_child_is_enqueued",
+      "plan::tests::selected_context_uses_canonical_child_binding_without_changing_parent_authority",
+      "plan::tests::suspension_contract_tests::disabled_suspension_blocks_normalized_subagent_launch_and_wait_before_ports",
+      "plan::tests::suspension_contract_tests::disabled_suspension_blocks_plan_before_any_child_port_or_wait",
+      "plan::tests::suspension_contract_tests::disabled_suspension_keeps_subagent_read_and_cancel_authority_paths",
+      "plan::tests::suspension_contract_tests::ordinary_plan_keeps_original_create_wait_enqueue_order",
+      "plan::tests::title_defaults_to_a_bounded_task_summary",
+      "plan::tests::unsupported_selected_context_route_fails_before_persist_without_legacy_fallback"
+    ]
+  },
+  "bamboo-engine": {
+    "target": "bamboo_engine",
+    "filter": "planner_artifact",
+    "names": [
+      "runtime::runner::loop_execution::pipeline::tests::planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it",
+      "session_app::child_completion_coordinator::tests::planner_artifact_completion_publishes_before_durable_resume_and_deduplicates",
+      "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report",
+      "session_app::child_completion_coordinator::tests::planner_artifact_terminal_sibling_recovery_publishes_the_same_bounded_reference",
+      "session_app::child_session::planner_artifact::tests::planner_artifact_binds_source_revision_and_never_grants_execution",
+      "session_app::child_session::planner_artifact::tests::planner_artifact_completion_only_publishes_current_sealed_report",
+      "session_app::child_session::planner_artifact::tests::planner_artifact_file_is_rebuildable_immutable_and_nofollow",
+      "session_app::child_session::planner_artifact::tests::planner_artifact_large_report_metadata_is_not_limited_by_resume_budget",
+      "session_app::child_session::planner_artifact::tests::planner_artifact_rejects_unsealed_nonreadonly_unknown_and_duplicate_reports",
+      "session_app::child_session::planner_artifact::tests::planner_artifact_synthetic_failure_returns_no_report_or_file_but_unsealed_success_is_rejected"
+    ]
+  }
+};
+
 const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_without_transport_feature_fails_without_starting_exporter";
-const FEATURE_SOURCE_SHA256 = "c5314706eab6baa083a6c777f6ce5f24461551dfeb36b51ff7c2e4b39a0cb93e";
+// Audited from accepted dev3fe and the live-bootstrap candidate: preserve the
+// existing FileInbox, current-user/Work and TicketApplication ownership. The
+// stream checkpoint and Inbox/actor methods are unconditional; the new root
+// bootstrap tests are cfg(test) and belong to the default storage catalog.
+// Default harnesses own 20 storage, two LLM and four Unix server live cases,
+// plus five fresh-input server regressions; none match the serial exclusions.
+// Feature cfg expressions, 31 default owners, four contexts and 19 explicit
+// additive cases remain unchanged. Default catalogs own retry and Stop tests.
+// The test-utils-gated engine semaphore helper is used by the default
+// reloadable-provider test in server-other via the server's dev dependency.
+// Gold router and reload cases belong to existing server default shards;
+// registry proof cases remain in the default bamboo-llm package owner.
+// Legacy background, resume summary and per-run isolation are default engine
+// tests in packages-3. Host lock coverage is server-execute; Schedule and
+// Connect resolver coverage is server-other. Live resume summary controls stay
+// in default engine packages-3; direct background admission stays in default
+// LLM packages-2, and the reloadable provider proof stays in server-other.
+// The injected project Dream endpoint A/B case stays in server-handlers.
+// No additive feature cases changed.
+const FEATURE_SOURCE_SHA256 = "5cd9167643884197b6165bcc2100d256b40550db1d1400599c39585ebaf1126c";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
@@ -47,6 +105,69 @@ const FEATURE_CONTEXTS = [
     { name: "ticket_runtime_files", kind: "test", added: [
       "actual_stopped_native_unknown_file_is_reconciled_offline_without_rewriting_or_acceptance"] }] },
 ];
+
+const SERVER_FILTERS = ["browser::", "handlers::agent::chat::", "handlers::agent::execute::",
+  "handlers::settings::", "app_state::", "handlers::"];
+const SERVER_LIB_SHARDS = ["server-browser", "server-chat", "server-execute", "server-settings",
+  "server-app-state", "server-handlers", "server-other"];
+const FEATURE_SHARDS = ["agent-core", "agent-tests-0", "agent-tests-1", "agent-tests-2", "agent-tests-3",
+  ...SERVER_LIB_SHARDS, "server-tests-0", "server-tests-1",
+  "packages-0", "packages-1", "packages-2", "packages-3", "packages-4"];
+function packageShard(name) {
+  if (name === "bamboo-agent") return "agent";
+  if (name === "bamboo-server") return "server";
+  return "packages-" + createHash("sha256").update(name).digest().readUInt32BE(0) % 5;
+}
+function defaultFeatures(owner) {
+  const enabled = new Set(["default"]), pending = ["default"];
+  while (pending.length) for (const feature of owner.features?.[pending.pop()] || []) {
+    if (Object.hasOwn(owner.features, feature) && !enabled.has(feature)) {
+      enabled.add(feature); pending.push(feature);
+    }
+  }
+  return enabled;
+}
+function integrationTargets(owner, shard) {
+  const agent = owner.name === "bamboo-agent", count = agent ? 4 : 2;
+  const index = Number(shard.slice(shard.lastIndexOf("-") + 1));
+  assert.ok(Number.isInteger(index) && index >= 0 && index < count, "Invalid integration shard");
+  const enabled = defaultFeatures(owner);
+  return owner.targets.filter((target) => target.test && target.kind.includes("test") &&
+    (target["required-features"] || []).every((feature) => enabled.has(feature)))
+    .filter((target) => {
+      // Both default catalogs must be available to the additive Ticket owner.
+      if (agent && ["ticket_runtime_publication", "ticket_runtime_files"].includes(target.name)) return index === 0;
+      return createHash("sha256").update(target.name).digest().readUInt32BE(0) % count === index;
+    }).map((target) => target.name).sort();
+}
+function defaultShardArguments(owner, shard) {
+  const args = cargoArguments(owner);
+  if (!shard) return args;
+  if (shard === "agent-core") return [...args, "--lib", "--bins"];
+  if (shard.startsWith("agent-tests-") || shard.startsWith("server-tests-")) {
+    const targets = integrationTargets(owner, shard);
+    assert.ok(targets.length, "Integration shard has no targets: " + shard);
+    return [...args, ...targets.flatMap((target) => ["--test", target])];
+  }
+  const index = SERVER_LIB_SHARDS.indexOf(shard);
+  if (index >= 0) {
+    args.push("--lib");
+    if (index < SERVER_FILTERS.length) args.push(SERVER_FILTERS[index]);
+    args.push("--", ...SERVER_FILTERS.slice(0, index).flatMap((filter) => ["--skip", filter]));
+  }
+  return args;
+}
+function selectShard(packages, featureContexts, shard) {
+  if (!shard) return { packages, featureContexts };
+  assert.ok(FEATURE_SHARDS.includes(shard), "Unknown feature shard: " + shard);
+  const group = shard.startsWith("agent-") ? "agent" : shard.startsWith("server-") ? "server" : shard;
+  const selected = packages.filter((owner) => packageShard(owner.name) === group);
+  assert.ok(selected.length, "Feature shard must contain at least one package: " + shard);
+  const names = new Set(selected.map((owner) => owner.name));
+  return { packages: selected, featureContexts: featureContexts.filter((context) => names.has(context.package) &&
+    (context.package !== "bamboo-agent" || shard === "agent-tests-0") &&
+    (context.package !== "bamboo-server" || shard === "server-other")) };
+}
 
 function selectedPackages(metadata) {
   const selected = new Set(metadata.workspace_default_members);
@@ -137,6 +258,8 @@ function cargoArguments(owner, context, compileOnly = false) {
     else args.push("--", ...context.targets.flatMap((target) => target.added), "--exact", "--color=never");
   } else if (owner.name === "bamboo-storage") {
     args.push("--", ...SERIAL_STORAGE_SELECTORS.flatMap((name) => ["--skip", name]));
+  } else if (PLANNER_SERIAL[owner.name]) {
+    args.push("--", ...PLANNER_SERIAL[owner.name].names.flatMap(name => ["--skip", name]));
   }
   return args;
 }
@@ -202,6 +325,31 @@ function runSerialStorage(binary, options, execute = spawnSync) {
   assert.equal(selected.length, Number(summaries[0][1]));
   return result;
 }
+function runPlannerSerial(binary, owner, catalog, options, execute = spawnSync) {
+  const recipe = PLANNER_SERIAL[owner.name];
+  assert.ok(recipe, "Unregistered Planner library graph");
+  const selected = listCases(binary, options, execute).filter(name => name.includes(recipe.filter));
+  assert.deepEqual(selected, [...recipe.names].sort(), "Planner serial catalog changed; review its owner");
+  for (const [target, names] of Object.entries(catalog)) if (target !== "lib/" + recipe.target) {
+    assert.ok(!names.some(name => name.includes(recipe.filter)), "Planner exclusion cannot hide another target");
+  }
+  const before = executableHash(binary);
+  const fd = fs.openSync(options.logPath, "w");
+  let result;
+  try { result = execute(binary, [recipe.filter, "--test-threads=1", "--color=never"], { ...options, stdio: ["ignore", fd, fd] }); }
+  finally { fs.closeSync(fd); }
+  assert.ok(fs.statSync(options.logPath).size <= 16 * 1024 * 1024, "Planner serial log exceeds its bound");
+  const log = fs.readFileSync(options.logPath, "utf8");
+  if (options.echoLog) process.stdout.write(log);
+  assert.ok(!result.error && result.status === 0, "Planner serial runtime failed");
+  const counts = parseCounts(log, selected.map(name => ({ name, ignored: false })),
+    catalog["lib/" + recipe.target].length - selected.length);
+  assert.equal(counts.passed, selected.length);
+  assert.equal(counts.failed + counts.ignored, 0);
+  assert.equal(executableHash(binary), before, "Planner must retain the original compiled library");
+  return { status: 0, cases: selected, executable: binary, sha256: before, counts };
+}
+
 function artifactKey(item) {
   return JSON.stringify([item.package_id, item.target.name, item.target.kind, item.features, item.profile, item.filenames, item.executable]);
 }
@@ -238,12 +386,21 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
   const metadata = execute("cargo", ["metadata", "--locked", "--format-version", "1", "--no-deps"],
     { cwd: root, env, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 });
   assert.equal(metadata.status, 0, metadata.stderr || "Cannot inspect packages");
-  const packages = selectedPackages(JSON.parse(metadata.stdout));
-  assert.equal(sourceFeatureHash(packages, root), sourceCatalogSha,
+  const workspace = JSON.parse(metadata.stdout);
+  const allPackages = selectedPackages(workspace);
+  assert.equal(sourceFeatureHash(allPackages, root), sourceCatalogSha,
     "Feature-sensitive source changed; review and update its explicit case ownership before admission");
+  for (const context of featureContexts) assert.ok(allPackages.some((owner) => owner.name === context.package),
+    "Missing feature owner: " + context.package);
+  const selection = selectShard(allPackages, featureContexts, environment.BAMBOO_FEATURE_SHARD);
+  const packages = selection.packages;
+  featureContexts = selection.featureContexts;
   const directory = fs.mkdtempSync(path.join(environment.RUNNER_TEMP || os.tmpdir(), "bamboo-feature-tests-"));
   const contexts = [], defaults = new Map();
+  const docOwner = environment.BAMBOO_FEATURE_SHARD === "agent-core" || environment.BAMBOO_FEATURE_SHARD === "server-tests-0"
+    ? packages[0] : null;
   const plan = [...packages.map((owner) => ({ label: "default-" + owner.name })),
+    ...(docOwner ? [{ label: "default-doc-" + docOwner.name }, { label: "default-examples-" + docOwner.name }] : []),
     ...featureContexts.map((context) => ({ label: "feature-" + context.package, features: context.features, targets: context.targets }))];
   const finished = [], source = { root, sourceCatalogSha,
     controllerSha256: createHash("sha256").update(fs.readFileSync(__filename)).digest("hex"),
@@ -291,7 +448,7 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
   for (const owner of packages) {
     let run;
     try {
-      run = cargo("default-" + owner.name, cargoArguments(owner));
+      run = cargo("default-" + owner.name, defaultShardArguments(owner, environment.BAMBOO_FEATURE_SHARD));
       run.receipt.catalog = catalog(run, owner);
       defaults.set(owner.name, run.receipt.catalog);
       if (owner.name === "bamboo-infrastructure") {
@@ -299,6 +456,32 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
           "Default-only production telemetry witness must remain compiled");
         if (run.receipt.status === 0) assert.ok(successfulCases(run.log).includes(DEFAULT_TELEMETRY_CASE),
           "Default-only production telemetry witness must execute");
+      }
+      if (PLANNER_SERIAL[owner.name]) {
+        const recipe = PLANNER_SERIAL[owner.name];
+        const unit = run.units.find(item => item.package_id === owner.id && item.target.name === recipe.target && item.profile.test);
+        assert.deepEqual(unit?.features, [], "Planner's standalone default feature graph changed");
+        assert.ok(unit.profile.opt_level === "0" && unit.profile.debuginfo === 0 && unit.profile.debug_assertions && unit.profile.overflow_checks,
+          "Planner reuses A's canonical test profile, not an ABI/unwind variant");
+        // Retain each standalone dependency graph. The frontend flag cannot
+        // change either library graph: neither contains the server.
+        const dependencyFeatures = owner.name === "bamboo-engine"
+          ? { "bamboo-config": [], "bamboo-infrastructure": ["test-utils"] }
+          : { "bamboo-config": ["test-utils"], "bamboo-infrastructure": [] };
+        run.receipt.plannerDefaultGraph = Object.entries(dependencyFeatures).map(([name, features]) => {
+          const dependency = workspace.packages.find(item => item.name === name);
+          assert.ok(dependency, "Missing Planner graph dependency");
+          const rows = run.units.filter(item => item.package_id === dependency.id && item.target.kind.includes("lib") && !item.profile.test);
+          assert.equal(rows.length, 1, "Planner dependency must have one original lib unit");
+          assert.deepEqual(rows[0].features, features, "Planner default graph changed; review ownership");
+          return evidence(rows[0]);
+        });
+        const server = workspace.packages.find(item => item.name === "bamboo-server");
+        assert.ok(!server || !run.units.some(item => item.package_id === server.id), "Planner library graph cannot acquire a frontend mode");
+        const binary = compiledExecutable(run.log, owner, env.CARGO_TARGET_DIR, recipe.target, "lib");
+        checkpoint("planner-serial", run.receipt.label);
+        run.receipt.plannerSerial = runPlannerSerial(binary, owner, run.receipt.catalog,
+          { ...packageOptions(owner, root, env), logPath: path.join(directory, "planner-serial-" + owner.name + ".log"), echoLog }, execute);
       }
       if (owner.name === "bamboo-storage") {
         const binary = compiledExecutable(run.log, owner, env.CARGO_TARGET_DIR, "bamboo_storage", "lib");
@@ -324,6 +507,18 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     }
     finished.push("default-" + owner.name);
     checkpoint("context-finished", "default-" + owner.name);
+  }
+  if (docOwner) {
+    const commands = [
+      ["default-doc-" + docOwner.name, ["test", "--locked", "--no-fail-fast", "--message-format=json-render-diagnostics", "-p", docOwner.name, "--doc"]],
+      ["default-examples-" + docOwner.name, ["build", "--locked", "--profile", "test", "--message-format=json-render-diagnostics", "-p", docOwner.name, "--examples"]],
+    ];
+    for (const [label, args] of commands) {
+      try { cargo(label, args); }
+      catch (error) { contexts.push({ label, status: 1, error: error.message }); }
+      finished.push(label);
+      checkpoint("context-finished", label);
+    }
   }
   for (const context of featureContexts) {
     let compile;
@@ -379,12 +574,13 @@ function runFeatureTests({ root = process.cwd(), environment = process.env, exec
     "Feature Unit/E2E: " + packages.length + " independent default package contexts; " + featureContexts.length +
     " explicit additive feature contexts; one owned target directory. Status: " + status + ".\n");
   checkpoint("finished", null, null, status === 0 && finished.length === plan.length &&
-    contexts.length === packages.length + featureContexts.reduce((count, context) => count + 1 + context.targets.length, 0));
+    contexts.length === packages.length + (docOwner ? 2 : 0) + featureContexts.reduce((count, context) => count + 1 + context.targets.length, 0));
   return { status, contexts, directory, packages: packages.map((item) => item.name) };
 }
 
 module.exports = { selectedPackages, sourceFeatureHash, cargoArguments, compiledExecutable, sshExecutable, runSerialStorage,
-  SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES,
+  FEATURE_SHARDS, SERVER_FILTERS, SERVER_LIB_SHARDS, packageShard, integrationTargets, defaultShardArguments, selectShard,
+  SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, PLANNER_SERIAL, runPlannerSerial,
   DEFAULT_TELEMETRY_CASE, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, validateFeatureCatalog, runFeatureTests };
 if (require.main === module) {
   try { process.exitCode = runFeatureTests().status; }

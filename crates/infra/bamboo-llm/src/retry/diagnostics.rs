@@ -24,16 +24,18 @@ pub struct InitialRequestDiagnostic {
     // The caller does not supply an authoritative Engine run ID to this layer.
     pub(super) run_id: Option<uuid::Uuid>,
     pub(super) attempt: u32,
-    pub(super) attempt_limit: u32,
+    pub(super) attempt_limit: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) retry_mode: Option<&'static str>,
     pub(super) event: &'static str,
     pub(super) phase: &'static str,
     pub(super) failure: &'static str,
     pub(super) status: Option<u16>,
     pub(super) attempt_timeout_ms: u64,
-    pub(super) total_budget_ms: u64,
+    pub(super) total_budget_ms: Option<u64>,
     pub(super) attempt_elapsed_ms: u64,
     pub(super) total_elapsed_ms: u64,
-    pub(super) remaining_budget_ms: u64,
+    pub(super) remaining_budget_ms: Option<u64>,
     pub(super) retry_delay_ms: Option<u64>,
     pub(super) stop_reason: Option<RequestStopReason>,
     // A timeout before response headers does not prove the POST was unreceived.
@@ -45,7 +47,7 @@ pub(super) struct AttemptObservation {
     pub(super) diagnostic: InitialRequestDiagnostic,
     request_started: Instant,
     attempt_started: Instant,
-    deadline: Instant,
+    deadline: Option<Instant>,
 }
 
 fn millis(duration: Duration) -> u64 {
@@ -145,7 +147,9 @@ impl AttemptObservation {
         }
         self.diagnostic.total_elapsed_ms =
             millis(now.saturating_duration_since(self.request_started));
-        self.diagnostic.remaining_budget_ms = millis(self.deadline.saturating_duration_since(now));
+        self.diagnostic.remaining_budget_ms = self
+            .deadline
+            .map(|d| millis(d.saturating_duration_since(now)));
     }
 
     fn terminal(&self) -> LLMError {
@@ -157,9 +161,13 @@ impl AttemptObservation {
         let stop = d
             .stop_reason
             .expect("terminal diagnostic has a stop reason");
+        let limit = d
+            .attempt_limit
+            .map(|n| format!(" (limit {n})"))
+            .unwrap_or_default();
         LLMError::RequestFailed(format!(
-            "Anthropic upstream request failed ({status}): {}. {} after {} request(s) (limit {}). Diagnostic ID: {}. Try again later or contact the upstream gateway administrator.",
-            d.failure, stop.guidance(), d.attempt, d.attempt_limit, d.diagnostic_id,
+            "Anthropic upstream request failed ({status}): {}. {} after {} request(s){limit}. Diagnostic ID: {}. Try again later or contact the upstream gateway administrator.",
+            d.failure, stop.guidance(), d.attempt, d.diagnostic_id,
         ))
     }
 }
@@ -188,23 +196,25 @@ impl InitialRequestBudget {
                 session_hash: self.session_hash.clone(),
                 run_id: None,
                 attempt: self.attempts.load(Ordering::Relaxed),
-                attempt_limit: self.max_attempts,
+                attempt_limit: (!self.is_continuous()).then_some(self.max_attempts),
+                retry_mode: self.is_continuous().then_some("until_cancelled"),
                 event: "attempt_start",
                 phase,
                 failure,
                 status: status.map(|s| s.as_u16()),
                 attempt_timeout_ms: millis(self.attempt_timeout),
-                total_budget_ms: millis(self.deadline.saturating_duration_since(self.started)),
+                total_budget_ms: (!self.is_continuous())
+                    .then(|| millis(self.deadline.saturating_duration_since(self.started))),
                 attempt_elapsed_ms: 0,
                 total_elapsed_ms: 0,
-                remaining_budget_ms: 0,
+                remaining_budget_ms: (!self.is_continuous()).then_some(0),
                 retry_delay_ms: None,
                 stop_reason: None,
                 upstream_outcome: "unknown",
             },
             request_started: self.started,
             attempt_started,
-            deadline: self.deadline,
+            deadline: (!self.is_continuous()).then_some(self.deadline),
         }
     }
 
@@ -267,6 +277,9 @@ impl InitialRequestBudget {
             RetryDecision::DelayExceedsBudget => {
                 d.stop_reason = Some(RequestStopReason::RetryDelayExceedsBudget)
             }
+            RetryDecision::DelayTooLarge => {
+                d.stop_reason = Some(RequestStopReason::RetryDelayTooLarge)
+            }
             RetryDecision::Return => {}
         }
         if d.stop_reason.is_some() {
@@ -276,6 +289,19 @@ impl InitialRequestBudget {
             }
         }
         observation.refresh();
+        if let Some(stop) = observation.diagnostic.stop_reason {
+            if self.can_defer_terminal(stop) {
+                if let Ok(mut deferred) = self.deferred_terminal.lock() {
+                    *deferred = Some(observation.clone());
+                    let mut waiting = observation;
+                    waiting.diagnostic.event = "retry_waiting";
+                    waiting.diagnostic.stop_reason = None;
+                    waiting.diagnostic.error_id = None;
+                    self.record(waiting);
+                    return;
+                }
+            }
+        }
         self.record(observation.clone());
         if matches!(decision, RetryDecision::Retry(_)) {
             observation.diagnostic.phase = "backoff";
@@ -303,6 +329,22 @@ impl Drop for CancellationObservation<'_> {
             .ok()
             .and_then(|value| value.clone());
         if let Some(mut observation) = latest {
+            // Observe the committed actor gate even if the provider future
+            // has not yet resumed to set live_continuous. Clone before
+            // inspecting the gate so the two mutexes are never nested.
+            let gate = self
+                .budget
+                .live_gate
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            if self.budget.is_continuous() || gate.is_some_and(|gate| gate.is_committed()) {
+                observation.diagnostic.retry_mode = Some("until_cancelled");
+                observation.diagnostic.attempt_limit = None;
+                observation.diagnostic.total_budget_ms = None;
+                observation.diagnostic.remaining_budget_ms = None;
+                observation.deadline = None;
+            }
             observation.diagnostic.event = "stop";
             observation.diagnostic.stop_reason = Some(RequestStopReason::CancelledOrDropped);
             self.budget.record(observation);
@@ -341,6 +383,42 @@ mod tests {
         let json = serde_json::to_string(&events).unwrap();
         assert!(!json.contains(&session));
         assert!(json.len() < 12 * 1024);
+    }
+
+    #[test]
+    fn cancellation_uses_only_a_committed_live_confirmation() {
+        for (committed, cancelled) in [(false, false), (false, true), (true, false)] {
+            let session = format!("live-cancel-{}", uuid::Uuid::new_v4());
+            let budget =
+                InitialRequestBudget::new(&RetryConfig::default()).with_session_id(Some(&session));
+            budget.record(budget.observation(
+                Instant::now(),
+                "backoff",
+                "http_status",
+                Some(StatusCode::SERVICE_UNAVAILABLE),
+            ));
+            let gate = bamboo_domain::AdmissionGate::default();
+            *budget.live_gate.lock().unwrap() = Some(gate.clone());
+            if committed {
+                gate.commit(|| Ok::<(), ()>(())).unwrap();
+            } else if cancelled {
+                gate.cancel_if_pending();
+            }
+            drop(CancellationObservation {
+                budget: &budget,
+                completed: false,
+            });
+            let events = recent_initial_request_diagnostics(&session);
+            let last = events.last().unwrap();
+            assert_eq!(
+                last.stop_reason,
+                Some(RequestStopReason::CancelledOrDropped)
+            );
+            assert_eq!(last.retry_mode, committed.then_some("until_cancelled"));
+            assert_eq!(last.attempt_limit.is_none(), committed);
+            assert_eq!(last.total_budget_ms.is_none(), committed);
+            assert_eq!(last.remaining_budget_ms.is_none(), committed);
+        }
     }
 
     #[test]

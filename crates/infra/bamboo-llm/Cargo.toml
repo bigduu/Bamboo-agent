@@ -12,12 +12,14 @@ bamboo-domain = { path = "../../core/bamboo-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }
+httpdate = "1"
 thiserror = { workspace = true }
 anyhow = "1"
 tracing = "0.1"
 async-trait = "0.1"
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
+native-tls = "0.2"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "form", "query", "native-tls", "charset", "http2", "system-proxy"] }
 reqwest-middleware = { version = "0.5", features = ["json", "form"] }
 reqwest-retry = "0.9"
@@ -27,8 +29,13 @@ base64 = "0.23"
 bytes = "1"
 sha2 = { workspace = true }
 hex = { workspace = true }
+ring = "0.17"
+subtle = "2.6"
 
 [dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+socket2 = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tempfile = "3"
 http = "1"
 wiremock = "0.6"

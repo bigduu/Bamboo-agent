@@ -1157,7 +1157,7 @@ mod tests {
             async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
                 self.calls.lock().unwrap().push(call.function.name.clone());
                 match call.function.name.as_str() {
-                    "Read" => Ok(ToolResult::text(
+                    "work_inspect" => Ok(ToolResult::text(
                         true,
                         serde_json::to_string(&AgenticToolResult::NeedMoreActions {
                             actions: vec![make_tool_call("queued-edit", "Edit", "{}")],
@@ -1176,24 +1176,31 @@ mod tests {
                 }
             }
             fn list_tools(&self) -> Vec<ToolSchema> {
-                ["Read", "SubAgent", "Edit", "exec_command", "vendor::Read"]
-                    .into_iter()
-                    .map(|name| ToolSchema {
-                        schema_type: "function".into(),
-                        function: crate::tools::FunctionSchema {
-                            name: name.into(),
-                            description: "probe".into(),
-                            parameters: serde_json::json!({"type":"object"}),
-                        },
-                    })
-                    .collect()
+                [
+                    "work_inspect",
+                    "Read",
+                    "SubAgent",
+                    "Edit",
+                    "exec_command",
+                    "vendor::Read",
+                ]
+                .into_iter()
+                .map(|name| ToolSchema {
+                    schema_type: "function".into(),
+                    function: crate::tools::FunctionSchema {
+                        name: name.into(),
+                        description: "probe".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                })
+                .collect()
             }
         }
         for ultra in [false, true] {
             for failure in [
                 None,
                 Some("worker_unavailable: configure an authorized worker and retry"),
-                Some("scope_denied: target is not attached; owner action required"),
+                Some("worker_permission_denied: target requires a human decision"),
             ] {
                 let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
                 session.authority_identity = SessionAuthorityIdentity::Supervisor {
@@ -1208,8 +1215,9 @@ mod tests {
                 let flags = ToolExecutionSessionFlags::from_session(&session);
                 execute_sub_actions(
                     &[
-                        make_tool_call("read", "Read", "{}"),
+                        make_tool_call("view", "work_inspect", "{}"),
                         make_tool_call("delegate", "SubAgent", "{}"),
+                        make_tool_call("direct-read", "Read", "{}"),
                         make_tool_call("direct-shell", "exec_command", "{}"),
                         make_tool_call("external-read", "vendor::Read", "{}"),
                     ],
@@ -1222,7 +1230,7 @@ mod tests {
                 .await;
                 assert_eq!(
                     *tools.calls.lock().unwrap(),
-                    ["Read", "SubAgent"],
+                    ["work_inspect", "SubAgent"],
                     "ultra={ultra}, failure={failure:?}"
                 );
                 if let Some(reason) = failure {
@@ -1239,7 +1247,22 @@ mod tests {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(started, ["read", "delegate"]);
+                assert_eq!(started, ["view", "delegate"]);
+                for id in [
+                    "queued-edit",
+                    "direct-read",
+                    "direct-shell",
+                    "external-read",
+                ] {
+                    assert!(
+                        session.messages.iter().any(|message| {
+                            message.tool_call_id.as_deref() == Some(id)
+                                && message.tool_success == Some(false)
+                                && message.content.contains("supervisor_delegation_required")
+                        }),
+                        "missing blocked result for {id}"
+                    );
+                }
             }
         }
     }

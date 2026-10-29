@@ -44,7 +44,7 @@ impl Fixture {
             .unwrap();
         supervisor.set_root_orchestration_only(ultra).unwrap();
         store.save_session(&supervisor).await.unwrap();
-        let fixture = Self {
+        let mut fixture = Self {
             home,
             store,
             supervisor,
@@ -56,6 +56,12 @@ impl Fixture {
                     .into(),
             })
             .await;
+        fixture.supervisor = fixture
+            .store
+            .load_execution_admission_snapshot(&fixture.supervisor.id)
+            .await
+            .unwrap()
+            .unwrap();
         fixture
     }
 
@@ -97,6 +103,9 @@ impl Fixture {
         ctx.session_id = Some(Arc::from(self.supervisor.id.as_str()));
         ctx.executing_supervisor =
             ExecutingSupervisorObservation::capture_from_executing_session(&self.supervisor);
+        ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+            &self.supervisor,
+        )));
         ctx
     }
 
@@ -129,8 +138,8 @@ fn result(outcome: ToolOutcome) -> Value {
 async fn directory_authorizes_before_paging_and_recovers_same_cursor_after_restart() {
     for ultra in [false, true] {
         let mut fixture = Fixture::new(ultra).await;
-        fixture.root("aa-unattached", "project-a", false).await;
-        let first = fixture.root("bb-authorized", "project-a", true).await;
+        let first = fixture.root("aa-unattached", "project-a", false).await;
+        fixture.root("bb-authorized", "project-a", true).await;
         fixture.root("cc-detached", "project-a", true).await;
         fixture
             .mutate(Mutation::Detach {
@@ -157,9 +166,6 @@ async fn directory_authorizes_before_paging_and_recovers_same_cursor_after_resta
             "private title",
             "private transcript",
             "private-fixture-model",
-            "aa-unattached",
-            "cc-detached",
-            "dd-metadata-changed",
         ] {
             assert!(
                 !serialized.contains(forbidden),
@@ -175,8 +181,26 @@ async fn directory_authorizes_before_paging_and_recovers_same_cursor_after_resta
         let next = fixture
             .invoke(json!({"action":"list","limit":1,"cursor":cursor}))
             .await;
-        assert_eq!(next["sessions"][0]["session_id"], "ee-authorized");
-        assert!(next["next_cursor"].is_null());
+        assert_eq!(next["sessions"][0]["session_id"], "bb-authorized");
+        let mut cursor = next["next_cursor"].as_str().map(str::to_owned);
+        let mut remaining = Vec::new();
+        while let Some(position) = cursor {
+            let page = fixture
+                .invoke(json!({"action":"list","limit":1,"cursor":position}))
+                .await;
+            assert_eq!(page["sessions"].as_array().unwrap().len(), 1);
+            remaining.push(
+                page["sessions"][0]["session_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            cursor = page["next_cursor"].as_str().map(str::to_owned);
+        }
+        assert_eq!(
+            remaining,
+            ["cc-detached", "dd-metadata-changed", "ee-authorized"]
+        );
         let filtered = fixture
             .invoke(json!({"action":"list","limit":1,"query":"PROJECT-B"}))
             .await;
@@ -273,10 +297,15 @@ async fn discovery_denies_missing_forged_and_stale_caller_lifetimes() {
 }
 
 #[tokio::test]
-async fn directory_excludes_recreated_project_changed_and_revoked_targets() {
+async fn directory_observes_current_birth_project_and_scope_without_legacy_acl_filtering() {
     for change in ["recreated", "project", "scope"] {
         let fixture = Fixture::new(true).await;
         let mut target = fixture.root("managed", "project-a", true).await;
+        let old_selector = fixture
+            .store
+            .inspect_supervisor_current_user_target(&fixture.reference, &target.id)
+            .await
+            .unwrap();
         match change {
             "recreated" => {
                 fixture.store.delete_session(&target.id).await.unwrap();
@@ -301,15 +330,35 @@ async fn directory_excludes_recreated_project_changed_and_revoked_targets() {
             _ => unreachable!(),
         }
         let page = fixture.invoke(json!({"action":"list"})).await;
-        assert!(page["sessions"].as_array().unwrap().is_empty(), "{change}");
-        assert!(fixture
-            .tool()
-            .invoke(
-                json!({"action":"inspect","session_id":target.id}),
-                fixture.ctx()
-            )
+        assert_eq!(page["sessions"].as_array().unwrap().len(), 1, "{change}");
+        assert_eq!(page["sessions"][0]["session_id"], target.id);
+        let fresh = fixture
+            .store
+            .inspect_supervisor_current_user_target(&fixture.reference, &target.id)
             .await
-            .is_err());
+            .unwrap();
+        if change == "scope" {
+            assert_eq!(
+                fresh, old_selector,
+                "legacy ACL change does not recreate a target"
+            );
+        } else {
+            assert_ne!(
+                fresh, old_selector,
+                "old birth/metadata must not describe the replacement"
+            );
+        }
+        assert!(
+            fixture
+                .tool()
+                .invoke(
+                    json!({"action":"inspect","session_id":target.id}),
+                    fixture.ctx()
+                )
+                .await
+                .is_ok(),
+            "{change}"
+        );
     }
 }
 

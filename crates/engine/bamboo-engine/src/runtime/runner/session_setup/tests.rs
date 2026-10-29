@@ -1365,6 +1365,8 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
             "default::Read",
             "vendor::session_control",
         ])
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&names);
     let config = crate::runtime::config::AgentLoopConfig::default();
@@ -1380,9 +1382,8 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
             .iter()
             .map(|entry| entry.execution_name().to_string())
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+        let expected = bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS
             .into_iter()
-            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
             .map(str::to_owned)
             .collect();
         assert_eq!(names, expected, "Supervisor ultra={ultra}");
@@ -1451,12 +1452,9 @@ fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_dis
         ..Default::default()
     };
     let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut supervisor);
-    assert_eq!(
-        schemas
-            .iter()
-            .map(|s| s.function.name.as_str())
-            .collect::<Vec<_>>(),
-        ["Read"]
+    assert!(
+        schemas.is_empty(),
+        "disabled delegation must not expose Read"
     );
 }
 
@@ -1493,17 +1491,11 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
             history.schema().function.parameters["properties"]["action"]["enum"],
             serde_json::json!(["list", "inspect", "get_meta", "read_messages"])
         );
-        if ultra {
-            assert_eq!(
-                names,
-                [
-                    "Read".into(),
-                    "session_control".into(),
-                    "session_history".into()
-                ]
-                .into()
-            );
-        }
+        assert_eq!(
+            names,
+            ["session_control".into(), "session_history".into()].into(),
+            "Supervisor ultra={ultra} must not expose direct Read"
+        );
         let provider =
             resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &supervisor)
                 .into_iter()

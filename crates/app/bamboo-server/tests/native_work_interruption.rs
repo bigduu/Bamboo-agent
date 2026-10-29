@@ -156,6 +156,219 @@ async fn cancelled_inflight_work_cannot_replay_task_or_regain_authority_after_re
         "id":"forbidden-late-step", "content":"Must never be committed after cancellation", "status":"completed"
     }]});
 
+    // A cold Host restart crosses an executor lifetime too. All real Task,
+    // Cancel and owned-stop receipts below are verified before dropping that
+    // runtime; no writer lock is relaxed or stop evidence synthesized.
+    let first_physical = physical.clone();
+    let first_provider = provider.clone();
+    let first_workspace = workspace.clone();
+    let (finished, first_runtime_exit) = tokio::sync::oneshot::channel();
+    let first_host = std::thread::spawn(move || {
+        let physical = first_physical;
+        let provider = first_provider;
+        let workspace = first_workspace;
+        let result = actix_web::rt::System::new().block_on(async move {
+            let state = web::Data::new(host(&physical, provider.clone()).await);
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(bamboo_server::configure_routes),
+            )
+            .await;
+            let project = state
+                .project_store
+                .create("Interruption Project", None)
+                .unwrap();
+            let project = state
+                .project_store
+                .bind_workspace(
+                    &project.id,
+                    project.revision,
+                    WorkspaceBinding {
+                        path: workspace.repo.clone(),
+                        label: None,
+                        git_common_dir: None,
+                    },
+                )
+                .unwrap();
+            let (service, owner) = state
+                .tickets
+                .authority(Principal::User {
+                    user_id: "host-owner".into(),
+                })
+                .await
+                .unwrap();
+            let work = prepare_work!(app, service, owner, project, "inflight");
+            let (assignment, start, start_receipt) =
+                start_work!(app, service, owner, work, workspace, "inflight");
+            let first = next(&mut requests).await;
+            assert!(first
+                .tools
+                .iter()
+                .any(|schema| schema.function.name == "Task"));
+            let before_revision = service.published().unwrap().1.assignments[&assignment]
+                .plan
+                .plan_revision;
+            first.reply.send(task_chunk(FIRST, &first_args)).unwrap();
+            let held = next(&mut requests).await;
+            assert_eq!(task_result(&held, FIRST).tool_success, Some(true));
+
+            let running = service.published().unwrap().1;
+            assert_eq!(running.tickets[&work].state, WorkState::Active);
+            assert!(!running.assignments[&assignment].process_stopped);
+            let plan = &running.assignments[&assignment].plan;
+            assert_eq!(plan.plan_revision, before_revision + 1);
+            assert_eq!(plan.steps.len(), 1);
+            assert_eq!(plan.steps[0].status, Some(StepStatus::Completed));
+            let saved_plan = canonical_bytes(plan).unwrap();
+            let task_receipt_id = format!(
+                "worker-plan/{}/{FIRST}",
+                running.assignments[&assignment].dispatch_key
+            );
+            let task_receipt = canonical_bytes(&running.receipts[&task_receipt_id]).unwrap();
+            let task_command: Command =
+                serde_json::from_str(&running.receipts[&task_receipt_id].canonical_request).unwrap();
+            assert!(
+                matches!(task_command.source, Some(CommandSource::WorkerTask { arguments }) if arguments == first_args)
+            );
+            let runtime = running.assignments[&assignment].runtime.clone().unwrap();
+            // Captured only from the real admitted Child/Run. It will be used for a
+            // cached reply and negative new-command checks, never to create stop evidence.
+            let retained =
+                TicketWorkerPlan::from_runtime_receipt(service.clone(), &assignment).unwrap();
+            let mut stale_child = state
+                .storage
+                .load_session(&runtime.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let cancel = service
+                .prepare_command(
+                    &owner,
+                    "cancel-inflight",
+                    vec![Operation::Cancel {
+                        work_id: work.clone(),
+                    }],
+                )
+                .unwrap();
+            let cancel_receipt = owner_post!(app, "/api/v1/tickets/update", &cancel, StatusCode::OK);
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let snapshot = service.published().unwrap().1;
+                    if snapshot.assignments[&assignment].process_stopped {
+                        assert_eq!(snapshot.tickets[&work].state, WorkState::Cancelled);
+                        assert_eq!(
+                            snapshot.assignments[&assignment].state,
+                            AssignmentState::Cancelled
+                        );
+                        assert!(snapshot.tickets[&work].active_assignment.is_none());
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("real owner cancellation joins the exact native run");
+            assert!(
+                held.reply
+                    .send(task_chunk("late-provider-task", &late_args))
+                    .is_err(),
+                "a confirmed stopped run cannot consume another provider response"
+            );
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+            // Exact cached projection is allowed; it must not be confused with a
+            // renewed tool grant or replace the current plan with a new command.
+            let stopped_revision = service.published().unwrap().0;
+            retained
+                .apply_task(&mut stale_child, FIRST, &first_args)
+                .unwrap();
+            assert!(matches!(
+                retained.apply_task(&mut stale_child, "new-after-cancel", &late_args),
+                Err(Error::ScopeDenied(_))
+            ));
+            assert_eq!(service.published().unwrap().0, stopped_revision);
+            let stopped = service.published().unwrap().1;
+            assert_eq!(
+                canonical_bytes(&stopped.assignments[&assignment].plan).unwrap(),
+                saved_plan
+            );
+            assert_eq!(
+                canonical_bytes(&stopped.receipts[&task_receipt_id]).unwrap(),
+                task_receipt
+            );
+            assert!(!stopped.receipts.contains_key(&format!(
+                "worker-plan/{}/new-after-cancel",
+                stopped.assignments[&assignment].dispatch_key
+            )));
+            assert!(stopped.tickets[&work].current_submission.is_none());
+            assert!(stopped.tickets[&work].accepted_submission.is_none());
+            assert!(stopped
+                .submissions
+                .values()
+                .filter(|s| s.work_id == work)
+                .all(|s| s.stale));
+            // Ticket stop is committed after the task/resource join, before the
+            // SDK's terminal Session publication tail. Observe both boundaries;
+            // the first receipt alone does not mean every diagnostic is published.
+            let child = tokio::time::timeout(WAIT, async {
+                loop {
+                    let child = state
+                        .storage
+                        .load_session(&runtime.session_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if child
+                        .metadata
+                        .get("runtime.local_task.state")
+                        .map(String::as_str)
+                        == Some("stopped")
+                        && matches!(
+                            child.last_run_status().as_deref(),
+                            Some("completed" | "error" | "timeout" | "cancelled" | "skipped")
+                        )
+                    {
+                        break child;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("SDK durably publishes the already joined Child's terminal state");
+            let stop_receipt: Value =
+                serde_json::from_str(&child.metadata["ticket.runtime.owned_stop.v1"]).unwrap();
+            assert_eq!(stop_receipt["receipt"], json!(runtime));
+            assert_eq!(stop_receipt["completed"], false);
+            let instance =
+                uuid::Uuid::parse_str(stop_receipt["task_instance"].as_str().unwrap()).unwrap();
+            assert!(!instance.is_nil());
+            assert_eq!(stop_receipt["child_birth"], json!(child.created_at));
+            assert_eq!(
+                child.metadata["runtime.local_task.instance"],
+                instance.to_string()
+            );
+            assert_eq!(child.metadata["runtime.local_task.state"], "stopped");
+            drop(retained);
+            state.shutdown().await;
+            (
+                project.id,
+                work,
+                assignment,
+                start,
+                start_receipt,
+                cancel,
+                cancel_receipt,
+                saved_plan,
+                task_receipt_id,
+                task_receipt,
+                stop_receipt,
+                requests,
+            )
+        });
+        // The System temporary and its executor have dropped before this send.
+        let _ = finished.send(result);
+    });
     let (
         project_id,
         work,
@@ -168,204 +381,14 @@ async fn cancelled_inflight_work_cannot_replay_task_or_regain_authority_after_re
         task_receipt_id,
         task_receipt,
         stop_receipt,
-    ) = {
-        let state = web::Data::new(host(&physical, provider.clone()).await);
-        let app = test::init_service(
-            App::new()
-                .app_data(state.clone())
-                .configure(bamboo_server::configure_routes),
-        )
-        .await;
-        let project = state
-            .project_store
-            .create("Interruption Project", None)
-            .unwrap();
-        let project = state
-            .project_store
-            .bind_workspace(
-                &project.id,
-                project.revision,
-                WorkspaceBinding {
-                    path: workspace.repo.clone(),
-                    label: None,
-                    git_common_dir: None,
-                },
-            )
-            .unwrap();
-        let (service, owner) = state
-            .tickets
-            .authority(Principal::User {
-                user_id: "host-owner".into(),
-            })
-            .await
-            .unwrap();
-        let work = prepare_work!(app, service, owner, project, "inflight");
-        let (assignment, start, start_receipt) =
-            start_work!(app, service, owner, work, workspace, "inflight");
-        let first = next(&mut requests).await;
-        assert!(first
-            .tools
-            .iter()
-            .any(|schema| schema.function.name == "Task"));
-        let before_revision = service.published().unwrap().1.assignments[&assignment]
-            .plan
-            .plan_revision;
-        first.reply.send(task_chunk(FIRST, &first_args)).unwrap();
-        let held = next(&mut requests).await;
-        assert_eq!(task_result(&held, FIRST).tool_success, Some(true));
-
-        let running = service.published().unwrap().1;
-        assert_eq!(running.tickets[&work].state, WorkState::Active);
-        assert!(!running.assignments[&assignment].process_stopped);
-        let plan = &running.assignments[&assignment].plan;
-        assert_eq!(plan.plan_revision, before_revision + 1);
-        assert_eq!(plan.steps.len(), 1);
-        assert_eq!(plan.steps[0].status, Some(StepStatus::Completed));
-        let saved_plan = canonical_bytes(plan).unwrap();
-        let task_receipt_id = format!(
-            "worker-plan/{}/{FIRST}",
-            running.assignments[&assignment].dispatch_key
-        );
-        let task_receipt = canonical_bytes(&running.receipts[&task_receipt_id]).unwrap();
-        let task_command: Command =
-            serde_json::from_str(&running.receipts[&task_receipt_id].canonical_request).unwrap();
-        assert!(
-            matches!(task_command.source, Some(CommandSource::WorkerTask { arguments }) if arguments == first_args)
-        );
-        let runtime = running.assignments[&assignment].runtime.clone().unwrap();
-        // Captured only from the real admitted Child/Run. It will be used for a
-        // cached reply and negative new-command checks, never to create stop evidence.
-        let retained =
-            TicketWorkerPlan::from_runtime_receipt(service.clone(), &assignment).unwrap();
-        let mut stale_child = state
-            .storage
-            .load_session(&runtime.session_id)
-            .await
-            .unwrap()
-            .unwrap();
-        let cancel = service
-            .prepare_command(
-                &owner,
-                "cancel-inflight",
-                vec![Operation::Cancel {
-                    work_id: work.clone(),
-                }],
-            )
-            .unwrap();
-        let cancel_receipt = owner_post!(app, "/api/v1/tickets/update", &cancel, StatusCode::OK);
-        tokio::time::timeout(WAIT, async {
-            loop {
-                let snapshot = service.published().unwrap().1;
-                if snapshot.assignments[&assignment].process_stopped {
-                    assert_eq!(snapshot.tickets[&work].state, WorkState::Cancelled);
-                    assert_eq!(
-                        snapshot.assignments[&assignment].state,
-                        AssignmentState::Cancelled
-                    );
-                    assert!(snapshot.tickets[&work].active_assignment.is_none());
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
+        mut requests,
+    ) = tokio::time::timeout(WAIT * 4, first_runtime_exit)
         .await
-        .expect("real owner cancellation joins the exact native run");
-        assert!(
-            held.reply
-                .send(task_chunk("late-provider-task", &late_args))
-                .is_err(),
-            "a confirmed stopped run cannot consume another provider response"
-        );
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
-
-        // Exact cached projection is allowed; it must not be confused with a
-        // renewed tool grant or replace the current plan with a new command.
-        let stopped_revision = service.published().unwrap().0;
-        retained
-            .apply_task(&mut stale_child, FIRST, &first_args)
-            .unwrap();
-        assert!(matches!(
-            retained.apply_task(&mut stale_child, "new-after-cancel", &late_args),
-            Err(Error::ScopeDenied(_))
-        ));
-        assert_eq!(service.published().unwrap().0, stopped_revision);
-        let stopped = service.published().unwrap().1;
-        assert_eq!(
-            canonical_bytes(&stopped.assignments[&assignment].plan).unwrap(),
-            saved_plan
-        );
-        assert_eq!(
-            canonical_bytes(&stopped.receipts[&task_receipt_id]).unwrap(),
-            task_receipt
-        );
-        assert!(!stopped.receipts.contains_key(&format!(
-            "worker-plan/{}/new-after-cancel",
-            stopped.assignments[&assignment].dispatch_key
-        )));
-        assert!(stopped.tickets[&work].current_submission.is_none());
-        assert!(stopped.tickets[&work].accepted_submission.is_none());
-        assert!(stopped
-            .submissions
-            .values()
-            .filter(|s| s.work_id == work)
-            .all(|s| s.stale));
-        // Ticket stop is committed after the task/resource join, before the
-        // SDK's terminal Session publication tail. Observe both boundaries;
-        // the first receipt alone does not mean every diagnostic is published.
-        let child = tokio::time::timeout(WAIT, async {
-            loop {
-                let child = state
-                    .storage
-                    .load_session(&runtime.session_id)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if child
-                    .metadata
-                    .get("runtime.local_task.state")
-                    .map(String::as_str)
-                    == Some("stopped")
-                    && matches!(
-                        child.last_run_status().as_deref(),
-                        Some("completed" | "error" | "timeout" | "cancelled" | "skipped")
-                    )
-                {
-                    break child;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("SDK durably publishes the already joined Child's terminal state");
-        let stop_receipt: Value =
-            serde_json::from_str(&child.metadata["ticket.runtime.owned_stop.v1"]).unwrap();
-        assert_eq!(stop_receipt["receipt"], json!(runtime));
-        assert_eq!(stop_receipt["completed"], false);
-        let instance =
-            uuid::Uuid::parse_str(stop_receipt["task_instance"].as_str().unwrap()).unwrap();
-        assert!(!instance.is_nil());
-        assert_eq!(stop_receipt["child_birth"], json!(child.created_at));
-        assert_eq!(
-            child.metadata["runtime.local_task.instance"],
-            instance.to_string()
-        );
-        assert_eq!(child.metadata["runtime.local_task.state"], "stopped");
-        drop(retained);
-        state.shutdown().await;
-        (
-            project.id,
-            work,
-            assignment,
-            start,
-            start_receipt,
-            cancel,
-            cancel_receipt,
-            saved_plan,
-            task_receipt_id,
-            task_receipt,
-            stop_receipt,
-        )
-    };
+        .expect("the first Host and runtime exit within the finite fixture bound")
+        .expect("the first Host retains its real receipt tuple through runtime exit");
+    first_host
+        .join()
+        .expect("the first Host thread exited normally");
 
     let state = web::Data::new(host(&physical, provider.clone()).await);
     let app = test::init_service(

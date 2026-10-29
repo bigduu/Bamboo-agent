@@ -65,6 +65,13 @@ impl StreamTimeoutContext {
         self
     }
 
+    /// Managed establishment has its own headers deadline/retry policy. Start
+    /// the independent stream watchdog when the successful response arrives.
+    pub(crate) fn managed_response_established(&mut self) {
+        self.request_started_at = Some(Instant::now());
+        self.disable_turn_retry();
+    }
+
     pub(crate) fn disable_turn_retry(&mut self) {
         self.turn_retry_eligible = false;
     }
@@ -165,7 +172,19 @@ where
             biased;
             _ = cancel_token.cancelled() => Err(AgentError::Cancelled),
             result = future => Ok(result),
-            _ = tokio::time::sleep_until(expires_at) => {
+            _ = async {
+                tokio::time::sleep_until(expires_at).await;
+                // A built-in request policy bounds each headers attempt itself.
+                // Preserve cancellation, but do not cut short its configured
+                // total budget or explicit continuous backoff. Providers that
+                // never enter the managed send retain this outer watchdog.
+                while http_retry_observer.request_policy_active() {
+                    // Poll only this ephemeral phase marker. After managed
+                    // send/backoff returns, a hung provider parser must still
+                    // expire rather than inherit an unbounded bootstrap wait.
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            } => {
                 let now = Instant::now();
                 let mut context = timeout_context.clone();
                 // An inner bounded request policy owns this attempt budget.

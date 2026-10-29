@@ -771,14 +771,22 @@ mod tests {
                 "supervisor_mode_required",
                 "Supervisor orchestration authority required",
             ),
+            (
+                StatusCode::CONFLICT,
+                "scope_binding_mismatch",
+                "Supervisor scope binding changed",
+            ),
             (StatusCode::CONFLICT, "scope_requires_recovery", ""),
         ] {
             let mut request_body = body.clone();
             if code == "supervisor_mode_required" {
                 state.config.write().await.features.ticket_mutation = true;
                 state.storage.save_session(&standard).await.unwrap();
-                request_body["binding_revision"] =
-                    serde_json::json!(standard.root_tool_authority_revision);
+                // Standard remains eligible. Reject an absent business binding,
+                // not the Supervisor's chosen thinking mode.
+                request_body["binding_revision"] = serde_json::json!(0);
+            } else if code == "scope_binding_mismatch" {
+                request_body["incarnation_id"] = serde_json::json!(uuid::Uuid::new_v4());
             } else if code == "scope_requires_recovery" {
                 supervisor = state
                     .storage
@@ -789,7 +797,7 @@ mod tests {
                 supervisor.set_root_orchestration_only(true).unwrap();
                 state.storage.save_session(&supervisor).await.unwrap();
                 body["binding_revision"] =
-                    serde_json::json!(supervisor.root_tool_authority_revision);
+                    serde_json::json!(supervisor.supervisor_orchestration_revision().unwrap());
                 request_body = body.clone();
                 std::fs::create_dir_all(&scope_root).unwrap();
                 std::fs::write(scope_root.join("foreign"), b"must not be adopted").unwrap();
@@ -852,7 +860,8 @@ mod tests {
             assert_eq!(result["scope"]["readable"], true);
         }
         let mut stale = body;
-        stale["binding_revision"] = serde_json::json!(supervisor.root_tool_authority_revision + 1);
+        stale["binding_revision"] =
+            serde_json::json!(supervisor.supervisor_orchestration_revision().unwrap() + 1);
         let response = test::call_service(
             &app,
             test::TestRequest::post()
@@ -864,10 +873,7 @@ mod tests {
         .await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let result: serde_json::Value = test::read_body_json(response).await;
-        assert_eq!(
-            result["error"]["message"],
-            "Supervisor scope binding changed"
-        );
+        assert_eq!(result["error"]["message"], "Existing scope binding differs");
         assert_eq!(result["error"]["type"], "api_error");
         assert_eq!(result["code"], "scope_binding_mismatch");
         assert_eq!(result["scope"], state.tickets.status().await);

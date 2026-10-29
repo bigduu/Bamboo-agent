@@ -107,20 +107,18 @@ impl TicketApplication {
                 "Canonical Supervisor identity required".into(),
             );
         };
-        if !supervisor.root_orchestration_only_enabled()
-            || supervisor.root_tool_authority_revision == 0
-        {
+        let Some(orchestration_revision) = supervisor.supervisor_orchestration_revision() else {
             return unavailable(
                 status,
                 "forbidden",
                 "supervisor_mode_required",
                 "Supervisor orchestration authority required".into(),
             );
-        }
+        };
         let binding = ScopeBinding {
             scope_id: format!("supervisor/{incarnation_id}"),
             supervisor_session_id: supervisor.id.clone(),
-            binding_revision: supervisor.root_tool_authority_revision,
+            binding_revision: orchestration_revision,
         };
         if let Some(service) = self.service.get() {
             let published = match service.published() {
@@ -142,7 +140,10 @@ impl TicketApplication {
                     )
                 }
             };
-            if published.binding != binding {
+            if published.binding.scope_id != binding.scope_id
+                || published.binding.supervisor_session_id != binding.supervisor_session_id
+                || published.binding.binding_revision == 0
+            {
                 return unavailable(
                     status,
                     "forbidden",
@@ -151,7 +152,7 @@ impl TicketApplication {
                 );
             }
             let authority = Authority::from_verified_host(
-                binding,
+                published.binding.clone(),
                 Principal::User {
                     user_id: "host-owner".into(),
                 },
@@ -271,7 +272,6 @@ impl TicketApplication {
         })?;
         if expected.supervisor_session_id != supervisor.id
             || expected.incarnation_id != incarnation_id
-            || expected.binding_revision != supervisor.root_tool_authority_revision
         {
             return Err(ScopeInitializationError::new(
                 409,
@@ -279,7 +279,7 @@ impl TicketApplication {
                 "Supervisor scope binding changed",
             ));
         }
-        if !supervisor.root_orchestration_only_enabled() || expected.binding_revision == 0 {
+        if expected.binding_revision == 0 {
             return Err(ScopeInitializationError::new(
                 403,
                 "supervisor_mode_required",
@@ -304,6 +304,22 @@ impl TicketApplication {
                     "Existing scope binding differs",
                 ))
             };
+        }
+        let role_revision = supervisor
+            .supervisor_orchestration_revision()
+            .ok_or_else(|| {
+                ScopeInitializationError::new(
+                    403,
+                    "supervisor_identity_mismatch",
+                    "Canonical Supervisor required",
+                )
+            })?;
+        if expected.binding_revision != role_revision {
+            return Err(ScopeInitializationError::new(
+                409,
+                "scope_binding_mismatch",
+                "New scope binding differs from canonical Supervisor role",
+            ));
         }
         // Keep the existing mutation gate unchanged throughout the physical job.
         let config = self.config.clone().read_owned().await;
@@ -373,11 +389,7 @@ impl TicketApplication {
             incarnation_id,
         };
         self.storage
-            .with_supervisor_orchestration_authority(
-                &reference,
-                expected.binding_revision,
-                operation,
-            )
+            .with_supervisor_orchestration_authority(&reference, role_revision, operation)
             .await
             .map_err(|error| {
                 let (status, code) = match error.kind() {

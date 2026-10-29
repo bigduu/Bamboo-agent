@@ -241,6 +241,24 @@ impl SessionStoreV2 {
         actor: &ActorSession,
         recorded: Option<&ActorSession>,
     ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
+        self.validate_actor_lineage_view(actor, recorded, false)
+            .await
+    }
+
+    pub(super) async fn validate_actor_control_lineage(
+        &self,
+        actor: &ActorSession,
+    ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
+        self.validate_actor_lineage_view(actor, Some(actor), true)
+            .await
+    }
+
+    async fn validate_actor_lineage_view(
+        &self,
+        actor: &ActorSession,
+        recorded: Option<&ActorSession>,
+        control_only: bool,
+    ) -> Result<Vec<ActorAncestorObservation>, ActorDirectoryError> {
         let own_rel = if actor.parent_actor_id.is_some() {
             Self::child_rel_path(&actor.root_actor_id, &actor.actor_id)
         } else {
@@ -252,11 +270,12 @@ impl SessionStoreV2 {
             bamboo_domain::SessionKind::Root
         };
         let mut current_session = self
-            .load_session_from_dir_strict(
+            .load_session_from_dir_strict_view(
                 &self.abs_path_from_rel(&own_rel),
                 &actor.actor_id,
                 own_kind,
                 &actor.root_actor_id,
+                control_only,
             )
             .await
             .map_err(storage)?
@@ -284,11 +303,12 @@ impl SessionStoreV2 {
                 return Err(ActorDirectoryError::InvalidIdentity);
             }
             let parent = self
-                .load_session_from_dir_strict(
+                .load_session_from_dir_strict_view(
                     &self.abs_path_from_rel(&expected_rel),
                     &parent_id,
                     kind,
                     root_id,
+                    control_only,
                 )
                 .await
                 .map_err(storage)?
