@@ -2155,3 +2155,193 @@ async fn sdk_wrapped_runtime_requires_client_for_bound_accounts_but_keeps_bare_s
         assert!(!other_calls.is_empty() && other_calls.iter().all(|model| model == "model-b"));
     }
 }
+
+// Synthetic end-to-end SDK request capture; no external provider is used.
+#[derive(Default)]
+struct SdkReasoningCapture(Mutex<Vec<(String, Option<bamboo_domain::ReasoningEffort>)>>);
+
+impl SdkReasoningCapture {
+    fn reply(
+        &self,
+        model: &str,
+        effort: Option<bamboo_domain::ReasoningEffort>,
+    ) -> Result<LLMStream, LLMError> {
+        self.0.lock().unwrap().push((model.to_owned(), effort));
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Synthetic completion".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[async_trait]
+impl LLMProvider for SdkReasoningCapture {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.reply(model, None)
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::LLMRequestOptions>,
+    ) -> Result<LLMStream, LLMError> {
+        self.reply(model, options.and_then(|value| value.reasoning_effort))
+    }
+}
+
+fn sdk_reasoning_config() -> bamboo_llm::Config {
+    let mut config = bamboo_llm::Config::default();
+    config.provider = "openai".into();
+    config.default_provider_instance = Some("chat-a".into());
+    config.features.provider_model_ref = true;
+    *config.memory_mut() = Some(
+        serde_json::from_value(json!({
+            "auto_dream_enabled": false, "project_prompt_injection": false,
+            "relevant_recall": false, "relevant_recall_rerank": false,
+            "project_first_dream": false, "ledger_agenda_injection": false,
+        }))
+        .unwrap(),
+    );
+    config.defaults = Some(
+        serde_json::from_value(json!({
+            "chat": {"provider": "chat-a", "model": "main-a", "reasoning_effort": "low"}
+        }))
+        .unwrap(),
+    );
+    config.provider_instances.insert(
+        "chat-a".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai", "enabled": true, "model": "main-a",
+            "runtime_models": ["main-a", "cheap"]
+        }))
+        .unwrap(),
+    );
+    config
+}
+
+#[tokio::test]
+async fn sdk_run_session_reasoning_respects_selected_model_and_session() {
+    use bamboo_domain::ReasoningEffort::{High, Low, Medium, Xhigh};
+    let cases = [
+        (
+            "session",
+            "main-a",
+            Some(High),
+            Some(Xhigh),
+            None,
+            "main-a",
+            Some(High),
+        ),
+        (
+            "ref",
+            "cheap",
+            None,
+            Some(Xhigh),
+            None,
+            "cheap",
+            Some(Xhigh),
+        ),
+        ("other-model", "cheap", None, None, None, "cheap", None),
+        ("chat-role", "main-a", None, None, None, "main-a", Some(Low)),
+        (
+            "explicit-model",
+            "cheap",
+            None,
+            Some(Xhigh),
+            Some("main-a"),
+            "main-a",
+            None,
+        ),
+    ];
+    for (
+        label,
+        original_model,
+        session_effort,
+        target_effort,
+        model_override,
+        expected_model,
+        expected_effort,
+    ) in cases
+    {
+        let home = tempfile::tempdir().unwrap();
+        let capture = Arc::new(SdkReasoningCapture::default());
+        let mut builder = Agent::builder()
+            .provider(capture.clone())
+            .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+            .tools(std::iter::empty());
+        if let Some(model) = model_override {
+            builder = builder.model(model);
+        }
+        let agent = builder
+            .with_defaults_for_data_dir(home.path().to_owned())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut session = Session::new(format!("sdk-reasoning-{label}"), original_model);
+        let mut target = bamboo_domain::ProviderModelRef::new("chat-a", original_model);
+        target.reasoning_effort = target_effort;
+        session.model_ref = Some(target);
+        session.reasoning_effort = session_effort;
+        session.add_message(Message::user("Synthetic reasoning witness"));
+        agent.run_session(&mut session).await.unwrap();
+        let calls = capture.0.lock().unwrap().clone();
+        assert!(!calls.is_empty(), "{label}: no request");
+        assert!(
+            calls
+                .iter()
+                .all(|(model, effort)| model == expected_model && *effort == expected_effort),
+            "{label}: {calls:?}"
+        );
+        if model_override.is_some() {
+            assert_eq!(
+                session.model_ref.as_ref().unwrap().reasoning_effort,
+                None,
+                "{label}"
+            );
+        }
+    }
+
+    // The low-level API deliberately remains a request-owned escape hatch.
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut session = Session::new("sdk-reasoning-explicit-request", "main-a");
+    session.reasoning_effort = Some(High);
+    session.add_message(Message::user("Synthetic explicit request"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request =
+        ExecuteRequestBuilder::new("Synthetic explicit request", tx, CancellationToken::new())
+            .provider_name("chat-a")
+            .model("main-a")
+            .reasoning_effort(Medium)
+            .build();
+    agent.execute(&mut session, request).await.unwrap();
+    drain.abort();
+    let calls = capture.0.lock().unwrap().clone();
+    assert!(
+        !calls.is_empty()
+            && calls
+                .iter()
+                .all(|(model, effort)| model == "main-a" && *effort == Some(Medium)),
+        "{calls:?}"
+    );
+}
