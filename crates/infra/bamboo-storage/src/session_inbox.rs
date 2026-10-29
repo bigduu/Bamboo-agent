@@ -795,7 +795,7 @@ impl FileSessionInbox {
         if !metadata.file_type().is_file() {
             return Err(invalid("Root outcome input ACK is not a regular file"));
         }
-        let bytes = Self::read_receipt_bytes(
+        let bytes = Self::read_receipt_bytes_retaining(
             &receipt_path,
             ReceiptLookupMode::ObserverProof {
                 max_bytes: self.max_transport_bytes(),
@@ -910,11 +910,14 @@ impl FileSessionInbox {
                     .as_ref()
                     .expect("filtered result")
                     .observer_status();
-                let status_digest = hex::encode(Sha256::digest(
-                    bamboo_domain::session::inbox::canonical_json_bytes(&serde_json::json!({
-                        "status":status, "run_id":&fact.run_id
-                    })),
-                ));
+                let status_digest = format!(
+                    "{:x}",
+                    Sha256::digest(bamboo_domain::session::inbox::canonical_json_bytes(
+                        &serde_json::json!({
+                            "status":status, "run_id":&fact.run_id
+                        })
+                    ),)
+                );
                 bamboo_domain::observer_filtered_fingerprint(
                     &std::collections::BTreeSet::from([bamboo_domain::ObserverChangeKind::Status]),
                     &std::collections::BTreeMap::from([(
@@ -2211,6 +2214,13 @@ impl FileSessionInbox {
     async fn read_receipt_bytes(
         path: &Path,
         mode: ReceiptLookupMode<'_>,
+    ) -> std::io::Result<Vec<u8>> {
+        Self::read_receipt_bytes_retaining(path, mode, None).await
+    }
+
+    async fn read_receipt_bytes_retaining(
+        path: &Path,
+        mode: ReceiptLookupMode<'_>,
         filesystem: Option<&OwnedFilesystem>,
     ) -> std::io::Result<Vec<u8>> {
         if let ReceiptLookupMode::ObserverProof { max_bytes, anchor } = mode {
@@ -2267,10 +2277,18 @@ impl FileSessionInbox {
         dir: &Path,
         requested: &SessionMessageEnvelope,
     ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
-        Self::admitted_receipt_in_mode(dir, requested, ReceiptLookupMode::Enqueue, None).await
+        Self::admitted_receipt_in_mode(dir, requested, ReceiptLookupMode::Enqueue).await
     }
 
     async fn admitted_receipt_in_mode(
+        dir: &Path,
+        requested: &SessionMessageEnvelope,
+        mode: ReceiptLookupMode<'_>,
+    ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
+        Self::admitted_receipt_in_mode_retaining(dir, requested, mode, None).await
+    }
+
+    async fn admitted_receipt_in_mode_retaining(
         dir: &Path,
         requested: &SessionMessageEnvelope,
         mode: ReceiptLookupMode<'_>,
@@ -2278,7 +2296,7 @@ impl FileSessionInbox {
     ) -> Result<Option<StoredInboxReceipt>, SessionInboxError> {
         let id = &requested.id;
         let admitted_path = Self::admitted_path(dir, id);
-        match Self::read_receipt_bytes(&admitted_path, mode, filesystem).await {
+        match Self::read_receipt_bytes_retaining(&admitted_path, mode, filesystem).await {
             Ok(bytes) => {
                 if matches!(mode, ReceiptLookupMode::ObserverProof { .. }) {
                     let receipt: RootOutcomeInputReceipt<'_> = serde_json::from_slice(&bytes)
@@ -2478,7 +2496,7 @@ impl FileSessionInbox {
         authority: Option<&GuardedSupervisorRoot>,
     ) -> Result<Option<SessionInboxDeliveryReceipt>, SessionInboxError> {
         if let Some(receipt) =
-            Self::admitted_receipt_in_mode(dir, requested, mode, Some(filesystem)).await?
+            Self::admitted_receipt_in_mode_retaining(dir, requested, mode, Some(filesystem)).await?
         {
             if !Self::matching_first_intent(
                 &receipt.intent,
@@ -2512,13 +2530,14 @@ impl FileSessionInbox {
                 }
             };
             for (generation, _name, path) in entries {
-                let bytes = match Self::read_receipt_bytes(&path, mode, Some(filesystem)).await {
-                    Ok(bytes) => bytes,
-                    Err(error) if mode.is_observation() => {
-                        return Err(SessionInboxError::Storage(error.to_string()));
-                    }
-                    Err(_) => continue,
-                };
+                let bytes =
+                    match Self::read_receipt_bytes_retaining(&path, mode, Some(filesystem)).await {
+                        Ok(bytes) => bytes,
+                        Err(error) if mode.is_observation() => {
+                            return Err(SessionInboxError::Storage(error.to_string()));
+                        }
+                        Err(_) => continue,
+                    };
                 let (wrapper, lease) = match Self::decode_owned_wrapper(&bytes) {
                     Ok(decoded) => decoded,
                     Err(error) if mode.is_observation() => return Err(error),
@@ -3307,7 +3326,6 @@ impl FileSessionInbox {
                 ReceiptLookupMode::Observe {
                     max_bytes: self.max_transport_bytes(),
                 },
-                None,
             )
             .await
             {
@@ -3397,7 +3415,6 @@ impl FileSessionInbox {
                     ReceiptLookupMode::Observe {
                         max_bytes: self.max_transport_bytes(),
                     },
-                    None,
                 )
                 .await?
                 .is_some()
