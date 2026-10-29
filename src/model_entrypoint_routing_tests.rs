@@ -1557,6 +1557,140 @@ async fn entrypoint_routing_legacy_explicit_same_name_override_stays_on_active_c
     );
 }
 
+#[tokio::test]
+async fn entrypoint_routing_legacy_public_helper_bare_model_stays_on_active_client() {
+    let b = vision_server(200).await;
+    let mut c = legacy_config(true, &b.uri());
+    routing_review_allow_a_models(&mut c, "vision-b");
+    let dir = tempfile::tempdir().unwrap();
+    let main = Arc::new(Capture::default());
+    let fallback = bamboo_engine::model_config_helper::resolve_image_fallback(&c)
+        .unwrap()
+        .unwrap();
+    let agent = agent(c, main.clone(), dir.path()).await;
+    let mut session = Session::new("synthetic-public-helper-vision-override", "main-a");
+    let user = Message::user_with_parts(
+        "Inspect synthetic pixel",
+        vec![bamboo_domain::MessagePart::ImageUrl {
+            image_url: bamboo_domain::ImageUrlRef {
+                url: PIXEL.into(),
+                detail: None,
+            },
+        }],
+    );
+    let original = user.clone();
+    session.add_message(user);
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request =
+        ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
+            .model("main-a")
+            .provider_name("chat-a")
+            .image_fallback(fallback)
+            .app_data_dir(dir.path().to_path_buf())
+            .build();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.execute(&mut session, request),
+    )
+    .await
+    .expect("controlled bare override must finish");
+    drain.abort();
+    let calls = main.calls.lock().unwrap().clone();
+    let requests = b.received_requests().await.unwrap();
+    let b_saw_pixel = requests
+        .iter()
+        .any(|request| String::from_utf8_lossy(&request.body).contains(PIXEL));
+    let b_models = requests
+        .iter()
+        .map(|request| request.body_json::<serde_json::Value>().unwrap()["model"].clone())
+        .collect::<Vec<_>>();
+    assert!(outcome.is_ok()
+        && calls.iter().any(|(model, _, images)| model == "vision-b" && *images)
+        && requests.is_empty(),
+        "explicit override must use A: outcome={outcome:?}, A={calls:?}, B_models={b_models:?}, B_saw_pixel={b_saw_pixel}");
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .find(|message| message.id == original.id)
+            .unwrap()
+            .content_parts,
+        original.content_parts,
+    );
+}
+
+#[tokio::test]
+async fn entrypoint_routing_legacy_missing_or_empty_explicit_override_never_sends_image() {
+    let mut outcomes = Vec::new();
+    for (index, model) in [Some(""), Some("   "), None].into_iter().enumerate() {
+        let b = vision_server(200).await;
+        let c = legacy_config(true, &b.uri());
+        let dir = tempfile::tempdir().unwrap();
+        let main = Arc::new(Capture::default());
+        let agent = agent(c, main.clone(), dir.path()).await;
+        let mut session = Session::new(format!("synthetic-empty-vision-{index}"), "main-a");
+        let user = Message::user_with_parts(
+            "Inspect synthetic pixel",
+            vec![bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef {
+                    url: PIXEL.into(),
+                    detail: None,
+                },
+            }],
+        );
+        let original = user.clone();
+        session.add_message(user);
+        let (tx, mut rx) = mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request =
+            ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
+                .model("main-a")
+                .provider_name("chat-a")
+                .image_fallback(bamboo_engine::ImageFallbackConfig {
+                    mode: bamboo_engine::ImageFallbackMode::Vision,
+                    vision_model: model.map(str::to_string),
+                })
+                .app_data_dir(dir.path().to_path_buf())
+                .build();
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            agent.execute(&mut session, request),
+        )
+        .await
+        .expect("controlled missing/empty override must finish");
+        drain.abort();
+        let calls = main.calls.lock().unwrap().clone();
+        let requests = b.received_requests().await.unwrap();
+        let b_saw_pixel = requests
+            .iter()
+            .any(|request| String::from_utf8_lossy(&request.body).contains(PIXEL));
+        let preserved = session
+            .messages
+            .iter()
+            .find(|message| message.id == original.id)
+            .is_some_and(|message| message.content_parts == original.content_parts);
+        outcomes.push((
+            index,
+            outcome,
+            calls,
+            requests.len(),
+            b_saw_pixel,
+            preserved,
+        ));
+    }
+    assert!(
+        outcomes.iter().all(
+            |(_, outcome, calls, count, pixel, preserved)| outcome.is_err()
+                && calls.iter().all(|(_, _, images)| !images)
+                && *count == 0
+                && !pixel
+                && *preserved
+        ),
+        "missing or empty caller overrides must refuse before any image send: {outcomes:?}"
+    );
+}
+
 /// A native SDK client was made from instance A named `openai`. Replacing that
 /// instance with a legacy `openai` pointing to B does not change the name but
 /// does change the account. A later configured Vision target must not reuse A.

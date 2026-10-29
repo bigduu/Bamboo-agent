@@ -177,3 +177,54 @@ async fn entrypoint_routing_headless_resume_keeps_original_account_when_default_
         "resuming must retain the original account for both flag values: {outcomes:?}"
     );
 }
+
+#[tokio::test]
+async fn entrypoint_routing_headless_missing_model_uses_saved_account_default() {
+    let mut outcomes = Vec::new();
+    for flag in [false, true] {
+        let (dir, state, original_provider, new_default, mut original) =
+            fixture(flag, "missing-model").await;
+        original.title_generated = true;
+        original.model = "unknown".into();
+        original.model_ref = None;
+        original.set_provider_name("chat-a");
+        state.storage.save_session(&original).await.unwrap();
+        state.session_store.save_session(&original).await.unwrap();
+        {
+            let mut config = state.config.write().await;
+            config.default_provider_instance = Some("broken-b".into());
+            let instance = config.provider_instances.get_mut("broken-b").unwrap();
+            instance.model = Some("main-a".into());
+            instance
+                .extra
+                .insert("runtime_models".into(), serde_json::json!(["main-a"]));
+        }
+        let storage = state.storage.clone();
+        let mut request = args(dir.path(), None);
+        request.timeout_secs = Some(10);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_with_state(request, state),
+        )
+        .await
+        .expect("synthetic headless consumer must finish");
+        let old_calls = original_provider.calls.lock().unwrap().clone();
+        let new_calls = new_default.calls.lock().unwrap().clone();
+        let saved = storage.load_session(&original.id).await.unwrap().unwrap();
+        let provider =
+            bamboo_engine::session_app::provider_model::session_effective_model_ref(&saved)
+                .map(|target| target.provider);
+        outcomes.push((flag, outcome, old_calls, new_calls, provider));
+    }
+    assert!(
+        outcomes.iter().all(
+            |(_, outcome, old_calls, new_calls, provider)| outcome.is_ok()
+                && old_calls
+                    .iter()
+                    .any(|(model, purpose, _)| model == "main-a" && purpose == "agent_loop")
+                && new_calls.is_empty()
+                && provider.as_deref() == Some("chat-a")
+        ),
+        "resuming must retain the original account for both flag values: {outcomes:?}"
+    );
+}
