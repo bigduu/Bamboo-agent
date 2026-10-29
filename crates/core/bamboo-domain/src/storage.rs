@@ -370,6 +370,25 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Conditionally commit one scheduled startup through the exact existing
+    /// Root writer. Comparison and publication must share the physical guard.
+    async fn save_root_actor_scheduled_startup(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&crate::InheritedChildWait>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, expected, inherited, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "conditional Root scheduled startup is unsupported".into(),
+            ),
+        ))
+    }
+
     /// Re-read and reconcile an execution's inherited child wait under the
     /// physical session lock, retain birth/fence checks, then save and publish.
     async fn save_inherited_child_wait_finalized(

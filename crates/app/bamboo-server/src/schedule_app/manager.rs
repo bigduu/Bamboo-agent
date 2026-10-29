@@ -1343,7 +1343,12 @@ fn resolve_run_config_from_config(
                         && providers.copilot.is_none()
                         && providers.bodhi.is_none()
                         && providers.extra.is_empty();
-                    if legacy_injected {
+                    if legacy_injected && !job.run_config.auto_execute {
+                        // A model-only legacy schedule can create an inert
+                        // session before any provider has been configured.
+                        // No model call or provider binding is claimed here.
+                        (None, None, snapshot_error, false)
+                    } else if legacy_injected {
                         match unconfigured_injected_schedule_provider(
                             &config_snapshot,
                             provider_registry,

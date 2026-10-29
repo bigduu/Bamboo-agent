@@ -214,6 +214,74 @@ impl SessionStoreV2 {
         .await
     }
 
+    pub(super) async fn save_root_actor_scheduled_startup_impl(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        publish: RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        let total_started = Instant::now();
+        validate_session_id(&session.id)?;
+        if let Some(wait) = inherited {
+            wait.validate_session(session)?;
+        }
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let proof = RootActorWriteProof::new(self.sessions_dir.join(&session.id), owner.clone());
+        let guards = DefaultWriterGuards::shared_with_root_actor(
+            lifecycle,
+            task,
+            session_write,
+            Some(proof.clone()),
+        );
+        let observed = expected.clone();
+        let proposed = session.clone();
+        Self::default_writer_job(&guards, move || {
+            let current = proof.validate()?;
+            observed
+                .check_conversation_generation(&current)
+                .map_err(conflict)?;
+            let schedule = observed
+                .metadata
+                .get("created_by_schedule_id")
+                .filter(|id| !id.trim().is_empty());
+            if schedule.is_none()
+                || schedule != current.metadata.get("created_by_schedule_id")
+                || schedule != proposed.metadata.get("created_by_schedule_id")
+                || observed.id != current.id
+                || observed.created_at != current.created_at
+                || observed.kind != current.kind
+                || observed.authority_identity != current.authority_identity
+                || observed.project_id_meta() != current.project_id_meta()
+                || observed.model != current.model
+                || observed.model_ref != current.model_ref
+                || observed.provider_name() != current.provider_name()
+                || observed.reasoning_effort != current.reasoning_effort
+                || observed.metadata_version != current.metadata_version
+            {
+                return Err(conflict("scheduled startup execution profile changed"));
+            }
+            proof.validate_candidate(&proposed)
+        })
+        .await?;
+        let reconciled = if let Some(wait) = inherited {
+            self.reconcile_inherited_runtime_snapshot(session, wait, false)
+                .await?
+        } else {
+            session.clone()
+        };
+        self.save_session_after_lock(&reconciled, total_started, &guards, None)
+            .await?;
+        self.publish_root_actor_runtime(&guards, publish).await?;
+        *session = reconciled;
+        Ok(())
+    }
+
     pub(super) async fn save_root_actor_runtime_impl(
         &self,
         owner: &RootActorRuntimeWrite,

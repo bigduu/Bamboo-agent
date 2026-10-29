@@ -248,6 +248,22 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
+    /// Start a scheduled run only if its original persisted execution profile
+    /// still matches under the backend's physical writer and Root authority.
+    /// Unsupported persisters must never emulate this with a separate read/save.
+    async fn save_scheduled_startup_session(
+        &self,
+        _session: &mut Session,
+        _expected: &Session,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "conditional scheduled startup persistence is unsupported".into(),
+            ),
+        ))
+    }
+
     /// Persist a runner's final snapshot. Implementations with a per-session
     /// lock should reconcile a tool-registered child wait against the latest
     /// durable wait inside that lock: a child may finish after the runner's
@@ -749,6 +765,14 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
     }
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_runtime_session(session).await
+    }
+
+    async fn save_scheduled_startup_session(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> io::Result<()> {
+        (**self).save_scheduled_startup_session(session, expected).await
     }
 
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {
