@@ -249,8 +249,17 @@ impl Fixture {
         (a.len(), b.len())
     }
 
-    /// Check a resolver produced by the actual consumer-specific builder.
+    /// Check the legacy background adapter, whose other roles stay fixed.
     pub(crate) async fn verify(self, resolver: Resolver) {
+        self.verify_background(resolver, false).await;
+    }
+
+    /// Check a full live auxiliary resolver through the same background matrix.
+    pub(crate) async fn verify_live(self, resolver: Resolver) {
+        self.verify_background(resolver, true).await;
+    }
+
+    async fn verify_background(self, resolver: Resolver, all_roles_live: bool) {
         let initial = resolver();
         assert_eq!(initial.fast_model_name.as_deref(), Some("fast-a"));
         assert_eq!(initial.summarization_model_name.as_deref(), Some("fast-a"));
@@ -296,12 +305,36 @@ impl Fixture {
         };
         let blocked_pair = pair(&blocked);
         let blocked_other = same_other_roles(&initial, &blocked);
+        if all_roles_live {
+            assert!(blocked.summarization_model_provider.is_none());
+            assert!(blocked.summarization_model_error.is_some());
+            let provider = blocked
+                .fast_model_provider
+                .as_ref()
+                .expect("busy Fast must reject");
+            let result = tokio::time::timeout(
+                LIMIT,
+                provider.chat_stream(
+                    &[Message::user("synthetic busy Fast")],
+                    &[],
+                    Some(32),
+                    blocked.fast_model_name.as_deref().unwrap_or("fast-a"),
+                ),
+            )
+            .await
+            .expect("busy Fast should fail promptly");
+            assert!(matches!(result, Err(bamboo_llm::LLMError::Api(_))));
+        }
         let blocked_call = dispatch(blocked).await;
         let blocked_counts = self.counts().await;
 
         let rejected = resolver();
         let rejected_pair = pair(&rejected);
         let rejected_other = same_other_roles(&initial, &rejected);
+        if all_roles_live {
+            assert_eq!(rejected.fast_model_name.as_deref(), Some("fast-a"));
+            assert_eq!(rejected.summarization_model_name.as_deref(), Some("fast-a"));
+        }
         let rejected_call = dispatch(rejected).await;
         let rejected_counts = self.counts().await;
 
@@ -338,6 +371,11 @@ impl Fixture {
         let disabled = resolver();
         let disabled_pair = pair(&disabled);
         let disabled_other = same_other_roles(&initial, &disabled);
+        if all_roles_live {
+            assert!(disabled.summarization_model_provider.is_none());
+            assert!(disabled.summarization_model_error.is_some());
+            assert!(disabled.fast_model_provider.is_some());
+        }
         let disabled_call = dispatch(disabled).await;
         let disabled_counts = self.counts().await;
 
@@ -359,7 +397,9 @@ impl Fixture {
             (disabled_pair, disabled_call, disabled_counts),
             ((None, false), Ok(false), (2, 0))
         );
-        assert!(blocked_other && rejected_other && restored_other && disabled_other);
+        if !all_roles_live {
+            assert!(blocked_other && rejected_other && restored_other && disabled_other);
+        }
 
         let requests = tokio::time::timeout(LIMIT, self.server_a.received_requests())
             .await

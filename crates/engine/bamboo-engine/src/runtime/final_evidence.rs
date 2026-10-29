@@ -363,6 +363,14 @@ pub(crate) async fn evaluate_final_evidence(
         request_purpose: Some("final_evidence_check".to_string()),
         ..Default::default()
     };
+    // Already rejected routes must not wait behind an unrelated request.
+    // Recheck after the wait as admission can change while queued.
+    if frame.cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled.into());
+    }
+    if let Some(error) = llm.known_pre_dispatch_error() {
+        return Err(AgentError::LLM(error.to_string()).into());
+    }
     let _guard = tokio::select! {
         biased;
         _ = frame.cancel_token.cancelled() => return Err(AgentError::Cancelled.into()),
@@ -370,6 +378,14 @@ pub(crate) async fn evaluate_final_evidence(
             &llm, frame.model, frame.auxiliary_max_concurrency,
         ) => guard,
     };
+    // An admission failure is known locally and must not claim a dispatch or
+    // reserve an upstream request. Preserve cancellation and budget precedence.
+    if frame.cancel_token.is_cancelled() {
+        return Err(AgentError::Cancelled.into());
+    }
+    if let Some(error) = llm.known_pre_dispatch_error() {
+        return Err(AgentError::LLM(error.to_string()).into());
+    }
     let timeout_context = frame.timeout_context.clone().begin_request();
     on_dispatch();
     let stream = await_stream_bootstrap(
