@@ -11,6 +11,7 @@ use std::time::Duration;
 use bamboo_agent_core::{Message, Role, Session};
 use bamboo_domain::{
     AdmissionGate, RootActorRuntimeWrite, SessionInboxBacklog, SessionMessageEnvelope,
+    SupervisorCurrentUserTarget,
 };
 use bamboo_engine::config::UntrustedExecutionInputs;
 use bamboo_engine::execution::SessionExecutionReservation;
@@ -79,7 +80,7 @@ impl FreshSyncWitness {
         })
     }
 
-    fn matches_reservation(&self, reservation: &SessionExecutionReservation) -> bool {
+    fn matches_reservation_identity(&self, reservation: &SessionExecutionReservation) -> bool {
         let Some(owner) = reservation.root_actor_writer() else {
             return false;
         };
@@ -88,7 +89,10 @@ impl FreshSyncWitness {
             && self.owner.created_at == owner.created_at
             && self.owner.conversation_generation == owner.conversation_generation
             && owner.fence.run_id == reservation.run_id()
-            && !reservation.cancel_token().is_cancelled()
+    }
+
+    fn matches_reservation(&self, reservation: &SessionExecutionReservation) -> bool {
+        self.matches_reservation_identity(reservation) && !reservation.cancel_token().is_cancelled()
     }
 
     fn matches_snapshot(&self, session: &Session) -> bool {
@@ -120,6 +124,7 @@ struct PendingFreshSync {
     inputs: Option<UntrustedExecutionInputs>,
     witness: FreshSyncWitness,
     snapshot: Session,
+    control_scope: Option<PendingControlScope>,
     backlog: SessionInboxBacklog,
     proof: bamboo_domain::LiveBootstrapProof,
     generate_title: bool,
@@ -127,16 +132,68 @@ struct PendingFreshSync {
     live_bootstrap_resume: bool,
 }
 
+/// A compact observation of the retained Root's original authority and
+/// Workspace. It is never a grant and is checked under the canonical target
+/// guard before the exact runner can be observed or signalled.
+#[derive(Clone)]
+struct PendingControlScope {
+    target: SupervisorCurrentUserTarget,
+    workspace_path: Option<String>,
+}
+
+impl PendingControlScope {
+    fn capture(snapshot: &Session) -> Option<Self> {
+        // Canonical control reads normalize legacy Roots at their own path.
+        // Normalize only this observation; never rewrite the stored Session.
+        let target = if snapshot.kind == bamboo_domain::SessionKind::Root
+            && snapshot.root_session_id.is_empty()
+        {
+            let mut legacy = snapshot.clone();
+            legacy.root_session_id = legacy.id.clone();
+            SupervisorCurrentUserTarget::capture(&legacy).ok()?
+        } else {
+            SupervisorCurrentUserTarget::capture(snapshot).ok()?
+        };
+        if target.kind != bamboo_domain::SessionKind::Root {
+            return None;
+        }
+        Some(Self {
+            target,
+            workspace_path: snapshot.workspace_path_meta(),
+        })
+    }
+
+    fn matches(&self, target: &SupervisorCurrentUserTarget, workspace_path: Option<&str>) -> bool {
+        let mut original = self.target.clone();
+        // Harmless metadata edits do not change the captured Root authority.
+        original.metadata_version = target.metadata_version;
+        original == *target && self.workspace_path.as_deref() == workspace_path
+    }
+}
+
 enum FreshSyncEntry {
     Parked(Box<PendingFreshSync>),
     // Retains the exact owner while take revalidates or abandonment finishes.
-    InFlight { nonce: Uuid, run_id: String },
+    InFlight {
+        nonce: Uuid,
+        run_id: String,
+        control_scope: Option<PendingControlScope>,
+    },
 }
 
 /// No durable or public reconstruction exists: restart loses every handoff.
 #[derive(Default)]
 pub(crate) struct FreshSyncRegistry {
     entries: Mutex<HashMap<String, FreshSyncEntry>>,
+    #[cfg(test)]
+    take_pauses: Mutex<HashMap<String, Arc<FreshSyncTakePause>>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct FreshSyncTakePause {
+    pub(crate) entered: tokio::sync::Notify,
+    pub(crate) release: tokio::sync::Notify,
 }
 
 /// Owns the pending reservation during asynchronous revalidation and cleanup.
@@ -204,6 +261,16 @@ fn empty_stable_backlog(backlog: &SessionInboxBacklog) -> bool {
 }
 
 impl FreshSyncRegistry {
+    #[cfg(test)]
+    pub(crate) fn pause_take_for_test(&self, id: &str) -> Arc<FreshSyncTakePause> {
+        let pause = Arc::new(FreshSyncTakePause::default());
+        self.take_pauses
+            .lock()
+            .unwrap()
+            .insert(id.into(), pause.clone());
+        pause
+    }
+
     /// Caller holds the runner read lock, preserving runner -> registry lock
     /// order. A parked or revalidating reservation is the same Pending owner.
     pub(crate) fn is_current_owner(&self, session_id: &str, run_id: &str) -> bool {
@@ -215,6 +282,43 @@ impl FreshSyncRegistry {
             Some(FreshSyncEntry::InFlight {
                 run_id: current, ..
             }) => current == run_id,
+            None => false,
+        }
+    }
+
+    /// Called only while the caller holds the exact runner's lock and the
+    /// canonical Supervisor/target storage fence. This does not bind the
+    /// Router's generic steer or delivery lifetime.
+    pub(super) fn matches_control_owner(
+        &self,
+        target: &SupervisorCurrentUserTarget,
+        run_id: &str,
+        workspace_path: Option<&str>,
+    ) -> bool {
+        let Ok(entries) = self.entries.lock() else {
+            return false;
+        };
+        match entries.get(&target.session_id) {
+            Some(FreshSyncEntry::Parked(entry)) => {
+                entry.reservation.run_id() == run_id
+                    && entry
+                        .witness
+                        .matches_reservation_identity(&entry.reservation)
+                    && entry
+                        .control_scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.matches(target, workspace_path))
+            }
+            Some(FreshSyncEntry::InFlight {
+                run_id: current,
+                control_scope,
+                ..
+            }) => {
+                current == run_id
+                    && control_scope
+                        .as_ref()
+                        .is_some_and(|scope| scope.matches(target, workspace_path))
+            }
             None => false,
         }
     }
@@ -234,9 +338,15 @@ impl FreshSyncRegistry {
         }
         let nonce = pending.nonce;
         let run_id = pending.reservation.run_id().to_owned();
-        let FreshSyncEntry::Parked(pending) =
-            std::mem::replace(entry, FreshSyncEntry::InFlight { nonce, run_id })
-        else {
+        let control_scope = pending.control_scope.clone();
+        let FreshSyncEntry::Parked(pending) = std::mem::replace(
+            entry,
+            FreshSyncEntry::InFlight {
+                nonce,
+                run_id,
+                control_scope,
+            },
+        ) else {
             unreachable!("entry was parked while the registry lock was held")
         };
         Some(TakenFreshSync {
@@ -328,6 +438,7 @@ impl FreshSyncRegistry {
         let token = owner.cancel_token().clone();
         let nonce = Uuid::new_v4();
         let deadline = Instant::now() + PENDING_SYNC_LIFETIME;
+        let control_scope = PendingControlScope::capture(&snapshot);
         {
             // No await while both guards are held. Stop and take serialize on
             // the same runner slot; the map stores the non-clonable owner.
@@ -361,6 +472,7 @@ impl FreshSyncRegistry {
                 reservation: reservation.take().expect("checked reservation"),
                 inputs: inputs.take(),
                 witness: witness.take().expect("checked witness"),
+                control_scope,
                 snapshot,
                 backlog,
                 proof,
@@ -408,6 +520,13 @@ impl FreshSyncRegistry {
         if !valid {
             taken.abandon().await;
             return None;
+        }
+        #[cfg(test)]
+        let pause = self.take_pauses.lock().unwrap().remove(id);
+        #[cfg(test)]
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
         }
         let handoff = {
             let mut runners = state.agent_runners.write().await;
@@ -458,5 +577,28 @@ impl FreshSyncRegistry {
         }
         matches!(state.session_inbox.inspect(id).await, Ok(after) if after == pending.backlog)
             && pending.witness.matches_reservation(&pending.reservation)
+    }
+}
+
+#[cfg(test)]
+mod control_scope_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_root_observation_keeps_birth_and_workspace_after_metadata_edit() {
+        let mut legacy = Session::new("legacy-pending-root", "model");
+        legacy.root_session_id.clear();
+        legacy.set_workspace_path_meta("/fixture/workspace-a");
+        let captured = PendingControlScope::capture(&legacy).unwrap();
+        // The control reader normalizes an old Root only in its observation.
+        assert!(legacy.root_session_id.is_empty());
+        let mut canonical = legacy.clone();
+        canonical.root_session_id = canonical.id.clone();
+        canonical.metadata_version += 1;
+        let mut selected = SupervisorCurrentUserTarget::capture(&canonical).unwrap();
+        assert!(captured.matches(&selected, Some("/fixture/workspace-a")));
+        assert!(!captured.matches(&selected, Some("/fixture/workspace-b")));
+        selected.created_at += chrono::Duration::seconds(1);
+        assert!(!captured.matches(&selected, Some("/fixture/workspace-a")));
     }
 }

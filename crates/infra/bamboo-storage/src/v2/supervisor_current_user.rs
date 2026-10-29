@@ -25,7 +25,8 @@ impl SessionStoreV2 {
     ///
     /// The effect is moved into an owned blocking job with the guards: dropping
     /// the async caller cannot release authority before an already-started
-    /// signal. The callback must not await or reenter Session storage.
+    /// signal. The callback receives the canonical Workspace path while its
+    /// guard is held; it must not await or reenter Session storage.
     pub async fn with_unscoped_supervisor_root_control<T, F>(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
@@ -35,7 +36,7 @@ impl SessionStoreV2 {
     ) -> io::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce() -> io::Result<T> + Send + 'static,
+        F: FnOnce(Option<&str>) -> io::Result<T> + Send + 'static,
     {
         if caller.session_id != supervisor.session_id
             || caller.authority_identity
@@ -62,7 +63,8 @@ impl SessionStoreV2 {
         tokio::task::spawn_blocking(move || {
             let _scope = scope;
             let _authority = authority;
-            effect()
+            let workspace_path = _authority.target.workspace_path_meta();
+            effect(workspace_path.as_deref())
         })
         .await
         .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?

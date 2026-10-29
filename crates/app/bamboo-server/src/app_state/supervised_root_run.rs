@@ -17,13 +17,14 @@ use bamboo_storage::SessionStoreV2;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use super::{live_retry::LiveRetryBridge, AgentRunner, AgentStatus};
+use super::{fresh_sync::FreshSyncRegistry, live_retry::LiveRetryBridge, AgentRunner, AgentStatus};
 
 pub(super) struct SupervisedRootRunController {
     pub(super) store: Arc<SessionStoreV2>,
     pub(super) router: Arc<bamboo_engine::SessionActivationRouter>,
     pub(super) runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(super) live_retry: Arc<LiveRetryBridge>,
+    pub(super) fresh_sync: Arc<FreshSyncRegistry>,
 }
 
 fn busy() -> io::Error {
@@ -48,6 +49,8 @@ fn run_control(
     router: &bamboo_engine::SessionActivationRouter,
     runners: &RwLock<HashMap<String, AgentRunner>>,
     live_retry: &LiveRetryBridge,
+    fresh_sync: &FreshSyncRegistry,
+    workspace_path: Option<&str>,
 ) -> io::Result<Value> {
     let candidate = {
         let entries = runners.try_read().map_err(|_| busy())?;
@@ -58,11 +61,13 @@ fn run_control(
             return Ok(conflict(&target.session_id, expected, "run_changed"));
         }
         if runner.exact_execution_finalized() {
-            return Ok(if runner.supervisor_run_is_finalized_for(target) {
-                finalized(target, runner)
-            } else {
-                conflict(&target.session_id, expected, "finalized_unobserved")
-            });
+            return Ok(
+                if runner.supervisor_run_is_finalized_for(target, workspace_path) {
+                    finalized(target, runner)
+                } else {
+                    conflict(&target.session_id, expected, "finalized_unobserved")
+                },
+            );
         }
         runner.run_id.clone()
     };
@@ -74,7 +79,15 @@ fn run_control(
         target.created_at,
         &candidate,
     ) {
-        Ok(owner) => owner,
+        Ok(owner) => Some(owner),
+        Err(reason)
+            if matches!(
+                reason.reason,
+                bamboo_domain::SessionRunConflictReason::UnboundLifetime
+            ) =>
+        {
+            None
+        }
         Err(reason) => {
             return Ok(conflict(
                 &target.session_id,
@@ -83,7 +96,10 @@ fn run_control(
             ));
         }
     };
-    if !owner.matches(&target.session_id, target.created_at, &candidate) {
+    if owner
+        .as_ref()
+        .is_some_and(|owner| !owner.matches(&target.session_id, target.created_at, &candidate))
+    {
         return Ok(conflict(&target.session_id, expected, "owner_changed"));
     }
     // A reservation/finalizer can hold the registry while waiting for its
@@ -98,11 +114,29 @@ fn run_control(
     // A finalizer can win after the candidate read but before this registry
     // acquisition. Never signal or relabel a finalized, unobserved owner.
     if runner.exact_execution_finalized() {
-        return Ok(if runner.supervisor_run_is_finalized_for(target) {
-            finalized(target, runner)
-        } else {
-            conflict(&target.session_id, expected, "finalized_unobserved")
-        });
+        return Ok(
+            if runner.supervisor_run_is_finalized_for(target, workspace_path) {
+                finalized(target, runner)
+            } else {
+                conflict(&target.session_id, expected, "finalized_unobserved")
+            },
+        );
+    }
+    // Fresh-input sync retains a real Root reservation before its generic
+    // Router lifetime is bound. Accept only that exact private reservation,
+    // under the runner lock and canonical storage fence; never manufacture a
+    // generic Router delivery or steer capability from this observation.
+    if owner.is_none()
+        && (!(matches!(runner.status, AgentStatus::Pending)
+            || (matches!(runner.status, AgentStatus::Cancelled)
+                && runner.cancel_token.is_cancelled()))
+            || !fresh_sync.matches_control_owner(target, &candidate, workspace_path))
+    {
+        return Ok(conflict(
+            &target.session_id,
+            expected,
+            "pending_owner_changed",
+        ));
     }
     if !matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
         && !runner.cancel_token.is_cancelled()
@@ -118,7 +152,7 @@ fn run_control(
         // set a terminal status or discard any pending Inbox input here.
         let gate = gate.ok_or_else(|| io::Error::other("missing Root cancel admission"))?;
         match gate.commit(|| {
-            runner.bind_supervisor_run_target(target);
+            runner.bind_supervisor_run_target(target, workspace_path);
             live_retry.cancel_and_token(&target.session_id, &candidate, &runner.cancel_token);
             Ok::<(), io::Error>(())
         })? {
@@ -140,9 +174,11 @@ fn run_control(
             "run_id":candidate, "completion_verified":false}),
         )
     } else {
-        runner.bind_supervisor_run_target(target);
+        runner.bind_supervisor_run_target(target, workspace_path);
         let status = if runner.cancel_token.is_cancelled() {
             "cancel_requested"
+        } else if matches!(runner.status, AgentStatus::Pending) {
+            "pending"
         } else {
             "running"
         };
@@ -174,9 +210,10 @@ impl SupervisedRootRunController {
         let router = self.router.clone();
         let runners = self.runners.clone();
         let live_retry = self.live_retry.clone();
+        let fresh_sync = self.fresh_sync.clone();
         let output = self
             .store
-            .with_unscoped_supervisor_root_control(caller, &supervisor, target, move || {
+            .with_unscoped_supervisor_root_control(caller, &supervisor, target, move |workspace| {
                 run_control(
                     &selected,
                     expected.as_deref(),
@@ -184,6 +221,8 @@ impl SupervisedRootRunController {
                     &router,
                     &runners,
                     &live_retry,
+                    &fresh_sync,
+                    workspace,
                 )
             })
             .await

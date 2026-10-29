@@ -89,9 +89,10 @@ pub struct AgentRunner {
     // visible status/completed_at when it signals, which is not finalization;
     // an unqualified finalizer cannot prove which run it finalized.
     pub(super) execution_finalized: bool,
-    // A Host may retain a target observation only after the router has bound
-    // this exact live run to its canonical lifetime. It is not an authority.
+    // A Host may retain an observation only after exact Router ownership or
+    // the retained FreshSync owner has been checked. It is not an authority.
     supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
+    supervisor_run_workspace: Option<Option<String>>,
 
     /// Last token budget event to replay for new subscribers.
     ///
@@ -162,8 +163,10 @@ impl AgentRunner {
     pub fn bind_supervisor_run_target(
         &mut self,
         target: &bamboo_domain::SupervisorCurrentUserTarget,
+        workspace_path: Option<&str>,
     ) {
         self.supervisor_run_target = Some(target.clone());
+        self.supervisor_run_workspace = Some(workspace_path.map(str::to_owned));
     }
 
     /// This bit is set only by finalization of the matching run ID.
@@ -178,8 +181,13 @@ impl AgentRunner {
     pub fn supervisor_run_is_finalized_for(
         &self,
         target: &bamboo_domain::SupervisorCurrentUserTarget,
+        workspace_path: Option<&str>,
     ) -> bool {
         self.execution_finalized
+            && self
+                .supervisor_run_workspace
+                .as_ref()
+                .is_some_and(|observed| observed.as_deref() == workspace_path)
             && self.supervisor_run_target.as_ref().is_some_and(|observed| {
                 let mut observed = observed.clone();
                 observed.metadata_version = target.metadata_version;
@@ -213,6 +221,7 @@ impl AgentRunner {
             completed_at: None,
             execution_finalized: false,
             supervisor_run_target: None,
+            supervisor_run_workspace: None,
             last_budget_event: None,
             last_critical_events: Vec::new(),
             last_tool_name: None,

@@ -1869,13 +1869,45 @@ mod execution_input_http {
         .is_err());
         assert!(!token.is_cancelled());
 
-        let cancelled =
-            supervisor_pending_run_action(&state, &supervisor, &target, "cancel", Some(&run_id))
+        // Pause the real take after revalidation but before its runner lock.
+        // A winning cancel must make that same take abandon its reservation.
+        let pause = state.fresh_sync.pause_take_for_test(id);
+        let take = state.fresh_sync.take(state.get_ref(), id);
+        let cancel = async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), pause.entered.notified())
                 .await
-                .unwrap();
-        assert_eq!(cancelled["status"], "cancel_requested");
-        assert_eq!(cancelled["completion_verified"], false);
-        assert!(token.is_cancelled());
+                .expect("the real take must reach its handoff boundary");
+            let cancelled = supervisor_pending_run_action(
+                &state,
+                &supervisor,
+                &target,
+                "cancel",
+                Some(&run_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cancelled["status"], "cancel_requested");
+            assert_eq!(cancelled["completion_verified"], false);
+            assert!(token.is_cancelled());
+            let stop = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/stop/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(stop.status(), StatusCode::OK);
+            let stopped =
+                supervisor_pending_run_action(&state, &supervisor, &target, "observe_run", None)
+                    .await
+                    .unwrap();
+            assert_eq!(stopped["status"], "cancel_requested", "{stopped}");
+            assert_eq!(stopped["completion_verified"], false);
+            pause.release.notify_one();
+        };
+        let (handoff, ()) = tokio::join!(take, cancel);
+        assert!(handoff.is_none(), "a cancelled owner cannot be handed off");
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while state.fresh_sync.is_current_owner(id, &run_id) {
                 tokio::task::yield_now().await;
@@ -1920,6 +1952,21 @@ mod execution_input_http {
             assert!(matches!(runner.status, AgentStatus::Pending));
             (runner.run_id.clone(), runner.cancel_token.clone())
         };
+        let original_target = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let originally_observed = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &original_target,
+            "observe_run",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(originally_observed["status"], "pending");
         let original = state
             .storage
             .load_session(changed_id)
@@ -1982,6 +2029,37 @@ mod execution_input_http {
         )
         .await;
         assert_eq!(stop.status(), StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let finalized = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(changed_id)
+                    .is_some_and(|runner| runner.exact_execution_finalized());
+                if finalized {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old retained owner must finalize after HTTP Stop");
+        let fresh_after_stop = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let after_stop = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh_after_stop,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_stop["status"], "run_conflict", "{after_stop}");
         tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
             .await
             .unwrap();

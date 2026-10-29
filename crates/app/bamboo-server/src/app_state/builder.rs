@@ -1218,11 +1218,13 @@ impl AppState {
         let browser = Arc::new(crate::browser::BrowserManager::with_profile_root(
             data_dir.join("browser-profiles"),
         ));
+        let fresh_sync = Arc::new(super::fresh_sync::FreshSyncRegistry::default());
         let root_run = Arc::new(super::supervised_root_run::SupervisedRootRunController {
             store: session_store.clone(),
             router: session_activation_router.clone(),
             runners: agent_runners.clone(),
             live_retry: live_retry.clone(),
+            fresh_sync: fresh_sync.clone(),
         });
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
@@ -1567,7 +1569,7 @@ impl AppState {
             metrics_service,
             agent_runners,
             live_retry,
-            fresh_sync: Arc::new(super::fresh_sync::FreshSyncRegistry::default()),
+            fresh_sync,
             execute_startups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_event_senders,
             actor_event_hub,

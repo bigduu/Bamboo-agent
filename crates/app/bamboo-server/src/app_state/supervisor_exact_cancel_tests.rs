@@ -529,6 +529,7 @@ async fn cancelled_root_control_admission_cannot_signal_late_owner() {
         router: fixture.state.session_activation_router.clone(),
         runners: fixture.state.agent_runners.clone(),
         live_retry: fixture.state.live_retry.clone(),
+        fresh_sync: fixture.state.fresh_sync.clone(),
     };
     let gate = bamboo_domain::AdmissionGate::default();
     gate.cancel_if_pending();

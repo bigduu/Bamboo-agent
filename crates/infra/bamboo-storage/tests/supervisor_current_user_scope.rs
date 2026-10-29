@@ -56,7 +56,9 @@ async fn root_control_retains_original_authority_and_never_borrows_finite_scope(
     };
     let (_home, store, reference) = fixture().await;
     let store = Arc::new(store);
-    let target = root(&store, "control-root", Some("control-project")).await;
+    let mut target = root(&store, "control-root", Some("control-project")).await;
+    target.set_workspace_path_meta("/fixture/control-workspace");
+    store.save_session(&target).await.unwrap();
     let supervisor = store
         .load_execution_admission_snapshot(&reference.session_id)
         .await
@@ -70,7 +72,8 @@ async fn root_control_retains_original_authority_and_never_borrows_finite_scope(
     let effects = Arc::new(AtomicUsize::new(0));
     let record = effects.clone();
     store
-        .with_unscoped_supervisor_root_control(&caller, &reference, &selector, move || {
+        .with_unscoped_supervisor_root_control(&caller, &reference, &selector, move |workspace| {
+            assert_eq!(workspace, Some("/fixture/control-workspace"));
             record.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
@@ -81,7 +84,7 @@ async fn root_control_retains_original_authority_and_never_borrows_finite_scope(
     forged_caller.root_tool_authority_revision += 1;
     let record = effects.clone();
     assert!(store
-        .with_unscoped_supervisor_root_control(&forged_caller, &reference, &selector, move || {
+        .with_unscoped_supervisor_root_control(&forged_caller, &reference, &selector, move |_| {
             record.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
@@ -91,7 +94,7 @@ async fn root_control_retains_original_authority_and_never_borrows_finite_scope(
     stale.created_at += chrono::Duration::seconds(1);
     let record = effects.clone();
     assert!(store
-        .with_unscoped_supervisor_root_control(&caller, &reference, &stale, move || {
+        .with_unscoped_supervisor_root_control(&caller, &reference, &stale, move |_| {
             record.fetch_add(1, Ordering::SeqCst);
             Ok(())
         })
@@ -113,7 +116,7 @@ async fn root_control_retains_original_authority_and_never_borrows_finite_scope(
                 &original,
                 &supervisor_ref,
                 &selected,
-                move || {
+                move |_| {
                     let _ = entered_tx.send(());
                     release_rx.recv().map_err(std::io::Error::other)?;
                     Ok(())
@@ -129,6 +132,7 @@ async fn root_control_retains_original_authority_and_never_borrows_finite_scope(
     let writer_store = store.clone();
     let mut changed = target.clone();
     changed.title = "changed after retained signal".into();
+    changed.set_workspace_path_meta("/fixture/changed-workspace");
     let mut writer = tokio::spawn(async move { writer_store.save_session(&changed).await });
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer)
@@ -179,7 +183,7 @@ async fn root_control_retains_original_authority_and_never_borrows_finite_scope(
         }
         let record = effects.clone();
         assert!(store
-            .with_unscoped_supervisor_root_control(&caller, &reference, &fresh, move || {
+            .with_unscoped_supervisor_root_control(&caller, &reference, &fresh, move |_| {
                 record.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             })
