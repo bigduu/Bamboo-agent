@@ -206,22 +206,26 @@ async fn try_llm_title(
     session: &Session,
     first_user_text: &str,
 ) -> Result<String, String> {
-    // Determine provider name (session-aware, with global config fallback) and resolve fast model.
-    let config_snapshot = { state.config().read().await.clone() };
-    let provider_name = title_provider_name(&config_snapshot, session);
-
-    let resolved = crate::model_config_helper::resolve_fast_model(
-        &config_snapshot,
-        &provider_name,
-        state.provider_registry(),
-    )
-    .ok_or_else(|| "no fast model resolved".to_string())?;
+    // Select the target and its handle while the same config is current.
+    // Drop the guard before any provider request or stream await.
+    let (provider_name, resolved, stream_timeout) = {
+        let config = state.config().read().await;
+        let provider_name = title_provider_name(&config, session);
+        let resolved = crate::model_config_helper::try_resolve_fast_model(
+            &config,
+            &provider_name,
+            state.provider_registry(),
+        )
+        .map_err(|error| format!("configured fast model unavailable: {error}"))?
+        .ok_or_else(|| "no fast model resolved".to_string())?;
+        (provider_name, resolved, config.stream_timeout)
+    };
 
     let messages: Vec<Message> = build_title_messages(first_user_text);
     let model_name = resolved.model_name.clone();
     let provider = resolved.provider;
     let timeout_context = crate::runtime::stream::handler::StreamTimeoutContext::new(
-        config_snapshot.stream_timeout,
+        stream_timeout,
         Some(&provider_name),
         Some(&model_name),
     )

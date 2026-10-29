@@ -12,6 +12,29 @@ pub(crate) struct ModelVisionProvider {
 
 #[async_trait]
 impl LLMProvider for ModelVisionProvider {
+    fn local_dispatch_refused(&self) -> bool {
+        self.inner.local_dispatch_refused()
+    }
+
+    fn queue_requires_current_route(&self) -> bool {
+        self.inner.queue_requires_current_route()
+    }
+    fn queued_route_identity(&self) -> crate::provider::QueuedRouteIdentity {
+        crate::provider::queued_identity_for(&self.inner)
+    }
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(inner) = self.inner.queued_provider_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            inner,
+            overrides: self.overrides.clone(),
+        })))
+    }
+    fn known_pre_dispatch_error(&self) -> Option<crate::provider::LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+
     async fn vision_support_override(&self, model: &str) -> Option<bool> {
         self.overrides.get(model).copied()
     }
@@ -79,6 +102,36 @@ mod tests {
     use super::*;
     use crate::{ModelCatalogService, ProviderRegistry, ResolvedModel};
     use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+
+    struct LocalRefusal;
+    #[async_trait]
+    impl LLMProvider for LocalRefusal {
+        fn known_pre_dispatch_error(&self) -> Option<crate::provider::LLMError> {
+            Some(crate::provider::LLMError::Auth("synthetic refusal".into()))
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            panic!("a known local refusal must not dispatch")
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_and_role_decorators_forward_known_pre_dispatch_failure() {
+        let vision: Arc<dyn LLMProvider> = Arc::new(ModelVisionProvider {
+            inner: Arc::new(LocalRefusal),
+            overrides: BTreeMap::new(),
+        });
+        let mut reference = ProviderModelRef::new("fixture", "model");
+        reference.reasoning_effort = Some(ReasoningEffort::Low);
+        let selected = ResolvedModel::from_ref(vision, &reference);
+        assert!(matches!(selected.provider.known_pre_dispatch_error(),
+            Some(crate::provider::LLMError::Auth(message)) if message == "synthetic refusal"));
+    }
     struct MetadataProvider;
     #[async_trait]
     impl LLMProvider for MetadataProvider {
@@ -233,5 +286,44 @@ mod tests {
             .models
             .iter()
             .any(|m| m.capabilities.supports_vision));
+    }
+
+    #[tokio::test]
+    async fn vision_and_reasoning_snapshots_preserve_outer_budget_identity() {
+        struct Snapshotting {
+            inner: Arc<dyn LLMProvider>,
+        }
+        #[async_trait]
+        impl LLMProvider for Snapshotting {
+            fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+                Ok(Some(self.inner.clone()))
+            }
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream> {
+                Ok(Box::pin(futures::stream::empty()))
+            }
+        }
+        let inner: Arc<dyn LLMProvider> = Arc::new(LocalRefusal);
+        let vision: Arc<dyn LLMProvider> = Arc::new(ModelVisionProvider {
+            inner: Arc::new(Snapshotting { inner }),
+            overrides: BTreeMap::from([("model-a".into(), false)]),
+        });
+        let reference =
+            ProviderModelRef::new("fixture", "model-a").with_reasoning_effort(ReasoningEffort::Low);
+        let role = ResolvedModel::from_ref(vision.clone(), &reference).provider;
+        for original in [vision, role] {
+            let expected = original
+                .resource_allocation_identity()
+                .unwrap_or(Arc::as_ptr(&original) as *const () as usize);
+            let pinned = crate::provider::queued_snapshot_for(original).unwrap();
+            assert_eq!(pinned.resource_allocation_identity(), Some(expected));
+            assert_eq!(pinned.vision_support_override("model-a").await, Some(false));
+            assert!(pinned.known_pre_dispatch_error().is_some());
+        }
     }
 }

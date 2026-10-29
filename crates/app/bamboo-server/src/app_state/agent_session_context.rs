@@ -17,7 +17,7 @@ use bamboo_domain::ProviderModelRef;
 use bamboo_engine::app_context::AgentSessionContext;
 use bamboo_engine::events::AccountEventSink;
 use bamboo_engine::runtime::execution::runner_state::AgentRunner;
-use bamboo_llm::{Config, LLMProvider, ProviderRegistry};
+use bamboo_llm::{Config, LLMError, LLMProvider, ProviderRegistry};
 use bamboo_storage::LockedSessionStore;
 
 use super::AppState;
@@ -73,6 +73,20 @@ impl AgentSessionContext for AppState {
         target: &ProviderModelRef,
     ) -> Option<Arc<dyn LLMProvider>> {
         AppState::get_provider_for_model_ref(self, target).ok()
+    }
+
+    fn get_provider_for_model_ref_with_config(
+        &self,
+        config: &Config,
+        target: &ProviderModelRef,
+    ) -> Result<Option<Arc<dyn LLMProvider>>, LLMError> {
+        self.provider_router
+            .route_with_config(config, target)
+            .map(Some)
+    }
+
+    fn resolve_provider_ref_under_config_lock(&self) -> bool {
+        true
     }
 
     async fn get_provider_for_endpoint(&self, provider_name: &str) -> Option<Arc<dyn LLMProvider>> {

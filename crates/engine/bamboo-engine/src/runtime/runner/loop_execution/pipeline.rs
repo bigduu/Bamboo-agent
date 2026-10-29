@@ -20,7 +20,7 @@ use crate::runtime::guardian_state::{
     write_guardian_state, GuardianPhase, GUARDIAN_REVIEW_RUBRIC,
 };
 use crate::runtime::runner::loop_execution::startup::{
-    resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState,
+    resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::session_setup::tool_schemas::{
@@ -50,7 +50,8 @@ use bamboo_metrics::{
 use super::super::to_event_token_usage;
 use super::gold::{
     apply_completed_gold_evaluation, evaluate_gold_terminal, poll_completed_gold_evaluation,
-    spawn_gold_evaluation_if_needed, start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
+    select_gold_evaluation_provider, spawn_gold_evaluation_if_needed,
+    start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
 use crate::runtime::runner::state_bridge;
 
@@ -2079,7 +2080,7 @@ async fn abort_in_flight_evaluations(
 ) {
     let mut task_was_cancelled = false;
     let mut task_generation = None;
-    let mut gold_was_cancelled = false;
+    let mut gold_cancelled_terminal = None;
     if let Some(in_flight) = state.task_evaluation.in_flight.take() {
         task_generation = Some(in_flight.request.based_on_task_context_version);
         let was_finished = in_flight.join_handle.is_finished();
@@ -2147,6 +2148,7 @@ async fn abort_in_flight_evaluations(
         }
     }
     if let Some(in_flight) = state.gold_evaluation.in_flight.take() {
+        let terminal_claimed = in_flight.terminal_claimed.clone();
         let was_finished = in_flight.join_handle.is_finished();
         if !was_finished {
             in_flight.join_handle.abort();
@@ -2156,9 +2158,17 @@ async fn abort_in_flight_evaluations(
         // emitted GoldEvaluationCompleted and must not receive a contradictory
         // cancellation lifecycle event during run cleanup.
         match in_flight.join_handle.await {
-            Ok(Some(_result)) => {}
-            Ok(None) => gold_was_cancelled = true,
-            Err(error) if error.is_cancelled() => gold_was_cancelled = true,
+            Ok(Some(Ok(_result))) => {}
+            Ok(Some(Err(error))) => {
+                tracing::warn!(
+                    "[{}] Async Gold evaluation refused during cleanup for round {}: {}",
+                    state.session_id,
+                    in_flight.request.round_number,
+                    error
+                );
+            }
+            Ok(None) => gold_cancelled_terminal = Some(terminal_claimed),
+            Err(error) if error.is_cancelled() => gold_cancelled_terminal = Some(terminal_claimed),
             Err(error) => {
                 tracing::warn!(
                     "[{}] Async Gold evaluation join failed during cleanup for round {}: {}",
@@ -2189,13 +2199,14 @@ async fn abort_in_flight_evaluations(
             })
             .await;
     }
-    if gold_was_cancelled {
-        let _ = event_tx
-            .send(AgentEvent::GoldEvaluationCancelled {
-                session_id: state.session_id.clone(),
-                reason: reason.to_string(),
-            })
-            .await;
+    if let Some(terminal_claimed) = gold_cancelled_terminal {
+        crate::runtime::gold_evaluation::emit_gold_cancelled_once(
+            event_tx,
+            &terminal_claimed,
+            &state.session_id,
+            reason,
+        )
+        .await;
     }
 }
 
@@ -2255,12 +2266,20 @@ fn spawn_task_evaluation_if_needed(
     };
 
     if state.task_evaluation.in_flight.is_some() {
-        state.task_evaluation.queued_request = Some(request);
-        tracing::debug!(
-            "[{}] Queued latest async task evaluation snapshot for round {} while another evaluation is still in flight",
-            state.session_id,
-            turn + 1
-        );
+        let model_name = request.model_name.clone();
+        state.task_evaluation.queued_request = QueuedEvaluation::new(request, llm, model_name);
+        if state.task_evaluation.queued_request.is_some() {
+            tracing::debug!(
+                "[{}] Queued latest async task evaluation for round {}",
+                state.session_id,
+                turn + 1
+            );
+        } else {
+            tracing::warn!(
+                "[{}] Could not bind the queued task evaluation to a stable provider",
+                state.session_id
+            );
+        }
         return Ok(());
     }
 
@@ -2389,7 +2408,7 @@ async fn handle_no_tool_calls_with_native(
     task_context: &Option<TaskLoopContext>,
     eval_model: &str,
     iteration: u32,
-    llm: Arc<dyn LLMProvider>,
+    gold_llm: Arc<dyn LLMProvider>,
     provider_transcript_items: Vec<ProviderTranscriptItem>,
     evidence_llm: Arc<dyn LLMProvider>,
     cancel_token: &CancellationToken,
@@ -2482,7 +2501,7 @@ async fn handle_no_tool_calls_with_native(
         config.reasoning_effort,
         session_id,
         iteration,
-        llm,
+        gold_llm,
         event_tx,
     )
     .await;
@@ -3197,32 +3216,46 @@ async fn run_pipeline_inner(
         poll_completed_task_evaluation(state).await;
         apply_completed_task_evaluation(session, event_tx, config, state).await;
         if state.task_evaluation.in_flight.is_none() {
-            if let Some(request) = state.task_evaluation.queued_request.take() {
+            if let Some(queued) = state.task_evaluation.queued_request.take() {
                 let eval_provider = state
                     .auxiliary_models
                     .fast_model_provider
                     .clone()
                     .unwrap_or_else(|| llm.clone());
-                spawn_task_evaluation_request(
-                    state,
-                    event_tx,
-                    request,
-                    eval_provider,
-                    cancel_token.clone(),
-                    config.auxiliary_evaluation_max_concurrency,
-                );
+                let model_name = state
+                    .auxiliary_models
+                    .fast_model_name
+                    .as_deref()
+                    .unwrap_or(state.model_name.as_str());
+                if queued.current_provider(eval_provider, model_name).is_some() {
+                    spawn_task_evaluation_request(
+                        state,
+                        event_tx,
+                        queued.request,
+                        queued.provider,
+                        cancel_token.clone(),
+                        config.auxiliary_evaluation_max_concurrency,
+                    );
+                } else {
+                    tracing::warn!(
+                        "[{}] Dropped queued task evaluation after its model or provider changed",
+                        state.session_id
+                    );
+                }
             }
         }
         poll_completed_gold_evaluation(state).await;
         apply_completed_gold_evaluation(session, config, state).await;
+        let gold_provider = select_gold_evaluation_provider(
+            config,
+            &llm,
+            state.auxiliary_models.fast_model_provider.as_ref(),
+        );
         start_queued_gold_evaluation_if_idle(
             state,
             event_tx,
-            state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
+            gold_provider,
+            config,
             cancel_token.clone(),
             config.auxiliary_evaluation_max_concurrency,
         );
@@ -3854,6 +3887,11 @@ async fn run_pipeline_inner(
                     .fast_model_name
                     .clone()
                     .unwrap_or_else(|| state.model_name.clone());
+                let gold_provider = select_gold_evaluation_provider(
+                    config,
+                    &llm,
+                    state.auxiliary_models.fast_model_provider.as_ref(),
+                );
                 match handle_no_tool_calls_with_native(
                     stream_output.content,
                     stream_output.visible_message,
@@ -3872,7 +3910,7 @@ async fn run_pipeline_inner(
                     &state.task_context,
                     &eval_model,
                     turn_counter + 1,
-                    llm.clone(),
+                    gold_provider,
                     stream_output.provider_transcript_items,
                     state
                         .auxiliary_models
@@ -4317,17 +4355,18 @@ async fn run_pipeline_inner(
                 error
             );
         }
+        let gold_provider = select_gold_evaluation_provider(
+            config,
+            &llm,
+            state.auxiliary_models.fast_model_provider.as_ref(),
+        );
         if let Err(error) = spawn_gold_evaluation_if_needed(
             turn_counter as usize,
             session,
             event_tx,
             config,
             state,
-            state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
+            gold_provider,
             cancel_token.clone(),
         ) {
             tracing::warn!(
@@ -13037,7 +13076,11 @@ mod tests {
         )
         .expect("evaluation request")
         .expect("task context");
-        state.task_evaluation.queued_request = Some(request.clone());
+        state.task_evaluation.queued_request = super::QueuedEvaluation::new(
+            request.clone(),
+            Arc::new(StubProvider),
+            request.model_name.clone(),
+        );
 
         let dropped = Arc::new(AtomicBool::new(false));
         let drop_flag = EvalDropFlag(dropped.clone());
@@ -13055,6 +13098,565 @@ mod tests {
             join_handle,
         });
         dropped
+    }
+
+    /// A queued request must not combine its old model with a newly selected
+    /// account. Drive the actual enqueue and pipeline dequeue paths.
+    #[tokio::test]
+    async fn queued_task_and_gold_keep_provider_and_model_paired_across_refresh() {
+        use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+        use bamboo_llm::{LLMRequestOptions, ResolvedModel};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
+        type Efforts = Arc<Mutex<Vec<(String, Option<ReasoningEffort>)>>>;
+
+        struct CaptureAux {
+            account: &'static str,
+            calls: Calls,
+            efforts: Efforts,
+        }
+
+        #[async_trait::async_trait]
+        impl LLMProvider for CaptureAux {
+            fn queue_requires_current_route(&self) -> bool {
+                true
+            }
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[bamboo_agent_core::tools::ToolSchema],
+                _max: Option<u32>,
+                _model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                panic!("auxiliary calls must carry request options")
+            }
+
+            async fn chat_stream_with_options(
+                &self,
+                _messages: &[Message],
+                _tools: &[bamboo_agent_core::tools::ToolSchema],
+                _max: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                let purpose = options
+                    .and_then(|options| options.request_purpose.as_deref())
+                    .unwrap_or("missing-purpose");
+                self.calls.lock().unwrap().push((
+                    self.account.into(),
+                    model.into(),
+                    purpose.into(),
+                ));
+                self.efforts.lock().unwrap().push((
+                    purpose.to_string(),
+                    options.and_then(|options| options.reasoning_effort),
+                ));
+                Err(LLMError::Auth("synthetic auxiliary refusal".into()))
+            }
+        }
+
+        struct ExplicitlyRejected;
+
+        #[async_trait::async_trait]
+        impl LLMProvider for ExplicitlyRejected {
+            fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+                Some(LLMError::Auth("synthetic explicit refusal".into()))
+            }
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                Err(LLMError::Auth("synthetic explicit refusal".into()))
+            }
+        }
+
+        struct AliasProvider {
+            inner: Arc<dyn LLMProvider>,
+            identity: Arc<dyn LLMProvider>,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for AliasProvider {
+            fn queue_requires_current_route(&self) -> bool {
+                true
+            }
+            fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
+                bamboo_llm::provider::QueuedRouteIdentity::Stable(self.identity.clone())
+            }
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                tools: &[bamboo_agent_core::tools::ToolSchema],
+                max: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.inner.chat_stream(messages, tools, max, model).await
+            }
+            async fn chat_stream_with_options(
+                &self,
+                messages: &[Message],
+                tools: &[bamboo_agent_core::tools::ToolSchema],
+                max: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                self.inner
+                    .chat_stream_with_options(messages, tools, max, model, options)
+                    .await
+            }
+        }
+
+        // Default SDK implementations are deliberately opaque: a new wrapper
+        // per resolution must preserve the pair saved at enqueue.
+        struct SdkOpaque(Arc<dyn LLMProvider>);
+        #[async_trait::async_trait]
+        impl LLMProvider for SdkOpaque {
+            async fn chat_stream(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.0.chat_stream(m, t, n, model).await
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                self.0
+                    .chat_stream_with_options(m, t, n, model, options)
+                    .await
+            }
+        }
+
+        struct WaitForQueuedCalls(Calls);
+
+        #[async_trait::async_trait]
+        impl LLMProvider for WaitForQueuedCalls {
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[bamboo_agent_core::tools::ToolSchema],
+                _max: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                assert_eq!(model, "main-model");
+                // Correct rejection sends nothing, so use a bounded wait.
+                let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if self.0.lock().unwrap().len() >= 2 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+
+            async fn chat_stream_with_options(
+                &self,
+                messages: &[Message],
+                tools: &[bamboo_agent_core::tools::ToolSchema],
+                max: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                let purpose = options.and_then(|value| value.request_purpose.as_deref());
+                if let Some(purpose @ ("task_evaluation" | "gold_evaluation")) = purpose {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(("main".into(), model.into(), purpose.into()));
+                    return Err(LLMError::Auth("synthetic auxiliary refusal".into()));
+                }
+                self.chat_stream(messages, tools, max, model).await
+            }
+        }
+
+        let mut observations = Vec::new();
+        for scenario in [
+            "unchanged",
+            "changed",
+            "same_model_new_provider",
+            "same_provider_new_model",
+            "name_only",
+            "provider_only",
+            "unset",
+            "explicit_gold_fast_changed",
+            "rewrapped_same_effort",
+            "rewrapped_new_effort",
+            "explicit_rejected_then_valid",
+            "same_identity_new_provider",
+            "sdk_rewrapped_same_provider",
+            "sdk_rewrapped_other_provider",
+            "sdk_rewrapped_rejected",
+        ] {
+            let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+            let efforts: Efforts = Arc::new(Mutex::new(Vec::new()));
+            let a: Arc<dyn LLMProvider> = Arc::new(CaptureAux {
+                account: "fast-a",
+                calls: calls.clone(),
+                efforts: efforts.clone(),
+            });
+            let b: Arc<dyn LLMProvider> = Arc::new(CaptureAux {
+                account: "fast-b",
+                calls: calls.clone(),
+                efforts: efforts.clone(),
+            });
+            let mut original = AuxiliaryModelConfig {
+                fast_model_name: (!matches!(scenario, "provider_only" | "unset"))
+                    .then(|| "model-a".into()),
+                fast_model_provider: (!matches!(scenario, "name_only" | "unset"))
+                    .then(|| a.clone()),
+                ..Default::default()
+            };
+            if matches!(scenario, "rewrapped_same_effort" | "rewrapped_new_effort") {
+                let reference = ProviderModelRef::new("fast-a", "model-a")
+                    .with_reasoning_effort(ReasoningEffort::Low);
+                original.fast_model_provider =
+                    Some(ResolvedModel::from_ref(a.clone(), &reference).provider);
+            }
+            let alias_identity: Arc<dyn LLMProvider> = Arc::new(ExplicitlyRejected);
+            let alias_b: Arc<dyn LLMProvider> = Arc::new(AliasProvider {
+                inner: b.clone(),
+                identity: alias_identity.clone(),
+            });
+            if scenario == "same_identity_new_provider" {
+                original.fast_model_provider = Some(Arc::new(AliasProvider {
+                    inner: a.clone(),
+                    identity: alias_identity,
+                }));
+            }
+            if scenario == "explicit_rejected_then_valid" {
+                original.fast_model_provider = Some(Arc::new(ExplicitlyRejected));
+            }
+            if matches!(
+                scenario,
+                "sdk_rewrapped_same_provider"
+                    | "sdk_rewrapped_other_provider"
+                    | "sdk_rewrapped_rejected"
+            ) {
+                original.fast_model_provider = Some(Arc::new(SdkOpaque(a.clone())));
+            }
+            let main: Arc<dyn LLMProvider> = Arc::new(WaitForQueuedCalls(calls.clone()));
+            let initial_task_provider = original
+                .fast_model_provider
+                .clone()
+                .unwrap_or_else(|| main.clone());
+            let initial_task_model = original
+                .fast_model_name
+                .as_deref()
+                .unwrap_or("main-model")
+                .to_string();
+            let current = Arc::new(Mutex::new(original.clone()));
+            let current_for_resolver = current.clone();
+            let config = AgentLoopConfig {
+                model_name: Some("main-model".into()),
+                system_prompt: Some("synthetic system".into()),
+                gold_config: Some(GoldConfig {
+                    enabled: true,
+                    model_name: (scenario == "explicit_gold_fast_changed")
+                        .then(|| "explicit-gold".into()),
+                    ..Default::default()
+                }),
+                auxiliary_model_resolver: Some(Arc::new(move || {
+                    current_for_resolver.lock().unwrap().clone()
+                })),
+                prompt_memory_flags: PromptMemoryFlags {
+                    project_prompt_injection: false,
+                    relevant_recall: false,
+                    relevant_recall_rerank: false,
+                    project_first_dream: false,
+                    ledger_agenda: false,
+                },
+                ..Default::default()
+            };
+            let initial_gold_provider = super::select_gold_evaluation_provider(
+                &config,
+                &main,
+                original.fast_model_provider.as_ref(),
+            );
+            let initial_gold_model = config
+                .gold_config
+                .as_ref()
+                .unwrap()
+                .model_name
+                .as_deref()
+                .unwrap_or(&initial_task_model)
+                .to_string();
+            let mut session = Session::new("synthetic-queued-eval", "main-model");
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "main-model".into();
+            state.auxiliary_models = original;
+            let _drop_flag = seed_blocked_task_evaluation(&mut session, &mut state);
+            let existing = state.task_evaluation.in_flight.take().unwrap();
+            existing.join_handle.abort();
+            let _ = existing.join_handle.await;
+            state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
+                request: existing.request,
+                metrics_started: Arc::new(AtomicBool::new(false)),
+                metrics_terminal: Arc::new(AtomicBool::new(false)),
+                join_handle: tokio::spawn(async { None }),
+            });
+            state.task_evaluation.queued_request = None;
+            state.task_context.as_mut().unwrap().task_list_dirty = true;
+
+            let gold_config = config.gold_config.as_ref().unwrap();
+            let previous_gold =
+                crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+                    &state.task_context,
+                    &session,
+                    &session.id,
+                    1,
+                    Some("model-a"),
+                    None,
+                    GoldCheckpoint::PostRound,
+                    gold_config,
+                    crate::runtime::stream::handler::StreamTimeoutContext::default(),
+                )
+                .unwrap()
+                .unwrap();
+            state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+                terminal_claimed: Arc::new(
+                    crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+                ),
+                request: previous_gold,
+                join_handle: tokio::spawn(async { None }),
+            });
+            let (tx, _rx) = mpsc::channel(128);
+            super::spawn_task_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                initial_task_provider,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            super::spawn_gold_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                initial_gold_provider,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                state
+                    .task_evaluation
+                    .queued_request
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .model_name,
+                initial_task_model
+            );
+            assert_eq!(
+                state
+                    .gold_evaluation
+                    .queued_request
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .model_name,
+                initial_gold_model
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !state
+                    .task_evaluation
+                    .in_flight
+                    .as_ref()
+                    .unwrap()
+                    .join_handle
+                    .is_finished()
+                    || !state
+                        .gold_evaluation
+                        .in_flight
+                        .as_ref()
+                        .unwrap()
+                        .join_handle
+                        .is_finished()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("synthetic earlier evaluations should complete");
+
+            match scenario {
+                "changed" | "explicit_gold_fast_changed" | "explicit_rejected_then_valid" => {
+                    *current.lock().unwrap() = AuxiliaryModelConfig {
+                        fast_model_name: Some("model-b".into()),
+                        fast_model_provider: Some(b.clone()),
+                        ..Default::default()
+                    };
+                }
+                "same_model_new_provider" => {
+                    current.lock().unwrap().fast_model_provider = Some(b.clone());
+                }
+                "sdk_rewrapped_same_provider" | "sdk_rewrapped_other_provider" => {
+                    let inner = if scenario == "sdk_rewrapped_same_provider" {
+                        a.clone()
+                    } else {
+                        b.clone()
+                    };
+                    current.lock().unwrap().fast_model_provider = Some(Arc::new(SdkOpaque(inner)));
+                }
+                "sdk_rewrapped_rejected" => {
+                    current.lock().unwrap().fast_model_provider =
+                        Some(Arc::new(ExplicitlyRejected));
+                }
+                "same_identity_new_provider" => {
+                    current.lock().unwrap().fast_model_provider = Some(alias_b.clone());
+                }
+                "same_provider_new_model" => {
+                    current.lock().unwrap().fast_model_name = Some("model-b".into());
+                }
+                "rewrapped_same_effort" | "rewrapped_new_effort" => {
+                    let effort = if scenario == "rewrapped_new_effort" {
+                        ReasoningEffort::High
+                    } else {
+                        ReasoningEffort::Low
+                    };
+                    let reference =
+                        ProviderModelRef::new("fast-a", "model-a").with_reasoning_effort(effort);
+                    let replacement = ResolvedModel::from_ref(a.clone(), &reference).provider;
+                    let mut current = current.lock().unwrap();
+                    let old = current.fast_model_provider.as_ref().unwrap();
+                    assert!(!Arc::ptr_eq(old, &replacement));
+                    current.fast_model_provider = Some(replacement);
+                }
+                _ => {}
+            }
+            let outcome = super::run_pipeline(
+                &mut session,
+                &tx,
+                main,
+                Arc::new(AlwaysOkExecutor),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "the synthetic main loop should run: {outcome:?}"
+            );
+            let mut actual = calls.lock().unwrap().clone();
+            actual.sort();
+            let pair = |account: &str, model: &str| {
+                vec![
+                    (
+                        account.to_string(),
+                        model.to_string(),
+                        "gold_evaluation".to_string(),
+                    ),
+                    (
+                        account.to_string(),
+                        model.to_string(),
+                        "task_evaluation".to_string(),
+                    ),
+                ]
+            };
+            let expected = match scenario {
+                "unchanged"
+                | "rewrapped_same_effort"
+                | "rewrapped_new_effort"
+                | "same_identity_new_provider"
+                | "sdk_rewrapped_same_provider"
+                | "sdk_rewrapped_other_provider" => pair("fast-a", "model-a"),
+                "name_only" => pair("main", "model-a"),
+                "provider_only" => pair("fast-a", "main-model"),
+                "unset" => pair("main", "main-model"),
+                "explicit_gold_fast_changed" => vec![(
+                    "main".into(),
+                    "explicit-gold".into(),
+                    "gold_evaluation".into(),
+                )],
+                _ => Vec::new(),
+            };
+            if matches!(scenario, "rewrapped_same_effort" | "rewrapped_new_effort") {
+                let effort = ReasoningEffort::Low;
+                let mut observed = efforts.lock().unwrap().clone();
+                observed.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(
+                    observed,
+                    vec![
+                        ("gold_evaluation".to_string(), Some(effort)),
+                        ("task_evaluation".to_string(), Some(effort)),
+                    ],
+                    "the saved wrapper must retain its original policy for {scenario}"
+                );
+            }
+            if scenario == "changed" {
+                assert!(actual.is_empty(), "a changed route must not dispatch the queued model to any provider: {actual:?}");
+                assert!(state.task_evaluation.in_flight.is_none());
+                assert!(state.gold_evaluation.in_flight.is_none());
+                state.auxiliary_models = current.lock().unwrap().clone();
+                state.task_context.as_mut().unwrap().task_list_dirty = true;
+                super::spawn_task_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    b.clone(),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                super::spawn_gold_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    b.clone(),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while calls.lock().unwrap().len() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("new requests should use the refreshed provider");
+                let mut later = calls.lock().unwrap().clone();
+                later.sort();
+                assert_eq!(
+                    later,
+                    vec![
+                        ("fast-b".into(), "model-b".into(), "gold_evaluation".into()),
+                        ("fast-b".into(), "model-b".into(), "task_evaluation".into()),
+                    ],
+                    "new work must use the refreshed complete pair"
+                );
+            }
+            observations.push((scenario, actual, expected));
+        }
+        for (scenario, actual, expected) in observations {
+            assert_eq!(actual, expected, "queued target mismatch for {scenario}");
+        }
     }
 
     #[tokio::test]
@@ -13484,6 +14086,159 @@ mod tests {
         }
     }
 
+    // The real evaluator runs under a real LocalTaskResources relay. The test
+    // holds the handoff after the evaluator returns so cleanup deterministically
+    // sees the same pending relay state as a delayed relay on another worker.
+    #[tokio::test]
+    async fn scoped_gold_route_rejection_and_cleanup_emit_one_terminal() {
+        use crate::app_context::model_routing_test_support::CaptureProvider;
+        use crate::runtime::gold_evaluation::{
+            execute_async_gold_evaluation_with_terminal, AsyncGoldEvaluationRequest,
+            GoldEvaluationTerminal,
+        };
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, ProviderRegistry};
+        use tokio::sync::oneshot;
+
+        let session_id = "scoped-gold-relay-race";
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = "gold-a".into();
+        config.default_provider_instance = Some("gold-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.insert(
+            "gold-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true,
+                "api_key":"synthetic-only", "base_url":"http://127.0.0.1:1",
+                "model":"main-model", "runtime_models":["main-model", "explicit-gold"]
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let target = ProviderModelRef::new("gold-a", "explicit-gold");
+        let (selected, origin) = registry.provider_for_model_with_origin(&target).unwrap();
+        let live = Arc::new(RwLock::new(config));
+        let capture = Arc::new(CaptureProvider::default());
+        let guard = bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            live.clone(),
+            origin.unwrap(),
+            target,
+            selected,
+            capture.clone(),
+        );
+        let held =
+            crate::runtime::runner::auxiliary_budget::acquire(&guard, "explicit-gold", 1).await;
+        let request = AsyncGoldEvaluationRequest {
+            session_id: session_id.into(),
+            round_number: 1,
+            model_name: "explicit-gold".into(),
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::default(),
+            reasoning_effort: None,
+            checkpoint: GoldCheckpoint::PostRound,
+            session_snapshot: Session::new(session_id, "main-model"),
+            task_context_snapshot: None,
+            gold_config: crate::runtime::config::GoldConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (returned_tx, returned_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let resources = bamboo_tools::LocalTaskResources::new(session_id, "test-run", Utc::now());
+        let eval_request = request.clone();
+        let eval_provider = guard.clone();
+        let eval_tx = tx.clone();
+        let terminal_claimed = Arc::new(GoldEvaluationTerminal::default());
+        let eval_terminal_claimed = terminal_claimed.clone();
+        let join_handle = resources
+            .scope(async move {
+                bamboo_tools::local_task_resources::spawn_cancellable(async move {
+                    let outcome = execute_async_gold_evaluation_with_terminal(
+                        eval_request,
+                        eval_provider,
+                        eval_tx,
+                        1,
+                        eval_terminal_claimed,
+                    )
+                    .await;
+                    let _ = returned_tx.send(outcome.is_err());
+                    // The owner sees a pending scoped relay while this test gate
+                    // holds the completed evaluation result before handoff.
+                    let _ = release_rx.await;
+                    Some(outcome)
+                })
+            })
+            .await;
+        let mut state = e2e_loop_state(session_id);
+        state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+            request,
+            terminal_claimed,
+            join_handle,
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(started, AgentEvent::GoldEvaluationStarted { .. }));
+        live.write()
+            .await
+            .provider_instances
+            .get_mut("gold-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["main-model"]));
+        drop(held);
+        let refused = tokio::time::timeout(Duration::from_secs(5), returned_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refused && guard.local_dispatch_refused());
+        assert!(!state
+            .gold_evaluation
+            .in_flight
+            .as_ref()
+            .unwrap()
+            .join_handle
+            .is_finished());
+
+        // Simulate the owning run terminating while its scoped relay has not
+        // finished reporting the already locally refused evaluation.
+        super::abort_in_flight_evaluations(&mut state, &tx, "run_cancelled").await;
+        drop(release_tx);
+        resources.close_and_drain().await.unwrap();
+        assert!(
+            capture.requests.lock().unwrap().is_empty(),
+            "no provider dispatch"
+        );
+        let mut reasons = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::GoldEvaluationCancelled { reason, .. } => reasons.push(reason),
+                AgentEvent::GoldEvaluationCompleted { .. } => panic!("refusal is not a verdict"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reasons.len(),
+            1,
+            "one Gold terminal even when relay and cleanup race: {reasons:?}"
+        );
+        assert!(matches!(
+            reasons[0].as_str(),
+            "route_rejected" | "run_cancelled"
+        ));
+    }
+
     #[tokio::test]
     async fn cleanup_harvests_finished_gold_evaluation_without_false_cancellation() {
         let session_id = "gold-eval-finished-before-cleanup";
@@ -13534,8 +14289,11 @@ mod tests {
         .await
         .expect("completed event");
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request,
-            join_handle: tokio::spawn(async move { Some(result) }),
+            join_handle: tokio::spawn(async move { Some(Ok(result)) }),
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !state
@@ -13748,10 +14506,17 @@ mod tests {
             gold_config: crate::runtime::config::GoldConfig::default(),
         };
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request: request.clone(),
             join_handle: tokio::spawn(std::future::pending()),
         });
-        state.gold_evaluation.queued_request = Some(request.clone());
+        state.gold_evaluation.queued_request = super::QueuedEvaluation::new(
+            request.clone(),
+            Arc::new(StubProvider),
+            request.model_name.clone(),
+        );
 
         tokio::time::timeout(
             Duration::from_millis(100),
@@ -13778,6 +14543,9 @@ mod tests {
         // same post-loop suspension finalizer (`runtime.suspend_reason` selects
         // this reason). Exercise that seam with another blocked request.
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request: request.clone(),
             join_handle: tokio::spawn(std::future::pending()),
         });
@@ -14574,6 +15342,557 @@ mod tests {
         assert!(dropped.load(Ordering::SeqCst));
         assert_eq!(main.calls.load(Ordering::SeqCst), 1);
         assert_eq!(session.model, "actual-model");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn managed_fast_queue_never_crosses_provider_or_model_after_refresh() {
+        use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_llm::{Config, LLMRequestOptions, ProviderRegistry};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct Foreground(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LLMProvider for Foreground {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                // Keep the real loop open while queued tasks complete.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                if options
+                    .and_then(|o| o.request_purpose.as_deref())
+                    .is_some_and(|p| p == "task_evaluation" || p == "gold_evaluation")
+                {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    return Err(LLMError::Auth("unexpected main fallback".into()));
+                }
+                self.chat_stream(m, t, n, model).await
+            }
+        }
+
+        for scenario in ["unchanged", "switch", "disabled", "revoked", "removed"] {
+            let a = MockServer::start().await;
+            let b = MockServer::start().await;
+            for server in [&a, &b] {
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string("data: [DONE]\n\n"),
+                    )
+                    .mount(server)
+                    .await;
+            }
+            let data = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            cfg.provider = "fast-a".into();
+            cfg.default_provider_instance = Some("fast-a".into());
+            cfg.http_proxy = "http://127.0.0.1:9".into();
+            cfg.https_proxy.clear();
+            cfg.proxy_auth = None;
+            cfg.defaults = Some(
+                serde_json::from_value(json!({
+                    "chat": {"provider": "fast-a", "model": "model-a"},
+                    "fast": {"provider": "fast-a", "model": "model-a"}
+                }))
+                .unwrap(),
+            );
+            for (id, model, endpoint) in [
+                ("fast-a", "model-a", a.uri()),
+                ("fast-b", "model-b", b.uri()),
+            ] {
+                cfg.provider_instances.insert(
+                    id.into(),
+                    serde_json::from_value(json!({
+                        "provider_type": "openai", "enabled": true,
+                        "api_key": "synthetic-only", "base_url": endpoint,
+                        "model": model, "runtime_models": [model]
+                    }))
+                    .unwrap(),
+                );
+            }
+            let registry = Arc::new(
+                ProviderRegistry::from_config(&cfg, data.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let current = Arc::new(Mutex::new(cfg));
+            let resolver_config = current.clone();
+            let resolver_registry = registry.clone();
+            let resolver = Arc::new(move || {
+                let config = resolver_config.lock().unwrap();
+                let (fast_model_name, fast_model_provider) =
+                    crate::model_config_helper::resolve_fast_model_for_runner(
+                        Some(&config),
+                        "fast-a",
+                        &resolver_registry,
+                    );
+                AuxiliaryModelConfig {
+                    fast_model_name,
+                    fast_model_provider,
+                    ..Default::default()
+                }
+            });
+            let original = resolver();
+            let fast_a = original.fast_model_provider.as_ref().unwrap().clone();
+            assert!(
+                fast_a.queue_requires_current_route(),
+                "a managed Host route must be marked"
+            );
+            let config = AgentLoopConfig {
+                model_name: Some("main-model".into()),
+                system_prompt: Some("synthetic system".into()),
+                gold_config: Some(GoldConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                auxiliary_model_resolver: Some(resolver),
+                prompt_memory_flags: PromptMemoryFlags {
+                    project_prompt_injection: false,
+                    relevant_recall: false,
+                    relevant_recall_rerank: false,
+                    project_first_dream: false,
+                    ledger_agenda: false,
+                },
+                ..Default::default()
+            };
+            let mut session = Session::new("managed-queue", "main-model");
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "main-model".into();
+            state.auxiliary_models = original;
+            let _drop_flag = seed_blocked_task_evaluation(&mut session, &mut state);
+            let existing = state.task_evaluation.in_flight.take().unwrap();
+            existing.join_handle.abort();
+            let _ = existing.join_handle.await;
+            state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
+                request: existing.request,
+                metrics_started: Arc::new(AtomicBool::new(false)),
+                metrics_terminal: Arc::new(AtomicBool::new(false)),
+                join_handle: tokio::spawn(async { None }),
+            });
+            state.task_evaluation.queued_request = None;
+            state.task_context.as_mut().unwrap().task_list_dirty = true;
+            let previous_gold =
+                crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+                    &state.task_context,
+                    &session,
+                    &session.id,
+                    1,
+                    Some("model-a"),
+                    None,
+                    GoldCheckpoint::PostRound,
+                    config.gold_config.as_ref().unwrap(),
+                    crate::runtime::stream::handler::StreamTimeoutContext::default(),
+                )
+                .unwrap()
+                .unwrap();
+            state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+                terminal_claimed: Arc::new(
+                    crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+                ),
+                request: previous_gold,
+                join_handle: tokio::spawn(async { None }),
+            });
+            let (tx, _rx) = mpsc::channel(128);
+            super::spawn_task_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                fast_a.clone(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            super::spawn_gold_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                fast_a,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert!(state.task_evaluation.queued_request.is_some());
+            assert!(state.gold_evaluation.queued_request.is_some());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !state
+                    .task_evaluation
+                    .in_flight
+                    .as_ref()
+                    .unwrap()
+                    .join_handle
+                    .is_finished()
+                    || !state
+                        .gold_evaluation
+                        .in_flight
+                        .as_ref()
+                        .unwrap()
+                        .join_handle
+                        .is_finished()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let mut cfg = current.lock().unwrap();
+                match scenario {
+                    "switch" => {
+                        cfg.defaults.as_mut().unwrap().fast =
+                            Some(bamboo_domain::ProviderModelRef::new("fast-b", "model-b"))
+                    }
+                    "disabled" => cfg.provider_instances.get_mut("fast-a").unwrap().enabled = false,
+                    "revoked" => {
+                        cfg.provider_instances
+                            .get_mut("fast-a")
+                            .unwrap()
+                            .extra
+                            .insert("runtime_models".into(), json!([]));
+                    }
+                    "removed" => {
+                        cfg.provider_instances.remove("fast-a");
+                    }
+                    _ => {}
+                }
+            }
+            let main_calls = Arc::new(AtomicUsize::new(0));
+            let main: Arc<dyn LLMProvider> = Arc::new(Foreground(main_calls.clone()));
+            super::run_pipeline(
+                &mut session,
+                &tx,
+                main,
+                Arc::new(AlwaysOkExecutor),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .expect("foreground pipeline should complete");
+            let requests_a = a.received_requests().await.unwrap();
+            let requests_b = b.received_requests().await.unwrap();
+            assert_eq!(
+                main_calls.load(Ordering::SeqCst),
+                0,
+                "no fallback to the main account for {scenario}"
+            );
+            assert!(
+                requests_b.is_empty(),
+                "never send A's queued model to B for {scenario}"
+            );
+            let expected_a = if scenario == "unchanged" { 2 } else { 0 };
+            assert_eq!(
+                requests_a.len(),
+                expected_a,
+                "unexpected A dispatch for {scenario}"
+            );
+            for request in &requests_a {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"],
+                    "model-a"
+                );
+            }
+            if scenario == "switch" {
+                assert!(state.task_evaluation.in_flight.is_none());
+                assert!(state.gold_evaluation.in_flight.is_none());
+                let fast_b = state
+                    .auxiliary_models
+                    .fast_model_provider
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                assert!(fast_b.queue_requires_current_route());
+                state.task_context.as_mut().unwrap().task_list_dirty = true;
+                super::spawn_task_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    fast_b.clone(),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                super::spawn_gold_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    fast_b,
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if b.received_requests().await.unwrap().len() >= 2 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("new work should use the admitted B route");
+                let later = b.received_requests().await.unwrap();
+                assert_eq!(later.len(), 2);
+                for request in &later {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()
+                            ["model"],
+                        "model-b"
+                    );
+                }
+                assert!(a.received_requests().await.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_explicit_gold_uses_original_guard_and_independent_refusal_state() {
+        use crate::runtime::config::{GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, LLMRequestOptions, ProviderRegistry};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio::sync::RwLock;
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        struct Main {
+            target: Arc<dyn LLMProvider>,
+            requests: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for Main {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while self.requests.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                o: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                if model == "explicit-gold" {
+                    self.target
+                        .chat_stream_with_options(m, t, n, model, o)
+                        .await
+                } else {
+                    self.chat_stream(m, t, n, model).await
+                }
+            }
+        }
+
+        let account = MockServer::start().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                request_count.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n")
+            })
+            .mount(&account)
+            .await;
+        let data = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.provider = "gold-a".into();
+        cfg.default_provider_instance = Some("gold-a".into());
+        cfg.http_proxy = "http://127.0.0.1:9".into();
+        cfg.https_proxy.clear();
+        cfg.proxy_auth = None;
+        cfg.provider_instances.insert("gold-a".into(), serde_json::from_value(json!({
+            "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+            "base_url":account.uri(), "model":"main-model", "runtime_models":["main-model", "explicit-gold"]
+        })).unwrap());
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&cfg, data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let selected = registry
+            .provider_for_configured_model(&cfg, &ProviderModelRef::new("gold-a", "main-model"))
+            .unwrap();
+        let live = Arc::new(RwLock::new(cfg));
+        let markers: Arc<Mutex<Vec<Arc<dyn LLMProvider>>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolver_markers = markers.clone();
+        let resolver_live = live.clone();
+        let resolver_registry = registry.clone();
+        let resolver_selected = selected.clone();
+        let resolver: crate::runtime::config::GoldTargetResolver =
+            Arc::new(move |model, delegate| {
+                let guard = bamboo_llm::gold_admission::guarded_gold_target(
+                    resolver_live.clone(),
+                    resolver_registry.clone(),
+                    ProviderModelRef::new("gold-a", model),
+                    resolver_selected.clone(),
+                    delegate,
+                );
+                resolver_markers.lock().unwrap().push(guard.clone());
+                guard
+            });
+        let config = AgentLoopConfig {
+            model_name: Some("main-model".into()),
+            system_prompt: Some("synthetic system".into()),
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                model_name: Some("explicit-gold".into()),
+                ..Default::default()
+            }),
+            gold_target_resolver: Some(resolver),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            ..Default::default()
+        };
+        let main: Arc<dyn LLMProvider> = Arc::new(Main {
+            target: selected,
+            requests: requests.clone(),
+        });
+        let mut session = Session::new("guarded-queue", "main-model");
+        let mut state = e2e_loop_state(&session.id);
+        state.model_name = "main-model".into();
+        let previous = crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+            &None,
+            &session,
+            &session.id,
+            1,
+            Some("main-model"),
+            None,
+            GoldCheckpoint::PostRound,
+            config.gold_config.as_ref().unwrap(),
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .unwrap()
+        .unwrap();
+        state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
+            request: previous,
+            join_handle: tokio::spawn(async { None }),
+        });
+        let (tx, _rx) = mpsc::channel(128);
+        let first = super::select_gold_evaluation_provider(&config, &main, None);
+        super::spawn_gold_evaluation_if_needed(
+            1,
+            &session,
+            &tx,
+            &config,
+            &mut state,
+            first,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(state.gold_evaluation.queued_request.is_some());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .unwrap()
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            main,
+            Arc::new(AlwaysOkExecutor),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("foreground pipeline should complete");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "exactly one queued Gold dispatch"
+        );
+        let seen = account.received_requests().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&seen[0].body).unwrap()["model"],
+            "explicit-gold"
+        );
+        let (old_guard, new_guard) = {
+            let markers = markers.lock().unwrap();
+            assert!(markers.len() >= 2, "a new guard must be created at refresh");
+            (markers[0].clone(), markers[1].clone())
+        };
+        assert!(!old_guard.local_dispatch_refused());
+        assert!(!new_guard.local_dispatch_refused());
+        assert!(old_guard
+            .chat_stream(&[], &[], None, "different-model")
+            .await
+            .is_err());
+        assert!(old_guard.local_dispatch_refused());
+        assert!(
+            !new_guard.local_dispatch_refused(),
+            "refusal belongs to exactly one guard"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "wrong model is locally rejected"
+        );
     }
 }
 

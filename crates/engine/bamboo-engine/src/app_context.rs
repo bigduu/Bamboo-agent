@@ -24,11 +24,15 @@ use tokio::sync::{broadcast, RwLock};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::ProviderModelRef;
-use bamboo_llm::{Config, LLMProvider, ProviderRegistry};
+use bamboo_llm::{Config, LLMError, LLMProvider, ProviderRegistry};
 use bamboo_storage::LockedSessionStore;
 
 use crate::events::AccountEventSink;
 use crate::runtime::execution::runner_state::AgentRunner;
+
+#[cfg(test)]
+#[path = "app_context/model_routing_test_support.rs"]
+pub(crate) mod model_routing_test_support;
 
 /// Shared application context the agent-session-orchestration cluster depends
 /// on, in place of the server's concrete `AppState`.
@@ -77,6 +81,23 @@ pub trait AgentSessionContext: Send + Sync {
     /// actix-coupled error type).
     fn get_provider_for_model_ref(&self, target: &ProviderModelRef)
         -> Option<Arc<dyn LLMProvider>>;
+
+    /// Route against a caller-held config snapshot. Standalone embedders retain
+    /// their existing override; hosts may enforce config-managed provenance.
+    /// This synchronous method must not attempt to reacquire the config lock.
+    fn get_provider_for_model_ref_with_config(
+        &self,
+        _config: &Config,
+        target: &ProviderModelRef,
+    ) -> Result<Option<Arc<dyn LLMProvider>>, LLMError> {
+        Ok(self.get_provider_for_model_ref(target))
+    }
+
+    /// Hosts with config-bound synchronous routing opt in. The default keeps
+    /// legacy embedder callbacks outside the config lock.
+    fn resolve_provider_ref_under_config_lock(&self) -> bool {
+        false
+    }
 
     /// Resolve a provider for a named provider endpoint.
     ///

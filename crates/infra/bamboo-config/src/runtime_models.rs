@@ -1,6 +1,6 @@
 //! Provider model admission is configuration authority, never upstream discovery.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{Config, DefaultsConfig, ProviderInstanceConfig};
 
@@ -11,7 +11,13 @@ pub const RUNTIME_MODELS_CONFIG_KEY: &str = "runtime_models";
 pub fn explicit_runtime_models(
     instance: &ProviderInstanceConfig,
 ) -> Result<Option<Vec<String>>, String> {
-    let Some(value) = instance.extra.get(RUNTIME_MODELS_CONFIG_KEY) else {
+    explicit_runtime_models_from_extra(&instance.extra)
+}
+
+fn explicit_runtime_models_from_extra(
+    extra: &BTreeMap<String, serde_json::Value>,
+) -> Result<Option<Vec<String>>, String> {
+    let Some(value) = extra.get(RUNTIME_MODELS_CONFIG_KEY) else {
         return Ok(None);
     };
     let values = value
@@ -27,6 +33,91 @@ pub fn explicit_runtime_models(
         models.insert(model.to_string());
     }
     Ok(Some(models.into_iter().collect()))
+}
+
+// A borrowed view of the fields that affect admission. In particular, do not
+// synthesize whole legacy instances here: that copies every legacy API key on
+// each call, including keys unrelated to this provider.
+#[derive(Clone, Copy)]
+struct ModelInputs<'a> {
+    enabled: bool,
+    model: Option<&'a str>,
+    fast_model: Option<&'a str>,
+    vision_model: Option<&'a str>,
+    extra: &'a BTreeMap<String, serde_json::Value>,
+}
+
+fn instance_model_inputs(instance: &ProviderInstanceConfig) -> ModelInputs<'_> {
+    ModelInputs {
+        enabled: instance.enabled,
+        model: instance.model.as_deref(),
+        fast_model: instance.fast_model.as_deref(),
+        vision_model: instance.vision_model.as_deref(),
+        extra: &instance.extra,
+    }
+}
+
+// Keep this projection aligned with synthesize_legacy_instances. The only
+// legacy fields relevant to admission are enabled, model selections, and the
+// runtime_models extra field.
+fn legacy_model_inputs<'a>(config: &'a Config, id: &str) -> Option<ModelInputs<'a>> {
+    let providers = config.providers();
+    match id {
+        "openai" => providers.openai.as_ref().map(|entry| ModelInputs {
+            enabled: true,
+            model: entry.model.as_deref(),
+            fast_model: entry.fast_model.as_deref(),
+            vision_model: entry.vision_model.as_deref(),
+            extra: &entry.extra,
+        }),
+        "anthropic" => providers.anthropic.as_ref().map(|entry| ModelInputs {
+            enabled: true,
+            model: entry.model.as_deref(),
+            fast_model: entry.fast_model.as_deref(),
+            vision_model: entry.vision_model.as_deref(),
+            extra: &entry.extra,
+        }),
+        "gemini" => providers.gemini.as_ref().map(|entry| ModelInputs {
+            enabled: true,
+            model: entry.model.as_deref(),
+            fast_model: entry.fast_model.as_deref(),
+            vision_model: entry.vision_model.as_deref(),
+            extra: &entry.extra,
+        }),
+        "copilot" => providers.copilot.as_ref().map(|entry| ModelInputs {
+            enabled: entry.enabled || config.provider == "copilot",
+            model: entry.model.as_deref(),
+            fast_model: entry.fast_model.as_deref(),
+            vision_model: entry.vision_model.as_deref(),
+            extra: &entry.extra,
+        }),
+        "bodhi" => providers.bodhi.as_ref().map(|entry| ModelInputs {
+            enabled: true,
+            model: None,
+            fast_model: None,
+            vision_model: None,
+            extra: &entry.extra,
+        }),
+        _ => None,
+    }
+}
+
+/// Whether this exact configured provider key has no explicit runtime list.
+/// The borrowed projection does not materialize unrelated provider credentials.
+#[doc(hidden)]
+pub fn has_implicit_runtime_models_for_provider_key(
+    config: &Config,
+    provider: &str,
+) -> Result<bool, String> {
+    let inputs = config
+        .provider_instances
+        .get(provider)
+        .map(instance_model_inputs)
+        .or_else(|| legacy_model_inputs(config, provider));
+    let Some(inputs) = inputs else {
+        return Ok(false);
+    };
+    Ok(inputs.enabled && explicit_runtime_models_from_extra(inputs.extra)?.is_none())
 }
 
 fn default_refs(
@@ -50,9 +141,7 @@ pub fn configured_provider_routing_key(config: &Config, provider: &str) -> Strin
     let provider = provider.trim();
     if config.provider_instances.contains_key(provider)
         || ((!config.has_provider_instances() || config.effective_default_provider() == provider)
-            && crate::synthesize_legacy_instances(config)
-                .iter()
-                .any(|(id, _)| id == provider))
+            && legacy_model_inputs(config, provider).is_some())
     {
         return provider.to_string();
     }
@@ -76,17 +165,21 @@ pub fn configured_provider_routing_key(config: &Config, provider: &str) -> Strin
 }
 
 fn configured_models(config: &Config, id: &str, instance: &ProviderInstanceConfig) -> Vec<String> {
-    let mut models: BTreeSet<String> = [
-        instance.model.as_deref(),
-        instance.fast_model.as_deref(),
-        instance.vision_model.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .filter(|model| !model.is_empty())
-    .map(ToString::to_string)
-    .collect();
+    configured_models_from_inputs(config, id, instance_model_inputs(instance))
+}
+
+fn configured_models_from_inputs(
+    config: &Config,
+    id: &str,
+    inputs: ModelInputs<'_>,
+) -> Vec<String> {
+    let mut models: BTreeSet<String> = [inputs.model, inputs.fast_model, inputs.vision_model]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .collect();
     if let Some(defaults) = config.defaults.as_ref() {
         for reference in default_refs(defaults) {
             if configured_provider_routing_key(config, &reference.provider) == id
@@ -103,21 +196,19 @@ fn configured_models(config: &Config, id: &str, instance: &ProviderInstanceConfi
 /// selections; no upstream catalog or hardcoded model is consulted.
 pub fn provider_runtime_models(config: &Config, provider: &str) -> Result<Vec<String>, String> {
     let id = configured_provider_routing_key(config, provider);
-    let synthesized = crate::synthesize_legacy_instances(config);
-    let instance = config.provider_instances.get(&id).or_else(|| {
-        synthesized
-            .iter()
-            .find(|(name, _)| name == &id)
-            .map(|(_, instance)| instance)
-    });
-    let Some(instance) = instance else {
+    let inputs = config
+        .provider_instances
+        .get(&id)
+        .map(instance_model_inputs)
+        .or_else(|| legacy_model_inputs(config, &id));
+    let Some(inputs) = inputs else {
         return Ok(Vec::new());
     };
-    if !instance.enabled {
+    if !inputs.enabled {
         return Ok(Vec::new());
     }
-    Ok(explicit_runtime_models(instance)?
-        .unwrap_or_else(|| configured_models(config, &id, instance)))
+    Ok(explicit_runtime_models_from_extra(inputs.extra)?
+        .unwrap_or_else(|| configured_models_from_inputs(config, &id, inputs)))
 }
 
 /// Reject removal of a configured role model instead of silently re-admitting
@@ -147,6 +238,246 @@ pub fn validate_runtime_model_admission(config: &Config) -> Result<(), String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // Oracle for the old, credential-copying implementation, used only with
+    // synthetic fixtures to check the borrowed implementation's semantics.
+    fn old_routing_key(config: &Config, provider: &str) -> String {
+        let provider = provider.trim();
+        if config.provider_instances.contains_key(provider)
+            || ((!config.has_provider_instances()
+                || config.effective_default_provider() == provider)
+                && crate::synthesize_legacy_instances(config)
+                    .iter()
+                    .any(|(id, _)| id == provider))
+        {
+            return provider.to_string();
+        }
+        if let Some(id) = config.default_provider_instance.as_deref() {
+            if config
+                .provider_instances
+                .get(id)
+                .is_some_and(|entry| entry.provider_type == provider)
+            {
+                return id.to_string();
+            }
+        }
+        config
+            .provider_instances
+            .iter()
+            .filter(|(_, entry)| entry.enabled && entry.provider_type == provider)
+            .map(|(id, _)| id)
+            .min()
+            .cloned()
+            .unwrap_or_else(|| provider.to_string())
+    }
+
+    fn old_admission(config: &Config, provider: &str) -> Result<Vec<String>, String> {
+        let id = old_routing_key(config, provider);
+        let synthesized = crate::synthesize_legacy_instances(config);
+        let instance = config.provider_instances.get(&id).or_else(|| {
+            synthesized
+                .iter()
+                .find(|(name, _)| name == &id)
+                .map(|(_, instance)| instance)
+        });
+        let Some(instance) = instance else {
+            return Ok(Vec::new());
+        };
+        if !instance.enabled {
+            return Ok(Vec::new());
+        }
+        if let Some(explicit) = explicit_runtime_models(instance)? {
+            return Ok(explicit);
+        }
+        let mut models: BTreeSet<String> = [
+            instance.model.as_deref(),
+            instance.fast_model.as_deref(),
+            instance.vision_model.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
+        .collect();
+        if let Some(defaults) = config.defaults.as_ref() {
+            for reference in default_refs(defaults) {
+                if old_routing_key(config, &reference.provider) == id
+                    && !reference.model.trim().is_empty()
+                {
+                    models.insert(reference.model.trim().to_string());
+                }
+            }
+        }
+        Ok(models.into_iter().collect())
+    }
+
+    #[test]
+    fn borrowed_admission_matches_legacy_and_instance_projection() {
+        let mut config = Config::default();
+        *config.providers_mut() = serde_json::from_value(json!({
+            "openai": {"api_key":"fixture-openai", "model":"o-chat", "fast_model":"o-fast"},
+            "anthropic": {"api_key":"fixture-anthropic", "model":"a-chat", "runtime_models":["a-chat", "custom"]},
+            "gemini": {"api_key":"fixture-gemini", "model":"g-chat"},
+            "bodhi": {"api_key":"fixture-bodhi", "runtime_models":["bodhi-model"]},
+            "copilot": {"enabled":true, "model":"c-chat"}
+        })).unwrap();
+        config.defaults = Some(
+            serde_json::from_value(json!({
+                "chat":{"provider":"openai", "model":"o-chat"},
+                "fast":{"provider":"gemini", "model":"role-fast"},
+                "vision":{"provider":"copilot", "model":"role-vision"}
+            }))
+            .unwrap(),
+        );
+        let check = |config: &Config| {
+            for name in [
+                "openai",
+                "anthropic",
+                "gemini",
+                "copilot",
+                "bodhi",
+                "relay-a",
+                "relay-b",
+                "unknown",
+            ] {
+                assert_eq!(
+                    configured_provider_routing_key(config, name),
+                    old_routing_key(config, name)
+                );
+                assert_eq!(
+                    provider_runtime_models(config, name),
+                    old_admission(config, name)
+                );
+            }
+        };
+        check(&config);
+        config.provider_instances.insert(
+            "relay-b".into(),
+            serde_json::from_value(json!({
+                "provider_type":"openai", "api_key":"fixture-b", "model":"b-chat"
+            }))
+            .unwrap(),
+        );
+        config.provider_instances.insert(
+            "relay-a".into(),
+            serde_json::from_value(json!({
+                "provider_type":"openai", "api_key":"fixture-a", "model":"a-chat"
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("anthropic".into());
+        check(&config);
+        config.default_provider_instance = Some("relay-b".into());
+        check(&config);
+        config.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(json!({
+                "provider_type":"openai", "enabled":false, "model":"disabled"
+            }))
+            .unwrap(),
+        );
+        check(&config);
+        config
+            .provider_instances
+            .get_mut("relay-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), json!(null));
+        check(&config);
+    }
+
+    #[test]
+    fn borrowed_admission_matches_edge_projections() {
+        let assert_parity = |config: &Config, provider: &str| {
+            assert_eq!(
+                configured_provider_routing_key(config, provider),
+                old_routing_key(config, provider),
+                "routing key for {provider:?}"
+            );
+            assert_eq!(
+                provider_runtime_models(config, provider),
+                old_admission(config, provider),
+                "admission for {provider:?}"
+            );
+        };
+
+        let mut config = Config::default();
+        for provider in ["", "  ", "openai", " copilot ", "unknown"] {
+            assert_parity(&config, provider);
+            assert!(provider_runtime_models(&config, provider)
+                .unwrap()
+                .is_empty());
+        }
+
+        config.providers_mut().copilot = Some(
+            serde_json::from_value(json!({"enabled":false, "model":"copilot-model"})).unwrap(),
+        );
+        config.provider = "anthropic".into();
+        assert_parity(&config, " copilot ");
+        assert!(provider_runtime_models(&config, "copilot")
+            .unwrap()
+            .is_empty());
+        config.provider = "copilot".into();
+        assert_parity(&config, " copilot ");
+        assert_eq!(
+            provider_runtime_models(&config, " copilot ").unwrap(),
+            ["copilot-model"]
+        );
+
+        let mut config = Config::default();
+        for (id, enabled, model) in [
+            ("relay-disabled", false, "disabled-model"),
+            ("relay-enabled", true, "enabled-model"),
+        ] {
+            config.provider_instances.insert(
+                id.into(),
+                serde_json::from_value(json!({
+                    "provider_type":"openai", "enabled":enabled, "model":model
+                }))
+                .unwrap(),
+            );
+        }
+        config.default_provider_instance = Some("relay-disabled".into());
+        assert_parity(&config, " openai ");
+        assert_eq!(
+            configured_provider_routing_key(&config, " openai "),
+            "relay-disabled"
+        );
+        assert!(provider_runtime_models(&config, " openai ")
+            .unwrap()
+            .is_empty());
+        config.default_provider_instance = None;
+        assert_parity(&config, " openai ");
+        assert_eq!(
+            configured_provider_routing_key(&config, " openai "),
+            "relay-enabled"
+        );
+        assert_eq!(
+            provider_runtime_models(&config, " openai ").unwrap(),
+            ["enabled-model"]
+        );
+
+        let mut config = Config::default();
+        config.providers_mut().openai = Some(
+            serde_json::from_value(json!({"model":"legacy-model", "runtime_models":[]})).unwrap(),
+        );
+        assert_parity(&config, "openai");
+        assert!(provider_runtime_models(&config, "openai")
+            .unwrap()
+            .is_empty());
+        for value in [json!(null), json!("all"), json!([42]), json!([" "])] {
+            config
+                .providers_mut()
+                .openai
+                .as_mut()
+                .unwrap()
+                .extra
+                .insert(RUNTIME_MODELS_CONFIG_KEY.into(), value);
+            assert_parity(&config, "openai");
+            assert!(provider_runtime_models(&config, "openai").is_err());
+        }
+    }
 
     fn config() -> Config {
         let mut config = Config::default();

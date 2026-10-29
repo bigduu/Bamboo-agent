@@ -9,6 +9,7 @@ use futures::StreamExt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 mod terminal;
+include!("token_budget_outer_guard_fixture.rs");
 
 enum Script {
     Known,
@@ -353,6 +354,36 @@ async fn provider(f: &Fixture, inner: Arc<Provider>) -> Arc<dyn LLMProvider> {
 }
 
 #[tokio::test]
+async fn token_budget_decorator_forwards_known_fast_refusal_without_reservation() {
+    let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+    let mut config = routing.config.read().await.clone();
+    config.provider_instances.get_mut("fast-b").unwrap().enabled = false;
+    let (_, rejected) = crate::model_config_helper::resolve_fast_model_for_runner(
+        Some(&config),
+        "chat-a",
+        &routing.registry,
+    );
+    let (fixture, _registration) = admitted().await;
+    configure(&fixture, 140);
+    let budget = NativeWorkTokenBudget::capture(
+        Some(fixture.service.clone()),
+        fixture.storage.clone(),
+        &fixture.child,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let decorated = budget.wrap(rejected.unwrap(), &AgentLoopConfig::default());
+    assert!(matches!(
+        decorated.known_pre_dispatch_error(),
+        Some(LLMError::Auth(_))
+    ));
+    assert_eq!(ledger(&fixture).total_charged, 0);
+    assert!(routing.requests("fast-b").is_empty());
+    assert!(routing.requests("chat-a").is_empty());
+}
+
+#[tokio::test]
 async fn token_budget_reserves_before_provider_and_settles_only_after_trailing_usage_eof() {
     let (f, _registration) = admitted().await;
     configure(&f, 140);
@@ -581,6 +612,49 @@ async fn token_budget_dynamic_auxiliary_and_vision_cannot_escape_shared_exhausti
 }
 
 #[tokio::test]
+async fn token_budget_background_only_override_cannot_escape_shared_exhaustion() {
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let dynamic: Arc<dyn LLMProvider> = inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        auxiliary_model_resolver: None,
+        background_model_resolver: Some(Arc::new(move |_| {
+            Some(bamboo_llm::ResolvedModel::new(
+                dynamic.clone(),
+                "fixture-model",
+            ))
+        })),
+        ..Default::default()
+    };
+    let main = budget.decorate(&mut config, inner.clone());
+    drop(
+        main.chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap(),
+    );
+    let background = config.resolve_auxiliary_models();
+    assert_eq!(
+        background.background_model_name.as_deref(),
+        Some("fixture-model")
+    );
+    assert!(background
+        .background_model_provider
+        .unwrap()
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(ledger(&f).total_charged, 140);
+}
+
+#[tokio::test]
 async fn token_budget_unknown_model_and_revoked_root_block_before_provider() {
     let (f, _registration) = admitted().await;
     configure(&f, 500);
@@ -725,4 +799,222 @@ async fn token_budget_unconfigured_ordinary_child_preserves_legacy_and_later_con
         "late configuration cannot escape the retained capability"
     );
     assert_eq!(ledger(&f).total_charged, 0);
+}
+
+#[tokio::test]
+async fn work_budget_and_reasoning_snapshot_share_real_auxiliary_semaphore() {
+    use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+    use bamboo_llm::{provider::queued_snapshot_for, ResolvedModel};
+    use std::time::Duration;
+
+    struct Snapshotting {
+        inner: Arc<dyn LLMProvider>,
+    }
+    #[async_trait::async_trait]
+    impl LLMProvider for Snapshotting {
+        fn queued_provider_snapshot(
+            &self,
+        ) -> bamboo_llm::provider::Result<Option<Arc<dyn LLMProvider>>> {
+            Ok(Some(self.inner.clone()))
+        }
+        async fn list_model_info(&self) -> bamboo_llm::provider::Result<Vec<ProviderModelInfo>> {
+            self.inner.list_model_info().await
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_domain::Message],
+            tools: &[bamboo_domain::ToolSchema],
+            cap: Option<u32>,
+            model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.inner.chat_stream(messages, tools, cap, model).await
+        }
+    }
+
+    let (fixture, _registration) = admitted().await;
+    configure(&fixture, 140);
+    let budget = NativeWorkTokenBudget::capture(
+        Some(fixture.service.clone()),
+        fixture.storage.clone(),
+        &fixture.child,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let calls = Provider::new(Script::Known);
+    let inner: Arc<dyn LLMProvider> = Arc::new(Snapshotting {
+        inner: calls.clone(),
+    });
+    let decorated = budget.wrap(
+        inner,
+        &AgentLoopConfig {
+            app_data_dir: Some(fixture.dir.path().to_path_buf()),
+            ..Default::default()
+        },
+    );
+    let reference = ProviderModelRef::new("fixture", "fixture-model")
+        .with_reasoning_effort(ReasoningEffort::Low);
+    let original = ResolvedModel::from_ref(decorated, &reference).provider;
+    let snapshot = queued_snapshot_for(original.clone()).unwrap();
+    assert_eq!(
+        snapshot.resource_allocation_identity(),
+        original.resource_allocation_identity()
+    );
+
+    let permit =
+        crate::runtime::runner::auxiliary_budget::acquire(&original, "fixture-model", 1).await;
+    let mut waiting = Box::pin(crate::runtime::runner::auxiliary_budget::acquire(
+        &snapshot,
+        "fixture-model",
+        1,
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), waiting.as_mut())
+            .await
+            .is_err()
+    );
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 0);
+    drop(permit);
+    let _permit = tokio::time::timeout(Duration::from_secs(2), waiting)
+        .await
+        .unwrap();
+    let mut stream = snapshot
+        .chat_stream(&[], &[], Some(40), "fixture-model")
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    assert_eq!(calls.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ledger(&fixture).total_charged,
+        30,
+        "the simulated usage settles at EOF"
+    );
+}
+
+// A resumed run's two live role handles must share the canonical Work budget.
+#[tokio::test]
+async fn token_budget_resume_auxiliary_pair_cannot_escape_shared_exhaustion() {
+    use std::sync::atomic::AtomicBool;
+
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let main_inner = Provider::new(Script::Known);
+    let summary_inner = Provider::new(Script::Known);
+    let background_inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let want_summary = Arc::new(AtomicBool::new(true));
+    let callback_want_summary = Arc::clone(&want_summary);
+    let summary: Arc<dyn LLMProvider> = summary_inner.clone();
+    let background: Arc<dyn LLMProvider> = background_inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        resume_auxiliary_resolver: Some(Arc::new(move || {
+            let summary = callback_want_summary
+                .load(Ordering::SeqCst)
+                .then(|| bamboo_llm::ResolvedModel::new(summary.clone(), "fixture-model"));
+            (
+                Ok(summary),
+                Some(bamboo_llm::ResolvedModel::new(
+                    background.clone(),
+                    "fixture-model",
+                )),
+            )
+        })),
+        ..Default::default()
+    };
+    let main = budget.decorate(&mut config, main_inner.clone());
+    drop(
+        main.chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap(),
+    );
+    let before_attempts = ledger(&f);
+    let pair = config.resolve_auxiliary_models();
+    assert_eq!(
+        pair.summarization_model_name.as_deref(),
+        Some("fixture-model")
+    );
+    assert_eq!(pair.background_model_name.as_deref(), Some("fixture-model"));
+    assert!(pair.summarization_model_error.is_none());
+    for provider in [
+        pair.summarization_model_provider.unwrap(),
+        pair.background_model_provider.unwrap(),
+    ] {
+        assert!(provider
+            .chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .is_err());
+    }
+    want_summary.store(false, Ordering::SeqCst);
+    let absent = config.resolve_auxiliary_models();
+    assert!(absent.summarization_model_name.is_none());
+    assert!(absent.summarization_model_provider.is_none());
+    assert!(absent.summarization_model_error.is_none());
+    assert!(absent
+        .background_model_provider
+        .unwrap()
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .is_err());
+    assert_eq!(main_inner.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(summary_inner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(background_inner.calls.load(Ordering::SeqCst), 0);
+    let after_attempts = ledger(&f);
+    assert_eq!(after_attempts.total_charged, 140);
+    assert_eq!(
+        after_attempts.reservations.len(),
+        before_attempts.reservations.len()
+    );
+}
+
+// A locally rejected summary is not a dispatch or a Work token reservation.
+#[tokio::test]
+async fn token_budget_resume_auxiliary_rejection_has_no_reservation() {
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let main_inner = Provider::new(Script::Known);
+    let background_inner = Provider::new(Script::Known);
+    let budget =
+        NativeWorkTokenBudget::capture(Some(f.service.clone()), f.storage.clone(), &f.child)
+            .await
+            .unwrap()
+            .unwrap();
+    let background: Arc<dyn LLMProvider> = background_inner.clone();
+    let mut config = AgentLoopConfig {
+        app_data_dir: Some(f.dir.path().to_path_buf()),
+        resume_auxiliary_resolver: Some(Arc::new(move || {
+            (
+                Err(LLMError::Api("synthetic resume route rejected".into())),
+                Some(bamboo_llm::ResolvedModel::new(
+                    background.clone(),
+                    "fixture-model",
+                )),
+            )
+        })),
+        ..Default::default()
+    };
+    let _main = budget.decorate(&mut config, main_inner.clone());
+    let before_selection = ledger(&f);
+    let selected = config.resolve_auxiliary_models();
+    assert!(selected.summarization_model_name.is_none());
+    assert!(selected.summarization_model_provider.is_none());
+    assert!(selected
+        .summarization_model_error
+        .as_deref()
+        .is_some_and(|error| error.contains("synthetic resume route rejected")));
+    assert!(selected.background_model_provider.is_some());
+    assert_eq!(main_inner.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(background_inner.calls.load(Ordering::SeqCst), 0);
+    let after_selection = ledger(&f);
+    assert_eq!(after_selection.total_charged, 0);
+    assert_eq!(
+        after_selection.reservations.len(),
+        before_selection.reservations.len()
+    );
 }
