@@ -4599,6 +4599,59 @@ mod tests {
         assert!(require_unique_json(br#"{"id":"a"} false"#).is_err());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn supervised_root_outcome_does_not_follow_inbox_or_lock_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        for link in ["inbox", "lock"] {
+            let (temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+            let mut root = sessions.load_session("session-1").await.unwrap().unwrap();
+            root.set_project_id_meta("synthetic-project");
+            sessions.save_session(&root).await.unwrap();
+            let parent = sessions
+                .get_or_create_default_supervisor("model")
+                .await
+                .unwrap();
+            let supervisor = bamboo_domain::SupervisorReference::from(&parent);
+            let authority = Arc::new(
+                sessions
+                    .lock_current_user_target(&supervisor, "session-1")
+                    .await
+                    .unwrap(),
+            );
+            let inbox_dir = sessions.sessions_root_dir().join("session-1").join("inbox");
+            let outside = temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            assert!(!inbox_dir.exists(), "fixture must not already own an Inbox");
+            let escaped = if link == "inbox" {
+                symlink(&outside, &inbox_dir).unwrap();
+                outside.join(OPERATION_LOCK_FILE)
+            } else {
+                std::fs::create_dir(&inbox_dir).unwrap();
+                let escaped = outside.join("escaped-lock");
+                symlink(&escaped, inbox_dir.join(OPERATION_LOCK_FILE)).unwrap();
+                escaped
+            };
+            let result = inbox
+                .filesystem_with_authority(
+                    "session-1",
+                    InboxAuthority::SupervisedRootOutcome {
+                        _guard: authority,
+                        inbox_dir,
+                    },
+                )
+                .await;
+            let rejected = result.is_err();
+            drop(result);
+            assert!(
+                !escaped.exists(),
+                "{link} link wrote outside the canonical Inbox"
+            );
+            assert!(rejected, "{link} link must fail closed");
+        }
+    }
+
     #[tokio::test]
     async fn root_outcome_notice_cannot_use_generic_inbox_admission() {
         let (_temp, _sessions, inbox) = fixture(SessionInboxLimits::default()).await;
