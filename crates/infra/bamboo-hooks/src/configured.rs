@@ -40,6 +40,7 @@ pub enum LifecycleHookEvent {
     SessionEnd,
     PreCompact,
     Notification,
+    BambooModelCallUsage,
 }
 
 /// Raw handler result returned by the settings dry-run endpoint.
@@ -69,6 +70,7 @@ impl LifecycleHookEvent {
             Self::SessionEnd => "SessionEnd",
             Self::PreCompact => "PreCompact",
             Self::Notification => "Notification",
+            Self::BambooModelCallUsage => "BambooModelCallUsage",
         }
     }
 
@@ -82,6 +84,7 @@ impl LifecycleHookEvent {
             Self::SessionEnd => AgentHookPoint::AfterSessionEnd,
             Self::PreCompact => AgentHookPoint::BeforeCompression,
             Self::Notification => AgentHookPoint::AfterNotification,
+            Self::BambooModelCallUsage => AgentHookPoint::AfterModelCallUsage,
         }
     }
 
@@ -383,6 +386,28 @@ fn synthetic_test_payload(event_name: &str) -> Result<(LifecycleHookEvent, HookP
                 dedup_key: Some("lifecycle-hook-test".to_string()),
                 created_at: Some(Utc::now().to_rfc3339()),
                 click_url: None,
+            },
+        ),
+        "BambooModelCallUsage" => (
+            LifecycleHookEvent::BambooModelCallUsage,
+            HookPayload::ModelCallUsage {
+                observation: bamboo_domain::ModelCallUsage {
+                    schema_version: 1,
+                    event_id: "synthetic-call".into(),
+                    call_id: "synthetic-call".into(),
+                    session_id: "synthetic-session".into(),
+                    run_id: None,
+                    provider: Some("openai".into()),
+                    model: Some("synthetic-model".into()),
+                    status: bamboo_domain::ModelCallStatus::Success,
+                    trace_id: None,
+                    span_id: None,
+                    usage: Some(bamboo_domain::ModelTokenUsage {
+                        input_tokens: Some(100),
+                        cache_read_input_tokens: Some(20),
+                        ..Default::default()
+                    }),
+                },
             },
         ),
         other => return Err(format!("unknown lifecycle hook event '{other}'")),
@@ -1309,6 +1334,7 @@ fn build_hook_envelope(
             completion_reason.clone(),
         ),
         HookPayload::None
+        | HookPayload::ModelCallUsage { .. }
         | HookPayload::Round { .. }
         | HookPayload::Compression { .. }
         | HookPayload::Notification { .. } => (None, None, None, None, None, None, None, None),
@@ -1318,9 +1344,11 @@ fn build_hook_envelope(
         schema_version: 1,
         hook_event_name: event_name.to_string(),
         session_id: session.id.clone(),
-        workspace_path: cwd
-            .map(|path| path.to_string_lossy().into_owned())
-            .unwrap_or_default(),
+        workspace_path: if matches!(payload, HookPayload::ModelCallUsage { .. }) {
+            String::new()
+        } else {
+            cwd.map(|path| path.to_string_lossy().into_owned()).unwrap_or_default()
+        },
         model: session.model.clone(),
         payload: payload.clone(),
         tool_name,
@@ -1436,7 +1464,7 @@ pub(super) fn register_configured_hooks(
         return;
     }
 
-    let events: [(LifecycleHookEvent, &[LifecycleHookGroup]); 8] = [
+    let events: [(LifecycleHookEvent, &[LifecycleHookGroup]); 9] = [
         (LifecycleHookEvent::SessionStart, &config.session_start),
         (
             LifecycleHookEvent::UserPromptSubmit,
@@ -1448,6 +1476,7 @@ pub(super) fn register_configured_hooks(
         (LifecycleHookEvent::SessionEnd, &config.session_end),
         (LifecycleHookEvent::PreCompact, &config.pre_compact),
         (LifecycleHookEvent::Notification, &config.notification),
+        (LifecycleHookEvent::BambooModelCallUsage, &config.model_call_usage),
     ];
     let mut sequence = 0_usize;
     for (event, groups) in events {

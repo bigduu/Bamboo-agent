@@ -246,6 +246,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::dead_letters::inspect),
         )
         .route(
+            "/sessions/{session_id}/traces",
+            web::get().to(agent::traces::list),
+        )
+        .route(
+            "/sessions/{session_id}/traces/{trace_id}",
+            web::get().to(agent::traces::detail),
+        )
+        .route(
             "/sessions/{session_id}/dead-letters/{message_id}/retry",
             web::post().to(agent::dead_letters::retry),
         )

@@ -12,10 +12,13 @@ use opentelemetry::trace::{SpanKind, Status, TraceContextExt, Tracer};
 use opentelemetry::{global, Context, InstrumentationScope, KeyValue};
 
 mod config;
+pub mod local;
 mod propagation;
 mod timeout;
 
-pub use config::{init, init_from_env, TelemetryConfig, TelemetryError, TelemetryGuard};
+pub use config::{
+    init, init_from_env, init_local_from_env, TelemetryConfig, TelemetryError, TelemetryGuard,
+};
 pub use propagation::TraceContext;
 pub use timeout::with_timeout;
 
@@ -74,6 +77,13 @@ pub struct Observation {
     ended: bool,
 }
 
+#[derive(Clone)]
+struct SessionLifetime {
+    session_id: String,
+    birth: String,
+    run_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
+
 impl Observation {
     fn start(
         name: impl Into<Cow<'static, str>>,
@@ -92,12 +102,26 @@ impl Observation {
         tracer: &T,
         name: impl Into<Cow<'static, str>>,
         kind: SpanKind,
-        attributes: Vec<KeyValue>,
+        mut attributes: Vec<KeyValue>,
     ) -> Self
     where
         T::Span: Send + Sync + 'static,
     {
         let parent = Context::current();
+        // Only inherit the lifetime when the child identifies the same session.
+        // A propagated trace context alone is never an authorization boundary.
+        if let Some(lifetime) = parent.get::<SessionLifetime>() {
+            let same_session = attributes.iter().any(|attribute| {
+                attribute.key.as_str() == "gen_ai.conversation.id"
+                    && attribute.value == opentelemetry::Value::from(lifetime.session_id.clone())
+            });
+            if same_session {
+                attributes.push(KeyValue::new(
+                    "bamboo.session.birth",
+                    lifetime.birth.clone(),
+                ));
+            }
+        }
         let span = tracer.build_with_context(
             tracer
                 .span_builder(name)
@@ -117,6 +141,28 @@ impl Observation {
         add_identifier(&mut attributes, "gen_ai.conversation.id", session_id);
         add_identifier(&mut attributes, "bamboo.root_session.id", root_session_id);
         Self::start("invoke_agent", SpanKind::Internal, attributes)
+    }
+
+    /// Bind local inspection to the exact persisted session lifetime. Child
+    /// observations inherit this only when their own session id matches.
+    pub fn bind_session_lifetime(
+        mut self,
+        session_id: &str,
+        birth: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        if valid_identifier(session_id) {
+            let lifetime = SessionLifetime {
+                session_id: session_id.to_owned(),
+                birth: birth.to_rfc3339(),
+                run_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            };
+            self.context.span().set_attribute(KeyValue::new(
+                "bamboo.session.birth",
+                lifetime.birth.clone(),
+            ));
+            self.context = self.context.with_value(lifetime);
+        }
+        self
     }
 
     /// One provider request, including stream consumption and internal retry.
@@ -169,6 +215,49 @@ impl Observation {
                 self.context.span().set_attribute(KeyValue::new(key, value));
             }
         }
+    }
+
+    /// Record the same authoritative snapshot exposed to usage observers.
+    pub fn model_usage(&self, usage: &bamboo_domain::ModelTokenUsage) {
+        for (key, value) in [
+            ("gen_ai.usage.input_tokens", usage.input_tokens),
+            ("gen_ai.usage.output_tokens", usage.output_tokens),
+            ("bamboo.usage.reasoning_tokens", usage.reasoning_tokens),
+            (
+                "bamboo.usage.cache_read_input_tokens",
+                usage.cache_read_input_tokens,
+            ),
+            (
+                "bamboo.usage.cache_creation_input_tokens",
+                usage.cache_creation_input_tokens,
+            ),
+            (
+                "bamboo.usage.cache_write_input_tokens",
+                usage.cache_write_input_tokens,
+            ),
+        ] {
+            if let Some(value) = value.and_then(|value| i64::try_from(value).ok()) {
+                self.context.span().set_attribute(KeyValue::new(key, value));
+            }
+        }
+    }
+
+    pub fn model_call_id(&self, call_id: &str) {
+        let mut attributes = Vec::new();
+        add_identifier(&mut attributes, "bamboo.model_call.id", call_id);
+        self.context.span().set_attributes(attributes);
+    }
+
+    /// Actual SDK context, absent when a non-recording/no-op tracer is in use.
+    pub fn trace_ids(&self) -> Option<(String, String)> {
+        let span = self.context.span();
+        let context = span.span_context();
+        (span.is_recording() && context.is_valid()).then(|| {
+            (
+                context.trace_id().to_string(),
+                context.span_id().to_string(),
+            )
+        })
     }
 
     pub fn finish(mut self, outcome: Outcome) {
@@ -249,6 +338,40 @@ pub fn record_execution_identity(execution_id: &str, run_id: &str) {
     add_identifier(&mut attributes, "bamboo.execution.id", execution_id);
     add_identifier(&mut attributes, "bamboo.run.id", run_id);
     Context::current().span().set_attributes(attributes);
+    if valid_identifier(run_id) {
+        if let Some(lifetime) = Context::current().get::<SessionLifetime>() {
+            if let Ok(mut current) = lifetime.run_id.lock() {
+                *current = Some(run_id.to_owned());
+            }
+        }
+    }
+}
+
+/// The real invocation's run identifier, when its runtime has established one.
+pub fn current_run_id(session_id: &str) -> Option<String> {
+    let context = Context::current();
+    let lifetime = context.get::<SessionLifetime>()?;
+    if lifetime.session_id != session_id { return None; }
+    let run_id = lifetime.run_id.lock().ok()?.clone();
+    run_id
+}
+
+/// Reject arbitrary path/content-shaped metadata at observer boundaries.
+pub fn safe_identifier(value: &str) -> Option<String> {
+    valid_identifier(value).then(|| value.to_owned())
+}
+
+pub fn safe_provider(value: &str) -> Option<String> {
+    provider_family(value).map(str::to_owned)
+}
+
+/// Classification used when a model-call future is dropped before returning.
+pub fn dropped_model_call_status() -> bamboo_domain::ModelCallStatus {
+    if std::thread::panicking() || timeout::is_timeout_drop() {
+        bamboo_domain::ModelCallStatus::Error
+    } else {
+        bamboo_domain::ModelCallStatus::Cancelled
+    }
 }
 
 /// Carry the current context across a task-spawn boundary. This is explicit and
@@ -299,6 +422,39 @@ pub mod test_support {
             self.exporter
                 .get_finished_spans()
                 .expect("in-memory exporter")
+        }
+    }
+
+    /// Uses a scoped SDK tracer and the production local processor. `global`
+    /// lets a server handler read the same store without changing the global
+    /// OpenTelemetry provider used by unrelated tests.
+    pub struct LocalTraceTest {
+        provider: SdkTracerProvider,
+        pub store: std::sync::Arc<super::local::LocalTraceStore>,
+    }
+
+    impl LocalTraceTest {
+        pub fn isolated() -> Self {
+            Self::with_store(std::sync::Arc::new(super::local::LocalTraceStore::default()))
+        }
+
+        pub fn global() -> Self {
+            Self::with_store(super::local::store())
+        }
+
+        fn with_store(store: std::sync::Arc<super::local::LocalTraceStore>) -> Self {
+            store.set_enabled(true);
+            let provider = SdkTracerProvider::builder()
+                .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
+                .with_span_processor(super::local::LocalProcessor(store.clone()))
+                .with_resource(opentelemetry_sdk::Resource::builder_empty().build())
+                .build();
+            Self { provider, store }
+        }
+
+        pub fn scope<F: Future>(&self, future: F) -> opentelemetry::context::WithContext<F> {
+            let tracer = self.provider.tracer_with_scope(super::scope());
+            future.with_context(Context::current().with_value(ScopedTracer(tracer)))
         }
     }
 }

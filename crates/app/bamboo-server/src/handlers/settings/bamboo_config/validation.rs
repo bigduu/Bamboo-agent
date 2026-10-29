@@ -399,7 +399,7 @@ fn validate_lifecycle_hooks_shape(value: &Value) -> Vec<ValidationIssue> {
 }
 
 fn validate_lifecycle_hooks_config(config: &LifecycleHooksConfig) -> Vec<ValidationIssue> {
-    let events: [(&str, &[LifecycleHookGroup]); 8] = [
+    let events: [(&str, &[LifecycleHookGroup]); 9] = [
         ("SessionStart", &config.session_start),
         ("UserPromptSubmit", &config.user_prompt_submit),
         ("PreToolUse", &config.pre_tool_use),
@@ -408,6 +408,7 @@ fn validate_lifecycle_hooks_config(config: &LifecycleHooksConfig) -> Vec<Validat
         ("SessionEnd", &config.session_end),
         ("PreCompact", &config.pre_compact),
         ("Notification", &config.notification),
+        ("BambooModelCallUsage", &config.model_call_usage),
     ];
     let mut issues = Vec::new();
     for (event, groups) in events {

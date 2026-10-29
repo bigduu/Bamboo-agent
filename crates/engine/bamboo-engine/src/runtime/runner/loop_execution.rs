@@ -54,7 +54,8 @@ pub(crate) async fn run_agent_loop_with_config(
     config: AgentLoopConfig,
 ) -> super::Result<()> {
     let observation =
-        bamboo_infrastructure::telemetry::Observation::agent(&session.id, &session.root_session_id);
+        bamboo_infrastructure::telemetry::Observation::agent(&session.id, &session.root_session_id)
+            .bind_session_lifetime(&session.id, session.created_at);
     let result = observation
         .scope(run_agent_loop_with_config_inner(
             session,

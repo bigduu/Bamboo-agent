@@ -21,6 +21,8 @@ pub enum PortableEvent {
     PreToolUse,
     PostToolUse,
     Stop,
+    /// Bamboo extension; this event is observational and has no control output.
+    BambooModelCallUsage,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -405,6 +407,15 @@ mod tests {
         ] {
             assert!(PortableConfig::parse(input.as_bytes()).is_err(), "{input}");
         }
+    }
+
+    #[test]
+    fn bamboo_model_usage_is_an_explicit_portable_extension() {
+        let bytes = br#"{"hooks":{"BambooModelCallUsage":[{"hooks":[{"type":"command","command":"true","timeout":1}]}]}}"#;
+        let config = PortableConfig::parse(bytes).unwrap();
+        assert!(config.hooks.contains_key(&PortableEvent::BambooModelCallUsage));
+        let invalid = br#"{"hooks":{"BambooModelCallUsage":[{"matcher":"tool","hooks":[{"type":"command","command":"true","timeout":1}]}]}}"#;
+        assert!(PortableConfig::parse(invalid).is_err());
     }
     #[test]
     fn explicit_trust_is_exact_and_changes_invalidate_it() {

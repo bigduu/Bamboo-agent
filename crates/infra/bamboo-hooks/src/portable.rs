@@ -61,6 +61,7 @@ fn event(point: AgentHookPoint) -> Option<PortableEvent> {
         AgentHookPoint::BeforeToolExecution => Some(PortableEvent::PreToolUse),
         AgentHookPoint::AfterToolExecution => Some(PortableEvent::PostToolUse),
         AgentHookPoint::BeforeFinalize => Some(PortableEvent::Stop),
+        AgentHookPoint::AfterModelCallUsage => Some(PortableEvent::BambooModelCallUsage),
         _ => None,
     }
 }
@@ -145,6 +146,9 @@ fn envelope_with_tool_input(
     original_tool_input: Option<&Value>,
     final_assistant_content: Option<&str>,
 ) -> Result<Value, String> {
+    if let (PortableEvent::BambooModelCallUsage, HookPayload::ModelCallUsage { observation }) = (event, payload) {
+        return Ok(json!({"schema_version":1,"hook_event_name":event,"session_id":session.id,"observation":observation}));
+    }
     let mut value = json!({"session_id":session.id,"transcript_path":null,"cwd":cwd,"hook_event_name":event,"permission_mode":"default"});
     match (event, payload) {
         (
@@ -647,6 +651,26 @@ async fn run_config_snapshot(
 mod tests {
     use super::*;
     use bamboo_plugin::{InstalledPlugin, PluginSource, RegisteredCapabilities};
+
+    #[test]
+    fn model_usage_envelope_omits_workspace_and_preserves_unknown_values() {
+        let mut session = Session::new("usage-test", "synthetic-model");
+        session.workspace = Some("/PRIVATE_WORKSPACE_SENTINEL".into());
+        let payload = HookPayload::ModelCallUsage {
+            observation: bamboo_domain::ModelCallUsage {
+                schema_version: 1, event_id: "event-1".into(), call_id: "call-1".into(),
+                session_id: session.id.clone(), run_id: None, provider: Some("openai".into()),
+                model: Some("synthetic-model".into()), status: bamboo_domain::ModelCallStatus::Success,
+                trace_id: None, span_id: None,
+                usage: Some(bamboo_domain::ModelTokenUsage { cache_read_input_tokens: Some(0), ..Default::default() }),
+            },
+        };
+        let value = envelope(PortableEvent::BambooModelCallUsage, &payload, &session, std::path::Path::new("/PRIVATE_CWD_SENTINEL")).unwrap();
+        assert_eq!(value["observation"]["usage"]["cache_read_input_tokens"], 0);
+        assert!(value["observation"]["usage"]["cache_creation_input_tokens"].is_null());
+        assert!(!value.to_string().contains("PRIVATE_"));
+        assert!(value.get("cwd").is_none());
+    }
     fn output(code: i32, stdout: &str, stderr: &str) -> crate::LifecycleHookTestOutput {
         crate::LifecycleHookTestOutput {
             exit_code: Some(code),

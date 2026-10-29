@@ -2,6 +2,49 @@ use std::time::Duration;
 
 use opentelemetry_sdk::trace::SdkTracerProvider;
 
+/// Preserve the exporter sampling decision while recording unsampled spans
+/// locally. The batch processor below receives sampled spans only.
+#[derive(Clone, Debug)]
+struct LocalSampler(opentelemetry_sdk::trace::Sampler);
+
+impl opentelemetry_sdk::trace::ShouldSample for LocalSampler {
+    fn should_sample(
+        &self,
+        parent: Option<&opentelemetry::Context>,
+        trace_id: opentelemetry::trace::TraceId,
+        name: &str,
+        kind: &opentelemetry::trace::SpanKind,
+        attributes: &[opentelemetry::KeyValue],
+        links: &[opentelemetry::trace::Link],
+    ) -> opentelemetry_sdk::trace::SamplingResult {
+        use opentelemetry_sdk::trace::SamplingDecision;
+        let mut result = self.0.should_sample(parent, trace_id, name, kind, attributes, links);
+        if result.decision == SamplingDecision::Drop {
+            result.decision = SamplingDecision::RecordOnly;
+        }
+        result
+    }
+}
+
+#[cfg(feature = "otel-otlp")]
+#[derive(Debug)]
+struct SampledOnly<P>(P);
+
+#[cfg(feature = "otel-otlp")]
+impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanProcessor for SampledOnly<P> {
+    fn on_start(&self, span: &mut opentelemetry_sdk::trace::Span, context: &opentelemetry::Context) {
+        self.0.on_start(span, context);
+    }
+    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+        if span.span_context.is_sampled() { self.0.on_end(span); }
+    }
+    fn force_flush(&self) -> opentelemetry_sdk::error::OTelSdkResult { self.0.force_flush() }
+    fn shutdown_with_timeout(&self, timeout: Duration) -> opentelemetry_sdk::error::OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
+    }
+    fn set_resource(&mut self, resource: &opentelemetry_sdk::Resource) { self.0.set_resource(resource); }
+}
+
 /// Explicit opt-in. Neither `RUST_LOG` nor standard `OTEL_*` variables enable
 /// Bamboo export. Disabled initialization does not replace a host's provider.
 #[derive(Clone, Debug)]
@@ -143,14 +186,78 @@ pub fn init(config: &TelemetryConfig) -> Result<TelemetryGuard, TelemetryError> 
 }
 
 pub fn init_from_env() -> Result<TelemetryGuard, TelemetryError> {
-    init(&TelemetryConfig::from_lookup(|key| {
-        std::env::var(key).ok()
-    })?)
+    let local_enabled = local_enabled_from_env()?;
+    let config = TelemetryConfig::from_lookup(|key| std::env::var(key).ok())?;
+    if !local_enabled {
+        super::local::store().set_enabled(false);
+        return init(&config);
+    }
+    let store = super::local::store();
+    store.set_enabled(true);
+    let provider = if config.enabled {
+        #[cfg(feature = "otel-otlp")]
+        {
+            build_provider_with_local(&config, Some(store))?
+        }
+        #[cfg(not(feature = "otel-otlp"))]
+        {
+            return Err(TelemetryError::FeatureUnavailable);
+        }
+    } else {
+        build_local_provider(store)
+    };
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    Ok(TelemetryGuard {
+        provider: Some(provider),
+    })
+}
+
+fn local_enabled_from_env() -> Result<bool, TelemetryError> {
+    match std::env::var("BAMBOO_LOCAL_TRACES_ENABLED").ok().as_deref() {
+        None | Some("true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        _ => Err(TelemetryError::InvalidConfiguration),
+    }
+}
+
+/// Preserve local inspection when optional external exporter setup fails.
+pub fn init_local_from_env() -> Result<TelemetryGuard, TelemetryError> {
+    if !local_enabled_from_env()? {
+        super::local::store().set_enabled(false);
+        return Ok(TelemetryGuard::default());
+    }
+    let store = super::local::store();
+    store.set_enabled(true);
+    let provider = build_local_provider(store);
+    opentelemetry::global::set_tracer_provider(provider.clone());
+    Ok(TelemetryGuard {
+        provider: Some(provider),
+    })
+}
+
+fn build_local_provider(store: std::sync::Arc<super::local::LocalTraceStore>) -> SdkTracerProvider {
+    use opentelemetry_sdk::trace::Sampler;
+    SdkTracerProvider::builder()
+        .with_span_processor(super::local::LocalProcessor(store))
+        .with_sampler(LocalSampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn))))
+        .with_max_attributes_per_span(16)
+        .with_max_events_per_span(0)
+        .with_max_links_per_span(0)
+        .with_resource(opentelemetry_sdk::Resource::builder_empty().build())
+        .build()
 }
 
 #[cfg(feature = "otel-otlp")]
 pub(super) fn build_provider(
     config: &TelemetryConfig,
+) -> Result<SdkTracerProvider, TelemetryError> {
+    build_provider_with_local(config, None)
+}
+
+#[cfg(feature = "otel-otlp")]
+fn build_provider_with_local(
+    config: &TelemetryConfig,
+    local: Option<std::sync::Arc<super::local::LocalTraceStore>>,
 ) -> Result<SdkTracerProvider, TelemetryError> {
     use opentelemetry_otlp::{Protocol, RetryPolicy, WithExportConfig, WithHttpConfig};
     use opentelemetry_sdk::trace::{BatchConfigBuilder, BatchSpanProcessor, Sampler};
@@ -198,11 +305,19 @@ pub(super) fn build_provider(
                 .build(),
         )
         .build();
-    Ok(SdkTracerProvider::builder()
-        .with_span_processor(processor)
-        .with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-            config.sample_ratio,
-        ))))
+    let local_enabled = local.is_some();
+    let mut builder = SdkTracerProvider::builder().with_span_processor(SampledOnly(processor));
+    if let Some(store) = local {
+        builder = builder.with_span_processor(super::local::LocalProcessor(store));
+    }
+    let sampling = Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(config.sample_ratio)));
+    let sampler: Box<dyn opentelemetry_sdk::trace::ShouldSample> = if local_enabled {
+        Box::new(LocalSampler(sampling))
+    } else {
+        Box::new(sampling)
+    };
+    Ok(builder
+        .with_sampler(sampler)
         .with_max_attributes_per_span(16)
         .with_max_events_per_span(0)
         .with_max_links_per_span(0)
@@ -222,6 +337,32 @@ pub(super) fn build_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "otel-otlp")]
+    #[test]
+    fn zero_export_sampling_keeps_local_spans_without_sending_them() {
+        use opentelemetry::trace::{SpanKind, TracerProvider};
+        use opentelemetry::KeyValue;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let store = std::sync::Arc::new(super::super::local::LocalTraceStore::default());
+        store.set_enabled(true);
+        let birth = chrono::Utc::now();
+        let provider = build_provider_with_local(&TelemetryConfig {
+            enabled: true,
+            endpoint: Some(format!("http://{}/v1/traces", listener.local_addr().unwrap())),
+            sample_ratio: 0.0,
+        }, Some(store.clone())).unwrap();
+        let tracer = provider.tracer_with_scope(super::super::scope());
+        super::super::Observation::start_with(&tracer, "invoke_agent", SpanKind::Internal, vec![
+            KeyValue::new("gen_ai.operation.name", "invoke_agent"),
+            KeyValue::new("gen_ai.conversation.id", "sample-zero"),
+        ]).bind_session_lifetime("sample-zero", birth).finish(super::super::Outcome::Success);
+        assert_eq!(store.page("sample-zero", birth, 10, None).traces.len(), 1);
+        provider.force_flush().unwrap();
+        provider.shutdown_with_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
 
     #[test]
     fn disabled_ignores_endpoint_sampler_and_does_not_start_provider() {

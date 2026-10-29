@@ -9,6 +9,7 @@ pub mod browser;
 pub mod chat;
 pub mod child_approval;
 pub mod dead_letters;
+pub mod traces;
 pub mod delete;
 pub mod dev;
 pub mod events;

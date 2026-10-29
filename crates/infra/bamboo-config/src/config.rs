@@ -2615,6 +2615,8 @@ pub struct LifecycleHooksConfig {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub notification: Vec<LifecycleHookGroup>,
+    #[serde(default, rename = "BambooModelCallUsage", skip_serializing_if = "Vec::is_empty")]
+    pub model_call_usage: Vec<LifecycleHookGroup>,
 }
 
 impl LifecycleHooksConfig {
@@ -2628,6 +2630,7 @@ impl LifecycleHooksConfig {
             && self.session_end.is_empty()
             && self.pre_compact.is_empty()
             && self.notification.is_empty()
+            && self.model_call_usage.is_empty()
     }
 }
 
