@@ -1310,6 +1310,28 @@ pub fn check_permissions(
             if action == "scope" {
                 return Ok(None);
             }
+            if action == "observe_run" {
+                let target = required_string_arg(args, "target_session_id")?;
+                bamboo_domain::validate_supervisor_target_id(target)
+                    .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                return Ok(None);
+            }
+            if action == "cancel" {
+                let target = required_string_arg(args, "target_session_id")?;
+                bamboo_domain::validate_supervisor_target_id(target)
+                    .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                let run = required_string_arg(args, "expected_run_id")?;
+                if !bamboo_domain::valid_session_run_id(run) {
+                    return Err(PermissionError::CheckFailed(
+                        "session_control cancel requires a valid expected_run_id".into(),
+                    ));
+                }
+                return Ok(Some(vec![PermissionContext::new(
+                    PermissionType::ExecuteCommand,
+                    format!("session_control cancel {target}"),
+                    "session_control cancel: request cancellation of one exact observed Root run",
+                )]));
+            }
             if action == "create" {
                 let request = args
                     .get("request")
@@ -2956,6 +2978,33 @@ mod tests {
                 &json!({"action":"create", "request":request})
             )
             .is_err());
+        }
+    }
+
+    #[test]
+    fn supervised_exact_cancel_requires_its_own_target_permission() {
+        assert!(check_permissions(
+            "session_control",
+            &json!({"action":"observe_run", "target_session_id":"root-a"})
+        )
+        .unwrap()
+        .is_none());
+        let args = json!({"action":"cancel", "target_session_id":"root-a",
+            "expected_run_id":"private-run-id"});
+        let contexts = check_permissions("session_control", &args)
+            .unwrap()
+            .unwrap();
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(contexts[0].resource, "session_control cancel root-a");
+        assert!(!contexts[0].resource.contains("private-run-id"));
+        for invalid in [
+            json!({"action":"observe_run"}),
+            json!({"action":"cancel", "target_session_id":"root-a"}),
+            json!({"action":"cancel", "target_session_id":"root-a", "expected_run_id":"not a run"}),
+            json!({"action":"cancel", "target_session_id":"bad\ntarget", "expected_run_id":"run-a"}),
+        ] {
+            assert!(check_permissions("session_control", &invalid).is_err());
         }
     }
 

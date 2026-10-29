@@ -85,6 +85,14 @@ pub struct AgentRunner {
     /// Timestamp when the run completed (if finished).
     pub completed_at: Option<DateTime<Utc>>,
 
+    // Only the exact-run finalizer sets this. Legacy HTTP Stop also sets the
+    // visible status/completed_at when it signals, which is not finalization;
+    // an unqualified finalizer cannot prove which run it finalized.
+    pub(super) execution_finalized: bool,
+    // A Host may retain a target observation only after the router has bound
+    // this exact live run to its canonical lifetime. It is not an authority.
+    supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
+
     /// Last token budget event to replay for new subscribers.
     ///
     /// When a new client subscribes to an ongoing run, this
@@ -149,6 +157,35 @@ impl AgentRunner {
         self.last_event_at
             .max(self.event_publication.last_event_at())
     }
+
+    /// Host-only observation, set under the exact live router-owner fence.
+    pub fn bind_supervisor_run_target(
+        &mut self,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+    ) {
+        self.supervisor_run_target = Some(target.clone());
+    }
+
+    /// This bit is set only by finalization of the matching run ID.
+    pub fn exact_execution_finalized(&self) -> bool {
+        self.execution_finalized
+    }
+
+    /// A terminal observation is available only for the selected target
+    /// lifetime/authority and only after the existing finalizer actually ran.
+    /// Ordinary checkpoint saves may advance metadata_version; the current
+    /// selector was independently revalidated by the caller before this read.
+    pub fn supervisor_run_is_finalized_for(
+        &self,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+    ) -> bool {
+        self.execution_finalized
+            && self.supervisor_run_target.as_ref().is_some_and(|observed| {
+                let mut observed = observed.clone();
+                observed.metadata_version = target.metadata_version;
+                &observed == target
+            })
+    }
     /// Broadcast channel capacity for agent events.
     pub const EVENT_CHANNEL_CAPACITY: usize = 1000;
 
@@ -174,6 +211,8 @@ impl AgentRunner {
             status: AgentStatus::Pending,
             started_at: Utc::now(),
             completed_at: None,
+            execution_finalized: false,
+            supervisor_run_target: None,
             last_budget_event: None,
             last_critical_events: Vec::new(),
             last_tool_name: None,

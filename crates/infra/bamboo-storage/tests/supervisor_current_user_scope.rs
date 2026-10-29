@@ -48,6 +48,147 @@ async fn canonical_bytes(store: &SessionStoreV2, id: &str) -> (Vec<u8>, Vec<u8>)
     )
 }
 
+#[tokio::test]
+async fn root_control_retains_original_authority_and_never_borrows_finite_scope() {
+    use bamboo_domain::{
+        HostScopeSessionObservation, HostSessionRight, HostSessionScopeBinding,
+        HostSessionTargetScope, HOST_SESSION_SCOPE_VERSION,
+    };
+    let (_home, store, reference) = fixture().await;
+    let store = Arc::new(store);
+    let target = root(&store, "control-root", Some("control-project")).await;
+    let supervisor = store
+        .load_execution_admission_snapshot(&reference.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = SessionCallerReference::from(&supervisor);
+    let selector = store
+        .inspect_supervisor_current_user_target(&reference, &target.id)
+        .await
+        .unwrap();
+    let effects = Arc::new(AtomicUsize::new(0));
+    let record = effects.clone();
+    store
+        .with_unscoped_supervisor_root_control(&caller, &reference, &selector, move || {
+            record.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let mut forged_caller = caller.clone();
+    forged_caller.root_tool_authority_revision += 1;
+    let record = effects.clone();
+    assert!(store
+        .with_unscoped_supervisor_root_control(&forged_caller, &reference, &selector, move || {
+            record.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .is_err());
+    let mut stale = selector.clone();
+    stale.created_at += chrono::Duration::seconds(1);
+    let record = effects.clone();
+    assert!(store
+        .with_unscoped_supervisor_root_control(&caller, &reference, &stale, move || {
+            record.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .is_err());
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+
+    // A cancelled tool awaiter must not drop the physical authority while its
+    // already-started blocking signal still runs.
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let locked = store.clone();
+    let original = caller.clone();
+    let supervisor_ref = reference.clone();
+    let selected = selector.clone();
+    let task = tokio::spawn(async move {
+        locked
+            .with_unscoped_supervisor_root_control(
+                &original,
+                &supervisor_ref,
+                &selected,
+                move || {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().map_err(std::io::Error::other)?;
+                    Ok(())
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    task.abort();
+    let writer_store = store.clone();
+    let mut changed = target.clone();
+    changed.title = "changed after retained signal".into();
+    let mut writer = tokio::spawn(async move { writer_store.save_session(&changed).await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), &mut writer)
+            .await
+            .is_err()
+    );
+    release_tx.send(()).unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), writer)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    // Installed finite scope has no cancel right. Never silently borrow a
+    // metadata-only right, and never treat a revoked slot as an absent scope.
+    let latest = store.load_session(&target.id).await.unwrap().unwrap();
+    let fresh = store
+        .inspect_supervisor_current_user_target(&reference, &target.id)
+        .await
+        .unwrap();
+    store
+        .install_host_session_scope(
+            0,
+            HostSessionScopeBinding {
+                schema_version: HOST_SESSION_SCOPE_VERSION,
+                grant_id: uuid::Uuid::new_v4(),
+                revision: 1,
+                caller: HostScopeSessionObservation::capture(&supervisor, vec![]).unwrap(),
+                targets: [(
+                    latest.id.clone(),
+                    HostSessionTargetScope {
+                        observation: HostScopeSessionObservation::capture(&latest, vec![]).unwrap(),
+                        rights: [HostSessionRight::ListMetadata].into(),
+                    },
+                )]
+                .into(),
+                creates: Default::default(),
+            },
+        )
+        .await
+        .unwrap();
+    for revoked in [false, true] {
+        if revoked {
+            store
+                .revoke_host_session_scope(&reference.session_id, 1)
+                .await
+                .unwrap();
+        }
+        let record = effects.clone();
+        assert!(store
+            .with_unscoped_supervisor_root_control(&caller, &reference, &fresh, move || {
+                record.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+            .await
+            .is_err());
+    }
+    assert_eq!(effects.load(Ordering::SeqCst), 1);
+}
+
 async fn assert_default_read(
     store: &SessionStoreV2,
     supervisor: &SupervisorReference,

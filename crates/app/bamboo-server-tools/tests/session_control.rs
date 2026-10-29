@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -16,6 +16,85 @@ use bamboo_engine::{session_app::supervisor::SupervisorSessionService, SessionMe
 use bamboo_server_tools::{SessionControlTool, SessionInspectorTool};
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
+
+#[derive(Default)]
+struct RecordingRootRunPort {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort
+    for RecordingRootRunPort
+{
+    async fn observe_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(bamboo_agent_core::tools::ToolResult::text(
+            true,
+            json!({"run_id":"run-1", "status":"running"}).to_string(),
+        ))
+    }
+
+    async fn cancel_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+        expected_run_id: &str,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(bamboo_agent_core::tools::ToolResult::text(
+            true,
+            json!({"run_id":expected_run_id, "status":"cancel_requested"}).to_string(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn exact_root_run_schema_requires_observed_target_and_run_without_granting_authority() {
+    let fixture = Fixture::new().await;
+    let port = Arc::new(RecordingRootRunPort::default());
+    let tool = SessionControlTool::new(fixture.messenger.clone()).with_root_run(port.clone());
+    let schema = tool.parameters_schema();
+    let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+    assert!(actions.contains(&json!("observe_run")));
+    assert!(actions.contains(&json!("cancel")));
+    let cancel = schema["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["action"]["const"] == "cancel")
+        .unwrap();
+    let required = cancel["required"].as_array().unwrap();
+    for field in ["target_session_id", "target_ref", "expected_run_id"] {
+        assert!(required.contains(&json!(field)));
+    }
+    let target = fixture
+        .targets
+        .iter()
+        .find(|target| target.session_id == "a")
+        .unwrap();
+    let observe = json!({"action":"observe_run", "target_session_id":"a", "target_ref":target});
+    assert_eq!(tool.classify(&observe), ToolClass::READONLY_PARALLEL);
+    let observed = completed(tool.invoke(observe, fixture.ctx.clone()).await.unwrap());
+    assert_eq!(observed["run_id"], "run-1");
+    let cancel = json!({"action":"cancel", "target_session_id":"a", "target_ref":target, "expected_run_id":"run-1"});
+    assert_eq!(tool.classify(&cancel), ToolClass::MUTATING_SERIAL);
+    assert_eq!(
+        completed(tool.invoke(cancel, fixture.ctx.clone()).await.unwrap())["status"],
+        "cancel_requested"
+    );
+    for invalid in [
+        json!({"action":"cancel", "target_session_id":"b", "target_ref":target, "expected_run_id":"run-1"}),
+        json!({"action":"cancel", "target_session_id":"a", "target_ref":target, "expected_run_id":"bad run"}),
+        json!({"action":"cancel", "target_session_id":"a", "expected_run_id":"run-1"}),
+    ] {
+        assert!(tool.invoke(invalid, fixture.ctx.clone()).await.is_err());
+    }
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+}
 
 #[derive(Default)]
 struct Activation {
