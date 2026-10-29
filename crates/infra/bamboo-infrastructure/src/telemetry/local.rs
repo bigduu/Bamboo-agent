@@ -601,6 +601,11 @@ mod tests {
                         .bind_local_scope(scope_path);
                     root.scope(async {
                         crate::telemetry::record_execution_identity("execution-1", "run-1");
+                        let reference = session_reference(id).unwrap();
+                        assert_eq!(
+                            crate::telemetry::current_run_id(&reference).as_deref(),
+                            Some("run-1")
+                        );
                         Observation::llm(Some("openai"), "synthetic-model", id)
                             .finish(Outcome::Success);
                     })

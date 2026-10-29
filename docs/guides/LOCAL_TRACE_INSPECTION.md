@@ -124,7 +124,8 @@ the identifier policy is unchanged. Other nonempty session IDs are represented
 by `~` followed by a 64-digit lowercase HMAC reference. That reference is
 stable within one process only, changes after restart, is not intended to be
 reversed or used as an authorization credential, and must not be treated as
-the persisted session ID.
+the persisted session ID. A run ID outside the identifier policy remains
+unknown (`null`); the session reference is not substituted for a run ID.
 Dropping an in-flight call emits a best-effort cancelled/error observation with
 unknown usage. Internal transport retries share a call ID; a new outer dispatch
 gets a new ID. If a stream fails after reporting usage, its error observation
