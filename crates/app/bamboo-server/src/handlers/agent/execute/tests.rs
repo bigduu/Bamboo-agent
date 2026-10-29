@@ -1768,7 +1768,7 @@ mod execution_input_http {
         use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
         let provider = Arc::new(ResumeBootstrapProvider::default());
-        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        let (home, state, _) = state_with_provider(None, provider.clone()).await;
         state
             .session_activation_router
             .set_spawner(Arc::new(ManualHttpOnly))
@@ -1889,6 +1889,99 @@ mod execution_input_http {
             1
         );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        // A newly selected target cannot retarget the original parked owner
+        // after its Workspace changes, even when the Root birth is unchanged.
+        let changed_id = "supervisor-pending-changed-workspace";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, changed_id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, changed_id).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{changed_id}"))
+                .set_json(serde_json::json!({
+                    "model": "test-model",
+                    "upstream_retry": {"mode": "until_cancelled"},
+                    "client_sync": {"client_message_count": 0, "client_has_pending_question": false}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["sync"]["need_sync"], true, "{body}");
+        let (changed_run, changed_token) = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(changed_id).expect("second owner is retained");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            (runner.run_id.clone(), runner.cancel_token.clone())
+        };
+        let original = state
+            .storage
+            .load_session(changed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let next_workspace = home.path().join("changed-workspace");
+        std::fs::create_dir_all(&next_workspace).unwrap();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{changed_id}"))
+                .insert_header((
+                    actix_web::http::header::IF_MATCH,
+                    format!("\"{}\"", original.metadata_version),
+                ))
+                .set_json(serde_json::json!({"workspace_path": next_workspace}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let fresh = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        assert_eq!(fresh.created_at, original.created_at);
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "pending-changed-workspace-cancel".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control cancel {changed_id}"),
+                },
+            )
+            .unwrap();
+        let refused = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["status"], "run_conflict", "{refused}");
+        assert!(!changed_token.is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let stop = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/stop/{changed_id}"))
+                .insert_header(("Bamboo-Run-Id", changed_run.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stop.status(), StatusCode::OK);
         tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
             .await
             .unwrap();
