@@ -1906,7 +1906,11 @@ mod execution_input_http {
             assert_eq!(stopped["completion_verified"], false);
             pause.release.notify_one();
         };
-        let (handoff, ()) = tokio::join!(take, cancel);
+        let (handoff, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(take, cancel)
+        })
+        .await
+        .expect("cancel and take must not deadlock");
         assert!(handoff.is_none(), "a cancelled owner cannot be handed off");
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             while state.fresh_sync.is_current_owner(id, &run_id) {
