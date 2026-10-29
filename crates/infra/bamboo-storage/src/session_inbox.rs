@@ -38,6 +38,67 @@ const ACTIVATION_INTENT_KEY: &str = "session_inbox_activation_intent";
 const COORDINATOR_INTENT_KEY: &str = "session_inbox_coordinator_activation_intent";
 const MAX_INTENT_TRANSPORT_BYTES: usize = 32 * 1024 * 1024;
 
+/// Strict observation while the caller retains the matching OwnedFilesystem.
+/// Never reacquire the Inbox lock or quarantine entries inside this operation.
+pub(crate) fn empty_live_bootstrap_generation_locked(
+    dir: &Path,
+    _filesystem: &OwnedFilesystem,
+) -> std::io::Result<u64> {
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "invalid Inbox directory",
+        ));
+    }
+    for queue in ["new", "cur"] {
+        let path = dir.join(queue);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+            Ok(metadata) if !metadata.file_type().is_dir() => {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid Inbox queue",
+                ));
+            }
+            Ok(_) => {}
+        }
+        // Treat even an unrecognized entry as pending rather than ignoring or
+        // quarantining it while deciding whether an old request is safe.
+        if std::fs::read_dir(path)?.next().transpose()?.is_some() {
+            return Err(std::io::Error::new(
+                ErrorKind::WouldBlock,
+                "Inbox is not empty",
+            ));
+        }
+    }
+    let path = dir.join(GENERATION_FILE);
+    let generation = match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid Inbox generation file",
+            ));
+        }
+        Ok(_) => std::fs::read_to_string(path)?
+            .trim()
+            .parse::<u64>()
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidData, error))?,
+    };
+    // The ordinary producer currently saturates here, so an enqueue then ACK
+    // at MAX could otherwise return to the same empty-queue observation.
+    if generation == u64::MAX {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidData,
+            "Inbox generation exhausted",
+        ));
+    }
+    Ok(generation)
+}
+
 #[path = "session_inbox_owned.rs"]
 mod owned;
 use owned::{AckAuthority, StoredLease};

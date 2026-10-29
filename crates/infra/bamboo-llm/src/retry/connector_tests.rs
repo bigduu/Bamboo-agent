@@ -128,7 +128,7 @@ async fn persistent_connector_failure_has_a_hard_bound_and_secret_free_terminal_
         })
         .mount(&server)
         .await;
-    let cfg = config(99);
+    let cfg = config(7);
     let error = run(&server, &cfg, &InitialRequestBudget::new(&cfg))
         .await
         .unwrap_err();
@@ -137,10 +137,10 @@ async fn persistent_connector_failure_has_a_hard_bound_and_secret_free_terminal_
     assert!(
         message.contains("HTTP 401")
             && message.contains("temporarily recovering")
-            && message.contains("4 request(s)")
+            && message.contains("7 request(s)")
     );
     assert!(!message.contains("Please check your API key") && !message.contains(RECOVERY));
-    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(hits.load(Ordering::SeqCst), 7);
 }
 
 #[tokio::test]

@@ -43,6 +43,13 @@ impl AdmissionGate {
         })))
     }
 
+    /// Compare the process-local cancellation fence, never its current state.
+    /// This lets an execution bind a producer offer to the proof captured for
+    /// that same fence without trusting a client-provided identifier.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn cancel_if_pending(&self) {
         let mut inner = self
             .0

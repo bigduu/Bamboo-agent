@@ -147,6 +147,14 @@ pub struct ExecuteRequest {
     /// config default, which may itself be unlimited.
     #[serde(default)]
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
+    /// Explicit initial upstream HTTP retry option for THIS execute only.
+    /// Omission keeps finite automatic retries; Stop cancels continuous retries.
+    #[serde(default)]
+    pub upstream_retry: Option<bamboo_llm::retry::UpstreamRetry>,
+    /// Opt into a nonterminal live bootstrap offer for this interactive Root.
+    /// Omission keeps the existing finite failure behavior.
+    #[serde(default)]
+    pub live_bootstrap_resume: bool,
 }
 
 #[cfg(test)]
@@ -214,6 +222,22 @@ mod tests {
     /// subagent budget override on the `POST /execute` body, and it decodes
     /// into the same `bamboo_config::RunBudgetConfig` the config-level default
     /// uses — no separate wire DTO to keep in sync.
+    #[test]
+    fn upstream_retry_is_explicit_and_rejects_unknown_modes() {
+        let ordinary: ExecuteRequest = serde_json::from_str("{}").unwrap();
+        assert!(ordinary.upstream_retry.is_none());
+        let continuous: ExecuteRequest =
+            serde_json::from_str(r#"{"upstream_retry":{"mode":"until_cancelled"}}"#).unwrap();
+        assert_eq!(
+            continuous.upstream_retry,
+            Some(bamboo_llm::retry::UpstreamRetry::UntilCancelled)
+        );
+        assert!(
+            serde_json::from_str::<ExecuteRequest>(r#"{"upstream_retry":{"mode":"unknown"}}"#)
+                .is_err()
+        );
+    }
+
     #[test]
     fn test_execute_request_deserializes_run_budget_override() {
         let json = r#"{

@@ -1094,6 +1094,16 @@ pub fn spawn_session_execution_with_inputs(
     args: SessionExecutionArgs,
     inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
 ) {
+    spawn_session_execution_with_upstream_retry(args, inputs, Default::default());
+}
+
+/// An explicit per-execution initial-request retry option. Existing admission,
+/// reservation, cancellation, messages and completion ownership are unchanged.
+pub fn spawn_session_execution_with_upstream_retry(
+    args: SessionExecutionArgs,
+    inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    upstream_retry: bamboo_llm::retry::UpstreamRetry,
+) {
     let span_session_id = args.session_id.clone();
     let session_span = tracing::info_span!("agent_execution", session_id = %span_session_id);
     let is_root = args.session.kind == bamboo_domain::SessionKind::Root;
@@ -1328,10 +1338,11 @@ pub fn spawn_session_execution_with_inputs(
             // waiting parent. Map a panic to a terminal error instead.
             let result = {
                 use futures::FutureExt;
-                match std::panic::AssertUnwindSafe(agent.execute_with_inputs(
+                match std::panic::AssertUnwindSafe(agent.execute_with_inputs_and_upstream_retry(
                     &mut session,
                     execute_request,
                     inputs,
+                    upstream_retry,
                 ))
                 .catch_unwind()
                 .await

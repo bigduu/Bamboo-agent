@@ -1,5 +1,7 @@
 use crate::runtime::config::{AgentLoopConfig, AuxiliaryModelConfig};
-use crate::runtime::gold_evaluation::{AsyncGoldEvaluationRequest, AsyncGoldEvaluationResult};
+use crate::runtime::gold_evaluation::{
+    AsyncGoldEvaluationRequest, AsyncGoldEvaluationResult, GoldEvaluationTerminal,
+};
 use crate::runtime::runner::task_lifecycle::{
     AsyncTaskEvaluationRequest, AsyncTaskEvaluationResult,
 };
@@ -7,6 +9,7 @@ use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Session};
 use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -55,23 +58,89 @@ pub(super) struct InFlightTaskEvaluation {
 
 pub(super) struct InFlightGoldEvaluation {
     pub(super) request: AsyncGoldEvaluationRequest,
-    // `Option<..>` output: `None` when the run was cancelled while the Gold
-    // evaluation was in flight (see `spawn_gold_evaluation_request`).
-    pub(super) join_handle: tokio::task::JoinHandle<Option<AsyncGoldEvaluationResult>>,
+    /// Shared with the async evaluator to claim one cancellation event.
+    pub(super) terminal_claimed: Arc<GoldEvaluationTerminal>,
+    // None is run cancellation; Err is a known local routing refusal, which
+    // must never be harvested as a successful evaluator result.
+    pub(super) join_handle: tokio::task::JoinHandle<
+        Option<Result<AsyncGoldEvaluationResult, bamboo_agent_core::AgentError>>,
+    >,
+}
+
+/// An evaluation waiting behind an in-flight one retains the exact target it
+/// was prepared for. Compare underlying allocations, not budget identity;
+/// account identity within a provider is a separate contract.
+pub(super) struct QueuedEvaluation<R> {
+    pub(super) request: R,
+    pub(super) provider: Arc<dyn LLMProvider>,
+    pub(super) model_name: String,
+    route: bamboo_llm::provider::QueuedRouteIdentity,
+    require_current: bool,
+}
+
+impl<R> QueuedEvaluation<R> {
+    pub(super) fn new(
+        request: R,
+        provider: Arc<dyn LLMProvider>,
+        model_name: String,
+    ) -> Option<Self> {
+        use bamboo_llm::provider::{queued_identity_for, queued_snapshot_for};
+        let provider = queued_snapshot_for(provider).ok()?;
+        let route = queued_identity_for(&provider);
+        let require_current = provider.queue_requires_current_route();
+        Some(Self {
+            request,
+            provider,
+            model_name,
+            route,
+            require_current,
+        })
+    }
+
+    pub(super) fn current_provider(
+        &self,
+        provider: Arc<dyn LLMProvider>,
+        model_name: &str,
+    ) -> Option<Arc<dyn LLMProvider>> {
+        // An opaque SDK provider has no authoritative live registry. Preserve
+        // its captured pair; never replace it with a newly returned provider.
+        if !self.require_current {
+            // An explicit local refusal is never treated as an unset route.
+            if provider.known_pre_dispatch_error().is_some() {
+                return None;
+            }
+            return Some(self.provider.clone());
+        }
+        if self.model_name != model_name {
+            return None;
+        }
+        use bamboo_llm::provider::{queued_identity_for, queued_snapshot_for, QueuedRouteIdentity};
+        let provider = queued_snapshot_for(provider).ok()?;
+        if !provider.queue_requires_current_route() {
+            return None;
+        }
+        let same = match (&self.route, queued_identity_for(&provider)) {
+            (QueuedRouteIdentity::Stable(left), QueuedRouteIdentity::Stable(right)) => {
+                Arc::ptr_eq(left, &right)
+            }
+            _ => false,
+        };
+        same.then_some(provider)
+    }
 }
 
 #[derive(Default)]
 pub(super) struct TaskEvaluationState {
     pub(super) in_flight: Option<InFlightTaskEvaluation>,
     pub(super) completed: Option<AsyncTaskEvaluationResult>,
-    pub(super) queued_request: Option<AsyncTaskEvaluationRequest>,
+    pub(super) queued_request: Option<QueuedEvaluation<AsyncTaskEvaluationRequest>>,
 }
 
 #[derive(Default)]
 pub(super) struct GoldEvaluationState {
     pub(super) in_flight: Option<InFlightGoldEvaluation>,
     pub(super) completed: Option<AsyncGoldEvaluationResult>,
-    pub(super) queued_request: Option<AsyncGoldEvaluationRequest>,
+    pub(super) queued_request: Option<QueuedEvaluation<AsyncGoldEvaluationRequest>>,
 }
 
 pub(super) struct LoopRunState {
@@ -941,5 +1010,27 @@ mod tests {
             )
         );
         assert!(crate::runtime::runner::session_setup::prompt_envelope::build_active_workflow_context_block(&session).is_none());
+    }
+
+    #[test]
+    fn rewrapped_copilot_queue_keeps_same_provider_without_network() {
+        use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+        use bamboo_llm::{LLMProvider, ResolvedModel};
+        use std::sync::Arc;
+
+        let provider: Arc<dyn LLMProvider> = Arc::new(
+            bamboo_llm::providers::copilot::CopilotProvider::with_token("synthetic-only"),
+        );
+        let reference =
+            ProviderModelRef::new("copilot", "model-a").with_reasoning_effort(ReasoningEffort::Low);
+        let first = ResolvedModel::from_ref(provider.clone(), &reference).provider;
+        let second = ResolvedModel::from_ref(provider, &reference).provider;
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "each resolution constructs a new role wrapper"
+        );
+        let queued = super::QueuedEvaluation::new((), first, "model-a".into())
+            .expect("normal Copilot can be queued");
+        assert!(queued.current_provider(second, "model-a").is_some());
     }
 }
