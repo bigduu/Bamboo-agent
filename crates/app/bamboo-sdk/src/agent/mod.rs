@@ -1232,10 +1232,32 @@ impl Agent {
                     return None;
                 }
                 let target = &config.defaults.as_ref()?.chat;
-                if target.model.trim() != session.model.trim() {
+                // Unlike a legacy Session reference, a configured role must
+                // already be a valid exact reference before it can lend its
+                // model-specific reasoning setting to this run.
+                if target.provider.trim().is_empty()
+                    || target.provider.trim() != target.provider
+                    || target.model.trim().is_empty()
+                    || target.model.trim() != target.model
+                    || target.model != session.model.trim()
+                {
                     return None;
                 }
                 let scope = execution.provider_scope.as_deref()?;
+                // A legacy type key can name the old client or an instance
+                // selected by newer config. Without a registry binding, do not
+                // treat the two as the same account after the default moved.
+                if target.provider == scope
+                    && !config.provider_instances.contains_key(scope)
+                    && config.effective_default_provider() != scope
+                    && bamboo_llm::AVAILABLE_PROVIDERS.contains(&scope)
+                    && config
+                        .provider_instances
+                        .values()
+                        .any(|instance| instance.provider_type == scope)
+                {
+                    return None;
+                }
                 let provider = execution
                     .sdk_canonical_provider(&target.provider, Some(config))
                     .ok()?;
