@@ -1494,6 +1494,65 @@ async fn entrypoint_routing_legacy_explicit_bare_override_stays_on_active_client
     );
 }
 
+#[tokio::test]
+async fn entrypoint_routing_legacy_explicit_same_name_override_stays_on_active_client() {
+    let b = vision_server(200).await;
+    let mut c = legacy_config(true, &b.uri());
+    routing_review_allow_a_models(&mut c, "vision-b");
+    let dir = tempfile::tempdir().unwrap();
+    let main = Arc::new(Capture::default());
+    let agent = agent(c, main.clone(), dir.path()).await;
+    let mut session = Session::new("synthetic-matching-bare-vision-override", "main-a");
+    let user = Message::user_with_parts(
+        "Inspect synthetic pixel",
+        vec![bamboo_domain::MessagePart::ImageUrl {
+            image_url: bamboo_domain::ImageUrlRef {
+                url: PIXEL.into(),
+                detail: None,
+            },
+        }],
+    );
+    let original = user.clone();
+    session.add_message(user);
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request =
+        ExecuteRequestBuilder::new("Inspect synthetic pixel", tx, CancellationToken::new())
+            .model("main-a")
+            .provider_name("chat-a")
+            .image_fallback(bamboo_engine::ImageFallbackConfig {
+                mode: bamboo_engine::ImageFallbackMode::Vision,
+                vision_model: Some("vision-b".into()),
+            })
+            .app_data_dir(dir.path().to_path_buf())
+            .build();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        agent.execute(&mut session, request),
+    )
+    .await
+    .expect("controlled bare override must finish")
+    .unwrap();
+    drain.abort();
+    let calls = main.calls.lock().unwrap().clone();
+    assert!(
+        calls
+            .iter()
+            .any(|(model, _, images)| model == "vision-b" && *images),
+        "explicit override did not reach active client: {calls:?}"
+    );
+    assert!(b.received_requests().await.unwrap().is_empty());
+    assert_eq!(
+        session
+            .messages
+            .iter()
+            .find(|message| message.id == original.id)
+            .unwrap()
+            .content_parts,
+        original.content_parts,
+    );
+}
+
 /// A native SDK client was made from instance A named `openai`. Replacing that
 /// instance with a legacy `openai` pointing to B does not change the name but
 /// does change the account. A later configured Vision target must not reuse A.

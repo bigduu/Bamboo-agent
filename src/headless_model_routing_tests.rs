@@ -129,3 +129,45 @@ async fn entrypoint_routing_headless_unset_override_keeps_legitimate_parent_inhe
         vec!["main-a"]
     );
 }
+
+#[tokio::test]
+async fn entrypoint_routing_headless_resume_keeps_original_account_when_default_changes() {
+    for flag in [false, true] {
+        let (dir, state, original_provider, new_default, original) =
+            fixture(flag, "missing-model").await;
+        {
+            let mut config = state.config.write().await;
+            config.default_provider_instance = Some("broken-b".into());
+            let instance = config.provider_instances.get_mut("broken-b").unwrap();
+            instance.model = Some("main-a".into());
+            instance
+                .extra
+                .insert("runtime_models".into(), serde_json::json!(["main-a"]));
+        }
+        let storage = state.storage.clone();
+        let mut request = args(dir.path(), None);
+        request.timeout_secs = Some(10);
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_with_state(request, state),
+        )
+        .await
+        .expect("synthetic headless consumer must finish");
+        let old_calls = original_provider.calls.lock().unwrap().clone();
+        let new_calls = new_default.calls.lock().unwrap().clone();
+        let saved = storage.load_session(&original.id).await.unwrap().unwrap();
+        assert!(outcome.is_ok(), "flag={flag}: {outcome:?}");
+        assert!(old_calls.iter().any(|(model, _, _)| model == "main-a"),
+            "original account must receive its saved model: flag={flag}, A={old_calls:?}, B={new_calls:?}");
+        assert!(
+            new_calls.is_empty(),
+            "new default must not receive the old session: flag={flag}, B={new_calls:?}"
+        );
+        assert_eq!(
+            bamboo_engine::session_app::provider_model::session_effective_model_ref(&saved)
+                .unwrap()
+                .provider,
+            "chat-a"
+        );
+    }
+}
