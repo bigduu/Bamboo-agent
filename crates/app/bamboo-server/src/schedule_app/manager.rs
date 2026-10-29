@@ -1151,10 +1151,16 @@ pub fn build_schedule_context(
     config: std::sync::Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
 ) -> ScheduleContext {
+    // Each execution supplies its own roster key to this shared immutable
+    // resolver. The Agent clone is scoped to Schedule; the caller's Agent and
+    // the public ScheduleContext/ResolvedRunConfig layout remain unchanged.
+    let schedule_agent = Arc::new(base.agent.with_background_model_resolver(
+        schedule_background_model_resolver(config.clone(), provider_registry.clone()),
+    ));
     ScheduleContext {
         schedule_store: base.schedule_store,
         workflow_runs: base.workflow_runs,
-        agent: base.agent,
+        agent: schedule_agent,
         tools: base.tools,
         permission_config: base.permission_config,
         sessions_cache: base.sessions_cache,
@@ -1172,6 +1178,24 @@ pub fn build_schedule_context(
             resolve_run_config_from_config(job, &config, &provider_registry)
         }),
     }
+}
+
+fn schedule_background_model_resolver(
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    registry: Arc<bamboo_llm::ProviderRegistry>,
+) -> bamboo_engine::runtime::config::BackgroundModelResolver {
+    Arc::new(move |provider_name| {
+        if provider_name.is_empty() {
+            return None;
+        }
+        config.try_read().ok().and_then(|current| {
+            bamboo_engine::model_config_helper::resolve_background_model(
+                &current,
+                provider_name,
+                &registry,
+            )
+        })
+    })
 }
 
 fn resolve_run_config_from_config(
@@ -1273,6 +1297,46 @@ fn resolve_run_config_from_config(
 
 #[cfg(test)]
 mod build_context_tests {
+
+    // Use the Schedule configuration and background callback builders, then
+    // compose their results for the matrix; this is not a whole scheduled run.
+    #[tokio::test]
+    async fn scheduled_run_legacy_background_rechecks_managed_admission() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let resolved =
+            resolve_run_config_from_config(&test_job(), &fixture.config, &fixture.registry);
+        assert_eq!(
+            resolved.model_roster.provider_name.as_deref(),
+            Some("account-a")
+        );
+        // The actual Schedule callback receives its run's frozen roster key.
+        // Compose it with the frozen roles as AgentLoopConfig does; the engine
+        // unit test separately exercises actual per-run key forwarding.
+        let fixed = bamboo_engine::AuxiliaryModelConfig {
+            fast_model_name: resolved.model_roster.fast_model(),
+            fast_model_provider: resolved.model_roster.fast_model_provider(),
+            background_model_name: resolved.model_roster.background_model(),
+            background_model_provider: resolved.model_roster.background_model_provider(),
+            summarization_model_name: resolved.model_roster.summarization_model(),
+            summarization_model_provider: resolved.model_roster.summarization_model_provider(),
+            ..Default::default()
+        };
+        let callback = super::schedule_background_model_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+        );
+        let provider = resolved.model_roster.provider_name.unwrap();
+        fixture
+            .verify(Arc::new(move || {
+                let mut models = fixed.clone();
+                let background = callback(&provider);
+                models.background_model_name =
+                    background.as_ref().map(|model| model.model_name.clone());
+                models.background_model_provider = background.map(|model| model.provider);
+                models
+            }))
+            .await;
+    }
     use super::ScheduleRunJob;
     use super::{
         resolve_run_config_from_config, schedule_workspace_source,

@@ -926,6 +926,58 @@ fn counted_failure_correction_requires_the_exact_runtime_snapshot_and_preserves_
     }
 }
 
+#[test]
+fn ordinary_failure_correction_is_exact_and_preserves_waits() {
+    use bamboo_domain::session::runtime_state::WaitingForBashState;
+    use bamboo_domain::AgentStatusState;
+    for (changed, waiting, cancelled) in [
+        (false, false, false),
+        (false, false, true),
+        (true, false, false),
+        (false, true, false),
+    ] {
+        let mut session = Session::new("ordinary-fixture", "fake-only");
+        let mut runtime =
+            bamboo_domain::AgentRuntimeState::new(if changed { "successor" } else { "owned" });
+        runtime.status = AgentStatusState::Running;
+        runtime.round.last_round_id = Some("round".into());
+        if waiting {
+            runtime.waiting_for_bash = Some(WaitingForBashState::for_bash(
+                vec!["shell".into()],
+                chrono::Utc::now(),
+            ));
+        }
+        session.agent_runtime_state = Some(runtime);
+        let expected = ("owned".into(), Some("round".into()), None);
+        let error = if cancelled {
+            bamboo_agent_core::AgentError::Cancelled
+        } else {
+            bamboo_agent_core::AgentError::LLM("synthetic failure".into())
+        };
+        fail_unblocked_ordinary_runtime(&mut session, Some(&expected), &error);
+        let status = session.agent_runtime_state.as_ref().unwrap().status;
+        assert_eq!(
+            status,
+            if changed || waiting {
+                AgentStatusState::Running
+            } else if cancelled {
+                AgentStatusState::Cancelled
+            } else {
+                AgentStatusState::Failed
+            }
+        );
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_bash
+                .is_some(),
+            waiting
+        );
+    }
+}
+
 #[tokio::test]
 async fn counted_ticket_question_yield_preserves_wait_without_claiming_budget_exhaustion() {
     let dir = tempfile::tempdir().unwrap();

@@ -84,6 +84,51 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    /// Bind a live-bootstrap Host to this execution only. The Host must retain
+    /// its exact runner and writer; this method does not create authority.
+    #[doc(hidden)]
+    pub fn with_live_bootstrap_host(
+        &self,
+        host: Arc<dyn crate::runtime::config::LiveBootstrapHost>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.live_bootstrap_host = Some(host);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind a live background route to this execution without changing other roles.
+    #[doc(hidden)]
+    pub fn with_background_model_resolver(
+        &self,
+        resolver: crate::runtime::config::BackgroundModelResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.background_model_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind a resumed Connect run's live summary/background selection.
+    #[doc(hidden)]
+    pub fn with_resume_auxiliary_resolver(
+        &self,
+        resolver: crate::runtime::config::ResumeAuxiliaryResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.resume_auxiliary_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Bind the Host's Gold route to this execution without changing SDK defaults.
+    #[doc(hidden)]
+    pub fn with_gold_target_resolver(
+        &self,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(resolver);
+        Self::from_runtime(Arc::new(runtime))
+    }
+
     /// Install the registered SDK adapter on this execution's runtime only.
     #[doc(hidden)]
     pub fn with_sdk_skill_execution_host(
@@ -241,6 +286,18 @@ impl Agent {
         self.runtime.execute(session, req).await
     }
 
+    /// Execute with an explicit initial upstream request policy.
+    pub async fn execute_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
+        self.runtime
+            .execute_with_upstream_retry(session, req, upstream_retry)
+            .await
+    }
+
     /// Explicit bounded caller-data handoff; no currentness or Skill authority.
     /// Ordinary execute/direct/spawn entrypoints continue to supply None.
     pub async fn execute_with_inputs(
@@ -250,6 +307,18 @@ impl Agent {
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
         self.runtime.execute_with_inputs(session, req, inputs).await
+    }
+
+    pub(crate) async fn execute_with_inputs_and_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
+        self.runtime
+            .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+            .await
     }
 
     /// Execute a caller-owned session under a complete logical-session
@@ -267,6 +336,21 @@ impl Agent {
         session: &mut Session,
         req: ExecuteRequest,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_direct_with_upstream_retry(
+            session,
+            req,
+            bamboo_llm::retry::UpstreamRetry::Bounded,
+        )
+        .await
+    }
+
+    /// Execute through the direct owner lifecycle with an explicit retry policy.
+    pub async fn execute_direct_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
         session
             .check_execution_compatibility()
             .map_err(|error| bamboo_agent_core::AgentError::Tool(error.to_string()))?;
@@ -274,7 +358,14 @@ impl Agent {
         self.check_direct_execution_admission(session, &lease)
             .await?;
         self.prepare_external_session_for_execution(session).await?;
-        self.execute_direct_registered(session, req, lease).await
+        self.execute_direct_registered_with_inputs_and_upstream_retry(
+            session,
+            req,
+            lease,
+            None,
+            upstream_retry,
+        )
+        .await
     }
 
     /// Check counted-state admission under an already acquired opaque lease.
@@ -395,6 +486,24 @@ impl Agent {
         lease: DirectExecutionLease,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
     ) -> crate::runtime::runner::Result<()> {
+        self.execute_direct_registered_with_inputs_and_upstream_retry(
+            session,
+            req,
+            lease,
+            inputs,
+            bamboo_llm::retry::UpstreamRetry::Bounded,
+        )
+        .await
+    }
+
+    async fn execute_direct_registered_with_inputs_and_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        lease: DirectExecutionLease,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
         self.check_direct_execution_admission(session, &lease)
             .await?;
         let inherited = self.persistence().inherited_child_wait().or_else(|| {
@@ -419,7 +528,7 @@ impl Agent {
             self.with_execution_persistence(self.persistence().clone())
         };
         agent
-            .execute_direct_registered_bound(session, req, lease, inputs)
+            .execute_direct_registered_bound(session, req, lease, inputs, upstream_retry)
             .await
     }
 
@@ -429,6 +538,7 @@ impl Agent {
         mut req: ExecuteRequest,
         mut lease: DirectExecutionLease,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
     ) -> crate::runtime::runner::Result<()> {
         if lease.target_session_id != session.id {
             return Err(bamboo_agent_core::AgentError::LLM(format!(
@@ -437,7 +547,9 @@ impl Agent {
             )));
         }
         let Some(router) = lease.router.take() else {
-            return self.execute_with_inputs(session, req, inputs).await;
+            return self
+                .execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                .await;
         };
         let mut registration = lease.registration.take().ok_or_else(|| {
             bamboo_agent_core::AgentError::LLM(
@@ -477,12 +589,14 @@ impl Agent {
                 // Bind before the runtime is first polled, so cancellation of
                 // this observer still leaves Drop the same sticky host proof.
                 registration.bind_tool_suspension_observation(token);
-                self.execute_with_inputs(session, req, inputs).await
+                self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                    .await
             })
             .await
             .0
         } else {
-            self.execute_with_inputs(session, req, inputs).await
+            self.execute_with_inputs_and_upstream_retry(session, req, inputs, upstream_retry)
+                .await
         };
         if registration.observed_forbidden_running() {
             // No stop receipt exists for this detached outcome, including when

@@ -22,6 +22,17 @@ mod task_lifecycle;
 pub(crate) mod tool_execution;
 mod workspace_context;
 
+/// Test-only access to the real process-wide auxiliary semaphore.
+#[cfg(feature = "test-utils")]
+#[doc(hidden)]
+pub async fn test_acquire_auxiliary_budget(
+    provider: &std::sync::Arc<dyn bamboo_llm::LLMProvider>,
+    model: &str,
+    limit: usize,
+) -> tokio::sync::OwnedSemaphorePermit {
+    auxiliary_budget::acquire(provider, model, limit).await
+}
+
 pub use bamboo_agent_core::PromptSnapshot;
 pub(crate) use loop_execution::run_agent_loop_with_config;
 pub use state_bridge::{refresh_turn_boundary_with_inbox, TurnBoundaryRefresh};

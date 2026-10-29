@@ -1532,6 +1532,8 @@ impl AppState {
             )),
             metrics_service,
             agent_runners,
+            live_retry: Arc::new(super::live_retry::LiveRetryBridge::default()),
+            fresh_sync: Arc::new(super::fresh_sync::FreshSyncRegistry::default()),
             execute_startups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_event_senders,
             actor_event_hub,

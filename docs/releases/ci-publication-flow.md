@@ -6,8 +6,9 @@ The current workflow files and branch protection are authoritative during rollou
 
 ## Feature: test before dev
 
-Create a feature branch and PR to `dev`. Its CI runs Unit and E2E, including the
-applicable native-platform cases. Fix failures on that feature branch before
+Create a feature branch and PR to `dev`. Code CI runs Linux Unit and E2E in
+independently rerunnable test shards; native-platform cases are available by
+manual dispatch. Root and docs Markdown-only changes run Quick Checks. Fix failures on that feature branch before
 merging. Run focused local tests for changed behavior; retain the actual CI
 source and results for review.
 
@@ -16,6 +17,18 @@ compatible compiled test executables and frontend artifacts; do not add a second
 workflow that runs an already-owned selection. Different platform or feature
 configurations can require distinct outputs. A cache hit alone is not a test
 result.
+
+Ubuntu Quick Checks run the complete Supervisor, Lotus artifact and release
+frontend policy Node suites once. Manual Windows and macOS diagnostics run nine system cases:
+bounded file reading, canonical artifact paths, four process/listener binding
+cases, actual archive staging/preservation and both LF/CRLF Git/Bash guards.
+macOS checks real process ownership with `ps/lsof`; Windows checks the explicit
+unsupported-process-binding refusal instead of claiming native Host acceptance.
+The native runner selects their exact names with Node's built-in test runner and
+requires all nine successful executions with no failed, cancelled, skipped or
+todo cases. A renamed, missing or duplicated case fails the job. Platform-free
+protocol, manifest/hash and release-selection policies stay in Ubuntu Quick;
+the existing native Rust acceptance still runs separately.
 
 `frontend-acceptance.yml` checks the embedded frontend package, build scripts and
 server resources. The relevant checks belong in feature CI; a standalone manual

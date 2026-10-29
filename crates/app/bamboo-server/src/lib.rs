@@ -104,6 +104,9 @@
 //!
 //! Google Gemini API compatible endpoints.
 
+#[cfg(test)]
+mod background_live_consumer_tests;
+
 pub mod app_state;
 pub mod browser;
 pub(crate) mod codex_run_tokens;

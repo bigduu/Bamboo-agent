@@ -261,7 +261,7 @@ legacyTest("legacy release matrices retain their original crate and server cover
   assert.match(job("main-release-admission"), /^    permissions:\n      contents: read\n      actions: read\n/mu)
 })
 
-test("one feature executor preserves default configurations and complete explicit additive case ownership", () => {
+test("feature shards preserve default configurations and complete explicit additive case ownership", () => {
   const { selectedPackages, sourceFeatureHash, FEATURE_SOURCE_SHA256, FEATURE_CONTEXTS, cargoArguments } = require('./run-feature-tests.cjs')
   const result = spawnSync('cargo', ['metadata', '--locked', '--format-version', '1', '--no-deps'], { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 })
   assert.equal(result.status, 0, result.stderr)
@@ -290,12 +290,12 @@ test("one feature executor preserves default configurations and complete explici
     assert.ok(packages.some(owner => owner.name === context.package))
     assert.ok(!cargoArguments({ name: context.package }, context, true).includes('--all-features'))
   }
-  assert.match(job('feature-tests'), /target\/feature-tests/u)
-  assert.match(job('feature-tests'), /run: node scripts\/run-feature-tests.cjs/u)
+  assert.match(job('feature-shards'), /target\/feature-tests/u)
+  assert.match(job('feature-shards'), /run: node scripts\/run-feature-tests.cjs/u)
 })
 
-test("the feature executor bounds debug artifacts and records capacity without changing release profiles", () => {
-  const feature = job("feature-tests")
+test("feature shards bound debug artifacts and record capacity without changing release profiles", () => {
+  const feature = job("feature-shards")
   assert.match(feature, /^    timeout-minutes: 90$/mu)
   for (const profile of ["DEV", "TEST"]) {
     const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
@@ -493,7 +493,7 @@ test("Observer API-only Clippy has one owner for the union of both runtime paths
 function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {
-      "feature-tests": "The canonical isolated-default and explicit-feature test executor",
+      "feature-shards": "The canonical isolated-default and explicit-feature test shards",
       "quick-checks": "Small synthetic workflow/controller policy fixtures",
       test: "Pinned legacy release policy fixtures; feature mode is admission only",
       "test-crates": "Pinned legacy release Unit acceptance until source cutover",
@@ -559,7 +559,7 @@ function assertLinuxTestOwnership(definitions) {
         assert.match(block, /^    if: >-\n      needs.validation-source.outputs.full == 'true' &&\n/mu)
         assert.doesNotMatch(block, /outputs\.feature|base_ref == 'dev'/u)
       }
-      if (file === "ci.yml" && id === "feature-tests") {
+      if (file === "ci.yml" && id === "feature-shards") {
         assert.equal([...block.matchAll(/run: node scripts\/run-feature-tests\.cjs$/gmu)].length, 1)
         assert.doesNotMatch(block, /cargo test/u)
         const paths = [...block.matchAll(/\bscripts\/[a-zA-Z0-9_./-]+\.(?:cjs|mjs|js|py|sh)/gu)].map(match => match[0])
@@ -1768,21 +1768,23 @@ legacyTest("Supervisor driver self-tests cover dev, full validation and release 
   assert.throws(() => verify(quick, full.replace(command, "true"), platform))
 })
 
-test("feature portable Node suites have one owner per OS without duplicating Ubuntu", () => {
+test("feature Node suites keep full Quick coverage and only exact native behavior cases", () => {
   const scripts = ["supervisor-native-acceptance.test.cjs", "lotus-next-artifact.test.cjs", "release-frontend-policy.test.cjs"]
+  const command = "node scripts/run-native-node-tests.cjs " + scripts.map(name => `scripts/${name}`).join(" ")
   const counts = (source) => scripts.map((name) => [...source.matchAll(/run: node --test ([^\n]+)/gu)]
     .reduce((count, [, args]) => count + args.split(/\s+/u).filter((arg) => arg === `scripts/${name}`).length, 0))
   const verify = (quick, native, linux) => {
     assert.deepEqual(counts(quick), [1, 1, 1], "Ubuntu Quick owns each portable suite once")
-    assert.deepEqual(counts(native), [1, 1, 1], "each native matrix entry owns each portable suite once")
+    assert.deepEqual(counts(native), [0, 0, 0], "native runners must not repeat the complete portable suites")
     assert.deepEqual(counts(linux), [0, 0, 0], "the Linux Cargo executor does not repeat Quick Node suites")
     assert.match(native, /if: needs\.validation-source\.outputs\.feature == 'true'/u)
     assert.match(native, /os: \[windows-2025, macos-latest\]/u)
-    const step = actorWindowsStep(native, "Test portable Supervisor and frontend policies")
-    assert.doesNotMatch(step, /\bif:|continue-on-error:|\|\||--test-(?:name|skip)-pattern/u)
+    const step = actorWindowsStep(native, "Test native Supervisor and frontend behavior")
+    assert.equal(step.match(/^        run: (.+)$/mu)?.[1], command)
+    assert.doesNotMatch(step, /\bif:|continue-on-error:|\|\|/u)
     assert.ok(native.indexOf(step) < native.indexOf("Run fixed native ownership"), "Node failures cannot be hidden after Cargo")
   }
-  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-tests")
+  const quick = job("quick-checks"), native = job("native-feature-tests"), linux = job("feature-shards")
   verify(quick, native, linux)
   for (const script of scripts) {
     assert.throws(() => verify(quick.replace(` scripts/${script}`, ""), native, linux))
@@ -1790,14 +1792,59 @@ test("feature portable Node suites have one owner per OS without duplicating Ubu
   }
   assert.throws(() => verify(quick, native, linux + "\nrun: node --test scripts/lotus-next-artifact.test.cjs"))
   assert.throws(() => verify(quick, native.replace("os: [windows-2025, macos-latest]", "os: [macos-latest]"), linux))
-  assert.throws(() => verify(quick, native.replace("- name: Test portable Supervisor and frontend policies", "- name: Test portable Supervisor and frontend policies\n        continue-on-error: true"), linux))
+  assert.throws(() => verify(quick, native.replace(command, "node --test " + scripts.map(name => `scripts/${name}`).join(" ")), linux))
+  assert.throws(() => verify(quick, native.replace("- name: Test native Supervisor and frontend behavior", "- name: Test native Supervisor and frontend behavior\n        continue-on-error: true"), linux))
 })
 
-test("standalone native Windows is manual and feature CI owns automatic acceptance", () => {
+const nativeNode = require("./run-native-node-tests.cjs")
+const nativeTap = () => ["TAP version 13", ...nativeNode.CASES.map((name, index) => `ok ${index + 1} - ${name}`),
+  "1..9", "# tests 9", "# pass 9", "# fail 0", "# cancelled 0", "# skipped 0", "# todo 0", ""].join("\n")
+
+test("native Node TAP requires all nine actual successful case names and totals", () => {
+  assert.equal(nativeNode.CASES.length, 9)
+  assert.equal(new Set(nativeNode.CASES).size, 9)
+  assert.doesNotThrow(() => nativeNode.verifyTap(nativeTap()))
+  assert.doesNotThrow(() => nativeNode.verifyTap(nativeTap().replace(/\n/g, "\r\n")))
+  for (const output of [
+    "TAP version 13\n1..0\n# tests 0\n# pass 0\n# fail 0\n# cancelled 0\n# skipped 0\n# todo 0\n",
+    nativeTap().replace(nativeNode.CASES[0], "renamed required native case"),
+    nativeTap().replace(nativeNode.CASES[0], nativeNode.CASES[1]),
+    nativeTap().replace("ok 1 - ", "not ok 1 - "),
+    nativeTap().replace(nativeNode.CASES[0], nativeNode.CASES[0] + " # SKIP"),
+    ...["tests", "pass", "fail", "cancelled", "skipped", "todo"].flatMap(field => [
+      nativeTap().replace(new RegExp("# " + field + " [0-9]+\\n"), ""),
+      nativeTap() + "# " + field + " 0\n",
+      nativeTap().replace(new RegExp("# " + field + " [0-9]+"), "# " + field + " 1"),
+    ]),
+  ]) assert.throws(() => nativeNode.verifyTap(output))
+})
+
+test("native Node selection uses the real runner and preserves failures before reporting success", () => {
+  const stdout = { write: () => {} }, stderr = { write: () => {} }
+  const run = (result, files = nativeNode.FILES) => nativeNode.run(files, { stdout, stderr, spawn: (executable, args) => {
+    assert.equal(executable, process.execPath)
+    assert.deepEqual(args.slice(0, 2), ["--test", "--test-reporter=tap"])
+    assert.deepEqual(args.slice(3), nativeNode.FILES)
+    const pattern = new RegExp(args[2].replace("--test-name-pattern=", ""))
+    for (const name of nativeNode.CASES) assert.ok(pattern.test(name))
+    assert.equal(pattern.test("FRAMEWORK HTTP: an extra created Root cannot hide behind equal returned retry receipts"), false)
+    assert.equal(pattern.test(nativeNode.CASES[0] + " extra"), false)
+    return result
+  } })
+  assert.equal(run({ status: 0, stdout: nativeTap() }), 0)
+  assert.equal(run({ status: 7, stdout: nativeTap() }), 7)
+  assert.equal(run({ status: null, signal: "SIGTERM", stdout: nativeTap() }), 1)
+  assert.equal(run({ status: null, error: new Error("native Node could not start") }), 1)
+  assert.equal(run({ status: 0, stdout: "TAP version 13\n1..0\n" }), 1)
+  assert.equal(run({ status: 0, stdout: nativeTap() }, nativeNode.FILES.slice(1)), 1)
+})
+
+test("native Windows acceptance remains available by manual dispatch", () => {
   const header = actorWindowsWorkflow.split("\njobs:\n")[0]
   assert.match(header, /on:\n  workflow_dispatch:/u)
   assert.doesNotMatch(header, /pull_request:|push:/u)
   assert.match(job("native-feature-tests"), /run: node scripts\/native-test-owner\.cjs/u)
+  assert.match(job("native-feature-tests"), /github.event_name == 'workflow_dispatch'/u)
 })
 
 const assertActorWindowsAcceptance = (source, controller = actorWindowsController) => {

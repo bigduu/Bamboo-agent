@@ -8,6 +8,11 @@ on:
         description: Exact 40-character SHA of the selected ref to validate as one frozen batch
         required: true
         type: string
+      native_diagnostics:
+        description: Also run the optional Windows and macOS diagnostics
+        required: false
+        type: boolean
+        default: false
   pull_request:
     branches: [ dev, main ]
 
@@ -46,6 +51,7 @@ jobs:
     outputs:
       full: ${{ steps.source.outputs.full }}
       feature: ${{ steps.source.outputs.feature }}
+      docs_only: ${{ steps.scope.outputs.docs_only }}
     steps:
       - name: Select the event source
         id: source
@@ -72,6 +78,24 @@ jobs:
           printf 'Event source: %s; full validation: false\n' "$GITHUB_SHA"
           printf 'full=false\nfeature=%s\n' "$feature" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/checkout@v7
+        if: github.event_name == 'pull_request'
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Classify the tested changes
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docs_only=false
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            docs_only="$(node scripts/ci-change-scope.cjs "$BASE_SHA" "$GITHUB_SHA")"
+          fi
+          printf 'docs_only=%s\n' "$docs_only" >> "$GITHUB_OUTPUT"
+
   quick-checks:
     name: Quick Checks
     needs: validation-source
@@ -80,28 +104,42 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+
+      - name: Check documentation changes
+        if: needs.validation-source.outputs.docs_only == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: git diff --check "$BASE_SHA" "$GITHUB_SHA"
 
       - name: Setup Node.js
+        if: needs.validation-source.outputs.docs_only == 'false'
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
           package-manager-cache: false
 
       - name: Install Rust formatting tools
+        if: needs.validation-source.outputs.docs_only == 'false'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
 
       - name: Check formatting
+        if: needs.validation-source.outputs.docs_only == 'false'
         run: cargo fmt --all -- --check
 
       - name: Test fast workflow and release policies
+        if: needs.validation-source.outputs.docs_only == 'false'
         run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
+        if: needs.validation-source.outputs.docs_only == 'false'
         run: node --test scripts/supervisor-native-acceptance.test.cjs
 
       - name: Test portable frontend artifact and release policies
+        if: needs.validation-source.outputs.docs_only == 'false'
         run: node --test scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
 
   promotion-source:
@@ -229,6 +267,8 @@ jobs:
         env:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           FEATURE_VALIDATION: ${{ needs.validation-source.outputs.feature }}
+          DOCS_ONLY: ${{ needs.validation-source.outputs.docs_only }}
+          NATIVE_REQUESTED: ${{ inputs.native_diagnostics || 'false' }}
           QUICK_RESULT: ${{ needs.quick-checks.result }}
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
           NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
@@ -244,22 +284,75 @@ jobs:
           test "$SOURCE_RESULT" = success
           case "$GITHUB_EVENT_NAME:${GITHUB_BASE_REF:-}:$FEATURE_VALIDATION" in
             pull_request:dev:true|workflow_dispatch::true)
-              for key in QUICK_RESULT FEATURE_RESULT NATIVE_RESULT BROWSER_RESULT LINT_RESULT MSRV_RESULT DOCS_RESULT SECURITY_RESULT DENY_RESULT; do
-                test "${!key}" = success
-              done ;;
+              test "$QUICK_RESULT" = success
+              if [[ "$DOCS_ONLY" == true ]]; then
+                test "$GITHUB_EVENT_NAME" = pull_request
+                for key in FEATURE_RESULT NATIVE_RESULT BROWSER_RESULT LINT_RESULT MSRV_RESULT DOCS_RESULT SECURITY_RESULT DENY_RESULT; do
+                  test "${!key}" = skipped
+                done
+              else
+                test "$DOCS_ONLY" = false
+                for key in FEATURE_RESULT BROWSER_RESULT LINT_RESULT MSRV_RESULT DOCS_RESULT SECURITY_RESULT DENY_RESULT; do
+                  test "${!key}" = success
+                done
+                if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$NATIVE_REQUESTED" == true ]]; then
+                  test "$NATIVE_RESULT" = success
+                else
+                  test "$NATIVE_RESULT" = skipped
+                fi
+              fi ;;
             *) exit 1 ;;
           esac
 
   feature-tests:
     name: Feature Unit and E2E
+    needs: [validation-source, feature-shards]
+    if: always() && !cancelled() && needs.validation-source.outputs.docs_only != 'true' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev'))
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all feature shards
+        env:
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          SHARDS_RESULT: ${{ needs.feature-shards.result }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_RESULT" = success
+          test "$SHARDS_RESULT" = success
+
+  feature-shards:
+    name: Feature Unit and E2E (${{ matrix.shard }})
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - agent-core
+          - agent-tests-0
+          - agent-tests-1
+          - agent-tests-2
+          - agent-tests-3
+          - server-browser
+          - server-chat
+          - server-execute
+          - server-settings
+          - server-app-state
+          - server-handlers
+          - server-other
+          - server-tests-0
+          - server-tests-1
+          - packages-0
+          - packages-1
+          - packages-2
+          - packages-3
+          - packages-4
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/target/feature-tests
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      BAMBOO_FEATURE_SHARD: ${{ matrix.shard }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -271,7 +364,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: swatinem/rust-cache@v2
         with:
-          shared-key: bamboo-feature-configurations-${{ runner.os }}
+          shared-key: bamboo-feature-configurations-${{ runner.os }}-${{ startsWith(matrix.shard, 'agent-') && 'agent' || startsWith(matrix.shard, 'server-') && 'server' || matrix.shard }}
           workspaces: . -> target/feature-tests
           save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
       - name: Require exact feature source and committed frontend
@@ -313,7 +406,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: feature-unit-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          name: feature-unit-e2e-${{ matrix.shard }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             ${{ runner.temp }}/bamboo-feature-tests-*/*
             ${{ runner.temp }}/bamboo-feature-profile.log
@@ -323,7 +416,7 @@ jobs:
   browser-runtime-tests:
     name: Browser Runtime Unit and E2E (${{ matrix.shard }})
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -415,7 +508,7 @@ jobs:
   native-feature-tests:
     name: Native Feature (${{ matrix.os }})
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && github.event_name == 'workflow_dispatch' && inputs.native_diagnostics
     strategy:
       fail-fast: false
       matrix:
@@ -433,8 +526,8 @@ jobs:
         with:
           node-version: '24'
           package-manager-cache: false
-      - name: Test portable Supervisor and frontend policies
-        run: node --test scripts/supervisor-native-acceptance.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
+      - name: Test native Supervisor and frontend behavior
+        run: node scripts/run-native-node-tests.cjs scripts/supervisor-native-acceptance.test.cjs scripts/lotus-next-artifact.test.cjs scripts/release-frontend-policy.test.cjs
       - uses: dtolnay/rust-toolchain@stable
       - name: Preserve the Actor acceptance compiler
         if: runner.os == 'Windows'
@@ -469,7 +562,7 @@ jobs:
   msrv:
     name: MSRV (Rust 1.95)
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -502,19 +595,35 @@ jobs:
     steps:
       - name: Require feature E2E execution
         env:
+          SOURCE_RESULT: ${{ needs.validation-source.result }}
+          DOCS_ONLY: ${{ needs.validation-source.outputs.docs_only }}
+          NATIVE_REQUESTED: ${{ inputs.native_diagnostics || 'false' }}
           FEATURE_RESULT: ${{ needs.feature-tests.result }}
           NATIVE_RESULT: ${{ needs.native-feature-tests.result }}
           BROWSER_RESULT: ${{ needs.browser-runtime-tests.result }}
         run: |
           set -euo pipefail
-          test "$FEATURE_RESULT" = success
-          test "$NATIVE_RESULT" = success
-          test "$BROWSER_RESULT" = success
+          test "$SOURCE_RESULT" = success
+          if [[ "$DOCS_ONLY" == true ]]; then
+            test "$GITHUB_EVENT_NAME" = pull_request
+            test "$FEATURE_RESULT" = skipped
+            test "$NATIVE_RESULT" = skipped
+            test "$BROWSER_RESULT" = skipped
+          else
+            test "$DOCS_ONLY" = false
+            test "$FEATURE_RESULT" = success
+            test "$BROWSER_RESULT" = success
+            if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch && "$NATIVE_REQUESTED" == true ]]; then
+              test "$NATIVE_RESULT" = success
+            else
+              test "$NATIVE_RESULT" = skipped
+            fi
+          fi
 
   lint:
     name: Lint
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -546,7 +655,7 @@ jobs:
   docs:
     name: Documentation
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -591,7 +700,7 @@ jobs:
   security:
     name: Security Audit
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -627,7 +736,7 @@ jobs:
   deny:
     name: cargo-deny (licenses/bans/advisories/sources)
     needs: validation-source
-    if: needs.validation-source.outputs.feature == 'true'
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

@@ -99,7 +99,7 @@ pub(crate) type VisionModelResolver = Arc<
 pub(crate) const VISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const VISION_TIMEOUT_MESSAGE: &str =
     "Vision description timed out; no image or partial description was sent to the main model.";
-pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Original images and attachment references were preserved. Configure defaults.vision (provider instance and model, with features.provider_model_ref enabled), or vision_model on the active provider, or select a genuinely Vision-capable main model. No image was sent.";
+pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Original images and attachment references were preserved. Configure defaults.vision (provider instance and model), or vision_model on the active provider, or select a genuinely Vision-capable main model. No image was sent.";
 
 pub(crate) async fn resolve_vision_target(
     config: &crate::runtime::config::AgentLoopConfig,

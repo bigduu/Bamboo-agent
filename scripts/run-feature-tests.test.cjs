@@ -9,6 +9,89 @@ const { selectedPackages, sourceFeatureHash, cargoArguments, sshExecutable, runS
   SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES,
   DEFAULT_TELEMETRY_CASE, FEATURE_CONTEXTS, validateFeatureCatalog, runFeatureTests, PLANNER_SERIAL, runPlannerSerial } = require("./run-feature-tests.cjs");
 
+test("feature shards partition package targets and additive owners exactly once", () => {
+  const { FEATURE_SHARDS, SERVER_FILTERS, SERVER_LIB_SHARDS, packageShard, integrationTargets, defaultShardArguments, selectShard } = require("./run-feature-tests.cjs");
+  const metadata = JSON.parse(spawnSync("cargo", ["metadata", "--locked", "--format-version", "1", "--no-deps"], { encoding: "utf8" }).stdout);
+  const packages = selectedPackages(metadata);
+  const selections = FEATURE_SHARDS.map(shard => selectShard(packages, FEATURE_CONTEXTS, shard));
+  assert.deepEqual(selections.flatMap(item => item.packages.map(owner => owner.name)).filter(name => !["bamboo-agent", "bamboo-server"].includes(name)).sort(),
+    packages.map(owner => owner.name).filter(name => !["bamboo-agent", "bamboo-server"].includes(name)).sort());
+  assert.deepEqual(selections.flatMap(item => item.featureContexts.map(context => context.package)).sort(), FEATURE_CONTEXTS.map(context => context.package).sort());
+  for (const selection of selections) for (const context of selection.featureContexts) {
+    assert.ok(selection.packages.some(owner => owner.name === context.package));
+  }
+  assert.equal(packageShard("bamboo-agent"), "agent");
+  assert.equal(packageShard("bamboo-server"), "server");
+  for (const [name, count] of [["bamboo-agent", 4], ["bamboo-server", 2]]) {
+    const owner = packages.find(item => item.name === name), prefix = name === "bamboo-agent" ? "agent" : "server";
+    const targets = Array.from({ length: count }, (_, index) => integrationTargets(owner, `${prefix}-tests-${index}`)).flat();
+    const expected = owner.targets.filter(target => target.test && target.kind.includes("test") && !target["required-features"]?.length)
+      .map(target => target.name).sort();
+    assert.deepEqual(targets.sort(), expected);
+    assert.equal(new Set(targets).size, targets.length);
+    for (let index = 0; index < count; index++) assert.ok(integrationTargets(owner, `${prefix}-tests-${index}`).length > 0);
+  }
+  const agent = packages.find(item => item.name === "bamboo-agent");
+  const agentFirst = integrationTargets(agent, "agent-tests-0");
+  for (const name of ["ticket_runtime_files", "ticket_runtime_publication"]) assert.ok(agentFirst.includes(name));
+  const server = packages.find(item => item.name === "bamboo-server");
+  for (const name of ["browser::one", "handlers::agent::chat::browser::two", "handlers::agent::execute::x",
+    "handlers::settings::x", "app_state::x", "handlers::other", "misc::other"]) {
+    const matches = SERVER_LIB_SHARDS.filter((shard, index) => {
+      const positive = index >= SERVER_FILTERS.length || name.includes(SERVER_FILTERS[index]);
+      return positive && !SERVER_FILTERS.slice(0, index).some(filter => name.includes(filter));
+    });
+    assert.equal(matches.length, 1, `${name} must belong to exactly one server library shard`);
+    assert.ok(defaultShardArguments(server, matches[0]).includes("--lib"));
+  }
+  assert.throws(() => selectShard(packages, FEATURE_CONTEXTS, "unknown"));
+});
+
+test("actual Cargo runs split agent and server targets, doctests and examples once", t => {
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-agent-shards-")));
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  for (const dir of ["src", "tests", "examples", "server/src", "server/tests", "server/examples", "recorder/src"]) fs.mkdirSync(path.join(root, dir), { recursive: true });
+  fs.writeFileSync(path.join(root, "Cargo.toml"), '[package]\nname="bamboo-agent"\nversion="0.0.0"\nedition="2021"\n[workspace]\nmembers=[".","server","recorder"]\ndefault-members=[".","server"]\n');
+  fs.writeFileSync(path.join(root, "server/Cargo.toml"), '[package]\nname="bamboo-server"\nversion="0.0.0"\nedition="2021"\n[features]\ntest-utils=[]\n[[test]]\nname="env_cache_isolation"\nrequired-features=["test-utils"]\n');
+  fs.writeFileSync(path.join(root, "recorder/Cargo.toml"), '[package]\nname="bamboo-tool-event-recorder-example"\nversion="0.0.0"\nedition="2021"\n');
+  fs.writeFileSync(path.join(root, "recorder/src/lib.rs"), 'pub fn recorder() {}\n');
+  const record = name => `use std::io::Write;writeln!(std::fs::OpenOptions::new().create(true).append(true).open(std::env::var("TEST_EVIDENCE").unwrap()).unwrap(),"${name}").unwrap();`;
+  fs.writeFileSync(path.join(root, "src/lib.rs"), '/// ```\n/// assert_eq!(bamboo_agent::answer(), 42);\n/// ```\npub fn answer()->u8{42}\n#[test]fn unit(){' + record("unit") + '}\n');
+  fs.writeFileSync(path.join(root, "src/main.rs"), 'fn main(){}\n#[test]fn binary(){' + record("binary") + '}\n');
+  fs.writeFileSync(path.join(root, "examples/demo.rs"), 'fn main(){}\n');
+  const targets = ["ticket_runtime_files", "ticket_runtime_publication", ...Array.from({ length: 20 }, (_, i) => `target_${i}`)];
+  for (const name of targets) fs.writeFileSync(path.join(root, "tests", name + ".rs"), `#[test]fn check(){${record(name)}}\n`);
+  const serverGroups = ["browser", "chat", "execute", "settings", "app-state", "handlers", "other"];
+  fs.writeFileSync(path.join(root, "server/src/lib.rs"), '/// ```\n/// assert_eq!(bamboo_server::answer(), 42);\n/// ```\npub fn answer()->u8{42}\n' +
+    'mod browser { #[test] fn check(){' + record("srv-browser") + '} }\n' +
+    'mod handlers { mod agent { mod chat { #[test] fn check(){' + record("srv-chat") + '} } mod execute { #[test] fn check(){' + record("srv-execute") + '} } }' +
+    ' mod settings { #[test] fn check(){' + record("srv-settings") + '} } #[test] fn other(){' + record("srv-handlers") + '} }\n' +
+    'mod app_state { #[test] fn check(){' + record("srv-app-state") + '} }\n#[test] fn other(){' + record("srv-other") + '}\n');
+  fs.writeFileSync(path.join(root, "server/examples/demo.rs"), 'fn main(){}\n');
+  const serverTargets = Array.from({ length: 12 }, (_, i) => `srv_target_${i}`);
+  for (const name of serverTargets) fs.writeFileSync(path.join(root, "server/tests", name + ".rs"), `#[test]fn check(){${record(name)}}\n`);
+  fs.writeFileSync(path.join(root, "server/tests/env_cache_isolation.rs"), '#[test]fn gated(){panic!("default shards must not run gated targets")}\n');
+  const baseEnv = { ...process.env, RUNNER_TEMP: root, TEST_EVIDENCE: path.join(root, "evidence"), CARGO_INCREMENTAL: "0" };
+  assert.equal(spawnSync("cargo", ["generate-lockfile", "--offline"], { cwd: root, env: baseEnv }).status, 0);
+  const metadata = JSON.parse(spawnSync("cargo", ["metadata", "--locked", "--format-version", "1", "--no-deps"],
+    { cwd: root, env: baseEnv, encoding: "utf8" }).stdout);
+  const sourceCatalogSha = sourceFeatureHash(selectedPackages(metadata), root);
+  const { SERVER_LIB_SHARDS } = require("./run-feature-tests.cjs");
+  for (const shard of ["agent-core", "agent-tests-0", "agent-tests-1", "agent-tests-2", "agent-tests-3", ...SERVER_LIB_SHARDS, "server-tests-0", "server-tests-1"]) {
+    const environment = { ...baseEnv, BAMBOO_FEATURE_SHARD: shard, CARGO_TARGET_DIR: path.join(root, "target", shard) };
+    const result = runFeatureTests({ root, environment, sourceCatalogSha, featureContexts: [], echoLog: false });
+    assert.equal(result.status, 0, JSON.stringify(result.contexts));
+    if (shard === "agent-core" || shard === "server-tests-0") {
+      const name = shard === "agent-core" ? "bamboo-agent" : "bamboo-server";
+      assert.ok(result.contexts.some(item => item.label === `default-doc-${name}` && item.status === 0));
+      assert.ok(result.contexts.some(item => item.label === `default-examples-${name}` && item.status === 0));
+      assert.ok(fs.existsSync(path.join(environment.CARGO_TARGET_DIR, "debug/examples/demo")));
+    }
+  }
+  assert.deepEqual(fs.readFileSync(baseEnv.TEST_EVIDENCE, "utf8").trim().split("\n").sort(),
+    ["binary", "unit", ...targets, ...serverTargets, ...serverGroups.map(name => "srv-" + name)].sort());
+});
+
 function packageMetadata(name, targets = []) { return { id: name, name, targets, features: {} }; }
 function metadataFixture() {
   return { workspace_members: ["bamboo-agent", "bamboo-broker", "bamboo-storage", "bamboo-tool-event-recorder-example", "bamboo-analytics"],

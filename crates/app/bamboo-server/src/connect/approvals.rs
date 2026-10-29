@@ -675,6 +675,17 @@ impl ResumeExecutionPort for ConnectResumePort {
             ),
         };
 
+        let resume_resolver = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
+            self.ctx.config.clone(),
+            self.ctx.provider_registry.clone(),
+            config.provider_name.clone(),
+        );
+        let resume_agent = Arc::new(
+            self.ctx
+                .agent
+                .with_resume_auxiliary_resolver(resume_resolver),
+        );
+
         let (mpsc_tx, _forwarder_handle, mut history_commit_barrier) =
             create_event_forwarder_with_root_actor(
                 session_id.clone(),
@@ -728,7 +739,7 @@ impl ResumeExecutionPort for ConnectResumePort {
             }
             consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
-                agent: self.ctx.agent.clone(),
+                agent: resume_agent.clone(),
                 session_id,
                 session,
                 execution_reservation,
@@ -1111,7 +1122,7 @@ impl ResumeExecutionPort for ConnectResumePort {
 
             consume_pending_clarification_resume(&mut session);
             spawn_session_execution(SessionExecutionArgs {
-                agent: ctx.agent.clone(),
+                agent: resume_agent,
                 session_id,
                 session,
                 execution_reservation,
@@ -1170,6 +1181,51 @@ fn apply_tool_result(
 
 #[cfg(test)]
 mod tests {
+
+    // Exercise the resolver constructed for a Connect resume. This stops at
+    // the resolver boundary; it is not an approval-session E2E test.
+    #[tokio::test]
+    async fn connect_resume_legacy_background_keeps_session_provider_live() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let mut session = bamboo_agent_core::Session::new("resume-fixture", "chat-b");
+        session.model_ref = Some(bamboo_domain::ProviderModelRef::new("account-b", "chat-b"));
+        session.set_provider_name("account-b");
+        let snapshot =
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture.config.read())
+                .await
+                .expect("config snapshot timeout")
+                .clone();
+        assert_eq!(snapshot.effective_default_provider(), "account-a");
+        let resume = resolve_resume_config_snapshot(&snapshot, &fixture.registry, &session, None);
+        assert_eq!(resume.provider_name, "account-b");
+        assert_eq!(resume.background_model.as_deref(), Some("memory-only"));
+        assert!(resume
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                fixture
+                    .registry
+                    .get("account-b")
+                    .is_some_and(|b| Arc::ptr_eq(provider, &b))
+            }));
+        let missing = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+            "account-missing".into(),
+        );
+        let (_, missing_background) = missing();
+        assert!(missing_background.is_none());
+        let resolver = bamboo_engine::model_areas::live_resume_auxiliary_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+            resume.provider_name,
+        );
+        // The callback captures the session's B key, not the global A key.
+        fixture
+            .verify_resume_background(Arc::new(move || resolver().1))
+            .await;
+    }
+
     use bamboo_agent_core::tools::{FunctionCall, ToolCall};
     use bamboo_agent_core::Message;
 
