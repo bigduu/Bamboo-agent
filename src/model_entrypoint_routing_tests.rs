@@ -1680,13 +1680,16 @@ async fn entrypoint_routing_legacy_missing_or_empty_explicit_override_never_send
         ));
     }
     assert!(
-        outcomes.iter().all(
-            |(_, outcome, calls, count, pixel, preserved)| outcome.is_err()
+        outcomes
+            .iter()
+            .all(|(_, outcome, calls, count, pixel, preserved)| outcome
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.to_string().contains("legacy Vision model"))
                 && calls.iter().all(|(_, _, images)| !images)
                 && *count == 0
                 && !pixel
-                && *preserved
-        ),
+                && *preserved),
         "missing or empty caller overrides must refuse before any image send: {outcomes:?}"
     );
 }
