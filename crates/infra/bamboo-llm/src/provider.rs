@@ -331,6 +331,14 @@ pub trait LLMProvider: Send + Sync {
         None
     }
 
+    /// Return the fixed provider explicitly injected into a Host while it is
+    /// still current. Mutable routers must never identify an inferred provider
+    /// as an injection; the default preserves existing SDK implementations.
+    #[doc(hidden)]
+    fn legacy_injected_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        Ok(None)
+    }
+
     /// An already-known local routing refusal, when no request may be sent.
     /// This query must be nonblocking and must not initiate a request.
     /// The default preserves existing providers and SDK implementations.

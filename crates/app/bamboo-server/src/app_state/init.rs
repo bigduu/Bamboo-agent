@@ -139,9 +139,19 @@ pub async fn init_skill_manager(data_dir: &Path) -> Arc<SkillManager> {
 /// hot-reloadable `RwLock` and `provider_handle` is a stable `ReloadableProvider`
 /// that always delegates to the latest value in the lock.
 pub fn build_provider_handles(provider: Arc<dyn LLMProvider>) -> ProviderHandles {
+    build_provider_handles_with_injected(provider, None)
+}
+
+pub(super) fn build_provider_handles_with_injected(
+    provider: Arc<dyn LLMProvider>,
+    injected: Option<Arc<dyn LLMProvider>>,
+) -> ProviderHandles {
     let provider_lock: Arc<RwLock<Arc<dyn LLMProvider>>> = Arc::new(RwLock::new(provider));
     let provider_handle: Arc<dyn LLMProvider> = Arc::new(
-        crate::reloadable_provider::ReloadableProvider::new(provider_lock.clone()),
+        crate::reloadable_provider::ReloadableProvider::new_with_injected_provider(
+            provider_lock.clone(),
+            injected,
+        ),
     );
     (provider_lock, provider_handle)
 }

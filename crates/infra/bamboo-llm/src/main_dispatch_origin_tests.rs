@@ -63,6 +63,8 @@ fn managed(config: &Config, entries: Vec<(&str, Arc<dyn LLMProvider>)>) -> Provi
             metadata: HashMap::new(),
             default_provider: "relay".into(),
             runtime_models: Some(runtime_models),
+            runtime_models_explicit: false,
+            managed_direct_pristine: false,
             origin: RegistryOrigin::Managed {
                 key: Box::new(key),
                 bindings,

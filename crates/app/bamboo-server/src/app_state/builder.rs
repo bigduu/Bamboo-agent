@@ -1,7 +1,7 @@
 use super::init::{
-    build_connect_manager, build_provider_handles, build_schedule_manager, build_spawn_scheduler,
-    init_mcp_manager, init_metrics_service, init_schedule_store, init_skill_manager, init_storage,
-    load_permission_checker, spawn_session_map_cleanup_task,
+    build_connect_manager, build_provider_handles_with_injected, build_schedule_manager,
+    build_spawn_scheduler, init_mcp_manager, init_metrics_service, init_schedule_store,
+    init_skill_manager, init_storage, load_permission_checker, spawn_session_map_cleanup_task,
 };
 use super::tools::{build_base_tools, build_root_tools};
 use super::*;
@@ -509,7 +509,8 @@ impl AppState {
         // Keep the exact supplied Arc as a Host-side source tag; a neighboring
         // managed registry must not turn this injected provider into a Host route.
         let initial_injected_provider = boot_provider_registry.is_none().then(|| provider.clone());
-        let (provider_lock, provider_handle) = build_provider_handles(provider);
+        let (provider_lock, provider_handle) =
+            build_provider_handles_with_injected(provider, initial_injected_provider.clone());
 
         // Initialize multi-provider registry (for features.provider_model_ref).
         let config_snapshot = config.read().await;

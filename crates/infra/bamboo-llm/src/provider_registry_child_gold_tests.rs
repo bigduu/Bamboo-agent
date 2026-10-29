@@ -54,6 +54,8 @@ fn make_registry(config: &Config, provider: Arc<dyn LLMProvider>) -> ProviderReg
                 "relay".into(),
                 vec!["main-a".into(), "gold".into()],
             )])),
+            runtime_models_explicit: false,
+            managed_direct_pristine: false,
             origin: RegistryOrigin::Managed {
                 key: Box::new(key),
                 bindings: HashMap::from([("relay".into(), binding)]),

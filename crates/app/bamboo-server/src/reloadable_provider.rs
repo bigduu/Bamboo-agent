@@ -13,11 +13,22 @@ use bamboo_llm::{LLMStream, PromptIR, ProviderVisibleToolFootprint};
 /// while keeping the call sites ergonomic (`Arc<dyn LLMProvider>`).
 pub struct ReloadableProvider {
     inner: Arc<RwLock<Arc<dyn LLMProvider>>>,
+    initial_injected_provider: Option<Arc<dyn LLMProvider>>,
 }
 
 impl ReloadableProvider {
     pub fn new(inner: Arc<RwLock<Arc<dyn LLMProvider>>>) -> Self {
-        Self { inner }
+        Self::new_with_injected_provider(inner, None)
+    }
+
+    pub(crate) fn new_with_injected_provider(
+        inner: Arc<RwLock<Arc<dyn LLMProvider>>>,
+        initial_injected_provider: Option<Arc<dyn LLMProvider>>,
+    ) -> Self {
+        Self {
+            inner,
+            initial_injected_provider,
+        }
     }
 
     async fn current(&self) -> Arc<dyn LLMProvider> {
@@ -27,6 +38,18 @@ impl ReloadableProvider {
 
 #[async_trait]
 impl LLMProvider for ReloadableProvider {
+    fn legacy_injected_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(injected) = self.initial_injected_provider.as_ref() else {
+            return Ok(None);
+        };
+        let current = self.inner.try_read().map_err(|_| {
+            bamboo_llm::LLMError::Api(
+                "Provider is being reconfigured; retry background work".into(),
+            )
+        })?;
+        Ok(Arc::ptr_eq(&*current, injected).then(|| current.clone()))
+    }
+
     fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
         let current = self
             .inner
@@ -153,6 +176,33 @@ mod tests {
         ) -> Result<LLMStream> {
             panic!("a known local refusal must not dispatch")
         }
+    }
+
+    #[tokio::test]
+    async fn injected_background_snapshot_is_fixed_and_stops_after_reload() {
+        let a: Arc<dyn LLMProvider> = Arc::new(FootprintProvider);
+        let b: Arc<dyn LLMProvider> = Arc::new(FootprintProvider);
+        let inner = Arc::new(RwLock::new(a.clone()));
+        let wrapper =
+            ReloadableProvider::new_with_injected_provider(inner.clone(), Some(a.clone()));
+        let fixed = wrapper
+            .legacy_injected_provider_snapshot()
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&fixed, &a));
+        let guard = inner.write().await;
+        assert!(wrapper.legacy_injected_provider_snapshot().is_err());
+        drop(guard);
+        *inner.write().await = b;
+        assert!(wrapper
+            .legacy_injected_provider_snapshot()
+            .unwrap()
+            .is_none());
+        assert!(Arc::ptr_eq(&fixed, &a));
+        assert!(ReloadableProvider::new(inner)
+            .legacy_injected_provider_snapshot()
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
