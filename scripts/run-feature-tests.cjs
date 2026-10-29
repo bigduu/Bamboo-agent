@@ -84,7 +84,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Gemini replacement and budget cases remain in the default bamboo-llm and
 // bamboo-engine owners (packages-2 and packages-3); Responses cases remain in
 // the default server-handlers owner. No additive feature cases changed.
-const FEATURE_SOURCE_SHA256 = "af92f34f9284402df3d34d308127b42d74e406f417d20b809869f3f42a69a327";
+// Model-usage settings validation and dry-run regressions are unconditional
+// server-settings cases; the shared event allowlist is unconditional too.
+const FEATURE_SOURCE_SHA256 = "2915a1033ff9c9ba5ac3c80332afd9d8354e7d7e11f9fcc609037257d6029741";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
