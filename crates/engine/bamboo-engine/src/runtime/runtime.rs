@@ -1126,13 +1126,11 @@ impl AgentRuntime {
                     if explicit_roles[0] {
                         current.fast_model_name = overrides.fast_model_name.clone();
                         current.fast_model_provider = overrides.fast_model_provider.clone();
-                        current.fast_model_error = None;
                     }
                     if explicit_roles[1] {
                         current.background_model_name = overrides.background_model_name.clone();
                         current.background_model_provider =
                             overrides.background_model_provider.clone();
-                        current.background_model_error = None;
                     }
                     if explicit_roles[2] {
                         current.summarization_model_name =

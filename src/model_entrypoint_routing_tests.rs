@@ -1153,3 +1153,45 @@ async fn entrypoint_routing_sdk_explicit_model_admission_preserves_unset_list_be
         }
     }
 }
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_explicit_fast_client_replaces_rejected_saved_route() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = Arc::new(Capture::default());
+    let fast = Arc::new(Capture::default());
+    let agent = agent(config(true, "missing-b"), main.clone(), dir.path()).await;
+    let mut session = Session::new("synthetic-explicit-fast", "main-a");
+    session.add_message(Message::user("Synthetic explicit Fast override"));
+    let (tx, mut rx) = mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let mut request = ExecuteRequestBuilder::new(
+        "Synthetic explicit Fast override",
+        tx,
+        CancellationToken::new(),
+    )
+    .model("main-a")
+    .provider_name("chat-a")
+    .fast_model("cheap")
+    .fast_model_provider(fast.clone())
+    .build();
+    request.gold_config = Some(GoldConfig {
+        enabled: true,
+        auto_continue_enabled: true,
+        goal: Some("Synthetic goal".into()),
+        ..Default::default()
+    });
+    request.app_data_dir = Some(dir.path().to_path_buf());
+    agent.execute(&mut session, request).await.unwrap();
+    drain.abort();
+    let main_calls = main.calls.lock().unwrap().clone();
+    let fast_calls = fast.calls.lock().unwrap().clone();
+    assert!(main_calls
+        .iter()
+        .all(|(_, purpose, _)| purpose != "gold_evaluation"));
+    assert!(
+        fast_calls
+            .iter()
+            .any(|(model, purpose, _)| model == "cheap" && purpose == "gold_evaluation"),
+        "{fast_calls:?}"
+    );
+}
