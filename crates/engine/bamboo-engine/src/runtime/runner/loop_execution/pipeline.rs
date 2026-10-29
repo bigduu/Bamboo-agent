@@ -2210,6 +2210,46 @@ async fn abort_in_flight_evaluations(
     }
 }
 
+fn start_queued_task_evaluation_if_idle(
+    state: &mut LoopRunState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    main_provider: Arc<dyn LLMProvider>,
+    cancel_token: CancellationToken,
+    configured_limit: usize,
+) {
+    if state.task_evaluation.in_flight.is_some() {
+        return;
+    }
+    let Some(queued) = state.task_evaluation.queued_request.take() else {
+        return;
+    };
+    let eval_provider = state
+        .auxiliary_models
+        .fast_model_provider
+        .clone()
+        .unwrap_or(main_provider);
+    let model_name = state
+        .auxiliary_models
+        .fast_model_name
+        .as_deref()
+        .unwrap_or(state.model_name.as_str());
+    if queued.current_provider(eval_provider, model_name).is_some() {
+        spawn_task_evaluation_request(
+            state,
+            event_tx,
+            queued.request,
+            queued.provider,
+            cancel_token,
+            configured_limit,
+        );
+    } else {
+        tracing::warn!(
+            "[{}] Dropped queued task evaluation after its model or provider changed",
+            state.session_id
+        );
+    }
+}
+
 fn spawn_task_evaluation_if_needed(
     turn: usize,
     session: &Session,
@@ -2408,6 +2448,7 @@ async fn handle_no_tool_calls_with_native(
     task_context: &Option<TaskLoopContext>,
     eval_model: &str,
     iteration: u32,
+    main_llm: Arc<dyn LLMProvider>,
     gold_llm: Arc<dyn LLMProvider>,
     provider_transcript_items: Vec<ProviderTranscriptItem>,
     evidence_llm: Arc<dyn LLMProvider>,
@@ -2501,7 +2542,11 @@ async fn handle_no_tool_calls_with_native(
         config.reasoning_effort,
         session_id,
         iteration,
-        gold_llm,
+        if config.auxiliary_model_resolver.is_some() {
+            main_llm.clone()
+        } else {
+            gold_llm
+        },
         event_tx,
     )
     .await;
@@ -2659,13 +2704,32 @@ async fn handle_no_tool_calls_with_native(
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
     };
     if let Some(mut answer) = buffered_candidate {
+        // A live resolver supplies one fresh Fast pair. If its provider is a
+        // local rejection sentinel, keep it even when the name is absent.
+        // SDK callers without a live resolver retain their supplied pair.
+        let (evidence_llm, evidence_model) = if config.auxiliary_model_resolver.is_some() {
+            let auxiliary = config.resolve_auxiliary_models();
+            (
+                auxiliary
+                    .fast_model_provider
+                    .unwrap_or_else(|| main_llm.clone()),
+                auxiliary.fast_model_name.unwrap_or_else(|| {
+                    config
+                        .model_name
+                        .clone()
+                        .unwrap_or_else(|| session.model.clone())
+                }),
+            )
+        } else {
+            (evidence_llm, eval_model.to_string())
+        };
         let check = super::final_answer::check(
             session,
             runtime_state,
             &mut answer,
             config,
             evidence_llm,
-            eval_model,
+            &evidence_model,
             cancel_token,
             metrics_collector,
             round_id,
@@ -2789,6 +2853,7 @@ async fn handle_no_tool_calls(
         task_context,
         eval_model,
         iteration,
+        llm.clone(),
         llm.clone(),
         Vec::new(),
         llm,
@@ -3215,35 +3280,13 @@ async fn run_pipeline_inner(
         refresh_auxiliary_models_for_round(state, config);
         poll_completed_task_evaluation(state).await;
         apply_completed_task_evaluation(session, event_tx, config, state).await;
-        if state.task_evaluation.in_flight.is_none() {
-            if let Some(queued) = state.task_evaluation.queued_request.take() {
-                let eval_provider = state
-                    .auxiliary_models
-                    .fast_model_provider
-                    .clone()
-                    .unwrap_or_else(|| llm.clone());
-                let model_name = state
-                    .auxiliary_models
-                    .fast_model_name
-                    .as_deref()
-                    .unwrap_or(state.model_name.as_str());
-                if queued.current_provider(eval_provider, model_name).is_some() {
-                    spawn_task_evaluation_request(
-                        state,
-                        event_tx,
-                        queued.request,
-                        queued.provider,
-                        cancel_token.clone(),
-                        config.auxiliary_evaluation_max_concurrency,
-                    );
-                } else {
-                    tracing::warn!(
-                        "[{}] Dropped queued task evaluation after its model or provider changed",
-                        state.session_id
-                    );
-                }
-            }
-        }
+        start_queued_task_evaluation_if_idle(
+            state,
+            event_tx,
+            llm.clone(),
+            cancel_token.clone(),
+            config.auxiliary_evaluation_max_concurrency,
+        );
         poll_completed_gold_evaluation(state).await;
         apply_completed_gold_evaluation(session, config, state).await;
         let gold_provider = select_gold_evaluation_provider(
@@ -3751,6 +3794,11 @@ async fn run_pipeline_inner(
                     }
                 };
 
+            // Only a validated, accepted output can authorize its Gold route.
+            if let Some(attempt) = llm_output.host_gold_attempt.as_ref() {
+                attempt.accept();
+            }
+
             if stream_output.tool_calls.is_empty() {
                 if crate::runtime::runner::round_lifecycle::is_openai_client_tool_search_boundary(
                     &stream_output.provider_transcript_items,
@@ -3910,6 +3958,7 @@ async fn run_pipeline_inner(
                     &state.task_context,
                     &eval_model,
                     turn_counter + 1,
+                    llm.clone(),
                     gold_provider,
                     stream_output.provider_transcript_items,
                     state
@@ -15899,6 +15948,10 @@ mod tests {
 #[cfg(test)]
 #[path = "pipeline_final_evidence_tests.rs"]
 mod final_evidence_tests;
+
+#[cfg(test)]
+#[path = "pipeline_model_routing_tests.rs"]
+mod model_routing_tests;
 
 #[cfg(all(test, unix))]
 #[path = "pipeline_exec_sessions_tests.rs"]

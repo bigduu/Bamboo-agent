@@ -346,8 +346,11 @@ async fn run_distillation_pass(
         return Ok(());
     }
 
-    let config_snapshot = ctx.dream.config.read().await.clone();
-    let Some((provider, model)) = resolve_background_model(&ctx.dream, &config_snapshot) else {
+    let resolved_background = {
+        let current_config = ctx.dream.config.read().await;
+        resolve_background_model(&ctx.dream, &current_config)?
+    };
+    let Some((provider, model)) = resolved_background else {
         // No background model → leave records unmarked so a later configured
         // model can still distill them.
         return Ok(());

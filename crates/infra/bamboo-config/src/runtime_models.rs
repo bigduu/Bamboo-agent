@@ -120,6 +120,48 @@ pub fn has_implicit_runtime_models_for_provider_key(
     Ok(inputs.enabled && explicit_runtime_models_from_extra(inputs.extra)?.is_none())
 }
 
+/// Read only a provider's explicitly configured runtime list. Missing provider
+/// configuration and a missing list are distinct from a disabled provider,
+/// an explicit empty list, or an invalid list.
+#[doc(hidden)]
+pub fn explicit_runtime_models_for_provider_key(
+    config: &Config,
+    provider: &str,
+) -> Result<Option<Vec<String>>, String> {
+    let inputs = config
+        .provider_instances
+        .get(provider)
+        .map(instance_model_inputs)
+        .or_else(|| legacy_model_inputs(config, provider));
+    let Some(inputs) = inputs else {
+        return Ok(None);
+    };
+    if !inputs.enabled {
+        return Err(format!("Provider '{provider}' is disabled"));
+    }
+    explicit_runtime_models_from_extra(inputs.extra)
+}
+
+/// Whether a provider has any configured admission inputs for this exact key.
+#[doc(hidden)]
+pub fn has_runtime_model_inputs_for_provider_key(config: &Config, provider: &str) -> bool {
+    config.provider_instances.contains_key(provider)
+        || legacy_model_inputs(config, provider).is_some()
+}
+
+/// A pristine injected Host has no configured provider input in this generation.
+#[doc(hidden)]
+pub fn has_any_runtime_model_inputs(config: &Config) -> bool {
+    let providers = config.providers();
+    !config.provider_instances.is_empty()
+        || providers.openai.is_some()
+        || providers.anthropic.is_some()
+        || providers.gemini.is_some()
+        || providers.copilot.is_some()
+        || providers.bodhi.is_some()
+        || !providers.extra.is_empty()
+}
+
 fn default_refs(
     defaults: &DefaultsConfig,
 ) -> impl Iterator<Item = &bamboo_domain::ProviderModelRef> {

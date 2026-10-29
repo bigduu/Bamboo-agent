@@ -69,8 +69,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // registry proof cases remain in the default bamboo-llm package owner.
 // Legacy background, resume summary and per-run isolation are default engine
 // tests in packages-3. Host lock coverage is server-execute; Schedule and
-// Connect resolver coverage is server-other. No additive feature cases changed.
-const FEATURE_SOURCE_SHA256 = "82f664e3867601e822783dacb0bbfae5ce302a94c9b9a76ea3fb820df3b03dd0";
+// Connect resolver coverage is server-other. Live resume summary controls stay
+// in default engine packages-3; direct background admission stays in default
+// LLM packages-2, and the reloadable provider proof stays in server-other.
+// The injected project Dream endpoint A/B case stays in server-handlers.
+// No additive feature cases changed.
+const FEATURE_SOURCE_SHA256 = "5cd9167643884197b6165bcc2100d256b40550db1d1400599c39585ebaf1126c";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

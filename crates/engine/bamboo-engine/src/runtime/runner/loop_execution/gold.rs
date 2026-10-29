@@ -135,10 +135,33 @@ pub(super) async fn evaluate_gold_terminal(
         return GoldTerminalDecision::Stop;
     }
 
-    // Side-channel double-check: re-verify achievement at the stop boundary.
-    let model_name = gold_config.model_name.as_deref().unwrap_or(eval_model);
+    // Take a new complete Fast pair at the terminal boundary. An explicitly
+    // selected Gold model still uses the execution's original Gold guard.
+    // Without a live resolver the SDK keeps its previously supplied pair.
+    let (model_name, llm) = if config.auxiliary_model_resolver.is_some() {
+        let auxiliary = config.resolve_auxiliary_models();
+        let model = gold_config
+            .model_name
+            .as_deref()
+            .or(auxiliary.fast_model_name.as_deref())
+            .or(config.model_name.as_deref())
+            .unwrap_or(&session.model)
+            .to_string();
+        let provider =
+            select_gold_evaluation_provider(config, &llm, auxiliary.fast_model_provider.as_ref());
+        (model, provider)
+    } else {
+        (
+            gold_config
+                .model_name
+                .as_deref()
+                .unwrap_or(eval_model)
+                .to_string(),
+            llm,
+        )
+    };
     let budget_provider = llm.clone();
-    let budget_model = model_name.to_string();
+    let budget_model = model_name.clone();
     let acquire_dispatch_guard = async move {
         crate::runtime::runner::auxiliary_budget::acquire(
             &budget_provider,
@@ -155,11 +178,11 @@ pub(super) async fn evaluate_gold_terminal(
         &crate::runtime::gold_evaluation::GoldEvalFrame {
             event_tx,
             session_id,
-            model: model_name,
+            model: &model_name,
             timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::new(
                 config.stream_timeout,
                 config.provider_name.as_deref(),
-                Some(model_name),
+                Some(&model_name),
             ),
             reasoning_effort,
             checkpoint: GoldCheckpoint::Terminal,

@@ -1,7 +1,7 @@
 use super::init::{
-    build_connect_manager, build_provider_handles, build_schedule_manager, build_spawn_scheduler,
-    init_mcp_manager, init_metrics_service, init_schedule_store, init_skill_manager, init_storage,
-    load_permission_checker, spawn_session_map_cleanup_task,
+    build_connect_manager, build_provider_handles_with_injected, build_schedule_manager,
+    build_spawn_scheduler, init_mcp_manager, init_metrics_service, init_schedule_store,
+    init_skill_manager, init_storage, load_permission_checker, spawn_session_map_cleanup_task,
 };
 use super::tools::{build_base_tools, build_root_tools};
 use super::*;
@@ -207,6 +207,7 @@ impl AppState {
             config,
             provider,
             boot_provider_handle_available,
+            Some(provider_registry),
             config_facade,
             Arc::new(NoopToolEventPublisher),
             memory_store,
@@ -254,6 +255,7 @@ impl AppState {
             provider,
             false,
             None,
+            None,
             Arc::new(NoopToolEventPublisher),
             memory_store,
             false,
@@ -273,6 +275,7 @@ impl AppState {
             config,
             provider,
             false,
+            None,
             None,
             Arc::new(NoopToolEventPublisher),
             memory_store,
@@ -296,6 +299,7 @@ impl AppState {
             provider,
             false,
             None,
+            None,
             tool_event_publisher,
             memory_store,
             true,
@@ -308,6 +312,7 @@ impl AppState {
         config: Config,
         provider: Arc<dyn LLMProvider>,
         boot_provider_handle_available: bool,
+        boot_provider_registry: Option<Arc<bamboo_llm::ProviderRegistry>>,
         config_facade: Option<Arc<bamboo_config::ConfigFacade>>,
         tool_event_publisher: Arc<dyn ToolEventPublisher>,
         memory_store: bamboo_memory::memory_store::MemoryStore,
@@ -500,27 +505,38 @@ impl AppState {
         // entries for a completed session together (issue #346).
 
         let process_registry = Arc::new(ProcessRegistry::new());
-        let (provider_lock, provider_handle) = build_provider_handles(provider);
+        // Only the explicit injection constructors have no boot registry.
+        // Keep the exact supplied Arc as a Host-side source tag; a neighboring
+        // managed registry must not turn this injected provider into a Host route.
+        let initial_injected_provider = boot_provider_registry.is_none().then(|| provider.clone());
+        let (provider_lock, provider_handle) =
+            build_provider_handles_with_injected(provider, initial_injected_provider.clone());
 
         // Initialize multi-provider registry (for features.provider_model_ref).
         let config_snapshot = config.read().await;
-        let provider_registry = match bamboo_llm::ProviderRegistry::from_config(
-            &config_snapshot,
-            bamboo_home_dir.clone(),
-        )
-        .await
-        {
-            Ok(registry) => Arc::new(registry),
-            Err(e) => {
-                tracing::error!("Failed to create provider registry: {}", e);
-                Arc::new(
-                    bamboo_llm::ProviderRegistry::from_config(
-                        &Config::default(),
-                        bamboo_home_dir.clone(),
+        let provider_registry = if let Some(registry) = boot_provider_registry {
+            // Ordinary boot selected its provider from this exact registry.
+            registry
+        } else {
+            // Injection constructors keep their independent provider/registry.
+            match bamboo_llm::ProviderRegistry::from_config(
+                &config_snapshot,
+                bamboo_home_dir.clone(),
+            )
+            .await
+            {
+                Ok(registry) => Arc::new(registry),
+                Err(e) => {
+                    tracing::error!("Failed to create provider registry: {}", e);
+                    Arc::new(
+                        bamboo_llm::ProviderRegistry::from_config(
+                            &Config::default(),
+                            bamboo_home_dir.clone(),
+                        )
+                        .await
+                        .expect("Cannot create even an empty provider registry"),
                     )
-                    .await
-                    .expect("Cannot create even an empty provider registry"),
-                )
+                }
             }
         };
         if boot_provider_handle_available
@@ -774,6 +790,15 @@ impl AppState {
                 .build()
                 .expect("agent runtime should be fully configured"),
         );
+
+        // Only Host-owned Connect and Schedule use the mutable default
+        // provider for a dedicated Gold run. Their cloned Agent tracks each
+        // actual main dispatch; HTTP and direct SDK contracts stay separate.
+        let host_gold_origin = super::host_gold_origin::origin_resolver(
+            provider_registry.clone(),
+            initial_injected_provider.clone(),
+        );
+        let non_http_agent = Arc::new(agent.with_host_gold_origin_resolver(host_gold_origin));
 
         let child_completion_coordinator = Arc::new(
             bamboo_engine::ChildCompletionCoordinator::new(
@@ -1045,7 +1070,7 @@ impl AppState {
 
         let schedule_manager = build_schedule_manager(
             schedule_store.clone(),
-            agent.clone(),
+            non_http_agent.clone(),
             tools_with_task.clone(),
             permission_checker.permission_config(),
             sessions.clone(),
@@ -1346,7 +1371,7 @@ impl AppState {
         // always-constructed-but-only-active-if-configured lifecycle.
         let connect_manager = Arc::new(
             build_connect_manager(
-                agent.clone(),
+                non_http_agent.clone(),
                 tool_factory.get(crate::tools::ToolSurface::Root),
                 session_repo.clone(),
                 agent_runners.clone(),
@@ -1489,6 +1514,7 @@ impl AppState {
             health_monitor,
             provider: provider_lock,
             provider_handle,
+            initial_injected_provider,
             sessions,
             storage,
             session_store,
@@ -2049,6 +2075,85 @@ mod broker_embed_tests {
                 .tools_for(crate::tools::ToolSurface::Root)
                 .owns_exact_tool(name));
         }
+        state.shutdown().await;
+    }
+}
+
+#[cfg(test)]
+mod boot_gold_identity_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn managed_config() -> Config {
+        let mut config = Config::default();
+        config.provider = "account-a".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.provider_instances.insert(
+            "account-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true,
+                "api_key":"synthetic-only", "base_url":"http://127.0.0.1:9",
+                "model":"main-a", "runtime_models":["main-a", "gold"]
+            }))
+            .unwrap(),
+        );
+        let memory = config.memory_mut().get_or_insert_with(Default::default);
+        memory.auto_dream_enabled = false;
+        memory.gardener_enabled = false;
+        memory.dedup_gardener_enabled = false;
+        memory.ledger_gardener_enabled = false;
+        memory.ledger_distillation_enabled = false;
+        memory.granularity_freshness_gardener_enabled = false;
+        config
+    }
+
+    #[tokio::test]
+    async fn cold_builder_keeps_original_managed_registry_allocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = managed_config();
+        let registry = Arc::new(
+            bamboo_llm::ProviderRegistry::from_config(&config, dir.path().into())
+                .await
+                .unwrap(),
+        );
+        let selected = registry.get_default().unwrap();
+        let state = AppState::new_with_provider_and_facade(
+            dir.path().into(),
+            config,
+            selected.clone(),
+            true,
+            Some(registry.clone()),
+            None,
+            Arc::new(NoopToolEventPublisher),
+            bamboo_memory::memory_store::MemoryStore::new(dir.path().join("jiandu")),
+            false,
+        )
+        .await
+        .unwrap();
+        assert!(Arc::ptr_eq(&state.provider_registry, &registry));
+        assert!(Arc::ptr_eq(&*state.provider.read().await, &selected));
+        assert!(state.initial_injected_provider.is_none());
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn injection_tag_remains_exact_across_provider_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let injected: Arc<dyn LLMProvider> = Arc::new(UnconfiguredProvider {
+            message: "injected fixture".into(),
+        });
+        let state =
+            AppState::new_with_provider(dir.path().into(), managed_config(), injected.clone())
+                .await
+                .unwrap();
+        let tag = state.initial_injected_provider.as_ref().unwrap();
+        assert!(Arc::ptr_eq(tag, &injected));
+        assert!(Arc::ptr_eq(&*state.provider.read().await, tag));
+        let managed = state.provider_registry.get("account-a").unwrap();
+        assert!(!Arc::ptr_eq(tag, &managed));
+        *state.provider.write().await = managed.clone();
+        assert!(!Arc::ptr_eq(&*state.provider.read().await, tag));
+        assert!(Arc::ptr_eq(tag, &injected));
         state.shutdown().await;
     }
 }

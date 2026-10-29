@@ -72,6 +72,14 @@ struct GuardedGoldProvider {
 
 impl GuardedGoldProvider {
     fn validate(&self) -> Result<Arc<dyn LLMProvider>> {
+        // Refusal state belongs to a single-use target. Reusing a guard or a
+        // nested delegate after it already refused could make an unrelated
+        // upstream failure look like a local routing failure.
+        if self.dispatch_refused.load(Ordering::Acquire) || self.delegate.local_dispatch_refused() {
+            return Err(LLMError::Api(
+                "Gold target already refused a dispatch; a fresh target is required".into(),
+            ));
+        }
         let expected = &self.expected;
         let config = self.config.try_read().map_err(|_| {
             LLMError::Api("Live configuration is busy while selecting a Gold route".into())
@@ -118,14 +126,18 @@ impl GuardedGoldProvider {
 
 #[async_trait]
 impl LLMProvider for GuardedGoldProvider {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
+        Some(self.delegate.clone())
+    }
+
     fn queue_requires_current_route(&self) -> bool {
         true
     }
 
-    // Queue identity is the original concrete target, while the queued
-    // snapshot retains this guard and its per-request refusal state.
+    // Retain the exact selected outer provider, including its policy wrappers.
+    // Folding to an inner identity could equate distinct managed targets.
     fn queued_route_identity(&self) -> crate::provider::QueuedRouteIdentity {
-        crate::provider::queued_identity_for(&self.expected)
+        crate::provider::QueuedRouteIdentity::Stable(self.expected.clone())
     }
 
     fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
@@ -139,7 +151,7 @@ impl LLMProvider for GuardedGoldProvider {
     }
 
     fn local_dispatch_refused(&self) -> bool {
-        self.dispatch_refused.load(Ordering::Acquire)
+        self.dispatch_refused.load(Ordering::Acquire) || self.delegate.local_dispatch_refused()
     }
 
     fn resource_allocation_identity(&self) -> Option<usize> {
@@ -263,6 +275,65 @@ mod queued_guard_tests {
         }
     }
 
+    struct FoldedIdentityWrapper(Arc<dyn LLMProvider>);
+    #[async_trait]
+    impl LLMProvider for FoldedIdentityWrapper {
+        fn queued_route_identity(&self) -> QueuedRouteIdentity {
+            queued_identity_for(&self.0)
+        }
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            output: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream> {
+            self.0.chat_stream(messages, tools, output, model).await
+        }
+    }
+
+    #[test]
+    fn managed_gold_queue_identity_keeps_distinct_outer_policy_wrappers() {
+        let inner: Arc<dyn LLMProvider> = Arc::new(UnexpectedCall);
+        let a: Arc<dyn LLMProvider> = Arc::new(FoldedIdentityWrapper(inner.clone()));
+        let b: Arc<dyn LLMProvider> = Arc::new(FoldedIdentityWrapper(inner));
+        assert!(!Arc::ptr_eq(&a, &b));
+        match (queued_identity_for(&a), queued_identity_for(&b)) {
+            (QueuedRouteIdentity::Stable(left), QueuedRouteIdentity::Stable(right)) => {
+                assert!(
+                    Arc::ptr_eq(&left, &right),
+                    "the wrappers share their folded inner identity"
+                );
+            }
+            _ => panic!("expected their shared folded identity"),
+        }
+        let config = Arc::new(RwLock::new(bamboo_config::Config::default()));
+        let registry = Arc::new(ProviderRegistry::new(HashMap::new(), "fixture".into()));
+        let first = guarded_gold_target(
+            config.clone(),
+            registry.clone(),
+            ProviderModelRef::new("fixture", "gold"),
+            a.clone(),
+            a,
+        );
+        let second = guarded_gold_target(
+            config,
+            registry,
+            ProviderModelRef::new("fixture", "gold"),
+            b.clone(),
+            b,
+        );
+        match (queued_identity_for(&first), queued_identity_for(&second)) {
+            (QueuedRouteIdentity::Stable(left), QueuedRouteIdentity::Stable(right)) => {
+                assert!(
+                    !Arc::ptr_eq(&left, &right),
+                    "different selected outer policies must not alias"
+                );
+            }
+            _ => panic!("managed guards must retain their exact outer identities"),
+        }
+    }
+
     #[tokio::test]
     async fn queued_gold_guards_share_identity_but_not_refusal_state() {
         let expected: Arc<dyn LLMProvider> = Arc::new(UnexpectedCall);
@@ -311,6 +382,134 @@ mod queued_guard_tests {
 #[cfg(test)]
 mod error_classification_tests {
     use super::*;
+
+    struct ReusedRefusal {
+        refused: AtomicBool,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl LLMProvider for ReusedRefusal {
+        fn local_dispatch_refused(&self) -> bool {
+            self.refused.load(Ordering::Acquire)
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(LLMError::Api("synthetic remote failure".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_refuses_reused_delegate_with_stale_marker_before_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = bamboo_config::Config::default();
+        config.provider = "chat-a".into();
+        config.default_provider_instance = Some("chat-a".into());
+        config.provider_instances.insert(
+            "chat-a".into(),
+            serde_json::from_value(serde_json::json!({"provider_type":"openai", "enabled":true,
+                "api_key":"synthetic-only", "base_url":"http://127.0.0.1:9",
+                "model":"gold", "runtime_models":["gold"]}))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().into())
+                .await
+                .unwrap(),
+        );
+        let target = ProviderModelRef::new("chat-a", "gold");
+        let expected = registry
+            .provider_for_configured_model(&config, &target)
+            .unwrap();
+        for stale_at_selection in [true, false] {
+            let reused = Arc::new(ReusedRefusal {
+                refused: AtomicBool::new(stale_at_selection),
+                calls: std::sync::atomic::AtomicUsize::new(0),
+            });
+            let guard = guarded_gold_target(
+                Arc::new(RwLock::new(config.clone())),
+                registry.clone(),
+                target.clone(),
+                expected.clone(),
+                reused.clone(),
+            );
+            if !stale_at_selection {
+                assert!(guard.known_pre_dispatch_error().is_none());
+                reused.refused.store(true, Ordering::Release);
+            }
+            assert!(guard.known_pre_dispatch_error().is_some());
+            assert!(guard.chat_stream(&[], &[], None, "gold").await.is_err());
+            assert!(guard.local_dispatch_refused());
+            assert_eq!(reused.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    struct NestedLocalRefusal {
+        refused: AtomicBool,
+    }
+
+    #[async_trait]
+    impl LLMProvider for NestedLocalRefusal {
+        fn local_dispatch_refused(&self) -> bool {
+            self.refused.load(Ordering::Acquire)
+        }
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            self.refused.store(true, Ordering::Release);
+            Err(LLMError::Api("synthetic nested refusal".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn nested_guard_forwards_actual_delegate_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = bamboo_config::Config::default();
+        config.provider = "chat-a".into();
+        config.default_provider_instance = Some("chat-a".into());
+        config.provider_instances.insert(
+            "chat-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+                "base_url":"http://127.0.0.1:9", "model":"gold", "runtime_models":["gold"]
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().into())
+                .await
+                .unwrap(),
+        );
+        let target = ProviderModelRef::new("chat-a", "gold");
+        let expected = registry
+            .provider_for_configured_model(&config, &target)
+            .unwrap();
+        let nested = Arc::new(NestedLocalRefusal {
+            refused: AtomicBool::new(false),
+        });
+        let guard = guarded_gold_target(
+            Arc::new(RwLock::new(config)),
+            registry,
+            target,
+            expected,
+            nested,
+        );
+        assert!(guard.known_pre_dispatch_error().is_none());
+        assert!(guard.chat_stream(&[], &[], None, "gold").await.is_err());
+        assert!(
+            guard.local_dispatch_refused(),
+            "inner route refusal must reach the outer guard"
+        );
+    }
 
     struct ErrorAfterConfigChange {
         config: Arc<RwLock<bamboo_config::Config>>,

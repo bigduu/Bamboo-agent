@@ -494,6 +494,10 @@ impl Usage {
 
 #[async_trait::async_trait]
 impl LLMProvider for BudgetedProvider {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
+        Some(self.inner.clone())
+    }
+
     fn local_dispatch_refused(&self) -> bool {
         self.inner.local_dispatch_refused()
     }

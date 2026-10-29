@@ -35,6 +35,98 @@ use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort};
 use crate::session_activation::SessionActivationRouter;
 use crate::session_messaging::SessionMessenger;
 
+pub(crate) type AuxiliaryModelResolver = Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>;
+pub(crate) type AuxiliaryModelResolverFactory =
+    Arc<dyn Fn(&str) -> AuxiliaryModelResolver + Send + Sync>;
+
+// A host factory is installed only on the Schedule Agent clone. Explicitly
+// absent roster keys are passed as empty, never substituted with a global key.
+fn select_auxiliary_model_resolver(
+    factory: Option<&AuxiliaryModelResolverFactory>,
+    roster_provider: Option<&str>,
+    fallback: Option<AuxiliaryModelResolver>,
+) -> Option<AuxiliaryModelResolver> {
+    factory
+        .map(|create| create(roster_provider.unwrap_or_default()))
+        .or(fallback)
+}
+
+#[cfg(test)]
+mod auxiliary_resolver_factory_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn factory_receives_each_roster_key_and_sdk_fallback_is_unchanged() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let recorded = keys.clone();
+        let factory: AuxiliaryModelResolverFactory = Arc::new(move |key| {
+            recorded.lock().unwrap().push(key.to_string());
+            let name = key.to_string();
+            Arc::new(move || AuxiliaryModelConfig {
+                fast_model_name: Some(name.clone()),
+                ..Default::default()
+            })
+        });
+        let fallback: AuxiliaryModelResolver = Arc::new(|| AuxiliaryModelConfig {
+            fast_model_name: Some("snapshot".into()),
+            ..Default::default()
+        });
+        let a = select_auxiliary_model_resolver(
+            Some(&factory),
+            Some("account-a"),
+            Some(fallback.clone()),
+        )
+        .unwrap();
+        let b = select_auxiliary_model_resolver(
+            Some(&factory),
+            Some("account-b"),
+            Some(fallback.clone()),
+        )
+        .unwrap();
+        let missing = select_auxiliary_model_resolver(Some(&factory), None, None).unwrap();
+        assert_eq!(a().fast_model_name.as_deref(), Some("account-a"));
+        assert_eq!(b().fast_model_name.as_deref(), Some("account-b"));
+        assert_eq!(missing().fast_model_name.as_deref(), Some(""));
+        assert_eq!(*keys.lock().unwrap(), vec!["account-a", "account-b", ""]);
+        let unchanged =
+            select_auxiliary_model_resolver(None, Some("account-a"), Some(fallback.clone()))
+                .unwrap();
+        assert!(Arc::ptr_eq(&unchanged, &fallback));
+        assert!(select_auxiliary_model_resolver(None, None, None).is_none());
+    }
+}
+
+// Preserve the exact managed child-resume route through the optional Work
+// decorator. `main` is the undecorated override and `decorated_main` was built
+// from it by execute_bound. Do not trust a later resolver caller to supply the
+// matching delegate, and do not silently downgrade an invariant violation.
+pub(crate) fn bind_child_gold_delegate(
+    config: &mut AgentLoopConfig,
+    selected: Option<&Arc<dyn LLMProvider>>,
+    main: &Arc<dyn LLMProvider>,
+    decorated_main: &Arc<dyn LLMProvider>,
+) -> crate::runtime::runner::Result<()> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    if !Arc::ptr_eq(selected, main) {
+        return Err(bamboo_agent_core::AgentError::LLM(
+            "Managed child-resume provider differs from its selected route".into(),
+        ));
+    }
+    let resolve = config.gold_target_resolver.take().ok_or_else(|| {
+        bamboo_agent_core::AgentError::LLM(
+            "Managed child-resume Gold route is missing its guard".into(),
+        )
+    })?;
+    let delegate = decorated_main.clone();
+    config.gold_target_resolver = Some(Arc::new(move |model, _untrusted_delegate| {
+        resolve(model, delegate.clone())
+    }));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // AgentRuntime — shared resources (assembled once)
 // ---------------------------------------------------------------------------
@@ -56,7 +148,11 @@ pub struct AgentRuntime {
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
     pub(crate) gold_target_resolver: Option<crate::runtime::config::GoldTargetResolver>,
+    pub(crate) host_gold_origin_resolver: Option<crate::runtime::host_gold::HostGoldOriginResolver>,
+    // Private to managed child resume; never inferred from a registry name.
+    pub(crate) child_resume_gold_selected: Option<Arc<dyn LLMProvider>>,
     pub(crate) background_model_resolver: Option<crate::runtime::config::BackgroundModelResolver>,
+    pub(crate) auxiliary_model_resolver_factory: Option<AuxiliaryModelResolverFactory>,
     pub(crate) resume_auxiliary_resolver: Option<crate::runtime::config::ResumeAuxiliaryResolver>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
@@ -256,7 +352,10 @@ impl AgentRuntimeBuilder {
             session_inbox: self.session_inbox,
             live_bootstrap_host: None,
             gold_target_resolver: None,
+            host_gold_origin_resolver: None,
+            child_resume_gold_selected: None,
             background_model_resolver: None,
+            auxiliary_model_resolver_factory: None,
             resume_auxiliary_resolver: None,
             activation_router: self.activation_router,
             session_messenger: self.session_messenger,
@@ -957,6 +1056,7 @@ impl AgentRuntime {
             loop_control,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
+        let uses_default_provider = provider_override.is_none();
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
         let configured_permission_mode = self
             .permission_config
@@ -984,6 +1084,11 @@ impl AgentRuntime {
             provider_type,
             ..
         } = model_roster;
+        let auxiliary_model_resolver = select_auxiliary_model_resolver(
+            self.auxiliary_model_resolver_factory.as_ref(),
+            provider_name.as_deref(),
+            auxiliary_model_resolver,
+        );
         let active_provider =
             provider_name.unwrap_or_else(|| config.effective_default_provider().to_string());
         let hook_runner = inputs
@@ -1129,10 +1234,101 @@ impl AgentRuntime {
         };
 
         drop(config);
-        let llm = match ticket_token_budget {
+        let undecorated_main = llm.clone();
+        let llm = match ticket_token_budget.as_ref() {
             Some(budget) => budget.decorate(&mut loop_config, llm),
             None => llm,
         };
+        // A Host default provider can change between main and Gold. Capture
+        // each accepted main dispatch rather than asking the mutable handle
+        // again when a dedicated Gold request starts.
+        if uses_default_provider
+            && loop_config
+                .gold_config
+                .as_ref()
+                .is_some_and(|gold| gold.enabled && gold.model_name.is_some())
+        {
+            if let Some(origin_resolver) = self.host_gold_origin_resolver.clone() {
+                let tracker = crate::runtime::host_gold::HostGoldRun::new(origin_resolver);
+                let source_tracker = tracker.clone();
+                let live_config = self.config.clone();
+                let original_main = undecorated_main.clone();
+                let budget = ticket_token_budget.clone();
+                let limits = Arc::new(AgentLoopConfig {
+                    app_data_dir: loop_config.app_data_dir.clone(),
+                    model_limits_section: loop_config.model_limits_section.clone(),
+                    legacy_model_limits: loop_config.legacy_model_limits.clone(),
+                    ..Default::default()
+                });
+                let inherited = loop_config.gold_target_resolver.take();
+                loop_config.gold_target_resolver = Some(Arc::new(move |model, _mutable_main| {
+                    let receipt = match source_tracker.accepted() {
+                        Ok(receipt) => receipt,
+                        Err(reason) => {
+                            return Arc::new(crate::runtime::host_gold::UnprovenGold {
+                                reason,
+                                refused: std::sync::atomic::AtomicBool::new(false),
+                            }) as Arc<dyn LLMProvider>
+                        }
+                    };
+                    let fixed = match &receipt.origin {
+                        crate::runtime::host_gold::HostGoldOrigin::Injected => {
+                            bamboo_llm::provider::fixed_injected_provider_with_identity(
+                                receipt.selected.clone(),
+                                original_main.clone(),
+                            )
+                        }
+                        crate::runtime::host_gold::HostGoldOrigin::Managed { .. } => {
+                            bamboo_llm::provider::fixed_provider_with_identity(
+                                receipt.selected.clone(),
+                                original_main.clone(),
+                            )
+                        }
+                    };
+                    let delegate = match budget.as_ref() {
+                        Some(budget) => budget.wrap(fixed, &limits),
+                        None => fixed,
+                    };
+                    match receipt.origin {
+                        crate::runtime::host_gold::HostGoldOrigin::Injected => inherited
+                            .as_ref()
+                            .map(|policy| policy(model, delegate.clone()))
+                            .unwrap_or(delegate),
+                        crate::runtime::host_gold::HostGoldOrigin::Managed {
+                            provider_name,
+                            origin,
+                        } => {
+                            let selected = receipt.selected;
+                            let config = live_config.clone();
+                            let managed: crate::runtime::config::GoldTargetResolver =
+                                Arc::new(move |model, delegate| {
+                                    bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+                                        config.clone(),
+                                        origin.clone(),
+                                        bamboo_domain::ProviderModelRef::new(
+                                            provider_name.as_str(),
+                                            model,
+                                        ),
+                                        selected.clone(),
+                                        delegate,
+                                    )
+                                });
+                            crate::runtime::agent::compose_child_gold_policy(
+                                inherited.clone(),
+                                managed,
+                            )(model, delegate)
+                        }
+                    }
+                }));
+                loop_config.host_gold_run = Some(tracker);
+            }
+        }
+        bind_child_gold_delegate(
+            &mut loop_config,
+            self.child_resume_gold_selected.as_ref(),
+            &undecorated_main,
+            &llm,
+        )?;
         #[cfg(test)]
         crate::runtime::tests::observe_untrusted_inputs(
             &session.id,

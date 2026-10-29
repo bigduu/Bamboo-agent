@@ -152,6 +152,58 @@ impl LLMProvider for FinalProvider {
     }
 }
 
+// Change the selected Fast role after the main request has started and a
+// response token is observed. The final-evidence request must use the new pair.
+struct SwitchingMainProvider {
+    inner: Arc<FinalProvider>,
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    target: bamboo_domain::ProviderModelRef,
+    changed: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for SwitchingMainProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.chat_stream_with_options(messages, tools, max, model, None)
+            .await
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        messages: &[Message],
+        tools: &[ToolSchema],
+        max: Option<u32>,
+        model: &str,
+        options: Option<&LLMRequestOptions>,
+    ) -> Result<LLMStream, LLMError> {
+        let original = self
+            .inner
+            .chat_stream_with_options(messages, tools, max, model, options)
+            .await?;
+        let config = self.config.clone();
+        let target = self.target.clone();
+        let changed = self.changed.clone();
+        Ok(Box::pin(original.then(move |chunk| {
+            let config = config.clone();
+            let target = target.clone();
+            let changed = changed.clone();
+            async move {
+                if matches!(&chunk, Ok(LLMChunk::Token(_))) && !changed.swap(true, Ordering::SeqCst)
+                {
+                    config.write().await.defaults.as_mut().unwrap().fast = Some(target);
+                }
+                chunk
+            }
+        })))
+    }
+}
+
 struct NoExecution;
 
 #[async_trait::async_trait]
@@ -256,6 +308,303 @@ async fn disabled_check_keeps_the_original_final_answer_without_an_auxiliary_cal
     assert!(!session
         .metadata
         .contains_key("runtime.final_evidence_check"));
+}
+
+#[tokio::test]
+async fn routing_contract_final_evidence_uses_live_pair_and_rejects_invalid_fast_before_dispatch() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use bamboo_domain::ProviderModelRef;
+    for target in ["fast-b", "memory-c", "unknown-account"] {
+        let context = RoutingContext::new(Some(false));
+        let model = match target {
+            "fast-b" => "cheap-b",
+            "memory-c" => "background-c",
+            _ => "missing-model",
+        };
+        context.config.write().await.defaults.as_mut().unwrap().fast =
+            Some(ProviderModelRef::new(target, model));
+        let (mut session, mut config, mut state) = fixture(true);
+        config.provider_name = Some("chat-a".into());
+        config.auxiliary_model_resolver = Some(crate::model_areas::live_auxiliary_model_resolver(
+            context.config.clone(),
+            context.registry.clone(),
+            "chat-a".into(),
+        ));
+        let provider = FinalProvider::new(Verdict::Revise);
+        let (tx, mut rx) = mpsc::channel(128);
+        let result = run(&mut session, &config, &mut state, provider.clone(), &tx).await;
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 0);
+        if target == "unknown-account" {
+            assert!(matches!(result, Err(AgentError::LLM(_))));
+            context.assert_no_requests();
+            assert_eq!(drain(&mut rx), (String::new(), 0));
+            assert_eq!(session.messages.last().unwrap().role, Role::Tool);
+        } else {
+            assert!(result.unwrap());
+            assert_eq!(
+                context.requests(target),
+                vec![(model.into(), "final_evidence_check".into())]
+            );
+            assert_eq!(drain(&mut rx), (CANDIDATE.into(), 1));
+            assert!(context.requests("chat-a").is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_final_evidence_reloads_fast_during_the_main_stream() {
+    use crate::app_context::model_routing_test_support::RoutingContext;
+    use bamboo_domain::ProviderModelRef;
+
+    for (account, model) in [
+        ("memory-c", "background-c"),
+        ("missing-account", "bad-model"),
+    ] {
+        let routing = RoutingContext::new(Some(false));
+        let (mut session, mut config, mut state) = fixture(true);
+        config.provider_name = Some("chat-a".into());
+        config.auxiliary_model_resolver = Some(crate::model_areas::live_auxiliary_model_resolver(
+            routing.config.clone(),
+            routing.registry.clone(),
+            "chat-a".into(),
+        ));
+        let inner = FinalProvider::new(Verdict::Revise);
+        let changed = Arc::new(AtomicBool::new(false));
+        let main = Arc::new(SwitchingMainProvider {
+            inner: inner.clone(),
+            config: routing.config.clone(),
+            target: ProviderModelRef::new(account, model),
+            changed: changed.clone(),
+        });
+        let (tx, mut rx) = mpsc::channel(128);
+        let result = run_pipeline(
+            &mut session,
+            &tx,
+            main,
+            Arc::new(NoExecution),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await;
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(inner.main_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(inner.auxiliary_calls.load(Ordering::SeqCst), 0);
+        assert!(routing.requests("fast-b").is_empty());
+        assert!(routing.requests("chat-a").is_empty());
+        if account == "memory-c" {
+            assert!(result.unwrap());
+            assert_eq!(
+                routing.requests(account),
+                vec![(model.into(), "final_evidence_check".into())]
+            );
+            assert_eq!(drain(&mut rx), (CANDIDATE.into(), 1));
+        } else {
+            assert!(matches!(result, Err(AgentError::LLM(_))));
+            assert!(routing.requests("memory-c").is_empty());
+            let status: serde_json::Value =
+                serde_json::from_str(&session.metadata["runtime.final_evidence_check"]).unwrap();
+            assert_eq!(status["status"], "failed");
+            assert_eq!(drain(&mut rx), (String::new(), 0));
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_gold_terminal_reloads_fast_during_the_main_stream() {
+    use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+    use bamboo_domain::ProviderModelRef;
+
+    for (account, model) in [
+        ("memory-c", "background-c"),
+        ("missing-account", "bad-model"),
+    ] {
+        let routing = RoutingContext::new(None);
+        for provider in routing.providers.values() {
+            *provider.failure.lock().unwrap() = Some(Failure::Auth);
+        }
+        let (mut session, mut config, mut state) = fixture(false);
+        config.provider_name = Some("chat-a".into());
+        config.gold_config = Some(crate::runtime::config::GoldConfig {
+            enabled: true,
+            auto_continue_enabled: true,
+            goal: Some("Verify the synthetic task".into()),
+            max_auto_continuations: 1,
+            ..Default::default()
+        });
+        config.auxiliary_model_resolver = Some(crate::model_areas::live_auxiliary_model_resolver(
+            routing.config.clone(),
+            routing.registry.clone(),
+            "chat-a".into(),
+        ));
+        let inner = FinalProvider::new(Verdict::Revise);
+        let changed = Arc::new(AtomicBool::new(false));
+        let main = Arc::new(SwitchingMainProvider {
+            inner: inner.clone(),
+            config: routing.config.clone(),
+            target: ProviderModelRef::new(account, model),
+            changed: changed.clone(),
+        });
+        let (tx, _rx) = mpsc::channel(128);
+        run_pipeline(
+            &mut session,
+            &tx,
+            main,
+            Arc::new(NoExecution),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("a refused terminal judge stops unverified");
+        assert!(changed.load(Ordering::SeqCst));
+        assert_eq!(inner.main_calls.load(Ordering::SeqCst), 1);
+        assert!(routing.requests("fast-b").is_empty());
+        assert!(routing.requests("chat-a").is_empty());
+        if account == "memory-c" {
+            assert_eq!(
+                routing.requests(account),
+                vec![(model.into(), "gold_evaluation".into())]
+            );
+        } else {
+            assert!(routing.requests("memory-c").is_empty());
+        }
+        assert_eq!(
+            crate::runtime::goal_state::read_goal_state(&session)
+                .unwrap()
+                .status,
+            crate::runtime::goal_state::GoalRuntimeStatus::NeedInput,
+        );
+    }
+}
+
+#[tokio::test]
+async fn routing_contract_final_evidence_preserves_cancel_and_budget_before_route_error() {
+    let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+    routing.config.write().await.defaults.as_mut().unwrap().fast = Some(
+        bamboo_domain::ProviderModelRef::new("missing-account", "bad-model"),
+    );
+    let resolve = crate::model_areas::live_auxiliary_model_resolver(
+        routing.config.clone(),
+        routing.registry.clone(),
+        "chat-a".into(),
+    );
+    let rejected = resolve()
+        .fast_model_provider
+        .expect("rejected route sentinel");
+    assert!(rejected.known_pre_dispatch_error().is_some());
+
+    for cancelled in [true, false] {
+        let (mut session, mut config, mut state) = fixture(true);
+        config.run_budget.max_total_tokens = Some(0);
+        let mut answer = Message::assistant(CANDIDATE, None);
+        let cancel = CancellationToken::new();
+        if cancelled {
+            cancel.cancel();
+        }
+        let result = super::super::final_answer::check(
+            &mut session,
+            &mut state.runtime_state,
+            &mut answer,
+            &config,
+            rejected.clone(),
+            "bad-model",
+            &cancel,
+            None,
+            "synthetic-priority",
+            Default::default(),
+        )
+        .await;
+        if cancelled {
+            assert!(matches!(result, Err(AgentError::Cancelled)));
+        } else {
+            assert!(matches!(result, Err(AgentError::Budget(_))));
+        }
+        let status: serde_json::Value =
+            serde_json::from_str(&session.metadata["runtime.final_evidence_check"]).unwrap();
+        assert_eq!(
+            status["status"],
+            if cancelled {
+                "cancelled"
+            } else {
+                "skipped_budget"
+            }
+        );
+    }
+    routing.assert_no_requests();
+}
+
+#[tokio::test]
+async fn routing_contract_final_evidence_rejection_does_not_wait_for_busy_slot() {
+    let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+    routing.config.write().await.defaults.as_mut().unwrap().fast = Some(
+        bamboo_domain::ProviderModelRef::new("missing-account", "bad-model"),
+    );
+    let resolve = crate::model_areas::live_auxiliary_model_resolver(
+        routing.config.clone(),
+        routing.registry.clone(),
+        "chat-a".into(),
+    );
+    let rejected = resolve()
+        .fast_model_provider
+        .expect("rejected route sentinel");
+    let held = crate::runtime::runner::auxiliary_budget::acquire(&rejected, "bad-model", 1).await;
+    let (mut session, mut config, mut state) = fixture(true);
+    config.auxiliary_evaluation_max_concurrency = 1;
+    let mut answer = Message::assistant(CANDIDATE, None);
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        super::super::final_answer::check(
+            &mut session,
+            &mut state.runtime_state,
+            &mut answer,
+            &config,
+            rejected,
+            "bad-model",
+            &CancellationToken::new(),
+            None,
+            "synthetic-queue",
+            Default::default(),
+        ),
+    )
+    .await
+    .expect("locally rejected route must not wait for the occupied slot");
+    assert!(matches!(result, Err(AgentError::LLM(_))));
+    let status: serde_json::Value =
+        serde_json::from_str(&session.metadata["runtime.final_evidence_check"]).unwrap();
+    assert_eq!(status["status"], "failed");
+    drop(held);
+    routing.assert_no_requests();
+}
+
+#[tokio::test]
+async fn routing_contract_final_evidence_skips_invalid_unused_role_without_tool_evidence() {
+    let (mut session, mut config, mut state) = fixture(true);
+    session
+        .messages
+        .retain(|message| matches!(message.role, Role::User | Role::System));
+    let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+    config.auxiliary_model_resolver = Some(crate::model_areas::live_auxiliary_model_resolver(
+        routing.config.clone(),
+        routing.registry.clone(),
+        "missing-account".into(),
+    ));
+    routing.config.write().await.defaults.as_mut().unwrap().fast = Some(
+        bamboo_domain::ProviderModelRef::new("missing-account", "missing-model"),
+    );
+    let provider = FinalProvider::new(Verdict::Revise);
+    let (tx, mut rx) = mpsc::channel(128);
+    assert!(
+        run(&mut session, &config, &mut state, provider.clone(), &tx)
+            .await
+            .unwrap()
+    );
+    assert_eq!(provider.auxiliary_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(drain(&mut rx), (CANDIDATE.into(), 1));
+    let status: serde_json::Value =
+        serde_json::from_str(&session.metadata["runtime.final_evidence_check"]).unwrap();
+    assert_eq!(status["status"], "skipped_no_evidence");
 }
 
 #[tokio::test]

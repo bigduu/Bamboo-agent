@@ -600,12 +600,14 @@ mod tests {
     #[derive(Clone)]
     struct SequenceProvider {
         responses: Arc<Mutex<Vec<String>>>,
+        models: Arc<Mutex<Vec<String>>>,
     }
 
     impl SequenceProvider {
         fn new(responses: Vec<String>) -> Self {
             Self {
                 responses: Arc::new(Mutex::new(responses)),
+                models: Arc::new(Mutex::new(Vec::new())),
             }
         }
     }
@@ -617,8 +619,12 @@ mod tests {
             _messages: &[Message],
             _tools: &[bamboo_agent_core::tools::ToolSchema],
             _max_output_tokens: Option<u32>,
-            _model: &str,
+            model: &str,
         ) -> Result<LLMStream, LLMError> {
+            self.models
+                .lock()
+                .expect("lock poisoned")
+                .push(model.to_owned());
             let next = self.responses.lock().expect("lock poisoned").remove(0);
             Ok(Box::pin(stream::iter(vec![
                 Ok(LLMChunk::Token(next)),
@@ -747,6 +753,136 @@ mod tests {
         assert!(project_dream
             .content
             .contains("HTTP project dream generated"));
+    }
+
+    #[actix_web::test]
+    async fn project_dream_injected_provider_is_not_replaced_by_legacy_registry_account() {
+        let temp_dir = tempdir().expect("tempdir");
+
+        let workspace = temp_dir.path().join("workspace-http-project-dream");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+
+        let registry_sink = wiremock::MockServer::start().await;
+        let injected = SequenceProvider::new(vec![
+            "{\"candidates\":[]}".to_string(),
+            "## Current durable context\n- HTTP project dream generated\n\n## Cross-session patterns\n- None\n\n## Active threads to remember\n- None\n\n## Stable constraints and preferences\n- None\n\n## Open risks or questions\n- None".to_string(),
+        ]);
+        let provider: Arc<dyn LLMProvider> = Arc::new(injected.clone());
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.providers_mut().openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "api_key": "synthetic-only", "base_url": registry_sink.uri(),
+                "model": "chat-model", "fast_model": "fast-model"
+            }))
+            .unwrap(),
+        );
+        *config.memory_mut() = Some(bamboo_config::MemoryConfig {
+            background_model: Some("fast-model".into()),
+            auto_dream_enabled: false,
+            gardener_enabled: false,
+            dedup_gardener_enabled: false,
+            ledger_gardener_enabled: false,
+            ledger_distillation_enabled: false,
+            granularity_freshness_gardener_enabled: false,
+            ..Default::default()
+        });
+        let app_state = web::Data::new(
+            AppState::new_with_provider(temp_dir.path().to_path_buf(), config, provider.clone())
+                .await
+                .expect("app state should initialize"),
+        );
+        let registered = app_state
+            .provider_registry
+            .get("openai")
+            .expect("registry account");
+        assert!(!Arc::ptr_eq(&provider, &registered));
+        let project = app_state
+            .project_store
+            .create_with_bindings(
+                "HTTP Project Dream",
+                None,
+                vec![bamboo_domain::WorkspaceBinding {
+                    path: workspace.to_string_lossy().into_owned(),
+                    label: None,
+                    git_common_dir: None,
+                }],
+            )
+            .expect("create Project");
+
+        let mut session = bamboo_agent_core::Session::new("session-http-project-dream", "model");
+        session.title = "HTTP Project Dream".to_string();
+        session.set_project_id_meta(project.id.to_string());
+        session.set_workspace_path_meta(workspace.to_string_lossy().into_owned());
+        session.conversation_summary = Some(ConversationSummary::new(
+            "Project-scoped session for manual dream generation.",
+            3,
+            120,
+        ));
+        session.add_message(Message::user("Generate project dream now."));
+        app_state
+            .storage
+            .save_session(&session)
+            .await
+            .expect("save session");
+
+        let app = test::init_service(
+            App::new()
+                .app_data(app_state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let req = test::TestRequest::post()
+            .uri("/api/v1/sessions/session-http-project-dream/project-dream/run")
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(resp).await;
+        assert_eq!(body.get("success").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            body.get("session_id").and_then(Value::as_str),
+            Some("session-http-project-dream")
+        );
+        assert_eq!(
+            body.get("project_id").and_then(Value::as_str),
+            Some(project.id.as_str())
+        );
+        assert_eq!(
+            body.get("dream_generated").and_then(Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            body.get("used_model").and_then(Value::as_str),
+            Some("fast-model")
+        );
+        assert!(body.get("generated_at").and_then(Value::as_str).is_some());
+        assert_eq!(
+            body.get("source_generation")
+                .and_then(Value::as_str)
+                .map(str::len),
+            Some(64)
+        );
+        assert!(body.get("note_path").is_none());
+
+        let memory = app_state.memory_store.for_project(&project.id);
+        let project_dream = memory
+            .read_dream_snapshot(
+                bamboo_memory::memory_store::MemoryScope::Project,
+                Some(project.id.as_str()),
+            )
+            .await
+            .expect("read project Dream snapshot")
+            .snapshot
+            .expect("project dream should exist");
+        assert!(project_dream
+            .content
+            .contains("HTTP project dream generated"));
+        assert!(injected.responses.lock().unwrap().is_empty());
+        assert_eq!(
+            injected.models.lock().unwrap().as_slice(),
+            ["fast-model", "fast-model"]
+        );
+        assert!(registry_sink.received_requests().await.unwrap().is_empty());
     }
 
     #[actix_web::test]
