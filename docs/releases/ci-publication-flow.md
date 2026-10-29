@@ -167,6 +167,15 @@ recovery; a staged branch alone does not activate a listener.
 Keep old release tags, source identities, signed receipts and recovery inputs.
 Their original instructions remain in the [historical guide](https://github.com/bigduu/Bamboo-agent/blob/ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2/docs/releases/ci-publication-flow.md).
 
+Run `node --test scripts/release-source.test.cjs` for the eight retained historical
+dispatch/preflight regressions. Their `workflow_run` checks read the hash-checked
+publisher fixture from `f0eb67c378e87e203fe490c85c54a89683608624`, rather than the
+active `publish-crate.yml`; the original v2/v4 producer and rejection cases stay.
+This file is not directly selected by feature CI. Current frozen-Dev positive and
+negative admission coverage remains in `crate-release.test.cjs` and
+`ci-routing.test.cjs`, both selected by `Quick Checks`. Historical compatibility
+does not authorize publication through the current frozen-Dev entrypoint.
+
 ### Recorded baseline
 
 For `v2026.10.15`, source
