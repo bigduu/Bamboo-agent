@@ -440,7 +440,11 @@ async fn compression_reports_summary_auth_failure_without_retrying_fast_chat_or_
 // Tests-first regression for the actual resume snapshot and compression consumer.
 // The AgentLoopConfig fields below deliberately reproduce execute_bound's current
 // mapping; this is not a full Connect approval/session or Agent execution test.
-async fn rejected_resume_summary_must_not_dispatch(explicit: bool, lock_busy: bool) {
+async fn rejected_resume_summary_must_not_dispatch(
+    explicit: bool,
+    lock_busy: bool,
+    use_live_auxiliary: bool,
+) {
     use crate::model_config_helper::try_resolve_task_summary_model;
     use crate::session_app::resolution::resolve_resume_config_snapshot;
     use tokio::sync::RwLock;
@@ -536,6 +540,11 @@ async fn rejected_resume_summary_must_not_dispatch(explicit: bool, lock_busy: bo
         Arc::clone(&registry),
         resume.provider_name.clone(),
     );
+    let live_auxiliary = crate::model_areas::live_auxiliary_model_resolver(
+        Arc::clone(&live),
+        Arc::clone(&registry),
+        resume.provider_name.clone(),
+    );
     let config = AgentLoopConfig {
         app_data_dir: Some(data_dir.path().to_path_buf()),
         provider_name: Some(resume.provider_name.clone()),
@@ -553,7 +562,7 @@ async fn rejected_resume_summary_must_not_dispatch(explicit: bool, lock_busy: bo
             .clone()
             .or_else(|| global.get_task_summary_model()),
         summarization_model_provider: resume.summarization_model_provider.clone(),
-        auxiliary_model_resolver: None,
+        auxiliary_model_resolver: use_live_auxiliary.then_some(live_auxiliary),
         resume_auxiliary_resolver: Some(resume_resolver),
         ..Default::default()
     };
@@ -591,22 +600,31 @@ async fn rejected_resume_summary_must_not_dispatch(explicit: bool, lock_busy: bo
 
 #[tokio::test]
 async fn rejected_explicit_resume_summary_does_not_dispatch_when_unlocked() {
-    rejected_resume_summary_must_not_dispatch(true, false).await;
+    rejected_resume_summary_must_not_dispatch(true, false, false).await;
 }
 
 #[tokio::test]
 async fn rejected_explicit_resume_summary_does_not_dispatch_when_locked() {
-    rejected_resume_summary_must_not_dispatch(true, true).await;
+    rejected_resume_summary_must_not_dispatch(true, true, false).await;
 }
 
 #[tokio::test]
 async fn rejected_legacy_resume_fast_does_not_dispatch_when_unlocked() {
-    rejected_resume_summary_must_not_dispatch(false, false).await;
+    rejected_resume_summary_must_not_dispatch(false, false, false).await;
 }
 
 #[tokio::test]
 async fn rejected_legacy_resume_fast_does_not_dispatch_when_locked() {
-    rejected_resume_summary_must_not_dispatch(false, true).await;
+    rejected_resume_summary_must_not_dispatch(false, true, false).await;
+}
+
+#[tokio::test]
+async fn rejected_resume_summary_with_live_auxiliary_never_dispatches() {
+    for explicit in [false, true] {
+        for lock_busy in [false, true] {
+            rejected_resume_summary_must_not_dispatch(explicit, lock_busy, true).await;
+        }
+    }
 }
 
 // Ok(None) from the real resume resolver keeps the original background
@@ -676,6 +694,97 @@ async fn unconfigured_resume_summary_falls_back_to_admitted_background() {
         background_model_name: resume.background_model,
         background_model_provider: resume.background_model_provider,
         auxiliary_model_resolver: None,
+        resume_auxiliary_resolver: Some(resolver),
+        ..Default::default()
+    };
+    assert!(maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "chat-b",
+        "unset-resume-summary",
+        &[],
+        &account_a,
+        None,
+        "mid-turn",
+    )
+    .await
+    .unwrap());
+    assert!(calls_a.lock().unwrap().is_empty());
+    let models = calls_b.lock().unwrap();
+    assert!(models.len() >= 2);
+    assert!(models.iter().all(|model| model == "memory-only"));
+}
+
+#[tokio::test]
+async fn unconfigured_resume_summary_with_live_auxiliary_falls_back_to_admitted_background() {
+    use crate::session_app::resolution::resolve_resume_config_snapshot;
+    use tokio::sync::RwLock;
+
+    let data_dir = tempfile::tempdir().unwrap();
+    let (account_a, calls_a) = recording_llm();
+    let (account_b, calls_b) = recording_llm();
+    let registry = Arc::new(ProviderRegistry::new(
+        HashMap::from([
+            ("account-a".into(), Arc::clone(&account_a)),
+            ("account-b".into(), Arc::clone(&account_b)),
+        ]),
+        "account-a".into(),
+    ));
+    registry.set_runtime_models(HashMap::from([
+        ("account-a".into(), vec!["chat-a".into(), "fast-a".into()]),
+        ("account-b".into(), vec!["memory-only".into()]),
+    ]));
+    let mut global = Config::default();
+    global.provider = "account-a".into();
+    global.default_provider_instance = Some("account-a".into());
+    global.defaults = None;
+    global.provider_instances.insert(
+        "account-a".into(),
+        serde_json::from_value(serde_json::json!({
+            "provider_type": "openai", "model": "chat-a", "fast_model": "fast-a",
+            "runtime_models": ["chat-a", "fast-a"]
+        }))
+        .unwrap(),
+    );
+    global.provider_instances.insert(
+        "account-b".into(),
+        serde_json::from_value(serde_json::json!({
+            "provider_type": "openai", "runtime_models": ["memory-only"]
+        }))
+        .unwrap(),
+    );
+    global
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .background_model = Some("memory-only".into());
+    let mut session = bounded_compression_session("unset-resume-summary");
+    session.model_ref = Some(ProviderModelRef::new("account-b", "chat-b"));
+    session.set_provider_name("account-b");
+    let resume = resolve_resume_config_snapshot(&global, &registry, &session, None);
+    assert_eq!(resume.provider_name, "account-b");
+    assert!(resume.summarization_model.is_none());
+    assert_eq!(resume.background_model.as_deref(), Some("memory-only"));
+    let live = Arc::new(RwLock::new(global.clone()));
+    let live_auxiliary = crate::model_areas::live_auxiliary_model_resolver(
+        Arc::clone(&live),
+        Arc::clone(&registry),
+        resume.provider_name.clone(),
+    );
+    let resolver = crate::model_areas::live_resume_auxiliary_resolver(
+        Arc::clone(&live),
+        Arc::clone(&registry),
+        resume.provider_name.clone(),
+    );
+    let (summary, background) = resolver();
+    assert!(summary.unwrap().is_none());
+    assert_eq!(background.unwrap().model_name, "memory-only");
+    let config = AgentLoopConfig {
+        app_data_dir: Some(data_dir.path().to_path_buf()),
+        provider_name: Some(resume.provider_name),
+        summarization_model_name: global.get_task_summary_model(),
+        background_model_name: resume.background_model,
+        background_model_provider: resume.background_model_provider,
+        auxiliary_model_resolver: Some(live_auxiliary),
         resume_auxiliary_resolver: Some(resolver),
         ..Default::default()
     };

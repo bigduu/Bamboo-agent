@@ -13,11 +13,22 @@ use bamboo_llm::{LLMStream, PromptIR, ProviderVisibleToolFootprint};
 /// while keeping the call sites ergonomic (`Arc<dyn LLMProvider>`).
 pub struct ReloadableProvider {
     inner: Arc<RwLock<Arc<dyn LLMProvider>>>,
+    initial_injected_provider: Option<Arc<dyn LLMProvider>>,
 }
 
 impl ReloadableProvider {
     pub fn new(inner: Arc<RwLock<Arc<dyn LLMProvider>>>) -> Self {
-        Self { inner }
+        Self::new_with_injected_provider(inner, None)
+    }
+
+    pub(crate) fn new_with_injected_provider(
+        inner: Arc<RwLock<Arc<dyn LLMProvider>>>,
+        initial_injected_provider: Option<Arc<dyn LLMProvider>>,
+    ) -> Self {
+        Self {
+            inner,
+            initial_injected_provider,
+        }
     }
 
     async fn current(&self) -> Arc<dyn LLMProvider> {
@@ -27,6 +38,18 @@ impl ReloadableProvider {
 
 #[async_trait]
 impl LLMProvider for ReloadableProvider {
+    fn legacy_injected_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(injected) = self.initial_injected_provider.as_ref() else {
+            return Ok(None);
+        };
+        let current = self.inner.try_read().map_err(|_| {
+            bamboo_llm::LLMError::Api(
+                "Provider is being reconfigured; retry background work".into(),
+            )
+        })?;
+        Ok(Arc::ptr_eq(&*current, injected).then(|| current.clone()))
+    }
+
     fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
         let current = self
             .inner
@@ -116,6 +139,12 @@ impl LLMProvider for ReloadableProvider {
         // `chat_stream_ir` override is preserved (NOT collapsed to a flat list by
         // the trait default).
         let provider = self.current().await;
+        // Observe only the main IR request, after selecting the concrete Arc
+        // and before forwarding that same Arc. Other purposes cannot overwrite
+        // an attempt's receipt. No task-local scope preserves SDK behavior.
+        if options.and_then(|options| options.request_purpose.as_deref()) == Some("agent_loop") {
+            let _ = bamboo_llm::provider::observe_main_dispatch(provider.clone());
+        }
         provider
             .chat_stream_ir(ir, tools, max_output_tokens, model, options)
             .await
@@ -147,6 +176,33 @@ mod tests {
         ) -> Result<LLMStream> {
             panic!("a known local refusal must not dispatch")
         }
+    }
+
+    #[tokio::test]
+    async fn injected_background_snapshot_is_fixed_and_stops_after_reload() {
+        let a: Arc<dyn LLMProvider> = Arc::new(FootprintProvider);
+        let b: Arc<dyn LLMProvider> = Arc::new(FootprintProvider);
+        let inner = Arc::new(RwLock::new(a.clone()));
+        let wrapper =
+            ReloadableProvider::new_with_injected_provider(inner.clone(), Some(a.clone()));
+        let fixed = wrapper
+            .legacy_injected_provider_snapshot()
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&fixed, &a));
+        let guard = inner.write().await;
+        assert!(wrapper.legacy_injected_provider_snapshot().is_err());
+        drop(guard);
+        *inner.write().await = b;
+        assert!(wrapper
+            .legacy_injected_provider_snapshot()
+            .unwrap()
+            .is_none());
+        assert!(Arc::ptr_eq(&fixed, &a));
+        assert!(ReloadableProvider::new(inner)
+            .legacy_injected_provider_snapshot()
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -515,5 +571,118 @@ mod tests {
             weak.upgrade().is_some(),
             "the snapshot must keep its identity allocation alive"
         );
+    }
+}
+
+#[cfg(test)]
+mod main_dispatch_observation_tests {
+    use super::*;
+    use bamboo_llm::provider::{scope_main_dispatch, MainDispatchObserver};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct Capture {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LLMProvider for Capture {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::empty()))
+        }
+
+        async fn chat_stream_ir(
+            &self,
+            _: &PromptIR,
+            _: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+            _: Option<&LLMRequestOptions>,
+        ) -> Result<LLMStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_main_dispatch_forwards_the_same_selected_arc_after_swap() {
+        let a = Arc::new(Capture::default());
+        let b = Arc::new(Capture::default());
+        let selected_a: Arc<dyn LLMProvider> = a.clone();
+        let selected_b: Arc<dyn LLMProvider> = b.clone();
+        let current = Arc::new(RwLock::new(selected_a.clone()));
+        let reloadable = ReloadableProvider::new(current.clone());
+        let seen = Arc::new(Mutex::new(Vec::<Arc<dyn LLMProvider>>::new()));
+        let observer_seen = seen.clone();
+        let observer_current = current.clone();
+        let observer: MainDispatchObserver = Arc::new(move |selected| {
+            observer_seen.lock().unwrap().push(selected);
+            *observer_current
+                .try_write()
+                .expect("selection read lock must be released") = selected_b.clone();
+        });
+        let options = LLMRequestOptions {
+            request_purpose: Some("agent_loop".into()),
+            ..Default::default()
+        };
+        let _ = scope_main_dispatch(
+            observer,
+            reloadable.chat_stream_ir(&PromptIR::default(), &[], None, "main", Some(&options)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.lock().unwrap().len(), 1);
+        assert!(Arc::ptr_eq(&seen.lock().unwrap()[0], &selected_a));
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn non_main_and_unscoped_requests_do_not_publish_an_attempt_receipt() {
+        let provider = Arc::new(Capture::default());
+        let current: Arc<RwLock<Arc<dyn LLMProvider>>> = Arc::new(RwLock::new(provider.clone()));
+        let reloadable = ReloadableProvider::new(current);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let observer_seen = seen.clone();
+        let observer: MainDispatchObserver = Arc::new(move |_| {
+            observer_seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let gold = LLMRequestOptions {
+            request_purpose: Some("gold_evaluation".into()),
+            ..Default::default()
+        };
+        scope_main_dispatch(observer, async {
+            let _ = reloadable
+                .chat_stream_ir(&PromptIR::default(), &[], None, "gold", Some(&gold))
+                .await
+                .unwrap();
+            let _ = reloadable
+                .chat_stream(&[], &[], None, "ordinary")
+                .await
+                .unwrap();
+            let _ = reloadable
+                .chat_stream_with_options(&[], &[], None, "ordinary", Some(&gold))
+                .await
+                .unwrap();
+        })
+        .await;
+        let main = LLMRequestOptions {
+            request_purpose: Some("agent_loop".into()),
+            ..Default::default()
+        };
+        let _ = reloadable
+            .chat_stream_ir(&PromptIR::default(), &[], None, "main", Some(&main))
+            .await
+            .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
     }
 }

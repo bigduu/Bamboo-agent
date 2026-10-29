@@ -57,6 +57,8 @@ pub type ResumeAuxiliarySelection = (
 pub type ResumeAuxiliaryResolver = Arc<dyn Fn() -> ResumeAuxiliarySelection + Send + Sync>;
 
 /// One execution's explicitly selected Gold route, installed only by the Host.
+/// Resolvers must be nonblocking and free of request side effects: a managed
+/// route may re-evaluate policy before and after waiting for an auxiliary slot.
 #[doc(hidden)]
 pub type GoldTargetResolver =
     Arc<dyn Fn(&str, Arc<dyn LLMProvider>) -> Arc<dyn LLMProvider> + Send + Sync>;
@@ -949,6 +951,7 @@ pub struct AgentLoopConfig {
     pub(crate) session_inbox: Option<Arc<dyn bamboo_domain::SessionInboxPort>>,
     pub(crate) live_bootstrap_host: Option<Arc<dyn LiveBootstrapHost>>,
     pub(crate) gold_target_resolver: Option<GoldTargetResolver>,
+    pub(crate) host_gold_run: Option<Arc<crate::runtime::host_gold::HostGoldRun>>,
     /// Active-owner wake generation. The loop consumes this at the same safe
     /// boundary where it drains SessionInbox; it never interrupts an in-flight
     /// provider/tool operation.
@@ -1183,6 +1186,7 @@ impl Default for AgentLoopConfig {
             session_inbox: None,
             live_bootstrap_host: None,
             gold_target_resolver: None,
+            host_gold_run: None,
             session_activation_notifications: None,
             attachment_reader: None,
             metrics_collector: None,

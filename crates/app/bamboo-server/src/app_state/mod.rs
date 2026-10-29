@@ -242,6 +242,11 @@ pub struct AppState {
     /// This avoids stale provider snapshots after runtime config updates.
     provider_handle: Arc<dyn LLMProvider>,
 
+    /// Exact Arc supplied by an injection constructor, never inferred from a
+    /// nearby registry. Future Host run factories capture and compare this tag.
+    #[allow(dead_code)]
+    pub(crate) initial_injected_provider: Option<Arc<dyn LLMProvider>>,
+
     /// Active conversation sessions (in-memory cache)
     ///
     /// Maps session IDs to Session objects. Persisted to storage
@@ -598,6 +603,7 @@ mod agent_session_context;
 mod builder;
 mod config_application;
 pub(crate) mod fresh_sync;
+pub(crate) mod host_gold_origin;
 pub(crate) mod live_retry;
 pub(crate) use config_application::ConfigApplicationState;
 mod config_runtime;

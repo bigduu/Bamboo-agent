@@ -42,6 +42,10 @@ struct RegistryState {
     // None preserves registries managed by embedders rather than Config. A
     // config-built registry always has a map, including explicit empty lists.
     runtime_models: Option<HashMap<String, Vec<String>>>,
+    // Config-derived admission is not an explicit embedder override.
+    runtime_models_explicit: bool,
+    // True only for an untouched generation with no configured provider inputs.
+    managed_direct_pristine: bool,
     origin: RegistryOrigin,
 }
 
@@ -162,6 +166,49 @@ fn gold_factory_identity_is_static(config: &Config, id: &str) -> bool {
 }
 
 impl ProviderRegistry {
+    /// Prove the unique managed origin of an already-selected dispatch Arc.
+    /// The provider, uniqueness, and factory binding come from one nonblocking
+    /// registry snapshot. Failure (including busy, poison, unmanaged, absent,
+    /// ambiguous, or missing binding) is unknown provenance, not SDK proof.
+    /// A returned origin still needs the live-config Gold admission guard.
+    #[doc(hidden)]
+    pub fn managed_origin_for_dispatched_provider(
+        self: &Arc<Self>,
+        selected: &Arc<dyn LLMProvider>,
+    ) -> Result<(String, Arc<ManagedProviderOrigin>), LLMError> {
+        let state = self.state.try_read().map_err(|_| {
+            LLMError::Api(
+                "Provider registry is busy or poisoned during dispatch origin lookup".into(),
+            )
+        })?;
+        let RegistryOrigin::Managed { bindings, .. } = &state.origin else {
+            return Err(LLMError::Api(
+                "Dispatch provider registry is not managed".into(),
+            ));
+        };
+        let mut matching = state
+            .providers
+            .iter()
+            .filter(|(_, provider)| Arc::ptr_eq(provider, selected));
+        let (name, _) = matching.next().ok_or_else(|| {
+            LLMError::Api("Dispatched provider is absent from the managed registry".into())
+        })?;
+        if matching.next().is_some() {
+            return Err(LLMError::Api(
+                "Dispatched provider has multiple managed registry keys".into(),
+            ));
+        }
+        if !bindings.contains_key(name) {
+            return Err(LLMError::Api(
+                "Dispatched provider has no managed factory binding".into(),
+            ));
+        }
+        let origin = self
+            .managed_origin_for_snapshot(&state, name, selected)
+            .ok_or_else(|| LLMError::Api("Managed dispatch origin became unavailable".into()))?;
+        Ok((name.clone(), origin))
+    }
+
     fn managed_origin_for_snapshot(
         self: &Arc<Self>,
         state: &RegistryState,
@@ -214,6 +261,8 @@ impl ProviderRegistry {
                 metadata,
                 default_provider,
                 runtime_models: None,
+                runtime_models_explicit: false,
+                managed_direct_pristine: false,
                 origin: RegistryOrigin::Unmanaged,
             }),
         }
@@ -254,12 +303,18 @@ impl ProviderRegistry {
             })?;
             bindings.insert(provider.clone(), binding);
         }
+        let managed_direct_pristine = providers.keys().all(|provider| provider == "copilot")
+            && config.defaults.is_none()
+            && config.default_provider_instance.is_none()
+            && !bamboo_config::has_any_runtime_model_inputs(config);
         Ok(Self {
             state: RwLock::new(RegistryState {
                 providers,
                 metadata,
                 default_provider,
                 runtime_models: Some(models),
+                runtime_models_explicit: false,
+                managed_direct_pristine,
                 origin: RegistryOrigin::Managed {
                     key: Box::new(key),
                     bindings,
@@ -313,6 +368,8 @@ impl ProviderRegistry {
             .collect();
         let mut state = self.state.write().recover_poison();
         state.runtime_models = Some(models);
+        state.runtime_models_explicit = true;
+        state.managed_direct_pristine = false;
         if let RegistryOrigin::Managed {
             legacy_memory_implicit,
             ..
@@ -529,6 +586,103 @@ impl ProviderRegistry {
         let managed = matches!(&state.origin, RegistryOrigin::Managed { .. });
         let provider = Self::configured_model_in_snapshot(&state, config, target)?;
         Ok((provider, managed))
+    }
+
+    /// Admit a legacy direct provider without treating a different registry
+    /// account's model list as authority for it. For an explicit list, the
+    /// registry handle, admission and (for managed registries) factory binding
+    /// are verified together under one nonblocking registry snapshot.
+    #[doc(hidden)]
+    pub fn validate_legacy_direct_provider(
+        &self,
+        config: &Config,
+        target: &bamboo_domain::ProviderModelRef,
+        direct: &Arc<dyn LLMProvider>,
+        explicitly_injected: bool,
+    ) -> Result<bool, LLMError> {
+        if target.provider.trim().is_empty()
+            || target.provider.trim() != target.provider
+            || target.model.trim().is_empty()
+            || target.model.trim() != target.model
+        {
+            return Err(LLMError::Api(
+                "Background provider and model must be non-empty and normalized".into(),
+            ));
+        }
+        let explicit_config =
+            bamboo_config::explicit_runtime_models_for_provider_key(config, &target.provider)
+                .map_err(LLMError::Api)?;
+        if explicit_config
+            .as_ref()
+            .is_some_and(|models| !models.iter().any(|model| model == target.model.trim()))
+        {
+            return Err(LLMError::Api(
+                "Background model is not admitted by the explicit provider list".into(),
+            ));
+        }
+        let state = self.state.try_read().map_err(|_| {
+            LLMError::Api("Provider registry is unavailable for background routing".into())
+        })?;
+        if config.default_provider_instance.is_some()
+            && !bamboo_config::has_runtime_model_inputs_for_provider_key(config, &target.provider)
+            && !matches!(&state.origin, RegistryOrigin::Unmanaged)
+        {
+            return Err(LLMError::Auth(
+                "Explicit default provider has no available configuration".into(),
+            ));
+        }
+        let (unmanaged, prior_implicit) = match &state.origin {
+            RegistryOrigin::Unmanaged => (true, true),
+            RegistryOrigin::Managed {
+                key,
+                bindings,
+                legacy_memory_implicit,
+            } => {
+                if !explicitly_injected {
+                    return Ok(false);
+                }
+                if state.managed_direct_pristine
+                    && !bamboo_config::has_runtime_model_inputs_for_provider_key(
+                        config,
+                        &target.provider,
+                    )
+                {
+                    (false, true)
+                } else if let Some(saved) = bindings.get(&target.provider) {
+                    let current =
+                        configured_binding(config, &target.provider, key)?.ok_or_else(|| {
+                            LLMError::Auth(
+                                "Background provider configuration is unavailable".into(),
+                            )
+                        })?;
+                    if !bool::from(saved.0.as_slice().ct_eq(current.0.as_slice())) {
+                        return Err(stale_binding());
+                    }
+                    (false, legacy_memory_implicit.contains(&target.provider))
+                } else {
+                    return Err(LLMError::Auth(
+                        "Background provider binding is unavailable".into(),
+                    ));
+                }
+            }
+        };
+        if explicit_config.is_some()
+            || state.runtime_models_explicit
+            || !prior_implicit
+            || config.default_provider_instance.is_some()
+        {
+            let registered = if unmanaged {
+                Self::provider_for_model_in_snapshot(&state, target)?
+            } else {
+                Self::configured_model_in_snapshot(&state, config, target)?
+            };
+            if !Arc::ptr_eq(&registered, direct) {
+                return Err(LLMError::Api(
+                    "Explicit background admission belongs to a different provider".into(),
+                ));
+            }
+        }
+        Ok(true)
     }
 
     /// The legacy direct-provider seam is only available to an explicitly
@@ -812,6 +966,7 @@ impl ProviderRegistry {
     /// Insert or replace a provider at runtime (used by instance CRUD / tests).
     pub fn insert(&self, key: String, provider: Arc<dyn LLMProvider>) {
         let mut state = self.state.write().recover_poison();
+        state.managed_direct_pristine = false;
         // An arbitrary inserted handle has no proven configuration binding.
         // Invalidate first: if dropping a replaced provider panics, poison
         // recovery must never pair its replacement with the old binding.
@@ -840,6 +995,7 @@ impl ProviderRegistry {
     /// Remove a provider by key at runtime (used by instance CRUD / tests).
     pub fn remove(&self, key: &str) -> Option<Arc<dyn LLMProvider>> {
         let mut state = self.state.write().recover_poison();
+        state.managed_direct_pristine = false;
         state.metadata.remove(key);
         if let Some(models) = state.runtime_models.as_mut() {
             models.remove(key);
@@ -858,7 +1014,11 @@ impl ProviderRegistry {
 
     /// Update the default provider key.
     pub fn set_default(&self, key: String) {
-        self.state.write().recover_poison().default_provider = key;
+        let mut state = self.state.write().recover_poison();
+        if state.default_provider != key {
+            state.managed_direct_pristine = false;
+        }
+        state.default_provider = key;
     }
 }
 
@@ -1147,6 +1307,260 @@ fn provider_is_configured(config: &Config, name: &str) -> bool {
 mod tests {
     use super::*;
     use bamboo_config::OpenAIConfig;
+
+    #[test]
+    fn legacy_direct_background_obeys_explicit_provider_identity_and_lists() {
+        struct Noop;
+        #[async_trait::async_trait]
+        impl LLMProvider for Noop {
+            async fn chat_stream(
+                &self,
+                _: &[bamboo_domain::Message],
+                _: &[bamboo_domain::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> crate::provider::Result<crate::provider::LLMStream> {
+                unreachable!("admission test never dispatches")
+            }
+        }
+        let a: Arc<dyn LLMProvider> = Arc::new(Noop);
+        let b: Arc<dyn LLMProvider> = Arc::new(Noop);
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        let target = bamboo_domain::ProviderModelRef::new("openai", "memory");
+        let registry = ProviderRegistry::new(
+            HashMap::from([("openai".into(), b.clone())]),
+            "openai".into(),
+        );
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &a, false)
+            .unwrap());
+        registry.set_runtime_models(HashMap::from([("openai".into(), vec!["memory".into()])]));
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &a, false)
+            .is_err());
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &b, false)
+            .unwrap());
+        registry.set_runtime_models(HashMap::new());
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &b, false)
+            .is_err());
+
+        let mut legacy = test_openai_config();
+        legacy
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["memory"]));
+        config.providers_mut().openai = Some(legacy);
+        let registry = ProviderRegistry::new(
+            HashMap::from([("openai".into(), a.clone())]),
+            "openai".into(),
+        );
+        let whitespace_provider = bamboo_domain::ProviderModelRef::new(" openai ", "memory");
+        let whitespace_model = bamboo_domain::ProviderModelRef::new("openai", " memory ");
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &whitespace_provider, &a, false)
+            .is_err());
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &whitespace_model, &a, false)
+            .is_err());
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &a, false)
+            .unwrap());
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &b, false)
+            .is_err());
+        config
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!([]));
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &a, false)
+            .is_err());
+        config
+            .providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::Value::Null);
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &a, false)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_empty_injection_does_not_bypass_explicit_registry_override() {
+        struct Noop;
+        #[async_trait::async_trait]
+        impl LLMProvider for Noop {
+            async fn chat_stream(
+                &self,
+                _: &[bamboo_domain::Message],
+                _: &[bamboo_domain::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> crate::provider::Result<crate::provider::LLMStream> {
+                unreachable!("admission test never dispatches")
+            }
+        }
+        let config = Config::default();
+        let dir = tempfile::tempdir().unwrap();
+        let registry = ProviderRegistry::from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        let direct: Arc<dyn LLMProvider> = Arc::new(Noop);
+        let target =
+            bamboo_domain::ProviderModelRef::new(config.effective_default_provider(), "memory");
+        assert!(registry.get(&target.provider).is_none());
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &direct, true)
+            .unwrap());
+        assert!(!registry
+            .validate_legacy_direct_provider(&config, &target, &direct, false)
+            .unwrap());
+        let mut copilot_config = Config::default();
+        copilot_config.provider = "copilot".into();
+        let copilot = ProviderRegistry::from_config(&copilot_config, dir.path().into())
+            .await
+            .unwrap();
+        let copilot_target = bamboo_domain::ProviderModelRef::new("copilot", "memory");
+        assert!(copilot
+            .validate_legacy_direct_provider(&copilot_config, &copilot_target, &direct, true)
+            .unwrap());
+        let mut explicitly_denied = copilot_config.clone();
+        explicitly_denied.providers_mut().copilot = Some(
+            serde_json::from_value(serde_json::json!({"enabled": true, "runtime_models": []}))
+                .unwrap(),
+        );
+        assert!(copilot
+            .validate_legacy_direct_provider(&explicitly_denied, &copilot_target, &direct, true)
+            .is_err());
+        registry.set_runtime_models(HashMap::new());
+        assert!(registry
+            .validate_legacy_direct_provider(&config, &target, &direct, true)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_injection_rejects_prior_explicit_generation_and_mutated_empty_registry() {
+        struct Noop;
+        #[async_trait::async_trait]
+        impl LLMProvider for Noop {
+            async fn chat_stream(
+                &self,
+                _: &[bamboo_domain::Message],
+                _: &[bamboo_domain::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> crate::provider::Result<crate::provider::LLMStream> {
+                unreachable!("admission test never dispatches")
+            }
+        }
+        let injected: Arc<dyn LLMProvider> = Arc::new(Noop);
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        let mut legacy = test_openai_config();
+        legacy.model = Some("chat".into());
+        legacy
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat"]));
+        config.providers_mut().openai = Some(legacy);
+        let registry = ProviderRegistry::from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        let mut live = config.clone();
+        live.providers_mut()
+            .openai
+            .as_mut()
+            .unwrap()
+            .extra
+            .remove("runtime_models");
+        let chat = bamboo_domain::ProviderModelRef::new("openai", "chat");
+        let memory = bamboo_domain::ProviderModelRef::new("openai", "memory");
+        assert!(registry
+            .validate_legacy_direct_provider(&live, &chat, &injected, true)
+            .is_err());
+        assert!(registry
+            .validate_legacy_direct_provider(&live, &memory, &injected, true)
+            .is_err());
+
+        let empty_config = Config::default();
+        let empty = ProviderRegistry::from_config(&empty_config, dir.path().into())
+            .await
+            .unwrap();
+        let target = bamboo_domain::ProviderModelRef::new(
+            empty_config.effective_default_provider(),
+            "memory",
+        );
+        assert!(empty
+            .validate_legacy_direct_provider(&empty_config, &target, &injected, true)
+            .unwrap());
+        let guard = empty.state.write().unwrap();
+        assert!(empty
+            .validate_legacy_direct_provider(&empty_config, &target, &injected, true)
+            .is_err());
+        drop(guard);
+        empty.insert("temporary".into(), injected.clone());
+        empty.remove("temporary");
+        assert!(empty
+            .validate_legacy_direct_provider(&empty_config, &target, &injected, true)
+            .is_err());
+
+        let switched = ProviderRegistry::from_config(&empty_config, dir.path().into())
+            .await
+            .unwrap();
+        assert!(switched
+            .validate_legacy_direct_provider(&empty_config, &target, &injected, true)
+            .unwrap());
+        switched.set_default("different".into());
+        assert!(switched
+            .validate_legacy_direct_provider(&empty_config, &target, &injected, true)
+            .is_err());
+
+        let mut ghost = Config::default();
+        ghost.default_provider_instance = Some("ghost".into());
+        let unmanaged = ProviderRegistry::new(HashMap::new(), "ghost".into());
+        let ghost_target = bamboo_domain::ProviderModelRef::new("ghost", "memory");
+        assert!(unmanaged
+            .validate_legacy_direct_provider(&ghost, &ghost_target, &injected, false)
+            .is_err());
+        let registered = ProviderRegistry::new(
+            HashMap::from([("ghost".into(), injected.clone())]),
+            "ghost".into(),
+        );
+        assert!(registered
+            .validate_legacy_direct_provider(&ghost, &ghost_target, &injected, false)
+            .unwrap());
+        let other: Arc<dyn LLMProvider> = Arc::new(Noop);
+        assert!(registered
+            .validate_legacy_direct_provider(&ghost, &ghost_target, &other, false)
+            .is_err());
+
+        let mut failed_config = Config::default();
+        failed_config.provider = "openai".into();
+        let mut failed_provider = test_openai_config();
+        failed_provider.api_key.clear();
+        failed_provider.model = Some("chat".into());
+        failed_provider
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat"]));
+        failed_config.providers_mut().openai = Some(failed_provider);
+        let failed = ProviderRegistry::from_config(&failed_config, dir.path().into())
+            .await
+            .unwrap();
+        assert!(failed.get("openai").is_none());
+        let mut removed = failed_config.clone();
+        removed.providers_mut().openai = None;
+        let target = bamboo_domain::ProviderModelRef::new("openai", "memory");
+        assert!(failed
+            .validate_legacy_direct_provider(&removed, &target, &injected, true)
+            .is_err());
+    }
 
     fn legacy_memory_test_config() -> Config {
         let mut config = Config::default();
@@ -1655,6 +2069,8 @@ mod tests {
                         "relay".into(),
                         vec!["chat".into(), "fast".into()],
                     )])),
+                    runtime_models_explicit: false,
+                    managed_direct_pristine: false,
                     origin: RegistryOrigin::Managed {
                         key: Box::new(key),
                         bindings: HashMap::from([("relay".into(), binding)]),
@@ -2229,6 +2645,8 @@ mod tests {
                     metadata: HashMap::new(),
                     default_provider: "relay".into(),
                     runtime_models: Some(HashMap::from([("relay".into(), vec!["chat".into()])])),
+                    runtime_models_explicit: false,
+                    managed_direct_pristine: false,
                     origin: RegistryOrigin::Managed {
                         key: Box::new(key),
                         bindings: HashMap::from([("relay".into(), binding)]),
@@ -2309,6 +2727,8 @@ mod tests {
                 metadata: HashMap::new(),
                 default_provider: "relay".into(),
                 runtime_models: Some(HashMap::from([("relay".into(), vec!["chat".into()])])),
+                runtime_models_explicit: false,
+                managed_direct_pristine: false,
                 origin: RegistryOrigin::Managed {
                     key: Box::new(key),
                     bindings: HashMap::from([("relay".into(), binding)]),
@@ -2696,3 +3116,11 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "provider_registry_child_gold_tests.rs"]
+mod provider_registry_child_gold_tests;
+
+#[cfg(test)]
+#[path = "main_dispatch_origin_tests.rs"]
+mod main_dispatch_origin_tests;

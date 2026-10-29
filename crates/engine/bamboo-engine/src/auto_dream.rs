@@ -154,6 +154,45 @@ pub struct AutoDreamContext {
     pub provider_registry: Arc<ProviderRegistry>,
 }
 
+pub(crate) fn resolve_background_target(
+    ctx: &AutoDreamContext,
+    snapshot: &Config,
+) -> Result<Option<(Arc<dyn LLMProvider>, String)>, String> {
+    // Preserve the legacy direct-client seam only for an unmanaged SDK or
+    // an explicitly injected Host provider that is still current. A model
+    // list attached to another provider cannot authorize this direct handle.
+    if snapshot.defaults.is_none() && snapshot.provider_instances.is_empty() {
+        let Some(model) = snapshot.get_memory_background_model() else {
+            return Ok(None);
+        };
+        let injected = ctx
+            .provider
+            .legacy_injected_provider_snapshot()
+            .map_err(|error| {
+                format!("Configured background model route is unavailable: {error}")
+            })?;
+        let direct = injected.as_ref().unwrap_or(&ctx.provider);
+        let target =
+            bamboo_domain::ProviderModelRef::new(snapshot.effective_default_provider(), &model);
+        let admitted = ctx
+            .provider_registry
+            .validate_legacy_direct_provider(snapshot, &target, direct, injected.is_some())
+            .map_err(|error| {
+                format!("Configured background model route is unavailable: {error}")
+            })?;
+        if admitted {
+            return Ok(Some((direct.clone(), model)));
+        }
+    }
+    crate::model_config_helper::try_resolve_background_model(
+        snapshot,
+        snapshot.effective_default_provider(),
+        &ctx.provider_registry,
+    )
+    .map(|target| target.map(|target| (target.provider, target.model_name)))
+    .map_err(|error| format!("Configured background model route is unavailable: {error}"))
+}
+
 fn memory_store_for_context(ctx: &AutoDreamContext) -> MemoryStore {
     ctx.memory.clone()
 }
@@ -3028,19 +3067,10 @@ async fn run_auto_dream_once_for_scope(
     // ProviderModelRef). Doing this after the session check keeps an idle default-on
     // instance without a model quiet; a "no model" warn here means real work exists
     // that we can't do.
-    let resolved_background =
-        if config_snapshot.features.provider_model_ref && config_snapshot.defaults.is_some() {
-            crate::model_config_helper::resolve_background_model(
-                &config_snapshot,
-                config_snapshot.effective_default_provider(),
-                &ctx.provider_registry,
-            )
-            .map(|resolved| (resolved.provider, resolved.model_name))
-        } else {
-            config_snapshot
-                .get_memory_background_model()
-                .map(|model| (ctx.provider.clone(), model))
-        };
+    let resolved_background = {
+        let current_config = ctx.config.read().await;
+        resolve_background_target(ctx, &current_config)?
+    };
     let Some((bg_provider, model)) = resolved_background else {
         tracing::warn!(
             target: DREAM_TRACING_TARGET,
@@ -3406,6 +3436,567 @@ mod tests {
 
     fn test_registry() -> Arc<ProviderRegistry> {
         Arc::new(ProviderRegistry::new(HashMap::new(), "test".to_string()))
+    }
+
+    #[tokio::test]
+    async fn managed_empty_background_registry_rejects_work_and_unmanaged_sdk_runs_it() {
+        use crate::ledger_gardener::{run_ledger_gardener_once, LedgerGardenerContext};
+        use bamboo_domain::ledger::RecordStatus;
+
+        let temp = tempfile::tempdir().unwrap();
+        let session_store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
+        let mut config = config_with_memory(bamboo_config::MemoryConfig {
+            background_model: Some("sdk-memory".into()),
+            auto_dream_enabled: true,
+            gardener_enabled: true,
+            gardener_min_sections: 2,
+            ledger_gardener_enabled: true,
+            ledger_distillation_enabled: true,
+            ..Default::default()
+        });
+        config.provider = "openai".into();
+        assert!(config.defaults.is_none() && config.provider_instances.is_empty());
+
+        // Build a managed generation from synthetic local inputs, then remove its
+        // last provider. The SDK snapshot itself has no defaults or instances.
+        let mut registry_config = config.clone();
+        registry_config.default_provider_instance = Some("fixture".into());
+        registry_config.provider_instances.insert(
+            "fixture".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": true,
+                "api_key": "synthetic-only", "base_url": "http://127.0.0.1:1",
+                "model": "chat"
+            }))
+            .unwrap(),
+        );
+        let managed = Arc::new(
+            ProviderRegistry::from_config(&registry_config, temp.path().into())
+                .await
+                .unwrap(),
+        );
+        assert!(managed.remove("fixture").is_some());
+        assert!(managed.is_empty());
+        assert!(!managed.is_unmanaged_and_empty());
+
+        let provider = SequenceProvider::new(vec![
+            r#"{"candidates":[],"ledger_candidates":[],"source_exhausted":true}"#.into(),
+            "## Current durable context\n- Synthetic fact".into(),
+            r#"{"pieces":[]}"#.into(),
+            "[]".into(),
+        ]);
+        let mut session = Session::new("synthetic-sdk-session", "model");
+        session.add_message(Message::user("A synthetic routing fixture."));
+        storage.save_session(&session).await.unwrap();
+        memory
+            .write_session_topic(&session.id, "default", "Synthetic context")
+            .await
+            .unwrap();
+        let blob = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "synthetic blob",
+                "fact one",
+                &[],
+                Some("fixture"),
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        for text in ["fact two", "fact three", "fact four"] {
+            memory
+                .merge_memory(
+                    &blob.frontmatter.id,
+                    None,
+                    text,
+                    &[],
+                    Some("fixture"),
+                    "test",
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        let ledger = LedgerStore::new(session_store.bamboo_home_dir());
+        let mut done = LedgerRecord::new(
+            "rec_synthetic",
+            RecordKind::Habit,
+            "Synthetic completed habit",
+        );
+        done.status = RecordStatus::Done;
+        ledger.write_record(done, None).await.unwrap();
+
+        let managed_context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(provider.clone()),
+            config: Arc::new(RwLock::new(config)),
+            provider_registry: managed,
+        };
+        let dream_error = run_auto_dream_once(&managed_context).await.unwrap_err();
+        assert!(dream_error.contains("Configured background model route is unavailable"));
+        assert!(crate::gardener::run_gardener_once(&managed_context)
+            .await
+            .is_err());
+        let ledger_context = LedgerGardenerContext {
+            dream: managed_context.clone(),
+            schedule_bridge: None,
+        };
+        let ledger_result = run_ledger_gardener_once(&ledger_context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger_result.failed, 1);
+        assert_eq!(ledger_result.distilled_records, 0);
+        assert!(provider.recorded_prompts().is_empty());
+        assert!(read_test_dream(&memory, MemoryScope::Global, None)
+            .await
+            .is_none());
+        let still_pending = ledger
+            .get_record(LedgerScope::Global, None, "rec_synthetic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!still_pending
+            .record
+            .tags
+            .iter()
+            .any(|tag| tag == "distilled"));
+
+        let direct_context = AutoDreamContext {
+            provider_registry: test_registry(),
+            ..managed_context
+        };
+        let result = run_auto_dream_once(&direct_context).await.unwrap().unwrap();
+        assert_eq!(result.used_model, "sdk-memory");
+        let gardener_result = crate::gardener::run_gardener_once(&direct_context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gardener_result.flagged, 1);
+        let direct_ledger = LedgerGardenerContext {
+            dream: direct_context,
+            schedule_bridge: None,
+        };
+        let ledger_result = run_ledger_gardener_once(&direct_ledger)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger_result.distilled_records, 1);
+        assert_eq!(provider.recorded_prompts().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn unmanaged_nonempty_sdk_registry_keeps_direct_provider_for_background_consumers() {
+        use crate::ledger_gardener::{run_ledger_gardener_once, LedgerGardenerContext};
+        use bamboo_domain::ledger::RecordStatus;
+
+        let temp = tempfile::tempdir().unwrap();
+        let session_store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let storage: Arc<dyn Storage> = session_store.clone();
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
+        let mut config = config_with_memory(bamboo_config::MemoryConfig {
+            background_model: Some("sdk-memory".into()),
+            auto_dream_enabled: true,
+            gardener_enabled: true,
+            gardener_min_sections: 2,
+            ledger_gardener_enabled: true,
+            ledger_distillation_enabled: true,
+            ..Default::default()
+        });
+        config.provider = "openai".into();
+        assert!(config.defaults.is_none() && config.provider_instances.is_empty());
+
+        // Build a managed generation from synthetic local inputs, then remove its
+        // last provider. The SDK snapshot itself has no defaults or instances.
+        let mut registry_config = config.clone();
+        registry_config.default_provider_instance = Some("fixture".into());
+        registry_config.provider_instances.insert(
+            "fixture".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": true,
+                "api_key": "synthetic-only", "base_url": "http://127.0.0.1:1",
+                "model": "chat"
+            }))
+            .unwrap(),
+        );
+        let managed = Arc::new(
+            ProviderRegistry::from_config(&registry_config, temp.path().into())
+                .await
+                .unwrap(),
+        );
+        assert!(managed.remove("fixture").is_some());
+        assert!(managed.is_empty());
+        assert!(!managed.is_unmanaged_and_empty());
+
+        let provider = SequenceProvider::new(vec![
+            r#"{"candidates":[],"ledger_candidates":[],"source_exhausted":true}"#.into(),
+            "## Current durable context\n- Synthetic fact".into(),
+            r#"{"pieces":[]}"#.into(),
+            "[]".into(),
+        ]);
+        let mut session = Session::new("synthetic-sdk-session", "model");
+        session.add_message(Message::user("A synthetic routing fixture."));
+        storage.save_session(&session).await.unwrap();
+        memory
+            .write_session_topic(&session.id, "default", "Synthetic context")
+            .await
+            .unwrap();
+        let blob = memory
+            .write_memory(
+                MemoryScope::Global,
+                None,
+                DurableMemoryType::User,
+                "synthetic blob",
+                "fact one",
+                &[],
+                Some("fixture"),
+                "test",
+                false,
+                None,
+            )
+            .await
+            .unwrap();
+        for text in ["fact two", "fact three", "fact four"] {
+            memory
+                .merge_memory(
+                    &blob.frontmatter.id,
+                    None,
+                    text,
+                    &[],
+                    Some("fixture"),
+                    "test",
+                    &[],
+                )
+                .await
+                .unwrap();
+        }
+        let ledger = LedgerStore::new(session_store.bamboo_home_dir());
+        let mut done = LedgerRecord::new(
+            "rec_synthetic",
+            RecordKind::Habit,
+            "Synthetic completed habit",
+        );
+        done.status = RecordStatus::Done;
+        ledger.write_record(done, None).await.unwrap();
+
+        let managed_context = AutoDreamContext {
+            session_store,
+            storage,
+            memory: memory.clone(),
+            provider: Arc::new(provider.clone()),
+            config: Arc::new(RwLock::new(config)),
+            provider_registry: managed,
+        };
+        let dream_error = run_auto_dream_once(&managed_context).await.unwrap_err();
+        assert!(dream_error.contains("Configured background model route is unavailable"));
+        assert!(crate::gardener::run_gardener_once(&managed_context)
+            .await
+            .is_err());
+        let ledger_context = LedgerGardenerContext {
+            dream: managed_context.clone(),
+            schedule_bridge: None,
+        };
+        let ledger_result = run_ledger_gardener_once(&ledger_context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger_result.failed, 1);
+        assert_eq!(ledger_result.distilled_records, 0);
+        assert!(provider.recorded_prompts().is_empty());
+        assert!(read_test_dream(&memory, MemoryScope::Global, None)
+            .await
+            .is_none());
+        let still_pending = ledger
+            .get_record(LedgerScope::Global, None, "rec_synthetic")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!still_pending
+            .record
+            .tags
+            .iter()
+            .any(|tag| tag == "distilled"));
+
+        let wrong_provider = SequenceProvider::new(vec![
+            r#"{"candidates":[],"ledger_candidates":[],"source_exhausted":true}"#.into(),
+            "## Current durable context\n- Synthetic fact".into(),
+            r#"{"pieces":[]}"#.into(),
+            "[]".into(),
+        ]);
+        let wrong_handle: Arc<dyn LLMProvider> = Arc::new(wrong_provider.clone());
+        let direct_context = AutoDreamContext {
+            provider_registry: Arc::new(ProviderRegistry::new(
+                HashMap::from([("openai".into(), wrong_handle)]),
+                "openai".into(),
+            )),
+            ..managed_context
+        };
+        let result = run_auto_dream_once(&direct_context).await.unwrap().unwrap();
+        assert_eq!(result.used_model, "sdk-memory");
+        let gardener_result = crate::gardener::run_gardener_once(&direct_context)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(gardener_result.flagged, 1);
+        let direct_ledger = LedgerGardenerContext {
+            dream: direct_context,
+            schedule_bridge: None,
+        };
+        let ledger_result = run_ledger_gardener_once(&direct_ledger)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger_result.distilled_records, 1);
+        assert_eq!(
+            (
+                provider.recorded_prompts().len(),
+                wrong_provider.recorded_prompts().len()
+            ),
+            (4, 0),
+        );
+    }
+
+    #[tokio::test]
+    async fn managed_legacy_background_route_requires_current_admission_and_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = config_with_memory(bamboo_config::MemoryConfig {
+            background_model: Some("legacy-memory".into()),
+            ..Default::default()
+        });
+        config.default_provider_instance = Some("fixture".into());
+        config.provider_instances.insert(
+            "fixture".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai", "enabled": true,
+                "api_key": "synthetic-only", "base_url": "http://127.0.0.1:1",
+                "model": "chat"
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, temp.path().into())
+                .await
+                .unwrap(),
+        );
+        let session_store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let direct = SequenceProvider::new(vec![]);
+        let ctx = AutoDreamContext {
+            storage: session_store.clone(),
+            session_store,
+            memory: MemoryStore::new(temp.path().join("jiandu")),
+            provider: Arc::new(direct.clone()),
+            config: Arc::new(RwLock::new(config.clone())),
+            provider_registry: registry.clone(),
+        };
+        let target = bamboo_domain::ProviderModelRef::new("fixture", "legacy-memory");
+        assert!(registry
+            .provider_for_configured_model(&config, &target)
+            .is_err());
+        let (selected, model) = resolve_background_target(&ctx, &config).unwrap().unwrap();
+        assert_eq!(model, "legacy-memory");
+        assert!(Arc::ptr_eq(&selected, &registry.get("fixture").unwrap()));
+
+        let mut disabled = config.clone();
+        disabled
+            .provider_instances
+            .get_mut("fixture")
+            .unwrap()
+            .enabled = false;
+        assert!(resolve_background_target(&ctx, &disabled).is_err());
+        let mut denied = config.clone();
+        denied
+            .provider_instances
+            .get_mut("fixture")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["chat"]));
+        assert!(resolve_background_target(&ctx, &denied).is_err());
+        let mut invalid = config.clone();
+        invalid
+            .provider_instances
+            .get_mut("fixture")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(null));
+        assert!(resolve_background_target(&ctx, &invalid).is_err());
+        let mut stale = config.clone();
+        stale.provider_instances.get_mut("fixture").unwrap().api_key = "changed-synthetic".into();
+        assert!(resolve_background_target(&ctx, &stale).is_err());
+        let mut explicit = config.clone();
+        explicit.defaults = Some(
+            serde_json::from_value(serde_json::json!({
+                "chat": {"provider": "missing", "model": "chat"}
+            }))
+            .unwrap(),
+        );
+        assert!(resolve_background_target(&ctx, &explicit).is_err());
+        assert!(direct.recorded_prompts().is_empty());
+    }
+
+    struct PausedCandidateStorage {
+        inner: Arc<SessionStoreV2>,
+        loads: AtomicUsize,
+        reached: tokio::sync::Barrier,
+        release: tokio::sync::Barrier,
+    }
+
+    #[async_trait]
+    impl Storage for PausedCandidateStorage {
+        async fn save_session(&self, session: &Session) -> std::io::Result<()> {
+            self.inner.save_session(session).await
+        }
+        async fn delete_session(&self, id: &str) -> std::io::Result<bool> {
+            self.inner.delete_session(id).await
+        }
+        async fn load_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+            let session = self.inner.load_session(id).await?;
+            if self.loads.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.reached.wait().await;
+                self.release.wait().await;
+            }
+            Ok(session)
+        }
+    }
+
+    #[tokio::test]
+    async fn dream_uses_current_background_route_after_candidate_scan() {
+        use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+        let temp = tempfile::tempdir().unwrap();
+        let state = RoutingContext::new(None);
+        state
+            .config
+            .write()
+            .await
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = true;
+        *state.providers["memory-c"].failure.lock().unwrap() = Some(Failure::Auth);
+        let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+        let session = RoutingContext::session();
+        store.save_session(&session).await.unwrap();
+        let paused = Arc::new(PausedCandidateStorage {
+            inner: store.clone(),
+            loads: AtomicUsize::new(0),
+            reached: tokio::sync::Barrier::new(2),
+            release: tokio::sync::Barrier::new(2),
+        });
+        let memory = MemoryStore::new(temp.path().join("jiandu"));
+        memory
+            .write_session_topic(&session.id, "default", "Synthetic context")
+            .await
+            .unwrap();
+        let ctx = AutoDreamContext {
+            session_store: store,
+            storage: paused.clone(),
+            memory,
+            provider: state.providers["chat-a"].clone(),
+            config: state.config.clone(),
+            provider_registry: state.registry.clone(),
+        };
+        let update = async {
+            tokio::time::timeout(Duration::from_secs(5), paused.reached.wait())
+                .await
+                .unwrap();
+            state
+                .config
+                .write()
+                .await
+                .defaults
+                .as_mut()
+                .unwrap()
+                .memory_background =
+                Some(bamboo_domain::ProviderModelRef::new("missing", "unknown"));
+            paused.release.wait().await;
+        };
+        let (result, ()) = tokio::join!(run_auto_dream_once(&ctx), update);
+        assert!(result.is_err());
+        state.assert_no_requests();
+    }
+
+    #[tokio::test]
+    async fn routing_contract_auto_dream_keeps_live_global_background_targets_without_account_retry(
+    ) {
+        use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+        for flag in [None, Some(false), Some(true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let state = RoutingContext::new(flag);
+            state
+                .config
+                .write()
+                .await
+                .memory_mut()
+                .get_or_insert_with(Default::default)
+                .auto_dream_enabled = true;
+            for provider in state.providers.values() {
+                *provider.failure.lock().unwrap() = Some(Failure::Auth);
+            }
+            let session_store = Arc::new(
+                SessionStoreV2::new(directory.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let storage: Arc<dyn Storage> = session_store.clone();
+            let session = RoutingContext::session();
+            storage.save_session(&session).await.unwrap();
+            let memory = MemoryStore::new(directory.path());
+            memory
+                .write_session_topic(&session.id, "default", "Synthetic routing context")
+                .await
+                .unwrap();
+            let context = AutoDreamContext {
+                session_store,
+                storage,
+                memory: memory.clone(),
+                provider: state.providers["chat-a"].clone(),
+                config: state.config.clone(),
+                provider_registry: state.registry.clone(),
+            };
+            assert!(run_auto_dream_once_with_store(&context, &memory)
+                .await
+                .is_err());
+            assert_eq!(state.models("memory-c"), vec!["background-c".to_string()]);
+            assert!(state.requests("chat-a").is_empty());
+            assert!(state.requests("fast-b").is_empty());
+
+            state
+                .config
+                .write()
+                .await
+                .defaults
+                .as_mut()
+                .unwrap()
+                .memory_background = None;
+            assert!(run_auto_dream_once_with_store(&context, &memory)
+                .await
+                .is_err());
+            assert_eq!(state.models("fast-b"), vec!["cheap-b".to_string()]);
+            assert!(state.requests("chat-a").is_empty());
+            state
+                .config
+                .write()
+                .await
+                .defaults
+                .as_mut()
+                .unwrap()
+                .memory_background = Some(bamboo_domain::ProviderModelRef::new(
+                "missing-account",
+                "unknown",
+            ));
+            assert!(run_auto_dream_once_with_store(&context, &memory)
+                .await
+                .is_err());
+            assert_eq!(state.requests("fast-b").len(), 1);
+            assert_eq!(state.requests("memory-c").len(), 1);
+            assert!(state.requests("chat-a").is_empty());
+        }
     }
 
     fn test_time(seconds: i64) -> DateTime<Utc> {
