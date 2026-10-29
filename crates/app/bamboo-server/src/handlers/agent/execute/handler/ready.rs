@@ -188,6 +188,13 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     };
     let (provider_override, provider_override_managed_registry) = selected_override;
 
+    #[cfg(test)]
+    super::super::tests::after_legacy_vision_provider_selection(
+        session_id,
+        provider_override_managed_registry.is_some(),
+    )
+    .await;
+
     // Consult the same provider/model that will execute this session. A legacy
     // Error fallback must not reject explicitly supported native image input.
     let vision_provider = match provider_override.as_ref() {

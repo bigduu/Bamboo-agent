@@ -174,6 +174,36 @@ pub(super) async fn after_root_admission_selection(id: &str, reserved: bool) {
     }
 }
 
+// Test-only gate after the real Ready path selects its concrete provider.
+// The keyed rendezvous leaves ordinary production and unrelated tests untouched.
+type LegacyVisionSelectionGate = (
+    tokio::sync::oneshot::Sender<bool>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+fn legacy_vision_selection_gates(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, LegacyVisionSelectionGate>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LegacyVisionSelectionGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(std::sync::Mutex::default)
+}
+pub(super) async fn after_legacy_vision_provider_selection(id: &str, managed: bool) {
+    let gate = legacy_vision_selection_gates().lock().unwrap().remove(id);
+    if let Some((selected, resume)) = gate {
+        let _ = selected.send(managed);
+        let _ = resume.await;
+    }
+}
+struct LegacyVisionSelectionProbe(String);
+impl Drop for LegacyVisionSelectionProbe {
+    fn drop(&mut self) {
+        legacy_vision_selection_gates()
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
+
 // Reachable only on the repaired HTTP ownership path. Baseline counterfactual
 // runs target the four early-selection races, never this secondary-only gate.
 impl crate::AppState {
@@ -5468,6 +5498,232 @@ mod execution_input_http {
         } else {
             shutdown_rejected_race(&state, &[&id]).await;
         }
+    }
+
+    /// A prepared Host run must never combine the old concrete account with a
+    /// Vision model taken from a newer configuration for the same provider id.
+    #[actix_web::test]
+    async fn vision_legacy_same_provider_reload_keeps_image_destination_bound() {
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+        let mut observations = Vec::new();
+        for (changed, replace_registry) in [(false, false), (true, false), (true, true)] {
+            let a = MockServer::start().await;
+            let b = MockServer::start().await;
+            let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic image description\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+            for server in [&a, &b] {
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+                    .mount(server)
+                    .await;
+            }
+            let home = tempfile::tempdir().unwrap();
+            let mut old = bamboo_llm::Config::default();
+            *old.memory_mut() = Some(
+                serde_json::from_value(serde_json::json!({
+                    "auto_dream_enabled":false, "project_prompt_injection":false,
+                    "relevant_recall":false, "relevant_recall_rerank":false,
+                    "project_first_dream":false, "ledger_agenda_injection":false
+                }))
+                .unwrap(),
+            );
+            let memory = old.memory().as_ref().unwrap();
+            assert!(
+                !memory.auto_dream_enabled
+                    && !memory.project_prompt_injection
+                    && !memory.relevant_recall
+                    && !memory.relevant_recall_rerank
+                    && !memory.project_first_dream
+                    && !memory.ledger_agenda_injection
+            );
+            old.provider = "openai".into();
+            old.default_provider_instance = Some("openai".into());
+            old.features.provider_model_ref = true;
+            old.http_proxy = "http://127.0.0.1:9".into();
+            old.https_proxy.clear();
+            old.hooks.image_fallback.enabled = true;
+            old.hooks.image_fallback.mode = "vision".into();
+            old.defaults = Some(
+                serde_json::from_value(serde_json::json!({
+                    "chat": {"provider":"openai", "model":"test-model"},
+                    "fast": {"provider":"openai", "model":"test-model"},
+                    "vision": {"provider":"openai", "model":"vision-old"}
+                }))
+                .unwrap(),
+            );
+            old.provider_instances.insert("openai".into(), serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic-old",
+                "base_url":a.uri(), "model":"test-model", "vision_model":"vision-old",
+                "runtime_models":["test-model","vision-old","vision-new"],
+                "model_capabilities":{"vision-old":{"supports_vision":true},"vision-new":{"supports_vision":true}}
+            })).unwrap());
+            let mut app = crate::AppState::new_with_provider_and_memory_store(
+                home.path().to_path_buf(),
+                old.clone(),
+                Arc::new(LocalProvider),
+                bamboo_memory::memory_store::MemoryStore::new(home.path().join("jiandu")),
+            )
+            .await
+            .unwrap();
+            app.stop_config_watcher_for_test();
+            app.provider_registry.replace_with(
+                ProviderRegistry::from_config(&old, home.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            app.provider_router = Arc::new(ProviderModelRouter::new(app.provider_registry.clone()));
+            let state = web::Data::new(app);
+            let id = format!("synthetic-legacy-vision-reload-{changed}-{replace_registry}");
+            let mut session = owned_http_session(&state, &id);
+            session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "test-model"));
+            let image = bamboo_agent_core::Message::user_with_parts(
+                "Inspect the synthetic pixel",
+                vec![bamboo_domain::MessagePart::ImageUrl {
+                    image_url: bamboo_domain::ImageUrlRef {
+                        url: PIXEL.into(),
+                        detail: None,
+                    },
+                }],
+            );
+            let image_id = image.id.clone();
+            let original_parts = image.content_parts.clone();
+            session.add_message(image);
+            state.storage.save_session(&session).await.unwrap();
+            state.session_store.save_session(&session).await.unwrap();
+
+            let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            assert!(legacy_vision_selection_gates()
+                .lock()
+                .unwrap()
+                .insert(id.clone(), (selected_tx, resume_rx))
+                .is_none());
+            let _probe = LegacyVisionSelectionProbe(id.clone());
+            let mut next = old.clone();
+            next.defaults.as_mut().unwrap().vision =
+                Some(bamboo_domain::ProviderModelRef::new("openai", "vision-new"));
+            let instance = next.provider_instances.get_mut("openai").unwrap();
+            instance.base_url = Some(b.uri());
+            instance.api_key = "synthetic-new".into();
+            instance.vision_model = Some("vision-new".into());
+            let replacement = if changed && replace_registry {
+                Some(
+                    ProviderRegistry::from_config(&next, home.path().to_path_buf())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let update = async {
+                let managed = tokio::time::timeout(std::time::Duration::from_secs(10), selected_rx)
+                    .await
+                    .expect("Host selected its original provider")
+                    .expect("selection gate");
+                if let Some(replacement) = replacement {
+                    state.provider_registry.replace_with(replacement);
+                }
+                if changed {
+                    *state.config.write().await = next;
+                }
+                resume_tx.send(()).expect("resume selected Host run");
+                managed
+            };
+            let ((status, body), managed) = tokio::join!(execute(&state, &id, None), update);
+            assert!(
+                managed,
+                "the original selected A1 client must have managed provenance"
+            );
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let run = body["run_id"].as_str().expect("accepted run").to_string();
+            let failure = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let terminal = {
+                        let runners = state.agent_runners.read().await;
+                        runners.get(&id).and_then(|runner| {
+                            if runner.run_id != run {
+                                return None;
+                            }
+                            match &runner.status {
+                                AgentStatus::Completed => Some(None),
+                                AgentStatus::Error(error) => Some(Some(error.clone())),
+                                AgentStatus::Cancelled => {
+                                    Some(Some("unexpected cancellation".into()))
+                                }
+                                AgentStatus::Pending | AgentStatus::Running => None,
+                            }
+                        })
+                    };
+                    if let Some(failure) = terminal {
+                        break failure;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("synthetic Host run must retire");
+            let seen = |requests: &[wiremock::Request], model: &str| {
+                requests.iter().any(|request| {
+                    request
+                        .body_json::<serde_json::Value>()
+                        .ok()
+                        .is_some_and(|body| body["model"] == model)
+                        && String::from_utf8_lossy(&request.body).contains(PIXEL)
+                })
+            };
+            let a_requests = a.received_requests().await.unwrap();
+            let b_requests = b.received_requests().await.unwrap();
+            let mut image_routes = Vec::new();
+            for (endpoint, requests) in [("A1", &a_requests), ("A2", &b_requests)] {
+                for request in requests {
+                    if String::from_utf8_lossy(&request.body).contains(PIXEL) {
+                        let model = request
+                            .body_json::<serde_json::Value>()
+                            .ok()
+                            .and_then(|body| body["model"].as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "<missing>".into());
+                        image_routes.push((endpoint.to_string(), model));
+                    }
+                }
+            }
+            let saved = state.storage.load_session(&id).await.unwrap().unwrap();
+            let preserved = saved
+                .messages
+                .iter()
+                .find(|m| m.id == image_id)
+                .is_some_and(|m| m.content_parts == original_parts);
+            observations.push((
+                changed,
+                replace_registry,
+                seen(&a_requests, "vision-old"),
+                seen(&a_requests, "vision-new"),
+                seen(&b_requests, "vision-new"),
+                failure,
+                preserved,
+                image_routes,
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .expect("shutdown synthetic Host");
+        }
+        let control = &observations[0];
+        assert!(
+            control.2
+                && !control.3
+                && !control.4
+                && control.5.is_none()
+                && control.6
+                && control.7 == [("A1".to_string(), "vision-old".to_string())],
+            "unchanged A1 must receive vision-old and succeed: {observations:?}"
+        );
+        assert!(observations.iter().skip(1).all(|(_, _, a_old, a_new, b_new, failure, preserved, routes)| {
+            let source_refused = failure.as_ref().is_some_and(|error|
+                error.contains("Legacy Vision provider source changed"));
+            let valid_routes = routes.len() <= 1 && routes.iter().all(|(endpoint, model)|
+                (endpoint == "A1" && model == "vision-old") || (endpoint == "A2" && model == "vision-new"));
+            !a_new && valid_routes && (((*a_old || *b_new) && failure.is_none()) || source_refused) && *preserved
+        }), "a configuration reload must not send a new Vision model through old A1: {observations:?}");
     }
 
     #[actix_web::test]
