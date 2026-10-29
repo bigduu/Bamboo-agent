@@ -1,8 +1,11 @@
 //! Codec and actual Main publishers/readers; no prefix-only permission grant.
 use super::*;
 use bamboo_domain::{
-    Message, SupervisorManagedLink, SupervisorManagementMutation, SupervisorManagementRequest,
-    SupervisorManagementState, SupervisorReference, MAX_SUPERVISOR_LINKS, MAX_SUPERVISOR_PROJECTS,
+    ActorActivationFence, Message, SessionMessageId, SupervisedRootOutcomeInput,
+    SupervisedRootOutcomeResult, SupervisedRootOutcomes, SupervisorManagedLink,
+    SupervisorManagementMutation, SupervisorManagementRequest, SupervisorManagementState,
+    SupervisorReference, ACTOR_DIRECTORY_SCHEMA_VERSION, MAX_SUPERVISOR_LINKS,
+    MAX_SUPERVISOR_PROJECTS,
 };
 use serde_json::{json, value::RawValue, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -66,6 +69,429 @@ fn assert_pair(directory: &Path, expected: &Session) {
     let side: Session = serde_json::from_value(side).unwrap();
     assert_eq!(side.created_at, expected.created_at);
     assert_eq!(side.authority_identity, expected.authority_identity);
+}
+
+fn synthetic_outcome_session() -> Session {
+    let mut session = Session::new("outcome-root", "synthetic-model");
+    let mut message = Message::user("synthetic input");
+    message.id = "private-receipt-1".into();
+    session.add_message(message);
+    let fence = ActorActivationFence {
+        schema_version: ACTOR_DIRECTORY_SCHEMA_VERSION,
+        actor_id: session.id.clone(),
+        activation_id: "private-activation-1".into(),
+        attempt: 1,
+        run_id: "private-run-1".into(),
+        lease_owner: "synthetic-owner".into(),
+        lease_epoch: 1,
+    };
+    let mut outcomes = SupervisedRootOutcomes::new(&session.id, session.created_at).unwrap();
+    outcomes.reserve(&fence, None).unwrap();
+    outcomes
+        .record_input(
+            &fence,
+            SupervisedRootOutcomeInput {
+                receipt_id: SessionMessageId::parse("private-receipt-1").unwrap(),
+                generation: 1,
+                supervisor_origin: None,
+            },
+        )
+        .unwrap();
+    outcomes
+        .finalize(&fence, SupervisedRootOutcomeResult::Completed)
+        .unwrap();
+    session
+        .runtime_metadata
+        .get_or_insert_with(Default::default)
+        .supervised_root_outcomes = Some(outcomes);
+    session
+}
+
+// Exact field whitelist of the previously shipped compact-aware reader.
+// Pre-framing versions that never understood compact Main are not covered.
+#[allow(dead_code)]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PreviousCompactAuthority {
+    id: Value,
+    created_at: Value,
+    kind: Value,
+    parent_session_id: Value,
+    #[serde(default)]
+    parent_created_at: Option<Value>,
+    root_session_id: Value,
+    spawn_depth: Value,
+    authority_identity: Value,
+    metadata_version: Value,
+    project_id: Value,
+    root_orchestration_only: Value,
+    root_tool_authority_revision: Value,
+    root_mode_transition_epoch: Value,
+    root_mode_operations: Value,
+    supervisor_management: Value,
+    #[serde(default)]
+    conversation_reset: Option<Value>,
+    title_label: Value,
+}
+
+struct PauseOutcomeFullSave {
+    inner: Arc<SessionStoreV2>,
+    reached: Arc<tokio::sync::Barrier>,
+    release: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl Storage for PauseOutcomeFullSave {
+    async fn save_session(&self, session: &Session) -> io::Result<()> {
+        self.reached.wait().await;
+        self.release.wait().await;
+        self.inner.save_session(session).await
+    }
+
+    async fn load_session(&self, id: &str) -> io::Result<Option<Session>> {
+        self.inner.load_session(id).await
+    }
+
+    async fn delete_session(&self, id: &str) -> io::Result<bool> {
+        self.inner.delete_session(id).await
+    }
+}
+
+#[test]
+fn compact_root_outcomes_are_committed_without_disclosing_history_to_graph_readers() {
+    let session = synthetic_outcome_session();
+    let raw = encoded(&session);
+    let header = section(&raw);
+    let text = std::str::from_utf8(header).unwrap();
+    assert!(header.len() < 4096);
+    for private in ["private-receipt-1", "private-activation-1", "private-run-1"] {
+        assert!(!text.contains(private));
+    }
+    assert_eq!(
+        payload(&raw)["supervised_root_outcomes_sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    let projected = compact_main::decode_v1_section(header, header.len())
+        .unwrap()
+        .into_snapshot_session();
+    assert!(projected
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        .is_none());
+    assert!(compact_main::validate_full_main(&raw).unwrap().is_some());
+
+    let mut changed = serde_json::to_value(&session.runtime_metadata).unwrap();
+    changed["supervised_root_outcomes"]["facts"][0]["run_id"] = json!("other-run");
+    assert!(
+        compact_main::validate_full_main(&corrupt_flat(&raw, "runtime_metadata", changed)).is_err()
+    );
+    let mut wrong_header = payload(&raw);
+    wrong_header["supervised_root_outcomes_sha256"] = json!("0".repeat(64));
+    assert!(compact_main::validate_full_main(&with_payload(&wrong_header, &session)).is_err());
+    assert!(compact_main::validate_full_main(&flat(&session)).is_err());
+    let mut duplicate_runtime = String::from_utf8(flat(&session)).unwrap();
+    let object_end = duplicate_runtime.rfind('}').unwrap();
+    duplicate_runtime.insert_str(object_end, ",\"runtime_metadata\":null");
+    assert!(compact_main::validate_full_main(duplicate_runtime.as_bytes()).is_err());
+    assert!(serde_json::from_value::<PreviousCompactAuthority>(payload(&raw)).is_err());
+    let old = encoded(&Session::new("old-root", "synthetic-model"));
+    assert!(serde_json::from_value::<PreviousCompactAuthority>(payload(&old)).is_ok());
+}
+
+#[tokio::test]
+async fn root_outcomes_reject_generic_forgery_and_legacy_clear_without_side_effects() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let with_outcome = synthetic_outcome_session();
+    let mut initial = with_outcome.clone();
+    initial
+        .runtime_metadata
+        .as_mut()
+        .unwrap()
+        .supervised_root_outcomes = None;
+    store.save_session(&initial).await.unwrap();
+    let directory = home.path().join("sessions").join(&initial.id);
+    std::fs::create_dir_all(directory.join("attachments")).unwrap();
+    std::fs::write(directory.join("attachments/keep.bin"), b"synthetic").unwrap();
+    let before = files(&directory);
+    let rejection = store.save_session(&with_outcome).await.unwrap_err();
+    assert_eq!(rejection.kind(), io::ErrorKind::PermissionDenied);
+    assert!(rejection
+        .get_ref()
+        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()));
+    assert_eq!(files(&directory), before);
+
+    // Seed a synthetic committed Main. A production producer must instead
+    // prove its retained Actor and publish through a fenced transaction.
+    std::fs::write(directory.join("session.json"), encoded(&with_outcome)).unwrap();
+    let loaded = store.load_session(&initial.id).await.unwrap().unwrap();
+    assert_eq!(
+        loaded
+            .runtime_metadata
+            .as_ref()
+            .unwrap()
+            .supervised_root_outcomes,
+        with_outcome
+            .runtime_metadata
+            .as_ref()
+            .unwrap()
+            .supervised_root_outcomes
+    );
+    let before = files(&directory);
+    assert_eq!(
+        store.clear_session(&initial.id).await.unwrap_err().kind(),
+        io::ErrorKind::Unsupported
+    );
+    assert_eq!(files(&directory), before);
+
+    // A sidecar may lead Main after a crash. Even a syntactically valid copy
+    // of the facts must not be returned by a control-plane-only reader.
+    let side_path = directory.join(RUNTIME_SIDECAR_FILE);
+    let valid_side = std::fs::read(&side_path).unwrap();
+    let mut forged_side: Session = serde_json::from_slice(&valid_side).unwrap();
+    forged_side
+        .runtime_metadata
+        .get_or_insert_with(Default::default)
+        .supervised_root_outcomes = with_outcome
+        .runtime_metadata
+        .as_ref()
+        .unwrap()
+        .supervised_root_outcomes
+        .clone();
+    std::fs::write(&side_path, serde_json::to_vec_pretty(&forged_side).unwrap()).unwrap();
+    assert!(store.load_runtime_control_plane(&initial.id).await.is_err());
+    assert!(store.load_root_authority(&initial.id).await.is_err());
+    std::fs::write(&side_path, valid_side).unwrap();
+    assert_eq!(files(&directory), before);
+
+    let mut removed = loaded;
+    removed
+        .runtime_metadata
+        .as_mut()
+        .unwrap()
+        .supervised_root_outcomes = None;
+    assert_eq!(
+        store.save_session(&removed).await.unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(files(&directory), before);
+}
+
+#[tokio::test]
+async fn stale_outcome_full_save_adopts_main_and_runtime_callback_is_untrusted() {
+    use crate::session_merge::LockedSessionStore;
+
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let with_outcome = synthetic_outcome_session();
+    let mut stale = with_outcome.clone();
+    stale
+        .runtime_metadata
+        .as_mut()
+        .unwrap()
+        .supervised_root_outcomes = None;
+    store.save_session(&stale).await.unwrap();
+    let directory = home.path().join("sessions").join(&stale.id);
+    // Simulated previously committed Main; no generic production writer is
+    // permitted to create this field.
+    std::fs::write(directory.join("session.json"), encoded(&with_outcome)).unwrap();
+    let expected = with_outcome
+        .runtime_metadata
+        .as_ref()
+        .unwrap()
+        .supervised_root_outcomes
+        .clone();
+    let storage: Arc<dyn Storage> = store.clone();
+    let locked = LockedSessionStore::new(storage);
+    let full_published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let callback = full_published.clone();
+    locked
+        .merge_save_runtime_and_publish(&mut stale, move |_, committed| {
+            callback.store(committed, std::sync::atomic::Ordering::SeqCst);
+        })
+        .await
+        .unwrap();
+    assert!(full_published.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(
+        stale.runtime_metadata.as_ref().unwrap().supervised_root_outcomes,
+        expected
+    );
+
+    let mut forged = with_outcome.clone();
+    forged
+        .runtime_metadata
+        .as_mut()
+        .unwrap()
+        .supervised_root_outcomes
+        .as_mut()
+        .unwrap()
+        .facts[0]
+        .result = Some(SupervisedRootOutcomeResult::Failed);
+    let runtime_published = Arc::new(std::sync::Mutex::new(None));
+    let callback = runtime_published.clone();
+    locked
+        .save_runtime_only_and_publish(&mut forged, move |saved| {
+            *callback.lock().unwrap() = Some(
+                saved
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.supervised_root_outcomes.clone()),
+            );
+        })
+        .await
+        .unwrap();
+    assert_eq!(*runtime_published.lock().unwrap(), Some(None));
+    let durable = store.load_session(&stale.id).await.unwrap().unwrap();
+    assert_eq!(
+        durable
+            .runtime_metadata
+            .as_ref()
+            .unwrap()
+            .supervised_root_outcomes,
+        expected
+    );
+
+    let mut same_session = with_outcome.clone();
+    locked
+        .save_runtime_only_and_publish(&mut same_session, |_| {})
+        .await
+        .unwrap();
+    assert_eq!(
+        same_session
+            .runtime_metadata
+            .as_ref()
+            .unwrap()
+            .supervised_root_outcomes,
+        expected
+    );
+    locked
+        .merge_save_runtime_and_publish(&mut same_session, |_, committed| {
+            assert!(committed);
+        })
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn runtime_only_fallback_keeps_main_outcomes_on_jsonl_storage() {
+    use crate::session_merge::LockedSessionStore;
+
+    let home = tempfile::tempdir().unwrap();
+    let jsonl = Arc::new(crate::jsonl::JsonlStorage::new(home.path()));
+    jsonl.init().await.unwrap();
+    let mut session = synthetic_outcome_session();
+    jsonl.save_session(&session).await.unwrap();
+    let expected = session
+        .runtime_metadata
+        .as_ref()
+        .unwrap()
+        .supervised_root_outcomes
+        .clone();
+    let storage: Arc<dyn Storage> = jsonl.clone();
+    let locked = LockedSessionStore::new(storage);
+    let published = Arc::new(std::sync::Mutex::new(None));
+    let callback = published.clone();
+    locked
+        .save_runtime_only_and_publish(&mut session, move |saved| {
+            *callback.lock().unwrap() = Some(
+                saved
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.supervised_root_outcomes.clone()),
+            );
+        })
+        .await
+        .unwrap();
+    assert_eq!(*published.lock().unwrap(), Some(None));
+    assert_eq!(
+        session
+            .runtime_metadata
+            .as_ref()
+            .unwrap()
+            .supervised_root_outcomes,
+        expected
+    );
+    assert_eq!(
+        jsonl
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .runtime_metadata
+            .unwrap()
+            .supervised_root_outcomes,
+        expected
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn outcome_changed_after_merge_read_rejects_full_save_and_callback() {
+    use crate::session_merge::LockedSessionStore;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let home = tempfile::tempdir().unwrap();
+    let inner = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let with_outcome = synthetic_outcome_session();
+    let mut stale = with_outcome.clone();
+    stale
+        .runtime_metadata
+        .as_mut()
+        .unwrap()
+        .supervised_root_outcomes = None;
+    inner.save_session(&stale).await.unwrap();
+    let directory = home.path().join("sessions").join(&stale.id);
+    let reached = Arc::new(tokio::sync::Barrier::new(2));
+    let release = Arc::new(tokio::sync::Barrier::new(2));
+    let storage: Arc<dyn Storage> = Arc::new(PauseOutcomeFullSave {
+        inner: inner.clone(),
+        reached: reached.clone(),
+        release: release.clone(),
+    });
+    let published = Arc::new(AtomicBool::new(false));
+    let callback = published.clone();
+    let writer = tokio::spawn(async move {
+        let locked = LockedSessionStore::new(storage);
+        locked
+            .merge_save_runtime_and_publish(&mut stale, move |_, _| {
+                callback.store(true, Ordering::SeqCst);
+            })
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached.wait())
+        .await
+        .unwrap();
+    // A synthetic Main replacement marks the competing commit boundary. This
+    // exercises the final writer's lock-time check, not an Actor producer.
+    std::fs::write(directory.join("session.json"), encoded(&with_outcome)).unwrap();
+    release.wait().await;
+    let error = tokio::time::timeout(Duration::from_secs(10), writer)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert!(error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()));
+    assert!(!published.load(Ordering::SeqCst));
+    assert_eq!(
+        inner
+            .load_session(&with_outcome.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .runtime_metadata
+            .unwrap()
+            .supervised_root_outcomes,
+        with_outcome
+            .runtime_metadata
+            .unwrap()
+            .supervised_root_outcomes
+    );
 }
 
 #[test]

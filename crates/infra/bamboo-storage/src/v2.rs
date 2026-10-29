@@ -749,6 +749,9 @@ pub(crate) fn runtime_sidecar_snapshot(session: &Session) -> Session {
         // allow a crash between the two files to expose dedupe state without
         // the corresponding message.
         metadata.session_inbox_admission = None;
+        // Outcome facts share Main's final-input/output commit boundary. A
+        // leading runtime sidecar cannot prove the final Main was committed.
+        metadata.supervised_root_outcomes = None;
     }
     snapshot
 }
@@ -767,6 +770,10 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
                 .runtime_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.session_inbox_admission.clone());
+            let outcomes = main
+                .runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.supervised_root_outcomes.clone());
             side.messages = main.messages;
             side.provider_transcript = main.provider_transcript;
             if let Some(admission) = admission {
@@ -776,10 +783,170 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
             } else if let Some(metadata) = side.runtime_metadata.as_mut() {
                 metadata.session_inbox_admission = None;
             }
+            if let Some(outcomes) = outcomes {
+                side.runtime_metadata
+                    .get_or_insert_with(Default::default)
+                    .supervised_root_outcomes = Some(outcomes);
+            } else if let Some(metadata) = side.runtime_metadata.as_mut() {
+                metadata.supervised_root_outcomes = None;
+            }
             side
         }
         None => main,
     }
+}
+
+/// A same-owner full save may race another Store's Main+Inbox checkpoint.
+/// Retain each already tracked typed input and its admission cursor under the
+/// physical Root lock; a conflicting same-ID message must never be rebased.
+fn rebase_supervised_input_transcript(
+    incoming: &mut Session,
+    durable: &Session,
+    outcomes: &bamboo_domain::SupervisedRootOutcomes,
+) -> io::Result<()> {
+    let conflict = |message: &str| {
+        io::Error::new(
+            io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(message.into()),
+        )
+    };
+    let insertions = {
+        let mut tracked: std::collections::HashMap<&str, Vec<_>> = std::collections::HashMap::new();
+        for input in outcomes.facts.iter().flat_map(|fact| &fact.inputs) {
+            tracked
+                .entry(input.receipt_id.as_str())
+                .or_default()
+                .push(input);
+        }
+        let mut durable_tracked = std::collections::HashMap::new();
+        for message in &durable.messages {
+            if tracked.contains_key(message.id.as_str())
+                && durable_tracked
+                    .insert(message.id.as_str(), message)
+                    .is_some()
+            {
+                return Err(conflict("tracked Root input is ambiguous"));
+            }
+        }
+        let mut existing = std::collections::HashMap::new();
+        for (index, message) in incoming.messages.iter().enumerate() {
+            match existing.entry(message.id.as_str()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(index);
+                }
+                std::collections::hash_map::Entry::Occupied(_)
+                    if tracked.contains_key(message.id.as_str()) =>
+                {
+                    return Err(conflict("tracked Root input changed"));
+                }
+                std::collections::hash_map::Entry::Occupied(_) => {}
+            }
+        }
+        for (id, inputs) in &tracked {
+            let message = durable_tracked
+                .get(id)
+                .ok_or_else(|| conflict("tracked Root input is missing"))?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(
+                message
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("session_message"))
+                    .cloned()
+                    .ok_or_else(|| conflict("tracked Root input marker is missing"))?,
+            )
+            .map_err(|_| conflict("invalid tracked Root input"))?;
+            if envelope.target_session_id != durable.id
+                || !bamboo_domain::is_matching_session_message(message, &envelope)
+                || inputs.iter().any(|input| {
+                    input
+                        .supervisor_origin
+                        .as_ref()
+                        .is_some_and(|origin| !origin.matches_input_envelope(&envelope))
+                })
+            {
+                return Err(conflict("tracked Root input marker differs"));
+            }
+            if let Some(index) = existing.get(id) {
+                if !bamboo_domain::is_matching_session_message(
+                    &incoming.messages[*index],
+                    &envelope,
+                ) {
+                    return Err(conflict("tracked Root input changed"));
+                }
+            }
+        }
+
+        // Reproduce the ordinary admitted-input rebase without its repeated
+        // transcript scans. Existing neighbours anchor missing messages in
+        // durable order; a contradictory anchor order fails closed.
+        let admission = durable.session_inbox_admission();
+        let is_admitted = |message: &bamboo_domain::Message| {
+            let typed = message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("session_message"))
+                .is_some_and(|marker| {
+                    marker.get("id").and_then(serde_json::Value::as_str)
+                        == Some(message.id.as_str())
+                        && marker
+                            .get("target_session_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(durable.id.as_str())
+                        && bamboo_domain::SessionMessageId::parse(message.id.clone()).is_ok()
+                });
+            typed || admission.is_some_and(|state| state.contains_str(&message.id))
+        };
+        let mut next = None;
+        let mut next_anchor = std::collections::HashMap::new();
+        for (index, message) in durable.messages.iter().enumerate().rev() {
+            if let Some(position) = existing.get(message.id.as_str()) {
+                next = Some(*position);
+            } else if is_admitted(message) {
+                next_anchor.insert(index, next);
+            }
+        }
+        let mut previous = None;
+        let mut anchors_reordered = false;
+        let mut restored = std::collections::HashSet::new();
+        let mut insertions = Vec::new();
+        for (index, message) in durable.messages.iter().enumerate() {
+            if let Some(position) = existing.get(message.id.as_str()) {
+                if previous.is_some_and(|prior| prior > *position) {
+                    anchors_reordered = true;
+                }
+                previous = Some(*position);
+            } else if is_admitted(message) && restored.insert(message.id.as_str()) {
+                let position = previous
+                    .map(|prior| prior + 1)
+                    .or_else(|| next_anchor.get(&index).copied().flatten())
+                    .unwrap_or(incoming.messages.len());
+                insertions.push((position, index, message.clone()));
+            }
+        }
+        if anchors_reordered && !insertions.is_empty() {
+            return Err(conflict("Root transcript anchor order changed"));
+        }
+        insertions.sort_by_key(|(position, index, _)| (*position, *index));
+        insertions
+    };
+    if !insertions.is_empty() {
+        let original = std::mem::take(&mut incoming.messages);
+        let mut merged = Vec::with_capacity(original.len() + insertions.len());
+        let mut pending = insertions.into_iter().peekable();
+        for (index, message) in original.into_iter().enumerate() {
+            while pending
+                .peek()
+                .is_some_and(|(position, _, _)| *position == index)
+            {
+                merged.push(pending.next().expect("checked insertion").2);
+            }
+            merged.push(message);
+        }
+        merged.extend(pending.map(|(_, _, message)| message));
+        incoming.messages = merged;
+    }
+    bamboo_domain::merge_session_inbox_admission(incoming, durable);
+    Ok(())
 }
 
 /// Normalize the persisted compatibility metadata through the authoritative
@@ -1745,6 +1912,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
         runtime.task_list_version = None;
         runtime.todo_list_version = None;
         runtime.session_inbox_admission = None;
+        runtime.supervised_root_outcomes = None;
         if runtime.is_empty() {
             copy.runtime_metadata = None;
         }
@@ -3513,6 +3681,9 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         session.messages.clear();
+        if let Some(metadata) = session.runtime_metadata.as_mut() {
+            metadata.supervised_root_outcomes = None;
+        }
         session.clear_stale_root_token_budget();
         Ok(Some(session))
     }
@@ -5271,6 +5442,7 @@ impl SessionStoreV2 {
         match serde_json::from_str::<Box<Session>>(&raw) {
             Ok(mut side) => {
                 supervisor::validate_identity(&side)?;
+                supervisor::reject_main_only_outcomes_in_sidecar(&side)?;
                 // The control-plane path (`load_runtime_control_plane`) returns
                 // this directly, so migrate a stale Root token_budget here too (#230).
                 side.clear_stale_root_token_budget();
@@ -5866,6 +6038,16 @@ impl SessionStoreV2 {
         if session.conversation_reset.is_some() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
                 "conversation generation requires a fenced reset transaction; legacy clear is unavailable".into(),
+            )));
+        }
+        if session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+            .is_some()
+        {
+            return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
+                "Root outcome facts require a fenced reset transaction; legacy clear is unavailable".into(),
             )));
         }
         // Keep only the first System message if present; drop all other messages.
@@ -7163,6 +7345,125 @@ impl SessionStoreV2 {
             Err(error) => return Err(error),
         };
 
+        // An incoming Session field is never authority to create or roll back
+        // Main-owned facts. The bound Root writer adopts the current Main and,
+        // only for its exact retained Inbox lease, derives the input transition.
+        // Other writers must preserve the exact durable value.
+        let incoming_outcomes = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref());
+        let durable_outcomes = previous_main
+            .as_ref()
+            .and_then(|previous| previous.runtime_metadata.as_ref())
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref());
+        let mut canonicalized = None;
+        if guards.root_actor.is_some() {
+            let durable = previous_main.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    bamboo_domain::SessionAuthorityConflict(
+                        "Root outcome source Main is missing".into(),
+                    ),
+                )
+            })?;
+            let mut outcomes = if let Some(input) = guards.input.clone() {
+                let durable = durable.clone();
+                Self::default_writer_job(guards, move || input.outcomes_after_input(&durable))
+                    .await?
+            } else {
+                durable_outcomes.cloned()
+            };
+            if guards.root_outcome_finalized {
+                if guards.input.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "Root input and final outcome cannot share a transition",
+                    ));
+                }
+                let owner = guards
+                    .root_actor
+                    .as_ref()
+                    .expect("Root owner checked")
+                    .owner();
+                if let Some(outcomes) = outcomes.as_mut() {
+                    if outcomes.facts.last().is_some_and(|fact| {
+                        fact.result.is_none() && fact.run_id != owner.fence.run_id
+                    }) {
+                        let reset = durable.conversation_reset_sha256().map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                bamboo_domain::SessionAuthorityConflict(error.to_string()),
+                            )
+                        })?;
+                        outcomes
+                            .mark_predecessor_interrupted(&owner.fence, reset.as_deref())
+                            .map_err(|error| {
+                                io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    bamboo_domain::SessionAuthorityConflict(error.into()),
+                                )
+                            })?;
+                    }
+                    if outcomes
+                        .facts
+                        .iter()
+                        .any(|fact| fact.run_id == owner.fence.run_id)
+                    {
+                        let result = match session.last_run_status().as_deref() {
+                            Some("completed") => {
+                                bamboo_domain::SupervisedRootOutcomeResult::Completed
+                            }
+                            Some("error") => bamboo_domain::SupervisedRootOutcomeResult::Failed,
+                            Some("cancelled") => {
+                                bamboo_domain::SupervisedRootOutcomeResult::Cancelled
+                            }
+                            Some("suspended") => {
+                                bamboo_domain::SupervisedRootOutcomeResult::Suspended
+                            }
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    bamboo_domain::SessionAuthorityConflict(
+                                        "final Root status is unavailable".into(),
+                                    ),
+                                ));
+                            }
+                        };
+                        outcomes.finalize(&owner.fence, result).map_err(|error| {
+                            io::Error::new(
+                                io::ErrorKind::WouldBlock,
+                                bamboo_domain::SessionAuthorityConflict(error.into()),
+                            )
+                        })?;
+                    }
+                }
+            }
+            if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
+                let mut current = session.clone();
+                if let Some(durable_outcomes) = durable_outcomes {
+                    rebase_supervised_input_transcript(&mut current, durable, durable_outcomes)?;
+                }
+                if let Some(outcomes) = outcomes {
+                    current
+                        .runtime_metadata
+                        .get_or_insert_with(Default::default)
+                        .supervised_root_outcomes = Some(outcomes);
+                } else if let Some(metadata) = current.runtime_metadata.as_mut() {
+                    metadata.supervised_root_outcomes = None;
+                }
+                canonicalized = Some(current);
+            }
+        } else if incoming_outcomes != durable_outcomes {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                bamboo_domain::SessionAuthorityConflict(
+                    "Root outcome facts require a fenced Main transition".into(),
+                ),
+            ));
+        }
+        let session = canonicalized.as_ref().unwrap_or(session);
+
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
         let session_bytes = compact_main::serialize_main(session)?;
@@ -7484,6 +7785,17 @@ impl Storage for SessionStoreV2 {
         publish: bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<()> {
         self.save_root_actor_runtime_impl(owner, session, runtime_only, publish)
+            .await
+    }
+
+    async fn save_finalized_root_actor_runtime(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        session: &mut Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_finalized_root_actor_runtime_impl(owner, session, inherited, publish)
             .await
     }
 
@@ -7810,8 +8122,13 @@ impl Storage for SessionStoreV2 {
                 owner.clone(),
             )
         });
-        let guards =
+        let mut guards =
             DefaultWriterGuards::shared_with_root_actor(lifecycle, task, session_write, proof);
+        if root_writer.is_some() {
+            Arc::get_mut(&mut guards)
+                .expect("new inherited Root final writer has no borrowers")
+                .root_outcome_finalized = true;
+        }
         let latest = self
             .load_session_unlocked(&session.id)
             .await?
@@ -7828,14 +8145,26 @@ impl Storage for SessionStoreV2 {
             .and_then(|state| state.waiting_for_children.as_ref())
             == Some(inherited)
         {
-            crate::session_merge::adopt_finalized_child_wait(&mut reconciled, &latest, true);
+            if let Some(registered_at) =
+                crate::session_merge::adopt_finalized_child_wait(&mut reconciled, &latest, true)
+            {
+                crate::session_merge::preserve_finalized_hidden_child_resumes(
+                    &mut reconciled,
+                    &latest,
+                    registered_at,
+                );
+            }
         }
         self.save_session_after_lock(&reconciled, started, &guards, None)
             .await?;
+        let committed = match guards.root_actor.clone() {
+            Some(proof) => Some(Self::default_writer_job(&guards, move || proof.validate()).await?),
+            None => None,
+        };
         if let Some((_, publish)) = root_writer {
             self.publish_root_actor_runtime(&guards, publish).await?;
         }
-        *session = reconciled;
+        *session = committed.unwrap_or(reconciled);
         Ok(())
     }
 
@@ -8122,6 +8451,79 @@ mod tests {
     use std::io;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn supervised_input_rebase_preserves_admitted_order_and_rejects_wrong_root() {
+        let mut durable = Session::new("root-rebase", "model");
+        let before = Message::user("before input");
+        let after = Message::user("after input");
+        let envelope = SessionMessageEnvelope::user_input(&durable.id, "tracked input");
+        let receipt_id = envelope.id.clone();
+        durable.add_message(before.clone());
+        durable.add_message(envelope.to_provider_message().unwrap());
+        durable.add_message(after.clone());
+        durable
+            .session_inbox_admission_mut()
+            .record(receipt_id.clone(), 1);
+        let fence = bamboo_domain::ActorActivationFence {
+            schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
+            actor_id: durable.id.clone(),
+            activation_id: "activation-1".into(),
+            attempt: 1,
+            run_id: "run-1".into(),
+            lease_owner: "owner".into(),
+            lease_epoch: 1,
+        };
+        let mut outcomes =
+            bamboo_domain::SupervisedRootOutcomes::new(&durable.id, durable.created_at).unwrap();
+        outcomes.reserve(&fence, None).unwrap();
+        outcomes
+            .record_input(
+                &fence,
+                bamboo_domain::SupervisedRootOutcomeInput {
+                    receipt_id: receipt_id.clone(),
+                    generation: 1,
+                    supervisor_origin: None,
+                },
+            )
+            .unwrap();
+
+        let mut stale = durable.clone();
+        stale
+            .messages
+            .retain(|message| message.id != receipt_id.as_str());
+        let later = Message::user("private later output");
+        stale.add_message(later.clone());
+        rebase_supervised_input_transcript(&mut stale, &durable, &outcomes).unwrap();
+        assert_eq!(
+            stale
+                .messages
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                before.id.as_str(),
+                receipt_id.as_str(),
+                after.id.as_str(),
+                later.id.as_str()
+            ]
+        );
+        assert!(stale
+            .session_inbox_admission()
+            .unwrap()
+            .contains_str(receipt_id.as_str()));
+
+        let mut reordered = durable.clone();
+        reordered.messages.swap(0, 2);
+        rebase_supervised_input_transcript(&mut reordered, &durable, &outcomes).unwrap();
+        assert_eq!(reordered.messages[0].id, after.id);
+
+        let mut wrong = SessionMessageEnvelope::user_input("another-root", "tracked input");
+        wrong.id = receipt_id;
+        let mut corrupt = durable.clone();
+        corrupt.messages[1] = wrong.to_provider_message().unwrap();
+        assert!(rebase_supervised_input_transcript(&mut stale, &corrupt, &outcomes).is_err());
+    }
 
     async fn create_temp_storage() -> io::Result<(SessionStoreV2, TempDir)> {
         let temp_dir = TempDir::new().map_err(io::Error::other)?;

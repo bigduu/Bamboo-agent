@@ -196,6 +196,159 @@ fn held(f: &Fixture) {
     }
 }
 
+#[tokio::test]
+async fn supervised_root_input_and_final_outcome_share_owned_main_and_receipt() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(temp.path().into()).await.unwrap());
+    let root = Session::new(ROOT, "controlled-model");
+    store.save_session(&root).await.unwrap();
+    let supervisor: bamboo_domain::SupervisorReference = (&store
+        .get_or_create_default_supervisor("model")
+        .await
+        .unwrap())
+        .into();
+    let caller = bamboo_domain::SessionCallerReference::from(
+        &store
+            .load_session(&supervisor.session_id)
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    let target = store
+        .inspect_supervisor_current_user_target(&supervisor, ROOT)
+        .await
+        .unwrap();
+    let operation = "root-outcome-operation";
+    let mut message = SessionMessageEnvelope::user_input(ROOT, "supervised input");
+    message.id = bamboo_domain::supervisor_current_user_message_id(&supervisor, &target, operation);
+    message.source = bamboo_domain::SessionMessageSource::Session {
+        session_id: supervisor.session_id.clone(),
+    };
+    message.kind = bamboo_domain::SessionMessageKind::PeerMessage;
+    message.correlation_id = Some(operation.into());
+    let raw = Arc::new(crate::FileSessionInbox::new(
+        store.clone(),
+        SessionInboxLimits::default(),
+    ));
+    let receipt = raw
+        .deliver_supervisor_current_user_followup(&caller, &supervisor, &target, &message)
+        .await
+        .unwrap();
+    let now = Utc::now();
+    let activation = store
+        .claim_activation(&ActorActivationClaim {
+            actor_id: ROOT.into(),
+            run_id: "supervised-run-1".into(),
+            lease_owner: "synthetic-root-owner".into(),
+            lease_expires_at: now + LeaseDuration::seconds(90),
+            inbox_generation: 0,
+            placement_ref: None,
+            now,
+        })
+        .await
+        .unwrap();
+    store
+        .start_activation(&activation.fence(), Utc::now())
+        .await
+        .unwrap();
+    let owner = RootActorRuntimeWrite {
+        fence: activation.fence(),
+        created_at: root.created_at,
+        conversation_generation: root.conversation_generation_observation(),
+    };
+    let bound = store.bind_root_actor_inbox(&owner, raw.clone()).unwrap();
+    let request = SessionInboxLeaseRequest {
+        consumer: SessionInboxConsumerId::new(),
+        now: Utc::now(),
+        duration: LeaseDuration::seconds(30),
+    };
+    let claim = bound
+        .claim_owned(ROOT, 1, Some(&owner.fence.run_id), &request)
+        .await
+        .unwrap()
+        .remove(0);
+    let mut candidate = root.clone();
+    candidate.add_message(message.to_provider_message().unwrap());
+    candidate
+        .session_inbox_admission_mut()
+        .record(message.id.clone(), receipt.generation);
+    store
+        .save_root_actor_input(&owner, &candidate, bound, &claim, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    assert!(raw.was_admitted(ROOT, &message.id).await.unwrap());
+    let mut committed = store.load_session(ROOT).await.unwrap().unwrap();
+    let facts = committed
+        .runtime_metadata
+        .as_ref()
+        .unwrap()
+        .supervised_root_outcomes
+        .as_ref()
+        .unwrap();
+    assert_eq!(facts.facts.len(), 1);
+    assert_eq!(facts.facts[0].run_id, owner.fence.run_id);
+    assert_eq!(facts.facts[0].inputs[0].receipt_id, receipt.id);
+    assert_eq!(facts.facts[0].inputs[0].generation, receipt.generation);
+    assert!(facts.facts[0].inputs[0].supervisor_origin.is_some());
+    assert!(facts.facts[0].result.is_none());
+
+    committed.set_last_run_status("completed");
+    store
+        .save_finalized_root_actor_runtime(&owner, &mut committed, None, Arc::new(|_| {}))
+        .await
+        .unwrap();
+    let reopened = SessionStoreV2::new(temp.path().into()).await.unwrap();
+    let after = reopened.load_session(ROOT).await.unwrap().unwrap();
+    let facts = after
+        .runtime_metadata
+        .unwrap()
+        .supervised_root_outcomes
+        .unwrap();
+    assert_eq!(facts.facts[0].run_id, owner.fence.run_id);
+    assert_eq!(facts.facts[0].inputs[0].receipt_id, receipt.id);
+    assert_eq!(
+        facts.facts[0].result,
+        Some(bamboo_domain::SupervisedRootOutcomeResult::Completed)
+    );
+    let delivered = raw
+        .deliver_supervised_root_outcome(
+            &caller,
+            &supervisor,
+            ROOT,
+            facts.facts[0].sequence,
+            &receipt.id,
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    let replay = raw
+        .deliver_supervised_root_outcome(
+            &caller,
+            &supervisor,
+            ROOT,
+            facts.facts[0].sequence,
+            &receipt.id,
+            Utc::now() + LeaseDuration::seconds(1),
+        )
+        .await
+        .unwrap();
+    assert_eq!(delivered.delivery, replay.delivery);
+    let pending = raw.inspect(&supervisor.session_id).await.unwrap();
+    assert_eq!((pending.generation, pending.pending + pending.claimed), (1, 1));
+    let notice = raw.claim(&supervisor.session_id, 1).await.unwrap().remove(0);
+    assert_eq!(notice.envelope.id, delivered.delivery.id);
+    let bamboo_domain::SessionMessageBody::RuntimeInstruction(notice) = &notice.envelope.body else {
+        panic!("Root outcome must be a typed runtime instruction");
+    };
+    let data = notice.data.as_ref().unwrap();
+    assert_eq!(data["root_session_id"], ROOT);
+    assert_eq!(data["run_id"], owner.fence.run_id);
+    assert_eq!(data["input_receipt_id"], receipt.id.as_str());
+    assert_eq!(data["input_generation"], receipt.generation);
+    assert_eq!(data["operation_id"], operation);
+    assert_eq!(data["status"], "completed");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_owned_full_checkpoint_commits_typed_input_cursor_and_ack_before_return() {
     let f = Fixture::new(LeaseDuration::seconds(30)).await;

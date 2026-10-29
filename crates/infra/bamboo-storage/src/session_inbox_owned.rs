@@ -64,6 +64,11 @@ pub(super) struct StoredLease {
 }
 
 impl StoredLease {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn effective_policy_for_testing(&self) -> SessionActivationPolicy {
+        self.policy
+    }
+
     /// Structural evidence only. Retirement does not mint or renew a lease.
     pub(super) fn matches_transport_name(&self, generation: u64, name: &str) -> bool {
         FileSessionInbox::owned_name(generation, &self.token) == name
@@ -80,17 +85,31 @@ impl StoredLease {
         };
         let lease: Self =
             serde_json::from_value(raw.clone()).map_err(|_| invalid("invalid Inbox lease"))?;
-        if lease.version != 1
-            || lease.token.epoch == 0
-            || lease.token.consumer.as_str().is_empty()
-            || lease.token.consumer.as_str().len() > 128
-            || uuid::Uuid::parse_str(&lease.token.incarnation).is_err()
-            || lease.failure_count > MAX_EXPLICIT_FAILURES
-            || lease
+        lease.validate()?;
+        Ok(Some(lease))
+    }
+
+    /// Parse directly from the physical JSON so duplicate nested keys cannot
+    /// be folded into a `Value` before the lease is checked.
+    pub(super) fn from_raw(raw: &serde_json::value::RawValue) -> Result<Self, SessionInboxError> {
+        let lease: Self =
+            serde_json::from_str(raw.get()).map_err(|_| invalid("invalid Inbox lease"))?;
+        lease.validate()?;
+        Ok(lease)
+    }
+
+    fn validate(&self) -> Result<(), SessionInboxError> {
+        if self.version != 1
+            || self.token.epoch == 0
+            || self.token.consumer.as_str().is_empty()
+            || self.token.consumer.as_str().len() > 128
+            || uuid::Uuid::parse_str(&self.token.incarnation).is_err()
+            || self.failure_count > MAX_EXPLICIT_FAILURES
+            || self
                 .reclaim_count
-                .is_some_and(|count| count >= lease.token.epoch)
-            || lease.manual_retry_count >= lease.token.epoch
-            || lease.last_error_code.as_ref().is_some_and(|code| {
+                .is_some_and(|count| count >= self.token.epoch)
+            || self.manual_retry_count >= self.token.epoch
+            || self.last_error_code.as_ref().is_some_and(|code| {
                 code.is_empty()
                     || code.len() > 64
                     || !code.bytes().all(|byte| {
@@ -99,13 +118,13 @@ impl StoredLease {
                             || matches!(byte, b'_' | b'-' | b'.')
                     })
             })
-            || (lease.failure_count > 0 && lease.last_error_code.is_none())
-            || (lease.retry_after.is_some() && lease.dead_lettered_at.is_some())
-            || (lease.retry_requested_at.is_some() && lease.dead_lettered_at.is_none())
+            || (self.failure_count > 0 && self.last_error_code.is_none())
+            || (self.retry_after.is_some() && self.dead_lettered_at.is_some())
+            || (self.retry_requested_at.is_some() && self.dead_lettered_at.is_none())
         {
             return Err(invalid("invalid Inbox lease"));
         }
-        Ok(Some(lease))
+        Ok(())
     }
 
     fn same_identity(&self, token: &SessionInboxLeaseToken) -> bool {
@@ -147,6 +166,10 @@ pub(crate) enum InboxAuthority {
     },
     CurrentSupervisor {
         _guard: Box<crate::v2::CurrentUserTargetGuard>,
+    },
+    SupervisedRootOutcome {
+        _guard: Arc<crate::v2::CurrentUserTargetGuard>,
+        inbox_dir: PathBuf,
     },
     Peer {
         _guard: crate::v2::PeerDeliveryGuard,
@@ -631,6 +654,7 @@ impl FileSessionInbox {
             InboxAuthority::HostCreation { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Unscoped { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::CurrentSupervisor { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::SupervisedRootOutcome { inbox_dir, .. } => Ok(inbox_dir.clone()),
             _ => self.inbox_dir(target).await,
         }
     }

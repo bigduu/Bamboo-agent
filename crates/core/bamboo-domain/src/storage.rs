@@ -370,6 +370,33 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Persist the final snapshot of this exact owned Root execution. The
+    /// backend must commit any tracked outcome with the reconciled Main, under
+    /// the same live Actor and Session guards. This is not a completion event.
+    /// Legacy backends retain their original final save; they do not claim
+    /// support for the V2 Root-outcome receipt contract.
+    async fn save_finalized_root_actor_runtime(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        inherited: Option<&crate::InheritedChildWait>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        if let Some(inherited) = inherited {
+            self.save_runtime_with_inherited_child_wait(
+                session,
+                inherited,
+                false,
+                Some((owner.clone(), publish)),
+                None,
+            )
+            .await
+        } else {
+            self.save_root_actor_runtime(owner, session, false, publish)
+                .await
+        }
+    }
+
     /// Probe before consuming a response that needs a bound profile check.
     fn supports_root_actor_bound_startup(&self) -> bool {
         false

@@ -849,7 +849,11 @@ pub(in crate::app_state) async fn subscription_recovers_across_owned_process_cra
     }
 }
 
-async fn run_native_source(f: &Fixture, text: &str, calls: usize) -> (String, String) {
+async fn run_native_source(
+    f: &Fixture,
+    text: &str,
+    calls: usize,
+) -> (String, String, u64, chrono::DateTime<Utc>) {
     use crate::tools::ToolSurface;
     use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolOutcome};
     use bamboo_agent_core::ToolExecutionContext;
@@ -872,6 +876,7 @@ async fn run_native_source(f: &Fixture, text: &str, calls: usize) -> (String, St
         .into_iter()
         .find(|target| target.session_id == ROOT_A)
         .expect("the real current-user directory must contain the original Root");
+    let target_created_at = target.created_at;
     let operation = format!("outcome-1053-operation-{calls}");
     let call = ToolCall {
         id: format!("outcome-1053-tool-{calls}"),
@@ -911,6 +916,10 @@ async fn run_native_source(f: &Fixture, text: &str, calls: usize) -> (String, St
         "admission is not an active execution: {receipt}"
     );
     let input_id = receipt["receipt_id"].as_str().unwrap().to_owned();
+    let generation = receipt["generation"]
+        .as_u64()
+        .filter(|value| *value > 0)
+        .expect("the real Inbox receipt must retain its delivery generation");
 
     let activation = tokio::time::timeout(WAIT, async {
         loop {
@@ -971,7 +980,7 @@ async fn run_native_source(f: &Fixture, text: &str, calls: usize) -> (String, St
             .any(|message| message.id == input_id && message.content == text),
         "the matching input must reach this actual provider call"
     );
-    (input_id, activation.run_id)
+    (input_id, activation.run_id, generation, target_created_at)
 }
 
 fn completed_root_fingerprint(actual_run_id: &str) -> String {
@@ -1098,11 +1107,18 @@ pub(in crate::app_state) async fn offline_observer_recovers_both_native_root_out
     assert!(home.starts_with(std::fs::canonicalize(&temporary).unwrap()));
     let reference: SupervisorReference =
         serde_json::from_value(signal["reference"].clone()).unwrap();
-    let first: (String, String) = serde_json::from_value(signal["first"].clone()).unwrap();
-    let second: (String, String) = serde_json::from_value(signal["second"].clone()).unwrap();
+    let first: (String, String, u64, chrono::DateTime<Utc>) =
+        serde_json::from_value(signal["first"].clone()).unwrap();
+    let second: (String, String, u64, chrono::DateTime<Utc>) =
+        serde_json::from_value(signal["second"].clone()).unwrap();
     let probe = Arc::new(Probe::default());
     let state = host(&home, probe.clone()).await;
     let source = load(&state, ROOT_A).await;
+    assert_eq!(first.3, second.3, "both inputs belong to one Root birth");
+    assert_eq!(
+        source.created_at, first.3,
+        "restart must retain that Root birth"
+    );
     assert_eq!(source.last_run_status().as_deref(), Some("completed"));
     for id in [&first.0, &second.0] {
         assert_eq!(
@@ -1187,14 +1203,17 @@ pub(in crate::app_state) async fn offline_observer_recovers_both_native_root_out
         2,
         "both immutable status views must be read"
     );
-    for (index, (input, run)) in [first, second].iter().enumerate() {
+    for (index, (input, run)) in [(&first.0, &first.1), (&second.0, &second.1)]
+        .into_iter()
+        .enumerate()
+    {
         assert_eq!(observed[index].0.event_id, history[index].event_id);
         assert!(
-            observed[index].1.contains(input),
+            observed[index].1.contains(input.as_str()),
             "view must identify its admitted receipt"
         );
         assert!(
-            observed[index].1.contains(run),
+            observed[index].1.contains(run.as_str()),
             "view must identify its actual Root activation"
         );
         assert!(
@@ -1205,6 +1224,181 @@ pub(in crate::app_state) async fn offline_observer_recovers_both_native_root_out
         );
     }
     drop(observed);
+    // Reading a view in the Observer Child is not evidence that the original
+    // Supervisor received the outcome. This Observer-path fixture proposes a
+    // structured runtime notification carrying each actual run/input; a
+    // free-form synthetic model summary cannot satisfy it. A direct path that
+    // does not depend on an Observer model also needs its own acceptance test.
+    let expected = [
+        (
+            &first.0,
+            &first.1,
+            first.2,
+            &first.3,
+            "outcome-1053-operation-1",
+        ),
+        (
+            &second.0,
+            &second.1,
+            second.2,
+            &second.3,
+            "outcome-1053-operation-2",
+        ),
+    ];
+    let parent_outcomes = tokio::time::timeout(WAIT, async {
+        loop {
+            let parent = load(&state, &reference.session_id).await;
+            let mut events = Vec::new();
+            for message in &parent.messages {
+                let Some(marker) = message
+                    .metadata
+                    .as_ref()
+                    .and_then(|value| value.get("session_message"))
+                else {
+                    continue;
+                };
+                let Ok(envelope) =
+                    serde_json::from_value::<bamboo_domain::SessionMessageEnvelope>(marker.clone())
+                else {
+                    continue;
+                };
+                if !matches!(
+                    &envelope.source,
+                    bamboo_domain::SessionMessageSource::Runtime { .. }
+                ) || envelope.target_session_id != reference.session_id
+                {
+                    continue;
+                }
+                let mut translated = message.clone();
+                let mut checkpoint_generation = None;
+                let mut checkpoint_intent = None;
+                let mut checkpoint_policy = None;
+                if let Some(fields) = translated.metadata.as_mut().and_then(Value::as_object_mut) {
+                    if let Some(checkpoint) = fields.get("_bamboo_owned_input_checkpoint") {
+                        let Some(checkpoint) = checkpoint.as_object() else {
+                            continue;
+                        };
+                        let keys = [
+                            "version",
+                            "envelope_id",
+                            "target_session_id",
+                            "session_created_at",
+                            "generation",
+                            "activation_intent",
+                            "activation_policy",
+                        ];
+                        if checkpoint.len() != keys.len()
+                            || keys.iter().any(|key| !checkpoint.contains_key(*key))
+                            || checkpoint["version"] != 1
+                            || checkpoint["envelope_id"] != envelope.id.as_str()
+                            || checkpoint["target_session_id"] != reference.session_id
+                            || checkpoint["session_created_at"] != json!(parent.created_at)
+                            || checkpoint["generation"]
+                                .as_u64()
+                                .is_none_or(|value| value == 0)
+                        {
+                            continue;
+                        }
+                        let Ok(intent) = serde_json::from_value::<
+                            Option<bamboo_domain::SessionInboxActivationIntent>,
+                        >(checkpoint["activation_intent"].clone()) else {
+                            continue;
+                        };
+                        let Ok(policy) = serde_json::from_value::<
+                            bamboo_domain::SessionActivationPolicy,
+                        >(checkpoint["activation_policy"].clone()) else {
+                            continue;
+                        };
+                        if let Some(requested) = intent.as_ref() {
+                            let Ok(requested_policy) = requested.policy() else {
+                                continue;
+                            };
+                            if (requested.delivery().is_some()
+                                && policy != bamboo_domain::SessionActivationPolicy::RespectSpecificWait)
+                                || (requested_policy == bamboo_domain::SessionActivationPolicy::InterruptSpecificWait
+                                    && policy != bamboo_domain::SessionActivationPolicy::InterruptSpecificWait)
+                            {
+                                continue;
+                            }
+                        }
+                        checkpoint_generation = checkpoint["generation"].as_u64();
+                        checkpoint_intent = Some(intent);
+                        checkpoint_policy = Some(policy);
+                        fields.remove("_bamboo_owned_input_checkpoint");
+                    }
+                }
+                if !bamboo_domain::is_matching_session_message(&translated, &envelope) {
+                    continue;
+                }
+                let receipt = state
+                    .observer_subscriptions
+                    .inbox
+                    .admitted_receipt_for_testing(&envelope)
+                    .await
+                    .expect("Supervisor Inbox receipt and semantics must be readable");
+                if receipt.is_some_and(|(receipt, intent, policy)| {
+                    receipt.id == envelope.id
+                        && receipt.generation > 0
+                        && checkpoint_generation
+                            .is_none_or(|generation| generation == receipt.generation)
+                        && checkpoint_intent
+                            .as_ref()
+                            .is_none_or(|expected| expected == &intent)
+                        && checkpoint_policy.is_none_or(|expected| policy == Some(expected))
+                })
+                {
+                    events.push(envelope);
+                }
+            }
+            let matches = |receipt: &str,
+                           run: &str,
+                           generation: u64,
+                           birth: &chrono::DateTime<Utc>,
+                           operation: &str| {
+                events
+                    .iter()
+                    .filter(|envelope| {
+                        let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) =
+                            &envelope.body
+                        else {
+                            return false;
+                        };
+                        let Some(data) = instruction.data.as_ref() else {
+                            return false;
+                        };
+                        data["target_session_id"] == ROOT_A
+                            && data["target_created_at"] == json!(birth)
+                            && data["run_id"] == run
+                            && data["status"] == "completed"
+                            && data["inputs"].as_array().is_some_and(|inputs| {
+                                inputs.iter().any(|input| {
+                                    input["receipt_id"] == receipt
+                                        && input["generation"] == generation
+                                        && input["operation_id"] == operation
+                                })
+                            })
+                    })
+                    .count()
+            };
+            let counts: Vec<_> = expected
+                .iter()
+                .map(|(receipt, run, generation, birth, operation)| {
+                    matches(receipt, run, *generation, birth, operation)
+                })
+                .collect();
+            if counts.iter().all(|count| *count > 0) {
+                break counts;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("each committed outcome must reach the canonical Supervisor Inbox");
+    assert_eq!(
+        parent_outcomes,
+        vec![1, 1],
+        "the checked transcript snapshot must not contain duplicate outcomes"
+    );
     assert_eq!(
         probe.source_calls.load(Ordering::SeqCst),
         0,
