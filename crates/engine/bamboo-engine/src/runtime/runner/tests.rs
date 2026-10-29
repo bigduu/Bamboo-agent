@@ -2521,7 +2521,10 @@ async fn suspended_session_resume_uses_a_new_metric_round_and_preserves_tool_lin
 async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
     use bamboo_agent_core::AgentHook;
     use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus};
-    struct Capture(mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>);
+    struct Capture {
+        sender: mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>,
+        birth: chrono::DateTime<Utc>,
+    }
     #[async_trait]
     impl AgentHook for Capture {
         fn point(&self) -> AgentHookPoint {
@@ -2535,8 +2538,10 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
         ) -> HookResult {
             assert!(session.messages.is_empty());
             assert!(session.workspace.is_none());
+            assert_eq!(session.created_at, self.birth);
+            assert_eq!(session.root_session_id, "synthetic-usage-hook");
             if let HookPayload::ModelCallUsage { observation } = payload {
-                self.0.send(observation.clone()).unwrap();
+                self.sender.send(observation.clone()).unwrap();
             }
             HookResult::Abort {
                 reason: "observer must not affect the call".into(),
@@ -2544,9 +2549,14 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
         }
     }
     let trace = bamboo_infrastructure::telemetry::test_support::LocalTraceTest::isolated();
+    let mut session = Session::new("synthetic-usage-hook", "synthetic-model");
+    let birth = session.created_at;
     let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
     let mut hooks = crate::runtime::hooks::HookRunner::new();
-    hooks.register(Arc::new(Capture(observed_tx)));
+    hooks.register(Arc::new(Capture {
+        sender: observed_tx,
+        birth,
+    }));
     let config = AgentLoopConfig {
         hook_runner: Arc::new(hooks),
         model_name: Some("synthetic-model".into()),
@@ -2571,8 +2581,6 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
     });
     let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
         Arc::new(bamboo_tools::BuiltinToolExecutor::new());
-    let mut session = Session::new("synthetic-usage-hook", "synthetic-model");
-    let birth = session.created_at;
     let (events, _receiver) = mpsc::channel(128);
     trace
         .scope(super::run_agent_loop_with_config(

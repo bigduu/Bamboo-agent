@@ -2,6 +2,8 @@
 //! Only explicitly allowlisted attributes are copied out of the SDK span.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::BuildHasher;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -74,6 +76,7 @@ pub struct TracePage {
 
 #[derive(Clone, Debug)]
 struct Record {
+    scope: Option<String>,
     session_id: String,
     birth: DateTime<Utc>,
     trace_id: String,
@@ -85,7 +88,7 @@ struct Record {
 struct Inner {
     records: VecDeque<Record>,
     next_sequence: u64,
-    evictions: HashMap<(String, DateTime<Utc>), u64>,
+    evictions: HashMap<(Option<String>, String, DateTime<Utc>), u64>,
     retired_eviction_scopes: bool,
 }
 
@@ -97,6 +100,21 @@ pub struct LocalTraceStore {
 }
 
 static STORE: OnceLock<Arc<LocalTraceStore>> = OnceLock::new();
+static SCOPE_HASHERS: OnceLock<(
+    std::collections::hash_map::RandomState,
+    std::collections::hash_map::RandomState,
+)> = OnceLock::new();
+
+/// Opaque process-local data-authority key. The path itself is not retained or
+/// serialized; two process-seeded hashers produce the key.
+pub fn scope_for_path(path: &Path) -> String {
+    let (first, second) = SCOPE_HASHERS.get_or_init(|| (Default::default(), Default::default()));
+    format!(
+        "{:016x}{:016x}",
+        first.hash_one(path),
+        second.hash_one(path)
+    )
+}
 
 pub fn store() -> Arc<LocalTraceStore> {
     STORE
@@ -140,7 +158,8 @@ impl LocalTraceStore {
             .records
             .iter()
             .find(|existing| {
-                existing.session_id == record.session_id
+                existing.scope == record.scope
+                    && existing.session_id == record.session_id
                     && existing.birth == record.birth
                     && existing.trace_id == record.trace_id
             })
@@ -153,7 +172,8 @@ impl LocalTraceStore {
         };
         // A span processor is allowed to receive the same completed span twice.
         if inner.records.iter().any(|existing| {
-            existing.session_id == record.session_id
+            existing.scope == record.scope
+                && existing.session_id == record.session_id
                 && existing.birth == record.birth
                 && existing.trace_id == record.trace_id
                 && existing.span.span_id == record.span.span_id
@@ -162,7 +182,7 @@ impl LocalTraceStore {
         }
         if inner.records.len() == MAX_LOCAL_SPANS {
             if let Some(evicted) = inner.records.pop_front() {
-                let key = (evicted.session_id, evicted.birth);
+                let key = (evicted.scope, evicted.session_id, evicted.birth);
                 if !inner.evictions.contains_key(&key)
                     && inner.evictions.len() >= MAX_EVICTION_SCOPES
                 {
@@ -185,17 +205,26 @@ impl LocalTraceStore {
         limit: usize,
         cursor: Option<u64>,
     ) -> TracePage {
+        self.page_scoped(None, session_id, birth, limit, cursor)
+    }
+
+    pub fn page_scoped(
+        &self,
+        scope: Option<&str>,
+        session_id: &str,
+        birth: DateTime<Utc>,
+        limit: usize,
+        cursor: Option<u64>,
+    ) -> TracePage {
         let limit = limit.clamp(1, MAX_LOCAL_SPANS);
         let inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let mut groups: HashMap<&str, Vec<&Record>> = HashMap::new();
-        for record in inner
-            .records
-            .iter()
-            .filter(|r| r.session_id == session_id && r.birth == birth)
-        {
+        for record in inner.records.iter().filter(|r| {
+            r.scope.as_deref() == scope && r.session_id == session_id && r.birth == birth
+        }) {
             groups.entry(&record.trace_id).or_default().push(record);
         }
         let mut groups: Vec<_> = groups.into_iter().collect();
@@ -206,7 +235,7 @@ impl LocalTraceStore {
         let has_more = groups.len() > limit;
         groups.truncate(limit);
         let next_cursor = has_more.then(|| groups.last().unwrap().1[0].trace_sequence.to_string());
-        let key = (session_id.to_owned(), birth);
+        let key = (scope.map(str::to_owned), session_id.to_owned(), birth);
         let evicted_spans = inner
             .evictions
             .get(&key)
@@ -245,6 +274,16 @@ impl LocalTraceStore {
         birth: DateTime<Utc>,
         trace_id: &str,
     ) -> Option<TraceDetail> {
+        self.detail_scoped(None, session_id, birth, trace_id)
+    }
+
+    pub fn detail_scoped(
+        &self,
+        scope: Option<&str>,
+        session_id: &str,
+        birth: DateTime<Utc>,
+        trace_id: &str,
+    ) -> Option<TraceDetail> {
         let inner = self
             .inner
             .lock()
@@ -252,12 +291,17 @@ impl LocalTraceStore {
         let records: Vec<_> = inner
             .records
             .iter()
-            .filter(|r| r.session_id == session_id && r.birth == birth && r.trace_id == trace_id)
+            .filter(|r| {
+                r.scope.as_deref() == scope
+                    && r.session_id == session_id
+                    && r.birth == birth
+                    && r.trace_id == trace_id
+            })
             .collect();
         if records.is_empty() {
             return None;
         }
-        let key = (session_id.to_owned(), birth);
+        let key = (scope.map(str::to_owned), session_id.to_owned(), birth);
         let evicted = inner
             .evictions
             .get(&key)
@@ -411,6 +455,7 @@ fn project(data: SpanData) -> Option<Record> {
         })
         .map(str::to_owned);
     Some(Record {
+        scope: identifier(&data, "bamboo.local.scope"),
         session_id,
         birth,
         trace_id: data.span_context.trace_id().to_string(),
@@ -601,5 +646,50 @@ mod tests {
                 .unwrap();
             assert_eq!(span.run_id.as_deref(), Some(expected));
         }
+    }
+
+    #[tokio::test]
+    async fn equal_session_lifetimes_in_distinct_data_scopes_do_not_mix() {
+        let trace = LocalTraceTest::isolated();
+        let birth = Utc::now();
+        let first = Path::new("/private-scope-one");
+        let second = Path::new("/private-scope-two");
+        trace
+            .scope(async {
+                for path in [first, second] {
+                    Observation::agent("same-session", "same-session")
+                        .bind_session_lifetime("same-session", birth)
+                        .bind_local_scope(path)
+                        .finish(Outcome::Success);
+                }
+            })
+            .await;
+        let first_key = scope_for_path(first);
+        let second_key = scope_for_path(second);
+        let first_page = trace
+            .store
+            .page_scoped(Some(&first_key), "same-session", birth, 10, None);
+        let second_page =
+            trace
+                .store
+                .page_scoped(Some(&second_key), "same-session", birth, 10, None);
+        assert_eq!(first_page.traces.len(), 1);
+        assert_eq!(second_page.traces.len(), 1);
+        assert_ne!(
+            first_page.traces[0].trace_id,
+            second_page.traces[0].trace_id
+        );
+        assert!(trace
+            .store
+            .detail_scoped(
+                Some(&second_key),
+                "same-session",
+                birth,
+                &first_page.traces[0].trace_id
+            )
+            .is_none());
+        assert!(!serde_json::to_string(&first_page)
+            .unwrap()
+            .contains("private-scope"));
     }
 }

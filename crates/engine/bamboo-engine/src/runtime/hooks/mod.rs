@@ -43,7 +43,12 @@ impl HookRunner {
     /// Best-effort observer. A fixed process-wide concurrency budget and
     /// deadline isolate model execution from slow or failed plugins. Only the
     /// small, content-free snapshot and a minimal session reach the observer.
-    pub(crate) fn notify_model_usage(&self, observation: bamboo_domain::ModelCallUsage) {
+    pub(crate) fn notify_model_usage(
+        &self,
+        observation: bamboo_domain::ModelCallUsage,
+        session_birth: chrono::DateTime<Utc>,
+        root_session_id: Option<String>,
+    ) {
         use std::sync::OnceLock;
         use std::time::Duration;
         static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
@@ -64,10 +69,12 @@ impl HookRunner {
         let runner = self.clone();
         handle.spawn(async move {
             let _permit = permit;
-            let session = Session::new(
+            let mut session = Session::new(
                 &observation.session_id,
                 observation.model.as_deref().unwrap_or("unknown"),
             );
+            session.created_at = session_birth;
+            session.root_session_id = root_session_id.unwrap_or_default();
             let payload = HookPayload::ModelCallUsage { observation };
             let work = async {
                 let _ = runner

@@ -43,8 +43,10 @@ impl<P: opentelemetry_sdk::trace::SpanProcessor> opentelemetry_sdk::trace::SpanP
     ) {
         self.0.on_start(span, context);
     }
-    fn on_end(&self, span: opentelemetry_sdk::trace::SpanData) {
+    fn on_end(&self, mut span: opentelemetry_sdk::trace::SpanData) {
         if span.span_context.is_sampled() {
+            span.attributes
+                .retain(|attribute| attribute.key.as_str() != "bamboo.local.scope");
             self.0.on_end(span);
         }
     }

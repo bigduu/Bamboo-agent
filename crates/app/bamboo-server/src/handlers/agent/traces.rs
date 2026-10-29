@@ -74,12 +74,17 @@ pub async fn list(
     };
     HttpResponse::Ok()
         .insert_header((header::CACHE_CONTROL, "private, no-store"))
-        .json(bamboo_infrastructure::telemetry::local::store().page(
-            &session_id,
-            birth,
-            limit,
-            cursor,
-        ))
+        .json(
+            bamboo_infrastructure::telemetry::local::store().page_scoped(
+                Some(&bamboo_infrastructure::telemetry::local::scope_for_path(
+                    &state.app_data_dir,
+                )),
+                &session_id,
+                birth,
+                limit,
+                cursor,
+            ),
+        )
 }
 
 pub async fn detail(
@@ -105,9 +110,14 @@ pub async fn detail(
         Ok(value) => value,
         Err(response) => return response,
     };
-    let Some(trace) =
-        bamboo_infrastructure::telemetry::local::store().detail(&session_id, birth, &trace_id)
-    else {
+    let Some(trace) = bamboo_infrastructure::telemetry::local::store().detail_scoped(
+        Some(&bamboo_infrastructure::telemetry::local::scope_for_path(
+            &state.app_data_dir,
+        )),
+        &session_id,
+        birth,
+        &trace_id,
+    ) else {
         return error(StatusCode::NOT_FOUND, "trace_not_found");
     };
     HttpResponse::Ok()
@@ -135,12 +145,22 @@ mod tests {
         let two = Session::new("trace-api-two", "synthetic-model");
         state.session_store.save_session(&one).await.unwrap();
         state.session_store.save_session(&two).await.unwrap();
+        let other_temp = tempfile::tempdir().unwrap();
+        let other_state = web::Data::new(
+            AppState::new(other_temp.path().canonicalize().unwrap())
+                .await
+                .unwrap(),
+        );
+        // Even an identical session id and birth under a different data
+        // authority must never expose this server's observations.
+        other_state.session_store.save_session(&one).await.unwrap();
         let tracer = LocalTraceTest::global();
         tracer
             .scope(async {
                 for _ in 0..2 {
                     let root = Observation::agent(&one.id, &one.id)
-                        .bind_session_lifetime(&one.id, one.created_at);
+                        .bind_session_lifetime(&one.id, one.created_at)
+                        .bind_local_scope(&state.app_data_dir);
                     root.scope(async {
                         let llm = Observation::llm(Some("openai"), "synthetic-model", &one.id);
                         llm.model_usage(&ModelTokenUsage {
@@ -155,6 +175,11 @@ mod tests {
                 }
                 Observation::agent(&two.id, &two.id)
                     .bind_session_lifetime(&two.id, two.created_at)
+                    .bind_local_scope(&state.app_data_dir)
+                    .finish(Outcome::Success);
+                Observation::agent(&one.id, &one.id)
+                    .bind_session_lifetime(&one.id, one.created_at)
+                    .bind_local_scope(&other_state.app_data_dir)
                     .finish(Outcome::Success);
             })
             .await;
@@ -205,6 +230,27 @@ mod tests {
         )
         .await;
         assert_ne!(second["traces"][0]["trace_id"], trace_id);
+        let other_app = test::init_service(
+            App::new()
+                .app_data(other_state)
+                .configure(crate::agent_routes),
+        )
+        .await;
+        let other_page: serde_json::Value = test::read_body_json(
+            test::call_service(&other_app, request("/api/v1/sessions/trace-api-one/traces")).await,
+        )
+        .await;
+        assert_eq!(other_page["traces"].as_array().unwrap().len(), 1);
+        assert_ne!(other_page["traces"][0]["trace_id"], trace_id);
+        assert_eq!(
+            test::call_service(
+                &other_app,
+                request(&format!("/api/v1/sessions/trace-api-one/traces/{trace_id}"))
+            )
+            .await
+            .status(),
+            StatusCode::NOT_FOUND
+        );
         let detail_uri = format!("/api/v1/sessions/trace-api-one/traces/{trace_id}");
         let detail_response = test::call_service(&app, request(&detail_uri)).await;
         assert_eq!(detail_response.status(), StatusCode::OK);

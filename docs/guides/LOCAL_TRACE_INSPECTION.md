@@ -34,8 +34,10 @@ that span remains locally recorded but is not sent to the exporter. See
 
 ## Read-only HTTP API
 
-Both endpoints use the existing HostOwner authorization boundary and the exact
-persisted session lifetime. They return `Cache-Control: private, no-store`, do
+Both endpoints use the existing HostOwner authorization boundary, the process's
+data-authority scope and the exact persisted session lifetime. An opaque,
+process-local key separates data directories without retaining their paths in
+trace records or sending that key to OTLP. They return `Cache-Control: private, no-store`, do
 not accept Codex run tokens, and never mix another session's spans. A missing
 session or trace returns 404. The list limit is 1–100 (default 50); `cursor` is
 opaque, and a client should deduplicate by `trace_id` when refreshing. A cursor
@@ -117,6 +119,9 @@ and a two-second deadline can drop work. Return values never control the model
 call. Native handlers receive the existing envelope with a `payload` of type
 `model_call_usage`; portable handlers receive `observation` at top level. Both
 contain the same schema-1 snapshot and no workspace path in the event payload.
+Programmatic native observers receive a deliberately minimal Session: its id,
+birth and valid root id identify the original lifetime, but other Session fields
+are not a snapshot of runtime state. Consume the usage observation itself.
 Deduplicate on `event_id`; retain IDs according to your plugin's own policy.
 
 A reviewed, runnable portable example is in

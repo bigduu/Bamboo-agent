@@ -81,6 +81,7 @@ pub struct Observation {
 struct SessionLifetime {
     session_id: String,
     birth: String,
+    local_scope: Option<String>,
     run_id: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
@@ -120,6 +121,9 @@ impl Observation {
                     "bamboo.session.birth",
                     lifetime.birth.clone(),
                 ));
+                if let Some(scope) = &lifetime.local_scope {
+                    attributes.push(KeyValue::new("bamboo.local.scope", scope.clone()));
+                }
             }
         }
         let span = tracer.build_with_context(
@@ -154,12 +158,26 @@ impl Observation {
             let lifetime = SessionLifetime {
                 session_id: session_id.to_owned(),
                 birth: birth.to_rfc3339(),
+                local_scope: None,
                 run_id: std::sync::Arc::new(std::sync::Mutex::new(None)),
             };
             self.context.span().set_attribute(KeyValue::new(
                 "bamboo.session.birth",
                 lifetime.birth.clone(),
             ));
+            self.context = self.context.with_value(lifetime);
+        }
+        self
+    }
+
+    /// Bind local inspection to the data authority without recording its path.
+    pub fn bind_local_scope(mut self, path: &std::path::Path) -> Self {
+        if let Some(mut lifetime) = self.context.get::<SessionLifetime>().cloned() {
+            let scope = local::scope_for_path(path);
+            self.context
+                .span()
+                .set_attribute(KeyValue::new("bamboo.local.scope", scope.clone()));
+            lifetime.local_scope = Some(scope);
             self.context = self.context.with_value(lifetime);
         }
         self

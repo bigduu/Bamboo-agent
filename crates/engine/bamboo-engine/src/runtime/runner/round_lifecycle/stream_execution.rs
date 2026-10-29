@@ -73,6 +73,8 @@ const LOADED_BROWSER_ACKNOWLEDGEMENT: &str =
 struct ModelUsageGuard {
     runner: Arc<crate::runtime::hooks::HookRunner>,
     snapshot: Option<bamboo_domain::ModelCallUsage>,
+    session_birth: chrono::DateTime<chrono::Utc>,
+    root_session_id: Option<String>,
 }
 
 impl ModelUsageGuard {
@@ -84,7 +86,11 @@ impl ModelUsageGuard {
         if let Some(mut snapshot) = self.snapshot.take() {
             snapshot.status = status;
             snapshot.usage = usage.map(token_usage);
-            self.runner.notify_model_usage(snapshot);
+            self.runner.notify_model_usage(
+                snapshot,
+                self.session_birth,
+                self.root_session_id.clone(),
+            );
         }
     }
 }
@@ -1716,6 +1722,10 @@ pub(super) async fn execute_llm_stream(
     let trace_ids = observation.trace_ids();
     let mut usage_guard = ModelUsageGuard {
         runner: config.hook_runner.clone(),
+        session_birth: session.created_at,
+        root_session_id: bamboo_infrastructure::telemetry::safe_identifier(
+            &session.root_session_id,
+        ),
         snapshot: bamboo_infrastructure::telemetry::safe_identifier(session_id).map(|session_id| {
             bamboo_domain::ModelCallUsage {
                 schema_version: 1,

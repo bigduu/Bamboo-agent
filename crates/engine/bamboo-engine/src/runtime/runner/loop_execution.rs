@@ -53,9 +53,14 @@ pub(crate) async fn run_agent_loop_with_config(
     cancel_token: CancellationToken,
     config: AgentLoopConfig,
 ) -> super::Result<()> {
-    let observation =
+    let mut observation =
         bamboo_infrastructure::telemetry::Observation::agent(&session.id, &session.root_session_id)
             .bind_session_lifetime(&session.id, session.created_at);
+    if bamboo_infrastructure::telemetry::local::store().enabled() {
+        if let Some(data_dir) = config.app_data_dir.as_deref() {
+            observation = observation.bind_local_scope(data_dir);
+        }
+    }
     let result = observation
         .scope(run_agent_loop_with_config_inner(
             session,

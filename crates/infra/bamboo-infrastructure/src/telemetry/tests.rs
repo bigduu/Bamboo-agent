@@ -323,7 +323,8 @@ mod otlp {
                 KeyValue::new("gen_ai.conversation.id", "synthetic-session"),
             ],
         )
-        .bind_session_lifetime("synthetic-session", chrono::Utc::now());
+        .bind_session_lifetime("synthetic-session", chrono::Utc::now())
+        .bind_local_scope(std::path::Path::new("/PRIVATE_SCOPE_SENTINEL"));
         let root_ids = agent.trace_ids().unwrap();
         let guard = agent.context.clone().attach();
         let llm = Observation::start_with(
@@ -373,6 +374,7 @@ mod otlp {
             "process.command",
             "host.name",
             "telemetry.sdk",
+            "bamboo.local.scope",
             "PRIVATE_",
         ] {
             assert!(!request.contains(denied), "leaked {denied}");
