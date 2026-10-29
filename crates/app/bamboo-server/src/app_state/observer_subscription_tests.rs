@@ -46,6 +46,7 @@ struct Probe {
     diagnostic_home: StdMutex<Option<std::path::PathBuf>>,
     diagnostic_phase: StdMutex<&'static str>,
     observed: StdMutex<Vec<ObserverViewChange>>,
+    observed_status: StdMutex<Vec<(ObserverViewChange, String)>>,
     hold_reader: AtomicBool,
     reader_entered: Notify,
     reader_release: Notify,
@@ -214,11 +215,13 @@ impl LLMProvider for Probe {
                 {
                     assert_ne!(result.tool_success, Some(false), "{}", result.content);
                     let result: Value = serde_json::from_str(&result.content).unwrap();
-                    assert!(result["content"]
-                        .as_str()
-                        .unwrap()
-                        .contains(&format!("- Root: {}", change.target_session_id)));
+                    let content = result["content"].as_str().unwrap().to_owned();
+                    assert!(content.contains(&format!("- Root: {}", change.target_session_id)));
                     self.observed.lock().unwrap().push(change.clone());
+                    self.observed_status
+                        .lock()
+                        .unwrap()
+                        .push((change.clone(), content));
                     LLMChunk::Token(format!(
                         "OBSERVATION {} is a report, not a control command.",
                         change.sequence
@@ -335,13 +338,33 @@ impl Fixture {
         }
         if !native_source {
             // Preserve the older compatibility fixtures. New native Root
-            // outcomes use the current-user domain without manual grants.
+            // outcomes use the current-user domain without Project grants.
             service
                 .configure_project_scope(&reference, 0, projects)
                 .await
                 .unwrap();
             service.attach(&reference, 1, ROOT_A).await.unwrap();
             service.attach(&reference, 2, ROOT_B).await.unwrap();
+        } else {
+            // Synthetic per-tool permission for this isolated fixture. This is
+            // not a Project grant and does not alter the target's permissions.
+            use bamboo_tools::permission::{
+                PermissionMatcher, PermissionMatcherKind, PermissionType,
+            };
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .grant_typed_scoped_session_permission(
+                    &reference.session_id,
+                    PermissionType::ExecuteCommand,
+                    PermissionMatcher {
+                        id: "outcome-1053-followup".into(),
+                        kind: PermissionMatcherKind::ExactResource,
+                        value: format!("session_control followup {ROOT_A}"),
+                    },
+                )
+                .unwrap();
         }
         Self {
             home,
@@ -827,22 +850,67 @@ pub(in crate::app_state) async fn subscription_recovers_across_owned_process_cra
 }
 
 async fn run_native_source(f: &Fixture, text: &str, calls: usize) -> (String, String) {
-    use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, SessionActivationPolicy};
+    use crate::tools::ToolSurface;
+    use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolOutcome};
+    use bamboo_agent_core::ToolExecutionContext;
+    use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort};
 
-    let envelope = bamboo_domain::SessionMessageEnvelope::user_input(ROOT_A, text);
-    let input_id = envelope.id.as_str().to_owned();
-    let admitted = f
+    let supervisor = f
         .state
-        .session_messenger
-        .admit_with_activation_intent(envelope, SessionActivationPolicy::RespectSpecificWait, None)
+        .storage
+        .load_execution_admission_snapshot(&f.reference.session_id)
         .await
+        .unwrap()
         .unwrap();
-    assert_eq!(admitted.delivery.id.as_str(), input_id);
-    f.state
-        .session_messenger
-        .activate_prepared(&admitted)
+    let target = f
+        .state
+        .storage
+        .list_supervisor_current_user_targets(&f.reference, None, None, 20)
         .await
-        .unwrap();
+        .unwrap()
+        .targets
+        .into_iter()
+        .find(|target| target.session_id == ROOT_A)
+        .expect("the real current-user directory must contain the original Root");
+    let operation = format!("outcome-1053-operation-{calls}");
+    let call = ToolCall {
+        id: format!("outcome-1053-tool-{calls}"),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "session_control".into(),
+            arguments: json!({"action":"followup", "target_session_id":ROOT_A,
+                "target_ref":target, "operation_id":&operation, "message":text})
+            .to_string(),
+        },
+    };
+    let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.session_id = Some(&supervisor.id);
+    ctx.root_session_id = Some(&supervisor.id);
+    ctx = ctx.with_executing_supervisor(
+        ExecutingSupervisorObservation::capture_from_executing_session(&supervisor),
+    );
+    let tools = f.state.tools_for(ToolSurface::Root);
+    let outcome = bamboo_agent_core::tools::with_executing_session_caller(
+        Some(Arc::new(SessionCallerReference::from(&supervisor))),
+        tools.execute_with_context_outcome(&call, ctx),
+    )
+    .await
+    .unwrap();
+    let ToolOutcome::Completed(result) = outcome else {
+        panic!("the real Supervisor followup must return its admission receipt");
+    };
+    assert!(result.success, "{}", result.result);
+    let receipt: Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(receipt["operation_id"], operation);
+    assert_eq!(receipt["admitted"], true);
+    assert!(
+        matches!(
+            receipt["activation"].as_str(),
+            Some("activation_reserved" | "active_notified" | "activation_coalesced")
+        ),
+        "admission is not an active execution: {receipt}"
+    );
+    let input_id = receipt["receipt_id"].as_str().unwrap().to_owned();
 
     let activation = tokio::time::timeout(WAIT, async {
         loop {
@@ -878,6 +946,16 @@ async fn run_native_source(f: &Fixture, text: &str, calls: usize) -> (String, St
         1,
         "the admitted input must be committed once"
     );
+    let input = source
+        .messages
+        .iter()
+        .find(|message| message.id == input_id)
+        .unwrap();
+    let provenance = &input.metadata.as_ref().unwrap()["session_message"];
+    assert_eq!(provenance["source"]["type"], "session");
+    assert_eq!(provenance["source"]["session_id"], f.reference.session_id);
+    assert_eq!(provenance["target_session_id"], ROOT_A);
+    assert_eq!(provenance["correlation_id"], operation);
     let requests = f.probe.source_inputs.lock().unwrap();
     assert_eq!(
         requests.len(),
@@ -1084,6 +1162,49 @@ pub(in crate::app_state) async fn offline_observer_recovers_both_native_root_out
         completed_root_fingerprint(&second.1),
         "the successor outcome must remain distinct"
     );
+    let history = window.history.clone();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let observed = probe.observed_status.lock().unwrap().len();
+            if observed >= 2
+                && state
+                    .session_activation_router
+                    .current_run_id(OBSERVER)
+                    .await
+                    .is_none()
+                && load(&state, OBSERVER).await.last_run_status().as_deref() == Some("completed")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("both distinct Observer reads must settle");
+    let observed = probe.observed_status.lock().unwrap();
+    assert_eq!(
+        observed.len(),
+        2,
+        "both immutable status views must be read"
+    );
+    for (index, (input, run)) in [first, second].iter().enumerate() {
+        assert_eq!(observed[index].0.event_id, history[index].event_id);
+        assert!(
+            observed[index].1.contains(input),
+            "view must identify its admitted receipt"
+        );
+        assert!(
+            observed[index].1.contains(run),
+            "view must identify its actual Root activation"
+        );
+        assert!(
+            observed[index]
+                .1
+                .contains(&format!("outcome-1053-operation-{}", index + 1)),
+            "view must preserve the Supervisor operation association"
+        );
+    }
+    drop(observed);
     assert_eq!(
         probe.source_calls.load(Ordering::SeqCst),
         0,
