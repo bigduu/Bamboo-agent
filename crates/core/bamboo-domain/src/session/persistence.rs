@@ -248,10 +248,15 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
-    /// Start a scheduled run only if its original persisted execution profile
+    /// Whether this private writer supports the physical profile check.
+    fn supports_bound_startup_session(&self) -> bool {
+        false
+    }
+
+    /// Persist a Root-bound transition only if its original execution profile
     /// still matches under the backend's physical writer and Root authority.
     /// Unsupported persisters must never emulate this with a separate read/save.
-    async fn save_scheduled_startup_session(
+    async fn save_bound_startup_session(
         &self,
         _session: &mut Session,
         _expected: &Session,
@@ -259,7 +264,7 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             crate::SessionAuthorityConflict(
-                "conditional scheduled startup persistence is unsupported".into(),
+                "conditional bound startup persistence is unsupported".into(),
             ),
         ))
     }
@@ -767,14 +772,16 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         (**self).save_runtime_session(session).await
     }
 
-    async fn save_scheduled_startup_session(
+    fn supports_bound_startup_session(&self) -> bool {
+        (**self).supports_bound_startup_session()
+    }
+
+    async fn save_bound_startup_session(
         &self,
         session: &mut Session,
         expected: &Session,
     ) -> io::Result<()> {
-        (**self)
-            .save_scheduled_startup_session(session, expected)
-            .await
+        (**self).save_bound_startup_session(session, expected).await
     }
 
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {

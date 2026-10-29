@@ -252,6 +252,43 @@ fn bind_connect_session_to_run(
     Ok(())
 }
 
+#[cfg(test)]
+mod startup_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+
+    pub(super) struct Hook {
+        pub(super) reached: Notify,
+        pub(super) resume: Notify,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Arc<Hook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<Hook>>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(key: &str) -> Arc<Hook> {
+        let hook = Arc::new(Hook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        hooks()
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause(key: &str) {
+        let hook = hooks().lock().unwrap().remove(key);
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+}
+
 fn connect_session_matches_run(session: &Session, resolved: &ResolvedConnectRunConfig) -> bool {
     session.model_ref.as_ref().is_some_and(|target| {
         resolved.model_roster.provider_name.as_deref() == Some(target.provider.as_str())
@@ -968,6 +1005,10 @@ impl ConnectBridge {
             }
         };
 
+        // Preserve the durable profile observed before this run changes it.
+        let expected_profile = session.clone();
+        #[cfg(test)]
+        startup_test_hooks::pause(key).await;
         let session_id = session.id.clone();
         let session_tx =
             get_or_create_event_sender(&self.ctx.session_event_senders, &session_id).await;
@@ -1027,18 +1068,18 @@ impl ConnectBridge {
                 return;
             }
         }
-        if let Some(persistence) = execution_reservation.execution_persistence() {
-            if let Err(error) = persistence.save_runtime_session(&mut session).await {
-                execution_reservation.abandon().await;
-                reply_text(
-                    &platform,
-                    reply_ctx,
-                    &format!("Unable to persist this turn: {error}"),
-                )
-                .await;
-                return;
+        let saved = match execution_reservation.execution_persistence() {
+            Some(persistence) => {
+                persistence
+                    .save_bound_startup_session(&mut session, &expected_profile)
+                    .await
             }
-        } else if let Err(error) = self.ctx.session_repo.save(&mut session).await {
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Connect startup requires a bound Root writer",
+            )),
+        };
+        if let Err(error) = saved {
             execution_reservation.abandon().await;
             reply_text(
                 &platform,
@@ -1768,6 +1809,91 @@ mod tests {
             text: text.to_string(),
             reply_ctx: ReplyCtx(serde_json::json!({ "chat_id": chat_id })),
         }
+    }
+
+    #[tokio::test]
+    async fn connect_startup_rejects_concurrent_model_patch_before_provider_call() {
+        use actix_web::{test, web, App};
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let state = web::Data::new(state);
+        let ctx = ConnectContext {
+            agent: state.agent.clone(),
+            tools: state.tools_for(ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
+            permission_checker: state.permission_checker.clone(),
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+        let key = "fake:connect-startup-race:user";
+        let snapshot = state.config.read().await.clone();
+        let resolved = resolve_connect_run_config(&snapshot, &state.provider_registry);
+        let initial = bridge
+            .create_and_register_session(key, &resolved)
+            .await
+            .unwrap();
+        let hook = startup_test_hooks::install(key);
+        let platform = FakePlatform::new("fake");
+        let platform_trait: Arc<dyn Platform> = platform.clone();
+        let reply = inbound("connect-startup-race", "user", "m1", "racing turn").reply_ctx;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let run = bridge.run_prompt(key, platform_trait, &reply, "racing turn");
+        let patch = async {
+            tokio::time::timeout(Duration::from_secs(5), hook.reached.notified())
+                .await
+                .expect("Connect must reach the startup gate");
+            let response = test::call_service(&app, test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", initial.id))
+                .set_json(serde_json::json!({"model_ref": {"provider":"startup-a", "model":"startup-model"}}))
+                .to_request()).await;
+            hook.resume.notify_one();
+            response
+        };
+        let (_, patch) = tokio::join!(run, patch);
+        assert!(
+            patch.status().is_success(),
+            "PATCH status: {}",
+            patch.status()
+        );
+        assert!(platform
+            .sent_texts()
+            .await
+            .iter()
+            .any(|text| text.contains("bound startup execution profile changed")));
+        let durable = state
+            .storage
+            .load_session(&initial.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.model_ref,
+            Some(bamboo_domain::ProviderModelRef::new(
+                "startup-a",
+                "startup-model"
+            ))
+        );
+        assert!(!durable
+            .messages
+            .iter()
+            .any(|message| message.content == "racing turn"));
+        for provider in providers.values() {
+            assert!(provider.models.lock().unwrap().is_empty());
+        }
+        state.shutdown().await;
     }
 
     #[tokio::test]

@@ -214,7 +214,7 @@ impl SessionStoreV2 {
         .await
     }
 
-    pub(super) async fn save_root_actor_scheduled_startup_impl(
+    pub(super) async fn save_root_actor_bound_startup_impl(
         &self,
         owner: &RootActorRuntimeWrite,
         session: &mut Session,
@@ -246,13 +246,41 @@ impl SessionStoreV2 {
             observed
                 .check_conversation_generation(&current)
                 .map_err(conflict)?;
-            let schedule = observed
-                .metadata
-                .get("created_by_schedule_id")
-                .filter(|id| !id.trim().is_empty());
-            if schedule.is_none()
+            let schedule = observed.metadata.get("created_by_schedule_id");
+            let connect = observed.metadata.get("created_by_connect_key");
+            let pending_result = |session: &Session| -> io::Result<Option<serde_json::Value>> {
+                let Some(question) = observed.pending_question.as_ref() else {
+                    return Ok(None);
+                };
+                session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| {
+                        message.tool_call_id.as_deref() == Some(question.tool_call_id.as_str())
+                    })
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(conflict)
+            };
+            if observed.pending_question != current.pending_question
+                || pending_result(&observed)? != pending_result(&current)?
+                || observed
+                    .metadata
+                    .get(bamboo_domain::CONSUMED_CLARIFICATION_IDS_KEY)
+                    != current
+                        .metadata
+                        .get(bamboo_domain::CONSUMED_CLARIFICATION_IDS_KEY)
+                || observed
+                    .metadata
+                    .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY)
+                    != current
+                        .metadata
+                        .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY)
                 || schedule != current.metadata.get("created_by_schedule_id")
                 || schedule != proposed.metadata.get("created_by_schedule_id")
+                || connect != current.metadata.get("created_by_connect_key")
+                || connect != proposed.metadata.get("created_by_connect_key")
                 || observed.id != current.id
                 || observed.created_at != current.created_at
                 || observed.kind != current.kind
@@ -264,7 +292,7 @@ impl SessionStoreV2 {
                 || observed.reasoning_effort != current.reasoning_effort
                 || observed.metadata_version != current.metadata_version
             {
-                return Err(conflict("scheduled startup execution profile changed"));
+                return Err(conflict("bound startup execution profile changed"));
             }
             proof.validate_candidate(&proposed)
         })

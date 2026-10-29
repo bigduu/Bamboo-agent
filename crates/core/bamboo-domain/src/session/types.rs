@@ -381,7 +381,7 @@ pub enum PendingQuestionSource {
 }
 
 /// A pending question waiting for user response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingQuestion {
     pub tool_call_id: String,
     /// Name of the tool that created this pending question (e.g. "EnterPlanMode", "ExitPlanMode").

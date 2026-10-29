@@ -7487,7 +7487,11 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
-    async fn save_root_actor_scheduled_startup(
+    fn supports_root_actor_bound_startup(&self) -> bool {
+        true
+    }
+
+    async fn save_root_actor_bound_startup(
         &self,
         owner: &bamboo_domain::storage::RootActorRuntimeWrite,
         session: &mut Session,
@@ -7495,7 +7499,7 @@ impl Storage for SessionStoreV2 {
         inherited: Option<&bamboo_domain::InheritedChildWait>,
         publish: bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<()> {
-        self.save_root_actor_scheduled_startup_impl(owner, session, expected, inherited, publish)
+        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, publish)
             .await
     }
 

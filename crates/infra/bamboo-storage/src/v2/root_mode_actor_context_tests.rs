@@ -668,7 +668,7 @@ async fn scheduled_startup_profile_conflict_does_not_write_or_publish() {
     let local_publications = Arc::new(AtomicUsize::new(0));
     let local_count = local_publications.clone();
     let error = bound
-        .merge_save_scheduled_startup_and_publish(&mut candidate, &expected, move |_, _| {
+        .merge_save_bound_startup_and_publish(&mut candidate, &expected, move |_, _| {
             local_count.fetch_add(1, Ordering::SeqCst);
         })
         .await
@@ -679,7 +679,7 @@ async fn scheduled_startup_profile_conflict_does_not_write_or_publish() {
         .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
     assert!(error
         .to_string()
-        .contains("scheduled startup execution profile changed"));
+        .contains("bound startup execution profile changed"));
     assert_eq!(serde_json::to_value(&candidate).unwrap(), candidate_before);
     assert_eq!(root_publications.load(Ordering::SeqCst), 0);
     assert_eq!(local_publications.load(Ordering::SeqCst), 0);
@@ -724,12 +724,13 @@ async fn scheduled_startup_commits_and_publishes_with_inherited_wait() {
         .bind_root_actor_writer(owner, publisher)
         .unwrap()
         .bind_inherited_child_wait(inherited);
+    assert!(bamboo_domain::RuntimeSessionPersistence::supports_bound_startup_session(&bound));
     let mut candidate = expected.clone();
     candidate.set_last_run_status("running");
     let local_publications = Arc::new(AtomicUsize::new(0));
     let local_count = local_publications.clone();
     bound
-        .merge_save_scheduled_startup_and_publish(&mut candidate, &expected, move |_, committed| {
+        .merge_save_bound_startup_and_publish(&mut candidate, &expected, move |_, committed| {
             assert!(committed);
             local_count.fetch_add(1, Ordering::SeqCst);
         })
@@ -766,8 +767,9 @@ async fn scheduled_startup_without_root_writer_fails_closed() {
     candidate.set_last_run_status("running");
     let storage: Arc<dyn Storage> = store.clone();
     let unbound = crate::session_merge::LockedSessionStore::new(storage);
+    assert!(!bamboo_domain::RuntimeSessionPersistence::supports_bound_startup_session(&unbound));
     let error = unbound
-        .merge_save_scheduled_startup(&mut candidate, &expected)
+        .merge_save_bound_startup(&mut candidate, &expected)
         .await
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Unsupported);
@@ -777,4 +779,253 @@ async fn scheduled_startup_without_root_writer_fails_closed() {
     let saved = store.load_session(&root.id).await.unwrap().unwrap();
     assert_eq!(saved.last_run_status(), expected.last_run_status());
     assert_eq!(saved.model_ref, expected.model_ref);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_response_does_not_overwrite_concurrent_profile_change() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for change in ["model", "question", "response", "consumed"] {
+        let home = tempfile::tempdir().unwrap();
+        let first = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let mut root = scheduled_startup_root("response-profile-race");
+        root.metadata.remove("created_by_schedule_id");
+        root.metadata
+            .insert("created_by_connect_key".into(), "fake:chat:user".into());
+        root.add_message(bamboo_domain::Message::tool_result(
+            "call-1",
+            "initial response occurrence",
+        ));
+        root.set_pending_question(
+            "call-1".into(),
+            "question".into(),
+            "Continue?".into(),
+            vec!["Yes".into()],
+            false,
+        );
+        first.save_session(&root).await.unwrap();
+        let original = first.load_session(&root.id).await.unwrap().unwrap();
+        let owner = activate(&first, &original).await;
+        let other_owner = owner.clone();
+        let second = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let root_publications = Arc::new(AtomicUsize::new(0));
+        let count = root_publications.clone();
+        let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let storage: Arc<dyn Storage> = first.clone();
+        let bound = Arc::new(
+            crate::session_merge::LockedSessionStore::new(storage)
+                .bind_root_actor_writer(owner, publisher)
+                .unwrap(),
+        );
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let entered = reached.clone();
+        let (release, wait) = std::sync::mpsc::sync_channel::<()>(0);
+        let local_publications = Arc::new(AtomicUsize::new(0));
+        let local_count = local_publications.clone();
+        let id = root.id.clone();
+        let response = tokio::spawn(async move {
+            bound
+                .mutate_runtime_session_and_publish(
+                    &id,
+                    || None,
+                    move |session| {
+                        entered.notify_one();
+                        wait.recv_timeout(std::time::Duration::from_secs(10))
+                            .expect("release response mutation");
+                        session.clear_pending_question();
+                        session.add_message(bamboo_domain::Message::user("accepted answer"));
+                        Ok::<(), ()>(())
+                    },
+                    move |_| {
+                        local_count.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+            .await
+            .expect("response must reach the controlled mutation");
+        let mut changed = second.load_session(&root.id).await.unwrap().unwrap();
+        match change {
+            "model" => {
+                changed.model = "model-b".into();
+                changed.model_ref =
+                    Some(bamboo_domain::ProviderModelRef::new("account-b", "model-b"));
+                changed.set_provider_name("account-b");
+                changed.metadata_version += 1;
+            }
+            "question" => changed.set_pending_question(
+                "call-1".into(),
+                "question".into(),
+                "Different?".into(),
+                vec!["No".into()],
+                false,
+            ),
+            "response" => {
+                changed
+                    .messages
+                    .iter_mut()
+                    .find(|message| message.tool_call_id.as_deref() == Some("call-1"))
+                    .unwrap()
+                    .content = "changed response occurrence".into()
+            }
+            "consumed" => {
+                changed.metadata.insert(
+                    bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY.into(),
+                    "[]".into(),
+                );
+            }
+            _ => unreachable!(),
+        }
+        if change == "response" {
+            second
+                .save_root_actor_runtime(&other_owner, &changed, false, Arc::new(|_| {}))
+                .await
+                .unwrap();
+        } else {
+            second.save_session(&changed).await.unwrap();
+        }
+        release.send(()).unwrap();
+        let error = response.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<SessionAuthorityConflict>()));
+        let durable = second.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(durable.model_ref, changed.model_ref);
+        assert_eq!(durable.pending_question, changed.pending_question);
+        assert_eq!(
+            durable
+                .metadata
+                .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY),
+            changed
+                .metadata
+                .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        );
+        assert!(!durable
+            .messages
+            .iter()
+            .any(|message| message.content == "accepted answer"));
+        assert_eq!(root_publications.load(Ordering::SeqCst), 0);
+        assert_eq!(local_publications.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
+async fn basic_root_writer_without_profile_cas_reports_unsupported() {
+    struct BasicOnly;
+    #[async_trait::async_trait]
+    impl Storage for BasicOnly {
+        fn supports_root_actor_runtime_write(&self) -> bool {
+            true
+        }
+        async fn save_session(&self, _: &Session) -> io::Result<()> {
+            unreachable!()
+        }
+        async fn load_session(&self, _: &str) -> io::Result<Option<Session>> {
+            unreachable!()
+        }
+        async fn delete_session(&self, _: &str) -> io::Result<bool> {
+            unreachable!()
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let root = scheduled_startup_root("unsupported-profile-cas");
+    store.save_session(&root).await.unwrap();
+    let original = store.load_session(&root.id).await.unwrap().unwrap();
+    let owner = activate(&store, &original).await;
+    let storage: Arc<dyn Storage> = Arc::new(BasicOnly);
+    let writer = crate::session_merge::LockedSessionStore::new(storage)
+        .bind_root_actor_writer(owner, Arc::new(|_| {}))
+        .unwrap();
+    assert!(!bamboo_domain::RuntimeSessionPersistence::supports_bound_startup_session(&writer));
+    let view: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = Arc::new(writer);
+    assert!(!view.supports_bound_startup_session());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_response_preserves_cross_instance_inherited_wait_completion() {
+    let home = tempfile::tempdir().unwrap();
+    let first = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let mut root = scheduled_startup_root("response-inherited-wait-race");
+    let mut runtime = bamboo_domain::AgentRuntimeState::new("previous-run");
+    runtime.waiting_for_children = Some(bamboo_domain::WaitingForChildrenState::for_children(
+        vec!["ordinary-child".into()],
+        bamboo_domain::ChildWaitPolicy::All,
+        Utc::now(),
+    ));
+    root.agent_runtime_state = Some(runtime);
+    root.set_pending_question(
+        "call-1".into(),
+        "question".into(),
+        "Continue?".into(),
+        vec!["Yes".into()],
+        false,
+    );
+    first.save_session(&root).await.unwrap();
+    let original = first.load_session(&root.id).await.unwrap().unwrap();
+    let inherited = bamboo_domain::InheritedChildWait::capture(&original).unwrap();
+    let owner = activate(&first, &original).await;
+    let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let storage: Arc<dyn Storage> = first.clone();
+    let bound = Arc::new(
+        crate::session_merge::LockedSessionStore::new(storage)
+            .bind_root_actor_writer(owner, Arc::new(|_| {}))
+            .unwrap()
+            .bind_inherited_child_wait(inherited),
+    );
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let entered = reached.clone();
+    let (release, wait) = std::sync::mpsc::sync_channel::<()>(0);
+    let id = root.id.clone();
+    let response = tokio::spawn(async move {
+        bound
+            .mutate_runtime_session_and_publish(
+                &id,
+                || None,
+                move |session| {
+                    entered.notify_one();
+                    wait.recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("release mutation");
+                    session.clear_pending_question();
+                    session.add_message(bamboo_domain::Message::user("accepted answer"));
+                    Ok::<(), ()>(())
+                },
+                |_| {},
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached.notified())
+        .await
+        .expect("response must reach the controlled mutation");
+    let mut completed = second.load_session(&root.id).await.unwrap().unwrap();
+    completed
+        .agent_runtime_state
+        .as_mut()
+        .unwrap()
+        .waiting_for_children = None;
+    second.save_session(&completed).await.unwrap();
+    release.send(()).unwrap();
+    let saved = response.await.unwrap().unwrap().unwrap().unwrap();
+    assert!(saved
+        .agent_runtime_state
+        .as_ref()
+        .unwrap()
+        .waiting_for_children
+        .is_none());
+    let durable = second.load_session(&root.id).await.unwrap().unwrap();
+    assert!(durable
+        .agent_runtime_state
+        .as_ref()
+        .unwrap()
+        .waiting_for_children
+        .is_none());
+    assert!(durable.pending_question.is_none());
+    assert!(durable
+        .messages
+        .iter()
+        .any(|message| message.content == "accepted answer"));
 }
