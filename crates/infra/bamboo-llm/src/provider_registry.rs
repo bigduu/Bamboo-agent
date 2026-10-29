@@ -1207,7 +1207,7 @@ pub struct LegacyVisionProviderSource {
 
 enum LegacyVisionProviderProof {
     Managed(Arc<ManagedProviderOrigin>),
-    Injected(SdkProviderBinding),
+    Injected(Box<SdkProviderBinding>),
 }
 
 impl LegacyVisionProviderSource {
@@ -1222,11 +1222,11 @@ impl LegacyVisionProviderSource {
                 origin.validate_legacy_vision_source(config, provider_id, &selected)?;
                 LegacyVisionProviderProof::Managed(origin)
             }
-            None => LegacyVisionProviderProof::Injected(SdkProviderBinding::capture(
+            None => LegacyVisionProviderProof::Injected(Box::new(SdkProviderBinding::capture(
                 config,
                 provider_id,
                 false,
-            )?),
+            )?)),
         };
         Ok(Self {
             provider_id: provider_id.to_string(),
