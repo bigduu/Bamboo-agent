@@ -352,7 +352,7 @@ pub fn observer_root_outcome_status(outcome: &ObserverSupervisedRootOutcome) -> 
             }
         } else {
             output.push_str(&format!(
-                "- {label} SHA-256: {} (full value in Supervisor notice)\n",
+                "- {label} SHA-256: {} (full value in structured Inbox data)\n",
                 hex::encode(Sha256::digest(value.as_bytes()))
             ));
         }
