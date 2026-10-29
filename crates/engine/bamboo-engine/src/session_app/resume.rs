@@ -351,6 +351,7 @@ mod tests {
         detached_release: Arc<Notify>,
         detached_finished: Arc<AtomicBool>,
         saw_marker_at_adapter: Arc<AtomicBool>,
+        used_configured_dispatch: Arc<AtomicBool>,
         save_calls: AtomicUsize,
     }
 
@@ -413,6 +414,14 @@ mod tests {
             std::future::pending::<()>().await;
         }
 
+        fn dispatch_configured_resume_execution(
+            &self,
+            request: ResumeSpawnRequest,
+        ) -> Result<(), ResumeSpawnRequest> {
+            self.used_configured_dispatch.store(true, Ordering::SeqCst);
+            self.dispatch_resume_execution(request)
+        }
+
         fn dispatch_resume_execution(
             &self,
             request: ResumeSpawnRequest,
@@ -461,6 +470,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configured_handoff_uses_explicit_origin_and_keeps_detached_owner() {
+        let mut session = Session::new("resume-config-origin", "model");
+        session.add_message(Message::tool_result("call-1", "Selected response: A"));
+        session.metadata.insert(
+            "clarification_resume_pending".to_string(),
+            "true".to_string(),
+        );
+        let port = Arc::new(CancellingResumePort {
+            durable: Mutex::new(session),
+            runners: Arc::new(RwLock::new(HashMap::new())),
+            senders: Arc::new(RwLock::new(HashMap::new())),
+            spawn_entered: Arc::new(Notify::new()),
+            detached_release: Arc::new(Notify::new()),
+            detached_finished: Arc::new(AtomicBool::new(false)),
+            saw_marker_at_adapter: Arc::new(AtomicBool::new(false)),
+            used_configured_dispatch: Arc::new(AtomicBool::new(false)),
+            save_calls: AtomicUsize::new(0),
+        });
+        let handoff = reserve_response_resume_handoff(
+            port.as_ref(),
+            "resume-config-origin",
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("reserve exact response successor");
+        let session = port.durable.lock().await.clone();
+        let outcome = resume_session_execution_with_handoff_and_configured_fallback(
+            port.as_ref(),
+            "resume-config-origin",
+            session,
+            test_resume_config(),
+            handoff,
+        )
+        .await;
+        assert!(matches!(outcome, ResumeOutcome::Started { .. }));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            port.spawn_entered.notified(),
+        )
+        .await
+        .expect("detached configured owner must register the successor");
+        assert!(port.used_configured_dispatch.load(Ordering::SeqCst));
+        port.detached_release.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !port.detached_finished.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached configured owner must finish");
+    }
+
+    #[tokio::test]
     async fn caller_cancellation_after_dispatch_keeps_detached_resume_owner() {
         let mut session = Session::new("resume-cancel", "model");
         session.add_message(Message::tool_result("call-1", "Selected response: A"));
@@ -480,6 +542,7 @@ mod tests {
             detached_release: Arc::new(Notify::new()),
             detached_finished: Arc::new(AtomicBool::new(false)),
             saw_marker_at_adapter: Arc::new(AtomicBool::new(false)),
+            used_configured_dispatch: Arc::new(AtomicBool::new(false)),
             save_calls: AtomicUsize::new(0),
         });
 
@@ -522,6 +585,7 @@ mod tests {
         .expect("detached owner must survive caller cancellation");
 
         assert!(port.saw_marker_at_adapter.load(Ordering::SeqCst));
+        assert!(!port.used_configured_dispatch.load(Ordering::SeqCst));
         assert_eq!(port.save_calls.load(Ordering::SeqCst), 0);
         let durable = port.durable.lock().await;
         assert_eq!(
