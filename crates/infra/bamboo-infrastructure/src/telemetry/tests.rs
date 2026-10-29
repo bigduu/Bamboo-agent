@@ -318,8 +318,27 @@ mod otlp {
             &tracer,
             "invoke_agent",
             SpanKind::Internal,
-            vec![KeyValue::new("gen_ai.operation.name", "invoke_agent")],
-        );
+            vec![
+                KeyValue::new("gen_ai.operation.name", "invoke_agent"),
+                KeyValue::new("gen_ai.conversation.id", "synthetic-session"),
+            ],
+        ).bind_session_lifetime("synthetic-session", chrono::Utc::now());
+        let root_ids = agent.trace_ids().unwrap();
+        let guard = agent.context.clone().attach();
+        let llm = Observation::start_with(&tracer, "chat", SpanKind::Client, vec![
+            KeyValue::new("gen_ai.operation.name", "chat"),
+            KeyValue::new("gen_ai.conversation.id", "synthetic-session"),
+        ]);
+        let child_ids = llm.trace_ids().unwrap();
+        assert_eq!(child_ids.0, root_ids.0);
+        assert_ne!(child_ids.1, root_ids.1);
+        llm.model_usage(&bamboo_domain::ModelTokenUsage {
+            input_tokens: Some(100), output_tokens: Some(20), reasoning_tokens: Some(3),
+            cache_read_input_tokens: Some(0), cache_creation_input_tokens: None,
+            cache_write_input_tokens: Some(12),
+        });
+        llm.finish(Outcome::Success);
+        drop(guard);
         agent.finish(Outcome::Success);
         provider.force_flush().unwrap();
         provider
@@ -332,6 +351,8 @@ mod otlp {
             "application/x-protobuf",
             "invoke_agent",
             "gen_ai.operation.name",
+            "bamboo.usage.cache_read_input_tokens",
+            "bamboo.usage.cache_write_input_tokens",
             "service.name",
             GEN_AI_CONVENTIONS_REVISION,
         ] {
