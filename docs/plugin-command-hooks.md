@@ -81,6 +81,13 @@ This implementation selects their small synchronous command intersection:
 | `PostToolUse` | Exit 2 or JSON `decision: "block"` supplies blocking feedback after execution; hook-specific context is supported; side effects cannot be undone |
 | `Stop` | Exit 2 or JSON `decision: "block"` requests continuation; ignored when `stop_hook_active` is true, with the existing host continuation ceiling |
 
+Separately, Bamboo provides the read-only `BambooModelCallUsage` observer
+extension. It receives a top-level `observation` and is delivered on a
+best-effort basis; its output cannot affect the model call. See
+[local trace inspection](guides/LOCAL_TRACE_INSPECTION.md#read-only-hook-event)
+for the payload, limits and example plugin. The control and input details below
+apply to the synchronous compatibility subset above.
+
 Exit 0 with empty stdout is a no-op. Plain stdout for tool/Stop events is ignored. Other exit codes, malformed JSON,
 truncated output, timeout and unsupported output shapes are reported as hook
 failures and contribute no control or context. Native hooks keep their
@@ -131,8 +138,8 @@ System injection path, never acquires `never_compress`, and creates no memory
 service. Blocked prompt context is discarded. Jiandu native recall is unchanged.
 
 Excluded: SessionStart/SessionEnd (Bamboo currently fires these per run), all
-other events, async/asyncRewake, MCP/prompt/agent/HTTP handlers, `ask`, input
-rewrites, persistent permission updates, env-file, executable handler objects,
+events except those described above, async/asyncRewake, MCP/prompt/agent/HTTP
+handlers, `ask`, input rewrites, persistent permission updates, env-file, executable handler objects,
 `statusMessage`, `additionalContextLimit`, `systemMessage`, `continue`,
 `suppressOutput`, and full upstream manifest import/export. Unsupported fields
 are rejected instead of silently discarded. Raw stderr and context may contain

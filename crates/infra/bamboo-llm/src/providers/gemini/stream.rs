@@ -19,7 +19,7 @@
 
 use crate::provider::{LLMError, Result};
 use crate::providers::common::sse::sse_error_is_present;
-use crate::types::LLMChunk;
+use crate::types::{LLMChunk, ProviderUsageInvalidFields, ProviderUsageReplacement};
 use bamboo_domain::{FunctionCall, ToolCall};
 use serde_json::Value;
 
@@ -44,6 +44,141 @@ pub struct GeminiStreamState {
     /// Whether an [`LLMChunk::UsageSummary`] has already been emitted for this
     /// stream. It follows the same terminal/content-free and emit-once rules.
     usage_summary_emitted: bool,
+    /// Cumulative provider fields retain absent, valid and malformed states.
+    provider_usage: GeminiProviderUsage,
+    pending_replacement: Option<ProviderUsageReplacement>,
+    emit_legacy_provider_usage: bool,
+}
+
+#[derive(Default)]
+struct GeminiProviderUsage {
+    snapshot: ProviderUsageReplacement,
+    invalid_tool_prompt: bool,
+    last_tool_prompt: Option<u64>,
+}
+
+impl GeminiProviderUsage {
+    fn observe(&mut self, usage: &Value) -> ProviderUsageReplacement {
+        if !usage.is_object() {
+            self.snapshot = ProviderUsageReplacement {
+                invalid_fields: ProviderUsageInvalidFields {
+                    input_tokens: true,
+                    output_tokens: true,
+                    total_tokens: true,
+                    reasoning_tokens: true,
+                    cache_read_input_tokens: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            self.invalid_tool_prompt = true;
+            self.last_tool_prompt = None;
+            return self.snapshot;
+        }
+        // The outer Option represents field presence; the inner Option
+        // distinguishes a valid integer from an explicitly malformed value.
+        let field = |key: &str| usage.get(key).map(Value::as_u64);
+        let prompt = field("promptTokenCount");
+        let tool = field("toolUsePromptTokenCount");
+        let candidates = field("candidatesTokenCount");
+        let thoughts = field("thoughtsTokenCount");
+        if let Some(tool) = tool {
+            self.invalid_tool_prompt = tool.is_none();
+            self.last_tool_prompt = tool;
+        }
+        let (input, invalid_input) = match (prompt, tool) {
+            (Some(None), _) | (_, Some(None)) => (None, true),
+            (Some(Some(prompt)), Some(Some(tool))) => {
+                let input = prompt.checked_add(tool);
+                (input, input.is_none())
+            }
+            (Some(Some(prompt)), None)
+                if !self.invalid_tool_prompt && self.last_tool_prompt.unwrap_or(0) == 0 =>
+            {
+                (Some(prompt), false)
+            }
+            (Some(Some(_)), None) => (None, self.snapshot.invalid_fields.input_tokens),
+            (None, Some(Some(_))) => (None, self.snapshot.invalid_fields.input_tokens),
+            (None, None) => (
+                self.snapshot.input_tokens,
+                self.snapshot.invalid_fields.input_tokens,
+            ),
+        };
+        self.snapshot.input_tokens = input;
+        self.snapshot.invalid_fields.input_tokens = invalid_input;
+        if let Some(thoughts) = thoughts {
+            self.snapshot.reasoning_tokens = thoughts;
+            self.snapshot.invalid_fields.reasoning_tokens = thoughts.is_none();
+        }
+        let (output, invalid_output) = match (candidates, thoughts) {
+            (Some(None), _) | (_, Some(None)) => (None, true),
+            (Some(Some(candidates)), Some(Some(thoughts))) => {
+                let output = candidates.checked_add(thoughts);
+                (output, output.is_none())
+            }
+            (Some(Some(_)), None) | (None, Some(Some(_))) => {
+                (None, self.snapshot.invalid_fields.output_tokens)
+            }
+            (None, None) => (
+                self.snapshot.output_tokens,
+                self.snapshot.invalid_fields.output_tokens,
+            ),
+        };
+        self.snapshot.output_tokens = output;
+        self.snapshot.invalid_fields.output_tokens = invalid_output;
+        if let Some(cached) = field("cachedContentTokenCount") {
+            self.snapshot.cache_read_input_tokens = cached;
+            self.snapshot.invalid_fields.cache_read_input_tokens = cached.is_none();
+        }
+        if let Some(total) = field("totalTokenCount") {
+            self.snapshot.total_tokens = total;
+            self.snapshot.invalid_fields.total_tokens = total.is_none();
+        }
+        let frame_input_sum = match (prompt.flatten(), tool.flatten()) {
+            (Some(prompt), Some(tool)) => prompt.checked_add(tool),
+            (Some(prompt), None) => Some(prompt),
+            (None, Some(tool)) => Some(tool),
+            (None, None) => None,
+        };
+        let frame_output_sum = match (candidates.flatten(), thoughts.flatten()) {
+            (Some(candidates), Some(thoughts)) => candidates.checked_add(thoughts),
+            (Some(candidates), None) => Some(candidates),
+            (None, Some(thoughts)) => Some(thoughts),
+            (None, None) => None,
+        };
+        let input_overflow =
+            prompt.flatten().is_some() && tool.flatten().is_some() && frame_input_sum.is_none();
+        let output_overflow = candidates.flatten().is_some()
+            && thoughts.flatten().is_some()
+            && frame_output_sum.is_none();
+        let input_floor = self
+            .snapshot
+            .input_tokens
+            .unwrap_or(0)
+            .max(self.snapshot.cache_read_input_tokens.unwrap_or(0))
+            .max(prompt.flatten().unwrap_or(0))
+            .max(tool.flatten().unwrap_or(0))
+            .max(frame_input_sum.unwrap_or(0));
+        let output_floor = self
+            .snapshot
+            .output_tokens
+            .unwrap_or(0)
+            .max(self.snapshot.reasoning_tokens.unwrap_or(0))
+            .max(candidates.flatten().unwrap_or(0))
+            .max(frame_output_sum.unwrap_or(0));
+        self.snapshot.input_floor = Some(input_floor);
+        self.snapshot.output_floor = Some(output_floor);
+        let minimum = input_floor.checked_add(output_floor);
+        if self.snapshot.total_tokens.is_some_and(|total| {
+            input_overflow || output_overflow || minimum.is_none_or(|minimum| minimum > total)
+        }) {
+            // Once inconsistent, a total stays unknown until the provider
+            // reports a new valid total; smaller partial frames cannot revive it.
+            self.snapshot.total_tokens = None;
+            self.snapshot.invalid_fields.total_tokens = true;
+        }
+        self.snapshot
+    }
 }
 
 impl GeminiStreamState {
@@ -95,17 +230,32 @@ fn take_gemini_usage_summary(state: &mut GeminiStreamState, value: &Value) -> Op
     })
 }
 
-/// Take usage carried by a Gemini event's `usageMetadata` as an *ordered*
-/// sequence of chunks: [`LLMChunk::CacheUsage`] (cache hit) first, then
-/// [`LLMChunk::UsageSummary`] (output/thinking).
-///
-/// Gemini folds both pieces into a single final `usageMetadata`, but
-/// `streamGenerateContent?alt=sse` sends no `[DONE]` sentinel — the connection
-/// closes right after that final event. Returning both chunks from this one
-/// call (rather than deferring the second to a later parse call that never
-/// comes) guarantees usage is delivered for cached requests too. Either piece
-/// may be absent (or already emitted); only the pieces present are included.
+/// Observe an accepted frame without consuming either legacy event.
+fn observe_gemini_provider_usage(state: &mut GeminiStreamState, value: &Value) {
+    state.pending_replacement = value
+        .get("usageMetadata")
+        .filter(|usage| {
+            !usage.is_object()
+                || [
+                    "promptTokenCount",
+                    "toolUsePromptTokenCount",
+                    "candidatesTokenCount",
+                    "thoughtsTokenCount",
+                    "cachedContentTokenCount",
+                    "totalTokenCount",
+                ]
+                .iter()
+                .any(|key| usage.get(key).is_some())
+        })
+        .map(|usage| state.provider_usage.observe(usage));
+}
+
+/// Take legacy usage from a terminal or content-free Gemini event, returning
+/// cache before summary. Each event is emitted at most once and neither is
+/// deferred past the final SSE frame, which may be followed directly by EOF.
 fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<LLMChunk> {
+    observe_gemini_provider_usage(state, value);
+    state.emit_legacy_provider_usage = true;
     let cache = take_gemini_cache_usage(state, value);
     let summary = take_gemini_usage_summary(state, value);
     let mut out = Vec::with_capacity(2);
@@ -118,6 +268,27 @@ fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<
     out
 }
 
+/// Production adapter adds the snapshot after the existing compatibility
+/// chunks. Repeated cumulative events replace values downstream, never add.
+pub(super) fn parse_with_provider_usage(
+    state: &mut GeminiStreamState,
+    event_type: &str,
+    data: &str,
+) -> Result<Vec<LLMChunk>> {
+    state.pending_replacement = None;
+    let mut chunks = parse_gemini_sse_event(state, event_type, data)?;
+    if let Some(replacement) = state.pending_replacement.take() {
+        chunks.push(LLMChunk::ProviderUsageReplace(replacement));
+        // Preserve the existing ProviderUsage variant for older consumers.
+        // Its values come from the same cumulative state to avoid a partial
+        // frame replacing a valid total with a misleading component.
+        if state.emit_legacy_provider_usage {
+            chunks.extend(replacement.legacy_chunk());
+        }
+    }
+    Ok(chunks)
+}
+
 /// Parse a single Gemini SSE event into zero or more [`LLMChunk`]s.
 ///
 /// Gemini sends JSON objects as data, not named events. The `event_type` parameter
@@ -125,8 +296,8 @@ fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<
 ///
 /// Returns:
 /// - `Ok(vec![chunk, ..])` for content-bearing events (text, tool calls) and
-///   usage events. Only terminal content-bearing events consume cumulative
-///   `usageMetadata`; a final event may yield both a `CacheUsage` and a
+///   usage events. Only terminal content-bearing events emit legacy
+///   `usageMetadata` events; a final event may yield both a `CacheUsage` and a
 ///   `UsageSummary`. Chunks have deterministic order: non-empty text/reasoning
 ///   tokens in part order, one `ToolCalls` chunk containing every function call
 ///   in part order, then `CacheUsage`, then `UsageSummary`
@@ -148,6 +319,8 @@ pub fn parse_gemini_sse_event(
     _event_type: &str,
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
+    state.pending_replacement = None;
+    state.emit_legacy_provider_usage = false;
     // Trim whitespace
     let data = data.trim();
 
@@ -205,8 +378,8 @@ pub fn parse_gemini_sse_event(
     // Gemini defines an empty finishReason as "generation has not stopped".
     // Any non-empty reason is terminal (including safety/filter/tool errors, not
     // only STOP/MAX_TOKENS), so only such content-bearing events may consume the
-    // cumulative usageMetadata. Content-free usage events remain handled by the
-    // early-return paths below.
+    // legacy cache/summary metadata. Content-free usage events remain handled
+    // by the early-return paths below. Snapshots are observed on every frame.
     let is_terminal_content_event = candidate
         .get("finishReason")
         .and_then(Value::as_str)
@@ -315,6 +488,10 @@ pub fn parse_gemini_sse_event(
         // the stream closes. Intermediate cumulative totals are intentionally
         // ignored so they cannot suppress the final totals.
         chunks.extend(take_gemini_event_usage(state, &value));
+    } else {
+        // Observe only after successful content parsing, so a rejected frame
+        // cannot corrupt later usage if a caller continues after an error.
+        observe_gemini_provider_usage(state, &value);
     }
 
     Ok(chunks)
@@ -323,6 +500,360 @@ pub fn parse_gemini_sse_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_usage_tracks_invalid_missing_zero_and_recovery() {
+        let mut state = GeminiStreamState::default();
+        let mut observe = |usage: &str| {
+            let data = format!(r#"{{"candidates":[],"usageMetadata":{usage}}}"#);
+            parse_with_provider_usage(&mut state, "", &data)
+                .unwrap()
+                .into_iter()
+                .find_map(|chunk| match chunk {
+                    LLMChunk::ProviderUsageReplace(usage) => Some(usage),
+                    _ => None,
+                })
+                .unwrap()
+        };
+        let first = observe(
+            r#"{"promptTokenCount":100,"cachedContentTokenCount":25,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}"#,
+        );
+        assert_eq!(first.cache_read_input_tokens, Some(25));
+        assert!(!first.invalid_fields.any());
+        let invalid = observe(r#"{"cachedContentTokenCount":-1,"thoughtsTokenCount":null}"#);
+        assert_eq!(invalid.input_tokens, Some(100));
+        assert_eq!(invalid.cache_read_input_tokens, None);
+        assert_eq!(invalid.output_tokens, None);
+        assert_eq!(invalid.reasoning_tokens, None);
+        assert!(invalid.invalid_fields.cache_read_input_tokens);
+        assert!(invalid.invalid_fields.output_tokens);
+        assert!(invalid.invalid_fields.reasoning_tokens);
+        let omitted = observe(r#"{"promptTokenCount":100}"#);
+        assert_eq!(omitted.cache_read_input_tokens, None);
+        assert!(omitted.invalid_fields.cache_read_input_tokens);
+        let restored = observe(
+            r#"{"cachedContentTokenCount":0,"candidatesTokenCount":20,"thoughtsTokenCount":3}"#,
+        );
+        assert_eq!(restored.cache_read_input_tokens, Some(0));
+        assert_eq!(restored.output_tokens, Some(23));
+        assert!(!restored.invalid_fields.any());
+        assert_eq!(observe(r#"{"cachedContentTokenCount":0}"#), restored);
+    }
+
+    #[test]
+    fn repeated_usage_invalidates_cross_frame_total_and_overflows() {
+        let mut usage = GeminiProviderUsage::default();
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        let first = usage.observe(&parse(r#"{"promptTokenCount":100,"toolUsePromptTokenCount":2,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":125}"#));
+        assert_eq!(first.input_tokens, Some(102));
+        assert_eq!(first.total_tokens, Some(125));
+        let inconsistent = usage.observe(&parse(r#"{"totalTokenCount":10}"#));
+        assert_eq!(inconsistent.total_tokens, None);
+        assert!(inconsistent.invalid_fields.total_tokens);
+        let smaller = usage.observe(&parse(r#"{"promptTokenCount":0,"toolUsePromptTokenCount":0,"candidatesTokenCount":0,"thoughtsTokenCount":0}"#));
+        assert_eq!(smaller.total_tokens, None);
+        assert!(smaller.invalid_fields.total_tokens);
+        usage.observe(&parse(r#"{"promptTokenCount":100,"toolUsePromptTokenCount":2,"candidatesTokenCount":20,"thoughtsTokenCount":3}"#));
+        let tool_invalid = usage.observe(&parse(r#"{"toolUsePromptTokenCount":"bad"}"#));
+        assert_eq!(tool_invalid.input_tokens, None);
+        assert!(tool_invalid.invalid_fields.input_tokens);
+        let prompt_only = usage.observe(&parse(r#"{"promptTokenCount":101}"#));
+        assert_eq!(prompt_only.input_tokens, None);
+        let overflow = usage.observe(&parse(
+            r#"{"promptTokenCount":101,"toolUsePromptTokenCount":18446744073709551615}"#,
+        ));
+        assert_eq!(overflow.input_tokens, None);
+        assert!(overflow.invalid_fields.input_tokens);
+        let recovered = usage.observe(&parse(
+            r#"{"promptTokenCount":101,"toolUsePromptTokenCount":0,"totalTokenCount":124}"#,
+        ));
+        assert_eq!(recovered.input_tokens, Some(101));
+        assert_eq!(recovered.total_tokens, Some(124));
+        assert!(!recovered.invalid_fields.any());
+        let all_invalid = usage.observe(&Value::Null);
+        assert!(all_invalid.invalid_fields.any());
+        assert!(all_invalid.legacy_chunk().is_none());
+    }
+
+    #[test]
+    fn partial_component_updates_do_not_retain_contradictory_totals() {
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        for partial in [
+            r#"{"candidatesTokenCount":30}"#,
+            r#"{"thoughtsTokenCount":30}"#,
+            r#"{"toolUsePromptTokenCount":101}"#,
+        ] {
+            let mut usage = GeminiProviderUsage::default();
+            usage.observe(&parse(r#"{"promptTokenCount":100,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}"#));
+            let next = usage.observe(&parse(partial));
+            if partial.contains("toolUsePromptTokenCount") {
+                assert_eq!(next.input_tokens, None);
+                assert!(!next.invalid_fields.input_tokens);
+            } else {
+                assert_eq!(next.output_tokens, None);
+                assert!(!next.invalid_fields.output_tokens);
+            }
+            assert_eq!(next.total_tokens, None);
+            assert!(next.invalid_fields.total_tokens);
+        }
+        let mut usage = GeminiProviderUsage::default();
+        usage.observe(&parse(
+            r#"{"promptTokenCount":100,"toolUsePromptTokenCount":3}"#,
+        ));
+        let prompt_only = usage.observe(&parse(r#"{"promptTokenCount":101}"#));
+        assert_eq!(prompt_only.input_tokens, None);
+        assert!(!prompt_only.invalid_fields.input_tokens);
+    }
+
+    #[test]
+    fn empty_usage_metadata_does_not_emit_a_replacement() {
+        let mut state = GeminiStreamState::default();
+        let chunks =
+            parse_with_provider_usage(&mut state, "", r#"{"candidates":[],"usageMetadata":{}}"#)
+                .unwrap();
+        assert!(!chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(_) | LLMChunk::ProviderUsage { .. }
+        )));
+    }
+
+    #[test]
+    fn component_overflow_invalidates_total_and_partial_frames_keep_floors() {
+        let parse = |text: &str| serde_json::from_str::<Value>(text).unwrap();
+        for frame in [
+            r#"{"promptTokenCount":18446744073709551615,"toolUsePromptTokenCount":1,"totalTokenCount":18446744073709551615}"#,
+            r#"{"candidatesTokenCount":18446744073709551615,"thoughtsTokenCount":1,"totalTokenCount":18446744073709551615}"#,
+        ] {
+            let snapshot = GeminiProviderUsage::default().observe(&parse(frame));
+            assert_eq!(snapshot.total_tokens, None);
+            assert!(snapshot.invalid_fields.total_tokens);
+        }
+        let mut usage = GeminiProviderUsage::default();
+        usage.observe(&parse(
+            r#"{"promptTokenCount":20,"candidatesTokenCount":20,"thoughtsTokenCount":3}"#,
+        ));
+        let output = usage.observe(&parse(r#"{"candidatesTokenCount":100}"#));
+        assert_eq!(output.output_tokens, None);
+        assert_eq!(output.output_floor, Some(100));
+        let input = usage.observe(&parse(r#"{"toolUsePromptTokenCount":101}"#));
+        assert_eq!(input.input_tokens, None);
+        assert_eq!(input.input_floor, Some(101));
+    }
+
+    #[test]
+    fn nonterminal_content_frames_replace_and_invalidate_provider_usage() {
+        let mut state = GeminiStreamState::default();
+        let first = r#"{"candidates":[{"content":{"parts":[{"text":"a"}]}}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":25,"candidatesTokenCount":20,"thoughtsTokenCount":3}}"#;
+        let invalid = r#"{"candidates":[{"content":{"parts":[{"text":"b"}]}}],"usageMetadata":{"cachedContentTokenCount":-1,"candidatesTokenCount":41}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", first).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens == Some(25)
+                    && snapshot.output_tokens == Some(23)
+        )));
+        let chunks = parse_with_provider_usage(&mut state, "", invalid).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens.is_none()
+                    && snapshot.invalid_fields.cache_read_input_tokens
+                    && snapshot.output_tokens.is_none()
+                    && snapshot.output_floor == Some(41)
+        )));
+        assert!(!chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage { .. }
+                | LLMChunk::CacheUsage { .. }
+                | LLMChunk::UsageSummary { .. }
+        )));
+        let terminal = r#"{"candidates":[{"content":{"parts":[{"text":"c"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":5,"candidatesTokenCount":41,"thoughtsTokenCount":3}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", terminal).unwrap();
+        let cache_index = chunks
+            .iter()
+            .position(|chunk| {
+                matches!(
+                    chunk,
+                    LLMChunk::CacheUsage {
+                        cache_read_input_tokens: 5,
+                        input_tokens: 95,
+                        ..
+                    }
+                )
+            })
+            .expect("terminal cache event");
+        let summary_index = chunks
+            .iter()
+            .position(|chunk| {
+                matches!(
+                    chunk,
+                    LLMChunk::UsageSummary {
+                        output_tokens: 41,
+                        thinking_tokens: 3
+                    }
+                )
+            })
+            .expect("terminal summary event");
+        assert!(cache_index < summary_index);
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens == Some(5)
+                    && snapshot.output_tokens == Some(44)
+        )));
+        let repeated = parse_with_provider_usage(&mut state, "", terminal).unwrap();
+        assert!(!repeated.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::CacheUsage { .. } | LLMChunk::UsageSummary { .. }
+        )));
+    }
+
+    #[test]
+    fn rejected_content_frame_does_not_change_later_usage_snapshot() {
+        let mut state = GeminiStreamState::default();
+        parse_with_provider_usage(
+            &mut state,
+            "",
+            r#"{"candidates":[],"usageMetadata":{"cachedContentTokenCount":25}}"#,
+        )
+        .unwrap();
+        for invalid in [
+            r#"{"usageMetadata":{"cachedContentTokenCount":99}}"#,
+            r#"{"candidates":[{"content":{"parts":[{"functionCall":{"args":{}}}]}}],"usageMetadata":{"cachedContentTokenCount":99}}"#,
+        ] {
+            assert!(parse_with_provider_usage(&mut state, "", invalid).is_err());
+        }
+        let chunks = parse_with_provider_usage(
+            &mut state,
+            "",
+            r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100}}"#,
+        )
+        .unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(snapshot)
+                if snapshot.cache_read_input_tokens == Some(25)
+        )));
+    }
+
+    #[tokio::test]
+    async fn production_stream_delivers_gemini_provider_usage_at_eof() {
+        use futures::StreamExt;
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":25,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":3,\"totalTokenCount\":123}}\n\n";
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(body)
+                .unwrap(),
+        );
+        let mut state = GeminiStreamState::default();
+        let mut stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+            response,
+            move |event, data| parse_with_provider_usage(&mut state, event, data),
+        );
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. }))
+                .count(),
+            1
+        );
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(23),
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                total_tokens: Some(123),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn provider_usage_normalizes_gemini_terminal_counts_without_double_counting() {
+        let mut state = GeminiStreamState::default();
+        let intermediate = r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"thoughtsTokenCount":1}}"#;
+        let intermediate_chunks = parse_with_provider_usage(&mut state, "", intermediate).unwrap();
+        assert!(intermediate_chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsageReplace(usage)
+                if usage.input_tokens == Some(100) && usage.output_tokens == Some(6)
+        )));
+        assert!(!intermediate_chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage { .. }
+                | LLMChunk::CacheUsage { .. }
+                | LLMChunk::UsageSummary { .. }
+        )));
+        let final_event = r#"{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":0,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}}"#;
+        for _ in 0..2 {
+            let chunks = parse_with_provider_usage(&mut state, "", final_event).unwrap();
+            assert!(chunks.iter().any(|chunk| matches!(
+                chunk,
+                LLMChunk::ProviderUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(23),
+                    total_tokens: Some(123),
+                    reasoning_tokens: Some(3),
+                    cache_read_input_tokens: Some(0),
+                    cache_creation_input_tokens: None,
+                    cache_write_input_tokens: None,
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn provider_usage_keeps_gemini_missing_zero_and_malformed_values_distinct() {
+        let mut state = GeminiStreamState::default();
+        let missing = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":0,"candidatesTokenCount":20}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", missing).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(0),
+                total_tokens: None,
+                ..
+            }
+        )));
+        let malformed = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"toolUsePromptTokenCount":3,"candidatesTokenCount":20,"thoughtsTokenCount":5,"totalTokenCount":10}}"#;
+        let mut state = GeminiStreamState::default();
+        let chunks = parse_with_provider_usage(&mut state, "", malformed).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(103),
+                output_tokens: Some(25),
+                reasoning_tokens: Some(5),
+                total_tokens: None,
+                cache_read_input_tokens: None,
+                ..
+            }
+        )));
+        let overflow = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":18446744073709551615,"thoughtsTokenCount":1,"totalTokenCount":18446744073709551615}}"#;
+        let mut state = GeminiStreamState::default();
+        let chunks = parse_with_provider_usage(&mut state, "", overflow).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(0),
+                output_tokens: None,
+                reasoning_tokens: Some(1),
+                total_tokens: None,
+                ..
+            }
+        )));
+    }
 
     async fn collect_sse_body(sse_body: String) -> Vec<LLMChunk> {
         use crate::providers::common::sse::llm_stream_from_sse_multi;

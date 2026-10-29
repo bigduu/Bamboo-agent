@@ -61,7 +61,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // bootstrap tests are cfg(test) and belong to the default storage catalog.
 // Default harnesses own 20 storage, two LLM and four Unix server live cases,
 // plus five fresh-input server regressions; none match the serial exclusions.
-// Feature cfg expressions, 31 default owners, four contexts and 19 explicit
+// Feature cfg expressions, 31 default owners, four contexts and 20 explicit
 // additive cases remain unchanged. Default catalogs own retry and Stop tests.
 // The test-utils-gated engine semaphore helper is used by the default
 // reloadable-provider test in server-other via the server's dev dependency.
@@ -73,16 +73,26 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // in default engine packages-3; direct background admission stays in default
 // LLM packages-2, and the reloadable provider proof stays in server-other.
 // The injected project Dream endpoint A/B case stays in server-handlers.
+// The local trace sampler adds one otel-otlp-only test to the infrastructure
+// additive owner; local trace, API, engine and hook tests use default owners.
+// The usage-presence normalization and its test are unconditional and remain
+// with the default engine owner; additive feature cases are unchanged.
+// Session-reference and local-OTLP redaction tests use their existing owners.
 // Root-fenced startup/response guard cases remain in the default storage owner;
 // Connect and Schedule routing cases stay in server-other, reasoning resolution
 // in the default engine owner, and Observer cases in server-app-state.
-// No additive feature cases changed.
-const FEATURE_SOURCE_SHA256 = "e64480378bb97fc6f646d26983eef67f33965b3cd2051da54bf00cf4d9897487";
+// Gemini replacement and budget cases remain in the default bamboo-llm and
+// bamboo-engine owners (packages-2 and packages-3); Responses cases remain in
+// the default server-handlers owner. No additive feature cases changed.
+// Model-usage settings validation and dry-run regressions are unconditional
+// server-settings cases; the shared event allowlist is unconditional too.
+const FEATURE_SOURCE_SHA256 = "2915a1033ff9c9ba5ac3c80332afd9d8354e7d7e11f9fcc609037257d6029741";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
     { name: "bamboo_infrastructure", kind: "lib", removed: [DEFAULT_TELEMETRY_CASE], added: [
       "telemetry::config::tests::explicit_guard_shutdown_is_bounded_and_idempotent",
+      "telemetry::config::tests::zero_export_sampling_keeps_local_spans_without_sending_them",
       ...["local_otlp_collector_receives_allowlisted_trace_bytes", "retryable_collector_status_is_sent_once",
         "ambient_otel_headers_and_resources_cannot_leak_credentials",
         "unavailable_collector_never_backpressures_spans_and_shutdown_is_bounded", "zero_sample_ratio_exports_no_roots"]

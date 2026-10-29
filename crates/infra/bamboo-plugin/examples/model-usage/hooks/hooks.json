@@ -1,0 +1,12 @@
+{
+  "description": "Bamboo-only read-only model usage observer",
+  "hooks": {
+    "BambooModelCallUsage": [{
+      "hooks": [{
+        "type": "command",
+        "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/hooks/usage.py\"",
+        "timeout": 2
+      }]
+    }]
+  }
+}

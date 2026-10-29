@@ -140,6 +140,10 @@ pub(super) async fn handle_chunk_result(
             );
             Ok(())
         }
+        Ok(LLMChunk::ProviderUsageReplace(usage)) => {
+            state.replace_provider_usage(usage);
+            Ok(())
+        }
         Ok(LLMChunk::ProviderUsage {
             input_tokens,
             output_tokens,
