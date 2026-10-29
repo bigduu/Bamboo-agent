@@ -335,8 +335,9 @@ pub enum ImageFallbackMode {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageFallbackConfig {
     pub mode: ImageFallbackMode,
-    /// Explicit Vision model name for the low-level fallback API. Missing
-    /// names are a configuration error; never guess a model or use the main model.
+    /// Explicit Vision model name for the low-level fallback API. A missing
+    /// name is an error there. Host-derived runs can resolve the configured
+    /// provider/model pair before invoking the low-level fallback.
     pub vision_model: Option<String>,
 }
 

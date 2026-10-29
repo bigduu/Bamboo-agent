@@ -48,10 +48,13 @@ fn selected_target(
         .map(str::to_string)
         .or_else(|| {
             configured_instance(config, active_provider).and_then(|instance| {
+                let copilot_default =
+                    (instance.provider_type == "copilot").then(|| "gpt-4o".to_string());
                 instance
                     .vision_model
                     .or(instance.fast_model)
                     .or(instance.model)
+                    .or(copilot_default)
             })
         })
         .or_else(|| {

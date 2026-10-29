@@ -2401,6 +2401,22 @@ async fn sdk_expect_reasoning_for_provider(
     );
 }
 
+async fn sdk_expect_source_refusal(agent: &Agent, capture: &SdkReasoningCapture, label: &str) {
+    capture.0.lock().unwrap().clear();
+    let mut session = Session::new(format!("sdk-reasoning-{label}"), "main-a");
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
+    session.add_message(Message::user("Synthetic config source refusal"));
+    let error = agent
+        .run_session(&mut session)
+        .await
+        .expect_err("changed source must be refused");
+    assert!(
+        error.to_string().contains("sdk_provider_binding:"),
+        "{error}"
+    );
+    assert!(capture.0.lock().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn sdk_reasoning_follows_current_config_and_builder_order() {
     use bamboo_domain::ReasoningEffort::{High, Low, Max};
@@ -2556,8 +2572,7 @@ async fn sdk_reasoning_legacy_scope_does_not_take_new_instance_alias() {
         );
         config.default_provider_instance = Some("openai".into());
     }
-    sdk_expect_reasoning_for_provider(&agent, &capture, "same-id-new-instance", "openai", None)
-        .await;
+    sdk_expect_source_refusal(&agent, &capture, "same-id-new-instance").await;
 }
 
 #[tokio::test]
@@ -2596,5 +2611,5 @@ async fn sdk_reasoning_instance_scope_does_not_take_same_id_legacy_role() {
         config.default_provider_instance = None;
         config.defaults.as_mut().unwrap().chat.reasoning_effort = Some(Max);
     }
-    sdk_expect_reasoning_for_provider(&agent, &capture, "same-id-new-legacy", "openai", None).await;
+    sdk_expect_source_refusal(&agent, &capture, "same-id-new-legacy").await;
 }

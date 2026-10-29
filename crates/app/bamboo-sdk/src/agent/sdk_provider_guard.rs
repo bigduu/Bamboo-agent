@@ -18,8 +18,8 @@ use tokio::sync::RwLock;
 pub(super) enum SdkBinding {
     Native(Arc<SdkProviderBinding>),
     Instance,
-    Legacy,
-    Opaque,
+    Legacy { alias_sensitive: bool },
+    Opaque { alias_sensitive: bool },
 }
 
 fn has_legacy(config: &Config, provider: &str) -> bool {
@@ -38,17 +38,84 @@ fn has_legacy(config: &Config, provider: &str) -> bool {
     }
 }
 
-/// A caller-owned client is authoritative for its identity. Remember only
-/// whether its declared key came from configured metadata, so later disable,
-/// removal, or source changes cannot silently reuse that client.
-pub(super) fn caller_binding(config: &Config, provider: &str) -> SdkBinding {
+fn has_provider_alias(config: &Config, provider: &str) -> bool {
+    config
+        .provider_instances
+        .values()
+        .any(|instance| instance.provider_type == provider)
+}
+
+/// The caller owns the client's actual identity. Preserve only the declared
+/// key's metadata source and any type-alias resolution used for admission.
+pub(super) fn caller_binding(
+    config: &Config,
+    provider: &str,
+    active_scope: Option<&str>,
+) -> SdkBinding {
+    let alias_sensitive =
+        bamboo_llm::AVAILABLE_PROVIDERS.contains(&provider) && active_scope != Some(provider);
     if config.provider_instances.contains_key(provider) {
         SdkBinding::Instance
     } else if has_legacy(config, provider) {
-        SdkBinding::Legacy
+        SdkBinding::Legacy { alias_sensitive }
     } else {
-        SdkBinding::Opaque
+        SdkBinding::Opaque { alias_sensitive }
     }
+}
+
+pub(super) fn validate_binding(
+    binding: &SdkBinding,
+    config: &Config,
+    provider: &str,
+    model: Option<&str>,
+) -> Result<(), LLMError> {
+    let instance = config.provider_instances.get(provider);
+    if instance.is_some_and(|instance| !instance.enabled)
+        || (instance.is_none()
+            && provider == "copilot"
+            && config
+                .providers()
+                .copilot
+                .as_ref()
+                .is_some_and(|copilot| !copilot.enabled && config.provider != "copilot"))
+    {
+        return Err(LLMError::Api(
+            "sdk_provider_binding: configured provider is disabled".into(),
+        ));
+    }
+    let source_valid = match binding {
+        SdkBinding::Native(binding) => binding.validate(config).is_ok(),
+        SdkBinding::Instance => config
+            .provider_instances
+            .get(provider)
+            .is_some_and(|instance| instance.enabled),
+        SdkBinding::Legacy { alias_sensitive } => {
+            !config.provider_instances.contains_key(provider)
+                && has_legacy(config, provider)
+                && (!alias_sensitive || !has_provider_alias(config, provider))
+        }
+        SdkBinding::Opaque { alias_sensitive } => {
+            !config.provider_instances.contains_key(provider)
+                && !has_legacy(config, provider)
+                && (!alias_sensitive || !has_provider_alias(config, provider))
+        }
+    };
+    if !source_valid {
+        return Err(LLMError::Api(
+            "sdk_provider_binding: provider configuration changed; supply a current client".into(),
+        ));
+    }
+    // Check disabled and invalid metadata even for model-catalog queries.
+    let models = bamboo_config::explicit_runtime_models_for_provider_key(config, provider)
+        .map_err(|_| LLMError::Api("sdk_provider_binding: invalid model admission".into()))?;
+    if let Some(model) = model {
+        if models.is_some_and(|models| !models.iter().any(|allowed| allowed == model)) {
+            return Err(LLMError::Api(
+                "sdk_provider_binding: model is not admitted for the selected provider".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) struct BoundSdkProvider {
@@ -70,40 +137,7 @@ impl BoundSdkProvider {
         let config = self.config.try_read().map_err(|_| {
             LLMError::Api("sdk_provider_binding: live provider configuration is busy".into())
         })?;
-        let source_valid = match &self.binding {
-            SdkBinding::Native(binding) => binding.validate(&config).is_ok(),
-            SdkBinding::Instance => config
-                .provider_instances
-                .get(&self.provider)
-                .is_some_and(|instance| instance.enabled),
-            SdkBinding::Legacy => {
-                !config.provider_instances.contains_key(&self.provider)
-                    && has_legacy(&config, &self.provider)
-            }
-            SdkBinding::Opaque => {
-                !config.provider_instances.contains_key(&self.provider)
-                    && !has_legacy(&config, &self.provider)
-            }
-        };
-        if !source_valid {
-            return Err(LLMError::Api(
-                "sdk_provider_binding: provider configuration changed; supply a current client"
-                    .into(),
-            ));
-        }
-        if let Some(model) = model {
-            let models =
-                bamboo_config::explicit_runtime_models_for_provider_key(&config, &self.provider)
-                    .map_err(|_| {
-                        LLMError::Api("sdk_provider_binding: invalid model admission".into())
-                    })?;
-            if models.is_some_and(|models| !models.iter().any(|allowed| allowed == model)) {
-                return Err(LLMError::Api(
-                    "sdk_provider_binding: model is not admitted for the selected provider".into(),
-                ));
-            }
-        }
-        Ok(())
+        validate_binding(&self.binding, &config, &self.provider, model)
     }
 
     fn dispatch(&self, model: Option<&str>) -> Result<(), LLMError> {
@@ -133,7 +167,8 @@ impl LLMProvider for BoundSdkProvider {
     }
 
     fn queue_requires_current_route(&self) -> bool {
-        true
+        matches!(&self.binding, SdkBinding::Native(_))
+            || self.delegate.queue_requires_current_route()
     }
 
     fn queued_route_identity(&self) -> QueuedRouteIdentity {
@@ -146,8 +181,9 @@ impl LLMProvider for BoundSdkProvider {
         if self.single_use {
             return Ok(None);
         }
+        let delegate = bamboo_llm::provider::queued_snapshot_for(self.delegate.clone())?;
         Ok(Some(Arc::new(Self {
-            delegate: self.delegate.clone(),
+            delegate,
             config: self.config.clone(),
             binding: self.binding.clone(),
             provider: self.provider.clone(),
@@ -277,7 +313,7 @@ mod tests {
         config.provider = "copilot".into();
         config.provider_instances.clear();
         config.default_provider_instance = None;
-        let binding = Arc::new(SdkProviderBinding::capture(&config, "copilot").unwrap());
+        let binding = Arc::new(SdkProviderBinding::capture(&config, "copilot", false).unwrap());
         let config = Arc::new(RwLock::new(config));
         let probe = Arc::new(Probe {
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -328,7 +364,7 @@ mod tests {
         original.default_provider_instance = None;
         original.provider_instances.clear();
         original.providers_mut().openai = None;
-        let binding = Arc::new(SdkProviderBinding::capture(&original, "openai").unwrap());
+        let binding = Arc::new(SdkProviderBinding::capture(&original, "openai", false).unwrap());
         let config = Arc::new(RwLock::new(original));
         let probe = Arc::new(Probe {
             calls: std::sync::atomic::AtomicUsize::new(0),
@@ -366,5 +402,111 @@ mod tests {
         assert!(error.to_string().contains("synthetic upstream error"));
         assert!(!target.local_dispatch_refused());
         assert_eq!(probe.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct SwitchingProvider {
+        current: std::sync::Mutex<Arc<dyn LLMProvider>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for SwitchingProvider {
+        fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>, LLMError> {
+            Ok(Some(self.current.lock().unwrap().clone()))
+        }
+
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            max: Option<u32>,
+            model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let selected = self.current.lock().unwrap().clone();
+            selected.chat_stream(messages, tools, max, model).await
+        }
+    }
+
+    #[tokio::test]
+    async fn sdk_caller_queue_keeps_delegate_snapshot_and_allocation() {
+        let (_, config, _) = fixture(false);
+        let a = Arc::new(Probe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let b = Arc::new(Probe {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let switching = Arc::new(SwitchingProvider {
+            current: std::sync::Mutex::new(a.clone()),
+        });
+        let root: Arc<dyn LLMProvider> = Arc::new(BoundSdkProvider {
+            delegate: switching.clone(),
+            config,
+            provider: "copilot".into(),
+            binding: SdkBinding::Legacy {
+                alias_sensitive: false,
+            },
+            single_use: false,
+            refused: AtomicBool::new(false),
+        });
+        let allocation = root.resource_allocation_identity();
+        assert!(!root.queue_requires_current_route());
+        // This is the same snapshot entry used by the engine's queued
+        // auxiliary evaluator, followed by a real bounded async wait.
+        let queued = bamboo_llm::provider::queued_snapshot_for(root).unwrap();
+        assert_eq!(queued.resource_allocation_identity(), allocation);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+        let wait = semaphore.clone();
+        let task = tokio::spawn(async move {
+            let _permit = wait.acquire().await.unwrap();
+            queued
+                .chat_stream(&[], &[], None, "main-a")
+                .await
+                .map(|_| ())
+        });
+        *switching.current.lock().unwrap() = b.clone();
+        semaphore.add_permits(1);
+        tokio::time::timeout(std::time::Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn sdk_caller_copilot_disabled_refuses_model_catalog_without_dispatch() {
+        let mut config = Config::default();
+        config.provider = "anthropic".into();
+        config.provider_instances.clear();
+        for initially_configured in [false, true] {
+            let mut initial = config.clone();
+            initial.providers_mut().copilot = if initially_configured {
+                Some(serde_json::from_value(serde_json::json!({"enabled": true})).unwrap())
+            } else {
+                None
+            };
+            let binding = caller_binding(&initial, "copilot", Some("anthropic"));
+            let shared = Arc::new(RwLock::new(initial));
+            let probe = Arc::new(Probe {
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                fail: false,
+            });
+            let provider = BoundSdkProvider {
+                delegate: probe.clone(),
+                config: shared.clone(),
+                binding,
+                provider: "copilot".into(),
+                single_use: false,
+                refused: AtomicBool::new(false),
+            };
+            shared.write().await.providers_mut().copilot =
+                Some(serde_json::from_value(serde_json::json!({"enabled": false})).unwrap());
+            assert!(provider.known_pre_dispatch_error().is_some());
+            assert!(provider.list_model_info().await.is_err());
+            assert_eq!(probe.calls.load(Ordering::SeqCst), 0);
+        }
     }
 }

@@ -1761,8 +1761,95 @@ async fn entrypoint_routing_sdk_native_overlay_keeps_selected_client_in_both_bui
             "main-a"
         );
         assert_eq!(
+            requests[0]
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer synthetic-overlay-key"),
+            "the selected local client must use the explicit synthetic overlay"
+        );
+        assert_eq!(
             shared.read().await.provider_instances["openai"].api_key,
             "synthetic-config-key"
         );
+    }
+}
+
+#[tokio::test]
+async fn entrypoint_routing_sdk_named_provider_new_session_is_independent_of_builder_order() {
+    for config_before_defaults in [false, true] {
+        for override_model in [false, true] {
+            let a = vision_server(200).await;
+            let b = vision_server(200).await;
+            let mut config = config(false, "chat-a");
+            config.provider = "openai".into();
+            config.defaults = None;
+            config.default_provider_instance = Some("chat-b".into());
+            config.provider_instances.clear();
+            for (id, model, server) in [("chat-a", "model-a", &a), ("chat-b", "model-b", &b)] {
+                config.provider_instances.insert(
+                    id.into(),
+                    serde_json::from_value(serde_json::json!({
+                        "provider_type": "openai", "enabled": true, "api_key": "synthetic-key",
+                        "base_url": server.uri(), "model": model
+                    }))
+                    .unwrap(),
+                );
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut disk = serde_json::to_value(&config).unwrap();
+            for id in ["chat-a", "chat-b"] {
+                disk["provider_instances"][id]["api_key"] = "synthetic-key".into();
+            }
+            tokio::fs::write(
+                dir.path().join("config.json"),
+                serde_json::to_vec(&disk).unwrap(),
+            )
+            .await
+            .unwrap();
+            let shared = Arc::new(RwLock::new(config));
+            let mut builder = bamboo_sdk::Agent::builder()
+                .provider_name("chat-a")
+                .tools(std::iter::empty());
+            if override_model {
+                builder = builder.model("manual-model");
+            }
+            let builder = if config_before_defaults {
+                builder
+                    .config(shared)
+                    .with_defaults_for_data_dir(dir.path().to_path_buf())
+                    .await
+                    .unwrap()
+            } else {
+                builder
+                    .with_defaults_for_data_dir(dir.path().to_path_buf())
+                    .await
+                    .unwrap()
+                    .config(shared)
+            };
+            let agent = builder.build().unwrap();
+            let expected = if override_model {
+                "manual-model"
+            } else {
+                "model-a"
+            };
+            let mut session = agent.new_session("synthetic-provider-order").unwrap();
+            assert_eq!(session.model, expected);
+            session.add_message(Message::user("Synthetic model selection"));
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                agent.run_session(&mut session),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let requests = a.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(
+                requests[0].body_json::<serde_json::Value>().unwrap()["model"],
+                expected
+            );
+            assert!(b.received_requests().await.unwrap().is_empty());
+        }
     }
 }

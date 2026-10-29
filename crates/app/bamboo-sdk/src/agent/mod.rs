@@ -167,6 +167,7 @@ pub struct Agent {
     provider_scope_is_instance: Option<bool>,
     /// Opaque factory-input witness only for an SDK-created native client.
     native_provider_binding: Option<Arc<bamboo_llm::provider_registry::SdkProviderBinding>>,
+    caller_provider_binding: Option<sdk_provider_guard::SdkBinding>,
     /// Live metadata used to resolve aliases against the assembled client identity.
     routing_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
     /// Default first-class Project membership for newly-created/unassigned sessions.
@@ -320,6 +321,7 @@ impl Agent {
             provider_scope: None,
             provider_scope_is_instance: None,
             native_provider_binding: None,
+            caller_provider_binding: None,
             routing_config: None,
             project_id: None,
             session_store: None,
@@ -349,6 +351,7 @@ impl Agent {
             provider_scope: None,
             provider_scope_is_instance: None,
             native_provider_binding: None,
+            caller_provider_binding: None,
             routing_config: None,
             project_id,
             session_store,
@@ -615,41 +618,45 @@ impl Agent {
             .transpose()
     }
 
-    fn sdk_validate_native_binding(
+    fn sdk_default_binding(&self) -> Option<sdk_provider_guard::SdkBinding> {
+        self.native_provider_binding
+            .as_ref()
+            .map(|binding| sdk_provider_guard::SdkBinding::Native(binding.clone()))
+            .or_else(|| self.caller_provider_binding.clone())
+    }
+
+    fn sdk_validate_default_binding(
         &self,
         config: Option<&bamboo_llm::Config>,
         model: Option<&str>,
     ) -> Result<(), AgentError> {
-        let Some(binding) = self.native_provider_binding.as_ref() else {
+        let Some(binding) = self.sdk_default_binding() else {
             return Ok(());
         };
-        let config = config.ok_or_else(|| {
-            Self::sdk_binding_error("native provider configuration is unavailable")
-        })?;
-        binding.validate(config).map_err(|_| {
-            Self::sdk_binding_error("native provider configuration changed; rebuild the SDK client")
-        })?;
-        if let (Some(scope), Some(model)) = (self.provider_scope.as_deref(), model) {
-            self.sdk_admit_model(Some(config), scope, model)?;
-        }
-        Ok(())
+        let config = config
+            .ok_or_else(|| Self::sdk_binding_error("provider configuration is unavailable"))?;
+        let scope = self
+            .provider_scope
+            .as_deref()
+            .ok_or_else(|| Self::sdk_binding_error("provider scope is unavailable"))?;
+        sdk_provider_guard::validate_binding(&binding, config, scope, model)
+            .map_err(|error| Self::sdk_binding_error(error.to_string()))
     }
 
     fn sdk_guarded_inner(&self, inner: &bamboo_engine::Agent) -> bamboo_engine::Agent {
         match (
-            &self.native_provider_binding,
+            self.sdk_default_binding(),
             &self.routing_config,
             &self.provider_scope,
         ) {
             (Some(binding), Some(config), Some(provider)) => {
-                let binding = binding.clone();
                 let config = config.clone();
                 let provider = provider.clone();
                 inner.with_default_provider_adapter(move |delegate| {
                     Arc::new(sdk_provider_guard::BoundSdkProvider {
                         delegate,
                         config,
-                        binding: sdk_provider_guard::SdkBinding::Native(binding),
+                        binding,
                         provider,
                         single_use: false,
                         refused: std::sync::atomic::AtomicBool::new(false),
@@ -802,7 +809,7 @@ impl Agent {
         config: Option<&bamboo_llm::Config>,
     ) -> Result<Option<bamboo_domain::ProviderModelRef>, AgentError> {
         let target = self.sdk_session_target(session)?;
-        self.sdk_validate_native_binding(config, None)?;
+        self.sdk_validate_default_binding(config, None)?;
         if let Some(target) = target.as_ref() {
             self.sdk_require_bound_provider(target, config)?;
         }
@@ -863,7 +870,7 @@ impl Agent {
             request.model_roster.model = Some(session.model.clone());
         }
         if request.provider_override.is_none() {
-            self.sdk_validate_native_binding(config, request.model_roster.model.as_deref())?;
+            self.sdk_validate_default_binding(config, request.model_roster.model.as_deref())?;
         }
         if request.provider_override.is_some() {
             if !explicit_provider
@@ -919,7 +926,11 @@ impl Agent {
         ) {
             if let Some(delegate) = request.provider_override.take() {
                 request.provider_override = Some(Arc::new(sdk_provider_guard::BoundSdkProvider {
-                    binding: sdk_provider_guard::caller_binding(snapshot, provider),
+                    binding: sdk_provider_guard::caller_binding(
+                        snapshot,
+                        provider,
+                        self.provider_scope.as_deref(),
+                    ),
                     provider: provider.clone(),
                     config: shared.clone(),
                     delegate,
@@ -1085,7 +1096,7 @@ impl Agent {
                     .or_else(|| {
                         (!session.model.trim().is_empty()).then_some(session.model.as_str())
                     });
-                execution.sdk_validate_native_binding(snapshot.as_ref(), model)
+                execution.sdk_validate_default_binding(snapshot.as_ref(), model)
             });
             if let Err(error) = current {
                 if let Some(snapshot) = preappend_snapshot {

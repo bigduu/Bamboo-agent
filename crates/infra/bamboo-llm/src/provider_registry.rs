@@ -1058,13 +1058,18 @@ impl Write for BindingWriter<'_> {
 // runtime_models is enforced independently against the live Config and the
 // registry snapshot; it is not an input to the provider factory. Omitting it
 // here permits one model's admission to change without changing the account.
-struct FactoryExtra<'a>(&'a std::collections::BTreeMap<String, serde_json::Value>);
+struct FactoryExtra<'a>(
+    &'a std::collections::BTreeMap<String, serde_json::Value>,
+    bool,
+);
 
 impl Serialize for FactoryExtra<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         for (name, value) in self.0 {
-            if name != bamboo_config::RUNTIME_MODELS_CONFIG_KEY {
+            if name != bamboo_config::RUNTIME_MODELS_CONFIG_KEY
+                && !(self.1 && name == bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY)
+            {
                 map.serialize_entry(name, value)?;
             }
         }
@@ -1123,21 +1128,27 @@ pub struct SdkProviderBinding {
     provider: String,
     key: ring::hmac::Key,
     tag: [u8; 32],
+    api_key_overridden: bool,
 }
 
 impl SdkProviderBinding {
     /// Capture the selected key's source from one factory-input snapshot.
     /// Unlike registry defaults, an explicit SDK key can legitimately
     /// select a non-default legacy provider or an initially empty key slot.
-    pub fn capture(config: &Config, provider: &str) -> Result<Self, LLMError> {
+    pub fn capture(
+        config: &Config,
+        provider: &str,
+        api_key_overridden: bool,
+    ) -> Result<Self, LLMError> {
         let key =
             ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
                 .map_err(|_| LLMError::Api("Could not bind SDK provider configuration".into()))?;
-        let tag = sdk_provider_binding(config, provider, &key)?;
+        let tag = sdk_provider_binding(config, provider, &key, api_key_overridden)?;
         Ok(Self {
             provider: provider.to_string(),
             key,
             tag,
+            api_key_overridden,
         })
     }
 
@@ -1145,7 +1156,8 @@ impl SdkProviderBinding {
     /// credentials. Dynamic environment and Copilot auth remain owned by the
     /// provider and are not represented by this Config proof.
     pub fn validate(&self, config: &Config) -> Result<(), LLMError> {
-        let current = sdk_provider_binding(config, &self.provider, &self.key)?;
+        let current =
+            sdk_provider_binding(config, &self.provider, &self.key, self.api_key_overridden)?;
         if !bool::from(self.tag.as_slice().ct_eq(current.as_slice())) {
             return Err(LLMError::Api("SDK provider configuration changed".into()));
         }
@@ -1157,6 +1169,7 @@ fn sdk_provider_binding(
     config: &Config,
     provider: &str,
     key: &ring::hmac::Key,
+    api_key_overridden: bool,
 ) -> Result<[u8; 32], LLMError> {
     // Disabled is a refusal, not the same source as an absent legacy slot
     // whose credentials were supplied by an SDK API-key overlay.
@@ -1167,10 +1180,11 @@ fn sdk_provider_binding(
     {
         return Err(LLMError::Api("SDK provider instance is disabled".into()));
     }
-    let binding = match configured_binding_with_mode(config, provider, key, true)? {
-        Some(binding) => binding,
-        None => hash_factory_inputs(key, config, provider, "sdk-unconfigured", &())?,
-    };
+    let binding =
+        match configured_binding_with_mode(config, provider, key, true, api_key_overridden)? {
+            Some(binding) => binding,
+            None => hash_factory_inputs(key, config, provider, "sdk-unconfigured", &())?,
+        };
     Ok(binding.0)
 }
 
@@ -1179,7 +1193,7 @@ fn configured_binding(
     id: &str,
     key: &ring::hmac::Key,
 ) -> Result<Option<Binding>, LLMError> {
-    configured_binding_with_mode(config, id, key, false)
+    configured_binding_with_mode(config, id, key, false, false)
 }
 
 fn configured_binding_with_mode(
@@ -1187,6 +1201,7 @@ fn configured_binding_with_mode(
     id: &str,
     key: &ring::hmac::Key,
     sdk_mode: bool,
+    api_key_overridden: bool,
 ) -> Result<Option<Binding>, LLMError> {
     if let Some(instance) = config.provider_instances.get(id) {
         if !instance.enabled {
@@ -1199,13 +1214,21 @@ fn configured_binding_with_mode(
             "instance",
             &(
                 &instance.provider_type,
-                &instance.api_key,
-                &instance.credential_ref,
+                if api_key_overridden {
+                    ""
+                } else {
+                    instance.api_key.as_str()
+                },
+                if api_key_overridden || (sdk_mode && !instance.api_key.is_empty()) {
+                    None
+                } else {
+                    instance.credential_ref.as_ref()
+                },
                 &instance.base_url,
                 &instance.reasoning_effort,
                 &instance.responses_only_models,
                 &instance.request_overrides,
-                FactoryExtra(&instance.extra),
+                FactoryExtra(&instance.extra, api_key_overridden),
                 (instance.provider_type == "copilot").then_some(config.headless_auth),
             ),
         )
@@ -1230,14 +1253,26 @@ fn configured_binding_with_mode(
                 id,
                 "legacy-openai",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.reasoning_effort,
                     &entry.responses_only_models,
                     &entry.request_overrides,
-                    entry.api_key_from_env,
-                    FactoryExtra(&entry.extra),
+                    if api_key_overridden {
+                        false
+                    } else {
+                        entry.api_key_from_env
+                    },
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
@@ -1254,15 +1289,27 @@ fn configured_binding_with_mode(
                 id,
                 "legacy-anthropic",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.reasoning_effort,
                     &entry.request_overrides,
                     &entry.max_tokens,
                     &entry.thinking_replay_always,
-                    entry.api_key_from_env,
-                    FactoryExtra(&entry.extra),
+                    if api_key_overridden {
+                        false
+                    } else {
+                        entry.api_key_from_env
+                    },
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
@@ -1279,13 +1326,25 @@ fn configured_binding_with_mode(
                 id,
                 "legacy-gemini",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.reasoning_effort,
                     &entry.request_overrides,
-                    entry.api_key_from_env,
-                    FactoryExtra(&entry.extra),
+                    if api_key_overridden {
+                        false
+                    } else {
+                        entry.api_key_from_env
+                    },
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
@@ -1302,12 +1361,20 @@ fn configured_binding_with_mode(
                 id,
                 "legacy-bodhi",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.target_provider,
                     &entry.reasoning_effort,
-                    FactoryExtra(&entry.extra),
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
@@ -1326,7 +1393,7 @@ fn configured_binding_with_mode(
                         &entry.reasoning_effort,
                         &entry.responses_only_models,
                         &entry.request_overrides,
-                        FactoryExtra(&entry.extra),
+                        FactoryExtra(&entry.extra, api_key_overridden),
                     ),
                 )
                 .map(Some)
@@ -1388,6 +1455,77 @@ fn provider_is_configured(config: &Config, name: &str) -> bool {
 mod tests {
     use super::*;
     use bamboo_config::OpenAIConfig;
+
+    #[test]
+    fn sdk_factory_binding_respects_instance_api_key_overlay_and_live_admission() {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.default_provider_instance = Some("work".into());
+        config.provider_instances.insert(
+            "work".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic-first",
+                "base_url":"http://127.0.0.1:9001", "api_key_from_env":true,
+                "runtime_models":["model-a"]
+            }))
+            .unwrap(),
+        );
+        let ordinary = SdkProviderBinding::capture(&config, "work", false).unwrap();
+        let overlay = SdkProviderBinding::capture(&config, "work", true).unwrap();
+        let instance = config.provider_instances.get_mut("work").unwrap();
+        instance.credential_ref =
+            Some(bamboo_config::credential_ref("provider", "work", "api_key").unwrap());
+        assert!(
+            ordinary.validate(&config).is_ok(),
+            "same hydrated key remains the same client"
+        );
+        let instance = config.provider_instances.get_mut("work").unwrap();
+        instance.api_key = "synthetic-rotated".into();
+        instance
+            .extra
+            .insert("api_key_from_env".into(), serde_json::json!(false));
+        instance
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["model-b"]));
+        assert!(ordinary.validate(&config).is_err());
+        assert!(
+            overlay.validate(&config).is_ok(),
+            "explicit overlay pins the actual client key"
+        );
+        config.provider_instances.get_mut("work").unwrap().base_url =
+            Some("http://127.0.0.1:9002".into());
+        assert!(
+            overlay.validate(&config).is_err(),
+            "endpoint remains bound under overlay"
+        );
+        config.provider_instances.get_mut("work").unwrap().enabled = false;
+        assert!(overlay.validate(&config).is_err());
+    }
+
+    #[test]
+    fn sdk_factory_binding_respects_legacy_api_key_overlay() {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.default_provider_instance = None;
+        config.provider_instances.clear();
+        config.providers_mut().openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "api_key":"synthetic-first", "api_key_from_env":true,
+                "base_url":"http://127.0.0.1:9001", "model":"model-a"
+            }))
+            .unwrap(),
+        );
+        let ordinary = SdkProviderBinding::capture(&config, "openai", false).unwrap();
+        let overlay = SdkProviderBinding::capture(&config, "openai", true).unwrap();
+        let provider = config.providers_mut().openai.as_mut().unwrap();
+        provider.api_key = "synthetic-rotated".into();
+        provider.api_key_from_env = false;
+        assert!(ordinary.validate(&config).is_err());
+        assert!(overlay.validate(&config).is_ok());
+        config.providers_mut().openai.as_mut().unwrap().base_url =
+            Some("http://127.0.0.1:9002".into());
+        assert!(overlay.validate(&config).is_err());
+    }
 
     #[test]
     fn legacy_direct_background_obeys_explicit_provider_identity_and_lists() {

@@ -640,6 +640,7 @@ impl AgentBuilder {
                 bamboo_llm::provider_registry::SdkProviderBinding::capture(
                     &provider_config,
                     &provider_scope,
+                    self.api_key.is_some(),
                 )
                 .map_err(|error| SdkError::Config(error.to_string()))?,
             ));
@@ -651,6 +652,7 @@ impl AgentBuilder {
                     bamboo_llm::provider_registry::SdkProviderBinding::capture(
                         &provider_config,
                         &provider_scope,
+                        self.api_key.is_some(),
                     )
                     .map_err(|error| SdkError::Config(error.to_string()))?,
                 ));
@@ -845,9 +847,21 @@ impl AgentBuilder {
         } else {
             None
         };
-        if self.provider_override.is_some() && self.model.is_none() {
-            // An injected client is authoritative for its declared account.
-            // A different global Chat role cannot lend its model name to it.
+        let caller_binding = if self.provider_override.is_some() {
+            config_snapshot
+                .as_ref()
+                .zip(provider_scope.as_deref())
+                .map(|(config, scope)| {
+                    super::sdk_provider_guard::caller_binding(config, scope, Some(scope))
+                })
+        } else {
+            None
+        };
+        if self.model.is_none()
+            && (self.provider_override.is_some() || self.provider_name.is_some())
+        {
+            // An injected or explicitly named client is authoritative for
+            // its declared account, regardless of config/defaults call order.
             if let (Some(scope), Some(config)) = (provider_scope.as_ref(), config_snapshot.as_ref())
             {
                 self.session_model =
@@ -1080,6 +1094,7 @@ impl AgentBuilder {
         agent.provider_scope = provider_scope;
         agent.provider_scope_is_instance = provider_scope_is_instance;
         agent.native_provider_binding = native_binding;
+        agent.caller_provider_binding = caller_binding;
         agent.routing_config = routing_config;
         Ok(agent)
     }
