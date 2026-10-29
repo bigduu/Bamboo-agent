@@ -321,6 +321,70 @@ async fn legacy_stop_status_is_not_exact_finalization_proof() {
 }
 
 #[actix_web::test]
+async fn supervisor_cancel_rejects_old_owner_after_same_id_root_recreation() {
+    let fixture = Box::pin(Fixture::new()).await;
+    grant_cancel(&fixture);
+    let mut old = crate::app_state::AgentRunner::new();
+    old.status = crate::app_state::AgentStatus::Running;
+    let old_run = old.run_id.clone();
+    let old_token = old.cancel_token.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &old_run)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), old);
+    let old_ref = current_target(&fixture).await;
+    invoke(&fixture, args("observe_run", &old_ref, None))
+        .await
+        .unwrap();
+
+    // Simulate a stale old Host owner outliving the canonical deletion; the
+    // new Root is real storage with the same ID and a different birth.
+    fixture.state.storage.delete_session(TARGET).await.unwrap();
+    let mut replacement = Session::new(TARGET, "replacement-model");
+    replacement.created_at = fixture.original.created_at + chrono::Duration::seconds(1);
+    replacement.set_project_id_meta(fixture.original.project_id_meta().unwrap());
+    replacement.set_workspace_path_meta(fixture.original.workspace_path_meta().unwrap());
+    replacement.add_message(Message::user("replacement Root content"));
+    fixture
+        .state
+        .storage
+        .save_session(&replacement)
+        .await
+        .unwrap();
+    let fresh_ref = current_target(&fixture).await;
+    assert_ne!(fresh_ref.created_at, old_ref.created_at);
+    let before = serde_json::to_value(fixture.reload().await).unwrap();
+    let inbox_before = fixture.state.session_inbox.inspect(TARGET).await.unwrap();
+
+    assert!(invoke(&fixture, args("cancel", &old_ref, Some(&old_run)))
+        .await
+        .is_err());
+    let conflict = invoke(&fixture, args("cancel", &fresh_ref, Some(&old_run)))
+        .await
+        .unwrap();
+    assert_eq!(conflict["status"], "run_conflict");
+    assert!(!old_token.is_cancelled());
+    assert_eq!(
+        fixture.state.session_inbox.inspect(TARGET).await.unwrap(),
+        inbox_before
+    );
+    assert_eq!(
+        serde_json::to_value(fixture.reload().await).unwrap(),
+        before
+    );
+    owner.abandon().await;
+    fixture.state.shutdown().await;
+}
+
+#[actix_web::test]
 async fn supervisor_cancel_real_root_keeps_queued_followup_for_successor() {
     let fixture = Box::pin(Fixture::new()).await;
     grant_cancel(&fixture);
