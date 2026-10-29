@@ -832,6 +832,14 @@ pub(super) fn finish(
             bounded_result(result, project(projection, &value))
         }
         Ok(_) => Err(ToolError::Execution("Unexpected SubAgent operation disposition".into())),
+        // This bounded, caller-actionable error contains no internal state.
+        // Keep all other argument failures redacted at the facade boundary.
+        Err(ToolError::InvalidArguments(message))
+            if projection == Projection::Chat
+                && message == bamboo_domain::ChildContextPacketError::Budget.to_string() =>
+        {
+            Err(ToolError::InvalidArguments(message))
+        }
         Err(ToolError::InvalidArguments(_)) => Err(invalid("Invalid SubAgent request or inspection cursor; start a new inspection")),
         Err(_) => Err(ToolError::Execution("SubAgent operation failed. Inspect the current child before retrying; execution details are available to the authenticated inspector.".into())),
     }
@@ -1524,5 +1532,29 @@ mod tests {
             )))
         )
         .is_err());
+    }
+
+    #[test]
+    fn chat_exposes_only_the_safe_child_context_budget_error() {
+        let budget = bamboo_domain::ChildContextPacketError::Budget.to_string();
+        let Err(error) = finish(
+            Some(Projection::Chat),
+            Err(ToolError::InvalidArguments(budget.clone())),
+        ) else {
+            panic!("budget overflow must remain an error");
+        };
+        assert!(matches!(error, ToolError::InvalidArguments(message) if message == budget));
+
+        for (projection, detail) in [
+            (Projection::Chat, "private endpoint or path".to_string()),
+            (Projection::Messages, budget),
+        ] {
+            let Err(error) = finish(Some(projection), Err(ToolError::InvalidArguments(detail)))
+            else {
+                panic!("invalid arguments must remain an error");
+            };
+            assert!(matches!(error, ToolError::InvalidArguments(message)
+                if message == "Invalid SubAgent request or inspection cursor; start a new inspection"));
+        }
     }
 }

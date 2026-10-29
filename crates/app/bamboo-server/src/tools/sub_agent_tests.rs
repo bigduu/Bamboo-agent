@@ -7712,6 +7712,91 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
 }
 
 #[tokio::test]
+async fn compact_named_child_preserves_a_large_assignment_without_counting_it_twice() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut parent = h
+        .storage
+        .load_session(&h.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.workspace = None;
+    parent.set_workspace_path_meta(h.workspace_path.to_string_lossy().into_owned());
+    parent.metadata_version += 1;
+    h.storage.save_session(&parent).await.unwrap();
+    let port = Arc::new(WaitOrderPort::new(h.adapter.clone(), h.storage.clone()));
+    port.expect_wait_on_enqueue.store(false, Ordering::SeqCst);
+    port.skip_successful_enqueue.store(true, Ordering::SeqCst);
+    let tool = SubAgentTool::new(port, h.adapter.clone());
+
+    // Match the incident's UTF-8 byte length while remaining below the
+    // per-line bound. A duplicate required brief exceeds the 16 KiB budget.
+    let message = format!(
+        "{}{}",
+        format!("{}\n", "界".repeat(333)).repeat(8),
+        "x".repeat(412)
+    );
+    assert_eq!(message.len(), 8412);
+    let result = invoke_completed(
+        &tool,
+        json!({"role":"implementer", "message":message}),
+        subagent_test_ctx(&h.parent_session_id, "compact-large-named-child"),
+    )
+    .await
+    .expect("the complete named-child assignment must fit once");
+    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    let child = h
+        .storage
+        .load_session(payload["actor_id"].as_str().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.metadata["assignment_prompt"], message);
+    let binding = bamboo_domain::ChildContextBinding::from_session(&child)
+        .expect("the protected assignment remains valid")
+        .expect("named child has a protected assignment");
+    let encoded = serde_json::to_string(&message).unwrap();
+    assert_eq!(
+        binding
+            .payload
+            .required_assignment
+            .matches(&encoded)
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn compact_named_child_reports_a_real_budget_overflow_without_creating_a_child() {
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut parent = h
+        .storage
+        .load_session(&h.parent_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    parent.workspace = None;
+    parent.set_workspace_path_meta(h.workspace_path.to_string_lossy().into_owned());
+    parent.metadata_version += 1;
+    h.storage.save_session(&parent).await.unwrap();
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    let message = format!("{}\n", "x".repeat(1000)).repeat(20);
+    let error = invoke_completed(
+        &h.tool,
+        json!({"role":"implementer", "message":message}),
+        subagent_test_ctx(&h.parent_session_id, "compact-over-budget-child"),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ToolError::InvalidArguments(message)
+        if message == bamboo_domain::ChildContextPacketError::Budget.to_string()));
+    assert_eq!(
+        h.adapter.session_store.list_index_entries().await.len(),
+        before
+    );
+}
+
+#[tokio::test]
 async fn compact_owned_inspection_correction_and_control_keep_one_logical_child() {
     let h = build_test_harness_with_storage(None, None, true).await;
     let mut child = h
