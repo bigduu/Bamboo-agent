@@ -263,8 +263,12 @@ async fn entrypoint_routing_headless_host_uses_configured_vision_role() {
         let calls = main.calls.lock().unwrap().clone();
         let requests = server.received_requests().await.unwrap();
         let b_saw_pixel = requests.iter().any(|request| {
-            String::from_utf8_lossy(&request.body)
-                .contains(crate::model_entrypoint_routing_tests::PIXEL)
+            request
+                .body_json::<serde_json::Value>()
+                .ok()
+                .is_some_and(|body| body["model"] == "vision-b")
+                && String::from_utf8_lossy(&request.body)
+                    .contains(crate::model_entrypoint_routing_tests::PIXEL)
         });
         let b_models = requests
             .iter()
@@ -281,6 +285,11 @@ async fn entrypoint_routing_headless_host_uses_configured_vision_role() {
     assert!(
         outcomes.iter().all(
             |(_, outcome, calls, b_models, b_saw_pixel, preserved)| outcome.is_ok()
+                && calls
+                    .iter()
+                    .any(|(model, purpose, images)| model == "main-a"
+                        && purpose == "agent_loop"
+                        && !images)
                 && calls.iter().all(|(_, _, images)| !images)
                 && b_models.iter().any(|model| model == "vision-b")
                 && *b_saw_pixel
