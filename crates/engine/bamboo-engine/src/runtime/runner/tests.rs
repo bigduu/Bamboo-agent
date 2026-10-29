@@ -2709,6 +2709,8 @@ async fn unsafe_session_id_keeps_usage_hook_and_local_span_correlated() {
         .find(|span| span.span_id == event.span_id.as_deref().unwrap())
         .unwrap();
     assert_eq!(span.call_id.as_deref(), Some(event.call_id.as_str()));
+    assert!(event.run_id.is_some());
+    assert_eq!(span.run_id, event.run_id);
     assert_eq!(span.usage, event.usage);
     assert!(!serde_json::to_string(&event).unwrap().contains(&session.id));
     assert!(!serde_json::to_string(&detail)
