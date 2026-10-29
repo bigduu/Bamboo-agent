@@ -1171,7 +1171,12 @@ impl Agent {
             if let (Some(target), Some(model)) =
                 (session.model_ref.as_mut(), execution.model.as_ref())
             {
-                target.model = model.clone();
+                if target.model != *model {
+                    // A per-model setting belongs to the previous target and
+                    // cannot be carried onto an explicitly different model.
+                    target.model = model.clone();
+                    target.reasoning_effort = None;
+                }
             }
             bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
                 session,
@@ -1212,7 +1217,21 @@ impl Agent {
             #[cfg(test)]
             constructor_parity_tests::observe_inputs(&session.id, inputs.as_ref());
             let mut request = builder.build();
-            request.reasoning_effort = execution.primary_reasoning_effort;
+            // The saved Session choice is authoritative. A typed target's
+            // effort belongs to its own model, and the builder's Chat-role
+            // effort is valid only when that same model is being executed.
+            let model_effort = session
+                .model_ref
+                .as_ref()
+                .filter(|target| target.model == session.model)
+                .and_then(|target| target.reasoning_effort);
+            let role_effort = if execution.session_model.as_deref() == Some(session.model.as_str())
+            {
+                execution.primary_reasoning_effort
+            } else {
+                None
+            };
+            request.reasoning_effort = session.reasoning_effort.or(model_effort).or(role_effort);
             execution
                 .inner
                 .execute_direct_registered_with_inputs(session, request, direct_lease, inputs)
