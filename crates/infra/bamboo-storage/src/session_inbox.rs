@@ -282,6 +282,8 @@ pub struct FileSessionInbox {
     #[cfg(any(test, feature = "test-utils"))]
     observer_cursor_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-utils"))]
+    observer_cursor_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    #[cfg(any(test, feature = "test-utils"))]
     observer_fault_failure: Arc<std::sync::atomic::AtomicBool>,
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
@@ -323,6 +325,8 @@ impl FileSessionInbox {
             limits,
             #[cfg(any(test, feature = "test-utils"))]
             observer_cursor_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(any(test, feature = "test-utils"))]
+            observer_cursor_pause: None,
             #[cfg(any(test, feature = "test-utils"))]
             observer_fault_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
@@ -385,6 +389,11 @@ impl FileSessionInbox {
             return Err(SessionInboxError::Storage(
                 "injected interruption after Observer Inbox receipt".into(),
             ));
+        }
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some((reached, resume)) = &self.observer_cursor_pause {
+            reached.notify_one();
+            resume.notified().await;
         }
         self.sessions
             .finish_observer_notice(&authority, &receipt.delivery, now)
@@ -465,6 +474,17 @@ impl FileSessionInbox {
     pub fn interrupt_next_observer_cursor_for_testing(&self) {
         self.observer_cursor_failure
             .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Pause a test-owned producer after the real Inbox commit, while the
+    /// original authority guards are still held and before cursor publication.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn pause_observer_cursor_for_testing(
+        &mut self,
+        reached: Arc<tokio::sync::Notify>,
+        resume: Arc<tokio::sync::Notify>,
+    ) {
+        self.observer_cursor_pause = Some((reached, resume));
     }
 
     pub(crate) fn bind_root_owner(

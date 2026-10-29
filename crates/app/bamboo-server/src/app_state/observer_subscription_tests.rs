@@ -28,6 +28,7 @@ const PROVIDER: &str = "subscription-fixture";
 const READER: &str = "subscription-reader";
 const PARENT: &str = "subscription-parent";
 const WORK: &str = "subscription-work";
+const SOURCE: &str = "subscription-real-source";
 const OBSERVER: &str = "subscription-observer";
 const ROOT_A: &str = "subscription-source-a";
 const ROOT_B: &str = "subscription-source-b";
@@ -37,6 +38,8 @@ const WAIT: Duration = Duration::from_secs(40);
 #[derive(Default)]
 struct Probe {
     calls: AtomicUsize,
+    source_calls: AtomicUsize,
+    source_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_request_diagnostics: StdMutex<Vec<Value>>,
@@ -174,9 +177,11 @@ impl LLMProvider for Probe {
         _: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
-        assert!(messages
-            .iter()
-            .all(|message| !message.content.contains(PRIVATE)));
+        if model != SOURCE {
+            assert!(messages
+                .iter()
+                .all(|message| !message.content.contains(PRIVATE)));
+        }
         let chunk = match model {
             READER => {
                 self.calls.fetch_add(1, Ordering::SeqCst);
@@ -227,6 +232,11 @@ impl LLMProvider for Probe {
                 self.work_entered.notify_one();
                 self.work_release.notified().await;
                 LLMChunk::Token("Independent original Work completed.".into())
+            }
+            SOURCE => {
+                self.source_inputs.lock().unwrap().push(messages.to_vec());
+                self.source_calls.fetch_add(1, Ordering::SeqCst);
+                LLMChunk::Token("Synthetic original Root finished.".into())
             }
             PARENT => {
                 self.parent_calls.fetch_add(1, Ordering::SeqCst);
@@ -281,6 +291,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_native_source(false).await
+    }
+    async fn new_with_native_source(native_source: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe::default());
         let state = host(home.path(), probe.clone()).await;
@@ -308,15 +321,28 @@ impl Fixture {
             projects.insert(project.id.clone());
             let mut target = Session::new(id, "never-source-model");
             target.set_project_id_meta(project.id.to_string());
+            if native_source && id == ROOT_A {
+                let workspace = home.path().join("source-workspace");
+                std::fs::create_dir(&workspace).unwrap();
+                target.model = SOURCE.into();
+                target.model_ref = Some(ProviderModelRef::new(PROVIDER, SOURCE));
+                target.set_provider_name(PROVIDER);
+                target.workspace = Some(workspace.to_string_lossy().into());
+                target.set_workspace_path_meta(workspace.to_string_lossy());
+            }
             target.add_message(Message::user(PRIVATE));
             state.storage.save_session(&target).await.unwrap();
         }
-        service
-            .configure_project_scope(&reference, 0, projects)
-            .await
-            .unwrap();
-        service.attach(&reference, 1, ROOT_A).await.unwrap();
-        service.attach(&reference, 2, ROOT_B).await.unwrap();
+        if !native_source {
+            // Preserve the older compatibility fixtures. New native Root
+            // outcomes use the current-user domain without manual grants.
+            service
+                .configure_project_scope(&reference, 0, projects)
+                .await
+                .unwrap();
+            service.attach(&reference, 1, ROOT_A).await.unwrap();
+            service.attach(&reference, 2, ROOT_B).await.unwrap();
+        }
         Self {
             home,
             state,
@@ -374,6 +400,14 @@ impl Fixture {
             .state_revision
     }
     async fn register(&self, filter: BTreeSet<ObserverChangeKind>) -> ObserverSubscription {
+        self.register_targets(filter, BTreeSet::from([ROOT_A.into(), ROOT_B.into()]))
+            .await
+    }
+    async fn register_targets(
+        &self,
+        filter: BTreeSet<ObserverChangeKind>,
+        targets: BTreeSet<String>,
+    ) -> ObserverSubscription {
         self.child(OBSERVER, true, READER).await;
         let receipt = self
             .state
@@ -383,7 +417,7 @@ impl Fixture {
                 self.revision().await,
                 Uuid::new_v4(),
                 OBSERVER,
-                BTreeSet::from([ROOT_A.into(), ROOT_B.into()]),
+                targets,
             )
             .await
             .unwrap();
@@ -555,6 +589,507 @@ async fn subscription_real_inbox_crash_retry_reopens_and_preserves_frozen_pendin
         0,
         "FileInbox admission alone is not model execution"
     );
+}
+
+const CRASH_WORKER_ENV: &str = "BAMBOO_OBSERVER_1053_CRASH_WORKER";
+const CRASH_TEST_NAME: &str = "app_state::supervised_root_outcome_tests::subscription_recovers_across_owned_process_crash_windows";
+const ROOT_CRASH_TEST_NAME: &str =
+    "app_state::supervised_root_outcome_tests::offline_observer_recovers_both_native_root_outcomes";
+
+fn write_crash_marker(marker: &std::path::Path, value: &Value) {
+    let temporary = marker.with_extension("tmp");
+    std::fs::write(&temporary, serde_json::to_vec(value).unwrap()).unwrap();
+    std::fs::rename(temporary, marker).unwrap();
+}
+
+async fn kill_owned_at_marker(
+    command: &mut tokio::process::Command,
+    marker: &std::path::Path,
+    stdout: &std::path::Path,
+    stderr: &std::path::Path,
+    boundary: &str,
+) -> Value {
+    use std::os::unix::process::ExitStatusExt;
+
+    let mut child = command.spawn().unwrap();
+    let child_pid = child.id().unwrap();
+    let deadline = if boundary == "after-root-final" {
+        WAIT * 3
+    } else {
+        WAIT
+    };
+    let reached = tokio::time::timeout(deadline, async {
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Err(format!(
+                    "owned crash worker exited before {boundary}: {status}"
+                ));
+            }
+            if let Ok(bytes) = std::fs::read(marker) {
+                break serde_json::from_slice::<Value>(&bytes).map_err(|error| error.to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
+    // Reap the exact owned process even if the marker or deadline failed.
+    if child.try_wait().unwrap().is_none() {
+        child.start_kill().unwrap();
+    }
+    let status = tokio::time::timeout(WAIT, child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let signal = reached
+        .map_err(|_| format!("owned worker timed out before {boundary}"))
+        .and_then(|result| result)
+        .unwrap_or_else(|error| {
+            panic!(
+                "{error}; stdout={} stderr={}",
+                std::fs::read_to_string(stdout).unwrap_or_default(),
+                std::fs::read_to_string(stderr).unwrap_or_default(),
+            )
+        });
+    assert_eq!(signal["boundary"], boundary);
+    assert_eq!(signal["pid"].as_u64(), Some(u64::from(child_pid)));
+    assert_eq!(
+        status.signal(),
+        Some(9),
+        "owned worker must receive SIGKILL"
+    );
+    signal
+}
+
+// Only the parent fixture sets this process-local switch. The actual stage and
+// Inbox transaction still go through the normal V2 authority and Maildir.
+async fn observer_crash_worker(boundary: &str) {
+    let home = std::path::PathBuf::from(std::env::var_os("BAMBOO_1053_HOME").unwrap());
+    let reference: SupervisorReference =
+        serde_json::from_str(&std::env::var("BAMBOO_1053_SUPERVISOR").unwrap()).unwrap();
+    let revision = std::env::var("BAMBOO_1053_VIEW_REVISION").unwrap();
+    let marker = std::path::PathBuf::from(std::env::var_os("BAMBOO_1053_MARKER").unwrap());
+    let store = Arc::new(SessionStoreV2::new(home).await.unwrap());
+    let now = Utc::now();
+    let ObserverStageOutcome::Staged(change) = store
+        .stage_supervisor_observation(&reference, OBSERVER, ROOT_A, &revision, now)
+        .await
+        .unwrap()
+    else {
+        panic!("worker must persist a new observation");
+    };
+
+    if boundary == "after-inbox" {
+        let reached = Arc::new(Notify::new());
+        let resume = Arc::new(Notify::new());
+        let mut inbox = FileSessionInbox::new(store, bamboo_domain::SessionInboxLimits::default());
+        inbox.pause_observer_cursor_for_testing(reached.clone(), resume);
+        let mut delivery = tokio::spawn(async move {
+            inbox
+                .deliver_supervisor_observation(&reference, OBSERVER, now)
+                .await
+        });
+        tokio::select! {
+            () = reached.notified() => {},
+            result = &mut delivery => panic!("delivery ended before the crash boundary: {result:?}"),
+        }
+        // The delivery task still holds its authority guards at this point.
+    } else {
+        assert_eq!(boundary, "after-stage");
+    }
+
+    write_crash_marker(
+        &marker,
+        &json!({
+            "boundary": boundary,
+            "pid": std::process::id(),
+            "change": change,
+        }),
+    );
+    // The parent sends SIGKILL only to this owned fixture after the marker.
+    std::future::pending::<()>().await;
+}
+
+pub(in crate::app_state) async fn subscription_recovers_across_owned_process_crash_windows() {
+    if let Ok(boundary) = std::env::var(CRASH_WORKER_ENV) {
+        observer_crash_worker(&boundary).await;
+        return;
+    }
+
+    for boundary in ["after-stage", "after-inbox"] {
+        let f = Fixture::new().await;
+        f.register(all()).await;
+        let view = f.publish(ROOT_A).await;
+        let revision = view["revision"].as_str().unwrap().to_owned();
+        let Fixture {
+            home,
+            state,
+            probe,
+            reference,
+        } = f;
+        state.shutdown().await;
+        drop(state);
+
+        let marker = home.path().join("observer-crash-marker.json");
+        let stdout = home.path().join("observer-crash-stdout.log");
+        let stderr = home.path().join("observer-crash-stderr.log");
+        std::fs::create_dir(home.path().join("tmp")).unwrap();
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                CRASH_TEST_NAME,
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env(CRASH_WORKER_ENV, boundary)
+            .env("BAMBOO_1053_HOME", home.path())
+            .env(
+                "BAMBOO_1053_SUPERVISOR",
+                serde_json::to_string(&reference).unwrap(),
+            )
+            .env("BAMBOO_1053_VIEW_REVISION", &revision)
+            .env("BAMBOO_1053_MARKER", &marker)
+            .env("HOME", home.path())
+            .env("TMPDIR", home.path().join("tmp"))
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("RUST_MIN_STACK", "8388608")
+            .current_dir(home.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .kill_on_drop(true);
+        for name in [
+            "LD_LIBRARY_PATH",
+            "DYLD_LIBRARY_PATH",
+            "DYLD_FALLBACK_LIBRARY_PATH",
+        ] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let signal = kill_owned_at_marker(&mut command, &marker, &stdout, &stderr, boundary).await;
+        let change: ObserverViewChange = serde_json::from_value(signal["change"].clone()).unwrap();
+
+        tokio::time::timeout(WAIT, async {
+            let reopened = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+            let inbox = FileSessionInbox::new(
+                reopened.clone(),
+                bamboo_domain::SessionInboxLimits::default(),
+            );
+            let parent = reopened
+                .load_root_authority(&reference.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let before_window =
+                &parent.supervisor_management.unwrap().subscriptions[OBSERVER].window;
+            assert_eq!(before_window.enqueued_sequence, 0);
+            assert_eq!(before_window.pending.as_ref(), Some(&change));
+            let before = inbox.inspect(OBSERVER).await.unwrap();
+            let expected_pending = usize::from(boundary == "after-inbox");
+            assert_eq!(before.pending, expected_pending);
+            assert_eq!(before.claimed, 0);
+            assert_eq!(before.generation, expected_pending as u64);
+
+            let receipt = inbox
+                .deliver_supervisor_observation(&reference, OBSERVER, Utc::now())
+                .await
+                .unwrap();
+            assert_eq!(receipt.delivery.id, change.event_id);
+            assert_eq!(receipt.delivery.generation, 1);
+            assert!(receipt.pending);
+            let after = inbox.inspect(OBSERVER).await.unwrap();
+            assert_eq!(after.pending, 1);
+            assert_eq!(after.claimed, 0);
+            assert_eq!(after.generation, 1);
+            if boundary == "after-inbox" {
+                assert_eq!(after, before, "retry must not enqueue a duplicate");
+            }
+            let parent = reopened
+                .load_root_authority(&reference.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let window = &parent.supervisor_management.unwrap().subscriptions[OBSERVER].window;
+            assert_eq!(window.enqueued_sequence, 1);
+            assert_eq!(window.history, vec![change]);
+            assert!(window.pending.is_none());
+            assert_eq!(
+                probe.calls.load(Ordering::SeqCst),
+                0,
+                "Inbox admission is not model execution"
+            );
+        })
+        .await
+        .expect("recovery must finish within the fixture deadline");
+    }
+}
+
+async fn run_native_source(f: &Fixture, text: &str, calls: usize) -> (String, String) {
+    use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort, SessionActivationPolicy};
+
+    let envelope = bamboo_domain::SessionMessageEnvelope::user_input(ROOT_A, text);
+    let input_id = envelope.id.as_str().to_owned();
+    let admitted = f
+        .state
+        .session_messenger
+        .admit_with_activation_intent(envelope, SessionActivationPolicy::RespectSpecificWait, None)
+        .await
+        .unwrap();
+    assert_eq!(admitted.delivery.id.as_str(), input_id);
+    f.state
+        .session_messenger
+        .activate_prepared(&admitted)
+        .await
+        .unwrap();
+
+    let activation = tokio::time::timeout(WAIT, async {
+        loop {
+            if f.probe.source_calls.load(Ordering::SeqCst) >= calls
+                && f.state
+                    .session_activation_router
+                    .current_run_id(ROOT_A)
+                    .await
+                    .is_none()
+            {
+                let entry = f.state.session_store.inspect_actor(ROOT_A).await.unwrap();
+                if let Some(activation) = entry.activation {
+                    if activation.status == ActorActivationStatus::Succeeded {
+                        break activation;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real synthetic-provider Root must commit and release its Actor");
+    // Read the source only after this Actor has finished: a read taken before
+    // the final save could still show the preceding run's completed snapshot.
+    let source = load(&f.state, ROOT_A).await;
+    assert_eq!(source.last_run_status().as_deref(), Some("completed"));
+    assert_eq!(
+        source
+            .messages
+            .iter()
+            .filter(|message| message.id == input_id)
+            .count(),
+        1,
+        "the admitted input must be committed once"
+    );
+    let requests = f.probe.source_inputs.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        calls,
+        "this synthetic provider must receive exactly one call per Root activation"
+    );
+    let request = requests
+        .get(calls - 1)
+        .expect("real provider call is recorded");
+    assert!(
+        request
+            .iter()
+            .any(|message| message.id == input_id && message.content == text),
+        "the matching input must reach this actual provider call"
+    );
+    (input_id, activation.run_id)
+}
+
+fn completed_root_fingerprint(actual_run_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    // Status v1 already defines this digest shape. The identity must come
+    // from the actual Actor activation, not Session metadata or a test nonce.
+    let status = json!({"status":"completed", "run_id":actual_run_id});
+    let digest = hex::encode(Sha256::digest(
+        bamboo_domain::session::inbox::canonical_json_bytes(&status),
+    ));
+    bamboo_domain::observer_filtered_fingerprint(
+        &BTreeSet::from([ObserverChangeKind::Status]),
+        &std::collections::BTreeMap::from([(ObserverChangeKind::Status, digest)]),
+    )
+    .unwrap()
+}
+
+pub(in crate::app_state) async fn consecutive_native_root_outcomes_have_distinct_observations() {
+    let f = Fixture::new_with_native_source(true).await;
+    let filter = BTreeSet::from([ObserverChangeKind::Status]);
+    f.register_targets(filter.clone(), BTreeSet::from([ROOT_A.into()]))
+        .await;
+    let first = run_native_source(&f, "first synthetic operation", 1).await;
+    let previous = f.filtered(ROOT_A, &filter, None).await.unwrap();
+    let second = run_native_source(&f, "second synthetic operation", 2).await;
+    assert_ne!(
+        first.0, second.0,
+        "real admissions must have distinct identities"
+    );
+    assert_ne!(
+        first.1, second.1,
+        "real Actor activations must have distinct run IDs"
+    );
+    assert_eq!(
+        previous["source_fingerprint"],
+        completed_root_fingerprint(&first.1),
+        "the first completed observation must bind the real first Actor"
+    );
+    let current = f
+        .filtered(ROOT_A, &filter, previous["source_fingerprint"].as_str())
+        .await
+        .expect("a distinct committed Root run must not disappear just because both completed");
+    assert_ne!(
+        current["source_fingerprint"],
+        previous["source_fingerprint"]
+    );
+    assert_eq!(
+        current["source_fingerprint"],
+        completed_root_fingerprint(&second.1),
+        "the second completed observation must bind the real second Actor"
+    );
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn offline_observer_recovers_both_native_root_outcomes() {
+    use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort};
+
+    if std::env::var(CRASH_WORKER_ENV).as_deref() == Ok("after-root-final") {
+        let f = Fixture::new_with_native_source(true).await;
+        f.register_targets(
+            BTreeSet::from([ObserverChangeKind::Status]),
+            BTreeSet::from([ROOT_A.into()]),
+        )
+        .await;
+        // No Observer pass occurs between these actual Root activations.
+        let first = run_native_source(&f, "first offline operation", 1).await;
+        let second = run_native_source(&f, "second offline operation", 2).await;
+        assert_ne!(first.0, second.0);
+        assert_ne!(first.1, second.1);
+        let marker = std::path::PathBuf::from(std::env::var_os("BAMBOO_1053_MARKER").unwrap());
+        write_crash_marker(
+            &marker,
+            &json!({
+                "boundary":"after-root-final", "pid":std::process::id(),
+                "home":f.home.path(), "reference":&f.reference,
+                "first":first, "second":second,
+            }),
+        );
+        // Leave the whole owned Host alive so its parent can kill it abruptly.
+        std::future::pending::<()>().await;
+        drop(f);
+        return;
+    }
+
+    let outer = tempfile::tempdir().unwrap();
+    let temporary = outer.path().join("tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    let marker = outer.path().join("root-final-marker.json");
+    let stdout = outer.path().join("root-final-stdout.log");
+    let stderr = outer.path().join("root-final-stderr.log");
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args([
+            "--exact",
+            ROOT_CRASH_TEST_NAME,
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env_clear()
+        .env(CRASH_WORKER_ENV, "after-root-final")
+        .env("BAMBOO_1053_MARKER", &marker)
+        .env("HOME", outer.path())
+        .env("TMPDIR", &temporary)
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("RUST_MIN_STACK", "8388608")
+        .current_dir(outer.path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .kill_on_drop(true);
+    for name in [
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    let signal =
+        kill_owned_at_marker(&mut command, &marker, &stdout, &stderr, "after-root-final").await;
+    let home = std::fs::canonicalize(signal["home"].as_str().unwrap()).unwrap();
+    assert!(home.starts_with(std::fs::canonicalize(&temporary).unwrap()));
+    let reference: SupervisorReference =
+        serde_json::from_value(signal["reference"].clone()).unwrap();
+    let first: (String, String) = serde_json::from_value(signal["first"].clone()).unwrap();
+    let second: (String, String) = serde_json::from_value(signal["second"].clone()).unwrap();
+    let probe = Arc::new(Probe::default());
+    let state = host(&home, probe.clone()).await;
+    let source = load(&state, ROOT_A).await;
+    assert_eq!(source.last_run_status().as_deref(), Some("completed"));
+    for id in [&first.0, &second.0] {
+        assert_eq!(
+            source
+                .messages
+                .iter()
+                .filter(|message| &message.id == id)
+                .count(),
+            1
+        );
+    }
+    let activation = state
+        .session_store
+        .inspect_actor(ROOT_A)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert_eq!(activation.status, ActorActivationStatus::Succeeded);
+    assert_eq!(activation.run_id, second.1);
+    // This fixture disables the background wake tick. These explicit passes
+    // exercise recovery after a real Host crash, but do not prove automatic
+    // startup scheduling or power-loss durability.
+    let now = Utc::now();
+    state.observer_subscriptions.tick(now).await;
+    settled(&state, OBSERVER).await;
+    let parent = load(&state, &reference.session_id).await;
+    assert_eq!(
+        parent.supervisor_management.unwrap().subscriptions[OBSERVER]
+            .window
+            .enqueued_sequence,
+        1
+    );
+    state
+        .observer_subscriptions
+        .tick(now + chrono::Duration::seconds(2))
+        .await;
+    let parent = load(&state, &reference.session_id).await;
+    let window = &parent.supervisor_management.unwrap().subscriptions[OBSERVER].window;
+    assert_eq!(
+        window.enqueued_sequence, 2,
+        "both committed Root outcomes must survive the offline interval"
+    );
+    assert_eq!(window.history.len(), 2);
+    assert_ne!(window.history[0].event_id, window.history[1].event_id);
+    assert_ne!(
+        window.history[0].source_fingerprint,
+        window.history[1].source_fingerprint
+    );
+    assert_eq!(
+        window.history[0].source_fingerprint,
+        completed_root_fingerprint(&first.1),
+        "the older admitted outcome must be observed first"
+    );
+    assert_eq!(
+        window.history[1].source_fingerprint,
+        completed_root_fingerprint(&second.1),
+        "the successor outcome must remain distinct"
+    );
+    assert_eq!(
+        probe.source_calls.load(Ordering::SeqCst),
+        0,
+        "recovery must not rerun the source Root"
+    );
+    state.shutdown().await;
 }
 
 #[tokio::test]

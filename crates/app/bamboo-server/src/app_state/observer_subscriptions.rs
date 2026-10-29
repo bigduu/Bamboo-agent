@@ -299,4 +299,4 @@ impl AppState {
 
 #[cfg(test)]
 #[path = "observer_subscription_tests.rs"]
-mod tests;
+pub(super) mod tests;
