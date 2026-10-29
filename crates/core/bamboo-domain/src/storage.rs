@@ -152,6 +152,9 @@ pub struct ChildActorRuntimeSave<'a> {
 
 /// Synchronous cache publication at the storage commit boundary. Implementors
 /// retain the same physical guards and revalidate the owner before invoking it.
+/// Full Root writers must invoke this exactly once with the committed snapshot
+/// before returning success. A caller that cannot confirm this publication
+/// treats the result as unknown; it cannot use its candidate as committed data.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
 
 /// The final sink receives a fresh owner check while the physical authority

@@ -1038,9 +1038,10 @@ impl LockedSessionStore {
             if !runtime_only {
                 if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
                     let (publish, slot) = capture_root_publication(publish.clone());
+                    let mut candidate = session.clone();
                     self.storage
                         .save_runtime_with_inherited_child_wait(
-                            session,
+                            &mut candidate,
                             inherited,
                             false,
                             Some((owner.clone(), publish)),
@@ -1178,10 +1179,11 @@ impl LockedSessionStore {
                 })?;
                 let carried_wait = self.inherited_for_session(session).cloned();
                 let (publish, slot) = capture_root_publication(publish.clone());
+                let mut candidate = session.clone();
                 self.storage
                     .save_root_actor_bound_startup(
                         owner,
-                        session,
+                        &mut candidate,
                         expected,
                         carried_wait.as_ref(),
                         publish,
@@ -1199,10 +1201,11 @@ impl LockedSessionStore {
                 let (owner, publish) = self.root_actor_writer.as_ref().expect("checked Root owner");
                 let carried_wait = self.inherited_for_session(session).cloned();
                 let (publish, slot) = capture_root_publication(publish.clone());
+                let mut candidate = session.clone();
                 self.storage
                     .save_finalized_root_actor_runtime(
                         owner,
-                        session,
+                        &mut candidate,
                         carried_wait.as_ref(),
                         publish,
                     )
@@ -1214,9 +1217,10 @@ impl LockedSessionStore {
                     .expect("bound provenance");
                 if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
                     let (publish, slot) = capture_root_publication(publish.clone());
+                    let mut candidate = session.clone();
                     self.storage
                         .save_runtime_with_inherited_child_wait(
-                            session,
+                            &mut candidate,
                             inherited,
                             false,
                             Some((owner.clone(), publish)),
@@ -1247,9 +1251,10 @@ impl LockedSessionStore {
             } else if let Some(inherited) = inherited {
                 if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
                     let (publish, slot) = capture_root_publication(publish.clone());
+                    let mut candidate = session.clone();
                     self.storage
                         .save_inherited_child_wait_finalized(
-                            session,
+                            &mut candidate,
                             inherited,
                             Some((owner.clone(), publish)),
                         )

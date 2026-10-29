@@ -926,7 +926,6 @@ fn rebase_supervised_input_transcript(
         if anchors_reordered && !insertions.is_empty() {
             return Err(conflict("Root transcript anchor order changed"));
         }
-        insertions.sort_by_key(|(position, index, _)| (*position, *index));
         insertions
     };
     if !insertions.is_empty() {
