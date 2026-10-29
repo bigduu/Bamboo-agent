@@ -1320,7 +1320,17 @@ async fn sdk_public_implicit_copilot_keeps_client_when_unrelated_instance_is_add
         .build()
         .unwrap();
 
-    for (index, mode) in ["initial", "unrelated", "rebound"].into_iter().enumerate() {
+    for (index, mode) in [
+        "initial",
+        "unrelated",
+        "default-switch",
+        "stanza",
+        "disabled-stanza",
+        "rebound",
+    ]
+    .into_iter()
+    .enumerate()
+    {
         if mode == "unrelated" {
             shared.write().await.provider_instances.insert(
                 "unrelated".into(),
@@ -1329,7 +1339,13 @@ async fn sdk_public_implicit_copilot_keeps_client_when_unrelated_instance_is_add
                 }))
                 .unwrap(),
             );
+        } else if mode == "default-switch" {
+            shared.write().await.default_provider_instance = Some("unrelated".into());
+        } else if mode == "stanza" || mode == "disabled-stanza" {
+            shared.write().await.providers_mut().copilot =
+                Some(serde_json::from_value(json!({"enabled":mode == "stanza"})).unwrap());
         } else if mode == "rebound" {
+            shared.write().await.providers_mut().copilot = None;
             shared.write().await.provider_instances.insert(
                 "copilot".into(),
                 serde_json::from_value(json!({
@@ -1349,10 +1365,10 @@ async fn sdk_public_implicit_copilot_keeps_client_when_unrelated_instance_is_add
         .await
         .expect("public SDK fixture must finish");
         let after = probe.provider_calls.load(Ordering::SeqCst);
-        if mode == "rebound" {
+        if mode == "stanza" || mode == "disabled-stanza" || mode == "rebound" {
             assert!(
                 result.is_err(),
-                "a same-key new instance must require a matching client"
+                "a new same-key source must require a matching client"
             );
             assert_eq!(after, before);
         } else {
