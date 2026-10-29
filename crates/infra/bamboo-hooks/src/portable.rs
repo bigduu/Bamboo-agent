@@ -7,8 +7,70 @@ use bamboo_plugin::{InstalledPlugins, PluginInstallStatus, PluginManifest};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 pub const PORTABLE_CONTEXT_BYTES: usize = 8192;
+
+// A cancelled spawn_blocking task can continue reading and hashing a bundle.
+// Keep its permit inside the blocking closure so repeated usage-observer
+// timeouts cannot create an unbounded number of those tasks.
+fn usage_review_slot() -> Result<OwnedSemaphorePermit, String> {
+    static SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    SLOTS
+        .get_or_init(|| Arc::new(Semaphore::new(4)))
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| "model usage plugin review budget exhausted".to_string())
+}
+
+fn spawn_review<T: Send + 'static>(
+    permit: Option<OwnedSemaphorePermit>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        work()
+    })
+}
+
+async fn resolve_bundle_path(
+    event: PortableEvent,
+    root: &Path,
+    relative: &str,
+) -> Result<PathBuf, String> {
+    if event != PortableEvent::BambooModelCallUsage {
+        return bundle_path(root, relative).map_err(|error| error.to_string());
+    }
+    let permit = usage_review_slot()?;
+    let root = root.to_owned();
+    let relative = relative.to_owned();
+    spawn_review(Some(permit), move || {
+        bundle_path(&root, &relative).map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+async fn resolve_working_directory(
+    event: PortableEvent,
+    workspace: Option<&str>,
+) -> Result<PathBuf, String> {
+    if event == PortableEvent::BambooModelCallUsage {
+        if let Some(workspace) = workspace {
+            return Ok(PathBuf::from(workspace));
+        }
+        let permit = usage_review_slot()?;
+        return spawn_review(Some(permit), std::env::current_dir)
+            .await
+            .map_err(|error| error.to_string())?
+            .map_err(|error| error.to_string());
+    }
+    Ok(workspace
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir().map_err(|error| error.to_string())?))
+}
+
 #[derive(Clone, Copy, Default)]
 pub struct PortableInputs<'a> {
     pub resolved_tool_name: Option<&'a str>,
@@ -453,7 +515,7 @@ async fn run_config(
     original_tool_input: Option<&Value>,
     final_assistant_content: Option<&str>,
 ) -> Result<PortableReport, String> {
-    let path = bundle_path(reviewed.root, reviewed.config).map_err(|e| e.to_string())?;
+    let path = resolve_bundle_path(event, reviewed.root, reviewed.config).await?;
     let config_bytes = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
     run_config_snapshot(
         event,
@@ -482,11 +544,7 @@ async fn run_config_snapshot(
     let source = &reviewed.source;
     let reviewed_digest = reviewed.digest;
     let config = PortableConfig::parse(config_bytes).map_err(|e| e.to_string())?;
-    let cwd = session
-        .workspace
-        .as_deref()
-        .map(PathBuf::from)
-        .unwrap_or(std::env::current_dir().map_err(|e| e.to_string())?);
+    let cwd = resolve_working_directory(event, session.workspace.as_deref()).await?;
     let input = envelope_with_tool_input(
         event,
         payload,
@@ -568,7 +626,12 @@ async fn run_config_snapshot(
                         )
                         .map_err(|e| e.to_string())?;
                         let bundle = root.to_owned();
-                        let current = tokio::task::spawn_blocking(move || {
+                        let permit = if event == PortableEvent::BambooModelCallUsage {
+                            Some(usage_review_slot()?)
+                        } else {
+                            None
+                        };
+                        let current = spawn_review(permit, move || {
                             current_manifest.validate()?;
                             registrations(&current_manifest, &bundle)
                         })
@@ -585,7 +648,7 @@ async fn run_config_snapshot(
                         // update rolled back, the old receipt/hash is valid again,
                         // but commands captured from its candidate are not trusted.
                         let current_path =
-                            bundle_path(root, reviewed.config).map_err(|e| e.to_string())?;
+                            resolve_bundle_path(event, root, reviewed.config).await?;
                         let current_bytes = tokio::fs::read(current_path)
                             .await
                             .map_err(|e| e.to_string())?;
@@ -655,6 +718,61 @@ async fn run_config_snapshot(
 mod tests {
     use super::*;
     use bamboo_plugin::{InstalledPlugin, PluginSource, RegisteredCapabilities};
+
+    #[tokio::test]
+    async fn cancelled_usage_review_keeps_its_slot_until_blocking_work_finishes() {
+        let slots = Arc::new(Semaphore::new(1));
+        let permit = slots.clone().try_acquire_owned().unwrap();
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let task = spawn_review(Some(permit), move || {
+            let _ = started.send(());
+            let _ = wait.recv();
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), observed)
+            .await
+            .expect("blocking review did not start")
+            .unwrap();
+        // The outer observer future may be dropped while the blocking task is
+        // still executing. Its slot must not be returned at that point.
+        drop(task);
+        assert!(slots.clone().try_acquire_owned().is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Ok(permit) = slots.clone().try_acquire_owned() {
+                    drop(permit);
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("completed blocking review did not release its slot");
+    }
+
+    #[tokio::test]
+    async fn usage_bundle_resolution_preserves_the_existing_path_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hooks.json");
+        std::fs::write(&file, b"{}").unwrap();
+        let event = PortableEvent::BambooModelCallUsage;
+        assert_eq!(
+            resolve_bundle_path(event, dir.path(), "hooks.json")
+                .await
+                .unwrap(),
+            file.canonicalize().unwrap()
+        );
+        assert!(resolve_bundle_path(event, dir.path(), "../outside")
+            .await
+            .is_err());
+        assert_eq!(
+            resolve_working_directory(event, Some("synthetic-workspace"))
+                .await
+                .unwrap(),
+            PathBuf::from("synthetic-workspace")
+        );
+    }
 
     #[test]
     fn model_usage_envelope_omits_workspace_and_preserves_unknown_values() {

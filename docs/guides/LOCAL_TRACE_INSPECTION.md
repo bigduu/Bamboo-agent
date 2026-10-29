@@ -117,18 +117,21 @@ input and read are known, input is positive, and read does not exceed input.
 ## Read-only hook event
 
 Configured native hooks and reviewed portable plugins may subscribe to the
-Bamboo extension `BambooModelCallUsage`. It is emitted once per dispatched
-primary model call after success or a reported error; dropping an in-flight call
-emits a best-effort cancelled/error observation with unknown usage. Internal
-transport retries share a call ID; a new outer dispatch gets a new ID. If a
-stream fails after reporting usage, its error observation retains the reported
-counters. Repeated cumulative snapshots update known counters rather than add
-them. Hook execution is best effort: a process-wide maximum of 32
-queued/running observers and a two-second deadline can drop work. Return values
-never control the model call. Native handlers receive the existing envelope
-with a `payload` of type `model_call_usage`; portable handlers receive
-`observation` at top level. Both
-contain the same schema-1 snapshot and no workspace path in the event payload.
+Bamboo extension `BambooModelCallUsage`. For session IDs that satisfy the
+identifier policy above, it is emitted once per dispatched primary model call
+after success or a reported error. Other session IDs produce no usage event.
+Dropping an in-flight call emits a best-effort cancelled/error observation with
+unknown usage. Internal transport retries share a call ID; a new outer dispatch
+gets a new ID. If a stream fails after reporting usage, its error observation
+retains the reported counters. Repeated cumulative snapshots update known
+counters instead of adding them. Hook execution is best effort: a process-wide
+maximum of 32 queued/running observers and a two-second deadline can drop work.
+Return values never control the model call. Up to four usage-plugin path
+resolutions and bundle hash checks may remain active after a timeout; further
+checks are dropped until a slot becomes free. Native handlers receive the
+existing envelope with a `payload` of type `model_call_usage`; portable
+handlers receive `observation` at top level. Both contain the same schema-1
+snapshot and no workspace path in the event payload.
 Programmatic native observers receive a deliberately minimal Session: its id,
 birth and valid root id identify the original lifetime, but other Session fields
 are not a snapshot of runtime state. Consume the usage observation itself.
