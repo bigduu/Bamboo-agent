@@ -2253,13 +2253,31 @@ async fn sdk_run_session_reasoning_respects_selected_model_and_session() {
         ("other-model", "cheap", None, None, None, "cheap", None),
         ("chat-role", "main-a", None, None, None, "main-a", Some(Low)),
         (
+            "normalized-ref",
+            " main-a ",
+            None,
+            Some(Xhigh),
+            None,
+            "main-a",
+            Some(Xhigh),
+        ),
+        (
+            "normalized-override",
+            " main-a ",
+            None,
+            Some(Xhigh),
+            Some("main-a"),
+            "main-a",
+            Some(Xhigh),
+        ),
+        (
             "explicit-model",
             "cheap",
             None,
             Some(Xhigh),
             Some("main-a"),
             "main-a",
-            None,
+            Some(Low),
         ),
     ];
     for (
@@ -2302,10 +2320,16 @@ async fn sdk_run_session_reasoning_respects_selected_model_and_session() {
                 .all(|(model, effort)| model == expected_model && *effort == expected_effort),
             "{label}: {calls:?}"
         );
-        if model_override.is_some() {
+        if label == "explicit-model" {
             assert_eq!(
                 session.model_ref.as_ref().unwrap().reasoning_effort,
                 None,
+                "{label}"
+            );
+        } else if label == "normalized-override" {
+            assert_eq!(
+                session.model_ref.as_ref().unwrap().reasoning_effort,
+                Some(Xhigh),
                 "{label}"
             );
         }
@@ -2344,4 +2368,109 @@ async fn sdk_run_session_reasoning_respects_selected_model_and_session() {
                 .all(|(model, effort)| model == "main-a" && *effort == Some(Medium)),
         "{calls:?}"
     );
+}
+
+async fn sdk_expect_reasoning(
+    agent: &Agent,
+    capture: &SdkReasoningCapture,
+    label: &str,
+    expected: Option<bamboo_domain::ReasoningEffort>,
+) {
+    capture.0.lock().unwrap().clear();
+    let mut session = Session::new(format!("sdk-reasoning-{label}"), "main-a");
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new("chat-a", "main-a"));
+    session.add_message(Message::user("Synthetic config snapshot witness"));
+    agent.run_session(&mut session).await.unwrap();
+    let calls = capture.0.lock().unwrap().clone();
+    assert!(
+        !calls.is_empty()
+            && calls
+                .iter()
+                .all(|(model, effort)| model == "main-a" && *effort == expected),
+        "{label}: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn sdk_reasoning_follows_current_config_and_builder_order() {
+    use bamboo_domain::ReasoningEffort::{High, Low, Max};
+
+    // A matching explicit model has the same Chat default in either builder order.
+    for before_defaults in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let capture = Arc::new(SdkReasoningCapture::default());
+        let builder = Agent::builder()
+            .provider(capture.clone())
+            .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+            .tools(std::iter::empty());
+        let builder = if before_defaults {
+            builder.model("main-a")
+        } else {
+            builder
+        };
+        let builder = builder
+            .with_defaults_for_data_dir(home.path().to_owned())
+            .await
+            .unwrap();
+        let builder = if before_defaults {
+            builder
+        } else {
+            builder.model("main-a")
+        };
+        let agent = builder.build().unwrap();
+        sdk_expect_reasoning(
+            &agent,
+            &capture,
+            &format!("builder-{before_defaults}"),
+            Some(Low),
+        )
+        .await;
+    }
+
+    // Replacing the config after default assembly must not retain the old role effort.
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let mut replacement = sdk_reasoning_config();
+    replacement.defaults.as_mut().unwrap().chat.reasoning_effort = Some(High);
+    let live = Arc::new(tokio::sync::RwLock::new(replacement));
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .model("main-a")
+        .config(live.clone())
+        .build()
+        .unwrap();
+    sdk_expect_reasoning(&agent, &capture, "replacement", Some(High)).await;
+
+    // Live updates apply only to the same admitted provider/model pair.
+    live.write()
+        .await
+        .defaults
+        .as_mut()
+        .unwrap()
+        .chat
+        .reasoning_effort = Some(Low);
+    sdk_expect_reasoning(&agent, &capture, "live-effort", Some(Low)).await;
+    live.write().await.defaults.as_mut().unwrap().chat.model = "cheap".into();
+    sdk_expect_reasoning(&agent, &capture, "live-other-model", None).await;
+    {
+        let mut config = live.write().await;
+        config.provider_instances.insert(
+            "chat-b".into(),
+            serde_json::from_value(json!({
+                "provider_type": "openai", "enabled": true, "model": "main-a",
+                "runtime_models": ["main-a"]
+            }))
+            .unwrap(),
+        );
+        let role = &mut config.defaults.as_mut().unwrap().chat;
+        role.provider = "chat-b".into();
+        role.model = "main-a".into();
+        role.reasoning_effort = Some(Max);
+    }
+    sdk_expect_reasoning(&agent, &capture, "live-other-account", None).await;
 }
