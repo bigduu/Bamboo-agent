@@ -69,8 +69,9 @@ async fn invoke(fixture: &Fixture, arguments: Value) -> Result<Value, ToolError>
     let ToolOutcome::Completed(result) = outcome else {
         panic!("exact cancellation must return its own synchronous observation");
     };
-    assert!(result.success, "{}", result.result);
-    Ok(serde_json::from_str(&result.result).unwrap())
+    let value: Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(result.success, value["status"] != "run_conflict");
+    Ok(value)
 }
 
 fn args(action: &str, target: &SupervisorCurrentUserTarget, run: Option<&str>) -> Value {
