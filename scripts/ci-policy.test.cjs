@@ -44,21 +44,42 @@ const job = (id, source = workflow) => {
     : source.slice(contentStart, contentStart + nextJob)
 }
 
-test("OTLP native diagnostic is manual, source-bound and read-only", () => {
+test("OTLP diagnostic is one-branch or manual, source-bound and read-only", () => {
   const source = readFileSync(".github/workflows/otlp-package-diagnostic.yml", "utf8")
-  assert.match(source, /^on:\n  workflow_dispatch:\n/mu)
-  assert.doesNotMatch(source, /^  (?:pull_request|push|schedule):/mu)
+  assert.match(source, /^on:\n  push:\n    branches: \[bamboo\/feat\/2387-otlp-packaging-c8\]\n  workflow_dispatch:\n/mu)
+  assert.doesNotMatch(source, /^  (?:pull_request|schedule):/mu)
   assert.match(source, /^permissions:\n  contents: read\n/mu)
-  assert.doesNotMatch(source, /upload-artifact|cache|\$\{\{\s*secrets\.|cargo publish/iu)
+  assert.doesNotMatch(source, /upload-artifact|(?:actions|swatinem)\/[^\s]*cache|\$\{\{\s*secrets\.|cargo publish|save-if:\s*true/iu)
+  assert.equal((source.match(/package-manager-cache: false/gu) || []).length, 2)
   assert.match(source, /persist-credentials: false/u)
-  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \}\}/u)
-  assert.match(source, /EXPECTED_TREE_SHA: \$\{\{ inputs\.snapshot_tree \}\}/u)
+  assert.match(source, /EXPECTED_SOURCE_SHA: \$\{\{ inputs\.snapshot_sha \|\| github\.sha \}\}/u)
+  assert.match(source, /EXPECTED_TREE_SHA: \$\{\{ inputs\.snapshot_tree \|\| '' \}\}/u)
   assert.match(source, /test "\$EXPECTED_SOURCE_SHA" = "\$DISPATCH_SOURCE_SHA"/u)
   assert.ok(source.indexOf("Require the exact dispatch source before checkout") < source.indexOf("actions/checkout@"))
-  for (const target of ["x86_64-unknown-linux-gnu", "aarch64-apple-darwin", "x86_64-pc-windows-msvc"]) {
-    assert.ok(source.includes(`target: ${target}`))
+  for (const [os, target] of [["ubuntu-24.04", "x86_64-unknown-linux-gnu"],
+    ["macos-14", "aarch64-apple-darwin"], ["windows-2022", "x86_64-pc-windows-msvc"]]) {
+    assert.ok(source.includes(`- os: ${os}\n            target: ${target}`))
   }
   assert.match(source, /run: node scripts\/otlp-package-diagnostic\.cjs/u)
+  assert.match(source, /run: node scripts\/otlp-collector-diagnostic\.cjs/u)
+})
+
+test("OTLP collector diagnostic runs only exact synthetic tests from its owned binary", () => {
+  const { CASES, selectTestExecutable, requireOnePassed } = require("./otlp-collector-diagnostic.cjs")
+  assert.equal(CASES.length, 9)
+  assert.equal(new Set(CASES).size, CASES.length)
+  assert.ok(CASES.includes("telemetry::tests::otlp::local_otlp_collector_receives_allowlisted_trace_bytes"))
+  assert.ok(CASES.includes("telemetry::config::tests::exported_references_hide_untrusted_ids_and_preserve_local_correlation"))
+  const artifact = { reason: "compiler-artifact", package_id: "infra",
+    target: { name: "bamboo_infrastructure", kind: ["lib"] }, profile: { test: true },
+    executable: path.resolve("/tmp/owned/deps/test"), features: ["otel-otlp", "test-utils"] }
+  assert.equal(selectTestExecutable([artifact], "infra", path.resolve("/tmp/owned")), artifact)
+  assert.throws(() => selectTestExecutable([artifact, artifact], "infra", path.resolve("/tmp/owned")))
+  assert.throws(() => selectTestExecutable([{ ...artifact, features: ["otel-otlp"] }], "infra", path.resolve("/tmp/owned")))
+  assert.throws(() => selectTestExecutable([{ ...artifact, executable: path.resolve("/tmp/unowned/test") }], "infra", path.resolve("/tmp/owned")))
+  requireOnePassed({ status: 0, stdout: "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out;\n" }, "case")
+  assert.throws(() => requireOnePassed({ status: 0, stdout: "test result: ok. 0 passed; 0 failed; 0 ignored;\n" }, "case"))
+  assert.throws(() => requireOnePassed({ status: 1, stdout: "" }, "case"))
 })
 
 test("OTLP diagnostic removes ambient credentials and requires actual feature-bearing compiler units", () => {

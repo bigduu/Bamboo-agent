@@ -35,18 +35,21 @@ server resources. The relevant checks belong in feature CI; a standalone manual
 run is diagnosis, not another automatic release or Main test. Lotus browser E2E
 is a separate frontend test.
 
-The proposed `otlp-package-diagnostic.yml` is a manually dispatched, read-only
-feature diagnostic for a single exact commit and tree. Once reviewed and present
-on the default branch, its three native jobs compile the unstamped embedded
+The proposed `otlp-package-diagnostic.yml` is a read-only feature diagnostic for
+a single exact commit and tree. One explicitly requested push to its specific
+Issue2387 branch can run it before installation; remove that temporary branch
+trigger before normal PR admission. Manual dispatch requires the workflow on
+the default branch. Its three native jobs compile the unstamped embedded
 executable with default features, verify Cargo's feature-bearing compiler units,
 architecture, embedded frontend bytes and `--version`, and print source and
-binary hashes. It stores no artifact and does not save a cache; this is neither
-a formal release binary nor evidence that OTLP network behavior passed. The
-ordinary feature owner retains the synthetic collector and privacy tests.
+binary hashes. A separate Linux job compiles one test executable and runs nine
+exact synthetic local/loopback collector and privacy cases. It stores no
+artifact and does not save a cache; this is neither a formal release binary nor
+canonical feature admission. The ordinary feature owner retains its tests.
 The compiler child receives a restricted environment without workflow tokens,
 publisher credentials or `OTEL_*` settings, not an operating-system sandbox.
-Check billing and available runner storage before a manual run. A candidate
-workflow file alone is not an installed controller or a successful run.
+Only the standard public-repository runner labels are selected. Check available
+runner storage. A candidate workflow file alone is not a successful run.
 
 The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
 `trusted-observer.yml` runs both Observer runtime selections in one feature job,
