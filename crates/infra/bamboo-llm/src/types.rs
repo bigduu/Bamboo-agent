@@ -61,13 +61,12 @@ pub enum LLMChunk {
     ///
     /// Every field is optional so parsers preserve the distinction between a
     /// provider reporting `0` and omitting a field entirely. Cache counts are
-    /// carried alongside the input/output totals because OpenAI-compatible
-    /// terminal events report all of them in one object and the single-chunk
-    /// Chat Completions parser must not discard either half.
+    /// carried alongside normalized input/output totals. Anthropic's disjoint
+    /// input components and Gemini's separate candidate/thought outputs are
+    /// combined only when the required component values are known.
     ///
-    /// `reasoning_tokens` is a subset of `output_tokens` for OpenAI Responses
-    /// and reasoning Chat Completions. Consumers must not add it to the output
-    /// total.
+    /// `reasoning_tokens` is a subset of the normalized `output_tokens` when
+    /// both are known. Consumers must not add it to the output total.
     ProviderUsage {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,

@@ -2620,3 +2620,119 @@ async fn synthetic_provider_usage_reaches_read_only_hook_and_same_local_span() {
         .unwrap()
         .contains("PRIVATE_PROMPT_SENTINEL"));
 }
+
+#[tokio::test]
+async fn synthetic_anthropic_and_gemini_streams_reach_usage_hook_and_local_span() {
+    use bamboo_agent_core::AgentHook;
+    use bamboo_domain::{AgentHookPoint, HookPayload, HookResult};
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    struct Capture(mpsc::UnboundedSender<bamboo_domain::ModelCallUsage>);
+    #[async_trait]
+    impl AgentHook for Capture {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterModelCallUsage
+        }
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            if let HookPayload::ModelCallUsage { observation } = payload {
+                self.0.send(observation.clone()).unwrap();
+            }
+            HookResult::Continue
+        }
+    }
+
+    let anthropic = concat!(
+        "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3}}}\n\n",
+        "event: content_block_start\ndata: {\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+        "event: content_block_delta\ndata: {\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"synthetic answer\"}}\n\n",
+        "event: content_block_stop\ndata: {\"index\":0}\n\n",
+        "event: message_delta\ndata: {\"usage\":{\"output_tokens\":7}}\n\n",
+        "event: message_stop\ndata: {}\n\n",
+    );
+    let gemini = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"synthetic answer\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":25,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":3,\"totalTokenCount\":123}}\n\n";
+    for (
+        family,
+        body,
+        expected_input,
+        expected_output,
+        expected_read,
+        expected_creation,
+        expected_reasoning,
+    ) in [
+        ("anthropic", anthropic, 15, 7, 3, Some(2), None),
+        ("gemini", gemini, 100, 23, 25, None, Some(3)),
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body),
+            )
+            .mount(&server)
+            .await;
+        let provider: Arc<dyn LLMProvider> = match family {
+            "anthropic" => Arc::new(
+                bamboo_llm::providers::anthropic::AnthropicProvider::new("synthetic-key")
+                    .with_base_url(server.uri()),
+            ),
+            _ => Arc::new(
+                bamboo_llm::providers::gemini::GeminiProvider::new("synthetic-key")
+                    .with_base_url(server.uri()),
+            ),
+        };
+        let trace = bamboo_infrastructure::telemetry::test_support::LocalTraceTest::isolated();
+        let mut session = Session::new(&format!("synthetic-{family}"), "synthetic-model");
+        let birth = session.created_at;
+        let (observed_tx, mut observed_rx) = mpsc::unbounded_channel();
+        let mut hooks = crate::runtime::hooks::HookRunner::new();
+        hooks.register(Arc::new(Capture(observed_tx)));
+        let config = AgentLoopConfig {
+            hook_runner: Arc::new(hooks),
+            provider_type: Some(family.into()),
+            model_name: Some("synthetic-model".into()),
+            system_prompt: Some("synthetic system".into()),
+            ..Default::default()
+        };
+        let tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor> =
+            Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+        let (events, _receiver) = mpsc::channel(128);
+        trace
+            .scope(super::run_agent_loop_with_config(
+                &mut session,
+                "PRIVATE_PROMPT_SENTINEL".into(),
+                events,
+                provider,
+                tools,
+                CancellationToken::new(),
+                config,
+            ))
+            .await
+            .expect("synthetic provider call");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), observed_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let usage = event.usage.expect("provider snapshot");
+        assert_eq!(usage.input_tokens, Some(expected_input));
+        assert_eq!(usage.output_tokens, Some(expected_output));
+        assert_eq!(usage.cache_read_input_tokens, Some(expected_read));
+        assert_eq!(usage.cache_creation_input_tokens, expected_creation);
+        assert_eq!(usage.reasoning_tokens, expected_reasoning);
+        let detail = trace
+            .store
+            .detail(&session.id, birth, &event.trace_id.unwrap())
+            .unwrap();
+        let span = detail
+            .spans
+            .iter()
+            .find(|span| span.call_id.as_deref() == Some(event.call_id.as_str()))
+            .unwrap();
+        assert_eq!(span.usage.as_ref(), Some(&usage));
+        assert!(!serde_json::to_string(&detail)
+            .unwrap()
+            .contains("PRIVATE_PROMPT_SENTINEL"));
+        assert!(observed_rx.try_recv().is_err(), "one event per model call");
+    }
+}

@@ -44,6 +44,9 @@ pub struct GeminiStreamState {
     /// Whether an [`LLMChunk::UsageSummary`] has already been emitted for this
     /// stream. It follows the same terminal/content-free and emit-once rules.
     usage_summary_emitted: bool,
+    /// Production stream emits the optional snapshot alongside the legacy
+    /// chunks without changing the public single-event parser's contract.
+    pending_provider_usage: Option<LLMChunk>,
 }
 
 impl GeminiStreamState {
@@ -106,6 +109,9 @@ fn take_gemini_usage_summary(state: &mut GeminiStreamState, value: &Value) -> Op
 /// comes) guarantees usage is delivered for cached requests too. Either piece
 /// may be absent (or already emitted); only the pieces present are included.
 fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<LLMChunk> {
+    state.pending_provider_usage = value
+        .get("usageMetadata")
+        .and_then(provider_usage_from_gemini);
     let cache = take_gemini_cache_usage(state, value);
     let summary = take_gemini_usage_summary(state, value);
     let mut out = Vec::with_capacity(2);
@@ -116,6 +122,67 @@ fn take_gemini_event_usage(state: &mut GeminiStreamState, value: &Value) -> Vec<
         out.push(summary);
     }
     out
+}
+
+/// Normalize Gemini's cumulative terminal usage. The API reports candidate and
+/// thought tokens separately; the schema's output is their combined total,
+/// while reasoning is a subset. Missing thoughts remain unknown, not zero.
+fn provider_usage_from_gemini(usage: &Value) -> Option<LLMChunk> {
+    let prompt = usage.get("promptTokenCount").and_then(Value::as_u64);
+    let input_tokens = match usage.get("toolUsePromptTokenCount") {
+        Some(value) => prompt
+            .zip(value.as_u64())
+            .and_then(|(a, b)| a.checked_add(b)),
+        // Bamboo currently sends client-side function declarations, not
+        // Google-managed server tools. The reported prompt remains the input
+        // when no separate tool-use prompt is present.
+        None => prompt,
+    };
+    let candidates = usage.get("candidatesTokenCount").and_then(Value::as_u64);
+    let reasoning_tokens = usage.get("thoughtsTokenCount").and_then(Value::as_u64);
+    let output_tokens = candidates
+        .zip(reasoning_tokens)
+        .and_then(|(a, b)| a.checked_add(b));
+    let cache_read_input_tokens = usage.get("cachedContentTokenCount").and_then(Value::as_u64);
+    let tool_input = usage.get("toolUsePromptTokenCount").and_then(Value::as_u64);
+    let known_minimum = [prompt, tool_input, candidates, reasoning_tokens]
+        .into_iter()
+        .flatten()
+        .try_fold(0_u64, u64::checked_add);
+    let total_tokens = usage
+        .get("totalTokenCount")
+        .and_then(Value::as_u64)
+        .filter(|total| known_minimum.is_some_and(|minimum| minimum <= *total));
+    if input_tokens.is_none()
+        && output_tokens.is_none()
+        && total_tokens.is_none()
+        && reasoning_tokens.is_none()
+        && cache_read_input_tokens.is_none()
+    {
+        return None;
+    }
+    Some(LLMChunk::ProviderUsage {
+        input_tokens,
+        output_tokens,
+        total_tokens,
+        reasoning_tokens,
+        cache_creation_input_tokens: None,
+        cache_read_input_tokens,
+        cache_write_input_tokens: None,
+    })
+}
+
+/// Production adapter adds the snapshot after the existing compatibility
+/// chunks. Repeated cumulative events replace values downstream, never add.
+pub(super) fn parse_with_provider_usage(
+    state: &mut GeminiStreamState,
+    event_type: &str,
+    data: &str,
+) -> Result<Vec<LLMChunk>> {
+    state.pending_provider_usage = None;
+    let mut chunks = parse_gemini_sse_event(state, event_type, data)?;
+    chunks.extend(state.pending_provider_usage.take());
+    Ok(chunks)
 }
 
 /// Parse a single Gemini SSE event into zero or more [`LLMChunk`]s.
@@ -323,6 +390,115 @@ pub fn parse_gemini_sse_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn production_stream_delivers_gemini_provider_usage_at_eof() {
+        use futures::StreamExt;
+        let body = "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"done\"}]},\"finishReason\":\"STOP\"}],\"usageMetadata\":{\"promptTokenCount\":100,\"cachedContentTokenCount\":25,\"candidatesTokenCount\":20,\"thoughtsTokenCount\":3,\"totalTokenCount\":123}}\n\n";
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(body)
+                .unwrap(),
+        );
+        let mut state = GeminiStreamState::default();
+        let mut stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+            response,
+            move |event, data| parse_with_provider_usage(&mut state, event, data),
+        );
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. }))
+                .count(),
+            1
+        );
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(23),
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                total_tokens: Some(123),
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn provider_usage_normalizes_gemini_terminal_counts_without_double_counting() {
+        let mut state = GeminiStreamState::default();
+        let intermediate = r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]}}],"usageMetadata":{"promptTokenCount":100,"candidatesTokenCount":5,"thoughtsTokenCount":1}}"#;
+        assert!(!parse_with_provider_usage(&mut state, "", intermediate)
+            .unwrap()
+            .iter()
+            .any(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. })));
+        let final_event = r#"{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":0,"candidatesTokenCount":20,"thoughtsTokenCount":3,"totalTokenCount":123}}"#;
+        for _ in 0..2 {
+            let chunks = parse_with_provider_usage(&mut state, "", final_event).unwrap();
+            assert!(chunks.iter().any(|chunk| matches!(
+                chunk,
+                LLMChunk::ProviderUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(23),
+                    total_tokens: Some(123),
+                    reasoning_tokens: Some(3),
+                    cache_read_input_tokens: Some(0),
+                    cache_creation_input_tokens: None,
+                    cache_write_input_tokens: None,
+                }
+            )));
+        }
+    }
+
+    #[test]
+    fn provider_usage_keeps_gemini_missing_zero_and_malformed_values_distinct() {
+        let mut state = GeminiStreamState::default();
+        let missing = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"cachedContentTokenCount":0,"candidatesTokenCount":20}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", missing).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: None,
+                reasoning_tokens: None,
+                cache_read_input_tokens: Some(0),
+                total_tokens: None,
+                ..
+            }
+        )));
+        let malformed = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":100,"toolUsePromptTokenCount":3,"candidatesTokenCount":20,"thoughtsTokenCount":5,"totalTokenCount":10}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", malformed).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(103),
+                output_tokens: Some(25),
+                reasoning_tokens: Some(5),
+                total_tokens: None,
+                cache_read_input_tokens: None,
+                ..
+            }
+        )));
+        let overflow = r#"{"candidates":[],"usageMetadata":{"promptTokenCount":0,"candidatesTokenCount":18446744073709551615,"thoughtsTokenCount":1,"totalTokenCount":18446744073709551615}}"#;
+        let chunks = parse_with_provider_usage(&mut state, "", overflow).unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(0),
+                output_tokens: None,
+                reasoning_tokens: Some(1),
+                total_tokens: None,
+                ..
+            }
+        )));
+    }
 
     async fn collect_sse_body(sse_body: String) -> Vec<LLMChunk> {
         use crate::providers::common::sse::llm_stream_from_sse_multi;

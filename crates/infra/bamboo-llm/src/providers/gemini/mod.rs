@@ -323,7 +323,7 @@ impl LLMProvider for GeminiProvider {
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
             move |event, data| {
-                let chunks = parse_gemini_sse_event(&mut state, event, data)?;
+                let chunks = stream::parse_with_provider_usage(&mut state, event, data)?;
 
                 if !logged_summary
                     && (requested_reasoning_for_log.is_some() || state.observed_thinking_signal)

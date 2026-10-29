@@ -85,7 +85,7 @@ impl ModelUsageGuard {
     ) {
         if let Some(mut snapshot) = self.snapshot.take() {
             snapshot.status = status;
-            snapshot.usage = usage.map(token_usage);
+            snapshot.usage = reported_token_usage(usage);
             self.runner.notify_model_usage(
                 snapshot,
                 self.session_birth,
@@ -126,6 +126,14 @@ fn token_usage(
         cache_creation_input_tokens: representable(value.cache_creation_input_tokens),
         cache_write_input_tokens: representable(value.cache_write_input_tokens),
     }
+}
+
+fn reported_token_usage(
+    value: Option<crate::runtime::stream::handler::ProviderUsageSnapshot>,
+) -> Option<bamboo_domain::ModelTokenUsage> {
+    value
+        .map(token_usage)
+        .filter(|usage| usage != &Default::default())
 }
 
 fn context_management_telemetry(

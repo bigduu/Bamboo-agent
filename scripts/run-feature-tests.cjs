@@ -75,7 +75,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // The injected project Dream endpoint A/B case stays in server-handlers.
 // The local trace sampler adds one otel-otlp-only test to the infrastructure
 // additive owner; local trace, API, engine and hook tests use default owners.
-const FEATURE_SOURCE_SHA256 = "1e768451edc4a85f9e706b6cb56c953fe9bd01bca795f62dad67bb81ef872c39";
+// The usage-presence normalization and its test are unconditional and remain
+// with the default engine owner; additive feature cases are unchanged.
+const FEATURE_SOURCE_SHA256 = "ce27ce3ae5af03e2b3a2667c8e75e699b90f61a82de3858b8ceed4d90a0c46cd";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

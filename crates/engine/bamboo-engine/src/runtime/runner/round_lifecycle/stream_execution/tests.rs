@@ -1966,6 +1966,118 @@ fn late_bound_marker_is_explicit_but_not_claimed_as_known_input() {
     assert_eq!(with_late_bound.tool_schema_late_bound_segment_count, 1);
 }
 
+#[test]
+fn reported_usage_keeps_unknown_absent_and_explicit_zero_present() {
+    use crate::runtime::stream::handler::ProviderUsageSnapshot;
+    let only_total = ProviderUsageSnapshot {
+        total_tokens: Some(100),
+        ..Default::default()
+    };
+    assert_eq!(super::reported_token_usage(Some(only_total)), None);
+    let explicit_zero = ProviderUsageSnapshot {
+        cache_read_input_tokens: Some(0),
+        ..Default::default()
+    };
+    let usage = super::reported_token_usage(Some(explicit_zero)).expect("reported zero");
+    assert_eq!(usage.cache_read_input_tokens, Some(0));
+    assert_eq!(usage.input_tokens, None);
+}
+
+#[tokio::test]
+async fn usage_observer_emits_once_per_retry_failure_success_and_cancel() {
+    use crate::runtime::stream::handler::ProviderUsageSnapshot;
+    use bamboo_agent_core::AgentHook;
+    use bamboo_domain::{AgentHookPoint, HookPayload, HookResult, ModelCallStatus, ModelCallUsage};
+
+    struct Capture(mpsc::UnboundedSender<ModelCallUsage>);
+    #[async_trait]
+    impl AgentHook for Capture {
+        fn point(&self) -> AgentHookPoint {
+            AgentHookPoint::AfterModelCallUsage
+        }
+        async fn run(&self, _: AgentHookPoint, payload: &HookPayload, _: &Session) -> HookResult {
+            if let HookPayload::ModelCallUsage { observation } = payload {
+                self.0.send(observation.clone()).unwrap();
+            }
+            HookResult::Continue
+        }
+    }
+    let (sender, mut receiver) = mpsc::unbounded_channel();
+    let mut hooks = crate::runtime::hooks::HookRunner::new();
+    hooks.register(Arc::new(Capture(sender)));
+    let hooks = Arc::new(hooks);
+    let guard = |id: &str| super::ModelUsageGuard {
+        runner: hooks.clone(),
+        session_birth: Utc::now(),
+        root_session_id: Some("usage-session".into()),
+        snapshot: Some(ModelCallUsage {
+            schema_version: 1,
+            event_id: id.into(),
+            call_id: id.into(),
+            session_id: "usage-session".into(),
+            run_id: None,
+            provider: None,
+            model: None,
+            status: ModelCallStatus::Error,
+            trace_id: None,
+            span_id: None,
+            usage: None,
+        }),
+    };
+    let mut failed = guard("attempt-1");
+    failed.finish(
+        ModelCallStatus::Error,
+        Some(ProviderUsageSnapshot {
+            output_tokens: Some(7),
+            ..Default::default()
+        }),
+    );
+    failed.finish(
+        ModelCallStatus::Success,
+        Some(ProviderUsageSnapshot {
+            output_tokens: Some(999),
+            ..Default::default()
+        }),
+    );
+    drop(failed);
+    let mut retry = guard("attempt-2");
+    retry.finish(
+        ModelCallStatus::Success,
+        Some(ProviderUsageSnapshot {
+            output_tokens: Some(3),
+            ..Default::default()
+        }),
+    );
+    drop(retry);
+    drop(guard("cancelled"));
+
+    let mut events = std::collections::HashMap::new();
+    for _ in 0..3 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(events.insert(event.call_id.clone(), event).is_none());
+    }
+    assert_eq!(events["attempt-1"].status, ModelCallStatus::Error);
+    assert_eq!(
+        events["attempt-1"].usage.as_ref().unwrap().output_tokens,
+        Some(7)
+    );
+    assert_eq!(events["attempt-2"].status, ModelCallStatus::Success);
+    assert_eq!(
+        events["attempt-2"].usage.as_ref().unwrap().output_tokens,
+        Some(3)
+    );
+    assert_eq!(events["cancelled"].status, ModelCallStatus::Cancelled);
+    assert_eq!(events["cancelled"].usage, None);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv())
+            .await
+            .is_err()
+    );
+}
+
 #[tokio::test]
 async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     let _env_lock = isolate_prompt_safe_env_cache();

@@ -19,13 +19,20 @@ listed in local inspection. Completed children can appear before their parent;
 or insertion contention has caused a drop. It cannot prove an entire trace was
 observed, and remote or separately managed spans may be missing.
 
-This first slice consumes the engine's authoritative `ProviderUsage` snapshots.
-The OpenAI-compatible Chat and Responses paths emit them. At this source
-revision, Anthropic and Gemini primarily emit legacy `CacheUsage` and
-`UsageSummary` chunks instead, which do not preserve whether zero was reported
-or omitted. Their hook and local-span `usage` can therefore be `null`, even when
-legacy session counters show activity. Provider-specific snapshot emission and
-fixtures remain follow-up work; do not infer missing values from those counters.
+The OpenAI-compatible Chat and Responses, Anthropic Messages and Gemini
+GenerateContent paths supply optional per-call snapshots. Anthropic reports
+fresh input, cache creation and cache read as disjoint components; the snapshot
+forms input total only when all three are present and the sum fits. It emits the
+snapshot at `message_stop`, so an interrupted stream can have unknown usage.
+Gemini reports prompt and cached content separately from candidate and thought
+tokens. Its snapshot combines candidate and thought tokens once for output
+only when both are present; otherwise output remains unknown. When reported,
+tool-use prompt tokens are included in input. The current adapter sends
+client-side function declarations, not Google-managed server tools. These
+rules follow the [Anthropic prompt-cache fields](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+and [Gemini usage metadata](https://ai.google.dev/api/generate-content).
+Legacy session counters may have different availability; do not infer a
+missing snapshot value from them.
 
 External OTLP still requires an explicit endpoint and opt-in. Local recording
 remains enabled when exporter setup fails. When export sampling drops a span,
