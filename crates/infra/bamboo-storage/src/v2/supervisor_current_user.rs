@@ -17,6 +17,59 @@ pub(crate) struct CurrentUserTargetGuard {
 }
 
 impl SessionStoreV2 {
+    /// Run a synchronous Host Root-control effect while retaining the original
+    /// Supervisor, target, ancestry and never-installed finite-scope fences.
+    /// The caller must be the original executing observation; neither it nor
+    /// `target` is a grant. Finite Host scopes do not currently confer a cancel
+    /// right, so an installed or previously revoked scope fails closed.
+    ///
+    /// The effect is moved into an owned blocking job with the guards: dropping
+    /// the async caller cannot release authority before an already-started
+    /// signal. The callback receives the canonical Workspace path while its
+    /// guard is held; it must not await or reenter Session storage.
+    pub async fn with_unscoped_supervisor_root_control<T, F>(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &SupervisorCurrentUserTarget,
+        effect: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(Option<&str>) -> io::Result<T> + Send + 'static,
+    {
+        if caller.session_id != supervisor.session_id
+            || caller.authority_identity
+                != (SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: supervisor.incarnation_id,
+                })
+            || target.kind != SessionKind::Root
+            || target.session_id == caller.session_id
+        {
+            return Err(denied("invalid Supervisor Root control identity"));
+        }
+        // Acquire publication before lifecycle/Task/Session/tree locks, as for
+        // the existing unscoped Host delivery boundary.
+        let scope = self
+            .host_scope_registry
+            .retain_never_installed(&caller.session_id)
+            .await?;
+        let authority = self
+            .lock_current_user_target(supervisor, &target.session_id)
+            .await?;
+        if !caller.matches_session(&authority.source) || *target != authority.reference {
+            return Err(denied("Supervisor caller or Root target changed"));
+        }
+        tokio::task::spawn_blocking(move || {
+            let _scope = scope;
+            let _authority = authority;
+            let workspace_path = _authority.target.workspace_path_meta();
+            effect(workspace_path.as_deref())
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
+    }
+
     pub(crate) async fn current_user_supervisor_scope(
         &self,
         reference: &SupervisorReference,

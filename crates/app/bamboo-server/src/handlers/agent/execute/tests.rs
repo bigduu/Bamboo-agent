@@ -174,6 +174,36 @@ pub(super) async fn after_root_admission_selection(id: &str, reserved: bool) {
     }
 }
 
+// Test-only gate after the real Ready path selects its concrete provider.
+// The keyed rendezvous leaves ordinary production and unrelated tests untouched.
+type LegacyVisionSelectionGate = (
+    tokio::sync::oneshot::Sender<bool>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+fn legacy_vision_selection_gates(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, LegacyVisionSelectionGate>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LegacyVisionSelectionGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(std::sync::Mutex::default)
+}
+pub(super) async fn after_legacy_vision_provider_selection(id: &str, managed: bool) {
+    let gate = legacy_vision_selection_gates().lock().unwrap().remove(id);
+    if let Some((selected, resume)) = gate {
+        let _ = selected.send(managed);
+        let _ = resume.await;
+    }
+}
+struct LegacyVisionSelectionProbe(String);
+impl Drop for LegacyVisionSelectionProbe {
+    fn drop(&mut self) {
+        legacy_vision_selection_gates()
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
+
 // Reachable only on the repaired HTTP ownership path. Baseline counterfactual
 // runs target the four early-selection races, never this secondary-only gate.
 impl crate::AppState {
@@ -1707,6 +1737,363 @@ mod execution_input_http {
             .was_admitted(id, &receipt_id)
             .await
             .unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    async fn supervisor_pending_run_action(
+        state: &web::Data<crate::AppState>,
+        supervisor: &bamboo_agent_core::Session,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        action: &str,
+        run: Option<&str>,
+    ) -> Result<serde_json::Value, bamboo_agent_core::tools::ToolError> {
+        use bamboo_agent_core::tools::{
+            ExecutingSupervisorObservation, FunctionCall, ToolCall, ToolOutcome,
+        };
+        use bamboo_agent_core::ToolExecutionContext;
+
+        let mut args = serde_json::json!({
+            "action": action,
+            "target_session_id": target.session_id,
+            "target_ref": target,
+        });
+        if let Some(run) = run {
+            args["expected_run_id"] = serde_json::json!(run);
+        }
+        let call = ToolCall {
+            id: "pending-sync-exact-cancel".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments: args.to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&supervisor.id);
+        ctx.root_session_id = Some(&supervisor.id);
+        ctx = ctx.with_executing_supervisor(
+            ExecutingSupervisorObservation::capture_from_executing_session(supervisor),
+        );
+        let outcome = bamboo_agent_core::tools::with_executing_session_caller(
+            Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                supervisor,
+            ))),
+            state
+                .tools_for(crate::tools::ToolSurface::Root)
+                .execute_with_context_outcome(&call, ctx),
+        )
+        .await?;
+        let ToolOutcome::Completed(result) = outcome else {
+            panic!("pending Root control must return its own result");
+        };
+        Ok(serde_json::from_str(&result.result).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn supervisor_observes_and_cancels_the_retained_fresh_sync_owner() {
+        use bamboo_domain::{Storage, SupervisorReference};
+        use bamboo_engine::session_app::supervisor::SupervisorSessionService;
+        use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "supervisor-pending-fresh-sync";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({
+                    "model": "test-model",
+                    "upstream_retry": {"mode": "until_cancelled"},
+                    "client_sync": {"client_message_count": 0, "client_has_pending_question": false}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["sync"]["need_sync"], true, "{body}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let (run_id, token) = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(id).expect("fresh input owner is retained");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            (runner.run_id.clone(), runner.cancel_token.clone())
+        };
+        assert!(state.fresh_sync.is_current_owner(id, &run_id));
+        let admitted = state.storage.load_session(id).await.unwrap().unwrap();
+        let input_id = admitted.messages.last().unwrap().id.clone();
+
+        let reference: SupervisorReference =
+            (&SupervisorSessionService::new(state.session_store.clone())
+                .get_or_create_default("supervisor-model")
+                .await
+                .unwrap())
+                .into();
+        let supervisor = state
+            .storage
+            .load_execution_admission_snapshot(&reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "pending-sync-exact-cancel".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control cancel {id}"),
+                },
+            )
+            .unwrap();
+        let target = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, id)
+            .await
+            .unwrap();
+        let observed =
+            supervisor_pending_run_action(&state, &supervisor, &target, "observe_run", None)
+                .await
+                .unwrap();
+        assert_eq!(observed["status"], "pending", "{observed}");
+        assert_eq!(observed["run_id"], run_id);
+
+        let wrong_run = uuid::Uuid::new_v4().to_string();
+        let conflict =
+            supervisor_pending_run_action(&state, &supervisor, &target, "cancel", Some(&wrong_run))
+                .await
+                .unwrap();
+        assert_eq!(conflict["status"], "run_conflict");
+        let mut stale = target.clone();
+        stale.created_at += chrono::Duration::seconds(1);
+        assert!(supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &stale,
+            "cancel",
+            Some(&run_id)
+        )
+        .await
+        .is_err());
+        assert!(!token.is_cancelled());
+
+        // Pause the real take after revalidation but before its runner lock.
+        // A winning cancel must make that same take abandon its reservation.
+        let pause = state.fresh_sync.pause_take_for_test(id);
+        let take = state.fresh_sync.take(state.get_ref(), id);
+        let cancel = async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), pause.entered.notified())
+                .await
+                .expect("the real take must reach its handoff boundary");
+            let cancelled = supervisor_pending_run_action(
+                &state,
+                &supervisor,
+                &target,
+                "cancel",
+                Some(&run_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cancelled["status"], "cancel_requested");
+            assert_eq!(cancelled["completion_verified"], false);
+            assert!(token.is_cancelled());
+            let stop = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/stop/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(stop.status(), StatusCode::OK);
+            let stopped =
+                supervisor_pending_run_action(&state, &supervisor, &target, "observe_run", None)
+                    .await
+                    .unwrap();
+            assert_eq!(stopped["status"], "cancel_requested", "{stopped}");
+            assert_eq!(stopped["completion_verified"], false);
+            pause.release.notify_one();
+        };
+        let (handoff, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(take, cancel)
+        })
+        .await
+        .expect("cancel and take must not deadlock");
+        assert!(handoff.is_none(), "a cancelled owner cannot be handed off");
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while state.fresh_sync.is_current_owner(id, &run_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled retained owner must be released");
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            after.messages.iter().filter(|m| m.id == input_id).count(),
+            1
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        // A newly selected target cannot retarget the original parked owner
+        // after its Workspace changes, even when the Root birth is unchanged.
+        let changed_id = "supervisor-pending-changed-workspace";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, changed_id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, changed_id).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{changed_id}"))
+                .set_json(serde_json::json!({
+                    "model": "test-model",
+                    "upstream_retry": {"mode": "until_cancelled"},
+                    "client_sync": {"client_message_count": 0, "client_has_pending_question": false}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["sync"]["need_sync"], true, "{body}");
+        let (changed_run, changed_token) = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(changed_id).expect("second owner is retained");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            (runner.run_id.clone(), runner.cancel_token.clone())
+        };
+        let original_target = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let originally_observed = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &original_target,
+            "observe_run",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(originally_observed["status"], "pending");
+        let original = state
+            .storage
+            .load_session(changed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let next_workspace = home.path().join("changed-workspace");
+        std::fs::create_dir_all(&next_workspace).unwrap();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{changed_id}"))
+                .insert_header((
+                    actix_web::http::header::IF_MATCH,
+                    format!("\"{}\"", original.metadata_version),
+                ))
+                .set_json(serde_json::json!({"workspace_path": next_workspace}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let fresh = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        assert_eq!(fresh.created_at, original.created_at);
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "pending-changed-workspace-cancel".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control cancel {changed_id}"),
+                },
+            )
+            .unwrap();
+        let refused = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["status"], "run_conflict", "{refused}");
+        assert!(!changed_token.is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let stop = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/stop/{changed_id}"))
+                .insert_header(("Bamboo-Run-Id", changed_run.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stop.status(), StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let finalized = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(changed_id)
+                    .is_some_and(|runner| runner.exact_execution_finalized());
+                if finalized {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old retained owner must finalize after HTTP Stop");
+        let fresh_after_stop = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let after_stop = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh_after_stop,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_stop["status"], "run_conflict", "{after_stop}");
         tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
             .await
             .unwrap();
@@ -5111,6 +5498,253 @@ mod execution_input_http {
         } else {
             shutdown_rejected_race(&state, &[&id]).await;
         }
+    }
+
+    /// A prepared Host run must never combine the old concrete account with a
+    /// Vision model taken from a newer configuration for the same provider id.
+    #[actix_web::test]
+    async fn vision_legacy_same_provider_reload_keeps_image_destination_bound() {
+        use bamboo_agent_core::Storage;
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+        let mut observations = Vec::new();
+        for (changed, replace_registry, is_managed) in [
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+        ] {
+            let a = MockServer::start().await;
+            let b = MockServer::start().await;
+            let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic image description\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+            for server in [&a, &b] {
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+                    .mount(server)
+                    .await;
+            }
+            let home = tempfile::tempdir().unwrap();
+            let mut old = bamboo_llm::Config::default();
+            *old.memory_mut() = Some(
+                serde_json::from_value(serde_json::json!({
+                    "auto_dream_enabled":false, "project_prompt_injection":false,
+                    "relevant_recall":false, "relevant_recall_rerank":false,
+                    "project_first_dream":false, "ledger_agenda_injection":false
+                }))
+                .unwrap(),
+            );
+            let memory = old.memory().as_ref().unwrap();
+            assert!(
+                !memory.auto_dream_enabled
+                    && !memory.project_prompt_injection
+                    && !memory.relevant_recall
+                    && !memory.relevant_recall_rerank
+                    && !memory.project_first_dream
+                    && !memory.ledger_agenda_injection
+            );
+            old.provider = "openai".into();
+            old.default_provider_instance = Some("openai".into());
+            old.features.provider_model_ref = true;
+            old.http_proxy = "http://127.0.0.1:9".into();
+            old.https_proxy.clear();
+            old.hooks.image_fallback.enabled = true;
+            old.hooks.image_fallback.mode = "vision".into();
+            old.defaults = Some(
+                serde_json::from_value(serde_json::json!({
+                    "chat": {"provider":"openai", "model":"test-model"},
+                    "fast": {"provider":"openai", "model":"test-model"},
+                    "vision": {"provider":"openai", "model":"vision-old"}
+                }))
+                .unwrap(),
+            );
+            old.provider_instances.insert("openai".into(), serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic-old",
+                "base_url":a.uri(), "model":"test-model", "vision_model":"vision-old",
+                "runtime_models":["test-model","vision-old","vision-new"],
+                "model_capabilities":{"vision-old":{"supports_vision":true},"vision-new":{"supports_vision":true}}
+            })).unwrap());
+            let mut app = crate::AppState::new_with_provider_and_memory_store(
+                home.path().to_path_buf(),
+                old.clone(),
+                Arc::new(LocalProvider),
+                bamboo_memory::memory_store::MemoryStore::new(home.path().join("jiandu")),
+            )
+            .await
+            .unwrap();
+            app.stop_config_watcher_for_test();
+            let built = ProviderRegistry::from_config(&old, home.path().to_path_buf())
+                .await
+                .unwrap();
+            let selected_registry = if is_managed {
+                built
+            } else {
+                let selected = built.get("openai").unwrap();
+                ProviderRegistry::new(
+                    std::collections::HashMap::from([("openai".into(), selected)]),
+                    "openai".into(),
+                )
+            };
+            app.provider_registry.replace_with(selected_registry);
+            app.provider_router = Arc::new(ProviderModelRouter::new(app.provider_registry.clone()));
+            let state = web::Data::new(app);
+            let id =
+                format!("synthetic-legacy-vision-reload-{changed}-{replace_registry}-{is_managed}");
+            let mut session = owned_http_session(&state, &id);
+            session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "test-model"));
+            let image = bamboo_agent_core::Message::user_with_parts(
+                "Inspect the synthetic pixel",
+                vec![bamboo_domain::MessagePart::ImageUrl {
+                    image_url: bamboo_domain::ImageUrlRef {
+                        url: PIXEL.into(),
+                        detail: None,
+                    },
+                }],
+            );
+            let image_id = image.id.clone();
+            let original_parts = image.content_parts.clone();
+            session.add_message(image);
+            state.storage.save_session(&session).await.unwrap();
+            state.session_store.save_session(&session).await.unwrap();
+
+            let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            assert!(legacy_vision_selection_gates()
+                .lock()
+                .unwrap()
+                .insert(id.clone(), (selected_tx, resume_rx))
+                .is_none());
+            let _probe = LegacyVisionSelectionProbe(id.clone());
+            let mut next = old.clone();
+            next.defaults.as_mut().unwrap().vision =
+                Some(bamboo_domain::ProviderModelRef::new("openai", "vision-new"));
+            let instance = next.provider_instances.get_mut("openai").unwrap();
+            instance.base_url = Some(b.uri());
+            instance.api_key = "synthetic-new".into();
+            instance.vision_model = Some("vision-new".into());
+            let replacement = if changed && replace_registry {
+                Some(
+                    ProviderRegistry::from_config(&next, home.path().to_path_buf())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let update = async {
+                let managed = tokio::time::timeout(std::time::Duration::from_secs(10), selected_rx)
+                    .await
+                    .expect("Host selected its original provider")
+                    .expect("selection gate");
+                if let Some(replacement) = replacement {
+                    state.provider_registry.replace_with(replacement);
+                }
+                if changed {
+                    *state.config.write().await = next;
+                }
+                resume_tx.send(()).expect("resume selected Host run");
+                managed
+            };
+            let ((status, body), managed) = tokio::join!(execute(&state, &id, None), update);
+            assert_eq!(
+                managed, is_managed,
+                "the selected A1 client must have the expected provenance"
+            );
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let run = body["run_id"].as_str().expect("accepted run").to_string();
+            let failure = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let terminal = {
+                        let runners = state.agent_runners.read().await;
+                        runners.get(&id).and_then(|runner| {
+                            if runner.run_id != run {
+                                return None;
+                            }
+                            match &runner.status {
+                                AgentStatus::Completed => Some(None),
+                                AgentStatus::Error(error) => Some(Some(error.clone())),
+                                AgentStatus::Cancelled => {
+                                    Some(Some("unexpected cancellation".into()))
+                                }
+                                AgentStatus::Pending | AgentStatus::Running => None,
+                            }
+                        })
+                    };
+                    if let Some(failure) = terminal {
+                        break failure;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("synthetic Host run must retire");
+            let seen = |requests: &[wiremock::Request], model: &str| {
+                requests.iter().any(|request| {
+                    request
+                        .body_json::<serde_json::Value>()
+                        .ok()
+                        .is_some_and(|body| body["model"] == model)
+                        && String::from_utf8_lossy(&request.body).contains(PIXEL)
+                })
+            };
+            let a_requests = a.received_requests().await.unwrap();
+            let b_requests = b.received_requests().await.unwrap();
+            let mut image_routes = Vec::new();
+            for (endpoint, requests) in [("A1", &a_requests), ("A2", &b_requests)] {
+                for request in requests {
+                    if String::from_utf8_lossy(&request.body).contains(PIXEL) {
+                        let model = request
+                            .body_json::<serde_json::Value>()
+                            .ok()
+                            .and_then(|body| body["model"].as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "<missing>".into());
+                        image_routes.push((endpoint.to_string(), model));
+                    }
+                }
+            }
+            let saved = state.storage.load_session(&id).await.unwrap().unwrap();
+            let preserved = saved
+                .messages
+                .iter()
+                .find(|m| m.id == image_id)
+                .is_some_and(|m| m.content_parts == original_parts);
+            observations.push((
+                changed,
+                replace_registry,
+                seen(&a_requests, "vision-old"),
+                seen(&a_requests, "vision-new"),
+                seen(&b_requests, "vision-new"),
+                failure,
+                preserved,
+                image_routes,
+                is_managed,
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .expect("shutdown synthetic Host");
+        }
+        for control in [&observations[0], &observations[3]] {
+            assert!(
+                control.2
+                    && !control.3
+                    && !control.4
+                    && control.5.is_none()
+                    && control.6
+                    && !control.7.is_empty()
+                    && control
+                        .7
+                        .iter()
+                        .all(|(endpoint, model)| endpoint == "A1" && model == "vision-old"),
+                "unchanged A1 must receive vision-old and succeed: {observations:?}"
+            );
+        }
+        assert!(observations.iter().filter(|entry| entry.0).all(|(_, _, a_old, a_new, b_new, failure, preserved, routes, _)| {
+            let source_refused = failure.as_ref().is_some_and(|error|
+                error.contains("Legacy Vision provider source changed"));
+            source_refused && !a_old && !a_new && !b_new && routes.is_empty() && *preserved
+        }), "a selected client with a changed source must be refused before any image is sent: {observations:?}");
     }
 
     #[actix_web::test]

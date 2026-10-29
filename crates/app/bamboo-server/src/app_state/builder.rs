@@ -500,6 +500,7 @@ impl AppState {
 
         let agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>> =
             Arc::new(RwLock::new(HashMap::new()));
+        let live_retry = Arc::new(super::live_retry::LiveRetryBridge::default());
         // NOTE: the idle-eviction sweep for `agent_runners` is spawned below,
         // once `session_event_senders` also exists, so it can drop both maps'
         // entries for a completed session together (issue #346).
@@ -1146,7 +1147,7 @@ impl AppState {
                         let config_snap = config_for_resolver.read().await.clone();
                         bamboo_engine::model_config_helper::resolve_subagent_model_ref(
                             &config_snap,
-                            &config_snap.provider,
+                            config_snap.effective_default_provider(),
                             &registry,
                             &subagent_type,
                         )
@@ -1217,6 +1218,14 @@ impl AppState {
         let browser = Arc::new(crate::browser::BrowserManager::with_profile_root(
             data_dir.join("browser-profiles"),
         ));
+        let fresh_sync = Arc::new(super::fresh_sync::FreshSyncRegistry::default());
+        let root_run = Arc::new(super::supervised_root_run::SupervisedRootRunController {
+            store: session_store.clone(),
+            router: session_activation_router.clone(),
+            runners: agent_runners.clone(),
+            live_retry: live_retry.clone(),
+            fresh_sync: fresh_sync.clone(),
+        });
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
@@ -1226,6 +1235,7 @@ impl AppState {
             persistence.clone(),
             session_messenger.clone(),
             root_creator,
+            root_run,
             spawn_scheduler.clone(),
             sessions.clone(),
             agent_runners.clone(),
@@ -1558,8 +1568,8 @@ impl AppState {
             )),
             metrics_service,
             agent_runners,
-            live_retry: Arc::new(super::live_retry::LiveRetryBridge::default()),
-            fresh_sync: Arc::new(super::fresh_sync::FreshSyncRegistry::default()),
+            live_retry,
+            fresh_sync,
             execute_startups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             session_event_senders,
             actor_event_hub,

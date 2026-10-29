@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::GoldConfig;
 use bamboo_domain::reasoning::ReasoningEffort;
 use bamboo_llm::Config;
-use bamboo_llm::{LLMError, ProviderModelRouter, ProviderRegistry, ResolvedModel};
+use bamboo_llm::{LLMError, ProviderRegistry, ResolvedModel};
 
 pub const GOLD_CONFIG_METADATA_KEY: &str = "gold_config";
 
@@ -453,7 +453,7 @@ fn try_resolve_role_ref_chain_with_origin<'a>(
         || model_ref.model.trim() != model_ref.model
     {
         return Err(LLMError::Api(
-            "Configured auxiliary provider/model reference is invalid".into(),
+            "Configured provider/model reference is invalid".into(),
         ));
     }
     if let Some(instance) = config.provider_instances.get(&model_ref.provider) {
@@ -479,6 +479,60 @@ fn try_resolve_role_ref_chain_with_origin<'a>(
         ResolvedModel::from_ref(provider, model_ref),
         managed,
     )))
+}
+
+pub fn try_resolve_exact_model(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    target: &bamboo_domain::ProviderModelRef,
+) -> Result<ResolvedModel, LLMError> {
+    try_resolve_role_ref_chain(config, registry, [Some(target)])?
+        .ok_or_else(|| LLMError::Api("Configured model target is required".into()))
+}
+
+/// A primary route retains the canonical account, its unwrapped provider and
+/// the managed proof captured for that same provider generation.
+pub struct ResolvedPrimaryModel {
+    pub target: bamboo_domain::ProviderModelRef,
+    pub provider: Arc<dyn bamboo_llm::LLMProvider>,
+    pub managed_origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+}
+
+pub fn try_resolve_primary_model(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    requested: &bamboo_domain::ProviderModelRef,
+) -> Result<ResolvedPrimaryModel, LLMError> {
+    if requested.provider.trim().is_empty()
+        || requested.model.trim().is_empty()
+        || requested.provider.trim() != requested.provider
+        || requested.model.trim() != requested.model
+    {
+        return Err(LLMError::Api(
+            "Configured provider/model reference is invalid".into(),
+        ));
+    }
+    let mut target = requested.clone();
+    target.provider = resolve_provider_routing_key(config, &target.provider, registry)?;
+    // Primary reasoning is carried by the run request; using a role wrapper
+    // here would hide the selected registry Arc from managed Gold admission.
+    let mut raw_target = target.clone();
+    raw_target.reasoning_effort = None;
+    let (admitted, was_managed) =
+        try_resolve_role_ref_chain_with_origin(config, registry, [Some(&raw_target)])?
+            .ok_or_else(|| LLMError::Api("Configured model target is required".into()))?;
+    let (provider, managed_origin) =
+        registry.provider_for_configured_model_with_managed_origin(config, &raw_target)?;
+    if !Arc::ptr_eq(&admitted.provider, &provider) || (was_managed && managed_origin.is_none()) {
+        return Err(LLMError::Api(
+            "Provider route changed during model admission; retry".into(),
+        ));
+    }
+    Ok(ResolvedPrimaryModel {
+        target,
+        provider,
+        managed_origin,
+    })
 }
 
 fn try_resolve_legacy_role(
@@ -881,10 +935,9 @@ pub fn resolve_code_review_model(
 pub fn resolve_subagent_model_ref(
     config: &Config,
     provider_name: &str,
-    provider_registry: &Arc<ProviderRegistry>,
+    _provider_registry: &Arc<ProviderRegistry>,
     subagent_type: &str,
 ) -> Option<bamboo_domain::ProviderModelRef> {
-    let router = ProviderModelRouter::new(provider_registry.clone());
     if let Some(defaults) = config.defaults.as_ref() {
         let candidate_refs = [
             defaults.subagent_models.get(subagent_type),
@@ -894,11 +947,34 @@ pub fn resolve_subagent_model_ref(
         ];
 
         let model_ref = candidate_refs.into_iter().flatten().next()?;
-        return router.route(model_ref).ok().map(|_| model_ref.clone());
+        // This is selection, not admission. Preserve an explicit invalid ref
+        // so the real child admission rejects it rather than inheriting the
+        // parent's unrelated model after `None`.
+        return Some(model_ref.clone());
     }
 
-    resolve_fast_model(config, provider_name, provider_registry)
-        .map(|resolved| bamboo_domain::ProviderModelRef::new(provider_name, resolved.model_name))
+    let legacy_model = if let Some(instance) = config.provider_instances.get(provider_name) {
+        // Retain a disabled instance's configured intent for final admission.
+        instance
+            .fast_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .or_else(|| {
+                instance
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|model| !model.is_empty())
+            })
+            .map(ToString::to_string)
+            .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()))
+    } else {
+        // Legacy provider entries historically treated a blank fast selection
+        // as unset and inherited the parent rather than selecting an empty ID.
+        get_fast_model_for_provider(config, provider_name).filter(|model| !model.trim().is_empty())
+    };
+    legacy_model.map(|model| bamboo_domain::ProviderModelRef::new(provider_name, model))
 }
 
 /// Resolve the model for a specific subagent type.
@@ -913,10 +989,7 @@ pub fn resolve_subagent_model(
 ) -> Option<ResolvedModel> {
     let model_ref =
         resolve_subagent_model_ref(config, provider_name, provider_registry, subagent_type)?;
-    let provider = ProviderModelRouter::new(provider_registry.clone())
-        .route(&model_ref)
-        .ok()?;
-    Some(ResolvedModel::from_ref(provider, &model_ref))
+    try_resolve_exact_model(config, provider_registry, &model_ref).ok()
 }
 
 /// Resolve the image-fallback configuration from a config snapshot.
@@ -953,12 +1026,48 @@ pub fn resolve_image_fallback(
     };
 
     let vision_model = if mode == ImageFallbackMode::Vision {
-        config_snapshot.get_vision_model()
+        config_snapshot
+            .defaults
+            .as_ref()
+            .map(|defaults| {
+                defaults
+                    .vision
+                    .as_ref()
+                    .or(defaults.fast.as_ref())
+                    .unwrap_or(&defaults.chat)
+                    .model
+                    .clone()
+            })
+            .or_else(|| config_snapshot.get_vision_model())
     } else {
         None
     };
 
     Ok(Some(crate::ImageFallbackConfig { mode, vision_model }))
+}
+
+/// Mark a Host-derived fallback for selection from the execution-time config.
+/// The public low-level resolver retains its snapshot-model behavior; only a
+/// caller that knows this value came from config should use this conversion.
+#[doc(hidden)]
+pub fn live_config_image_fallback(
+    mut fallback: Option<crate::ImageFallbackConfig>,
+) -> Option<crate::ImageFallbackConfig> {
+    if let Some(fallback) = fallback.as_mut() {
+        if fallback.mode == crate::ImageFallbackMode::Vision {
+            fallback.vision_model = None;
+        }
+    }
+    fallback
+}
+
+/// Resolve a Host-derived mode, leaving the Vision pair to the runtime's one
+/// execution-time config snapshot rather than retaining a model-only value.
+#[doc(hidden)]
+pub fn resolve_live_image_fallback(
+    config: &Config,
+) -> Result<Option<crate::ImageFallbackConfig>, String> {
+    resolve_image_fallback(config).map(live_config_image_fallback)
 }
 
 #[cfg(test)]
@@ -1165,6 +1274,75 @@ mod tests {
             }
             state.assert_no_requests();
         }
+    }
+
+    #[test]
+    fn primary_route_canonicalizes_alias_and_keeps_raw_provider_and_effort() {
+        let mut config = Config::default();
+        config.provider_instances.insert(
+            "work-openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "model":"chat-model",
+                "runtime_models":["chat-model"]
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("work-openai".into());
+        let registry = registry_with_provider_ids(&["work-openai"], "work-openai");
+        let target = bamboo_domain::ProviderModelRef::new("openai", "chat-model")
+            .with_reasoning_effort(ReasoningEffort::High);
+        let selected = try_resolve_primary_model(&config, &registry, &target).unwrap();
+        assert_eq!(selected.target.provider, "work-openai");
+        assert_eq!(
+            selected.target.reasoning_effort,
+            Some(ReasoningEffort::High)
+        );
+        assert!(Arc::ptr_eq(
+            &selected.provider,
+            &registry.get("work-openai").unwrap()
+        ));
+        assert!(selected.managed_origin.is_none());
+
+        config.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":false, "model":"chat-model"
+            }))
+            .unwrap(),
+        );
+        let error = try_resolve_primary_model(&config, &registry, &target)
+            .err()
+            .expect("a disabled exact ID must not route to an alias");
+        assert!(error.to_string().contains("disabled"));
+    }
+
+    #[test]
+    fn subagent_resolved_model_requires_exact_current_admission() {
+        use crate::app_context::model_routing_test_support::RoutingContext;
+
+        let state = RoutingContext::new(None);
+        let mut config = state.config.try_read().unwrap().clone();
+        config.defaults.as_mut().unwrap().sub_agent =
+            Some(ProviderModelRef::new("fast-b", "cheap-b"));
+        let resolved = resolve_subagent_model(&config, "chat-a", &state.registry, "coder")
+            .expect("the selected admitted role must resolve");
+        assert_eq!(resolved.model_name, "cheap-b");
+        assert!(Arc::ptr_eq(
+            &resolved.provider,
+            &state.registry.get("fast-b").unwrap()
+        ));
+
+        let instance = config.provider_instances.get_mut("fast-b").unwrap();
+        instance.enabled = false;
+        assert!(resolve_subagent_model(&config, "chat-a", &state.registry, "coder").is_none());
+
+        let instance = config.provider_instances.get_mut("fast-b").unwrap();
+        instance.enabled = true;
+        instance
+            .extra
+            .insert("runtime_models".into(), serde_json::json!([]));
+        assert!(resolve_subagent_model(&config, "chat-a", &state.registry, "coder").is_none());
+        state.assert_no_requests();
     }
 
     #[test]

@@ -383,13 +383,34 @@ async fn handle_reserved_execute(
                 admission.native_main,
             )
         };
-    let startup_turn_id = state
-        .storage
-        .load_session(&session_id)
-        .await
-        .ok()
-        .flatten()
-        .and_then(|session| crate::handlers::agent::events::startup_work_id(&session));
+    let stored_session = state.storage.load_session(&session_id).await.ok().flatten();
+    let startup_turn_id = stored_session
+        .as_ref()
+        .and_then(crate::handlers::agent::events::startup_work_id);
+    // The prepared session remains authoritative and is revalidated later;
+    // use its scheduled binding here so default-account settings cannot reject
+    // or supply reasoning for an explicitly bound scheduled account.
+    let initial_schedule_binding = stored_session
+        .as_ref()
+        .filter(|session| session.metadata.contains_key("created_by_schedule_id"))
+        .map(bamboo_engine::session_app::provider_model::schedule_bound_model_ref);
+    if let Some(Err(error)) = initial_schedule_binding.as_ref() {
+        fail_reserved_pending_startup(
+            &state,
+            &session_id,
+            startup_turn_id.as_deref(),
+            error,
+            admission_reservation,
+            startup_guard,
+        )
+        .await;
+        return bad_request_error_response(error.clone());
+    }
+    let scheduled_provider = initial_schedule_binding
+        .as_ref()
+        .and_then(|binding| binding.as_ref().ok())
+        .and_then(|binding| binding.as_ref())
+        .map(|target| target.provider.clone());
     tracing::debug!(
         "[{}] Execute requested: model={:?}, model_ref={:?}, reasoning_effort={:?}, has_client_sync={}",
         session_id,
@@ -425,11 +446,12 @@ async fn handle_reserved_execute(
         .collect();
     let disabled_skill_ids_vec: Vec<String> =
         config_snapshot.disabled_skill_ids().into_iter().collect();
-    let explicit_provider = req
-        .model_ref
-        .as_ref()
-        .map(|model_ref| model_ref.provider.as_str())
-        .or(req.provider.as_deref());
+    let explicit_provider = scheduled_provider.as_deref().or_else(|| {
+        req.model_ref
+            .as_ref()
+            .map(|model_ref| model_ref.provider.as_str())
+            .or(req.provider.as_deref())
+    });
     let requested_provider_alias = resolve_requested_provider(&config_snapshot, explicit_provider);
     let requested_provider = match resolve_provider_routing_key(
         &config_snapshot,
@@ -535,6 +557,9 @@ async fn handle_reserved_execute(
             )
             .await;
             return match error {
+                invalid @ bamboo_engine::session_app::errors::ExecutePreparationError::InvalidModelReference(_) => {
+                    bad_request_error_response(invalid.to_string())
+                }
                 bamboo_engine::session_app::errors::ExecutePreparationError::NotFound(_) => {
                     tracing::warn!("[{session_id}] Execute session not found");
                     HttpResponse::NotFound().json(serde_json::json!({
@@ -566,7 +591,31 @@ async fn handle_reserved_execute(
             model_source,
             reasoning_source,
             is_child_session,
+            scheduled_binding,
+            scheduled_startup_expected,
         } => {
+            let initial_binding = initial_schedule_binding
+                .as_ref()
+                .and_then(|binding| binding.as_ref().ok());
+            if (initial_schedule_binding.is_some() || scheduled_binding.is_some())
+                && initial_binding != scheduled_binding.as_ref()
+            {
+                let detail =
+                    "Scheduled session model or provider changed during preparation; retry";
+                fail_reserved_pending_startup(
+                    &state,
+                    &session_id,
+                    startup_turn_id.as_deref(),
+                    detail,
+                    admission_reservation,
+                    startup_guard,
+                )
+                .await;
+                return HttpResponse::Conflict().json(serde_json::json!({
+                    "status": "rejected", "session_id": session_id,
+                    "error": crate::error::error_value(detail)
+                }));
+            }
             let session = *session;
             ready::handle_execute_ready(ready::ExecuteReadyContext {
                 state: &state,
@@ -584,6 +633,7 @@ async fn handle_reserved_execute(
                     model_source,
                     reasoning_source,
                     is_child_session,
+                    scheduled_startup_expected,
                     no_human_approver: req.no_human_approver,
                     run_budget: req.run_budget,
                     upstream_retry: req.upstream_retry.unwrap_or_default(),
