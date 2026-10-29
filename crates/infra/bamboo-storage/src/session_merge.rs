@@ -1657,7 +1657,12 @@ impl LockedSessionStore {
         F: FnOnce(&Session, bool) + Send,
     {
         self.merge_save_runtime_inner_and_publish(
-            session, true, false, None, Some(expected), publish,
+            session,
+            true,
+            false,
+            None,
+            Some(expected),
+            publish,
         )
         .await
     }
@@ -1692,8 +1697,15 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, true, Some(inherited), None, publish)
-            .await
+        self.merge_save_runtime_inner_and_publish(
+            session,
+            true,
+            true,
+            Some(inherited),
+            None,
+            publish,
+        )
+        .await
     }
 
     /// Forward only this execution's captured Root writer; never accept one
@@ -1878,7 +1890,12 @@ impl LockedSessionStore {
                     .insert(0, bamboo_domain::Message::system(prompt));
             }
             result = self
-                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None, None)
+                .save_session_rebasing_task_conflicts_with_input(
+                    session,
+                    input.as_ref(),
+                    None,
+                    None,
+                )
                 .await;
         }
         if may_publish_runtime_result(&result) {
@@ -2152,7 +2169,12 @@ impl LockedSessionStore {
             adopt_fresher_durable_model_context_state(session, latest);
         }
         let result = self
-            .save_session_rebasing_task_conflicts_with_input(session, None, inherited, scheduled_expected)
+            .save_session_rebasing_task_conflicts_with_input(
+                session,
+                None,
+                inherited,
+                scheduled_expected,
+            )
             .await;
         if may_publish_runtime_result(&result) {
             *original = candidate;

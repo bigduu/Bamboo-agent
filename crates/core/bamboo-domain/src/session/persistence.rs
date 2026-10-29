@@ -772,7 +772,9 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         session: &mut Session,
         expected: &Session,
     ) -> io::Result<()> {
-        (**self).save_scheduled_startup_session(session, expected).await
+        (**self)
+            .save_scheduled_startup_session(session, expected)
+            .await
     }
 
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {

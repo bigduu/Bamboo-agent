@@ -34,7 +34,10 @@ pub(crate) mod scheduled_startup_test_hooks {
     }
 
     pub(crate) fn install(id: &str) -> Arc<Hook> {
-        let hook = Arc::new(Hook { reached: Notify::new(), resume: Notify::new() });
+        let hook = Arc::new(Hook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
         hooks().lock().unwrap().insert(id.to_string(), hook.clone());
         hook
     }

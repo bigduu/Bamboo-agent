@@ -345,14 +345,22 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     crate::handlers::agent::events::clear_pending_turn(&mut session);
 
     // ---- Save session before spawn (metadata-group merge) ----
-    let saved = match (ready.scheduled_startup_expected.as_deref(), execution_persistence.as_ref()) {
+    let saved = match (
+        ready.scheduled_startup_expected.as_deref(),
+        execution_persistence.as_ref(),
+    ) {
         (Some(expected), Some(persistence)) => {
-            persistence.save_scheduled_startup_session(&mut session, expected).await
+            persistence
+                .save_scheduled_startup_session(&mut session, expected)
+                .await
         }
         (Some(expected), None) => {
             bamboo_domain::RuntimeSessionPersistence::save_scheduled_startup_session(
-                state.persistence.as_ref(), &mut session, expected,
-            ).await
+                state.persistence.as_ref(),
+                &mut session,
+                expected,
+            )
+            .await
         }
         (None, Some(persistence)) => persistence.save_runtime_session(&mut session).await,
         (None, None) => state.persistence.merge_save_runtime(&mut session).await,
@@ -368,7 +376,10 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             ready.startup_guard,
         )
         .await;
-        if error.get_ref().is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>()) {
+        if error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+        {
             return HttpResponse::Conflict().json(serde_json::json!({
                 "status": "rejected", "session_id": session_id,
                 "error": crate::error::error_value(error.to_string())

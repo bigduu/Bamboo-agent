@@ -100,6 +100,46 @@ pub struct ScheduleManager {
     guard_progress: ScheduleGuardObservers,
 }
 
+#[cfg(test)]
+mod startup_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+
+    pub(super) struct Hook {
+        pub(super) reached: Notify,
+        pub(super) resume: Notify,
+        pub(super) session_id: Mutex<Option<String>>,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Arc<Hook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<Hook>>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(run_id: &str) -> Arc<Hook> {
+        let hook = Arc::new(Hook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+            session_id: Mutex::new(None),
+        });
+        hooks()
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause(run_id: &str, session_id: &str) {
+        let hook = hooks().lock().unwrap().remove(run_id);
+        if let Some(hook) = hook {
+            *hook.session_id.lock().unwrap() = Some(session_id.to_string());
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+}
+
 // Only explicitly observed fixture runs are retained. Observations never read
 // storage, introduce a suspension point, or participate in scheduling decisions.
 #[cfg(test)]
@@ -621,6 +661,9 @@ async fn run_schedule_job(
         .save_runtime_authoritative_flags(&mut session)
         .await
         .map_err(|e| format!("failed to save scheduled session: {e}"))?;
+    // Preserve the exact profile that was exposed by the initial save. A later
+    // PATCH must win over this run's selected provider before execution starts.
+    let scheduled_startup_expected = session.clone();
     #[cfg(test)]
     progress.at("session_bind_pending");
     if let Err(error) = ctx
@@ -647,6 +690,8 @@ async fn run_schedule_job(
     );
     #[cfg(test)]
     progress.at("session_bound");
+    #[cfg(test)]
+    startup_test_hooks::pause(&job.run_id, &session_id).await;
 
     if let Some(reason) = prompt_hook_block {
         return Err(format!(
@@ -740,6 +785,28 @@ async fn run_schedule_job(
     {
         execution_reservation.abandon().await;
         return Err(format!("Root schedule execution binding failed: {error}"));
+    }
+    // Configured Schedule runs must atomically recheck the exact model pair
+    // after claiming their Root. Legacy unconfigured injected agents have no
+    // configured binding and retain their existing compatibility path.
+    if resolved.model_provider.is_some() && !resolved.model_is_injected {
+        let saved = match execution_reservation.execution_persistence() {
+            Some(persistence) => {
+                persistence
+                    .save_scheduled_startup_session(&mut session, &scheduled_startup_expected)
+                    .await
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "configured Schedule startup requires a bound Root writer",
+            )),
+        };
+        if let Err(error) = saved {
+            execution_reservation.abandon().await;
+            return Err(format!(
+                "Scheduled startup profile was not committed: {error}"
+            ));
+        }
     }
     let root_publication = execution_reservation.root_actor_writer().map(|owner| {
         bamboo_engine::events::RootActorEventPublication::new(

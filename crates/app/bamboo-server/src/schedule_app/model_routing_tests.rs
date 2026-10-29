@@ -539,20 +539,34 @@ async fn scheduled_startup_rejects_concurrent_model_patch_before_provider_call()
     state.config.write().await.features.provider_model_ref = false;
     let mut request = job();
     request.run_config.auto_execute = false;
-    run_schedule_job(context(&state).await, request, None).await.unwrap();
-    let entry = state.session_store.list_index_entries().await.into_iter()
+    run_schedule_job(context(&state).await, request, None)
+        .await
+        .unwrap();
+    let entry = state
+        .session_store
+        .list_index_entries()
+        .await
+        .into_iter()
         .find(|entry| entry.created_by_schedule_id.as_deref() == Some("synthetic-model-schedule"))
         .expect("scheduled session");
     let hook = crate::handlers::agent::execute::scheduled_startup_test_hooks::install(&entry.id);
     let app = test::init_service(
-        App::new().app_data(state.clone()).configure(crate::routes::configure_routes),
-    ).await;
-    let execute = test::call_service(&app, test::TestRequest::post()
-        .uri(&format!("/api/v1/execute/{}", entry.id))
-        .set_json(serde_json::json!({})).to_request());
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let execute = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{}", entry.id))
+            .set_json(serde_json::json!({}))
+            .to_request(),
+    );
     let patch = async {
         tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
-            .await.expect("execute must reach the startup gate");
+            .await
+            .expect("execute must reach the startup gate");
         let response = test::call_service(&app, test::TestRequest::patch()
             .uri(&format!("/api/v1/sessions/{}", entry.id))
             .set_json(serde_json::json!({"model_ref": {"provider": "startup-a", "model": "startup-model"}}))
@@ -561,10 +575,85 @@ async fn scheduled_startup_rejects_concurrent_model_patch_before_provider_call()
         response
     };
     let (execute, patch) = tokio::join!(execute, patch);
-    assert!(patch.status().is_success(), "PATCH status: {}", patch.status());
+    assert!(
+        patch.status().is_success(),
+        "PATCH status: {}",
+        patch.status()
+    );
     assert_eq!(execute.status(), actix_web::http::StatusCode::CONFLICT);
-    let durable = state.storage.load_session(&entry.id).await.unwrap().unwrap();
-    assert_eq!(durable.model_ref, Some(bamboo_domain::ProviderModelRef::new("startup-a", "startup-model")));
+    let body = test::read_body(execute).await;
+    assert!(String::from_utf8_lossy(&body).contains("scheduled startup execution profile changed"));
+    let durable = state
+        .storage
+        .load_session(&entry.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.model_ref,
+        Some(bamboo_domain::ProviderModelRef::new(
+            "startup-a",
+            "startup-model"
+        ))
+    );
+    for provider in providers.values() {
+        assert!(provider.models.lock().unwrap().is_empty());
+    }
+    state.shutdown().await;
+}
+
+#[tokio::test]
+async fn scheduled_startup_automatic_rejects_concurrent_model_patch_before_provider_call() {
+    use actix_web::{test, web, App};
+    let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+    let state = web::Data::new(state);
+    let mut request = job();
+    request.run_id = "auto-scheduled-patch-race".into();
+    let hook = startup_test_hooks::install(&request.run_id);
+    let context = context(&state).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let run = run_schedule_job(context, request, None);
+    let patch = async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), hook.reached.notified())
+            .await
+            .expect("schedule must reach the startup gate");
+        let session_id = hook.session_id.lock().unwrap().clone().unwrap();
+        let response = test::call_service(&app, test::TestRequest::patch()
+            .uri(&format!("/api/v1/sessions/{session_id}"))
+            .set_json(serde_json::json!({"model_ref": {"provider": "startup-a", "model": "startup-model"}}))
+            .to_request()).await;
+        hook.resume.notify_one();
+        (session_id, response)
+    };
+    let (run, (session_id, patch)) = tokio::join!(run, patch);
+    assert!(
+        patch.status().is_success(),
+        "PATCH status: {}",
+        patch.status()
+    );
+    let error = run.err().expect("a changed Schedule profile must not run");
+    assert!(
+        error.contains("scheduled startup execution profile changed"),
+        "{error}"
+    );
+    let durable = state
+        .storage
+        .load_session(&session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        durable.model_ref,
+        Some(bamboo_domain::ProviderModelRef::new(
+            "startup-a",
+            "startup-model"
+        ))
+    );
     for provider in providers.values() {
         assert!(provider.models.lock().unwrap().is_empty());
     }
