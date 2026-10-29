@@ -37,6 +37,7 @@ pub struct ResolvedDefaultRunConfig {
     /// The admitted client for the selected primary model. Host consumers must
     /// dispatch this pair together rather than use a mutable default client.
     pub model_provider: Option<Arc<dyn LLMProvider>>,
+    pub model_origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
     pub model_error: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub gold_config: Option<GoldConfig>,
@@ -53,7 +54,21 @@ pub fn resolve_default_run_config(
     config_snapshot: &Config,
     provider_registry: &Arc<ProviderRegistry>,
 ) -> ResolvedDefaultRunConfig {
-    let target = default_chat_model_ref(config_snapshot);
+    let mut target = default_chat_model_ref(config_snapshot);
+    let (model_provider, model_origin, model_error) = match target.as_ref() {
+        Some(requested) => match crate::model_config_helper::try_resolve_primary_model(
+            config_snapshot,
+            provider_registry,
+            requested,
+        ) {
+            Ok(selected) => {
+                target = Some(selected.target);
+                (Some(selected.provider), selected.managed_origin, None)
+            }
+            Err(error) => (None, None, Some(error.to_string())),
+        },
+        None => (None, None, None),
+    };
     let model = target.as_ref().map(|target| target.model.clone());
     let provider_name = Some(
         target
@@ -61,20 +76,6 @@ pub fn resolve_default_run_config(
             .map(|target| target.provider.clone())
             .unwrap_or_else(|| config_snapshot.effective_default_provider().to_string()),
     );
-    let (model_provider, model_error) = match target
-        .as_ref()
-        .map(|target| {
-            crate::model_config_helper::try_resolve_exact_model(
-                config_snapshot,
-                provider_registry,
-                target,
-            )
-        })
-        .transpose()
-    {
-        Ok(target) => (target.map(|target| target.provider), None),
-        Err(error) => (None, Some(error.to_string())),
-    };
     let provider_type = provider_name.as_deref().and_then(|name| {
         crate::model_config_helper::resolve_provider_type(config_snapshot, name, provider_registry)
     });
@@ -88,7 +89,15 @@ pub fn resolve_default_run_config(
         capability_provider_name,
         provider_registry,
     );
-    let reasoning_effort = config_snapshot.get_reasoning_effort();
+    let reasoning_effort = target
+        .as_ref()
+        .and_then(|target| target.reasoning_effort)
+        .or_else(|| {
+            target
+                .as_ref()
+                .and_then(|target| config_snapshot.reasoning_effort_for_key(&target.provider))
+        })
+        .or_else(|| config_snapshot.get_reasoning_effort());
     let base_system_prompt = crate::prompt_defaults::read_global_default_system_prompt_template();
     let workspace_path = config_snapshot
         .get_default_work_area_path()
@@ -103,6 +112,7 @@ pub fn resolve_default_run_config(
     ResolvedDefaultRunConfig {
         model_roster,
         model_provider,
+        model_origin,
         model_error,
         reasoning_effort,
         gold_config: crate::model_config_helper::resolve_gold_config(config_snapshot, None),

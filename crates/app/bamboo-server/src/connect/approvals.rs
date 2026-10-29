@@ -362,6 +362,22 @@ fn map_respond_error(error: bamboo_engine::session_app::errors::RespondError) ->
     }
 }
 
+// Preserve an explicit structured target, even if malformed; an invalid
+// explicit target must never become permission to use the default provider.
+fn connect_session_target(
+    session: &Session,
+) -> Result<Option<bamboo_domain::ProviderModelRef>, String> {
+    if let Some(target) = session.model_ref.as_ref() {
+        if session.model != target.model {
+            return Err("The session model does not match its provider binding".to_string());
+        }
+        return Ok(Some(target.clone()));
+    }
+    Ok(session
+        .provider_name()
+        .map(|provider| bamboo_domain::ProviderModelRef::new(provider, session.model.clone())))
+}
+
 /// Production [`Responder`]: submits through `submit_pending_response`
 /// (`SessionAccess` is implemented directly by `SessionRepository`, no
 /// `AppState` wrapper needed), applies any permission grants the answer
@@ -403,9 +419,14 @@ impl Responder for EngineResponder {
             return Err(ResponderError::PendingQuestionChanged);
         }
         validate_pending_response(pending, &answer).map_err(ResponderError::InvalidResponse)?;
+        let pending_tool_call_id = pending.tool_call_id.clone();
 
-        let port = ConnectResumePort {
+        let mut port = ConnectResumePort {
             ctx: self.ctx.clone(),
+            provider_override: None,
+            model_origin: None,
+            selected_provider_name: None,
+            model_reasoning_effort: None,
         };
         let mut handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
             &port,
@@ -418,6 +439,56 @@ impl Responder for EngineResponder {
                 "the suspending run is still finalizing; answer not consumed".to_string(),
             )
         })?;
+        // The previous runner may have finished while the successor was
+        // being reserved. Re-read its durable session under the same response
+        // guard before selecting the provider and consuming the answer.
+        let current = match inspect_pending_response_guarded(
+            &self.ctx.session_repo,
+            session_id,
+            &response_guard,
+        )
+        .await
+        {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                handoff.abandon().await;
+                return Err(ResponderError::NotFound);
+            }
+            Err(error) => {
+                handoff.abandon().await;
+                return Err(map_respond_error(error));
+            }
+        };
+        let Some(pending) = current.pending_question.as_ref() else {
+            handoff.abandon().await;
+            return Err(ResponderError::NoPendingQuestion);
+        };
+        if pending.tool_call_id != pending_tool_call_id {
+            handoff.abandon().await;
+            return Err(ResponderError::PendingQuestionChanged);
+        }
+        if let Err(error) = validate_pending_response(pending, &answer) {
+            handoff.abandon().await;
+            return Err(ResponderError::InvalidResponse(error));
+        }
+        let current_model = current.model.clone();
+        let terminal_stop =
+            bamboo_engine::session_app::no_progress::is_no_progress_question(&current, pending)
+                && answer == bamboo_engine::session_app::no_progress::STOP_OPTION;
+        let current_target = if terminal_stop {
+            None
+        } else {
+            match connect_session_target(&current) {
+                Ok(target) => target,
+                Err(error) => {
+                    handoff.abandon().await;
+                    return Err(ResponderError::Other(format!(
+                        "{error}; answer not consumed"
+                    )));
+                }
+            }
+        };
+
         // Subscribe and resolve async configuration before the response CAS.
         // This intentionally gives one response a stable config snapshot;
         // concurrent config changes apply to later requests/runs. After the
@@ -425,6 +496,28 @@ impl Responder for EngineResponder {
         // owner synchronously, so callback cancellation cannot strand it.
         let receiver = handoff.subscribe();
         let config_snapshot = self.ctx.config.read().await.clone();
+        if let Some(target) = current_target.as_ref() {
+            match bamboo_engine::model_config_helper::try_resolve_primary_model(
+                &config_snapshot,
+                &self.ctx.provider_registry,
+                target,
+            ) {
+                Ok(selected) => {
+                    port.model_reasoning_effort = selected.target.reasoning_effort.or_else(|| {
+                        config_snapshot.reasoning_effort_for_key(&selected.target.provider)
+                    });
+                    port.selected_provider_name = Some(selected.target.provider);
+                    port.provider_override = Some(selected.provider);
+                    port.model_origin = selected.managed_origin;
+                }
+                Err(error) => {
+                    handoff.abandon().await;
+                    return Err(ResponderError::Other(format!(
+                        "Configured model is unavailable: {error}; answer not consumed"
+                    )));
+                }
+            }
+        }
         let input = RespondInput {
             session_id: session_id.to_string(),
             user_response: answer,
@@ -452,7 +545,7 @@ impl Responder for EngineResponder {
         let submission = submit_pending_response_checked_guarded(
             response_access,
             input,
-            expected_tool_call_id.map(str::to_string),
+            Some(pending_tool_call_id),
             &response_guard,
         )
         .await;
@@ -464,6 +557,13 @@ impl Responder for EngineResponder {
                 return Err(map_respond_error(error));
             }
         };
+
+        let target_changed = !terminal_stop
+            && (session.model != current_model
+                || !matches!(
+                    connect_session_target(&session),
+                    Ok(target) if target == current_target
+                ));
 
         // Mirrors `handlers::agent::respond::handlers::submit`: record any
         // permission grant so the resumed re-execution of the gated tool
@@ -479,14 +579,58 @@ impl Responder for EngineResponder {
             }
         }
 
-        if let Some(event) = plan_mode_transition_event(session_id, plan_mode_transition.as_ref()) {
+        let transition = plan_mode_transition_event(session_id, plan_mode_transition.as_ref());
+        if target_changed || terminal_stop {
+            let stopped_message = terminal_stop.then(|| {
+                session
+                    .messages
+                    .last()
+                    .expect("Stop acknowledgement")
+                    .clone()
+            });
+            let reason = if terminal_stop {
+                "Stopped by the user."
+            } else {
+                "Answer was saved, but the session model or provider changed before resuming"
+            };
+            // Once the answer is committed, a detached owner must publish its
+            // history even if the caller is cancelled while awaiting a receipt.
+            let published = tokio::spawn(publish_recorded_response_and_abandon(
+                self.ctx.clone(),
+                session_id.to_string(),
+                handoff,
+                transition,
+                stopped_message,
+                reason.to_string(),
+            ))
+            .await
+            .unwrap_or(false);
+            let message = if published {
+                reason.to_string()
+            } else {
+                format!("{reason}; response event publication failed")
+            };
+            return Ok(RespondAndResumeOutcome::NotResumed(message));
+        }
+        if let Some(event) = transition {
             handoff.publish_event(event);
         }
 
+        // Resolve all auxiliary fallbacks using the same canonical account as
+        // the selected main provider, including legacy provider-type aliases.
+        let mut route_session = session.clone();
+        if let Some(provider_name) = port.selected_provider_name.as_ref() {
+            let target =
+                bamboo_domain::ProviderModelRef::new(provider_name.as_str(), &session.model);
+            bamboo_engine::session_app::provider_model::persist_model_ref(
+                &mut route_session,
+                &target,
+            );
+        }
         let resume_config = resolve_resume_config_snapshot(
             &config_snapshot,
             &self.ctx.provider_registry,
-            &session,
+            &route_session,
             None,
         );
 
@@ -515,6 +659,70 @@ impl Responder for EngineResponder {
             ),
         }
     }
+}
+
+// A saved response owns its publication until the history barrier is accepted,
+// even when no model can be started or a concurrent target edit blocks resume.
+async fn publish_recorded_response_and_abandon(
+    ctx: ConnectContext,
+    session_id: String,
+    handoff: bamboo_engine::session_app::resume::ResponseResumeHandoff,
+    transition: Option<AgentEvent>,
+    stopped_message: Option<bamboo_agent_core::Message>,
+    reason: String,
+) -> bool {
+    let (reservation, sender) = handoff.into_parts();
+    let root_publication = match (
+        reservation.root_actor_writer(),
+        ctx.root_account_sink.clone(),
+    ) {
+        (Some(owner), Some(sink)) => Some(bamboo_engine::events::RootActorEventPublication::new(
+            ctx.session_repo.storage().clone(),
+            sink,
+            owner,
+        )),
+        (Some(_), None) => {
+            tracing::warn!(%session_id, "Connect response has no Root account sink");
+            reservation.abandon().await;
+            return false;
+        }
+        (None, _) => None,
+    };
+    let (events, _forwarder, mut history) = create_event_forwarder_with_root_actor(
+        session_id.clone(),
+        reservation.run_id().to_string(),
+        sender,
+        ctx.agent_runners.clone(),
+        ctx.account_feed_inbox.clone(),
+        root_publication,
+    );
+    let is_stop = stopped_message.is_some();
+    let mut published = true;
+    if let Some(event) = transition {
+        published = events.send(event).await.is_ok();
+    }
+    if let Some(message) = stopped_message {
+        published = published
+            && events
+                .send(AgentEvent::message_appended(&session_id, &message))
+                .await
+                .is_ok();
+    }
+    let terminal = if is_stop {
+        AgentEvent::Cancelled {
+            message: Some(reason),
+        }
+    } else {
+        AgentEvent::Error { message: reason }
+    };
+    published = published && events.send(terminal).await.is_ok();
+    published = published && history.send_and_wait(&events, session_id.clone()).await;
+    if !published {
+        tracing::warn!(%session_id, "Connect response history publication was not confirmed");
+    }
+    drop(events);
+    reservation.abandon().await;
+    published
 }
 
 fn plan_mode_transition_event(
@@ -565,6 +773,10 @@ fn plan_mode_transition_event(
 /// `AppState`-specific wiring connect deliberately doesn't use).
 struct ConnectResumePort {
     ctx: ConnectContext,
+    provider_override: Option<Arc<dyn bamboo_llm::LLMProvider>>,
+    model_origin: Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+    selected_provider_name: Option<String>,
+    model_reasoning_effort: Option<bamboo_domain::ReasoningEffort>,
 }
 
 fn connect_resume_auxiliary_model_resolver(
@@ -633,6 +845,10 @@ impl ResumeExecutionPort for ConnectResumePort {
     ) -> Result<(), ResumeSpawnRequest> {
         let owner = ConnectResumePort {
             ctx: self.ctx.clone(),
+            provider_override: self.provider_override.clone(),
+            model_origin: self.model_origin.clone(),
+            selected_provider_name: self.selected_provider_name.clone(),
+            model_reasoning_effort: self.model_reasoning_effort,
         };
         tokio::spawn(async move {
             ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
@@ -670,8 +886,9 @@ impl ResumeExecutionPort for ConnectResumePort {
             }
         };
 
+        let provider_override = self.provider_override.clone();
         let model = session.model.clone();
-        let reasoning_effort = session.reasoning_effort;
+        let reasoning_effort = session.reasoning_effort.or(self.model_reasoning_effort);
         let model_roster = ModelRoster {
             model: Some(model),
             provider_name: Some(config.provider_name.clone()),
@@ -698,11 +915,19 @@ impl ResumeExecutionPort for ConnectResumePort {
             self.ctx.provider_registry.clone(),
             config.provider_name.clone(),
         );
-        let resume_agent = Arc::new(
-            self.ctx
-                .agent
-                .with_resume_auxiliary_resolver(resume_resolver),
-        );
+        let mut resume_agent = self
+            .ctx
+            .agent
+            .with_resume_auxiliary_resolver(resume_resolver);
+        if let Some(policy) = crate::app_state::host_gold_origin::managed_selection_resolver(
+            self.ctx.config.clone(),
+            &config.provider_name,
+            provider_override.as_ref(),
+            self.model_origin.as_ref(),
+        ) {
+            resume_agent = resume_agent.with_composed_gold_target_resolver(policy);
+        }
+        let resume_agent = Arc::new(resume_agent);
 
         let (mpsc_tx, _forwarder_handle, mut history_commit_barrier) =
             create_event_forwarder_with_root_actor(
@@ -762,7 +987,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 session,
                 execution_reservation,
                 tools_override: Some(self.ctx.tools.clone()),
-                provider_override: None,
+                provider_override: provider_override.clone(),
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source: "connect_resume".to_string(),
@@ -1145,7 +1370,7 @@ impl ResumeExecutionPort for ConnectResumePort {
                 session,
                 execution_reservation,
                 tools_override: Some(ctx.tools.clone()),
-                provider_override: None,
+                provider_override,
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source: "connect_resume".to_string(),
@@ -1405,6 +1630,329 @@ mod tests {
         }
     }
 
+    // Test the publication boundary directly; the caller supplies this handoff
+    // only after the response transaction has already committed.
+    #[tokio::test]
+    async fn connect_changed_target_publishes_transition_and_history_before_release() {
+        for with_transition in [false, true] {
+            let (_dir, state, _) = crate::model_routing_test_support::state().await;
+            let mut session = Session::new("changed-target", "chat-model");
+            state.session_repo.save(&mut session).await.unwrap();
+            let ctx = supervisor_context(&state);
+            let sender = get_or_create_event_sender(&ctx.session_event_senders, &session.id).await;
+            let mut events = sender.subscribe();
+            let mut account_events = state.account_sink.subscribe();
+            let port = ConnectResumePort {
+                ctx: ctx.clone(),
+                provider_override: None,
+                model_origin: None,
+                selected_provider_name: None,
+                model_reasoning_effort: None,
+            };
+            let handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
+                &port,
+                &session.id,
+                std::time::Duration::from_secs(5),
+            )
+            .await
+            .expect("reserve response owner");
+            let transition = with_transition.then(|| AgentEvent::PlanModeExited {
+                session_id: session.id.clone(),
+                approved: true,
+                restored_mode: "default".into(),
+                plan: None,
+            });
+            assert!(
+                publish_recorded_response_and_abandon(
+                    ctx,
+                    session.id.clone(),
+                    handoff,
+                    transition,
+                    None,
+                    "The target changed".into(),
+                )
+                .await
+            );
+            let mut saw_transition = false;
+            let mut saw_error = false;
+            loop {
+                let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                    .await
+                    .expect("session history barrier")
+                    .unwrap();
+                match event {
+                    AgentEvent::PlanModeExited { .. } => saw_transition = true,
+                    AgentEvent::Error { message } if message == "The target changed" => {
+                        saw_error = true
+                    }
+                    AgentEvent::SessionHistoryCommitted { .. } => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(saw_transition, with_transition);
+            assert!(saw_error);
+            let mut account_transition = false;
+            loop {
+                let change =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), account_events.recv())
+                        .await
+                        .expect("account history barrier")
+                        .unwrap();
+                match &change.event {
+                    AgentEvent::PlanModeExited { .. } => account_transition = true,
+                    AgentEvent::SessionHistoryCommitted { session_id }
+                        if session_id == &session.id =>
+                    {
+                        break
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(account_transition, with_transition);
+            state.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_resume_invalid_or_inconsistent_target_keeps_the_question() {
+        for mismatch in [false, true] {
+            let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+            let mut session = Session::new("bound-invalid", "chat-model");
+            let target = if mismatch {
+                bamboo_domain::ProviderModelRef::new("chat-b", "different-model")
+            } else {
+                bamboo_domain::ProviderModelRef::new("missing-account", "chat-model")
+            };
+            session.model_ref = Some(target);
+            session.add_message(Message::user("synthetic task"));
+            session.set_pending_question(
+                "call-1".into(),
+                "conclusion_with_options".into(),
+                "Continue?".into(),
+                vec!["Continue".into()],
+                false,
+            );
+            state.session_repo.save(&mut session).await.unwrap();
+            let responder = EngineResponder::new(supervisor_context(&state));
+            let outcome = responder
+                .respond_and_resume(&session.id, Some("call-1"), "Continue".into())
+                .await;
+            assert!(
+                matches!(outcome, Err(ResponderError::Other(ref message)) if message.contains("answer not consumed"))
+            );
+            let saved = state.session_repo.load_merged(&session.id).await.unwrap();
+            assert_eq!(
+                saved
+                    .pending_question
+                    .as_ref()
+                    .map(|ask| ask.tool_call_id.as_str()),
+                Some("call-1")
+            );
+            for provider in providers.values() {
+                assert!(provider.models.lock().unwrap().is_empty());
+            }
+            state.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_resume_uses_bound_provider_and_legacy_role_effort() {
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let mut session = Session::new("bound-resume", "chat-model");
+        session.model_ref = Some(
+            bamboo_domain::ProviderModelRef::new("chat-b", "chat-model")
+                .with_reasoning_effort(bamboo_domain::ReasoningEffort::High),
+        );
+        session.set_provider_name("chat-b");
+        session.add_message(Message::user("synthetic task"));
+        session.set_pending_question(
+            "call-1".into(),
+            "conclusion_with_options".into(),
+            "Continue?".into(),
+            vec!["Continue".into()],
+            false,
+        );
+        state.session_repo.save(&mut session).await.unwrap();
+        let responder = EngineResponder::new(supervisor_context(&state));
+        let outcome = responder
+            .respond_and_resume(&session.id, Some("call-1"), "Continue".into())
+            .await;
+        assert!(matches!(outcome, Ok(RespondAndResumeOutcome::Resumed(_))));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if !providers["chat-b"].models.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the selected provider must receive the resumed main request");
+        assert_eq!(
+            *providers["chat-b"].models.lock().unwrap(),
+            vec!["chat-model"]
+        );
+        assert_eq!(
+            providers["chat-b"]
+                .efforts
+                .lock()
+                .unwrap()
+                .first()
+                .copied()
+                .flatten(),
+            Some(bamboo_domain::ReasoningEffort::High)
+        );
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn connect_progress_stop_does_not_require_a_working_model() {
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let mut session = Session::new("bound-stop", "chat-model");
+        session.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+            "missing-account",
+            "chat-model",
+        ));
+        let mut message = Message::assistant("Paused", None);
+        message.metadata = Some(serde_json::json!({"runtime_kind":"observation_progress_pause"}));
+        let question_id = message.id.clone();
+        session.add_message(message);
+        session.set_pending_question_with_source(
+            question_id.clone(),
+            "observation_progress".into(),
+            "Paused".into(),
+            vec!["Continue".into(), "Stop".into()],
+            false,
+            bamboo_agent_core::PendingQuestionSource::AgenticClarification,
+        );
+        state.session_repo.save(&mut session).await.unwrap();
+        let sender = get_or_create_event_sender(&state.session_event_senders, &session.id).await;
+        let mut events = sender.subscribe();
+        let responder = EngineResponder::new(supervisor_context(&state));
+        let outcome = responder
+            .respond_and_resume(&session.id, Some(&question_id), "Stop".into())
+            .await;
+        assert!(matches!(
+            outcome,
+            Ok(RespondAndResumeOutcome::NotResumed(message)) if message == "Stopped by the user."
+        ));
+        let mut saw_message = false;
+        let mut saw_cancelled = false;
+        loop {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+                .await
+                .expect("Stop history publication must complete")
+                .unwrap();
+            match event {
+                AgentEvent::MessageAppended { content, .. }
+                    if content.starts_with("Stopped this run.") =>
+                {
+                    saw_message = true;
+                }
+                AgentEvent::Cancelled { .. } => saw_cancelled = true,
+                AgentEvent::SessionHistoryCommitted { .. } => break,
+                _ => {}
+            }
+        }
+        assert!(saw_message && saw_cancelled);
+        let saved = state.session_repo.load_merged(&session.id).await.unwrap();
+        assert!(saved.pending_question.is_none());
+        for provider in providers.values() {
+            assert!(provider.models.lock().unwrap().is_empty());
+        }
+        state.shutdown().await;
+    }
+
+    #[derive(Default)]
+    struct ResumePairProvider {
+        models: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl bamboo_llm::LLMProvider for ResumePairProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::ToolSchema],
+            _: Option<u32>,
+            model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.models.lock().unwrap().push(model.to_string());
+            Ok(Box::pin(futures::stream::iter(vec![
+                Ok(bamboo_llm::LLMChunk::Token("done".into())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_permission_replay_resumes_with_selected_provider() {
+        use crate::app_state::resume_adapter::supervisor_tests::Fixture;
+        let fixture = Box::pin(Fixture::pending()).await;
+        fixture.prepare_workspace_catalog().await;
+        fixture.formal_approve().await;
+        let provider = Arc::new(ResumePairProvider::default());
+        // The synthetic client is not created by the Host factory. Use an
+        // unmanaged registry instead of claiming it has a managed binding.
+        fixture
+            .state
+            .provider_registry
+            .replace_with(bamboo_llm::ProviderRegistry::new(
+                std::collections::HashMap::from([(
+                    "chat-b".into(),
+                    provider.clone() as Arc<dyn bamboo_llm::LLMProvider>,
+                )]),
+                "chat-b".into(),
+            ));
+        fixture
+            .state
+            .config
+            .write()
+            .await
+            .provider_instances
+            .insert(
+                "chat-b".into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "enabled":true, "model":"test-model"
+                }))
+                .unwrap(),
+            );
+        let mut session = fixture.reload().await;
+        let target = bamboo_domain::ProviderModelRef::new("chat-b", "test-model");
+        bamboo_engine::session_app::provider_model::persist_model_ref(&mut session, &target);
+        fixture.state.session_repo.save(&mut session).await.unwrap();
+        let ctx = supervisor_context(&fixture.state);
+        let snapshot = ctx.config.read().await.clone();
+        let selected = bamboo_engine::model_config_helper::try_resolve_primary_model(
+            &snapshot,
+            &ctx.provider_registry,
+            &target,
+        )
+        .unwrap();
+        let config =
+            resolve_resume_config_snapshot(&snapshot, &ctx.provider_registry, &session, None);
+        let port = ConnectResumePort {
+            ctx,
+            provider_override: Some(selected.provider),
+            model_origin: selected.managed_origin,
+            selected_provider_name: Some(selected.target.provider),
+            model_reasoning_effort: None,
+        };
+        let outcome = bamboo_engine::session_app::resume::resume_session_execution(
+            &port,
+            &session.id,
+            config,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            bamboo_engine::session_app::types::ResumeOutcome::Started { .. }
+        ));
+        fixture.settled(1, false).await;
+        assert_eq!(*provider.models.lock().unwrap(), vec!["test-model"]);
+    }
+
     #[tokio::test]
     async fn connect_supervisor_typed_replay_restores_identity_and_rejects_corruption() {
         use crate::app_state::resume_adapter::supervisor_tests::Fixture;
@@ -1424,7 +1972,13 @@ mod tests {
                 None,
             );
             let outcome = bamboo_engine::session_app::resume::resume_session_execution(
-                &ConnectResumePort { ctx },
+                &ConnectResumePort {
+                    ctx,
+                    provider_override: None,
+                    model_origin: None,
+                    selected_provider_name: None,
+                    model_reasoning_effort: None,
+                },
                 &session.id,
                 config,
             )
@@ -1453,7 +2007,13 @@ mod tests {
             None,
         );
         let outcome = bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
-            &ConnectResumePort { ctx },
+            &ConnectResumePort {
+                ctx,
+                provider_override: None,
+                model_origin: None,
+                selected_provider_name: None,
+                model_reasoning_effort: None,
+            },
             &session.id,
             session.clone(),
             config,

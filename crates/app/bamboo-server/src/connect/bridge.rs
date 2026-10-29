@@ -225,6 +225,43 @@ pub(super) fn connect_auxiliary_model_resolver(
     )
 }
 
+fn bind_connect_session_to_run(
+    session: &mut Session,
+    resolved: &ResolvedConnectRunConfig,
+) -> Result<(), String> {
+    let provider = resolved
+        .model_roster
+        .provider_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Connect provider is unavailable".to_string())?;
+    let model = resolved
+        .model_roster
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Connect model is unavailable".to_string())?;
+    let target = bamboo_domain::ProviderModelRef::new(provider, model);
+    bamboo_engine::session_app::provider_model::persist_model_ref(session, &target);
+    session.reasoning_effort = resolved.reasoning_effort;
+    if let Some(effort) = resolved.reasoning_effort {
+        session.set_reasoning_effort_meta(effort.as_str());
+    } else {
+        session.clear_reasoning_effort_meta();
+    }
+    Ok(())
+}
+
+fn connect_session_matches_run(session: &Session, resolved: &ResolvedConnectRunConfig) -> bool {
+    session.model_ref.as_ref().is_some_and(|target| {
+        resolved.model_roster.provider_name.as_deref() == Some(target.provider.as_str())
+            && resolved.model_roster.model.as_deref() == Some(target.model.as_str())
+            && session.provider_name().as_deref() == Some(target.provider.as_str())
+            && session.model == target.model
+            && session.reasoning_effort == resolved.reasoning_effort
+    })
+}
+
 /// Builds a fresh session for a connect chat key. Mirrors
 /// `schedule_app::session_factory::create_schedule_session`.
 ///
@@ -272,6 +309,7 @@ fn create_connect_session(
             "connect",
         );
     }
+    session.reasoning_effort = reasoning_effort;
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());
     }
@@ -857,11 +895,15 @@ impl ConnectBridge {
         // Root activation validates durable birth before owning the first User
         // turn. Publish the inert identity before registering its chat mapping.
         let mut session = session;
+        bind_connect_session_to_run(&mut session, resolved)?;
         self.ctx
             .session_repo
             .save(&mut session)
             .await
             .map_err(|error| format!("Unable to persist the new Connect session: {error}"))?;
+        if !connect_session_matches_run(&session, resolved) {
+            return Err("Connect session model changed while it was saved".to_string());
+        }
         self.set_session_id_for_key(key, &session.id).await;
         Ok(session)
     }
@@ -970,6 +1012,11 @@ impl ConnectBridge {
 
         // Only the exact shared runner/router owner may publish a new prompt or
         // mutate process-global permission workspace state.
+        if let Err(error) = bind_connect_session_to_run(&mut session, &resolved) {
+            execution_reservation.abandon().await;
+            reply_text(&platform, reply_ctx, &error).await;
+            return;
+        }
         session.add_message(Message::user(text.to_string()));
         if let Some(config) = self.ctx.permission_checker.permission_config() {
             config.set_session_workspace(session_id.clone(), session.workspace.clone());
@@ -991,8 +1038,25 @@ impl ConnectBridge {
                 .await;
                 return;
             }
-        } else {
-            self.ctx.session_repo.save_and_cache(&mut session).await;
+        } else if let Err(error) = self.ctx.session_repo.save(&mut session).await {
+            execution_reservation.abandon().await;
+            reply_text(
+                &platform,
+                reply_ctx,
+                format!("Unable to persist this turn: {error}"),
+            )
+            .await;
+            return;
+        }
+        if !connect_session_matches_run(&session, &resolved) {
+            execution_reservation.abandon().await;
+            reply_text(
+                &platform,
+                reply_ctx,
+                "The turn was saved, but its model or provider changed before execution.",
+            )
+            .await;
+            return;
         }
 
         self.set_cancel_token(key, execution_reservation.cancel_token().clone())
@@ -1014,8 +1078,21 @@ impl ConnectBridge {
             &resolved.model_roster,
         );
 
+        let agent = match crate::app_state::host_gold_origin::managed_selection_resolver(
+            self.ctx.config.clone(),
+            resolved
+                .model_roster
+                .provider_name
+                .as_deref()
+                .unwrap_or_default(),
+            resolved.model_provider.as_ref(),
+            resolved.model_origin.as_ref(),
+        ) {
+            Some(policy) => Arc::new(self.ctx.agent.with_composed_gold_target_resolver(policy)),
+            None => self.ctx.agent.clone(),
+        };
         spawn_session_execution(SessionExecutionArgs {
-            agent: self.ctx.agent.clone(),
+            agent,
             session_id: session_id.clone(),
             session,
             execution_reservation,
@@ -1654,9 +1731,10 @@ mod tests {
         }
         // Keep the original terminal-auth fixture while exercising the new
         // explicit admission path; no real keyed provider is constructed.
-        state
-            .provider_registry
-            .insert("openai".into(), state.provider.read().await.clone());
+        state.provider_registry.replace_with(ProviderRegistry::new(
+            HashMap::from([("openai".into(), state.provider.read().await.clone())]),
+            "openai".into(),
+        ));
         state.provider_registry.set_runtime_models(HashMap::from([(
             "openai".into(),
             vec!["gpt-4o-mini".into()],
@@ -1737,6 +1815,58 @@ mod tests {
             vec!["chat-model"]
         );
         assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        let key = "fake:routing-chat:routing-user";
+        let id = bridge
+            .session_id_for_key(key)
+            .await
+            .expect("Connect session");
+        let saved = state
+            .session_repo
+            .load_merged(&id)
+            .await
+            .expect("saved Connect session");
+        assert_eq!(
+            saved.model_ref,
+            Some(bamboo_domain::ProviderModelRef::new("chat-b", "chat-model"))
+        );
+
+        state.config.write().await.defaults.as_mut().unwrap().chat =
+            bamboo_domain::ProviderModelRef::new("fast-c", "cheap-model")
+                .with_reasoning_effort(bamboo_domain::ReasoningEffort::High);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.run_prompt(key, platform_trait.clone(), &reply, "Synthetic follow-up"),
+        )
+        .await
+        .expect("follow-up must settle");
+        let saved = state
+            .session_repo
+            .load_merged(&id)
+            .await
+            .expect("updated Connect session");
+        assert_eq!(
+            saved.model_ref,
+            Some(bamboo_domain::ProviderModelRef::new(
+                "fast-c",
+                "cheap-model"
+            ))
+        );
+        assert_eq!(
+            saved.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::High)
+        );
+        assert_eq!(saved.reasoning_effort_meta().as_deref(), Some("high"));
+        assert_eq!(
+            providers["fast-c"]
+                .efforts
+                .lock()
+                .unwrap()
+                .last()
+                .copied()
+                .flatten(),
+            Some(bamboo_domain::ReasoningEffort::High)
+        );
+
         state.config.write().await.defaults.as_mut().unwrap().chat =
             bamboo_domain::ProviderModelRef::new("unknown-account", "unadmitted-chat");
         tokio::time::timeout(
@@ -1752,7 +1882,10 @@ mod tests {
         .expect("invalid Connect route must settle before dispatch");
         assert_eq!(providers["chat-b"].models.lock().unwrap().len(), 1);
         assert!(providers["startup-a"].models.lock().unwrap().is_empty());
-        assert!(providers["fast-c"].models.lock().unwrap().is_empty());
+        assert_eq!(
+            *providers["fast-c"].models.lock().unwrap(),
+            vec!["cheap-model"]
+        );
     }
 
     fn key_for(chat_id: &str, user_id: &str) -> String {

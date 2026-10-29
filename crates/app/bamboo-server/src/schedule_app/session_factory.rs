@@ -82,6 +82,7 @@ pub fn create_schedule_session(
             "schedule",
         );
     }
+    session.reasoning_effort = reasoning_effort;
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());
     }
