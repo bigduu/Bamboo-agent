@@ -188,6 +188,9 @@ struct Fixture {
     followup_targets: Mutex<HashMap<String, Value>>,
 }
 
+#[path = "supervisor_exact_cancel_tests.rs"]
+mod exact_cancel_tests;
+
 impl Fixture {
     async fn new() -> Self {
         let home = tempfile::tempdir().unwrap();

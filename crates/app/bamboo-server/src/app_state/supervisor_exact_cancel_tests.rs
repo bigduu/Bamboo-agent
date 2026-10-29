@@ -1,0 +1,240 @@
+//! Exact-Root cancellation through the real Supervisor tool, store and router.
+//! The controlled runners are in-memory fixtures, not native provider runs.
+
+use super::*;
+use std::sync::atomic::Ordering;
+
+use bamboo_domain::SupervisorCurrentUserTarget;
+use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+
+async fn current_target(fixture: &Fixture) -> SupervisorCurrentUserTarget {
+    fixture
+        .state
+        .storage
+        .inspect_supervisor_current_user_target(&fixture.reference, TARGET)
+        .await
+        .unwrap()
+}
+
+fn grant_cancel(fixture: &Fixture) {
+    fixture
+        .state
+        .permission_checker
+        .permission_config()
+        .unwrap()
+        .grant_typed_scoped_session_permission(
+            &fixture.reference.session_id,
+            PermissionType::ExecuteCommand,
+            PermissionMatcher {
+                id: "fixture-exact-cancel".into(),
+                kind: PermissionMatcherKind::ExactResource,
+                value: format!("session_control cancel {TARGET}"),
+            },
+        )
+        .unwrap();
+}
+
+async fn invoke(fixture: &Fixture, arguments: Value) -> Result<Value, ToolError> {
+    let supervisor = fixture
+        .state
+        .storage
+        .load_execution_admission_snapshot(&fixture.reference.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let call = ToolCall {
+        id: "fixture-exact-cancel-call".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "session_control".into(),
+            arguments: arguments.to_string(),
+        },
+    };
+    let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.session_id = Some(&supervisor.id);
+    ctx.root_session_id = Some(&supervisor.id);
+    ctx = ctx.with_executing_supervisor(
+        ExecutingSupervisorObservation::capture_from_executing_session(&supervisor),
+    );
+    let outcome = bamboo_agent_core::tools::with_executing_session_caller(
+        Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+            &supervisor,
+        ))),
+        fixture
+            .state
+            .tools_for(ToolSurface::Root)
+            .execute_with_context_outcome(&call, ctx),
+    )
+    .await?;
+    let ToolOutcome::Completed(result) = outcome else {
+        panic!("exact cancellation must return its own synchronous observation");
+    };
+    assert!(result.success, "{}", result.result);
+    Ok(serde_json::from_str(&result.result).unwrap())
+}
+
+fn args(action: &str, target: &SupervisorCurrentUserTarget, run: Option<&str>) -> Value {
+    let mut value = json!({"action": action, "target_session_id": TARGET, "target_ref": target});
+    if let Some(run) = run {
+        value["expected_run_id"] = json!(run);
+    }
+    value
+}
+
+#[actix_web::test]
+async fn supervisor_exact_cancel_reports_request_then_finalization_and_fences_successor() {
+    let fixture = Box::pin(Fixture::new()).await;
+    grant_cancel(&fixture);
+    let target = current_target(&fixture).await;
+    let before = serde_json::to_value(fixture.reload().await).unwrap();
+    let inbox_before = fixture.state.session_inbox.inspect(TARGET).await.unwrap();
+
+    let mut old = crate::app_state::AgentRunner::new();
+    old.status = crate::app_state::AgentStatus::Running;
+    let old_run = old.run_id.clone();
+    let old_token = old.cancel_token.clone();
+    let old_owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &old_run)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), old);
+
+    let observed = invoke(&fixture, args("observe_run", &target, None))
+        .await
+        .unwrap();
+    assert_eq!(observed["run_id"], old_run);
+    let requested = invoke(&fixture, args("cancel", &target, Some(&old_run)))
+        .await
+        .unwrap();
+    assert_eq!(requested["status"], "cancel_requested");
+    assert_eq!(requested["run_id"], old_run);
+    assert_eq!(requested["completion_verified"], false);
+    assert!(old_token.is_cancelled());
+    {
+        let runners = fixture.state.agent_runners.read().await;
+        let old = runners.get(TARGET).unwrap();
+        assert!(matches!(old.status, crate::app_state::AgentStatus::Running));
+        assert!(old.completed_at.is_none());
+    }
+    assert_eq!(
+        fixture.state.session_inbox.inspect(TARGET).await.unwrap(),
+        inbox_before
+    );
+    assert_eq!(
+        serde_json::to_value(fixture.reload().await).unwrap(),
+        before
+    );
+
+    let result: Result<(), bamboo_agent_core::AgentError> =
+        Err(bamboo_agent_core::AgentError::Cancelled);
+    assert!(
+        bamboo_engine::execution::finalize_runner_exact(
+            &fixture.state.agent_runners,
+            TARGET,
+            &old_run,
+            &result,
+        )
+        .await
+    );
+    old_owner.finish(0).await.unwrap();
+    let finished = invoke(&fixture, args("cancel", &target, Some(&old_run)))
+        .await
+        .unwrap();
+    assert_eq!(finished["status"], "already_finished");
+
+    let mut successor = crate::app_state::AgentRunner::new();
+    successor.status = crate::app_state::AgentStatus::Running;
+    let successor_id = successor.run_id.clone();
+    let successor_token = successor.cancel_token.clone();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), successor);
+    let successor_owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &successor_id)
+        .await
+        .unwrap();
+    let stale = invoke(&fixture, args("cancel", &target, Some(&old_run)))
+        .await
+        .unwrap();
+    assert_eq!(stale["status"], "run_conflict");
+    assert!(!successor_token.is_cancelled());
+    assert_eq!(
+        fixture.state.session_inbox.inspect(TARGET).await.unwrap(),
+        inbox_before
+    );
+    assert_eq!(
+        serde_json::to_value(fixture.reload().await).unwrap(),
+        before
+    );
+    let successor_result: Result<(), bamboo_agent_core::AgentError> = Ok(());
+    assert!(
+        bamboo_engine::execution::finalize_runner_exact(
+            &fixture.state.agent_runners,
+            TARGET,
+            &successor_id,
+            &successor_result,
+        )
+        .await
+    );
+    successor_owner.finish(0).await.unwrap();
+    fixture.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn supervisor_exact_cancel_rejects_stale_target_and_invalid_run_without_effect() {
+    let fixture = Box::pin(Fixture::new()).await;
+    grant_cancel(&fixture);
+    let target = current_target(&fixture).await;
+    let mut runner = crate::app_state::AgentRunner::new();
+    runner.status = crate::app_state::AgentStatus::Running;
+    let run_id = runner.run_id.clone();
+    let token = runner.cancel_token.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &run_id)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), runner);
+    let inbox_before = fixture.state.session_inbox.inspect(TARGET).await.unwrap();
+
+    let mut stale = target.clone();
+    stale.created_at += chrono::Duration::seconds(1);
+    assert!(invoke(&fixture, args("cancel", &stale, Some(&run_id)))
+        .await
+        .is_err());
+    assert!(
+        invoke(&fixture, args("cancel", &target, Some("invalid run")))
+            .await
+            .is_err()
+    );
+    assert!(invoke(&fixture, args("cancel", &target, None))
+        .await
+        .is_err());
+    assert!(!token.is_cancelled());
+    assert_eq!(
+        fixture.state.session_inbox.inspect(TARGET).await.unwrap(),
+        inbox_before
+    );
+    assert_eq!(fixture.probe.requests.lock().unwrap().len(), 0);
+    assert!(!fixture.probe.blocked.load(Ordering::SeqCst));
+    owner.abandon().await;
+    fixture.state.shutdown().await;
+}
