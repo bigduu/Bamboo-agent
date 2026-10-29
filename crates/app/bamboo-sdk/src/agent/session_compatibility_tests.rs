@@ -929,3 +929,191 @@ async fn session_version_sdk_race_other_admission_errors_keep_original_append_se
         assert_eq!(fixture.probe.provider_calls.load(Ordering::SeqCst), 0);
     }
 }
+
+/// Switch the actual live configuration inside the first durable admission
+/// read. Both SDK public entry points have already checked their route before
+/// entering this persistence call; no sleep or private execution bypass is used.
+struct RoutingOriginRacePersistence {
+    inner: Arc<dyn RuntimeSessionPersistence>,
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    legacy_base_url: String,
+    switch_source: bool,
+    reads: AtomicUsize,
+}
+
+#[async_trait]
+impl RuntimeSessionPersistence for RoutingOriginRacePersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.inner.save_runtime_session(session).await
+    }
+
+    async fn load_runtime_session(&self, id: &str) -> std::io::Result<Option<Session>> {
+        self.inner.load_runtime_session(id).await
+    }
+
+    async fn load_runtime_admission_snapshot(&self, id: &str) -> std::io::Result<Option<Session>> {
+        if self.reads.fetch_add(1, Ordering::SeqCst) == 0 && self.switch_source {
+            let mut live = self.config.write().await;
+            assert!(live.provider_instances.remove("openai").is_some());
+            live.default_provider_instance = None;
+            live.providers_mut().openai = Some(
+                serde_json::from_value(json!({
+                    "api_key": "synthetic-b", "base_url": self.legacy_base_url.as_str(),
+                    "model": "main-a", "runtime_models": ["main-a"]
+                }))
+                .unwrap(),
+            );
+        }
+        self.inner.load_runtime_admission_snapshot(id).await
+    }
+}
+
+/// Only listens on loopback and counts accepted connections. A connection from
+/// the native SDK client is sufficient to prove old-account dispatch. The SSE
+/// reply lets a buggy request complete rather than waiting for network timeout.
+async fn routing_review_loopback_endpoint(
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let task = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            observed.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 8192];
+            let _ = socket.read(&mut request).await;
+            let body = concat!(
+                "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",",
+                "\"created\":0,\"model\":\"main-a\",\"choices\":[{\"index\":0,",
+                "\"delta\":{\"content\":\"Synthetic completion\"},\"finish_reason\":null}]}\n\n",
+                "data: [DONE]\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(), body
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    (format!("http://{address}"), calls, task)
+}
+
+#[tokio::test]
+async fn sdk_public_entries_do_not_dispatch_native_client_after_admission_source_race() {
+    for entry in ["run_session", "execute"] {
+        // The unswitched control establishes that this exact fixture actually
+        // reaches A; an unrelated startup failure cannot count as race coverage.
+        for switch_source in [false, true] {
+            let (old_url, old_calls, old_server) = routing_review_loopback_endpoint().await;
+            let (new_url, new_calls, new_server) = routing_review_loopback_endpoint().await;
+            let mut config = bamboo_llm::Config::default();
+            config.provider = "openai".into();
+            config.default_provider_instance = Some("openai".into());
+            config.features.provider_model_ref = true;
+            config.defaults = Some(
+                serde_json::from_value(json!({
+                    "chat": {"provider": "openai", "model": "main-a"}
+                }))
+                .unwrap(),
+            );
+            *config.memory_mut() = Some(
+                serde_json::from_value(json!({
+                    "auto_dream_enabled": false, "project_prompt_injection": false,
+                    "relevant_recall": false, "relevant_recall_rerank": false,
+                    "project_first_dream": false, "ledger_agenda_injection": false
+                }))
+                .unwrap(),
+            );
+            config.provider_instances.insert(
+                "openai".into(),
+                serde_json::from_value(json!({
+                    "provider_type": "openai", "enabled": true,
+                    "api_key": "synthetic-a", "base_url": old_url,
+                    "model": "main-a", "runtime_models": ["main-a"]
+                }))
+                .unwrap(),
+            );
+            let shared = Arc::new(tokio::sync::RwLock::new(config));
+            let home = tempfile::tempdir().unwrap();
+            let mut agent = Agent::builder()
+                .config(shared.clone())
+                .tools(std::iter::empty())
+                .with_defaults_for_data_dir(home.path().to_path_buf())
+                .await
+                .unwrap()
+                .build()
+                .unwrap();
+            assert_eq!(old_calls.load(Ordering::SeqCst), 0);
+            let race = Arc::new(RoutingOriginRacePersistence {
+                inner: agent.persistence().clone(),
+                config: shared,
+                legacy_base_url: new_url,
+                switch_source,
+                reads: AtomicUsize::new(0),
+            });
+            agent.inner = agent.inner.with_execution_persistence(race.clone());
+
+            let mut session = Session::new(format!("synthetic-routing-race-{entry}"), "main-a");
+            session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
+            session.add_message(Message::user("Synthetic routing race"));
+            let outcome = if entry == "run_session" {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    agent.run_session(&mut session),
+                )
+                .await
+                .expect("public run_session fixture must finish")
+            } else {
+                let (tx, mut rx) = mpsc::channel(256);
+                let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+                let request = ExecuteRequestBuilder::new(
+                    "Synthetic routing race",
+                    tx,
+                    CancellationToken::new(),
+                )
+                .model("main-a")
+                .provider_name("openai")
+                .app_data_dir(home.path().to_path_buf())
+                .build();
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    agent.execute(&mut session, request),
+                )
+                .await
+                .expect("public execute fixture must finish");
+                drain.abort();
+                result
+            };
+            let old = old_calls.load(Ordering::SeqCst);
+            let new = new_calls.load(Ordering::SeqCst);
+            old_server.abort();
+            new_server.abort();
+            assert!(race.reads.load(Ordering::SeqCst) > 0, "race did not fire");
+            if !switch_source {
+                assert!(outcome.is_ok(), "{entry} control failed: {outcome:?}");
+                assert!(
+                    old > 0 && new == 0,
+                    "{entry} control did not reach A: A={old}, B={new}"
+                );
+                continue;
+            }
+            assert_eq!(
+            old, 0,
+            "{entry} dispatched to removed instance A after legacy B took the same key; B={new}, outcome={outcome:?}"
+        );
+            let error = outcome.expect_err("a changed native origin must be refused");
+            assert!(
+                error.to_string().contains("sdk_provider_binding:"),
+                "{entry}: {error}"
+            );
+            assert_eq!(
+                new, 0,
+                "the guard must not dispatch to the replacement source"
+            );
+        }
+    }
+}
