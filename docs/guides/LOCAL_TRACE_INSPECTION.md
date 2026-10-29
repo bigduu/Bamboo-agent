@@ -34,7 +34,9 @@ Gemini reports prompt and cached content separately from candidate and thought
 tokens. Its snapshot combines candidate and thought tokens once for output
 only when both are present; otherwise output remains unknown. When reported,
 tool-use prompt tokens are included in input. The current adapter sends
-client-side function declarations, not Google-managed server tools. These
+client-side function declarations, not Google-managed server tools. If a later
+Gemini usage frame explicitly contains a malformed field, an earlier value for
+that field can remain in the snapshot. These
 rules follow the [Anthropic prompt-cache fields](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
 and [Gemini usage metadata](https://ai.google.dev/api/generate-content).
 Legacy session counters may have different availability; do not infer a
@@ -133,9 +135,10 @@ the persisted session ID. A run ID outside the identifier policy remains
 unknown (`null`); the session reference is not substituted for a run ID.
 Dropping an in-flight call emits a best-effort cancelled/error observation with
 unknown usage. Internal transport retries share a call ID; a new outer dispatch
-gets a new ID. If a stream fails after reporting usage, its error observation
-retains the reported counters. Repeated cumulative snapshots update known
-counters instead of adding them. Hook execution is best effort: a process-wide
+gets a new ID. A provider stream error can retain previously observed counters;
+timeouts, cancellation or protocol-specific handling can leave them unknown.
+Repeated cumulative snapshots update known counters instead of adding them.
+Hook execution is best effort: a process-wide
 maximum of 32 queued/running observers and a two-second deadline can drop work.
 Return values never control the model call. Up to four usage-plugin registry
 and file reads, manifest parsing and validation, path resolutions, bundle hash
