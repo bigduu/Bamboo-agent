@@ -5,7 +5,8 @@ use bamboo_domain::Session;
 
 use super::errors::ExecutePreparationError;
 use super::provider_model::{
-    persist_legacy_model_provider, persist_model_ref, session_effective_model_ref,
+    persist_legacy_model_provider, persist_model_ref, schedule_bound_model_ref,
+    session_effective_model_ref,
 };
 use super::repository::SessionAccess;
 use super::types::{
@@ -81,16 +82,26 @@ pub async fn prepare_execute(
         });
     }
 
+    let scheduled_binding = if session.metadata.contains_key("created_by_schedule_id") {
+        Some(
+            schedule_bound_model_ref(&session)
+                .map_err(ExecutePreparationError::InvalidModelReference)?,
+        )
+    } else {
+        None
+    };
+
+    // Capture before resolving or mutating the candidate. The storage layer
+    // compares this profile under the physical writer guard before startup.
+    let scheduled_startup_expected = scheduled_binding
+        .as_ref()
+        .map(|_| Box::new(session.clone()));
+
     // ---- Resolve model cascade ----
     // Flag ON (new): session.model_ref → request.model_ref → config.default_model_ref
     // Flag OFF (old): session.model → config.default_model → request.model
-    let (effective_model_ref, effective_model, model_source) = if config.provider_model_ref_enabled
-    {
-        resolve_model_ref_cascade(&session, &input, &config)
-    } else {
-        let (effective_model, model_source) = resolve_model_cascade(&session, &input, &config);
-        (None, effective_model, model_source)
-    };
+    let (effective_model_ref, effective_model, model_source) =
+        resolve_execution_model(&session, &input, &config)?;
 
     let Some(effective_model) = effective_model else {
         return Ok(ExecutePreparationOutcome::ModelRequired);
@@ -172,7 +183,35 @@ pub async fn prepare_execute(
         model_source,
         reasoning_source: reasoning_effort_source,
         is_child_session,
+        scheduled_binding,
+        scheduled_startup_expected,
     })
+}
+
+fn resolve_execution_model(
+    session: &Session,
+    input: &ExecuteInput,
+    config: &ExecutionConfigSnapshot,
+) -> Result<
+    (
+        Option<bamboo_domain::ProviderModelRef>,
+        Option<String>,
+        &'static str,
+    ),
+    ExecutePreparationError,
+> {
+    if let Some(target) =
+        schedule_bound_model_ref(session).map_err(ExecutePreparationError::InvalidModelReference)?
+    {
+        let model = Some(target.model.clone());
+        return Ok((Some(target), model, "session"));
+    }
+    if config.provider_model_ref_enabled {
+        Ok(resolve_model_ref_cascade(session, input, config))
+    } else {
+        let (model, source) = resolve_model_cascade(session, input, config);
+        Ok((None, model, source))
+    }
 }
 
 /// Old-path model resolution: session.model → config.default_model → request.model

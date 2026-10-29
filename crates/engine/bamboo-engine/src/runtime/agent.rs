@@ -401,6 +401,34 @@ impl Agent {
         Agent { runtime }
     }
 
+    /// Return only the Host's still-current explicitly injected provider.
+    #[doc(hidden)]
+    pub fn legacy_injected_provider_snapshot(
+        &self,
+    ) -> Result<Option<Arc<dyn bamboo_llm::LLMProvider>>, bamboo_llm::LLMError> {
+        self.runtime.provider.legacy_injected_provider_snapshot()
+    }
+
+    /// Freeze the same verified injection and retain its Host budget identity.
+    #[doc(hidden)]
+    pub fn fixed_legacy_injected_provider(
+        &self,
+        expected: &Arc<dyn bamboo_llm::LLMProvider>,
+    ) -> Result<Option<Arc<dyn bamboo_llm::LLMProvider>>, bamboo_llm::LLMError> {
+        Ok(self
+            .runtime
+            .provider
+            .legacy_injected_provider_snapshot()?
+            .and_then(|current| {
+                Arc::ptr_eq(&current, expected).then(|| {
+                    bamboo_llm::provider::fixed_injected_provider_with_identity(
+                        current,
+                        self.runtime.provider.clone(),
+                    )
+                })
+            }))
+    }
+
     /// One execution's immutable persistence capability. Shared tool/provider
     /// resources remain on the existing runtime; default callers stay unbound.
     #[doc(hidden)]
@@ -411,6 +439,38 @@ impl Agent {
         let mut runtime = (*self.runtime).clone();
         runtime.persistence = persistence;
         runtime.inherited_child_wait_captured = true;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Mark this execution's legacy image fallback as derived by the Host
+    /// from configuration. The shared agent and caller-owned runs stay unchanged.
+    #[doc(hidden)]
+    pub fn with_config_derived_image_fallback(&self) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.legacy_image_from_config = true;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Replace the per-run evidence for the selected legacy Vision client.
+    #[doc(hidden)]
+    pub fn with_legacy_vision_provider_source(
+        &self,
+        source: Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.legacy_image_provider_source = source;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Adapt the default provider for this execution while retaining every
+    /// other runtime capability. Explicit request-level overrides stay separate.
+    #[doc(hidden)]
+    pub fn with_default_provider_adapter(
+        &self,
+        adapter: impl FnOnce(Arc<dyn bamboo_llm::LLMProvider>) -> Arc<dyn bamboo_llm::LLMProvider>,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.provider = adapter(runtime.provider.clone());
         Self::from_runtime(Arc::new(runtime))
     }
 
@@ -491,6 +551,20 @@ impl Agent {
         let mut runtime = (*self.runtime).clone();
         runtime.gold_target_resolver = Some(resolver);
         runtime.child_resume_gold_selected = None;
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    /// Add a managed Host policy while retaining any inherited Gold policy.
+    #[doc(hidden)]
+    pub fn with_composed_gold_target_resolver(
+        &self,
+        resolver: crate::runtime::config::GoldTargetResolver,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.gold_target_resolver = Some(compose_child_gold_policy(
+            runtime.gold_target_resolver.take(),
+            resolver,
+        ));
         Self::from_runtime(Arc::new(runtime))
     }
 

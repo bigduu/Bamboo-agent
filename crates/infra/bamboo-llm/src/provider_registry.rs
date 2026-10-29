@@ -76,6 +76,36 @@ pub struct ManagedProviderOrigin {
 }
 
 impl ManagedProviderOrigin {
+    fn validate_legacy_vision_source(
+        &self,
+        config: &Config,
+        provider_id: &str,
+        expected: &Arc<dyn LLMProvider>,
+    ) -> Result<(), LLMError> {
+        if self.provider_id != provider_id || !Arc::ptr_eq(&self.selected, expected) {
+            return Err(stale_binding());
+        }
+        let original = self.original_binding.as_ref().ok_or_else(stale_binding)?;
+        let current = configured_binding(config, provider_id, &self.key)?;
+        // An implicit Copilot client remains the same source when unrelated
+        // provider instances are added. Source tags still distinguish an
+        // explicit instance or stanza from this implicit form.
+        let current = if current.is_none()
+            && provider_id == "copilot"
+            && !config.provider_instances.contains_key(provider_id)
+            && config.providers().copilot.is_none()
+        {
+            configured_binding_with_mode(config, provider_id, &self.key, true, false)?
+        } else {
+            current
+        };
+        let current = current.ok_or_else(stale_binding)?;
+        if !bool::from(original.as_slice().ct_eq(current.0.as_slice())) {
+            return Err(stale_binding());
+        }
+        Ok(())
+    }
+
     pub(crate) fn validate_gold_target(
         &self,
         config: &Config,
@@ -573,6 +603,20 @@ impl ProviderRegistry {
         Ok(Some(provider))
     }
 
+    /// Select the configured model and its managed proof from one registry
+    /// generation. An unmanaged embedder selection has no managed proof.
+    #[doc(hidden)]
+    pub fn provider_for_configured_model_with_managed_origin(
+        self: &Arc<Self>,
+        config: &Config,
+        target: &bamboo_domain::ProviderModelRef,
+    ) -> Result<(Arc<dyn LLMProvider>, Option<Arc<ManagedProviderOrigin>>), LLMError> {
+        let state = self.state.read().recover_poison();
+        let provider = Self::configured_model_in_snapshot(&state, config, target)?;
+        let origin = self.managed_origin_for_snapshot(&state, &target.provider, &provider);
+        Ok((provider, origin))
+    }
+
     /// Return a coherent configured handle and whether its registry generation
     /// is Host-managed under the same lock. The keyed binding does not retain
     /// or expose plaintext credentials.
@@ -1044,13 +1088,18 @@ impl Write for BindingWriter<'_> {
 // runtime_models is enforced independently against the live Config and the
 // registry snapshot; it is not an input to the provider factory. Omitting it
 // here permits one model's admission to change without changing the account.
-struct FactoryExtra<'a>(&'a std::collections::BTreeMap<String, serde_json::Value>);
+struct FactoryExtra<'a>(
+    &'a std::collections::BTreeMap<String, serde_json::Value>,
+    bool,
+);
 
 impl Serialize for FactoryExtra<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
         for (name, value) in self.0 {
-            if name != bamboo_config::RUNTIME_MODELS_CONFIG_KEY {
+            if name != bamboo_config::RUNTIME_MODELS_CONFIG_KEY
+                && !(self.1 && name == bamboo_config::PROVIDER_INSTANCE_API_KEY_FROM_ENV_CONFIG_KEY)
+            {
                 map.serialize_entry(name, value)?;
             }
         }
@@ -1102,10 +1151,145 @@ fn hash_factory_inputs<T: Serialize>(
 // legacy alias distinct even when they happen to share an ID and credentials.
 // Ambient system-proxy state and Copilot's dynamic authentication are not
 // represented by Config and are intentionally outside this binding.
+/// Opaque in-memory identity of the factory inputs used by an SDK client.
+/// It stores only a keyed tag, never serialized credentials or an endpoint.
+#[doc(hidden)]
+pub struct SdkProviderBinding {
+    provider: String,
+    key: ring::hmac::Key,
+    tag: [u8; 32],
+    api_key_overridden: bool,
+}
+
+impl SdkProviderBinding {
+    /// Capture the selected key's source from one factory-input snapshot.
+    /// Unlike registry defaults, an explicit SDK key can legitimately
+    /// select a non-default legacy provider or an initially empty key slot.
+    pub fn capture(
+        config: &Config,
+        provider: &str,
+        api_key_overridden: bool,
+    ) -> Result<Self, LLMError> {
+        let key =
+            ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+                .map_err(|_| LLMError::Api("Could not bind SDK provider configuration".into()))?;
+        let tag = sdk_provider_binding(config, provider, &key, api_key_overridden)?;
+        Ok(Self {
+            provider: provider.to_string(),
+            key,
+            tag,
+            api_key_overridden,
+        })
+    }
+
+    /// Check the exact configured source and factory inputs without exposing
+    /// credentials. Dynamic environment and Copilot auth remain owned by the
+    /// provider and are not represented by this Config proof.
+    pub fn validate(&self, config: &Config) -> Result<(), LLMError> {
+        let current =
+            sdk_provider_binding(config, &self.provider, &self.key, self.api_key_overridden)?;
+        if !bool::from(self.tag.as_slice().ct_eq(current.as_slice())) {
+            return Err(LLMError::Api("SDK provider configuration changed".into()));
+        }
+        Ok(())
+    }
+}
+
+/// Per-run evidence tying a selected Host client to one config source. For
+/// embedder-managed clients this proves only that the source has not changed
+/// since selection, not how that client was constructed. Never serialize it.
+#[doc(hidden)]
+pub struct LegacyVisionProviderSource {
+    provider_id: String,
+    selected: Arc<dyn LLMProvider>,
+    proof: LegacyVisionProviderProof,
+}
+
+enum LegacyVisionProviderProof {
+    Managed(Arc<ManagedProviderOrigin>),
+    Injected(Box<SdkProviderBinding>),
+}
+
+impl LegacyVisionProviderSource {
+    pub fn capture(
+        config: &Config,
+        provider_id: &str,
+        selected: Arc<dyn LLMProvider>,
+        managed_origin: Option<Arc<ManagedProviderOrigin>>,
+    ) -> Result<Self, LLMError> {
+        let proof = match managed_origin {
+            Some(origin) => {
+                origin.validate_legacy_vision_source(config, provider_id, &selected)?;
+                LegacyVisionProviderProof::Managed(origin)
+            }
+            None => LegacyVisionProviderProof::Injected(Box::new(SdkProviderBinding::capture(
+                config,
+                provider_id,
+                false,
+            )?)),
+        };
+        Ok(Self {
+            provider_id: provider_id.to_string(),
+            selected,
+            proof,
+        })
+    }
+
+    pub fn validate(
+        &self,
+        config: &Config,
+        provider_id: &str,
+        selected: &Arc<dyn LLMProvider>,
+    ) -> Result<(), LLMError> {
+        if self.provider_id != provider_id || !Arc::ptr_eq(&self.selected, selected) {
+            return Err(stale_binding());
+        }
+        match &self.proof {
+            LegacyVisionProviderProof::Managed(origin) => {
+                origin.validate_legacy_vision_source(config, provider_id, selected)
+            }
+            LegacyVisionProviderProof::Injected(binding) => binding.validate(config),
+        }
+    }
+}
+
+fn sdk_provider_binding(
+    config: &Config,
+    provider: &str,
+    key: &ring::hmac::Key,
+    api_key_overridden: bool,
+) -> Result<[u8; 32], LLMError> {
+    // Disabled is a refusal, not the same source as an absent legacy slot
+    // whose credentials were supplied by an SDK API-key overlay.
+    if config
+        .provider_instances
+        .get(provider)
+        .is_some_and(|instance| !instance.enabled)
+    {
+        return Err(LLMError::Api("SDK provider instance is disabled".into()));
+    }
+    let binding =
+        match configured_binding_with_mode(config, provider, key, true, api_key_overridden)? {
+            Some(binding) => binding,
+            None => hash_factory_inputs(key, config, provider, "sdk-unconfigured", &())?,
+        };
+    Ok(binding.0)
+}
+
 fn configured_binding(
     config: &Config,
     id: &str,
     key: &ring::hmac::Key,
+) -> Result<Option<Binding>, LLMError> {
+    configured_binding_with_mode(config, id, key, false, false)
+}
+
+fn configured_binding_with_mode(
+    config: &Config,
+    id: &str,
+    key: &ring::hmac::Key,
+    sdk_mode: bool,
+    api_key_overridden: bool,
 ) -> Result<Option<Binding>, LLMError> {
     if let Some(instance) = config.provider_instances.get(id) {
         if !instance.enabled {
@@ -1118,13 +1302,21 @@ fn configured_binding(
             "instance",
             &(
                 &instance.provider_type,
-                &instance.api_key,
-                &instance.credential_ref,
+                if api_key_overridden {
+                    ""
+                } else {
+                    instance.api_key.as_str()
+                },
+                if api_key_overridden || (sdk_mode && !instance.api_key.is_empty()) {
+                    None
+                } else {
+                    instance.credential_ref.as_ref()
+                },
                 &instance.base_url,
                 &instance.reasoning_effort,
                 &instance.responses_only_models,
                 &instance.request_overrides,
-                FactoryExtra(&instance.extra),
+                FactoryExtra(&instance.extra, api_key_overridden),
                 (instance.provider_type == "copilot").then_some(config.headless_auth),
             ),
         )
@@ -1132,7 +1324,7 @@ fn configured_binding(
     }
 
     let hybrid = config.has_provider_instances();
-    if hybrid && config.effective_default_provider() != id {
+    if !sdk_mode && hybrid && config.effective_default_provider() != id {
         return Ok(None);
     }
 
@@ -1141,7 +1333,7 @@ fn configured_binding(
         "openai" => match providers
             .openai
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1149,14 +1341,26 @@ fn configured_binding(
                 id,
                 "legacy-openai",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.reasoning_effort,
                     &entry.responses_only_models,
                     &entry.request_overrides,
-                    entry.api_key_from_env,
-                    FactoryExtra(&entry.extra),
+                    if api_key_overridden {
+                        false
+                    } else {
+                        entry.api_key_from_env
+                    },
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
@@ -1165,7 +1369,7 @@ fn configured_binding(
         "anthropic" => match providers
             .anthropic
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1173,15 +1377,27 @@ fn configured_binding(
                 id,
                 "legacy-anthropic",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.reasoning_effort,
                     &entry.request_overrides,
                     &entry.max_tokens,
                     &entry.thinking_replay_always,
-                    entry.api_key_from_env,
-                    FactoryExtra(&entry.extra),
+                    if api_key_overridden {
+                        false
+                    } else {
+                        entry.api_key_from_env
+                    },
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
@@ -1190,7 +1406,7 @@ fn configured_binding(
         "gemini" => match providers
             .gemini
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1198,13 +1414,25 @@ fn configured_binding(
                 id,
                 "legacy-gemini",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.reasoning_effort,
                     &entry.request_overrides,
-                    entry.api_key_from_env,
-                    FactoryExtra(&entry.extra),
+                    if api_key_overridden {
+                        false
+                    } else {
+                        entry.api_key_from_env
+                    },
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
@@ -1213,7 +1441,7 @@ fn configured_binding(
         "bodhi" => match providers
             .bodhi
             .as_ref()
-            .filter(|entry| !entry.api_key.is_empty())
+            .filter(|entry| sdk_mode || !entry.api_key.is_empty())
         {
             Some(entry) => hash_factory_inputs(
                 key,
@@ -1221,19 +1449,27 @@ fn configured_binding(
                 id,
                 "legacy-bodhi",
                 &(
-                    &entry.api_key,
-                    &entry.credential_ref,
+                    if api_key_overridden {
+                        ""
+                    } else {
+                        entry.api_key.as_str()
+                    },
+                    if api_key_overridden || (sdk_mode && !entry.api_key.is_empty()) {
+                        None
+                    } else {
+                        entry.credential_ref.as_ref()
+                    },
                     &entry.base_url,
                     &entry.target_provider,
                     &entry.reasoning_effort,
-                    FactoryExtra(&entry.extra),
+                    FactoryExtra(&entry.extra, api_key_overridden),
                 ),
             )
             .map(Some),
             None => Ok(None),
         },
         "copilot" => match providers.copilot.as_ref() {
-            Some(entry) if !hybrid || entry.enabled || config.provider == "copilot" => {
+            Some(entry) if sdk_mode || !hybrid || entry.enabled || config.provider == "copilot" => {
                 hash_factory_inputs(
                     key,
                     config,
@@ -1245,12 +1481,12 @@ fn configured_binding(
                         &entry.reasoning_effort,
                         &entry.responses_only_models,
                         &entry.request_overrides,
-                        FactoryExtra(&entry.extra),
+                        FactoryExtra(&entry.extra, api_key_overridden),
                     ),
                 )
                 .map(Some)
             }
-            None if !hybrid => {
+            None if sdk_mode || !hybrid => {
                 hash_factory_inputs(key, config, id, "implicit-copilot", &config.headless_auth)
                     .map(Some)
             }
@@ -1307,6 +1543,77 @@ fn provider_is_configured(config: &Config, name: &str) -> bool {
 mod tests {
     use super::*;
     use bamboo_config::OpenAIConfig;
+
+    #[test]
+    fn sdk_factory_binding_respects_instance_api_key_overlay_and_live_admission() {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.default_provider_instance = Some("work".into());
+        config.provider_instances.insert(
+            "work".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic-first",
+                "base_url":"http://127.0.0.1:9001", "api_key_from_env":true,
+                "runtime_models":["model-a"]
+            }))
+            .unwrap(),
+        );
+        let ordinary = SdkProviderBinding::capture(&config, "work", false).unwrap();
+        let overlay = SdkProviderBinding::capture(&config, "work", true).unwrap();
+        let instance = config.provider_instances.get_mut("work").unwrap();
+        instance.credential_ref =
+            Some(bamboo_config::credential_ref("provider", "work", "api_key").unwrap());
+        assert!(
+            ordinary.validate(&config).is_ok(),
+            "same hydrated key remains the same client"
+        );
+        let instance = config.provider_instances.get_mut("work").unwrap();
+        instance.api_key = "synthetic-rotated".into();
+        instance
+            .extra
+            .insert("api_key_from_env".into(), serde_json::json!(false));
+        instance
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["model-b"]));
+        assert!(ordinary.validate(&config).is_err());
+        assert!(
+            overlay.validate(&config).is_ok(),
+            "explicit overlay pins the actual client key"
+        );
+        config.provider_instances.get_mut("work").unwrap().base_url =
+            Some("http://127.0.0.1:9002".into());
+        assert!(
+            overlay.validate(&config).is_err(),
+            "endpoint remains bound under overlay"
+        );
+        config.provider_instances.get_mut("work").unwrap().enabled = false;
+        assert!(overlay.validate(&config).is_err());
+    }
+
+    #[test]
+    fn sdk_factory_binding_respects_legacy_api_key_overlay() {
+        let mut config = Config::default();
+        config.provider = "openai".into();
+        config.default_provider_instance = None;
+        config.provider_instances.clear();
+        config.providers_mut().openai = Some(
+            serde_json::from_value(serde_json::json!({
+                "api_key":"synthetic-first", "api_key_from_env":true,
+                "base_url":"http://127.0.0.1:9001", "model":"model-a"
+            }))
+            .unwrap(),
+        );
+        let ordinary = SdkProviderBinding::capture(&config, "openai", false).unwrap();
+        let overlay = SdkProviderBinding::capture(&config, "openai", true).unwrap();
+        let provider = config.providers_mut().openai.as_mut().unwrap();
+        provider.api_key = "synthetic-rotated".into();
+        provider.api_key_from_env = false;
+        assert!(ordinary.validate(&config).is_err());
+        assert!(overlay.validate(&config).is_ok());
+        config.providers_mut().openai.as_mut().unwrap().base_url =
+            Some("http://127.0.0.1:9002".into());
+        assert!(overlay.validate(&config).is_err());
+    }
 
     #[test]
     fn legacy_direct_background_obeys_explicit_provider_identity_and_lists() {
@@ -1880,6 +2187,92 @@ mod tests {
             .unwrap(),
         );
         config
+    }
+
+    #[tokio::test]
+    async fn legacy_vision_source_binds_client_and_config_without_model_overbinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = managed_config();
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().into())
+                .await
+                .unwrap(),
+        );
+        let (client, origin) = registry.get_with_origin("relay").unwrap();
+        let managed =
+            LegacyVisionProviderSource::capture(&config, "relay", client.clone(), origin).unwrap();
+        let injected =
+            LegacyVisionProviderSource::capture(&config, "relay", client.clone(), None).unwrap();
+        let mut model_only = config.clone();
+        let instance = model_only.provider_instances.get_mut("relay").unwrap();
+        instance.vision_model = Some("synthetic-new-vision".into());
+        instance.extra.insert(
+            "runtime_models".into(),
+            serde_json::json!(["chat", "synthetic-new-vision"]),
+        );
+        for source in [&managed, &injected] {
+            assert!(source.validate(&config, "relay", &client).is_ok());
+            assert!(source.validate(&model_only, "relay", &client).is_ok());
+            assert!(source.validate(&config, "other", &client).is_err());
+            let mut changed = config.clone();
+            changed
+                .provider_instances
+                .get_mut("relay")
+                .unwrap()
+                .base_url = Some("http://127.0.0.1:32102".into());
+            assert!(source.validate(&changed, "relay", &client).is_err());
+            let mut disabled = config.clone();
+            disabled
+                .provider_instances
+                .get_mut("relay")
+                .unwrap()
+                .enabled = false;
+            assert!(source.validate(&disabled, "relay", &client).is_err());
+        }
+        let rebuilt = ProviderRegistry::from_config(&config, dir.path().into())
+            .await
+            .unwrap();
+        let other = rebuilt.get("relay").unwrap();
+        assert!(managed.validate(&config, "relay", &other).is_err());
+        assert!(injected.validate(&config, "relay", &other).is_err());
+        registry.insert("relay".into(), client.clone());
+        let (_, missing) = registry.get_with_origin("relay").unwrap();
+        assert!(missing.is_some());
+        assert!(
+            LegacyVisionProviderSource::capture(&config, "relay", client.clone(), missing).is_err()
+        );
+
+        // A managed implicit Copilot source is still the same source when an
+        // unrelated instance is added. No Copilot client or network is used.
+        let mut copilot = Config::default();
+        copilot.provider = "copilot".into();
+        copilot.default_provider_instance = None;
+        copilot.provider_instances.clear();
+        let key =
+            ring::hmac::Key::generate(ring::hmac::HMAC_SHA256, &ring::rand::SystemRandom::new())
+                .unwrap();
+        let tag = configured_binding(&copilot, "copilot", &key)
+            .unwrap()
+            .unwrap()
+            .0;
+        let origin = Arc::new(ManagedProviderOrigin {
+            registry: registry.clone(),
+            provider_id: "copilot".into(),
+            key,
+            original_binding: Some(tag),
+            selected: client.clone(),
+        });
+        let implicit =
+            LegacyVisionProviderSource::capture(&copilot, "copilot", client.clone(), Some(origin))
+                .unwrap();
+        copilot.provider_instances.insert(
+            "other".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic"
+            }))
+            .unwrap(),
+        );
+        assert!(implicit.validate(&copilot, "copilot", &client).is_ok());
     }
 
     async fn assert_changed_static_inputs_are_rejected(original: &Config, changed: &Config) {

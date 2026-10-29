@@ -74,6 +74,23 @@ fn approval_tool_name_for_display(tool_name: &str) -> String {
     }
 }
 
+fn approval_permission_description(
+    tool_name: &str,
+    args: &serde_json::Value,
+    permission_type: crate::permission::PermissionType,
+) -> &'static str {
+    if canonical_tool_name(tool_name).eq_ignore_ascii_case("session_control")
+        && args.get("action").and_then(serde_json::Value::as_str) == Some("cancel")
+        && permission_type == crate::permission::PermissionType::ExecuteCommand
+    {
+        // The existing high-risk permission is retained, but this operation
+        // signals a Session run and never executes a shell command.
+        "request cancellation of the selected Session run"
+    } else {
+        permission_type.description()
+    }
+}
+
 fn approval_parameters_for_display(tool_name: &str, args: &serde_json::Value) -> serde_json::Value {
     if canonical_tool_name(tool_name).eq_ignore_ascii_case("session_message") {
         // Peer text and routing identifiers must not enter approval display
@@ -975,7 +992,12 @@ impl BuiltinToolExecutor {
                     let approved = proxy
                         .request_approval(crate::approval::ApprovalAsk {
                             tool_name: approval_tool_name_for_display(&tool_name),
-                            permission: permission_type.description().to_string(),
+                            permission: approval_permission_description(
+                                &tool_name,
+                                &args,
+                                permission_type,
+                            )
+                            .to_string(),
                             resource: approval_display_resource.clone(),
                             permission_request: Some(display_request),
                         })
@@ -1004,7 +1026,7 @@ impl BuiltinToolExecutor {
                     let question = format!(
                         "**Permission required**\n\nThe `{}` tool needs approval to {} on:\n\n`{}`",
                         approval_tool_name_for_display(&tool_name),
-                        permission_type.description(),
+                        approval_permission_description(&tool_name, &args, permission_type),
                         approval_display_resource
                     );
                     if let Some(config) = config {
@@ -1433,6 +1455,38 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::tools::WriteTool;
+
+    #[test]
+    fn exact_session_cancel_approval_describes_its_operation() {
+        use crate::permission::PermissionType;
+        let cancel = serde_json::json!({"action":"cancel"});
+        for tool in ["session_control", "default::session_control"] {
+            assert_eq!(
+                approval_permission_description(tool, &cancel, PermissionType::ExecuteCommand),
+                "request cancellation of the selected Session run"
+            );
+        }
+        assert_eq!(
+            approval_permission_description(
+                "session_control",
+                &serde_json::json!({"action":"followup"}),
+                PermissionType::ExecuteCommand,
+            ),
+            "Execute shell commands"
+        );
+        assert_eq!(
+            approval_permission_description(
+                "exec_command",
+                &cancel,
+                PermissionType::ExecuteCommand
+            ),
+            "Execute shell commands"
+        );
+        assert_eq!(
+            approval_permission_description("session_control", &cancel, PermissionType::WriteFile),
+            "Write files to disk"
+        );
+    }
 
     fn make_tool_call(name: &str, args: serde_json::Value) -> ToolCall {
         make_tool_call_with_id("call_1", name, args)

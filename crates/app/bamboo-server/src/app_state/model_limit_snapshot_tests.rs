@@ -264,6 +264,7 @@ async fn run_hosted_probe(
         provider_name: state.config.read().await.provider.clone(),
         provider_override: Some(probe),
         provider_override_managed_registry: None,
+        legacy_vision_provider_source: None,
         model_roster: bamboo_engine::ModelRoster {
             model: Some("legacy-hosted-model".into()),
             ..Default::default()

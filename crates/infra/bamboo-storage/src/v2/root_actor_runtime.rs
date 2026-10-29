@@ -214,6 +214,102 @@ impl SessionStoreV2 {
         .await
     }
 
+    pub(super) async fn save_root_actor_bound_startup_impl(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        publish: RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        let total_started = Instant::now();
+        validate_session_id(&session.id)?;
+        if let Some(wait) = inherited {
+            wait.validate_session(session)?;
+        }
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let proof = RootActorWriteProof::new(self.sessions_dir.join(&session.id), owner.clone());
+        let guards = DefaultWriterGuards::shared_with_root_actor(
+            lifecycle,
+            task,
+            session_write,
+            Some(proof.clone()),
+        );
+        let observed = expected.clone();
+        let proposed = session.clone();
+        Self::default_writer_job(&guards, move || {
+            let current = proof.validate()?;
+            observed
+                .check_conversation_generation(&current)
+                .map_err(conflict)?;
+            let schedule = observed.metadata.get("created_by_schedule_id");
+            let connect = observed.metadata.get("created_by_connect_key");
+            let pending_result = |session: &Session| -> io::Result<Option<serde_json::Value>> {
+                let Some(question) = observed.pending_question.as_ref() else {
+                    return Ok(None);
+                };
+                session
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| {
+                        message.tool_call_id.as_deref() == Some(question.tool_call_id.as_str())
+                    })
+                    .map(serde_json::to_value)
+                    .transpose()
+                    .map_err(conflict)
+            };
+            if observed.pending_question != current.pending_question
+                || pending_result(&observed)? != pending_result(&current)?
+                || observed
+                    .metadata
+                    .get(bamboo_domain::CONSUMED_CLARIFICATION_IDS_KEY)
+                    != current
+                        .metadata
+                        .get(bamboo_domain::CONSUMED_CLARIFICATION_IDS_KEY)
+                || observed
+                    .metadata
+                    .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY)
+                    != current
+                        .metadata
+                        .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY)
+                || schedule != current.metadata.get("created_by_schedule_id")
+                || schedule != proposed.metadata.get("created_by_schedule_id")
+                || connect != current.metadata.get("created_by_connect_key")
+                || connect != proposed.metadata.get("created_by_connect_key")
+                || observed.id != current.id
+                || observed.created_at != current.created_at
+                || observed.kind != current.kind
+                || observed.authority_identity != current.authority_identity
+                || observed.project_id_meta() != current.project_id_meta()
+                || observed.model != current.model
+                || observed.model_ref != current.model_ref
+                || observed.provider_name() != current.provider_name()
+                || observed.reasoning_effort != current.reasoning_effort
+                || observed.metadata_version != current.metadata_version
+            {
+                return Err(conflict("bound startup execution profile changed"));
+            }
+            proof.validate_candidate(&proposed)
+        })
+        .await?;
+        let reconciled = if let Some(wait) = inherited {
+            self.reconcile_inherited_runtime_snapshot(session, wait, false)
+                .await?
+        } else {
+            session.clone()
+        };
+        self.save_session_after_lock(&reconciled, total_started, &guards, None)
+            .await?;
+        self.publish_root_actor_runtime(&guards, publish).await?;
+        *session = reconciled;
+        Ok(())
+    }
+
     pub(super) async fn save_root_actor_runtime_impl(
         &self,
         owner: &RootActorRuntimeWrite,
