@@ -24,8 +24,8 @@ BAMBOO_OTEL_SAMPLE_RATIO=1 \
 The root `bamboo-agent` package also includes this transport in its default
 feature set, including source builds and library consumers. To omit it when
 building the root package, use `--no-default-features`. A previously configured
-enable flag and endpoint will begin exporting after upgrading from a build that
-did not include the transport.
+enable flag and valid endpoint can start exporting after upgrading from a build
+that did not include the transport, subject to sampling and collector availability.
 
 The API-only example has no bundled browser UI. Use the normal locked frontend
 staging procedure for a UI build. An OTLP/HTTP protobuf receiver must already be
