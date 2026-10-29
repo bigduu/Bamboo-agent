@@ -14,10 +14,47 @@ use bamboo_llm::{
 };
 use tokio::sync::RwLock;
 
+#[derive(Clone)]
+pub(super) enum SdkBinding {
+    Native(Arc<SdkProviderBinding>),
+    Instance,
+    Legacy,
+    Opaque,
+}
+
+fn has_legacy(config: &Config, provider: &str) -> bool {
+    let providers = config.providers();
+    match provider {
+        "openai" => providers.openai.is_some(),
+        "anthropic" => providers.anthropic.is_some(),
+        "gemini" => providers.gemini.is_some(),
+        "bodhi" => providers.bodhi.is_some(),
+        "copilot" => {
+            providers.copilot.is_some()
+                || (config.provider_instances.is_empty()
+                    && config.effective_default_provider() == provider)
+        }
+        _ => false,
+    }
+}
+
+/// A caller-owned client is authoritative for its identity. Remember only
+/// whether its declared key came from configured metadata, so later disable,
+/// removal, or source changes cannot silently reuse that client.
+pub(super) fn caller_binding(config: &Config, provider: &str) -> SdkBinding {
+    if config.provider_instances.contains_key(provider) {
+        SdkBinding::Instance
+    } else if has_legacy(config, provider) {
+        SdkBinding::Legacy
+    } else {
+        SdkBinding::Opaque
+    }
+}
+
 pub(super) struct BoundSdkProvider {
     pub(super) delegate: Arc<dyn LLMProvider>,
     pub(super) config: Arc<RwLock<Config>>,
-    pub(super) binding: Arc<SdkProviderBinding>,
+    pub(super) binding: SdkBinding,
     pub(super) provider: String,
     pub(super) single_use: bool,
     pub(super) refused: AtomicBool,
@@ -33,12 +70,27 @@ impl BoundSdkProvider {
         let config = self.config.try_read().map_err(|_| {
             LLMError::Api("sdk_provider_binding: live provider configuration is busy".into())
         })?;
-        self.binding.validate(&config).map_err(|_| {
-            LLMError::Api(
-                "sdk_provider_binding: native provider configuration changed; rebuild the SDK client"
+        let source_valid = match &self.binding {
+            SdkBinding::Native(binding) => binding.validate(&config).is_ok(),
+            SdkBinding::Instance => config
+                .provider_instances
+                .get(&self.provider)
+                .is_some_and(|instance| instance.enabled),
+            SdkBinding::Legacy => {
+                !config.provider_instances.contains_key(&self.provider)
+                    && has_legacy(&config, &self.provider)
+            }
+            SdkBinding::Opaque => {
+                !config.provider_instances.contains_key(&self.provider)
+                    && !has_legacy(&config, &self.provider)
+            }
+        };
+        if !source_valid {
+            return Err(LLMError::Api(
+                "sdk_provider_binding: provider configuration changed; supply a current client"
                     .into(),
-            )
-        })?;
+            ));
+        }
         if let Some(model) = model {
             let models =
                 bamboo_config::explicit_runtime_models_for_provider_key(&config, &self.provider)
@@ -47,7 +99,7 @@ impl BoundSdkProvider {
                     })?;
             if models.is_some_and(|models| !models.iter().any(|allowed| allowed == model)) {
                 return Err(LLMError::Api(
-                    "sdk_provider_binding: model is not admitted for the native provider".into(),
+                    "sdk_provider_binding: model is not admitted for the selected provider".into(),
                 ));
             }
         }
@@ -234,7 +286,7 @@ mod tests {
         let provider = Arc::new(BoundSdkProvider {
             delegate: probe.clone(),
             config: config.clone(),
-            binding,
+            binding: SdkBinding::Native(binding),
             provider: "copilot".into(),
             single_use: false,
             refused: AtomicBool::new(false),
@@ -285,7 +337,7 @@ mod tests {
         let provider = BoundSdkProvider {
             delegate: probe.clone(),
             config: config.clone(),
-            binding,
+            binding: SdkBinding::Native(binding),
             provider: "openai".into(),
             single_use: false,
             refused: AtomicBool::new(false),

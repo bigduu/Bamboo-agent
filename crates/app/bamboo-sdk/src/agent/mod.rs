@@ -649,7 +649,7 @@ impl Agent {
                     Arc::new(sdk_provider_guard::BoundSdkProvider {
                         delegate,
                         config,
-                        binding,
+                        binding: sdk_provider_guard::SdkBinding::Native(binding),
                         provider,
                         single_use: false,
                         refused: std::sync::atomic::AtomicBool::new(false),
@@ -911,6 +911,22 @@ impl Agent {
             request.model_roster.model.as_deref(),
         ) {
             self.sdk_admit_model(config, provider, model)?;
+        }
+        if let (Some(snapshot), Some(shared), Some(provider)) = (
+            config,
+            self.routing_config.as_ref(),
+            request.model_roster.provider_name.as_ref(),
+        ) {
+            if let Some(delegate) = request.provider_override.take() {
+                request.provider_override = Some(Arc::new(sdk_provider_guard::BoundSdkProvider {
+                    binding: sdk_provider_guard::caller_binding(snapshot, provider),
+                    provider: provider.clone(),
+                    config: shared.clone(),
+                    delegate,
+                    single_use: false,
+                    refused: std::sync::atomic::AtomicBool::new(false),
+                }));
+            }
         }
         Ok(())
     }
