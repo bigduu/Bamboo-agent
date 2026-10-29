@@ -265,6 +265,62 @@ async fn supervisor_exact_cancel_rejects_stale_target_and_invalid_run_without_ef
 }
 
 #[actix_web::test]
+async fn legacy_stop_status_is_not_exact_finalization_proof() {
+    let fixture = Box::pin(Fixture::new()).await;
+    grant_cancel(&fixture);
+    let target = current_target(&fixture).await;
+    let mut runner = crate::app_state::AgentRunner::new();
+    runner.status = crate::app_state::AgentStatus::Running;
+    let run_id = runner.run_id.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &run_id)
+        .await
+        .unwrap();
+    fixture
+        .state
+        .agent_runners
+        .write()
+        .await
+        .insert(TARGET.into(), runner);
+    invoke(&fixture, args("observe_run", &target, None))
+        .await
+        .unwrap();
+    {
+        // This is precisely what the legacy HTTP Stop path can expose before
+        // the original executor has finished; it is not a terminal receipt.
+        let mut runners = fixture.state.agent_runners.write().await;
+        let runner = runners.get_mut(TARGET).unwrap();
+        runner.cancel_token.cancel();
+        runner.status = crate::app_state::AgentStatus::Cancelled;
+        runner.completed_at = Some(chrono::Utc::now());
+    }
+    let pending = invoke(&fixture, args("cancel", &target, Some(&run_id)))
+        .await
+        .unwrap();
+    assert_eq!(pending["status"], "cancel_requested");
+    assert_eq!(pending["completion_verified"], false);
+    let result: Result<(), bamboo_agent_core::AgentError> =
+        Err(bamboo_agent_core::AgentError::Cancelled);
+    assert!(
+        bamboo_engine::execution::finalize_runner_exact(
+            &fixture.state.agent_runners,
+            TARGET,
+            &run_id,
+            &result,
+        )
+        .await
+    );
+    owner.finish(0).await.unwrap();
+    let finished = invoke(&fixture, args("cancel", &target, Some(&run_id)))
+        .await
+        .unwrap();
+    assert_eq!(finished["status"], "already_finished");
+    fixture.state.shutdown().await;
+}
+
+#[actix_web::test]
 async fn supervisor_cancel_real_root_keeps_queued_followup_for_successor() {
     let fixture = Box::pin(Fixture::new()).await;
     grant_cancel(&fixture);
