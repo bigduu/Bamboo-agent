@@ -37,7 +37,21 @@ pub(crate) struct ObserverNoticeAuthority {
     locked: LockedObserver,
     pub(crate) envelope: SessionMessageEnvelope,
     pub(crate) inbox_dir: PathBuf,
+    pub(crate) supervisor_receipts: Vec<SessionMessageEnvelope>,
+    pub(crate) supervisor_inbox_dir: PathBuf,
     fault: bool,
+}
+
+/// Retained canonical Observer/target guards for reading Root Main and its
+/// original Inbox ACKs. This is not an execution or sending grant.
+pub(crate) struct ObserverRootOutcomeAuthority {
+    pub(crate) _guards: Arc<SupervisorManagementGuards>,
+    pub(crate) parent: Session,
+    pub(crate) target: Session,
+    pub(crate) main: Session,
+    pub(crate) cursor: Option<bamboo_domain::ObserverRootOutcomeCursor>,
+    pub(crate) pending: Option<bamboo_domain::ObserverViewChange>,
+    pub(crate) inbox_dir: PathBuf,
 }
 
 fn owner<'a>(reference: &SupervisorReference, child: &'a Session) -> ObserverSubscriptionOwner<'a> {
@@ -52,6 +66,64 @@ fn owner<'a>(reference: &SupervisorReference, child: &'a Session) -> ObserverSub
 }
 
 impl SessionStoreV2 {
+    pub(crate) async fn observer_root_outcome_authority(
+        &self,
+        caller: &SessionCallerReference,
+        reference: &SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<Arc<ObserverRootOutcomeAuthority>> {
+        let locked = self
+            .subscription_authority(reference, &caller.session_id, true)
+            .await?;
+        if !caller.matches_session(&locked.child) {
+            return Err(denied("Observer original caller changed"));
+        }
+        let subscription = locked
+            .state
+            .subscriptions
+            .get(&caller.session_id)
+            .ok_or_else(|| denied("Observer has no subscription"))?;
+        if subscription.filter != BTreeSet::from([ObserverChangeKind::Status])
+            || !locked.registration.target_links.contains_key(target_id)
+        {
+            return Err(denied(
+                "Observer outcome requires its assigned status subscription",
+            ));
+        }
+        let cursor = subscription
+            .window
+            .root_outcome_cursors
+            .get(target_id)
+            .cloned();
+        let pending = subscription.window.pending.clone();
+        let target = self
+            .load_root_authority_unchecked(target_id)
+            .await?
+            .ok_or_else(|| denied("Observer target is missing"))?;
+        let main = self
+            .load_execution_admission_unchecked(target_id)
+            .await?
+            .ok_or_else(|| denied("Observer Root Main is missing"))?;
+        if main.id != target.id
+            || main.created_at != target.created_at
+            || main.kind != SessionKind::Root
+            || main.authority_identity != target.authority_identity
+            || main.project_id_meta() != target.project_id_meta()
+            || main.conversation_reset != target.conversation_reset
+        {
+            return Err(denied("Observer Root Main lifetime changed"));
+        }
+        Ok(Arc::new(ObserverRootOutcomeAuthority {
+            _guards: locked.guards,
+            parent: locked.parent,
+            target,
+            main,
+            cursor,
+            pending,
+            inbox_dir: self.sessions_dir.join(target_id).join("inbox"),
+        }))
+    }
+
     async fn subscription_authority(
         &self,
         reference: &SupervisorReference,
@@ -145,7 +217,7 @@ impl SessionStoreV2 {
         let mut locked = self
             .subscription_authority(reference, child_id, true)
             .await?;
-        let candidate =
+        let mut candidate =
             ObserverSubscription::new(locked.registration.revision, filter, min_interval_ms)
                 .map_err(invalid)?;
         if let Some(old) = locked.state.subscriptions.get(child_id) {
@@ -165,6 +237,22 @@ impl SessionStoreV2 {
                 "Supervisor changed before subscription",
             ));
         }
+        if candidate.filter == BTreeSet::from([ObserverChangeKind::Status]) {
+            for (target_id, link) in &locked.registration.target_links {
+                candidate.window.root_outcome_cursors.insert(
+                    target_id.clone(),
+                    bamboo_domain::ObserverRootOutcomeCursor {
+                        root_created_at: link.target_created_at,
+                        sequence: 0,
+                    },
+                );
+            }
+            candidate.validate().map_err(invalid)?;
+            locked.state.schema_version = locked
+                .state
+                .schema_version
+                .max(bamboo_domain::SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION);
+        }
         locked.state.schema_version = locked
             .state
             .schema_version
@@ -179,6 +267,57 @@ impl SessionStoreV2 {
         Ok(candidate)
     }
 
+    /// Upgrade an existing status-only subscription after its legacy pending
+    /// item has finished. Zero means no verified Root outcome receipt; an old
+    /// snapshot fingerprint is never promoted into a source cursor.
+    pub async fn initialize_observer_root_outcome_lane(
+        &self,
+        reference: &SupervisorReference,
+        child_id: &str,
+    ) -> io::Result<()> {
+        let mut locked = self
+            .subscription_authority(reference, child_id, true)
+            .await?;
+        let subscription = locked
+            .state
+            .subscriptions
+            .get_mut(child_id)
+            .ok_or_else(|| denied("Observer has no subscription"))?;
+        if subscription.filter != BTreeSet::from([ObserverChangeKind::Status])
+            || subscription.window.pending.is_some()
+        {
+            return Ok(());
+        }
+        let mut changed = false;
+        for (target, link) in &locked.registration.target_links {
+            if !subscription
+                .window
+                .root_outcome_cursors
+                .contains_key(target)
+            {
+                subscription.window.root_outcome_cursors.insert(
+                    target.clone(),
+                    bamboo_domain::ObserverRootOutcomeCursor {
+                        root_created_at: link.target_created_at,
+                        sequence: 0,
+                    },
+                );
+                changed = true;
+            }
+        }
+        if changed {
+            subscription.validate().map_err(invalid)?;
+            locked.state.schema_version = locked
+                .state
+                .schema_version
+                .max(bamboo_domain::SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION);
+            locked.state.revision = next_revision(locked.state.revision)?;
+            self.publish_management_state(&mut locked.parent, &locked.state, &locked.guards)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// A trusted Host supplies only a selector. Verify the actually published,
     /// bounded bundle and its current canonical provenance before recording it.
     pub async fn stage_supervisor_observation(
@@ -187,6 +326,28 @@ impl SessionStoreV2 {
         child_id: &str,
         target_id: &str,
         revision: &str,
+        observed_at: DateTime<Utc>,
+    ) -> io::Result<ObserverStageOutcome> {
+        self.stage_supervisor_observation_with_root_outcome(
+            reference,
+            child_id,
+            target_id,
+            revision,
+            None,
+            observed_at,
+        )
+        .await
+    }
+
+    /// The optional position is a selector only. The locked Root Main and
+    /// current receipt-committed cursor determine whether it is the next fact.
+    pub async fn stage_supervisor_observation_with_root_outcome(
+        &self,
+        reference: &SupervisorReference,
+        child_id: &str,
+        target_id: &str,
+        revision: &str,
+        root_outcome: Option<&bamboo_domain::ObserverRootOutcomeCursor>,
         observed_at: DateTime<Utc>,
     ) -> io::Result<ObserverStageOutcome> {
         let mut locked = self
@@ -223,7 +384,23 @@ impl SessionStoreV2 {
             Arc::clone(&locked.guards),
         )
         .await?;
-        let fingerprint = verify_view(&files, &locked, &target, revision)?;
+        let main = if root_outcome.is_some() {
+            Some(
+                self.load_execution_admission_unchecked(target_id)
+                    .await?
+                    .ok_or_else(|| denied("Observer Root Main is missing"))?,
+            )
+        } else {
+            None
+        };
+        let fingerprint = verify_view(
+            &files,
+            &locked,
+            &target,
+            revision,
+            root_outcome,
+            main.as_ref(),
+        )?;
         let filter = subscription.filter.clone();
         let outcome = locked
             .state
@@ -231,16 +408,23 @@ impl SessionStoreV2 {
             .get_mut(child_id)
             .expect("subscription checked")
             .window
-            .stage(
+            .stage_with_root_outcome(
                 &owner(reference, &locked.child),
                 target_id,
                 revision,
                 &fingerprint,
                 filter,
                 observed_at,
+                root_outcome.cloned(),
             )
             .map_err(invalid)?;
         if matches!(outcome, ObserverStageOutcome::Staged(_)) {
+            if root_outcome.is_some() {
+                locked.state.schema_version = locked
+                    .state
+                    .schema_version
+                    .max(bamboo_domain::SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION);
+            }
             locked.state.revision = next_revision(locked.state.revision)?;
             self.publish_management_state(&mut locked.parent, &locked.state, &locked.guards)
                 .await?;
@@ -430,10 +614,45 @@ impl SessionStoreV2 {
             Arc::clone(&locked.guards),
         )
         .await?;
-        let fingerprint = verify_view(&files, &locked, &target, &change.view_revision)?;
+        let main = if change.root_outcome.is_some() {
+            Some(
+                self.load_execution_admission_unchecked(&change.target_session_id)
+                    .await?
+                    .ok_or_else(|| denied("Observer Root Main is missing"))?,
+            )
+        } else {
+            None
+        };
+        let fingerprint = verify_view(
+            &files,
+            &locked,
+            &target,
+            &change.view_revision,
+            change.root_outcome.as_ref(),
+            main.as_ref(),
+        )?;
         if fingerprint != change.source_fingerprint {
             return Err(denied("Observer pending fingerprint changed"));
         }
+        let supervisor_receipts =
+            if let (Some(position), Some(main)) = (change.root_outcome.as_ref(), main.as_ref()) {
+                let outcome = next_verified_root_outcome(&locked, &target, main, position)?;
+                outcome
+                    .inputs
+                    .iter()
+                    .map(|input| {
+                        crate::session_inbox::supervised_root_outcome_envelope(
+                            reference,
+                            locked.parent.created_at,
+                            &outcome,
+                            input,
+                            change.observed_at,
+                        )
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let content = serde_json::to_string(change).map_err(|error| invalid(error.to_string()))?;
         let envelope=SessionMessageEnvelope {
             id:change.event_id.clone(),source:SessionMessageSource::Runtime{subsystem:"supervisor_observation".into()},
@@ -454,6 +673,8 @@ impl SessionStoreV2 {
             locked,
             envelope,
             inbox_dir,
+            supervisor_receipts,
+            supervisor_inbox_dir: self.sessions_dir.join(&reference.session_id).join("inbox"),
             fault: false,
         }))
     }
@@ -562,6 +783,8 @@ impl SessionStoreV2 {
             locked,
             envelope,
             inbox_dir,
+            supervisor_receipts: Vec::new(),
+            supervisor_inbox_dir: PathBuf::new(),
             fault: true,
         }))
     }
@@ -683,11 +906,113 @@ impl SessionStoreV2 {
     }
 }
 
+// Reconstruct a bounded selector from canonical Main under the same physical
+// guards as the Observer relationship. A snapshot is not authority to choose
+// an arbitrary fact, even if its manifest and file hashes are self-consistent.
+fn next_verified_root_outcome(
+    locked: &LockedObserver,
+    target: &Session,
+    main: &Session,
+    position: &bamboo_domain::ObserverRootOutcomeCursor,
+) -> io::Result<bamboo_domain::ObserverSupervisedRootOutcome> {
+    let subscription = locked
+        .state
+        .subscriptions
+        .get(&locked.child.id)
+        .ok_or_else(|| denied("Observer subscription missing"))?;
+    if subscription.filter != BTreeSet::from([ObserverChangeKind::Status])
+        || main.id != target.id
+        || main.created_at != target.created_at
+        || main.kind != SessionKind::Root
+        || main.authority_identity != target.authority_identity
+        || main.project_id_meta() != target.project_id_meta()
+        || main.conversation_reset != target.conversation_reset
+        || position.root_created_at != main.created_at
+    {
+        return Err(denied("Observer Root outcome source changed"));
+    }
+    let reference = observer_parent_reference(&locked.parent)
+        .ok_or_else(|| denied("Observer Supervisor changed"))?;
+    let outcomes = main
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        .ok_or_else(|| denied("Root outcome source is unavailable"))?;
+    outcomes.validate().map_err(invalid)?;
+    if outcomes.root_session_id != main.id || outcomes.root_created_at != main.created_at {
+        return Err(denied("Root outcome source lifetime changed"));
+    }
+    let belongs = |input: &bamboo_domain::SupervisedRootOutcomeInput| {
+        input.supervisor_origin.as_ref().is_some_and(|origin| {
+            origin.original_caller().is_some()
+                && origin.requires_host_scope().is_some()
+                && origin.supervisor() == &reference
+                && origin.supervisor_created_at() == locked.parent.created_at
+                && origin.matches_receipt(&main.id, main.created_at, &input.receipt_id)
+        })
+    };
+    let cursor = subscription
+        .window
+        .root_outcome_cursors
+        .get(&target.id)
+        .ok_or_else(|| denied("Observer Root outcome baseline is unavailable"))?;
+    if cursor.root_created_at != target.created_at {
+        return Err(denied("Observer Root outcome cursor lifetime changed"));
+    }
+    if cursor.sequence != 0
+        && !outcomes
+            .facts
+            .iter()
+            .any(|fact| fact.sequence == cursor.sequence && fact.result.is_some())
+    {
+        return Err(denied("Observer Root outcome cursor is unavailable"));
+    }
+    let fact = outcomes
+        .facts
+        .iter()
+        .find(|fact| {
+            fact.sequence > cursor.sequence
+                && fact.result.is_some()
+                && fact.inputs.iter().any(&belongs)
+        })
+        .ok_or_else(|| denied("Observer has no next Root outcome"))?;
+    if position.sequence != fact.sequence {
+        return Err(denied(
+            "Observer Root outcome is not the next canonical fact",
+        ));
+    }
+    let inputs = fact
+        .inputs
+        .iter()
+        .filter(|input| belongs(input))
+        .map(|input| bamboo_domain::ObserverSupervisedRootInput {
+            receipt_id: input.receipt_id.clone(),
+            generation: input.generation,
+            operation_id: input
+                .supervisor_origin
+                .as_ref()
+                .expect("filtered origin")
+                .operation_id()
+                .clone(),
+        })
+        .collect();
+    Ok(bamboo_domain::ObserverSupervisedRootOutcome {
+        target_session_id: main.id.clone(),
+        target_created_at: main.created_at,
+        sequence: fact.sequence,
+        run_id: fact.run_id.clone(),
+        status: fact.result.clone().expect("filtered result"),
+        inputs,
+    })
+}
+
 fn verify_view(
     files: &crate::context_view::ContextSnapshotFiles,
     locked: &LockedObserver,
     target: &Session,
     revision: &str,
+    root_outcome: Option<&bamboo_domain::ObserverRootOutcomeCursor>,
+    main: Option<&Session>,
 ) -> io::Result<String> {
     let child = &locked.child;
     let registration = &locked.registration;
@@ -734,6 +1059,23 @@ fn verify_view(
     {
         return Err(denied("Observer view current provenance changed"));
     }
+    let verified_outcome = match (root_outcome, main, manifest.get("root_outcome")) {
+        (None, None, None) => None,
+        (Some(position), Some(main), Some(value)) => {
+            let observed = next_verified_root_outcome(locked, target, main, position)?;
+            let digest = digest_hex(Sha256::digest(bamboo_domain::canonical_json_bytes(
+                &serde_json::to_value(&observed).map_err(|error| invalid(error.to_string()))?,
+            )));
+            if *value
+                != json!({"root_created_at":position.root_created_at,
+                "sequence":position.sequence,"sha256":digest})
+            {
+                return Err(denied("Observer Root outcome commitment differs"));
+            }
+            Some(observed)
+        }
+        _ => return Err(denied("Observer Root outcome selector differs")),
+    };
     for (key, bytes) in [("status", &files.status), ("brief", &files.brief)] {
         let content =
             std::str::from_utf8(bytes).map_err(|_| invalid("Observer view is not UTF-8"))?;
@@ -749,6 +1091,23 @@ fn verify_view(
     let fingerprints: BTreeMap<ObserverChangeKind, String> =
         serde_json::from_value(manifest["fingerprints"].clone())
             .map_err(|_| invalid("Observer view fingerprints missing"))?;
+    if let Some(outcome) = verified_outcome {
+        if files.status != bamboo_domain::observer_root_outcome_status(&outcome).as_bytes()
+            || files.brief != bamboo_domain::OBSERVER_ROOT_OUTCOME_BRIEF.as_bytes()
+        {
+            return Err(denied(
+                "Observer Root outcome view differs from canonical source",
+            ));
+        }
+        let expected = digest_hex(Sha256::digest(bamboo_domain::canonical_json_bytes(
+            &json!({
+                "status":outcome.status.observer_status(),"run_id":outcome.run_id
+            }),
+        )));
+        if fingerprints.get(&ObserverChangeKind::Status) != Some(&expected) {
+            return Err(denied("Observer Root outcome fingerprint differs"));
+        }
+    }
     manifest
         .as_object_mut()
         .ok_or_else(|| invalid("Observer manifest object missing"))?

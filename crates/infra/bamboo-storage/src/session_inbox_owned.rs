@@ -177,6 +177,14 @@ pub(crate) enum InboxAuthority {
     Observer {
         _guard: Arc<crate::v2::ObserverNoticeAuthority>,
     },
+    ObserverRootOutcomeRead {
+        _guard: Arc<crate::v2::ObserverRootOutcomeAuthority>,
+        inbox_dir: PathBuf,
+    },
+    ObserverSupervisorReceipt {
+        _guard: Arc<crate::v2::ObserverNoticeAuthority>,
+        inbox_dir: PathBuf,
+    },
     HostScoped {
         _guard: crate::v2::host_session_scope::HostScopedDeliveryGuards,
     },
@@ -650,6 +658,8 @@ impl FileSessionInbox {
         match authority {
             InboxAuthority::Peer { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Observer { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::ObserverRootOutcomeRead { inbox_dir, .. } => Ok(inbox_dir.clone()),
+            InboxAuthority::ObserverSupervisorReceipt { inbox_dir, .. } => Ok(inbox_dir.clone()),
             InboxAuthority::HostScoped { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::HostCreation { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Unscoped { _guard } => Ok(_guard.inbox_dir.clone()),

@@ -47,18 +47,63 @@ pub enum SupervisedRootOutcomeInputOrigin {
     CurrentUser {
         supervisor: SupervisorReference,
         supervisor_created_at: DateTime<Utc>,
+        /// Captured from the original executing operation, never reconstructed
+        /// from the current Supervisor after a restart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<crate::SessionCallerReference>,
+        /// True if the original operation retained a finite Host scope; false
+        /// only when its writer actually retained a never-installed fence.
+        /// None is historical uncertainty, not permission to replay.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requires_host_scope: Option<bool>,
         target: SupervisorCurrentUserTarget,
         operation_id: SessionMessageId,
     },
     LegacyOrCreatedRoot {
         supervisor: SupervisorReference,
         supervisor_created_at: DateTime<Utc>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        caller: Option<crate::SessionCallerReference>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        requires_host_scope: Option<bool>,
         target_created_at: DateTime<Utc>,
         operation_id: SessionMessageId,
     },
 }
 
 impl SupervisedRootOutcomeInputOrigin {
+    /// Historical evidence is not a grant. Storage separately retains and
+    /// validates current authority; an originally finite source cannot be
+    /// widened merely because a restarted registry has no installation.
+    pub fn permits_scope_replay(&self, scoped: bool) -> bool {
+        match self.requires_host_scope() {
+            Some(true) => scoped,
+            Some(false) => true,
+            None => false,
+        }
+    }
+    pub fn requires_host_scope(&self) -> Option<bool> {
+        match self {
+            Self::CurrentUser {
+                requires_host_scope,
+                ..
+            }
+            | Self::LegacyOrCreatedRoot {
+                requires_host_scope,
+                ..
+            } => *requires_host_scope,
+        }
+    }
+    /// Historical executing identity. Absence is not permission to synthesize
+    /// a caller from a later load of the Supervisor.
+    pub fn original_caller(&self) -> Option<&crate::SessionCallerReference> {
+        match self {
+            Self::CurrentUser { caller, .. } | Self::LegacyOrCreatedRoot { caller, .. } => {
+                caller.as_ref()
+            }
+        }
+    }
+
     fn reference_and_operation(&self) -> (&SupervisorReference, &SessionMessageId) {
         match self {
             Self::CurrentUser {
@@ -79,6 +124,23 @@ impl SupervisedRootOutcomeInputOrigin {
         self.reference_and_operation().1
     }
 
+    pub fn supervisor(&self) -> &SupervisorReference {
+        self.reference_and_operation().0
+    }
+
+    pub fn supervisor_created_at(&self) -> DateTime<Utc> {
+        match self {
+            Self::CurrentUser {
+                supervisor_created_at,
+                ..
+            }
+            | Self::LegacyOrCreatedRoot {
+                supervisor_created_at,
+                ..
+            } => *supervisor_created_at,
+        }
+    }
+
     /// Structural consistency only. The storage writer must separately retain
     /// and validate the original caller, target and Inbox guards.
     pub fn matches_receipt(
@@ -92,6 +154,25 @@ impl SupervisedRootOutcomeInputOrigin {
             || supervisor.incarnation_id.is_nil()
             || supervisor.session_id == root_id
         {
+            return false;
+        }
+        if self.original_caller().is_some_and(|caller| {
+            caller.session_id != supervisor.session_id
+                || caller.authority_identity
+                    != (crate::SessionAuthorityIdentity::Supervisor {
+                        incarnation_id: supervisor.incarnation_id,
+                    })
+                || match self {
+                    Self::CurrentUser {
+                        supervisor_created_at,
+                        ..
+                    }
+                    | Self::LegacyOrCreatedRoot {
+                        supervisor_created_at,
+                        ..
+                    } => caller.created_at != *supervisor_created_at,
+                }
+        }) {
             return false;
         }
         match self {
@@ -150,12 +231,16 @@ impl SupervisedRootOutcomeInputOrigin {
                 Self::CurrentUser {
                     supervisor: left_supervisor,
                     supervisor_created_at: left_birth,
+                    caller: _,
+                    requires_host_scope: _,
                     target: left_target,
                     operation_id: left_operation,
                 },
                 Self::CurrentUser {
                     supervisor: right_supervisor,
                     supervisor_created_at: right_birth,
+                    caller: _,
+                    requires_host_scope: _,
                     target: right_target,
                     operation_id: right_operation,
                 },
@@ -171,12 +256,16 @@ impl SupervisedRootOutcomeInputOrigin {
                 Self::LegacyOrCreatedRoot {
                     supervisor: left_supervisor,
                     supervisor_created_at: left_birth,
+                    caller: _,
+                    requires_host_scope: _,
                     target_created_at: left_target_birth,
                     operation_id: left_operation,
                 },
                 Self::LegacyOrCreatedRoot {
                     supervisor: right_supervisor,
                     supervisor_created_at: right_birth,
+                    caller: _,
+                    requires_host_scope: _,
                     target_created_at: right_target_birth,
                     operation_id: right_operation,
                 },
@@ -203,6 +292,115 @@ pub struct SupervisedRootOutcomeInputProjection {
     pub correlation_id_sha256: Option<String>,
     /// Historical operation only; its presence does not authorize disclosure.
     pub recorded_supervisor_operation_id: Option<SessionMessageId>,
+}
+
+/// Bounded data returned by an integrated Observer source read after the
+/// current relationship, Root lifetime and original input ACKs are checked.
+/// This value is an observation, not permission to send or mutate a Session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverSupervisedRootInput {
+    pub receipt_id: SessionMessageId,
+    pub generation: u64,
+    pub operation_id: SessionMessageId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverSupervisedRootOutcome {
+    pub target_session_id: String,
+    pub target_created_at: DateTime<Utc>,
+    pub sequence: u64,
+    pub run_id: String,
+    pub status: SupervisedRootOutcomeResult,
+    pub inputs: Vec<ObserverSupervisedRootInput>,
+}
+
+/// The historical view is derived from the canonical fact, rather than from
+/// an independently replaceable snapshot. Values are escaped and bounded;
+/// full identities remain in the individually verified Supervisor notices.
+pub fn observer_root_outcome_status(outcome: &ObserverSupervisedRootOutcome) -> String {
+    fn preview(value: &str) -> String {
+        let mut result = String::new();
+        for ch in value.chars() {
+            let escaped = match ch {
+                '<' => "&lt;".to_string(),
+                '>' => "&gt;".to_string(),
+                '&' => "&amp;".to_string(),
+                '\\' | '`' | '*' | '_' | '[' | ']' | '#' | '!' | '|' => format!("\\{ch}"),
+                ch if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') => " ".to_string(),
+                ch => ch.to_string(),
+            };
+            if result.len() + escaped.len() > 297 {
+                result.push_str("...");
+                break;
+            }
+            result.push_str(&escaped);
+        }
+        result
+    }
+    fn identity(output: &mut String, label: &str, value: &str) {
+        output.push_str(&format!("- {label} preview: {}\n", preview(value)));
+        let encoded = hex::encode(value.as_bytes());
+        if encoded.len() <= 800 {
+            for (index, chunk) in encoded.as_bytes().chunks(400).enumerate() {
+                output.push_str(&format!(
+                    "- {label} UTF-8 hex part {}: {}\n",
+                    index + 1,
+                    std::str::from_utf8(chunk).expect("hex is ASCII")
+                ));
+            }
+        } else {
+            output.push_str(&format!(
+                "- {label} SHA-256: {} (full value in Supervisor notice)\n",
+                hex::encode(Sha256::digest(value.as_bytes()))
+            ));
+        }
+    }
+    let mut output = format!("# Session status\n\nRecorded Root outcome; not live progress.\n\n- Last persisted status: {}\n\n## Recorded Root outcome\n", outcome.status.observer_status());
+    identity(&mut output, "Run", &outcome.run_id);
+    if let Some(input) = outcome.inputs.first() {
+        identity(&mut output, "Input receipt", input.receipt_id.as_str());
+        identity(
+            &mut output,
+            "Supervisor operation",
+            input.operation_id.as_str(),
+        );
+    }
+    if outcome.inputs.len() > 1 {
+        output.push_str(&format!(
+            "- Verified inputs: {} (first shown; each has a separate Supervisor notice)\n",
+            outcome.inputs.len()
+        ));
+    }
+    output
+}
+
+pub const OBSERVER_ROOT_OUTCOME_BRIEF: &str =
+    "# Session task brief\n\nHistorical outcome only; task details are not included.\n";
+
+/// The historical lane is opt-in for a current status subscription. Legacy
+/// snapshots continue their original behavior and never become source cursors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ObserverRootOutcomeRead {
+    LegacySnapshot,
+    CaughtUp,
+    /// Main is committed but its owned input ACK has not yet appeared.
+    PendingSource,
+    Next(ObserverSupervisedRootOutcome),
+}
+
+impl SupervisedRootOutcomeResult {
+    /// Whitelisted persisted labels; never a provider error message.
+    pub fn observer_status(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "error",
+            Self::Cancelled => "cancelled",
+            Self::Suspended => "suspended",
+            Self::InterruptedUnknown => "interrupted_unknown",
+        }
+    }
 }
 
 /// No question text, error string or provider output is copied into this record.
@@ -1004,7 +1202,10 @@ impl SupervisedRootOutcomes {
         {
             return Err("Root outcome successor identity differs");
         }
-        let previous = self.facts.last().ok_or("Root outcome predecessor is missing")?;
+        let previous = self
+            .facts
+            .last()
+            .ok_or("Root outcome predecessor is missing")?;
         if previous.conversation_reset_sha256.as_deref() != conversation_reset_sha256
             || successor.attempt <= previous.attempt
             || successor.lease_epoch <= previous.lease_epoch
@@ -1020,8 +1221,11 @@ impl SupervisedRootOutcomes {
             None => {}
         }
         let mut candidate = self.clone();
-        candidate.facts.last_mut().expect("predecessor checked").result =
-            Some(SupervisedRootOutcomeResult::InterruptedUnknown);
+        candidate
+            .facts
+            .last_mut()
+            .expect("predecessor checked")
+            .result = Some(SupervisedRootOutcomeResult::InterruptedUnknown);
         candidate.validate()?;
         *self = candidate;
         Ok(true)
@@ -1303,11 +1507,18 @@ mod tests {
         assert_eq!(outcomes, before);
 
         let successor = fence(2);
-        assert!(outcomes.mark_predecessor_interrupted(&successor, None).unwrap());
-        assert!(!outcomes.mark_predecessor_interrupted(&successor, None).unwrap());
+        assert!(outcomes
+            .mark_predecessor_interrupted(&successor, None)
+            .unwrap());
+        assert!(!outcomes
+            .mark_predecessor_interrupted(&successor, None)
+            .unwrap());
         assert_eq!(outcomes.facts.len(), 1);
         assert_eq!(outcomes.facts[0].run_id, first.run_id);
-        assert_eq!(outcomes.facts[0].result, Some(SupervisedRootOutcomeResult::InterruptedUnknown));
+        assert_eq!(
+            outcomes.facts[0].result,
+            Some(SupervisedRootOutcomeResult::InterruptedUnknown)
+        );
     }
 
     #[test]
@@ -1324,9 +1535,35 @@ mod tests {
         let origin = SupervisedRootOutcomeInputOrigin::CurrentUser {
             supervisor: supervisor.clone(),
             supervisor_created_at: Utc::now(),
+            caller: None,
+            requires_host_scope: None,
             target: target.clone(),
             operation_id: operation.clone(),
         };
+        assert!(!origin.permits_scope_replay(false));
+        assert!(!origin.permits_scope_replay(true));
+        let mut finite = origin.clone();
+        if let SupervisedRootOutcomeInputOrigin::CurrentUser {
+            requires_host_scope,
+            ..
+        } = &mut finite
+        {
+            *requires_host_scope = Some(true);
+        }
+        assert!(!finite.permits_scope_replay(false));
+        assert!(finite.permits_scope_replay(true));
+        let mut default_current_user = finite.clone();
+        if let SupervisedRootOutcomeInputOrigin::CurrentUser {
+            requires_host_scope,
+            ..
+        } = &mut default_current_user
+        {
+            *requires_host_scope = Some(false);
+        }
+        assert!(default_current_user.permits_scope_replay(false));
+        assert!(default_current_user.permits_scope_replay(true));
+        assert!(origin.same_operation(&finite));
+        assert!(finite.same_operation(&default_current_user));
         let owned_input = SupervisedRootOutcomeInput {
             receipt_id: receipt.clone(),
             generation: 1,
@@ -1487,6 +1724,8 @@ mod tests {
                         SupervisedRootOutcomeInputOrigin::LegacyOrCreatedRoot {
                             supervisor,
                             supervisor_created_at: birth,
+                            caller: None,
+                            requires_host_scope: None,
                             target_created_at: birth,
                             operation_id: operation,
                         },

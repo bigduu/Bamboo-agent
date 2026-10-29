@@ -50,6 +50,7 @@ pub struct SessionInspectorTool {
     access: SessionHistoryAccess,
     tool_name: &'static str,
     discovery: Arc<dyn SessionDiscoveryPort>,
+    observer_outcome_inbox: Option<Arc<bamboo_storage::FileSessionInbox>>,
 }
 
 impl SessionInspectorTool {
@@ -62,6 +63,7 @@ impl SessionInspectorTool {
             storage,
             access: SessionHistoryAccess::HostRouted,
             tool_name: SESSION_HISTORY_TOOL_NAME,
+            observer_outcome_inbox: None,
         }
     }
 
@@ -72,6 +74,7 @@ impl SessionInspectorTool {
             storage,
             access: SessionHistoryAccess::Full,
             tool_name: SESSION_HISTORY_TOOL_NAME,
+            observer_outcome_inbox: None,
         }
     }
 
@@ -88,6 +91,7 @@ impl SessionInspectorTool {
             access: SessionHistoryAccess::Authorized,
             tool_name: SESSION_HISTORY_TOOL_NAME,
             discovery,
+            observer_outcome_inbox: None,
         }
     }
 
@@ -99,6 +103,7 @@ impl SessionInspectorTool {
             storage,
             access: SessionHistoryAccess::SelfOnly,
             tool_name: SESSION_HISTORY_TOOL_NAME,
+            observer_outcome_inbox: None,
         }
     }
 
@@ -113,7 +118,17 @@ impl SessionInspectorTool {
             storage,
             access: SessionHistoryAccess::SelfOnly,
             tool_name: SESSION_HISTORY_CURRENT_TOOL_NAME,
+            observer_outcome_inbox: None,
         }
+    }
+
+    /// Host-only Observer wiring; never a model-provided authority or grant.
+    pub fn with_observer_outcome_inbox(
+        mut self,
+        inbox: Arc<bamboo_storage::FileSessionInbox>,
+    ) -> Self {
+        self.observer_outcome_inbox = Some(inbox);
+        self
     }
 
     /// Trusted Host subscription adapter. It reuses the exact scoped reader and
@@ -125,7 +140,19 @@ impl SessionInspectorTool {
         filter: &std::collections::BTreeSet<bamboo_domain::ObserverChangeKind>,
         previous: Option<&str>,
     ) -> Result<Option<bamboo_agent_core::tools::ToolResult>, ToolError> {
-        scoped_context::observe(self, ctx, target_id, filter, previous).await
+        scoped_context::observe(self, ctx, target_id, filter, previous, false).await
+    }
+
+    /// The producer uses its receipt-committed source position, never a model
+    /// supplied fingerprint, to select the next historical Root status.
+    pub async fn observe_next_root_outcome(
+        &self,
+        ctx: &ToolCtx,
+        target_id: &str,
+        filter: &std::collections::BTreeSet<bamboo_domain::ObserverChangeKind>,
+        previous: Option<&str>,
+    ) -> Result<Option<bamboo_agent_core::tools::ToolResult>, ToolError> {
+        scoped_context::observe(self, ctx, target_id, filter, previous, true).await
     }
 
     pub(super) async fn load_session(

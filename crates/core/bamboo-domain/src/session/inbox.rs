@@ -3244,6 +3244,8 @@ mod tests {
                 incarnation_id: uuid::Uuid::new_v4(),
             },
             supervisor_created_at: Utc::now(),
+            caller: None,
+            requires_host_scope: None,
             target: crate::SupervisorCurrentUserTarget::capture(&target_session).unwrap(),
             operation_id: SessionMessageId::parse("origin-operation").unwrap(),
         };

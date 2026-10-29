@@ -1036,6 +1036,137 @@ pub(in crate::app_state) async fn consecutive_native_root_outcomes_have_distinct
     f.state.shutdown().await;
 }
 
+#[tokio::test]
+async fn historical_pending_requires_supervisor_receipt_before_observer_cursor() {
+    let f = Fixture::new_with_native_source(true).await;
+    let filter = BTreeSet::from([ObserverChangeKind::Status]);
+    f.register_targets(filter.clone(), BTreeSet::from([ROOT_A.into()]))
+        .await;
+    let source = run_native_source(&f, "guarded historical operation", 1).await;
+    // Model the narrow Main-before-ACK crash window with this isolated test
+    // receipt; no failure counter or cursor may advance while it is absent.
+    let admitted = f
+        .home
+        .path()
+        .join("sessions")
+        .join(ROOT_A)
+        .join("inbox")
+        .join("admitted");
+    let ack = std::fs::read_dir(&admitted)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            std::fs::read(path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .is_some_and(|value| {
+                    value.get("id").and_then(Value::as_str) == Some(source.0.as_str())
+                })
+        })
+        .expect("the real input ACK must exist");
+    let held = ack.with_extension("test-held");
+    std::fs::rename(&ack, &held).unwrap();
+    assert!(f.filtered(ROOT_A, &filter, None).await.is_none());
+    f.state.observer_subscriptions.tick(Utc::now()).await;
+    let waiting = f.subscription().await;
+    assert_eq!(waiting.failures, 0);
+    assert_eq!(waiting.window.root_outcome_cursors[ROOT_A].sequence, 0);
+    std::fs::rename(&held, &ack).unwrap();
+    let view = f.filtered(ROOT_A, &filter, None).await.unwrap();
+    let position: bamboo_domain::ObserverRootOutcomeCursor =
+        serde_json::from_value(view["root_outcome"].clone()).unwrap();
+    let now = Utc::now();
+    f.state
+        .session_store
+        .stage_supervisor_observation_with_root_outcome(
+            &f.reference,
+            OBSERVER,
+            ROOT_A,
+            view["revision"].as_str().unwrap(),
+            Some(&position),
+            now,
+        )
+        .await
+        .unwrap();
+    let before = f.state.session_inbox.inspect(OBSERVER).await.unwrap();
+    assert!(f
+        .state
+        .observer_subscriptions
+        .inbox
+        .deliver_supervisor_observation(&f.reference, OBSERVER, now)
+        .await
+        .is_err());
+    let after = f.state.session_inbox.inspect(OBSERVER).await.unwrap();
+    assert_eq!(before.generation, after.generation);
+    let pending = f.subscription().await.window;
+    assert_eq!(pending.root_outcome_cursors[ROOT_A].sequence, 0);
+    assert_eq!(
+        pending.pending.unwrap().root_outcome,
+        Some(position.clone())
+    );
+
+    let observer = load(&f.state, OBSERVER).await;
+    let receipts = f
+        .state
+        .observer_subscriptions
+        .inbox
+        .deliver_observer_root_outcome_to_supervisor(
+            &SessionCallerReference::from(&observer),
+            &f.reference,
+            ROOT_A,
+            position.sequence,
+            now,
+        )
+        .await
+        .unwrap()
+        .expect("root outcome source is ready");
+    assert_eq!(receipts.len(), 1);
+    assert!(receipts[0].delivery.generation > 0);
+    f.state
+        .observer_subscriptions
+        .inbox
+        .interrupt_next_observer_cursor_for_testing();
+    assert!(f
+        .state
+        .observer_subscriptions
+        .inbox
+        .deliver_supervisor_observation(&f.reference, OBSERVER, now)
+        .await
+        .is_err());
+    let interrupted = f.subscription().await.window;
+    assert_eq!(interrupted.root_outcome_cursors[ROOT_A].sequence, 0);
+    assert_eq!(
+        interrupted.pending.unwrap().root_outcome,
+        Some(position.clone())
+    );
+    let replay = f
+        .state
+        .observer_subscriptions
+        .inbox
+        .deliver_observer_root_outcome_to_supervisor(
+            &SessionCallerReference::from(&observer),
+            &f.reference,
+            ROOT_A,
+            position.sequence,
+            now,
+        )
+        .await
+        .unwrap()
+        .expect("root outcome source remains ready");
+    assert_eq!(replay[0].delivery, receipts[0].delivery);
+    f.state
+        .observer_subscriptions
+        .inbox
+        .deliver_supervisor_observation(&f.reference, OBSERVER, now)
+        .await
+        .unwrap();
+    let window = f.subscription().await.window;
+    assert_eq!(window.root_outcome_cursors[ROOT_A], position);
+    assert_eq!(window.enqueued_sequence, 1);
+    assert_ne!(source.0, "");
+    f.state.shutdown().await;
+}
+
 pub(in crate::app_state) async fn offline_observer_recovers_both_native_root_outcomes() {
     use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort};
 
