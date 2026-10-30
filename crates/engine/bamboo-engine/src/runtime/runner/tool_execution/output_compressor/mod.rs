@@ -511,6 +511,29 @@ pub(super) async fn maybe_compress(
         let counter = bamboo_compression::TiktokenTokenCounter::default();
         let tokens = counter.count_text(&result.result);
         if tokens > max_tool_output_tokens {
+            let subagent_content_page = execution_name == "SubAgent"
+                && result.success
+                && serde_json::from_str::<serde_json::Value>(&result.result)
+                    .ok()
+                    .is_some_and(|payload| {
+                        matches!(
+                            payload.get("view").and_then(serde_json::Value::as_str),
+                            Some("message" | "result")
+                        )
+                    });
+            if subagent_content_page {
+                // Never return a successful page whose cursor advances past
+                // text removed by generic compression. This also covers a
+                // Host/worker cap mismatch or a post-tool hook changing it.
+                result.success = false;
+                result.result = serde_json::json!({
+                    "error":"subagent_page_exceeds_tool_output_budget",
+                    "message":"Increase max_tool_output_tokens and retry this inspection page",
+                    "limit_tokens":max_tool_output_tokens,
+                })
+                .to_string();
+                return outcome;
+            }
             if exec_session {
                 if let Some(truncated) =
                     truncate_exec_session_output(&result.result, max_tool_output_tokens, &counter)
@@ -952,6 +975,72 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn oversized_subagent_content_page_fails_without_advancing_its_cursor() {
+        let raw = serde_json::json!({
+            "view":"result", "text":"界🦀".repeat(800),
+            "byte_start":0, "byte_end":5600, "next_cursor":"opaque-next-cursor",
+        })
+        .to_string();
+        let make_outcome = |execution_name: &str| ToolExecutionOutcome {
+            output_cap: None,
+            permission_replay_origin: None,
+            result: Ok(ToolResult::text(true, raw.clone())),
+            needs_human: None,
+            portable_tool: selected_tool_identity(execution_name),
+            post_tool_hook_eligible: true,
+            managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        };
+        for name in ["SubAgent", "default::SubAgent"] {
+            let result = maybe_compress(
+                name,
+                r#"{"intent":"inspect","message":"result"}"#,
+                "subagent-cap",
+                make_outcome("SubAgent"),
+                512,
+                None,
+                None,
+            )
+            .await
+            .result
+            .unwrap();
+            assert!(!result.success);
+            let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(payload["error"], "subagent_page_exceeds_tool_output_budget");
+            assert!(payload.get("next_cursor").is_none());
+            assert!(payload.get("text").is_none());
+        }
+        let unlimited = maybe_compress(
+            "SubAgent",
+            r#"{"intent":"inspect","message":"result"}"#,
+            "subagent-cap",
+            make_outcome("SubAgent"),
+            0,
+            None,
+            None,
+        )
+        .await
+        .result
+        .unwrap();
+        assert!(unlimited.success);
+        assert_eq!(unlimited.result, raw);
+        let foreign = maybe_compress(
+            "vendor::SubAgent",
+            "{}",
+            "subagent-cap",
+            make_outcome("vendor::SubAgent"),
+            512,
+            None,
+            None,
+        )
+        .await
+        .result
+        .unwrap();
+        assert!(foreign.success);
+        assert!(foreign.result.contains("tool output truncated"));
     }
 
     #[tokio::test]
