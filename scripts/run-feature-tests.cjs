@@ -88,9 +88,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // server-settings cases; the shared event allowlist is unconditional too.
 // SubAgent compact creation/pagination regressions belong to server-other,
 // facade budget validation to packages-4 and circuit regressions to packages-3.
-// The test-utils diagnostic records each compact read attempt; no additive
-// feature-only cases were added.
-const FEATURE_SOURCE_SHA256 = "cc12d1abd4c666bde1a925151b008e9661d9ebf8b7789c4ac16be6556abf76e3";
+// Host output-cap and compressor checks also belong to packages-3. The existing
+// compression library counts content pages against the dispatch cap; the
+// test-utils diagnostic records each read attempt. No additive feature-only
+// cases were added. Actual compact/actor integration targets stay in agent-tests-0.
+const FEATURE_SOURCE_SHA256 = "cb5d5d66467143429453fde8eddab531d00c2de19228cebb31e721a1c1bc1215";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
