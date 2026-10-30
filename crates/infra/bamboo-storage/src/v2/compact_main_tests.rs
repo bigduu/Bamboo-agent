@@ -317,7 +317,11 @@ async fn stale_outcome_full_save_adopts_main_and_runtime_callback_is_untrusted()
         .unwrap();
     assert!(full_published.load(std::sync::atomic::Ordering::SeqCst));
     assert_eq!(
-        stale.runtime_metadata.as_ref().unwrap().supervised_root_outcomes,
+        stale
+            .runtime_metadata
+            .as_ref()
+            .unwrap()
+            .supervised_root_outcomes,
         expected
     );
 

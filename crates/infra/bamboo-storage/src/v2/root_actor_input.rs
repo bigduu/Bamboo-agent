@@ -157,9 +157,11 @@ impl RootActorInputProof {
                 .last()
                 .is_none_or(|fact| fact.run_id != owner.fence.run_id || fact.result.is_some())
         {
-            if outcomes.facts.last().is_some_and(|fact| {
-                fact.result.is_none() && fact.run_id != owner.fence.run_id
-            }) {
+            if outcomes
+                .facts
+                .last()
+                .is_some_and(|fact| fact.result.is_none() && fact.run_id != owner.fence.run_id)
+            {
                 outcomes
                     .mark_predecessor_interrupted(&owner.fence, reset.as_deref())
                     .map_err(conflict)?;
