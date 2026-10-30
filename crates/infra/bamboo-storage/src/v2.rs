@@ -7358,7 +7358,7 @@ impl SessionStoreV2 {
             .and_then(|previous| previous.runtime_metadata.as_ref())
             .and_then(|metadata| metadata.supervised_root_outcomes.as_ref());
         let mut canonicalized = None;
-        if guards.root_actor.is_some() {
+        if let Some(root_actor) = guards.root_actor.as_ref() {
             let durable = previous_main.as_ref().ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::WouldBlock,
@@ -7381,11 +7381,7 @@ impl SessionStoreV2 {
                         "Root input and final outcome cannot share a transition",
                     ));
                 }
-                let owner = guards
-                    .root_actor
-                    .as_ref()
-                    .expect("Root owner checked")
-                    .owner();
+                let owner = root_actor.owner();
                 if let Some(outcomes) = outcomes.as_mut() {
                     if outcomes.facts.last().is_some_and(|fact| {
                         fact.result.is_none() && fact.run_id != owner.fence.run_id

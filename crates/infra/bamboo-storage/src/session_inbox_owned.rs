@@ -186,10 +186,12 @@ pub(crate) enum InboxAuthority {
         inbox_dir: PathBuf,
     },
     HostScoped {
-        _guard: crate::v2::host_session_scope::HostScopedDeliveryGuards,
+        // Boxed like `CurrentSupervisor` above: these guard sets are far larger
+        // than the other variants and would otherwise size every enum value.
+        _guard: Box<crate::v2::host_session_scope::HostScopedDeliveryGuards>,
     },
     HostCreation {
-        _guard: crate::v2::host_root_create::HostCreatedRootDeliveryGuards,
+        _guard: Box<crate::v2::host_root_create::HostCreatedRootDeliveryGuards>,
     },
     Unscoped {
         _guard: crate::v2::host_session_scope::LegacySessionDeliveryGuards,

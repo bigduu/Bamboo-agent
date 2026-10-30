@@ -4096,7 +4096,9 @@ impl SessionInboxPort for FileSessionInbox {
         // Never reenter public delivery or widen the ordinary same-tree port.
         self.deliver_with_lifecycle_held_state(
             envelope,
-            InboxAuthority::HostScoped { _guard: authority },
+            InboxAuthority::HostScoped {
+                _guard: Box::new(authority),
+            },
             None,
             Some(intent),
         )
@@ -4125,7 +4127,9 @@ impl SessionInboxPort for FileSessionInbox {
         )?;
         self.deliver_with_lifecycle_held_state(
             envelope,
-            InboxAuthority::HostCreation { _guard: authority },
+            InboxAuthority::HostCreation {
+                _guard: Box::new(authority),
+            },
             None,
             Some(intent),
         )
