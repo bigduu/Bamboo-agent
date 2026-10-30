@@ -1128,3 +1128,335 @@ async fn managed_clear_readback_refuses_permission_replay_or_uncertain_save() {
         f.state.shutdown().await;
     }
 }
+
+// Both routes see only temporary synthetic Sessions and the loopback owner.
+#[actix_web::test]
+async fn managed_clear_readback_allows_idle_plan_after_c1_preflight() {
+    for phase in [
+        bamboo_domain::PlanModeStatus::Exploring,
+        bamboo_domain::PlanModeStatus::Designing,
+        bamboo_domain::PlanModeStatus::Reviewing,
+        bamboo_domain::PlanModeStatus::Finalizing,
+    ] {
+        let f = Fixture::new(false).await;
+        let mut session = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("synthetic-c1-plan");
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: phase,
+        });
+        session.agent_runtime_state = Some(runtime);
+        f.state.storage.save_session(&session).await.unwrap();
+        let (_, directory) = f.call(Method::GET, None, None).await;
+        let target = directory["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "target-a")
+            .unwrap()["current_user_target"]
+            .clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(f.state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let detail = test::TestRequest::get()
+            .uri("/api/v1/sessions/target-a")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let detail = test::call_service(&app, detail).await;
+        assert_eq!(detail.status(), StatusCode::OK, "{phase:?}");
+        let detail: Value = test::read_body_json(detail).await;
+        assert_eq!(detail["session"]["is_running"], false, "{phase:?}");
+        assert_eq!(
+            detail["session"]["plan_mode"]["status"],
+            serde_json::to_value(phase).unwrap()
+        );
+        let pending = test::TestRequest::get()
+            .uri("/api/v1/respond/target-a/pending")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let pending = test::call_service(&app, pending).await;
+        assert_eq!(pending.status(), StatusCode::OK, "{phase:?}");
+        let pending: Value = test::read_body_json(pending).await;
+        assert_eq!(pending["has_pending_question"], false, "{phase:?}");
+        let clear = test::TestRequest::post()
+            .uri("/api/v1/sessions/target-a/clear")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let response = test::call_service(&app, clear).await;
+        assert_eq!(response.status(), StatusCode::OK, "{phase:?}");
+        let receipt: Value = test::read_body_json(response).await;
+        assert_eq!(receipt["success"], true);
+        let body = json!({"supervisor": f.supervisor, "target": target, "clear_readback": true});
+        let (status, history) = f
+            .call(Method::POST, Some("target-a/history"), Some(body))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{phase:?}: {history}");
+        assert_eq!(
+            history["bound_clear_evidence"],
+            json!({"full_message_count":0,"execution_active":false,
+            "has_pending_question":false,"has_pending_approval":false})
+        );
+        assert_eq!(history["bound_token_usage"], Value::Null);
+        let after = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .plan_mode
+                .as_ref()
+                .unwrap()
+                .status,
+            phase
+        );
+        f.state.shutdown().await;
+    }
+}
+
+#[actix_web::test]
+async fn managed_clear_readback_blocks_real_waits_even_with_idle_plan() {
+    for case in [
+        "approval",
+        "replay",
+        "recovery",
+        "pending_question",
+        "pending_input",
+        "runtime_running",
+        "active_tool",
+        "suspended_status",
+        "suspension",
+        "child",
+        "bash",
+        "local_runner",
+        "running_runner",
+    ] {
+        let f = Fixture::new(false).await;
+        let mut session = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        session.messages.clear();
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("synthetic-c1-plan");
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: if case == "approval" {
+                bamboo_domain::PlanModeStatus::AwaitingApproval
+            } else {
+                bamboo_domain::PlanModeStatus::Exploring
+            },
+        });
+        match case {
+            "replay" => {
+                session.metadata.insert(
+                    "permission.reexecute_tool_call_id".into(),
+                    "synthetic".into(),
+                );
+            }
+            "recovery" => {
+                session.metadata.insert(
+                    "permission.replay_save_recovery_required".into(),
+                    "synthetic".into(),
+                );
+            }
+            "pending_question" => session.set_pending_question(
+                "q".into(),
+                "synthetic".into(),
+                "synthetic".into(),
+                vec![],
+                false,
+            ),
+            "pending_input" => {
+                session.set_pending_injected_messages(vec![json!({"id":"synthetic"})])
+            }
+            "runtime_running" => runtime.status = bamboo_domain::AgentStatusState::Running,
+            "active_tool" => runtime.tools.active_tool_calls = 1,
+            "suspended_status" => runtime.status = bamboo_domain::AgentStatusState::Suspended,
+            "suspension" => {
+                runtime.suspension = Some(bamboo_domain::SuspensionState {
+                    reason: "synthetic".into(),
+                    suspended_at: chrono::Utc::now(),
+                    resumable: true,
+                    hook_point: None,
+                })
+            }
+            "child" => {
+                runtime.waiting_for_children =
+                    Some(bamboo_domain::WaitingForChildrenState::for_children(
+                        vec!["synthetic-child".into()],
+                        bamboo_domain::ChildWaitPolicy::All,
+                        chrono::Utc::now(),
+                    ))
+            }
+            "bash" => {
+                runtime.waiting_for_bash = Some(bamboo_domain::WaitingForBashState::for_bash(
+                    vec!["synthetic-shell".into()],
+                    chrono::Utc::now(),
+                ))
+            }
+            "approval" | "local_runner" | "running_runner" => {}
+            _ => unreachable!(),
+        }
+        session.agent_runtime_state = Some(runtime);
+        if case == "child" {
+            let mut child =
+                Session::new_child_of("synthetic-child", &session, "model", "Synthetic child");
+            child.set_project_id_meta(f.project.to_string());
+            f.state.storage.save_session(&child).await.unwrap();
+        }
+        f.state.storage.save_session(&session).await.unwrap();
+        let durable = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let durable_runtime = durable.agent_runtime_state.as_ref().unwrap();
+        match case {
+            "approval" => assert_eq!(
+                durable_runtime.plan_mode.as_ref().unwrap().status,
+                bamboo_domain::PlanModeStatus::AwaitingApproval
+            ),
+            "replay" => assert!(durable
+                .metadata
+                .contains_key("permission.reexecute_tool_call_id")),
+            "recovery" => assert!(durable
+                .metadata
+                .contains_key("permission.replay_save_recovery_required")),
+            "pending_question" => assert!(durable.has_pending_question()),
+            "pending_input" => assert!(durable.has_pending_injected_messages()),
+            "runtime_running" => assert_eq!(
+                durable_runtime.status,
+                bamboo_domain::AgentStatusState::Running
+            ),
+            "active_tool" => assert_eq!(durable_runtime.tools.active_tool_calls, 1),
+            "suspended_status" => assert_eq!(
+                durable_runtime.status,
+                bamboo_domain::AgentStatusState::Suspended
+            ),
+            "suspension" => assert!(durable_runtime.suspension.is_some()),
+            "child" => assert!(durable_runtime.waiting_for_children.is_some()),
+            "bash" => assert!(durable_runtime.waiting_for_bash.is_some()),
+            "local_runner" | "running_runner" => {}
+            _ => unreachable!(),
+        }
+        if matches!(case, "local_runner" | "running_runner") {
+            let mut runner = bamboo_engine::AgentRunner::new();
+            if case == "running_runner" {
+                runner.status = bamboo_engine::AgentStatus::Running;
+            }
+            f.state
+                .agent_runners
+                .write()
+                .await
+                .insert("target-a".into(), runner);
+        }
+        // Observe exactly the fields used by the existing Lotus C1 preflight.
+        let app = test::init_service(
+            App::new()
+                .app_data(f.state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let detail = test::TestRequest::get()
+            .uri("/api/v1/sessions/target-a")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let detail = test::call_service(&app, detail).await;
+        assert_eq!(detail.status(), StatusCode::OK, "{case}");
+        let detail: Value = test::read_body_json(detail).await;
+        assert_eq!(
+            detail["session"]["is_running"],
+            case == "running_runner",
+            "{case}"
+        );
+        let pending = test::TestRequest::get()
+            .uri("/api/v1/respond/target-a/pending")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let pending = test::call_service(&app, pending).await;
+        assert_eq!(pending.status(), StatusCode::OK, "{case}");
+        let pending: Value = test::read_body_json(pending).await;
+        assert_eq!(
+            pending["has_pending_question"],
+            case == "pending_question",
+            "{case}"
+        );
+        let approval = detail["session"]["plan_mode"]["status"] == "awaiting_approval";
+        assert_eq!(approval, case == "approval", "{case}");
+        let preflight_allows = detail["session"]["is_running"] == false
+            && pending["has_pending_question"] == false
+            && !approval;
+        assert_eq!(
+            preflight_allows,
+            !matches!(case, "approval" | "pending_question" | "running_runner"),
+            "{case}"
+        );
+        let (_, directory) = f.call(Method::GET, None, None).await;
+        let target = directory["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "target-a")
+            .unwrap()["current_user_target"]
+            .clone();
+        let body = json!({"supervisor":f.supervisor,"target":target,"clear_readback":true});
+        let (status, history) = f
+            .call(Method::POST, Some("target-a/history"), Some(body))
+            .await;
+        match case {
+            "approval" | "replay" => {
+                assert_eq!(status, StatusCode::OK, "{case}: {history}");
+                assert_eq!(
+                    history["bound_clear_evidence"]["has_pending_approval"], true,
+                    "{case}"
+                );
+            }
+            "pending_question" => {
+                assert_eq!(status, StatusCode::OK, "{case}: {history}");
+                assert_eq!(
+                    history["bound_clear_evidence"]["has_pending_question"], true,
+                    "{case}"
+                );
+            }
+            "local_runner" | "running_runner" => {
+                assert_eq!(status, StatusCode::OK, "{case}: {history}");
+                assert_eq!(
+                    history["bound_clear_evidence"]["execution_active"], true,
+                    "{case}"
+                );
+            }
+            _ => {
+                assert_eq!(status, StatusCode::LOCKED, "{case}: {history}");
+                assert_eq!(history["code"], "clear_readback_unsettled", "{case}");
+                assert!(history.get("bound_clear_evidence").is_none(), "{case}");
+            }
+        }
+        if matches!(case, "local_runner" | "running_runner") {
+            f.state.agent_runners.write().await.remove("target-a");
+        }
+        f.state.shutdown().await;
+    }
+}

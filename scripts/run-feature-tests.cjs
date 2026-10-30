@@ -98,8 +98,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // they are excluded from the ordinary storage run and executed once serially.
 // Two identity-bound clear-readback Actix cases also belong to server-handlers;
 // They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
-// The pending-snapshot predicate adds one ordinary domain packages-2 case and
-// one server-handlers Actix case; neither is an additive feature-only case.
+// The C1 pending predicates add two ordinary domain packages-2 cases and three
+// server-handlers Actix cases; none is an additive feature-only case.
 const FEATURE_SOURCE_SHA256 = "1237ba6c2a17d52eb69204322f082e5fc843ddca6dbc636e77e5d0f832cdc831";
 
 const FEATURE_CONTEXTS = [

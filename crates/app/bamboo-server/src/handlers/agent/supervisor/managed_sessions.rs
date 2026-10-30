@@ -320,11 +320,11 @@ pub async fn inspect_managed_history(
             "The target changed; refresh the directory",
         ));
     }
-    // Evaluate the domain's complete pending/uncertain predicate on this
-    // exact durable snapshot. Some conditions have existing explicit flags;
-    // otherwise fail closed without mislabelling them as an approval.
+    // Evaluate C1's pending/uncertain predicate on this exact durable
+    // snapshot. Idle non-approval Plans are retained; real waits still block.
+    // Otherwise fail closed without mislabelling a wait as an approval.
     let pending = if body.clear_readback {
-        bamboo_domain::conversation_reset_pending_rejection(&session)
+        bamboo_domain::conversation_clear_readback_pending_rejection(&session)
     } else {
         None
     };
