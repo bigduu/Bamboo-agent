@@ -4,9 +4,9 @@ use std::{collections::BTreeMap, io};
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
 use bamboo_domain::{
-    ProjectId, ProjectStatus, SessionCallerReference, SessionKind, SupervisorCurrentUserTarget,
-    SupervisorManagedLink, SupervisorManagementMutation, SupervisorManagementRequest,
-    SupervisorReference, SupervisorScopeObservation,
+    ProjectId, ProjectStatus, SessionKind, SupervisorCurrentUserTarget, SupervisorManagedLink,
+    SupervisorManagementMutation, SupervisorManagementRequest, SupervisorReference,
+    SupervisorScopeObservation,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_projects::ProjectStoreError;
@@ -167,7 +167,7 @@ pub async fn inspect_managed_sessions(
         .insert_header((actix_web::http::header::VARY,"Origin, Cookie, Authorization"))
         .json(json!({
             "capabilities":{"managed_sessions_http_v1":true,"supervisor_current_user_scope_v1":true,
-                "current_user_bound_history_v1":state.storage.supports_supervisor_current_user_observed_session()},
+                "current_user_bound_history_v1":state.storage.supports_supervisor_current_user_bound_history()},
             "scope":scope,"sessions":sessions,"next_after":page.next_after,"legacy_links":links,
             "management_access":{"kind":"current_user","requires_session_attachment":false},
             "owner_authorization":{"available":true,"required":true,"kind":"existing_access","http_registration":false,"code":null}
@@ -225,7 +225,7 @@ pub async fn inspect_managed_history(
     }
     if !state
         .storage
-        .supports_supervisor_current_user_observed_session()
+        .supports_supervisor_current_user_bound_history()
     {
         return Ok(history_error(
             StatusCode::NOT_IMPLEMENTED,
@@ -233,9 +233,26 @@ pub async fn inspect_managed_history(
             "This storage backend does not support bound history",
         ));
     }
-    let (durable, observed) = match state
+    // Active runners persist checkpoints to disk while their mutable local
+    // Session can outrun the shared cache. Check runner state without waiting
+    // while the storage guard is held; contention falls back to durable data.
+    let cache = state.sessions.clone();
+    let runners = state.agent_runners.clone();
+    let id = session_id.clone();
+    let read_cache: Option<Box<dyn FnOnce() -> Option<bamboo_domain::Session> + Send>> =
+        Some(Box::new(move || {
+            let runners = runners.try_read().ok()?;
+            if runners
+                .get(&id)
+                .is_some_and(|runner| runner.completed_at.is_none())
+            {
+                return None;
+            }
+            bamboo_engine::read_cached_session(&cache, &id)
+        }));
+    let (session, observed, cache_selected) = match state
         .storage
-        .load_supervisor_current_user_observed_session(&reference, &session_id)
+        .load_supervisor_current_user_bound_history(&reference, &body.target, read_cache)
         .await
     {
         Ok(snapshot) => snapshot,
@@ -247,9 +264,12 @@ pub async fn inspect_managed_history(
                     "bound_history_unsupported",
                     "This storage backend does not support bound history",
                 ),
-                io::ErrorKind::NotFound
-                | io::ErrorKind::PermissionDenied
-                | io::ErrorKind::WouldBlock => (
+                io::ErrorKind::WouldBlock => (
+                    StatusCode::CONFLICT,
+                    "target_observation_stale",
+                    "The target changed; refresh the directory",
+                ),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => (
                     StatusCode::CONFLICT,
                     "target_observation_unavailable",
                     "The observed target is unavailable or changed; refresh the directory",
@@ -263,6 +283,8 @@ pub async fn inspect_managed_history(
             return Ok(history_error(status, code, message));
         }
     };
+    // A custom backend cannot turn its returned identity into a grant or cause
+    // this endpoint to expose history for a different selected target.
     if observed != body.target {
         return Ok(history_error(
             StatusCode::CONFLICT,
@@ -270,30 +292,10 @@ pub async fn inspect_managed_history(
             "The target changed; refresh the directory",
         ));
     }
-
-    // Preserve the existing quiet-session cache behavior only when the cached
-    // immutable snapshot has the same complete caller/generation, project and
-    // metadata as the guarded durable read. A replacement cache must never be
-    // paired with the old observed target. Active runs use persisted history,
-    // exactly as the ordinary history handler does.
-    let active = state
-        .agent_runners
-        .read()
-        .await
-        .get(&session_id)
-        .is_some_and(|runner| runner.completed_at.is_none());
-    let cached = (!active)
-        .then(|| bamboo_engine::read_cached_session(&state.sessions, &session_id))
-        .flatten();
-    let (session, source) = match cached {
-        Some(cached)
-            if SessionCallerReference::from(&durable).matches_session(&cached)
-                && cached.metadata_version == durable.metadata_version
-                && cached.project_id_meta() == durable.project_id_meta() =>
-        {
-            (cached, "matched_cache")
-        }
-        _ => (durable, "durable"),
+    let source = if cache_selected {
+        "matched_cache"
+    } else {
+        "durable"
     };
     let mut result =
         crate::handlers::agent::history::render_history(&session_id, session, &body.query);

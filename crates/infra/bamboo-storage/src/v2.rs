@@ -7697,8 +7697,41 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
-    fn supports_supervisor_current_user_observed_session(&self) -> bool {
+    fn supports_supervisor_current_user_bound_history(&self) -> bool {
         true
+    }
+
+    async fn load_supervisor_current_user_bound_history(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        expected: &bamboo_domain::SupervisorCurrentUserTarget,
+        read_cache: Option<Box<dyn FnOnce() -> Option<Session> + Send>>,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorCurrentUserTarget, bool)> {
+        let guard = self
+            .lock_current_user_target(supervisor, &expected.session_id)
+            .await?;
+        if guard.reference != *expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "target observation changed",
+            ));
+        }
+        let durable = self
+            .peer_delivery_session(&expected.session_id, &guard.target.root_session_id)
+            .await?;
+        let cached = read_cache.and_then(|read| read());
+        let (session, cache_selected) = match cached {
+            Some(cached)
+                if bamboo_domain::SessionCallerReference::from(&durable)
+                    .matches_session(&cached)
+                    && cached.metadata_version == durable.metadata_version
+                    && cached.project_id_meta() == durable.project_id_meta() =>
+            {
+                (cached, true)
+            }
+            _ => (durable, false),
+        };
+        Ok((session, guard.reference.clone(), cache_selected))
     }
 
     async fn load_supervisor_current_user_observed_session(
