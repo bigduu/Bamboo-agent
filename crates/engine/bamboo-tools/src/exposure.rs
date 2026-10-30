@@ -148,7 +148,7 @@ where
 pub fn expandable_tool_short_description(name: &str) -> Option<&'static str> {
     match canonical_tool_name(name).as_str() {
         "Sleep" => Some("Pause briefly when waiting for an external state change before polling again."),
-        "ViewImage" => Some("Inspect a local PNG, JPEG, GIF, WebP, or retained conversation image reference through multimodal delivery or configured Vision-model description."),
+        "ViewImage" => Some("Inspect a local PNG, JPEG, GIF, WebP, or retained conversation image reference; an optional prompt can focus the Vision-model description on the user's question."),
         "WebFetch" => Some("Fetch a webpage by URL when you need cleaned page text from a known target."),
         "memory" => Some("Manage Bamboo's unified memory system for session notes and durable project/global memories."),
         "scheduler" => Some("Manage Bamboo scheduled automation jobs for recurring or delayed work."),
