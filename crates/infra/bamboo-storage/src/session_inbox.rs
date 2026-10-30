@@ -5,7 +5,7 @@
 //! `Session.id`; the current worker/process/placement never enters the path.
 
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
@@ -1512,26 +1512,25 @@ impl FileSessionInbox {
     }
 
     async fn lock_file(dir: &Path) -> Result<FileOperationLock, SessionInboxError> {
-        tokio::fs::create_dir_all(dir).await.map_err(|error| {
-            SessionInboxError::Storage(format!(
-                "create session inbox directory {}: {error}",
-                dir.display()
-            ))
-        })?;
-        let path = dir.join(OPERATION_LOCK_FILE);
+        let path = dir.to_owned();
         tokio::task::spawn_blocking(move || {
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .map_err(|error| {
-                    SessionInboxError::Storage(format!(
-                        "open session inbox lock {}: {error}",
-                        path.display()
-                    ))
-                })?;
+            // The legacy claim/ACK path takes the same advisory lock as the owned
+            // writer, so it must resolve it the same way: retain the canonical
+            // Inbox directory and open the lock name relative to that handle. A
+            // link at either name now fails closed instead of creating or locking
+            // an object outside the canonical Inbox.
+            let anchor = anchor::InboxAnchor::acquire(&path).map_err(|error| {
+                SessionInboxError::Storage(format!(
+                    "create session inbox directory {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let file = anchor.open_lock(OPERATION_LOCK_FILE).map_err(|error| {
+                SessionInboxError::Storage(format!(
+                    "open session inbox lock {}: {error}",
+                    path.display()
+                ))
+            })?;
             file.lock_exclusive().map_err(|error| {
                 SessionInboxError::Storage(format!(
                     "lock session inbox {}: {error}",
@@ -4657,6 +4656,51 @@ mod tests {
             }
             if !rejected {
                 violations.push(format!("{link} link did not fail closed"));
+            }
+        }
+        assert!(violations.is_empty(), "{}", violations.join("; "));
+    }
+
+    /// The legacy claim/ACK entrypoint reaches the operation lock through
+    /// `lock_operation`, not through the owned writer, so it needs its own guard
+    /// against a replaced Inbox name or lock name.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn legacy_ack_does_not_follow_inbox_or_lock_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let mut violations = Vec::new();
+        for link in ["inbox", "lock"] {
+            let (temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+            let inbox_dir = sessions.sessions_root_dir().join("session-1").join("inbox");
+            let outside = temp.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            assert!(!inbox_dir.exists(), "fixture must not already own an Inbox");
+            let escaped = if link == "inbox" {
+                symlink(&outside, &inbox_dir).unwrap();
+                outside.join(OPERATION_LOCK_FILE)
+            } else {
+                std::fs::create_dir(&inbox_dir).unwrap();
+                let escaped = outside.join("escaped-lock");
+                symlink(&escaped, inbox_dir.join(OPERATION_LOCK_FILE)).unwrap();
+                escaped
+            };
+            let claim = SessionInboxClaim {
+                envelope: SessionMessageEnvelope::user_input("session-1", "instruction"),
+                generation: 1,
+                activation_policy: SessionActivationPolicy::RespectSpecificWait,
+                claim_id: "00000000000000000001.json".into(),
+            };
+            let result = inbox.ack("session-1", &claim).await;
+            if escaped.exists() {
+                violations.push(format!(
+                    "{link} link took a lock outside the canonical Inbox"
+                ));
+            }
+            if !matches!(result, Err(SessionInboxError::Storage(_))) {
+                violations.push(format!(
+                    "{link} link did not fail closed at the lock boundary: {result:?}"
+                ));
             }
         }
         assert!(violations.is_empty(), "{}", violations.join("; "));

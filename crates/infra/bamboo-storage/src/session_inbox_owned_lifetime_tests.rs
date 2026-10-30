@@ -4,6 +4,7 @@ use bamboo_domain::{
     Session, SessionInboxConsumerId, SessionInboxLeaseRequest, SessionInboxOwnedClaim, Storage,
 };
 use chrono::Duration as LeaseDuration;
+use std::fs::OpenOptions;
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
     Condvar,
