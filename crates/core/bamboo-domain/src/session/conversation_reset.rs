@@ -205,7 +205,11 @@ impl ConversationResetState {
     }
 }
 
-fn pending_rejection(session: &Session) -> Option<ConversationResetRejection> {
+/// Inspect only pending or uncertain state present in this Session snapshot.
+/// This is not a reset authorization, execution grant, or proof of physical idle.
+pub fn conversation_reset_pending_rejection(
+    session: &Session,
+) -> Option<ConversationResetRejection> {
     use ConversationResetRejection as Rejection;
     if session
         .metadata
@@ -319,7 +323,7 @@ pub fn prepare_conversation_reset(
     {
         return Ok(Rejected(Rejection::StaleObservation));
     }
-    if let Some(rejection) = pending_rejection(session) {
+    if let Some(rejection) = conversation_reset_pending_rejection(session) {
         return Ok(Rejected(rejection));
     }
     let rejection = match safety {

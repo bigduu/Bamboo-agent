@@ -994,6 +994,15 @@ async fn managed_clear_readback_binds_full_count_pending_and_local_activity() {
 #[actix_web::test]
 async fn managed_clear_readback_follows_acknowledged_c1() {
     let f = Fixture::new(false).await;
+    // Retain the selector actually held by the UI when it issued C1.
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
     let app = test::init_service(
         App::new()
             .app_data(f.state.clone())
@@ -1009,14 +1018,17 @@ async fn managed_clear_readback_follows_acknowledged_c1() {
     let receipt: Value = test::read_body_json(response).await;
     assert_eq!(receipt["success"], true);
     assert_eq!(receipt["session_id"], "target-a");
-    let (_, directory) = f.call(Method::GET, None, None).await;
-    let target = directory["sessions"]
+    let (_, after_directory) = f.call(Method::GET, None, None).await;
+    let after_target = &after_directory["sessions"]
         .as_array()
         .unwrap()
         .iter()
         .find(|row| row["session_id"] == "target-a")
-        .unwrap()["current_user_target"]
-        .clone();
+        .unwrap()["current_user_target"];
+    assert_eq!(
+        after_target, &target,
+        "ordinary C1 must retain its observed selector"
+    );
     let request = json!({"supervisor": f.supervisor, "target": target, "clear_readback": true});
     let (status, history) = f
         .call(Method::POST, Some("target-a/history"), Some(request))
@@ -1033,4 +1045,86 @@ async fn managed_clear_readback_follows_acknowledged_c1() {
     assert_eq!(history["is_delta"], false);
     assert_eq!(history["truncated"], false);
     f.state.shutdown().await;
+}
+
+// C1 retains these permission replay markers. An empty visible transcript and
+// an idle local runner are therefore insufficient clear-confirmation evidence.
+#[actix_web::test]
+async fn managed_clear_readback_refuses_permission_replay_or_uncertain_save() {
+    for marker in [
+        "permission.reexecute_tool_call_id",
+        "permission.reexecute_request_generation",
+        "permission.replay_save_recovery_required",
+    ] {
+        let f = Fixture::new(false).await;
+        let mut session = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        session.metadata.insert(marker.into(), "synthetic".into());
+        f.state.storage.save_session(&session).await.unwrap();
+        let (_, directory) = f.call(Method::GET, None, None).await;
+        let target = directory["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "target-a")
+            .unwrap()["current_user_target"]
+            .clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(f.state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let clear = test::TestRequest::post()
+            .uri("/api/v1/sessions/target-a/clear")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let response = test::call_service(&app, clear).await;
+        assert_eq!(response.status(), StatusCode::OK, "{marker}");
+        let receipt: Value = test::read_body_json(response).await;
+        assert_eq!(receipt["success"], true, "{marker}");
+        let stored = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.messages.is_empty(), "{marker}");
+        assert!(stored.pending_question.is_none(), "{marker}");
+        assert!(stored.token_usage.is_none(), "{marker}");
+        assert!(stored.metadata.contains_key(marker), "{marker}");
+        assert!(
+            !f.state.agent_runners.read().await.contains_key("target-a"),
+            "{marker}"
+        );
+        let body = json!({"supervisor": f.supervisor, "target": target, "clear_readback": true});
+        let (status, history) = f
+            .call(Method::POST, Some("target-a/history"), Some(body.clone()))
+            .await;
+        if marker == "permission.replay_save_recovery_required" {
+            assert_eq!(status, StatusCode::LOCKED, "{marker}: {history}");
+            assert_eq!(history["code"], "clear_readback_unsettled");
+            assert!(history.get("bound_clear_evidence").is_none());
+        } else {
+            assert_eq!(status, StatusCode::OK, "{marker}: {history}");
+            assert_eq!(
+                history["bound_clear_evidence"]["has_pending_approval"], true,
+                "{marker}"
+            );
+        }
+        let mut ordinary = body;
+        ordinary.as_object_mut().unwrap().remove("clear_readback");
+        let (status, ordinary_history) = f
+            .call(Method::POST, Some("target-a/history"), Some(ordinary))
+            .await;
+        assert_eq!(status, StatusCode::OK, "ordinary history: {marker}");
+        assert!(ordinary_history.get("bound_clear_evidence").is_none());
+        f.state.shutdown().await;
+    }
 }

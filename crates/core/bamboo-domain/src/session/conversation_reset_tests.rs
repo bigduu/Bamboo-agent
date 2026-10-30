@@ -525,3 +525,53 @@ fn reset_request_has_no_force_stop_permission_or_role_argument() {
         .authority_identity
         .is_ordinary());
 }
+
+#[test]
+fn pending_snapshot_predicate_reports_permission_replay_and_other_unsettled_state() {
+    let clean = source(false);
+    assert_eq!(conversation_reset_pending_rejection(&clean), None);
+    for (key, expected) in [
+        (
+            "permission.reexecute_tool_call_id",
+            ConversationResetRejection::PendingApproval,
+        ),
+        (
+            "permission.reexecute_request_generation",
+            ConversationResetRejection::PendingApproval,
+        ),
+        (
+            "permission.replay_save_recovery_required",
+            ConversationResetRejection::UncertainOperation,
+        ),
+        (
+            "agent.runtime.state",
+            ConversationResetRejection::LegacyRuntimeState,
+        ),
+    ] {
+        let mut session = clean.clone();
+        session.metadata.insert(key.into(), "synthetic".into());
+        assert_eq!(
+            conversation_reset_pending_rejection(&session),
+            Some(expected),
+            "{key}"
+        );
+    }
+    let mut session = clean.clone();
+    session.set_pending_injected_messages(vec![json!({"id":"synthetic"})]);
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingInput)
+    );
+    let mut session = clean.clone();
+    session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::ActiveRun)
+    );
+    let mut session = clean;
+    session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Suspended;
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingWait)
+    );
+}
