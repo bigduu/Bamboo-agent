@@ -12,7 +12,17 @@ For a supported target, send one `POST` to
 ```json
 {
   "supervisor": { "session_id": "bamboo-default-supervisor", "incarnation_id": "<uuid>" },
-  "target": "<the complete current_user_target object from the directory>",
+  "target": {
+    "session_id": "session-123",
+    "created_at": "2026-10-30T00:00:00Z",
+    "kind": "root",
+    "root_session_id": "session-123",
+    "parent_session_id": null,
+    "authority_sha256": "<64 lowercase hex characters>",
+    "ancestry_sha256": "<64 lowercase hex characters>",
+    "metadata_version": 0,
+    "project_id": null
+  },
   "query": { "since_message_id": "<optional cursor>", "projection": "messages" }
 }
 ```
