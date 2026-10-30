@@ -36,14 +36,19 @@ fn list_inspect_budget() -> Duration {
 ///
 /// `Command::output()` waits forever: its failure model has no exit for a
 /// child that never exits. Storage that stalls the kernel (dataless files,
-/// dead NFS mounts) produces exactly that child, so every Git invocation in
-/// this module funnels through this bounded wrapper instead. Std-only:
-/// reader threads drain the pipes (avoids fixed-size pipe deadlocks), the
-/// parent polls `try_wait`, and a miss of the deadline escalates to
-/// `kill()`. A killed child surfaces as a normal `Err` string so callers
-/// degrade that one entry instead of hanging the whole inventory.
-fn bounded_output(mut command: Command, deadline: Duration) -> Result<Output, String> {
+/// dead network mounts) produces exactly that child, so every Git
+/// invocation in this module funnels through this bounded wrapper instead.
+/// Std-only: stdin is null so commands that read it (`mktree`) see the same
+/// immediate EOF `output()` gave them instead of inheriting a long-lived
+/// server stdin; one reader thread per pipe drains output (so a full pipe
+/// can never deadlock the child); the parent polls `try_wait`; a missed
+/// deadline escalates to `kill()` plus a reaping `wait()`, which guarantees
+/// the pipe writers are gone before `recv()` runs. A killed child surfaces
+/// as a normal `Err` string so callers degrade that one entry instead of
+/// hanging the whole inventory.
+fn bounded_output(mut command: Command, deadline_at: Instant) -> Result<Output, String> {
     let mut child = command
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -68,7 +73,7 @@ fn bounded_output(mut command: Command, deadline: Duration) -> Result<Output, St
     });
     let started = Instant::now();
     let mut status = None;
-    while started.elapsed() < deadline {
+    while Instant::now() < deadline_at {
         match child.try_wait() {
             Ok(exited) => {
                 if exited.is_some() {
@@ -154,10 +159,15 @@ pub(super) fn git_command(repo: &Path) -> Command {
 }
 
 fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
-    command_with_timeout(repo, args, git_command_timeout())
+    command_by(repo, args, Instant::now() + git_command_timeout())
 }
 
-fn command_with_timeout(repo: &Path, args: &[&str], deadline: Duration) -> Result<Output, String> {
+/// Runs one Git command, bounded by `deadline_at`. The effective ceiling is
+/// also capped by the per-command ceiling, so one slow entry can never spend
+/// a whole inventory budget on a single child.
+fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output, String> {
+    let ceiling = Instant::now() + git_command_timeout();
+    let deadline_at = deadline_at.min(ceiling);
     let mut command = git_command(repo);
     if matches!(args.first(), Some(&"status" | &"read-tree"))
         || args.starts_with(&["worktree", "add"])
@@ -167,7 +177,7 @@ fn command_with_timeout(repo: &Path, args: &[&str], deadline: Duration) -> Resul
         // values. Bounded too: an include file can live on stalled storage.
         let mut probe = git_command(repo);
         probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
-        let configured = bounded_output(probe, deadline)
+        let configured = bounded_output(probe, deadline_at)
             .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
         if !configured.status.success() {
             return Err(format!(
@@ -203,19 +213,15 @@ fn command_with_timeout(repo: &Path, args: &[&str], deadline: Duration) -> Resul
         }
     }
     command.args(args);
-    bounded_output(command, deadline).map_err(|e| format!("Git at {}: {e}", repo.display()))
+    bounded_output(command, deadline_at).map_err(|e| format!("Git at {}: {e}", repo.display()))
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    git_bytes_with_deadline(repo, args, git_command_timeout())
+    git_bytes_by(repo, args, Instant::now() + git_command_timeout())
 }
 
-fn git_bytes_with_deadline(
-    repo: &Path,
-    args: &[&str],
-    deadline: Duration,
-) -> Result<Vec<u8>, String> {
-    let output = command_with_timeout(repo, args, deadline)?;
+fn git_bytes_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Vec<u8>, String> {
+    let output = command_by(repo, args, deadline_at)?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         let guidance = if diagnostic.contains(": smudge filter ")
@@ -795,12 +801,11 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
             continue;
         }
         let mut inspect = || -> Result<(PathBuf, bool), String> {
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .ok_or_else(|| {
-                    "Inspection budget exhausted; dirty state is unknown for this checkout"
-                        .to_string()
-                })?;
+            if Instant::now() >= deadline {
+                return Err(
+                    "Inspection budget exhausted; dirty state is unknown for this checkout".into(),
+                );
+            }
             let canonical = fs::canonicalize(&entry.path)
                 .map_err(|e| format!("{} is unavailable: {e}", entry.path.display()))?;
             if repository(&canonical)? != common || workspace_root(&canonical)? != canonical {
@@ -809,12 +814,11 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
             // Opening depends on checkout identity, not whether Git can report
             // its complete dirty state (for example, a disabled content filter).
             entry.openable = true;
-            let index =
-                git_bytes_with_deadline(&canonical, &["ls-files", "--stage", "-z"], remaining)?;
+            let index = git_bytes_by(&canonical, &["ls-files", "--stage", "-z"], deadline)?;
             let has_submodules = index
                 .split(|byte| *byte == 0)
                 .any(|entry| entry.starts_with(b"160000 "));
-            let status = git_bytes_with_deadline(
+            let status = git_bytes_by(
                 &canonical,
                 &[
                     "status",
@@ -823,7 +827,7 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
                     "--untracked-files=normal",
                     "--ignore-submodules=dirty",
                 ],
-                remaining,
+                deadline,
             )?;
             if status.is_empty() && has_submodules {
                 return Err(
@@ -1972,6 +1976,35 @@ mod tests {
             "New-context filters: {observations:?}"
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn git_children_see_eof_stdin_even_when_the_parent_keeps_stdin_open() {
+        // bamboo serve runs with an open stdin forever. Children that read
+        // stdin (`mktree` inside create()) must see EOF immediately, not the
+        // inherited server stdin, or they block until the command timeout.
+        let f = Fixture::new();
+        let read_end = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(f.0.join("held-open-stdin"))
+            .unwrap();
+        let _held = StdioHolder(read_end);
+        let started = std::time::Instant::now();
+        let created = create(&f.repo(), &f.roots(), "stdin-eof", "stdin-eof").unwrap();
+        assert!(
+            started.elapsed() < git_command_timeout(),
+            "create must not wait for the command ceiling"
+        );
+        assert!(created.join(".git").is_file());
+    }
+
+    /// Keeps the held file descriptor open for the test body; a plain File
+    /// would be dropped (and closed) before the assertion runs.
+    #[cfg(unix)]
+    struct StdioHolder(std::fs::File);
 
     #[cfg(unix)]
     #[test]
