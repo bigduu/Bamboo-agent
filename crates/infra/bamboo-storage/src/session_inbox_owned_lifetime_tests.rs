@@ -668,7 +668,41 @@ fn actual_write_error_cleanup_keeps_guards_and_primary_error_without_publication
 }
 
 #[test]
-fn failed_replace_rotation_and_remove_keep_existing_residue_and_terminal_contracts() {
+fn replace_failure_cleans_write_temp_and_keeps_primary_error() {
+    let fixture = Fixture::new();
+    fixture.deliver();
+    let first = fixture.request(0);
+    let claim = fixture.claim(&first);
+    let path = fixture.dir.join("cur").join(&claim.claim.claim_id);
+    let before = std::fs::read(&path).unwrap();
+    let mut inbox = fixture.inbox.clone();
+    inbox.owned_fs_hook = Some(Arc::new(|phase, _| {
+        if phase == "replace" {
+            return Err(std::io::Error::other("primary replace failure"));
+        }
+        Ok(())
+    }));
+    let mut request = first.clone();
+    request.now += LeaseDuration::seconds(5);
+    let error = fixture
+        .runtime
+        .block_on(inbox.renew_owned("target", &claim, &request))
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("primary replace failure"));
+    // No publication and no stranded temp after the failed replace.
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+    assert!(
+        !std::fs::read_dir(path.parent().unwrap()).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("tmp."))
+    );
+}
+
+#[test]
+fn failed_replace_rotation_and_remove_keep_existing_and_clean_temp_on_write_failures() {
     for failure in ["write", "replace", "after_replace", "rotate", "remove"] {
         let fixture = Fixture::new();
         fixture.deliver();
@@ -754,7 +788,7 @@ fn failed_replace_rotation_and_remove_keep_existing_residue_and_terminal_contrac
                         .contains("tmp.")
                 })
                 .count();
-            assert_eq!(temps, usize::from(failure == "replace")); // existing rename-failure residue
+            assert_eq!(temps, 0); // failed replace observation/rename cleans its temp
         }
     }
 }
@@ -805,7 +839,7 @@ fn acquisition_setup_keeps_preceding_scope_until_deleted_target_can_pass() {
 }
 
 #[test]
-fn actual_os_replace_error_retains_scope_and_leaves_original_temp_residue() {
+fn actual_os_replace_error_retains_scope_and_cleans_the_write_temp() {
     let fixture = Fixture::new();
     fixture.deliver();
     let first = fixture.request(0);
@@ -849,7 +883,7 @@ fn actual_os_replace_error_retains_scope_and_leaves_original_temp_residue() {
                 .contains("tmp.")
         })
         .count();
-    assert_eq!(temps, 1);
+    assert_eq!(temps, 0, "actual rename failure must clean its write temp");
     // Restore only this fixture's injected directory fault, not production repair.
     std::fs::remove_dir(&path).unwrap();
     std::fs::write(&path, before).unwrap();

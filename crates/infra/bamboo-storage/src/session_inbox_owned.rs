@@ -318,11 +318,18 @@ impl OwnedFilesystem {
             use std::io::Write;
             let anchor = filesystem.anchor();
             let temp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            // Every step through the anchored rename shares the cleanup below: a
+            // failed observation, validation, or rename must not leave the
+            // exclusive temp behind. `after_replace` runs post-commit, so a late
+            // observation error reports without touching published bytes.
             let result = (|| {
                 let mut file = anchor.create_exclusive(&temp)?;
                 filesystem.observe("write_temp", path)?;
                 file.write_all(&bytes)?;
-                file.sync_all()
+                file.sync_all()?;
+                filesystem.observe("replace", path)?;
+                filesystem.validate()?;
+                anchor.rename(&temp, path)
             })();
             if let Err(error) = result {
                 // Keep the primary error and the existing best-effort cleanup contract.
@@ -331,9 +338,6 @@ impl OwnedFilesystem {
                 let _ = anchor.remove_file(&temp);
                 return Err(error);
             }
-            filesystem.observe("replace", path)?;
-            filesystem.validate()?;
-            anchor.rename(&temp, path)?;
             filesystem.observe("after_replace", path)
         })
         .await
