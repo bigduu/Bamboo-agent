@@ -233,26 +233,12 @@ pub async fn inspect_managed_history(
             "This storage backend does not support bound history",
         ));
     }
-    // Active runners persist checkpoints to disk while their mutable local
-    // Session can outrun the shared cache. Check runner state without waiting
-    // while the storage guard is held; contention falls back to durable data.
-    let cache = state.sessions.clone();
-    let runners = state.agent_runners.clone();
-    let id = session_id.clone();
-    let read_cache: Option<Box<dyn FnOnce() -> Option<bamboo_domain::Session> + Send>> =
-        Some(Box::new(move || {
-            let runners = runners.try_read().ok()?;
-            if runners
-                .get(&id)
-                .is_some_and(|runner| runner.completed_at.is_none())
-            {
-                return None;
-            }
-            bamboo_engine::read_cached_session(&cache, &id)
-        }));
-    let (session, observed, cache_selected) = match state
+    // The existing guarded Session snapshot is authoritative for freshness.
+    // Matching cache identity alone cannot prove that its history includes
+    // every durable append, edit or truncation.
+    let (session, observed) = match state
         .storage
-        .load_supervisor_current_user_bound_history(&reference, &body.target, read_cache)
+        .load_supervisor_current_user_bound_history(&reference, &body.target)
         .await
     {
         Ok(snapshot) => snapshot,
@@ -292,11 +278,9 @@ pub async fn inspect_managed_history(
             "The target changed; refresh the directory",
         ));
     }
-    let source = if cache_selected {
-        "matched_cache"
-    } else {
-        "durable"
-    };
+    // Token state belongs to this same immutable snapshot. A managed client
+    // can safely recover after a clear without a separate ID-only detail read.
+    let bound_token_usage = session.token_usage.clone();
     let mut result =
         crate::handlers::agent::history::render_history(&session_id, session, &body.query);
     let object = result
@@ -304,7 +288,8 @@ pub async fn inspect_managed_history(
         .expect("history renderer always returns an object");
     object.insert("supervisor".into(), json!(reference));
     object.insert("current_user_target".into(), json!(observed));
-    object.insert("history_snapshot_source".into(), json!(source));
+    object.insert("history_snapshot_source".into(), json!("durable"));
+    object.insert("bound_token_usage".into(), json!(bound_token_usage));
     Ok(HttpResponse::Ok()
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
         .insert_header((
