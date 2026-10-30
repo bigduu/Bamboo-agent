@@ -173,6 +173,20 @@ test("serial storage retains complete original selectors and exact successful ru
     { log: success + "test " + names[0] + " ... ok\n" }]) assert.throws(() => run(overrides));
 });
 
+test("bound history guard cases have one serial storage owner", () => {
+  const prefix = "v2::supervisor_management::current_user::observed_history_guard_tests::";
+  const names = ["bound_history_rejects_stale_target", "observed_history_guard_fences_same_id_recreation_until_snapshot_finishes"]
+    .map((name) => prefix + name);
+  assert.ok(SERIAL_STORAGE_FAMILIES.includes(prefix));
+  for (const name of names) {
+    assert.equal(SERIAL_STORAGE_SELECTORS.filter((selector) => name.includes(selector)).length, 1);
+    assert.equal(SERIAL_STORAGE_FILTERS.filter((filter) => name.includes(filter)).length, 1);
+  }
+  const args = cargoArguments({ name: "bamboo-storage" });
+  assert.equal(args.filter((arg) => arg === prefix).length, 1);
+  assert.equal(args[args.indexOf(prefix) - 1], "--skip");
+});
+
 test("new or removed feature cases fail closed without rerunning common defaults", () => {
   const context = { targets: [{ name: "unit", kind: "lib", added: ["feature_only"], removed: ["default_only"] }] };
   const before = { "lib/unit": ["common", "default_only"] }, after = { "lib/unit": ["common", "feature_only"] };

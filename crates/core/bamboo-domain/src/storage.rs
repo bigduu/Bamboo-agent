@@ -665,6 +665,22 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Read the bound durable Session and sample a Host execution observation
+    /// while the same target/ancestry guards are retained. The callback must
+    /// be synchronous, nonblocking, and must not re-enter storage. A busy or
+    /// unsupported Host must return an error rather than fabricate idleness.
+    async fn load_supervisor_current_user_bound_clear_readback(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _expected: &crate::SupervisorCurrentUserTarget,
+        _observe_execution: &(dyn Fn() -> std::io::Result<bool> + Send + Sync),
+    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget, bool)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded current-user clear readback is unsupported",
+        ))
+    }
+
     /// Return history and its target selector from one retained canonical read.
     /// A second unguarded load must not pair old progress with a replacement
     /// Session's new selector. Custom stores fail closed until implemented.
