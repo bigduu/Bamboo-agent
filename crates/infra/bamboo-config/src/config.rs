@@ -2552,7 +2552,7 @@ pub const MIN_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 1;
 pub const MAX_LIFECYCLE_HOOK_TIMEOUT_MS: u64 = 600_000;
 
 /// Stable user-facing event keys accepted by `lifecycle_hooks`.
-pub const LIFECYCLE_HOOK_EVENT_NAMES: [&str; 8] = [
+pub const LIFECYCLE_HOOK_EVENT_NAMES: [&str; 9] = [
     "SessionStart",
     "UserPromptSubmit",
     "PreToolUse",
@@ -2561,6 +2561,7 @@ pub const LIFECYCLE_HOOK_EVENT_NAMES: [&str; 8] = [
     "SessionEnd",
     "PreCompact",
     "Notification",
+    "BambooModelCallUsage",
 ];
 
 fn default_lifecycle_hook_timeout_ms() -> u64 {
@@ -2615,6 +2616,12 @@ pub struct LifecycleHooksConfig {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub notification: Vec<LifecycleHookGroup>,
+    #[serde(
+        default,
+        rename = "BambooModelCallUsage",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub model_call_usage: Vec<LifecycleHookGroup>,
 }
 
 impl LifecycleHooksConfig {
@@ -2628,6 +2635,7 @@ impl LifecycleHooksConfig {
             && self.session_end.is_empty()
             && self.pre_compact.is_empty()
             && self.notification.is_empty()
+            && self.model_call_usage.is_empty()
     }
 }
 

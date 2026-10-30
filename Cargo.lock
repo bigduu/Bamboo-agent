@@ -1059,6 +1059,8 @@ dependencies = [
  "bamboo-domain",
  "chrono",
  "dashmap",
+ "hex",
+ "hmac",
  "libc",
  "opentelemetry",
  "opentelemetry-http",
@@ -1068,6 +1070,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sysinfo",
  "tempfile",
  "thiserror 2.0.21",
@@ -1076,6 +1079,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -1425,6 +1429,7 @@ dependencies = [
  "bamboo-a2a",
  "bamboo-agent-core",
  "bamboo-broker",
+ "bamboo-compression",
  "bamboo-config",
  "bamboo-domain",
  "bamboo-engine",

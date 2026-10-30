@@ -1276,8 +1276,8 @@ fn main() {
     // Explicitly enabled export is independent of logging. Failure is fail-open
     // and diagnostics never include the endpoint or exporter error payload.
     let mut telemetry = bamboo_infrastructure::telemetry::init_from_env().unwrap_or_else(|error| {
-        eprintln!("warning: telemetry disabled: {error}");
-        Default::default()
+        eprintln!("warning: telemetry export unavailable: {error}");
+        bamboo_infrastructure::telemetry::init_local_from_env().unwrap_or_default()
     });
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_stack_size(thread_stack)

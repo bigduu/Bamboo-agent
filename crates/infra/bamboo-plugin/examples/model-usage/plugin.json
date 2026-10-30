@@ -1,0 +1,8 @@
+{
+  "id": "model-usage-example",
+  "name": "Model usage observer example",
+  "version": "0.1.0",
+  "provides": {
+    "hooks": [{"config": "hooks/hooks.json", "scripts": ["hooks/usage.py"]}]
+  }
+}

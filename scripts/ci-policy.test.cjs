@@ -282,7 +282,7 @@ test("feature shards preserve default configurations and complete explicit addit
   }
   assert.equal(sourceFeatureHash(packages, require('node:fs').realpathSync('.')), FEATURE_SOURCE_SHA256,
     'New feature-sensitive source requires a reviewed ownership update')
-  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 19)
+  assert.equal(FEATURE_CONTEXTS.flatMap(context => context.targets.flatMap(target => target.added)).length, 20)
   assert.deepEqual(FEATURE_CONTEXTS.map(context => [context.package, context.features]), [
     ['bamboo-infrastructure', ['otel-otlp', 'test-utils']], ['bamboo-tickets', ['test-utils']],
     ['bamboo-server', ['test-utils']], ['bamboo-agent', ['ticket-runtime-fixtures']]])

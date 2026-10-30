@@ -44,7 +44,9 @@ disabled without deleting them. `matcher` is a Rust regular expression over
 the tool name and is supported only for `PreToolUse` and `PostToolUse`.
 
 Handlers run sequentially in configuration order. A control decision stops
-normal dispatch; observer events always run every matching handler.
+normal dispatch; observer events do not stop on a control decision. Model-call
+usage observers are best effort and may be dropped under their bounded queue
+or deadline.
 Programmatic hooks and configured handlers share the same dispatcher and
 priority ordering.
 
@@ -93,6 +95,7 @@ Supported events:
 | `SessionEnd` | After a terminal status is known | Observer only; decisions cannot change the settled result. |
 | `PreCompact` | Immediately before LLM context summarization | `additional_context` becomes custom summarizer instructions. Decisions are ignored because blocking compaction risks context overflow. |
 | `Notification` | After notification policy and dedup, alongside desktop/ntfy/Bark delivery | Fire-and-forget observer; decisions and output are ignored. |
+| `BambooModelCallUsage` | After a dispatched primary model call finishes or reports an error | Best-effort observer; decisions and output cannot change the call. |
 
 ## Input envelope
 
@@ -123,6 +126,9 @@ A delivered notification payload contains `id`, `category`, `priority`,
 `title`, `body`, `dedup_key`, `created_at`, and an optional `click_url`.
 Tool-oriented envelopes also keep the convenience fields `tool_name`,
 `tool_input`, and `tool_response` for compatibility.
+Usage observers receive a `model_call_usage` payload with the versioned
+`observation` and no workspace path. See [local trace inspection](guides/LOCAL_TRACE_INSPECTION.md#read-only-hook-event)
+for optional cache counters, delivery limits, deduplication and a plugin example.
 
 All handlers also receive:
 
@@ -154,7 +160,8 @@ truncated stdout, missing runtimes, and timeouts are logged and treated as
 non-blocking failures. The dry-run endpoint returns these diagnostics without
 persisting configuration.
 
-Observer events (`SessionEnd`, `Notification`) never change control flow.
+Observer events (`SessionEnd`, `Notification`, `BambooModelCallUsage`) never
+change control flow.
 `PreCompact` consumes only `additional_context`; its decision and an exit-2
 block signal are deliberately ignored.
 

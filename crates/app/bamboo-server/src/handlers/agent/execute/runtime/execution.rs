@@ -40,6 +40,8 @@ pub(crate) struct SpawnAgentExecution {
     /// Opaque managed-origin proof captured with the selected provider handle.
     pub(crate) provider_override_managed_registry:
         Option<Arc<bamboo_llm::provider_registry::ManagedProviderOrigin>>,
+    pub(crate) legacy_vision_provider_source:
+        Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
     /// Cohesive primary + auxiliary model/provider selection.
     pub(crate) model_roster: ModelRoster,
     pub(crate) reasoning_effort: Option<bamboo_domain::reasoning::ReasoningEffort>,
@@ -144,7 +146,7 @@ impl SpawnAgentExecution {
         self,
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
     ) {
-        spawn_agent_execution_with_inputs(self, inputs, None, Default::default(), false);
+        spawn_agent_execution_with_inputs(self, inputs, None, Default::default(), false, false);
     }
 
     pub(crate) fn spawn_with_native_inputs(
@@ -152,7 +154,14 @@ impl SpawnAgentExecution {
         inputs: Option<bamboo_engine::config::UntrustedExecutionInputs>,
         native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
     ) {
-        spawn_agent_execution_with_inputs(self, inputs, native_binding, Default::default(), false);
+        spawn_agent_execution_with_inputs(
+            self,
+            inputs,
+            native_binding,
+            Default::default(),
+            false,
+            false,
+        );
     }
 
     pub(crate) fn spawn_with_native_inputs_and_retry(
@@ -168,6 +177,7 @@ impl SpawnAgentExecution {
             native_binding,
             upstream_retry,
             live_bootstrap_resume,
+            true,
         );
     }
 }
@@ -178,6 +188,7 @@ fn spawn_agent_execution_with_inputs(
     native_binding: Option<crate::skill_runtime::NativeExecutionBinding>,
     upstream_retry: bamboo_llm::retry::UpstreamRetry,
     live_bootstrap_resume: bool,
+    image_fallback_from_config: bool,
 ) {
     let session_model_ref = session_effective_model_ref(&args.session);
     let provider_override = match (session_model_ref.as_ref(), args.provider_override.take()) {
@@ -218,6 +229,15 @@ fn spawn_agent_execution_with_inputs(
             tools_for_execution(args.state.as_ref(), args.is_child_session),
         )
     });
+    let agent = if image_fallback_from_config {
+        Arc::new(agent.with_config_derived_image_fallback())
+    } else {
+        agent
+    };
+    // Replace, including clearing, per-run evidence on the execution clone.
+    let agent = Arc::new(
+        agent.with_legacy_vision_provider_source(args.legacy_vision_provider_source.clone()),
+    );
     let gold_target_resolver = gold_route::make_gold_target_resolver(
         args.state.as_ref(),
         &args.provider_name,

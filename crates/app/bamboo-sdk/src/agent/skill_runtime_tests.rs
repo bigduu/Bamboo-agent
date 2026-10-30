@@ -4,6 +4,8 @@
 use super::*;
 use bamboo_agent_core::tools::{FunctionCall, ToolSchema};
 use bamboo_domain::{ImageUrlRef, MessagePart, TokenBudget};
+use bamboo_engine::ExecuteRequestBuilder;
+use bamboo_llm::retry::UpstreamRetry;
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -2022,4 +2024,592 @@ async fn sdk_typed_cancel_wakes_real_public_router_reservation_wait_without_appe
             1
         );
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sdk_typed_account_mismatch_stops_before_portable_hook_or_append() {
+    let home = tempfile::tempdir().unwrap();
+    let hook_count = install_prompt_hook(home.path(), false);
+    let provider = Arc::new(PassiveProvider::default());
+    let agent = build(home.path(), provider.clone()).await;
+    let mut session = agent.new_session("sdk-typed-unpaired-account").unwrap();
+    session.model = "other-model".into();
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+        "other-provider",
+        "other-model",
+    ));
+    let before = serde_json::to_value(&session).unwrap();
+    let result = agent
+        .run_with_skills(
+            &mut session,
+            SdkSkillInput::new("Synthetic typed account witness", vec![]),
+        )
+        .await;
+    assert!(result.is_err());
+    assert!(
+        !hook_count.exists(),
+        "prompt hook must not run on a mismatched account"
+    );
+    assert!(provider.0.lock().unwrap().is_empty());
+    assert_eq!(serde_json::to_value(&session).unwrap(), before);
+    assert!(agent
+        .storage()
+        .load_session(&session.id)
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[derive(Default)]
+struct SdkIdentityCapture(Mutex<Vec<String>>);
+
+#[async_trait]
+impl LLMProvider for SdkIdentityCapture {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.0.lock().unwrap().push(model.to_string());
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Synthetic completion".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn sdk_wrapped_runtime_requires_client_for_bound_accounts_but_keeps_bare_sessions() {
+    let home = tempfile::tempdir().unwrap();
+    let main = Arc::new(SdkIdentityCapture::default());
+    let scoped = build(home.path(), main.clone()).await;
+    let agent = Agent::from_runtime(scoped.inner.clone());
+
+    let mut bare = Session::new("sdk-wrapped-bare", "claude-test");
+    bare.add_message(Message::user("Synthetic bare request"));
+    agent.run_session(&mut bare).await.unwrap();
+    let bare_calls = main.0.lock().unwrap().clone();
+    assert!(!bare_calls.is_empty() && bare_calls.iter().all(|model| model == "claude-test"));
+    main.0.lock().unwrap().clear();
+
+    let mut bound = Session::new("sdk-wrapped-bound", "model-b");
+    bound.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+        "synthetic-b",
+        "model-b",
+    ));
+    bound.add_message(Message::user("Synthetic bound request"));
+    let before = serde_json::to_value(&bound).unwrap();
+    assert!(agent.run_session(&mut bound).await.is_err());
+    assert_eq!(serde_json::to_value(&bound).unwrap(), before);
+    assert!(main.0.lock().unwrap().is_empty());
+
+    for retry_entry in [false, true] {
+        let mut session = Session::new(format!("sdk-wrapped-named-{retry_entry}"), "model-b");
+        session.add_message(Message::user("Synthetic named request"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request =
+            ExecuteRequestBuilder::new("Synthetic named request", tx, CancellationToken::new())
+                .model("model-b")
+                .provider_name("synthetic-b")
+                .build();
+        let result = if retry_entry {
+            agent
+                .execute_with_upstream_retry(&mut session, request, UpstreamRetry::Bounded)
+                .await
+        } else {
+            agent.execute(&mut session, request).await
+        };
+        drain.abort();
+        assert!(result.is_err());
+        assert!(main.0.lock().unwrap().is_empty());
+
+        let other = Arc::new(SdkIdentityCapture::default());
+        let mut paired = Session::new(format!("sdk-wrapped-paired-{retry_entry}"), "model-b");
+        paired.model_ref = Some(bamboo_domain::ProviderModelRef::new(
+            "synthetic-b",
+            "model-b",
+        ));
+        paired.add_message(Message::user("Synthetic explicit pair"));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+        let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+        let request =
+            ExecuteRequestBuilder::new("Synthetic explicit pair", tx, CancellationToken::new())
+                .provider_name("synthetic-b")
+                .provider_override(other.clone())
+                .build();
+        let result = if retry_entry {
+            agent
+                .execute_with_upstream_retry(&mut paired, request, UpstreamRetry::Bounded)
+                .await
+        } else {
+            agent.execute(&mut paired, request).await
+        };
+        drain.abort();
+        result.unwrap();
+        assert!(main.0.lock().unwrap().is_empty());
+        let other_calls = other.0.lock().unwrap().clone();
+        assert!(!other_calls.is_empty() && other_calls.iter().all(|model| model == "model-b"));
+    }
+}
+
+// Synthetic end-to-end SDK request capture; no external provider is used.
+#[derive(Default)]
+struct SdkReasoningCapture(Mutex<Vec<(String, Option<bamboo_domain::ReasoningEffort>)>>);
+
+impl SdkReasoningCapture {
+    fn reply(
+        &self,
+        model: &str,
+        effort: Option<bamboo_domain::ReasoningEffort>,
+    ) -> Result<LLMStream, LLMError> {
+        self.0.lock().unwrap().push((model.to_owned(), effort));
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Synthetic completion".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[async_trait]
+impl LLMProvider for SdkReasoningCapture {
+    async fn chat_stream(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        self.reply(model, None)
+    }
+
+    async fn chat_stream_with_options(
+        &self,
+        _: &[Message],
+        _: &[ToolSchema],
+        _: Option<u32>,
+        model: &str,
+        options: Option<&bamboo_llm::LLMRequestOptions>,
+    ) -> Result<LLMStream, LLMError> {
+        self.reply(model, options.and_then(|value| value.reasoning_effort))
+    }
+}
+
+fn sdk_reasoning_config() -> bamboo_llm::Config {
+    let mut config = bamboo_llm::Config::default();
+    config.provider = "openai".into();
+    config.default_provider_instance = Some("chat-a".into());
+    config.features.provider_model_ref = true;
+    *config.memory_mut() = Some(
+        serde_json::from_value(json!({
+            "auto_dream_enabled": false, "project_prompt_injection": false,
+            "relevant_recall": false, "relevant_recall_rerank": false,
+            "project_first_dream": false, "ledger_agenda_injection": false,
+        }))
+        .unwrap(),
+    );
+    config.defaults = Some(
+        serde_json::from_value(json!({
+            "chat": {"provider": "chat-a", "model": "main-a", "reasoning_effort": "low"}
+        }))
+        .unwrap(),
+    );
+    config.provider_instances.insert(
+        "chat-a".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai", "enabled": true, "model": "main-a",
+            "runtime_models": ["main-a", "cheap"]
+        }))
+        .unwrap(),
+    );
+    config
+}
+
+#[tokio::test]
+async fn sdk_run_session_reasoning_respects_selected_model_and_session() {
+    use bamboo_domain::ReasoningEffort::{High, Low, Medium, Xhigh};
+    let cases = [
+        (
+            "session",
+            "main-a",
+            Some(High),
+            Some(Xhigh),
+            None,
+            "main-a",
+            Some(High),
+        ),
+        (
+            "ref",
+            "cheap",
+            None,
+            Some(Xhigh),
+            None,
+            "cheap",
+            Some(Xhigh),
+        ),
+        ("other-model", "cheap", None, None, None, "cheap", None),
+        ("chat-role", "main-a", None, None, None, "main-a", Some(Low)),
+        (
+            "normalized-ref",
+            " main-a ",
+            None,
+            Some(Xhigh),
+            None,
+            "main-a",
+            Some(Xhigh),
+        ),
+        (
+            "normalized-override",
+            " main-a ",
+            None,
+            Some(Xhigh),
+            Some("main-a"),
+            "main-a",
+            Some(Xhigh),
+        ),
+        (
+            "explicit-model",
+            "cheap",
+            None,
+            Some(Xhigh),
+            Some("main-a"),
+            "main-a",
+            Some(Low),
+        ),
+    ];
+    for (
+        label,
+        original_model,
+        session_effort,
+        target_effort,
+        model_override,
+        expected_model,
+        expected_effort,
+    ) in cases
+    {
+        let home = tempfile::tempdir().unwrap();
+        let capture = Arc::new(SdkReasoningCapture::default());
+        let mut builder = Agent::builder()
+            .provider(capture.clone())
+            .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+            .tools(std::iter::empty());
+        if let Some(model) = model_override {
+            builder = builder.model(model);
+        }
+        let agent = builder
+            .with_defaults_for_data_dir(home.path().to_owned())
+            .await
+            .unwrap()
+            .build()
+            .unwrap();
+        let mut session = Session::new(format!("sdk-reasoning-{label}"), original_model);
+        let mut target = bamboo_domain::ProviderModelRef::new("chat-a", original_model);
+        target.reasoning_effort = target_effort;
+        session.model_ref = Some(target);
+        session.reasoning_effort = session_effort;
+        session.add_message(Message::user("Synthetic reasoning witness"));
+        agent.run_session(&mut session).await.unwrap();
+        let calls = capture.0.lock().unwrap().clone();
+        assert!(!calls.is_empty(), "{label}: no request");
+        assert!(
+            calls
+                .iter()
+                .all(|(model, effort)| model == expected_model && *effort == expected_effort),
+            "{label}: {calls:?}"
+        );
+        if label == "explicit-model" {
+            assert_eq!(
+                session.model_ref.as_ref().unwrap().reasoning_effort,
+                None,
+                "{label}"
+            );
+        } else if label == "normalized-override" {
+            assert_eq!(
+                session.model_ref.as_ref().unwrap().reasoning_effort,
+                Some(Xhigh),
+                "{label}"
+            );
+        }
+    }
+
+    // The low-level API deliberately remains a request-owned escape hatch.
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    let mut session = Session::new("sdk-reasoning-explicit-request", "main-a");
+    session.reasoning_effort = Some(High);
+    session.add_message(Message::user("Synthetic explicit request"));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(256);
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let request =
+        ExecuteRequestBuilder::new("Synthetic explicit request", tx, CancellationToken::new())
+            .provider_name("chat-a")
+            .model("main-a")
+            .reasoning_effort(Medium)
+            .build();
+    agent.execute(&mut session, request).await.unwrap();
+    drain.abort();
+    let calls = capture.0.lock().unwrap().clone();
+    assert!(
+        !calls.is_empty()
+            && calls
+                .iter()
+                .all(|(model, effort)| model == "main-a" && *effort == Some(Medium)),
+        "{calls:?}"
+    );
+}
+
+async fn sdk_expect_reasoning(
+    agent: &Agent,
+    capture: &SdkReasoningCapture,
+    label: &str,
+    expected: Option<bamboo_domain::ReasoningEffort>,
+) {
+    sdk_expect_reasoning_for_provider(agent, capture, label, "chat-a", expected).await;
+}
+
+async fn sdk_expect_reasoning_for_provider(
+    agent: &Agent,
+    capture: &SdkReasoningCapture,
+    label: &str,
+    provider: &str,
+    expected: Option<bamboo_domain::ReasoningEffort>,
+) {
+    capture.0.lock().unwrap().clear();
+    let mut session = Session::new(format!("sdk-reasoning-{label}"), "main-a");
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new(provider, "main-a"));
+    session.add_message(Message::user("Synthetic config snapshot witness"));
+    agent.run_session(&mut session).await.unwrap();
+    let calls = capture.0.lock().unwrap().clone();
+    assert!(
+        !calls.is_empty()
+            && calls
+                .iter()
+                .all(|(model, effort)| model == "main-a" && *effort == expected),
+        "{label}: {calls:?}"
+    );
+}
+
+async fn sdk_expect_source_refusal(agent: &Agent, capture: &SdkReasoningCapture, label: &str) {
+    capture.0.lock().unwrap().clear();
+    let mut session = Session::new(format!("sdk-reasoning-{label}"), "main-a");
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "main-a"));
+    session.add_message(Message::user("Synthetic config source refusal"));
+    let error = agent
+        .run_session(&mut session)
+        .await
+        .expect_err("changed source must be refused");
+    assert!(
+        error.to_string().contains("sdk_provider_binding:"),
+        "{error}"
+    );
+    assert!(capture.0.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn sdk_reasoning_follows_current_config_and_builder_order() {
+    use bamboo_domain::ReasoningEffort::{High, Low, Max};
+
+    // A matching explicit model has the same Chat default in either builder order.
+    for before_defaults in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let capture = Arc::new(SdkReasoningCapture::default());
+        let builder = Agent::builder()
+            .provider(capture.clone())
+            .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+            .tools(std::iter::empty());
+        let builder = if before_defaults {
+            builder.model("main-a")
+        } else {
+            builder
+        };
+        let builder = builder
+            .with_defaults_for_data_dir(home.path().to_owned())
+            .await
+            .unwrap();
+        let builder = if before_defaults {
+            builder
+        } else {
+            builder.model("main-a")
+        };
+        let agent = builder.build().unwrap();
+        sdk_expect_reasoning(
+            &agent,
+            &capture,
+            &format!("builder-{before_defaults}"),
+            Some(Low),
+        )
+        .await;
+    }
+
+    // Replacing the config after default assembly must not retain the old role effort.
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let mut replacement = sdk_reasoning_config();
+    replacement.defaults.as_mut().unwrap().chat.reasoning_effort = Some(High);
+    let live = Arc::new(tokio::sync::RwLock::new(replacement));
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .config(Arc::new(tokio::sync::RwLock::new(sdk_reasoning_config())))
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .model("main-a")
+        .config(live.clone())
+        .build()
+        .unwrap();
+    sdk_expect_reasoning(&agent, &capture, "replacement", Some(High)).await;
+
+    // Live updates apply only to the same admitted provider/model pair.
+    live.write()
+        .await
+        .defaults
+        .as_mut()
+        .unwrap()
+        .chat
+        .reasoning_effort = Some(Low);
+    sdk_expect_reasoning(&agent, &capture, "live-effort", Some(Low)).await;
+    live.write().await.defaults.as_mut().unwrap().chat.model = "cheap".into();
+    sdk_expect_reasoning(&agent, &capture, "live-other-model", None).await;
+    {
+        let mut config = live.write().await;
+        config.provider_instances.insert(
+            "chat-b".into(),
+            serde_json::from_value(json!({
+                "provider_type": "openai", "enabled": true, "model": "main-a",
+                "runtime_models": ["main-a"]
+            }))
+            .unwrap(),
+        );
+        let role = &mut config.defaults.as_mut().unwrap().chat;
+        role.provider = "chat-b".into();
+        role.model = "main-a".into();
+        role.reasoning_effort = Some(Max);
+    }
+    sdk_expect_reasoning(&agent, &capture, "live-other-account", None).await;
+    {
+        let mut config = live.write().await;
+        let role = &mut config.defaults.as_mut().unwrap().chat;
+        role.provider = " chat-a ".into();
+        role.model = "main-a".into();
+    }
+    sdk_expect_reasoning(&agent, &capture, "invalid-role-provider", None).await;
+    {
+        let mut config = live.write().await;
+        let role = &mut config.defaults.as_mut().unwrap().chat;
+        role.provider = "chat-a".into();
+        role.model = " main-a ".into();
+    }
+    sdk_expect_reasoning(&agent, &capture, "invalid-role-model", None).await;
+}
+
+#[tokio::test]
+async fn sdk_reasoning_legacy_scope_does_not_take_new_instance_alias() {
+    use bamboo_domain::ReasoningEffort::{Low, Max};
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let mut config = sdk_reasoning_config();
+    config.provider = "openai".into();
+    config.provider_instances.clear();
+    config.default_provider_instance = None;
+    config.defaults.as_mut().unwrap().chat.provider = "openai".into();
+    let live = Arc::new(tokio::sync::RwLock::new(config));
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .model("main-a")
+        .config(live.clone())
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    sdk_expect_reasoning_for_provider(&agent, &capture, "legacy-only", "openai", Some(Low)).await;
+    live.write().await.provider_instances.insert(
+        "chat-b".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai", "enabled": true, "model": "main-a",
+            "runtime_models": ["main-a"]
+        }))
+        .unwrap(),
+    );
+    sdk_expect_reasoning_for_provider(
+        &agent,
+        &capture,
+        "hybrid-legacy-default",
+        "openai",
+        Some(Low),
+    )
+    .await;
+    {
+        let mut config = live.write().await;
+        config.default_provider_instance = Some("chat-b".into());
+        config.defaults.as_mut().unwrap().chat.reasoning_effort = Some(Max);
+    }
+    sdk_expect_reasoning_for_provider(&agent, &capture, "hybrid-instance-default", "openai", None)
+        .await;
+    {
+        let mut config = live.write().await;
+        config.provider_instances.insert(
+            "openai".into(),
+            serde_json::from_value(json!({
+                "provider_type": "openai", "enabled": true, "model": "main-a",
+                "runtime_models": ["main-a"]
+            }))
+            .unwrap(),
+        );
+        config.default_provider_instance = Some("openai".into());
+    }
+    sdk_expect_source_refusal(&agent, &capture, "same-id-new-instance").await;
+}
+
+#[tokio::test]
+async fn sdk_reasoning_instance_scope_does_not_take_same_id_legacy_role() {
+    use bamboo_domain::ReasoningEffort::{Low, Max};
+    let home = tempfile::tempdir().unwrap();
+    let capture = Arc::new(SdkReasoningCapture::default());
+    let mut config = sdk_reasoning_config();
+    config.provider = "openai".into();
+    config.provider_instances.clear();
+    config.provider_instances.insert(
+        "openai".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai", "enabled": true, "model": "main-a",
+            "runtime_models": ["main-a"]
+        }))
+        .unwrap(),
+    );
+    config.default_provider_instance = Some("openai".into());
+    config.defaults.as_mut().unwrap().chat.provider = "openai".into();
+    let live = Arc::new(tokio::sync::RwLock::new(config));
+    let agent = Agent::builder()
+        .provider(capture.clone())
+        .model("main-a")
+        .config(live.clone())
+        .tools(std::iter::empty())
+        .with_defaults_for_data_dir(home.path().to_owned())
+        .await
+        .unwrap()
+        .build()
+        .unwrap();
+    sdk_expect_reasoning_for_provider(&agent, &capture, "instance-only", "openai", Some(Low)).await;
+    {
+        let mut config = live.write().await;
+        config.provider_instances.remove("openai");
+        config.default_provider_instance = None;
+        config.defaults.as_mut().unwrap().chat.reasoning_effort = Some(Max);
+    }
+    sdk_expect_source_refusal(&agent, &capture, "same-id-new-legacy").await;
 }

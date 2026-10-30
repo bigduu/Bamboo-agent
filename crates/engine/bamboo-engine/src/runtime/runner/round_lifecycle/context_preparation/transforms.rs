@@ -139,12 +139,35 @@ async fn apply_image_fallback(
     // Apply image fallback (placeholder / OCR / error / vision) to the prepared
     // LLM context only. This must never mutate the persisted session messages
     // (UI should still show images).
-    if let Some(fallback) = config.image_fallback.clone() {
+    if let Some(mut fallback) = config.image_fallback.clone() {
+        let has_images = prepared_context.messages.iter().any(|message| {
+            message.content_parts.as_ref().is_some_and(|parts| {
+                parts
+                    .iter()
+                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+            })
+        });
+        let target = if has_images
+            && fallback.mode == crate::ImageFallbackMode::Vision
+            && config.legacy_vision_model_resolver.is_some()
+        {
+            Some(super::super::super::image_fallback::resolve_legacy_vision_target(config).await?)
+        } else {
+            None
+        };
+        if let Some(target) = target.as_ref() {
+            fallback.vision_model = Some(target.model_name.clone());
+        }
         apply_image_fallback_to_llm_messages(
             &mut prepared_context.messages,
             fallback,
             config.attachment_reader.as_deref(),
-            Some(llm),
+            Some(
+                target
+                    .as_ref()
+                    .map(|target| &target.provider)
+                    .unwrap_or(llm),
+            ),
         )
         .await?;
     }

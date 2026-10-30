@@ -27,6 +27,8 @@ pub enum HookPayload {
     Round { round: u32 },
     /// A prompt-oriented hook payload reserved for prompt/LLM seams.
     Prompt { prompt: String },
+    /// Read-only observation of one completed provider call.
+    ModelCallUsage { observation: crate::ModelCallUsage },
     /// A parsed tool call immediately before dispatch.
     ToolExecution {
         tool_name: String,
@@ -126,6 +128,8 @@ pub enum AgentHookPoint {
     // LLM call
     BeforeLlmCall,
     AfterLlmCall,
+    /// Advisory only; observer results never alter the model call.
+    AfterModelCallUsage,
 
     // Tool execution
     BeforeToolExecution,

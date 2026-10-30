@@ -179,15 +179,16 @@ async fn create_child_action_inner(
             input.model_override = Some(model.model.clone());
             input.model_ref_override = Some(model.clone());
         }
-        // The existing strict route protects the complete assignment. This
-        // default adds no invented user constraints or parent-history fork.
+        // The strict route protects the complete assignment in task_brief.
+        // Do not duplicate it as the default objective: both fields are rendered
+        // and counted against the required-context budget.
         if !input
             .runtime_metadata
             .contains_key(bamboo_domain::CHILD_PACKET_INPUT_KEY)
         {
             let packet = bamboo_domain::ChildContextPacket {
                 version: 1,
-                objective: input.assignment_prompt.clone(),
+                objective: "Complete the task described in task_brief.".into(),
                 constraints: Vec::new(),
                 acceptance: vec!["Complete the assigned task; report concrete evidence, verification and remaining blockers.".into()],
                 non_goals: Vec::new(),

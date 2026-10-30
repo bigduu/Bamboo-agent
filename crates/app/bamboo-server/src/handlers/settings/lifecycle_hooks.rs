@@ -179,6 +179,62 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn dry_run_usage_event_receives_synthetic_cache_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("usage.js"),
+            r#"
+let raw = "";
+process.stdin.setEncoding("utf8");
+process.stdin.on("data", chunk => raw += chunk);
+process.stdin.on("end", () => process.stdout.write(raw));
+"#,
+        )
+        .unwrap();
+        let state = web::Data::new(AppState::new(dir.path().to_path_buf()).await.unwrap());
+        let app = test::init_service(
+            App::new()
+                .app_data(state)
+                .route("/hooks/test", web::post().to(test_lifecycle_hook)),
+        )
+        .await;
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/hooks/test")
+                .set_json(serde_json::json!({
+                    "event": "BambooModelCallUsage",
+                    "type": "script",
+                    "path": "usage.js",
+                    "runner": "node",
+                    "timeout_ms": 5_000
+                }))
+                .to_request(),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["exit_code"], 0, "{body}");
+        assert_eq!(body["timed_out"], false);
+        let input: serde_json::Value =
+            serde_json::from_str(body["stdout"].as_str().unwrap()).unwrap();
+        assert_eq!(input["hook_event_name"], "BambooModelCallUsage");
+        assert_eq!(input["workspace_path"], "");
+        assert_eq!(input["payload"]["type"], "model_call_usage");
+        assert_eq!(input["payload"]["observation"]["schema_version"], 1);
+        assert_eq!(
+            input["payload"]["observation"]["usage"]["input_tokens"],
+            100
+        );
+        assert_eq!(
+            input["payload"]["observation"]["usage"]["cache_read_input_tokens"],
+            20
+        );
+    }
+
+    #[actix_web::test]
     async fn dry_run_executes_external_script_handler() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(

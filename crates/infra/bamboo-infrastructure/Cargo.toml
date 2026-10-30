@@ -22,6 +22,10 @@ dashmap = "6"
 rusqlite = { version = "0.40", features = ["bundled", "chrono"] }
 sysinfo = "0.39"
 libc = "0.2"
+hmac = "0.13"
+sha2 = "0.11"
+hex = { workspace = true }
+uuid = { workspace = true }
 
 # Trace API is always available to embedding hosts. Transport is opt-in.
 opentelemetry = { version = "=0.33.1", default-features = false, features = ["trace"] }

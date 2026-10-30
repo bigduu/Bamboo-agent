@@ -18,12 +18,13 @@
 //! already depends on infrastructure (and is depended on by the server), making
 //! it the natural home for a value object that carries live provider handles.
 //!
-//! ## Resolution semantics are preserved byte-for-byte
+//! ## Resolution semantics
 //!
 //! The roster carries *intent* only; it performs no `Config` fallback itself.
-//! A `None` auxiliary role maps exactly to the old "both name and provider were
-//! `None`" state, so the downstream `None → Config::get_*` fallbacks in
-//! [`AgentRuntime::execute`](crate::AgentRuntime) are unchanged. The primary
+//! A `None` auxiliary role uses strict live global-role resolution in
+//! [`AgentRuntime::execute`](crate::AgentRuntime). Host callers can provide their
+//! admitted registry resolver; a direct SDK client covers its declared account
+//! only. Explicit role fields retain the caller-owned SDK override seam. The primary
 //! `model`/`provider_name`/`provider_type` keep the same request→config cascade
 //! at their resolution sites.
 
