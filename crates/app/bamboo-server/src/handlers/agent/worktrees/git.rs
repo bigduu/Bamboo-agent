@@ -1,8 +1,108 @@
 //! Git is the only worktree registry. This module deliberately has no runtime
 //! dependencies, so its real filesystem/Git regressions can run without Cargo.
 use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Hard ceiling for one Git child process. A checkout on slow or offline
+/// storage (for example macOS-evicted dataless files) can block `git status`
+/// inside the kernel for minutes; the inventory must never inherit that.
+/// Tests run with a short ceiling so timeout regressions stay fast.
+fn git_command_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(1500)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
+/// Wall-clock budget for inspecting all entries of one repository during a
+/// `list` call. The listing itself (`git worktree list`) is metadata-only;
+/// per-entry inspection shells out repeatedly and is what can stall. Once
+/// the budget is spent, remaining entries keep metadata with unknown dirty
+/// state instead of blocking the inventory response.
+fn list_inspect_budget() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(4000)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+/// Runs one Git child process to completion, or kills it at the deadline.
+///
+/// `Command::output()` waits forever: its failure model has no exit for a
+/// child that never exits. Storage that stalls the kernel (dataless files,
+/// dead NFS mounts) produces exactly that child, so every Git invocation in
+/// this module funnels through this bounded wrapper instead. Std-only:
+/// reader threads drain the pipes (avoids fixed-size pipe deadlocks), the
+/// parent polls `try_wait`, and a miss of the deadline escalates to
+/// `kill()`. A killed child surfaces as a normal `Err` string so callers
+/// degrade that one entry instead of hanging the whole inventory.
+fn bounded_output(mut command: Command, deadline: Duration) -> Result<Output, String> {
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Cannot run git: {e}"))?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = stdout_tx.send(buf);
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = stderr_tx.send(buf);
+    });
+    let started = Instant::now();
+    let mut status = None;
+    while started.elapsed() < deadline {
+        match child.try_wait() {
+            Ok(exited) => {
+                if exited.is_some() {
+                    status = exited;
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if status.is_none() {
+        // SIGKILL terminates the child, closing its pipe write ends, so the
+        // reader threads return and recv() below can never block on a pipe
+        // whose writer is gone. wait() also reaps the corpse.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let stdout = stdout_rx.recv().unwrap_or_default();
+    let stderr = stderr_rx.recv().unwrap_or_default();
+    let _ = stdout_reader.join();
+    let _ = stderr_reader.join();
+    match status {
+        Some(status) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        None => Err(
+            "git did not finish within its command timeout; the checkout may be on slow or offline storage"
+                .to_string(),
+        ),
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Worktree {
@@ -54,15 +154,20 @@ pub(super) fn git_command(repo: &Path) -> Command {
 }
 
 fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
+    command_with_timeout(repo, args, git_command_timeout())
+}
+
+fn command_with_timeout(repo: &Path, args: &[&str], deadline: Duration) -> Result<Output, String> {
     let mut command = git_command(repo);
     if matches!(args.first(), Some(&"status" | &"read-tree"))
         || args.starts_with(&["worktree", "add"])
     {
         // Reading configuration names does not execute filters. Include every
-        // scope and include file, but never read/log their potentially secret values.
-        let configured = git_command(repo)
-            .args(["config", "--includes", "--null", "--name-only", "--list"])
-            .output()
+        // scope and include file, but never read/log their potentially secret
+        // values. Bounded too: an include file can live on stalled storage.
+        let mut probe = git_command(repo);
+        probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
+        let configured = bounded_output(probe, deadline)
             .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
         if !configured.status.success() {
             return Err(format!(
@@ -97,14 +202,20 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
             command.args(["-c", &format!("filter.{driver}.required=true")]);
         }
     }
-    command
-        .args(args)
-        .output()
-        .map_err(|e| format!("Git at {}: {e}", repo.display()))
+    command.args(args);
+    bounded_output(command, deadline).map_err(|e| format!("Git at {}: {e}", repo.display()))
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = command(repo, args)?;
+    git_bytes_with_deadline(repo, args, git_command_timeout())
+}
+
+fn git_bytes_with_deadline(
+    repo: &Path,
+    args: &[&str],
+    deadline: Duration,
+) -> Result<Vec<u8>, String> {
+    let output = command_with_timeout(repo, args, deadline)?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         let guidance = if diagnostic.contains(": smudge filter ")
@@ -627,6 +738,7 @@ pub fn root(path: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
+    let deadline = Instant::now() + list_inspect_budget();
     let common = repository(repo)?;
     let listing = git_bytes(repo, &["worktree", "list", "--porcelain", "-z"])?;
     let mut result = Vec::new();
@@ -683,6 +795,12 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
             continue;
         }
         let mut inspect = || -> Result<(PathBuf, bool), String> {
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .ok_or_else(|| {
+                    "Inspection budget exhausted; dirty state is unknown for this checkout"
+                        .to_string()
+                })?;
             let canonical = fs::canonicalize(&entry.path)
                 .map_err(|e| format!("{} is unavailable: {e}", entry.path.display()))?;
             if repository(&canonical)? != common || workspace_root(&canonical)? != canonical {
@@ -691,11 +809,12 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
             // Opening depends on checkout identity, not whether Git can report
             // its complete dirty state (for example, a disabled content filter).
             entry.openable = true;
-            let index = git_bytes(&canonical, &["ls-files", "--stage", "-z"])?;
+            let index =
+                git_bytes_with_deadline(&canonical, &["ls-files", "--stage", "-z"], remaining)?;
             let has_submodules = index
                 .split(|byte| *byte == 0)
                 .any(|entry| entry.starts_with(b"160000 "));
-            let status = git_bytes(
+            let status = git_bytes_with_deadline(
                 &canonical,
                 &[
                     "status",
@@ -704,6 +823,7 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
                     "--untracked-files=normal",
                     "--ignore-submodules=dirty",
                 ],
+                remaining,
             )?;
             if status.is_empty() && has_submodules {
                 return Err(
@@ -2029,5 +2149,111 @@ mod tests {
         let after = command(&f.repo(), &["ls-files", "--stage", "-z"]).unwrap();
         assert!(after.status.success());
         assert!(after.stdout.contains(&0xff));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_checkout_times_out_and_keeps_other_inventory_entries() {
+        let f = Fixture::new();
+        let healthy = create(&f.repo(), &f.roots(), "healthy", "healthy").unwrap();
+        let stalled = create(&f.repo(), &f.roots(), "stalled", "stalled").unwrap();
+        // An unopening FIFO as the linked worktree's index reproduces the
+        // production hang exactly: any Git that reads the index blocks in
+        // the kernel, while metadata listing (`worktree list`) stays fast.
+        // Dataless (macOS-evicted) working trees stall the same way.
+        let admin = f.repo().join(".git").join("worktrees").join("stalled");
+        fs::remove_file(admin.join("index")).unwrap();
+        let _guard = FifoSentinel::create(admin.join("index"));
+        let started = std::time::Instant::now();
+        let entries = list(&f.repo()).expect("inventory must return despite the stalled entry");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < list_inspect_budget() + git_command_timeout(),
+            "list took {elapsed:?}, beyond budget {:?} + ceiling {:?}",
+            list_inspect_budget(),
+            git_command_timeout()
+        );
+        assert_eq!(entries.len(), 3, "main + healthy + stalled all present");
+        let hung = entries
+            .iter()
+            .find(|entry| entry.path == stalled)
+            .expect("stalled entry kept");
+        assert_eq!(
+            hung.dirty, None,
+            "a stalled checkout reports unknown dirty state"
+        );
+        assert!(
+            hung.error.as_deref().unwrap().contains("timeout")
+                || hung
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("slow or offline storage"),
+            "error explains the timeout: {:?}",
+            hung.error
+        );
+        let fine = entries
+            .iter()
+            .find(|entry| entry.path == healthy)
+            .expect("healthy entry present");
+        assert_eq!(fine.dirty, Some(false));
+        assert!(fine.error.is_none(), "{:?}", fine.error);
+        let main = entries
+            .iter()
+            .find(|entry| entry.path == f.repo())
+            .expect("main entry present");
+        assert_eq!(main.dirty, Some(false));
+        assert!(main.error.is_none(), "{:?}", main.error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_budget_degrades_remaining_entries_without_git_calls() {
+        let f = Fixture::new();
+        let healthy = create(&f.repo(), &f.roots(), "healthy", "healthy").unwrap();
+        let stalled = create(&f.repo(), &f.roots(), "stalled", "stalled").unwrap();
+        let admin = f.repo().join(".git").join("worktrees").join("stalled");
+        fs::remove_file(admin.join("index")).unwrap();
+        let _guard = FifoSentinel::create(admin.join("index"));
+        // Burn the whole budget on the first stalled entry (list order is
+        // main first), then verify the remaining entries still degrade with
+        // metadata instead of spawning further Git children.
+        let entries = list(&f.repo()).unwrap();
+        assert!(entries.iter().any(|entry| entry.path == healthy));
+        assert!(entries.iter().any(|entry| entry.path == stalled));
+        assert!(
+            entries.iter().filter(|entry| entry.dirty.is_none()).count() >= 1,
+            "at least the stalled entry has unknown dirty state: {entries:?}"
+        );
+    }
+
+    /// Keeps a FIFO path present for the test body and removes it on drop so
+    /// Fixture cleanup (remove_dir_all) does not block opening the pipe.
+    #[cfg(unix)]
+    struct FifoSentinel(PathBuf);
+    #[cfg(unix)]
+    impl FifoSentinel {
+        #[allow(clippy::unnecessary_wraps)]
+        fn create(path: PathBuf) -> Self {
+            nix_mknod_fifo(&path);
+            Self(path)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for FifoSentinel {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn nix_mknod_fifo(path: &Path) {
+        // mkfifo(3) via libc would add a dependency; a binding-free fallback
+        // is not available, so use the nix-free Command route.
+        let status = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo is available on unix hosts");
+        assert!(status.success(), "mkfifo {path:?} failed");
     }
 }
