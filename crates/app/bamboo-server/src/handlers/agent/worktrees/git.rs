@@ -32,6 +32,13 @@ fn list_inspect_budget() -> Duration {
     }
 }
 
+/// Wall-clock budget for one complete inventory request, covering every
+/// repository it scans. The HTTP response must always return, so this is the
+/// bound the caller shares across repositories.
+pub fn inventory_budget() -> Duration {
+    list_inspect_budget()
+}
+
 /// Runs one Git child process to completion, or kills it at the deadline.
 ///
 /// `Command::output()` waits forever: its failure model has no exit for a
@@ -756,7 +763,15 @@ pub fn root(path: &Path) -> Result<PathBuf, String> {
 }
 
 pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
-    let deadline = Instant::now() + list_inspect_budget();
+    list_until(repo, Instant::now() + list_inspect_budget())
+}
+
+/// Lists one repository's worktrees, inspecting entries only until
+/// `overall_deadline`. An inventory scans several repositories, so the caller
+/// shares one deadline across them: the per-repository budget alone would make
+/// the response unbounded in the number of repositories.
+pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree>, String> {
+    let deadline = overall_deadline.min(Instant::now() + list_inspect_budget());
     let common = repository(repo)?;
     let listing = git_bytes(repo, &["worktree", "list", "--porcelain", "-z"])?;
     let mut result = Vec::new();

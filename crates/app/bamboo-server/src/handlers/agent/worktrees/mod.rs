@@ -150,6 +150,10 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         .cloned()
         .or(preferences.default_root);
     let repositories = blocking(move || {
+        // One wall-clock budget for the whole inventory, shared by every
+        // repository: a per-repository budget alone would leave the response
+        // unbounded in the number of repositories a Project folder contains.
+        let scan_deadline = std::time::Instant::now() + git::inventory_budget();
         // Discover repositories within registered Project roots without adding
         // overlapping workspace bindings or another repository registry.
         let bound_sources: Vec<_> = project.workspace_roots().map(PathBuf::from).collect();
@@ -177,7 +181,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                 }
             };
             if !seen.insert(common.clone()) { continue; }
-            match git::list(&path) {
+            match git::list_until(&path, scan_deadline) {
                 Ok(entries) => {
                     for session in &sessions {
                         let Some(workspace) = session.workspace_path.as_deref().map(Path::new) else { continue; };
