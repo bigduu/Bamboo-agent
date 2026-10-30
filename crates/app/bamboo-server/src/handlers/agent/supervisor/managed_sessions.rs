@@ -320,6 +320,30 @@ pub async fn inspect_managed_history(
             "The target changed; refresh the directory",
         ));
     }
+    // Evaluate the domain's complete pending/uncertain predicate on this
+    // exact durable snapshot. Some conditions have existing explicit flags;
+    // otherwise fail closed without mislabelling them as an approval.
+    let pending = if body.clear_readback {
+        bamboo_domain::conversation_reset_pending_rejection(&session)
+    } else {
+        None
+    };
+    let has_pending_question = session.has_pending_question();
+    let has_pending_approval = matches!(
+        pending,
+        Some(bamboo_domain::ConversationResetRejection::PendingApproval)
+    ) || session
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|runtime| runtime.plan_mode.as_ref())
+        .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval);
+    if pending.is_some() && !has_pending_question && !has_pending_approval {
+        return Ok(HttpResponse::build(StatusCode::LOCKED).json(json!({
+            "error": crate::error::error_value("The selected conversation has unresolved state; clear completion cannot be confirmed."),
+            "code": "clear_readback_unsettled",
+            "recovery": "Resolve the pending or uncertain operation before confirming the clear.",
+        })));
+    }
     // Token state belongs to this same immutable snapshot. A managed client
     // can safely recover after a clear without a separate ID-only detail read.
     let bound_token_usage = session.token_usage.clone();
@@ -329,10 +353,8 @@ pub async fn inspect_managed_history(
         json!({
             "full_message_count": session.messages.len(),
             "execution_active": active,
-            "has_pending_question": session.has_pending_question(),
-            "has_pending_approval": session.agent_runtime_state.as_ref()
-                .and_then(|runtime| runtime.plan_mode.as_ref())
-                .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval),
+            "has_pending_question": has_pending_question,
+            "has_pending_approval": has_pending_approval,
         })
     });
     let mut result =
