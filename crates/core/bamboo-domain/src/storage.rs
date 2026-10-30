@@ -645,6 +645,42 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Whether this backend supports the guarded, target-bound durable history read.
+    fn supports_supervisor_current_user_bound_history(&self) -> bool {
+        false
+    }
+
+    /// Match the original target and read its durable Session under the same
+    /// canonical Supervisor, target and ancestry guards. A cache with the same
+    /// identity is not necessarily as fresh as durable history. Custom stores
+    /// fail closed until they implement the same atomic contract.
+    async fn load_supervisor_current_user_bound_history(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _expected: &crate::SupervisorCurrentUserTarget,
+    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded current-user Session history is unsupported",
+        ))
+    }
+
+    /// Read the bound durable Session and sample a Host execution observation
+    /// while the same target/ancestry guards are retained. The callback must
+    /// be synchronous, nonblocking, and must not re-enter storage. A busy or
+    /// unsupported Host must return an error rather than fabricate idleness.
+    async fn load_supervisor_current_user_bound_clear_readback(
+        &self,
+        _supervisor: &crate::SupervisorReference,
+        _expected: &crate::SupervisorCurrentUserTarget,
+        _observe_execution: &(dyn Fn() -> std::io::Result<bool> + Send + Sync),
+    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget, bool)> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded current-user clear readback is unsupported",
+        ))
+    }
+
     /// Return history and its target selector from one retained canonical read.
     /// A second unguarded load must not pair old progress with a replacement
     /// Session's new selector. Custom stores fail closed until implemented.

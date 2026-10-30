@@ -4,8 +4,9 @@ use std::{collections::BTreeMap, io};
 
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse};
 use bamboo_domain::{
-    ProjectId, ProjectStatus, SessionKind, SupervisorManagedLink, SupervisorManagementMutation,
-    SupervisorManagementRequest, SupervisorReference, SupervisorScopeObservation,
+    ProjectId, ProjectStatus, SessionKind, SupervisorCurrentUserTarget, SupervisorManagedLink,
+    SupervisorManagementMutation, SupervisorManagementRequest, SupervisorReference,
+    SupervisorScopeObservation,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_projects::ProjectStoreError;
@@ -165,11 +166,216 @@ pub async fn inspect_managed_sessions(
         .insert_header((actix_web::http::header::CACHE_CONTROL,"no-store"))
         .insert_header((actix_web::http::header::VARY,"Origin, Cookie, Authorization"))
         .json(json!({
-            "capabilities":{"managed_sessions_http_v1":true,"supervisor_current_user_scope_v1":true},
+            "capabilities":{"managed_sessions_http_v1":true,"supervisor_current_user_scope_v1":true,
+                "current_user_bound_history_v1":state.storage.supports_supervisor_current_user_bound_history()},
             "scope":scope,"sessions":sessions,"next_after":page.next_after,"legacy_links":links,
             "management_access":{"kind":"current_user","requires_session_attachment":false},
             "owner_authorization":{"available":true,"required":true,"kind":"existing_access","http_registration":false,"code":null}
         })))
+}
+
+fn history_error(status: StatusCode, code: &str, message: &str) -> HttpResponse {
+    HttpResponse::build(status).json(json!({
+        "error": crate::error::error_value(message),
+        "code": code,
+        "recovery": "Refresh the Supervisor directory and explicitly select the target again.",
+    }))
+}
+
+/// An observation selects a snapshot; it never supplies authorization.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundHistoryRequest {
+    supervisor: SupervisorReference,
+    target: SupervisorCurrentUserTarget,
+    #[serde(default)]
+    query: crate::handlers::agent::history::HistoryQuery,
+    #[serde(default)]
+    clear_readback: bool,
+}
+
+/// Read UI history and its selected identity from one retained storage read.
+/// The returned body can be rendered after the physical guard is released:
+/// both the Session and target are immutable values from the same read.
+pub async fn inspect_managed_history(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+    path: web::Path<String>,
+    body: web::Json<BoundHistoryRequest>,
+) -> actix_web::Result<HttpResponse> {
+    tickets::user(&state, &request)
+        .await
+        .map_err(tickets::TicketHttpError::from)?;
+    let session_id = path.into_inner();
+    if body.target.session_id != session_id {
+        return Ok(history_error(
+            StatusCode::BAD_REQUEST,
+            "target_id_mismatch",
+            "The path and observed target must match",
+        ));
+    }
+    if body.clear_readback
+        && (body.query.since_message_id.is_some() || body.query.projection.is_some())
+    {
+        return Ok(history_error(
+            StatusCode::BAD_REQUEST,
+            "clear_readback_requires_full_history",
+            "Clear readback requires the full history",
+        ));
+    }
+    let reference = match canonical_reference(&state).await {
+        Ok(reference) => reference,
+        Err(response) => return Ok(*response),
+    };
+    if reference != body.supervisor {
+        return Ok(history_error(
+            StatusCode::CONFLICT,
+            "supervisor_observation_stale",
+            "The Supervisor changed; refresh the directory",
+        ));
+    }
+    if !state
+        .storage
+        .supports_supervisor_current_user_bound_history()
+    {
+        return Ok(history_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "bound_history_unsupported",
+            "This storage backend does not support bound history",
+        ));
+    }
+    // The existing guarded Session snapshot is authoritative for freshness.
+    // Matching cache identity alone cannot prove that its history includes
+    // every durable append, edit or truncation.
+    let snapshot = if body.clear_readback {
+        // Execute startup and C1 use this process-local session lock. The
+        // storage port retains target guards while it invokes the nonblocking
+        // registry probe, avoiding a lock-order wait under storage authority.
+        let _persistence_guard = state.persistence.acquire_lock(&session_id).await;
+        let observe_execution = || -> io::Result<bool> {
+            let runners = state
+                .agent_runners
+                .try_read()
+                .map_err(|_| io::Error::other("execution registry is busy"))?;
+            let startups = state
+                .execute_startups
+                .try_lock()
+                .map_err(|_| io::Error::other("execution startup registry is busy"))?;
+            Ok(startups.contains_key(&session_id)
+                || runners
+                    .get(&session_id)
+                    .is_some_and(|runner| !runner.exact_execution_finalized()))
+        };
+        state
+            .storage
+            .load_supervisor_current_user_bound_clear_readback(
+                &reference,
+                &body.target,
+                &observe_execution,
+            )
+            .await
+            .map(|(session, observed, active)| (session, observed, Some(active)))
+    } else {
+        state
+            .storage
+            .load_supervisor_current_user_bound_history(&reference, &body.target)
+            .await
+            .map(|(session, observed)| (session, observed, None))
+    };
+    let (session, observed, execution_active) = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(failure) => {
+            tracing::warn!(%session_id, %failure, "bound Supervisor history unavailable");
+            let (status, code, message) = match failure.kind() {
+                io::ErrorKind::Unsupported => (
+                    StatusCode::NOT_IMPLEMENTED,
+                    "bound_history_unsupported",
+                    "This storage backend does not support bound history",
+                ),
+                io::ErrorKind::WouldBlock => (
+                    StatusCode::CONFLICT,
+                    "target_observation_stale",
+                    "The target changed; refresh the directory",
+                ),
+                io::ErrorKind::NotFound | io::ErrorKind::PermissionDenied => (
+                    StatusCode::CONFLICT,
+                    "target_observation_unavailable",
+                    "The observed target is unavailable or changed; refresh the directory",
+                ),
+                _ => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "bound_history_unavailable",
+                    "Bound history could not be read",
+                ),
+            };
+            return Ok(history_error(status, code, message));
+        }
+    };
+    // A custom backend cannot turn its returned identity into a grant or cause
+    // this endpoint to expose history for a different selected target.
+    if observed != body.target {
+        return Ok(history_error(
+            StatusCode::CONFLICT,
+            "target_observation_stale",
+            "The target changed; refresh the directory",
+        ));
+    }
+    // Evaluate C1's pending/uncertain predicate on this exact durable
+    // snapshot. Idle non-approval Plans are retained; real waits still block.
+    // Otherwise fail closed without mislabelling a wait as an approval.
+    let pending = if body.clear_readback {
+        bamboo_domain::conversation_clear_readback_pending_rejection(&session)
+    } else {
+        None
+    };
+    let has_pending_question = session.has_pending_question();
+    let has_pending_approval = matches!(
+        pending,
+        Some(bamboo_domain::ConversationResetRejection::PendingApproval)
+    ) || session
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|runtime| runtime.plan_mode.as_ref())
+        .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval);
+    if pending.is_some() && !has_pending_question && !has_pending_approval {
+        return Ok(HttpResponse::build(StatusCode::LOCKED).json(json!({
+            "error": crate::error::error_value("The selected conversation has unresolved state; clear completion cannot be confirmed."),
+            "code": "clear_readback_unsettled",
+            "recovery": "Resolve the pending or uncertain operation before confirming the clear.",
+        })));
+    }
+    // Token state belongs to this same immutable snapshot. A managed client
+    // can safely recover after a clear without a separate ID-only detail read.
+    let bound_token_usage = session.token_usage.clone();
+    // Execution is a Host-local registry observation, not proof that a
+    // different process or physical child has stopped.
+    let bound_clear_evidence = execution_active.map(|active| {
+        json!({
+            "full_message_count": session.messages.len(),
+            "execution_active": active,
+            "has_pending_question": has_pending_question,
+            "has_pending_approval": has_pending_approval,
+        })
+    });
+    let mut result =
+        crate::handlers::agent::history::render_history(&session_id, session, &body.query);
+    let object = result
+        .as_object_mut()
+        .expect("history renderer always returns an object");
+    object.insert("supervisor".into(), json!(reference));
+    object.insert("current_user_target".into(), json!(observed));
+    object.insert("history_snapshot_source".into(), json!("durable"));
+    object.insert("bound_token_usage".into(), json!(bound_token_usage));
+    if let Some(evidence) = bound_clear_evidence {
+        object.insert("bound_clear_evidence".into(), evidence);
+    }
+    Ok(HttpResponse::Ok()
+        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
+        .insert_header((
+            actix_web::http::header::VARY,
+            "Origin, Cookie, Authorization",
+        ))
+        .json(result))
 }
 
 async fn validate_attach_target(

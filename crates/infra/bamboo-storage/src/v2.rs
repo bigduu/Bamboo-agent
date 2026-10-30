@@ -7697,6 +7697,53 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    fn supports_supervisor_current_user_bound_history(&self) -> bool {
+        true
+    }
+
+    async fn load_supervisor_current_user_bound_history(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        expected: &bamboo_domain::SupervisorCurrentUserTarget,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorCurrentUserTarget)> {
+        let guard = self
+            .lock_current_user_target(supervisor, &expected.session_id)
+            .await?;
+        if guard.reference != *expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "target observation changed",
+            ));
+        }
+        let durable = self
+            .peer_delivery_session(&expected.session_id, &guard.target.root_session_id)
+            .await?;
+        Ok((durable, guard.reference.clone()))
+    }
+
+    async fn load_supervisor_current_user_bound_clear_readback(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        expected: &bamboo_domain::SupervisorCurrentUserTarget,
+        observe_execution: &(dyn Fn() -> io::Result<bool> + Send + Sync),
+    ) -> io::Result<(Session, bamboo_domain::SupervisorCurrentUserTarget, bool)> {
+        let guard = self
+            .lock_current_user_target(supervisor, &expected.session_id)
+            .await?;
+        if guard.reference != *expected {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "target observation changed",
+            ));
+        }
+        let durable = self
+            .peer_delivery_session(&expected.session_id, &guard.target.root_session_id)
+            .await?;
+        // Host callback is nonblocking and executes before guard drop.
+        let execution_active = observe_execution()?;
+        Ok((durable, guard.reference.clone(), execution_active))
+    }
+
     async fn load_supervisor_current_user_observed_session(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,

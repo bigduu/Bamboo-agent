@@ -525,3 +525,262 @@ fn reset_request_has_no_force_stop_permission_or_role_argument() {
         .authority_identity
         .is_ordinary());
 }
+
+#[test]
+fn pending_snapshot_predicate_reports_permission_replay_and_other_unsettled_state() {
+    let clean = source(false);
+    assert_eq!(conversation_reset_pending_rejection(&clean), None);
+    for (key, expected) in [
+        (
+            "permission.reexecute_tool_call_id",
+            ConversationResetRejection::PendingApproval,
+        ),
+        (
+            "permission.reexecute_request_generation",
+            ConversationResetRejection::PendingApproval,
+        ),
+        (
+            "permission.replay_save_recovery_required",
+            ConversationResetRejection::UncertainOperation,
+        ),
+        (
+            "agent.runtime.state",
+            ConversationResetRejection::LegacyRuntimeState,
+        ),
+    ] {
+        let mut session = clean.clone();
+        session.metadata.insert(key.into(), "synthetic".into());
+        assert_eq!(
+            conversation_reset_pending_rejection(&session),
+            Some(expected),
+            "{key}"
+        );
+    }
+    let mut session = clean.clone();
+    session.set_pending_injected_messages(vec![json!({"id":"synthetic"})]);
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingInput)
+    );
+    let mut session = clean.clone();
+    session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::ActiveRun)
+    );
+    let mut session = clean;
+    session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Suspended;
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingWait)
+    );
+}
+
+#[test]
+fn clear_readback_allows_only_nonwaiting_plan_while_reset_stays_strict() {
+    use crate::{
+        ChildWaitPolicy, PlanModeState, PlanModeStatus, SuspensionState, WaitingForBashState,
+        WaitingForChildrenState,
+    };
+    let clean = source(false);
+    for phase in [
+        PlanModeStatus::Exploring,
+        PlanModeStatus::Designing,
+        PlanModeStatus::Reviewing,
+        PlanModeStatus::Finalizing,
+        PlanModeStatus::AwaitingApproval,
+    ] {
+        let mut session = clean.clone();
+        let runtime = session.agent_runtime_state.as_mut().unwrap();
+        runtime.plan_mode = Some(PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: phase,
+        });
+        assert_eq!(
+            conversation_reset_pending_rejection(&session),
+            Some(ConversationResetRejection::PendingWait)
+        );
+        let expected = (phase == PlanModeStatus::AwaitingApproval)
+            .then_some(ConversationResetRejection::PendingWait);
+        assert_eq!(
+            conversation_clear_readback_pending_rejection(&session),
+            expected,
+            "{phase:?}"
+        );
+    }
+    for status in [
+        AgentStatusState::Idle,
+        AgentStatusState::Completed,
+        AgentStatusState::Cancelled,
+        AgentStatusState::Failed,
+    ] {
+        let mut session = clean.clone();
+        let runtime = session.agent_runtime_state.as_mut().unwrap();
+        runtime.status = status;
+        runtime.plan_mode = Some(PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+        assert_eq!(
+            conversation_clear_readback_pending_rejection(&session),
+            None,
+            "{status:?}"
+        );
+        assert_eq!(
+            conversation_reset_pending_rejection(&session),
+            Some(ConversationResetRejection::PendingWait),
+            "{status:?}"
+        );
+    }
+    for wait in ["suspended_status", "suspension", "child", "bash"] {
+        let mut session = clean.clone();
+        let runtime = session.agent_runtime_state.as_mut().unwrap();
+        runtime.plan_mode = Some(PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+        match wait {
+            "suspended_status" => runtime.status = AgentStatusState::Suspended,
+            "suspension" => {
+                runtime.suspension = Some(SuspensionState {
+                    reason: "synthetic".into(),
+                    suspended_at: Utc::now(),
+                    resumable: true,
+                    hook_point: None,
+                })
+            }
+            "child" => {
+                runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+                    vec!["synthetic-child".into()],
+                    ChildWaitPolicy::All,
+                    Utc::now(),
+                ))
+            }
+            "bash" => {
+                runtime.waiting_for_bash = Some(WaitingForBashState::for_bash(
+                    vec!["synthetic-shell".into()],
+                    Utc::now(),
+                ))
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            conversation_reset_pending_rejection(&session),
+            Some(ConversationResetRejection::PendingWait),
+            "{wait}"
+        );
+        assert_eq!(
+            conversation_clear_readback_pending_rejection(&session),
+            Some(ConversationResetRejection::PendingWait),
+            "{wait}"
+        );
+    }
+    for active in ["initializing", "running", "finalizing", "tool"] {
+        let mut session = clean.clone();
+        let runtime = session.agent_runtime_state.as_mut().unwrap();
+        runtime.plan_mode = Some(PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+        match active {
+            "initializing" => runtime.status = AgentStatusState::Initializing,
+            "running" => runtime.status = AgentStatusState::Running,
+            "finalizing" => runtime.status = AgentStatusState::Finalizing,
+            "tool" => runtime.tools.active_tool_calls = 1,
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            conversation_reset_pending_rejection(&session),
+            Some(ConversationResetRejection::ActiveRun),
+            "{active}"
+        );
+        assert_eq!(
+            conversation_clear_readback_pending_rejection(&session),
+            Some(ConversationResetRejection::ActiveRun),
+            "{active}"
+        );
+    }
+    for (marker, expected) in [
+        (
+            "permission.reexecute_tool_call_id",
+            ConversationResetRejection::PendingApproval,
+        ),
+        (
+            "permission.reexecute_request_generation",
+            ConversationResetRejection::PendingApproval,
+        ),
+        (
+            "permission.replay_save_recovery_required",
+            ConversationResetRejection::UncertainOperation,
+        ),
+        (
+            "agent.runtime.state",
+            ConversationResetRejection::LegacyRuntimeState,
+        ),
+    ] {
+        let mut session = clean.clone();
+        session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+            entered_at: Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: PlanModeStatus::Exploring,
+        });
+        session.metadata.insert(marker.into(), "synthetic".into());
+        assert_eq!(
+            conversation_clear_readback_pending_rejection(&session),
+            Some(expected),
+            "{marker}"
+        );
+        assert_eq!(
+            conversation_reset_pending_rejection(&session),
+            Some(expected),
+            "{marker}"
+        );
+    }
+    let mut session = clean.clone();
+    session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+        entered_at: Utc::now(),
+        pre_permission_mode: "default".into(),
+        plan_file_path: None,
+        status: PlanModeStatus::Exploring,
+    });
+    session.set_pending_question(
+        "q".into(),
+        "synthetic".into(),
+        "synthetic".into(),
+        vec![],
+        false,
+    );
+    assert_eq!(
+        conversation_clear_readback_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingQuestion)
+    );
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingQuestion)
+    );
+    let mut session = clean;
+    session.agent_runtime_state.as_mut().unwrap().plan_mode = Some(PlanModeState {
+        entered_at: Utc::now(),
+        pre_permission_mode: "default".into(),
+        plan_file_path: None,
+        status: PlanModeStatus::Exploring,
+    });
+    session.set_pending_injected_messages(vec![json!({"id":"synthetic"})]);
+    assert_eq!(
+        conversation_clear_readback_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingInput)
+    );
+    assert_eq!(
+        conversation_reset_pending_rejection(&session),
+        Some(ConversationResetRejection::PendingInput)
+    );
+}

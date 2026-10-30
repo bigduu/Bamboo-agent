@@ -9,7 +9,8 @@ const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 const { parseCounts } = require("./test-groups.cjs");
 const SERIAL_STORAGE_FAMILIES = ["root_birth_tests", "host_root_create::tests", "supervisor_management_tests",
-  "supervisor_management_lifetime_tests", "supervisor_proof_tests", "supervisor_management::observer_lock_order_tests"].map((name) => "v2::" + name + "::");
+  "supervisor_management_lifetime_tests", "supervisor_proof_tests", "supervisor_management::observer_lock_order_tests",
+  "supervisor_management::current_user::observed_history_guard_tests"].map((name) => "v2::" + name + "::");
 const SERIAL_STORAGE_FILTERS = ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"];
 const SERIAL_STORAGE_SELECTORS = [...SERIAL_STORAGE_FAMILIES,
   "session_merge::tests::supervisor_management_race_rejects_staged_task_callbacks_and_fresh_invocation_succeeds"];
@@ -92,7 +93,14 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // compression library counts content pages against the dispatch cap; the
 // test-utils diagnostic records each read attempt. No additive feature-only
 // cases were added. Actual compact/actor integration targets stay in agent-tests-0.
-const FEATURE_SOURCE_SHA256 = "cb5d5d66467143429453fde8eddab531d00c2de19228cebb31e721a1c1bc1215";
+// Bound Supervisor history adds four ordinary Actix cases to server-handlers.
+// Its two storage guard cases belong to the existing serial storage owner;
+// they are excluded from the ordinary storage run and executed once serially.
+// Two identity-bound clear-readback Actix cases also belong to server-handlers;
+// They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
+// The C1 pending predicates add two ordinary domain packages-2 cases and three
+// server-handlers Actix cases; none is an additive feature-only case.
+const FEATURE_SOURCE_SHA256 = "244b6b4f0cbba93be4f1bcbf2ea84482deafe170a49fe9fadb1c07292ab7b8de";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
