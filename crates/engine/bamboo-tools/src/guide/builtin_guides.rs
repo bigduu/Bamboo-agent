@@ -567,7 +567,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "SubAgent",
             ToolCategory::TaskManagement,
             "Use only intent, target, role, message, and reply_to; omit unused fields. For chat (the default intent), put the complete assignment and needed paths in message: omit target to create a child, or reuse its returned logical ActorId to correct or continue it. role selects a profile only on creation; tools and permissions come from the runtime. intent=inspect with message=tree shows the owned tree; with target, message selects overview, diagnostics, messages, result, or error. For a page or selected full message, JSON-encode view/cursor/message_id inside message and omit unused query fields. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question. Direct parents reply with intent=chat, the exact pending ParentRequest id in reply_to, and the answer in message, omitting target and role; forced permission accepts exactly approve_once or deny. The runtime manages activation and waiting.",
-            "For ordinary executing Sessions, do not use proactively for simple one-step tasks. A trusted Supervisor delegates execution even for simple tasks: first use session_history list and bounded inspect to reuse existing managed Sessions for main execution. Use SubAgent only for auxiliary planning, review or verification; report a recoverable blocker if no suitable authorized target is available. From a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
+            "For ordinary executing Sessions, do not use proactively for simple one-step tasks. A trusted Supervisor delegates execution even for simple tasks: first use session_history list and bounded inspect to reuse existing managed Sessions for main execution. Use SubAgent only for auxiliary planning, review or verification; report a recoverable blocker if no suitable authorized target is available. Multiple children with distinct, non-overlapping assignments may run in parallel when the work splits into independent slices; never assign overlapping files or unclear shared responsibility. From a child session, create a nested child only when the current assignment explicitly authorizes nested delegation and it is necessary; do not create multiple overlapping children with unclear responsibilities.",
             &["Task"],
             vec![
                 example(
@@ -847,6 +847,9 @@ mod tests {
         assert!(!guide
             .when_not_to_use
             .contains("do not spawn children from child sessions"));
+        assert!(guide
+            .when_not_to_use
+            .contains("non-overlapping assignments may run in parallel"));
         assert!(guide.when_to_use.contains("intent=inspect"));
         assert!(guide.when_to_use.contains("intent=control"));
         assert!(guide.when_to_use.contains("intent=ask_parent"));
