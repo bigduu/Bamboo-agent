@@ -311,6 +311,12 @@ pub fn repository(repo: &Path) -> Result<PathBuf, String> {
     repository_by(repo, Instant::now() + git_command_timeout())
 }
 
+/// Deadline-aware repository identity lookup for the inventory handler: the
+/// handler's deduplication probes share the request's scan deadline.
+pub fn repository_until(repo: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+    repository_by(repo, deadline_at)
+}
+
 fn repository_by(repo: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
     let value = git_path_by(
         repo,
@@ -337,6 +343,12 @@ pub(super) fn workspace_root_queries_for_test(path: &Path) -> usize {
 
 pub fn workspace_root(path: &Path) -> Result<PathBuf, String> {
     workspace_root_by(path, Instant::now() + git_command_timeout())
+}
+
+/// Deadline-aware checkout-root lookup for the inventory handler's session
+/// association probes.
+pub fn workspace_root_until(path: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+    workspace_root_by(path, deadline_at)
 }
 
 fn workspace_root_by(path: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
@@ -870,8 +882,8 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
 /// the response unbounded in the number of repositories.
 pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree>, String> {
     let deadline = overall_deadline.min(Instant::now() + list_inspect_budget());
-    let common = repository(repo)?;
-    let listing = git_bytes(repo, &["worktree", "list", "--porcelain", "-z"])?;
+    let common = repository_by(repo, deadline)?;
+    let listing = git_bytes_by(repo, &["worktree", "list", "--porcelain", "-z"], deadline)?;
     let mut result = Vec::new();
     let mut entry: Option<Worktree> = None;
     for field in listing.split(|byte| *byte == 0) {
@@ -2417,6 +2429,85 @@ mod tests {
             .status()
             .expect("mkfifo is available on unix hosts");
         assert!(status.success(), "mkfifo {path:?} failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_listing_probes_respect_the_shared_deadline() {
+        let f = Fixture::new();
+        // Each bound repository gets a linked worktree whose administrative
+        // HEAD is a FIFO: `worktree list` itself stalls reading it, which is
+        // the probe that previously restarted the clock inside list_until.
+        for name in ["one", "two", "three", "four"] {
+            let repo = f.roots().join(name);
+            init_discovery_repo(&repo);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+            )
+            .unwrap();
+            let linked = f.roots().join(format!("{name}-linked"));
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "--",
+                    linked.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )
+            .unwrap();
+            let admin_head = repo
+                .join(".git")
+                .join("worktrees")
+                .join(format!("{name}-linked"))
+                .join("HEAD");
+            fs::remove_file(&admin_head).unwrap();
+            let guard = FifoSentinel::create(admin_head);
+            std::mem::forget(guard);
+        }
+        // One shared inventory deadline for every repository, exactly as the
+        // handler passes it: the total must stay bounded, not per call.
+        let budget = Duration::from_millis(1500);
+        let scan_deadline = std::time::Instant::now() + budget;
+        let started = std::time::Instant::now();
+        let mut failures = 0;
+        for name in ["one", "two", "three", "four"] {
+            let repo = f.roots().join(name);
+            if list_until(&repo, scan_deadline).is_err() {
+                failures += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(4000),
+            "listing probes took {elapsed:?}; the shared deadline must bound all repositories"
+        );
+        assert!(
+            failures > 0,
+            "a stalled listing must fail with a timeout rather than hang"
+        );
+        for name in ["one", "two", "three", "four"] {
+            let _ = fs::remove_file(
+                f.roots()
+                    .join(name)
+                    .join(".git")
+                    .join("worktrees")
+                    .join(format!("{name}-linked"))
+                    .join("HEAD"),
+            );
+        }
     }
 
     #[cfg(unix)]

@@ -170,7 +170,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         let mut seen = HashSet::new();
         for path in sources {
             let source = git::path_label(&path);
-            let common = match git::repository(&path) {
+            let common = match git::repository_until(&path, scan_deadline) {
                 Ok(common) => common,
                 Err(error) => {
                     repositories.push(RepositoryInventory {
@@ -200,7 +200,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                             if entries.iter().any(|entry| entry.path == workspace) {
                                 Some(workspace.to_path_buf())
                             } else {
-                                git::workspace_root(workspace).ok()
+                                git::workspace_root_until(workspace, scan_deadline).ok()
                             }
                         });
                     }
