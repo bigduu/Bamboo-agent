@@ -609,6 +609,8 @@ async fn managed_history_binds_snapshot_to_observed_target_and_keeps_legacy_hist
         .await
         .unwrap();
     replacement.set_project_id_meta(f.project.to_string());
+    // Recreated Roots use the same next-revision CAS for Project changes.
+    replacement.metadata_version = replacement.metadata_version.checked_add(1).unwrap();
     replacement.add_message(Message::user("PRIVATE replacement history"));
     f.state.storage.save_session(&replacement).await.unwrap();
     let (status, stale) = f
@@ -800,5 +802,235 @@ async fn managed_history_binds_ordinary_child_and_its_ancestry() {
     assert_eq!(status, StatusCode::OK, "{history}");
     assert_eq!(history["current_user_target"], target);
     assert_eq!(history["messages"][0]["content"], "synthetic child history");
+    f.state.shutdown().await;
+}
+
+// Synthetic state only: verify the readback evidence comes from the selected
+// durable Session and that the Host activity probe does not wait under storage.
+#[actix_web::test]
+async fn managed_clear_readback_binds_full_count_pending_and_local_activity() {
+    let f = Fixture::new(false).await;
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let ordinary = json!({"supervisor": f.supervisor, "target": target});
+    let mut request = ordinary.clone();
+    request["clear_readback"] = json!(true);
+    let (_, default_history) = f
+        .call(Method::POST, Some("target-a/history"), Some(ordinary))
+        .await;
+    assert!(default_history.get("bound_clear_evidence").is_none());
+
+    let mut session = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    session.messages.clear();
+    f.state.storage.save_session(&session).await.unwrap();
+    let (status, empty) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert_eq!(
+        empty["bound_clear_evidence"],
+        json!({
+            "full_message_count": 0, "execution_active": false,
+            "has_pending_question": false, "has_pending_approval": false
+        })
+    );
+    assert_eq!(empty["bound_token_usage"], Value::Null);
+
+    let mut hidden = Message::user("synthetic hidden runtime record");
+    hidden.metadata = Some(json!({"hidden_from_ui": true}));
+    session.add_message(hidden);
+    f.state.storage.save_session(&session).await.unwrap();
+    let (_, hidden_history) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(hidden_history["messages"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        hidden_history["bound_clear_evidence"]["full_message_count"],
+        1
+    );
+
+    session.messages.clear();
+    session.set_pending_question(
+        "q".into(),
+        "synthetic".into(),
+        "synthetic".into(),
+        vec![],
+        false,
+    );
+    f.state.storage.save_session(&session).await.unwrap();
+    let (_, pending) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(
+        pending["bound_clear_evidence"]["has_pending_question"],
+        true
+    );
+    session.clear_pending_question();
+    let mut runtime = bamboo_domain::AgentRuntimeState::default();
+    runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+        entered_at: chrono::Utc::now(),
+        pre_permission_mode: "default".into(),
+        plan_file_path: None,
+        status: bamboo_domain::PlanModeStatus::AwaitingApproval,
+    });
+    session.agent_runtime_state = Some(runtime);
+    f.state.storage.save_session(&session).await.unwrap();
+    let (_, approval) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(
+        approval["bound_clear_evidence"]["has_pending_approval"],
+        true
+    );
+
+    f.state
+        .agent_runners
+        .write()
+        .await
+        .insert("target-a".into(), bamboo_engine::AgentRunner::new());
+    let (_, active) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(active["bound_clear_evidence"]["execution_active"], true);
+    f.state.agent_runners.write().await.remove("target-a");
+    let startup =
+        crate::handlers::agent::events::begin_execute_startup(f.state.get_ref(), "target-a");
+    let (_, starting) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(starting["bound_clear_evidence"]["execution_active"], true);
+    drop(startup);
+
+    let held = f.state.agent_runners.write().await;
+    let (status, busy) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        f.call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        ),
+    )
+    .await
+    .expect("no registry wait under storage guard");
+    drop(held);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{busy}");
+
+    let startups = f.state.execute_startups.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let holder = std::thread::spawn(move || {
+        let _guard = startups.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+    let (status, busy) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        f.call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        ),
+    )
+    .await
+    .expect("no startup registry wait under storage guard");
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{busy}");
+
+    let mut stale = request.clone();
+    stale["target"]["authority_sha256"] = json!("f".repeat(64));
+    let (status, _) = f
+        .call(Method::POST, Some("target-a/history"), Some(stale))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    request["query"] = json!({"projection":"messages"});
+    let (status, _) = f
+        .call(Method::POST, Some("target-a/history"), Some(request))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    f.state.shutdown().await;
+}
+
+// Exercise the real C1 write and the opt-in same-identity readback through
+// production routes, using only a temporary store and synthetic Session.
+#[actix_web::test]
+async fn managed_clear_readback_follows_acknowledged_c1() {
+    let f = Fixture::new(false).await;
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let request = test::TestRequest::post()
+        .uri("/api/v1/sessions/target-a/clear")
+        .peer_addr("127.0.0.1:12345".parse().unwrap())
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value = test::read_body_json(response).await;
+    assert_eq!(receipt["success"], true);
+    assert_eq!(receipt["session_id"], "target-a");
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let request = json!({"supervisor": f.supervisor, "target": target, "clear_readback": true});
+    let (status, history) = f
+        .call(Method::POST, Some("target-a/history"), Some(request))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(
+        history["bound_clear_evidence"],
+        json!({
+            "full_message_count": 0, "execution_active": false,
+            "has_pending_question": false, "has_pending_approval": false
+        })
+    );
+    assert_eq!(history["bound_token_usage"], Value::Null);
+    assert_eq!(history["is_delta"], false);
+    assert_eq!(history["truncated"], false);
     f.state.shutdown().await;
 }

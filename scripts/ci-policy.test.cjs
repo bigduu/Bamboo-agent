@@ -333,7 +333,8 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   const { SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, cargoArguments } = require("./run-feature-tests.cjs")
   assert.deepEqual(SERIAL_STORAGE_FAMILIES, ["v2::root_birth_tests::", "v2::host_root_create::tests::",
     "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::",
-    "v2::supervisor_management::observer_lock_order_tests::"])
+    "v2::supervisor_management::observer_lock_order_tests::",
+    "v2::supervisor_management::current_user::observed_history_guard_tests::"])
   assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
   const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
   assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())

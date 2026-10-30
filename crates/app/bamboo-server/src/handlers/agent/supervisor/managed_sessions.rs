@@ -190,6 +190,8 @@ pub struct BoundHistoryRequest {
     target: SupervisorCurrentUserTarget,
     #[serde(default)]
     query: crate::handlers::agent::history::HistoryQuery,
+    #[serde(default)]
+    clear_readback: bool,
 }
 
 /// Read UI history and its selected identity from one retained storage read.
@@ -210,6 +212,15 @@ pub async fn inspect_managed_history(
             StatusCode::BAD_REQUEST,
             "target_id_mismatch",
             "The path and observed target must match",
+        ));
+    }
+    if body.clear_readback
+        && (body.query.since_message_id.is_some() || body.query.projection.is_some())
+    {
+        return Ok(history_error(
+            StatusCode::BAD_REQUEST,
+            "clear_readback_requires_full_history",
+            "Clear readback requires the full history",
         ));
     }
     let reference = match canonical_reference(&state).await {
@@ -236,11 +247,42 @@ pub async fn inspect_managed_history(
     // The existing guarded Session snapshot is authoritative for freshness.
     // Matching cache identity alone cannot prove that its history includes
     // every durable append, edit or truncation.
-    let (session, observed) = match state
-        .storage
-        .load_supervisor_current_user_bound_history(&reference, &body.target)
-        .await
-    {
+    let snapshot = if body.clear_readback {
+        // Execute startup and C1 use this process-local session lock. The
+        // storage port retains target guards while it invokes the nonblocking
+        // registry probe, avoiding a lock-order wait under storage authority.
+        let _persistence_guard = state.persistence.acquire_lock(&session_id).await;
+        let observe_execution = || -> io::Result<bool> {
+            let runners = state
+                .agent_runners
+                .try_read()
+                .map_err(|_| io::Error::other("execution registry is busy"))?;
+            let startups = state
+                .execute_startups
+                .try_lock()
+                .map_err(|_| io::Error::other("execution startup registry is busy"))?;
+            Ok(startups.contains_key(&session_id)
+                || runners
+                    .get(&session_id)
+                    .is_some_and(|runner| !runner.exact_execution_finalized()))
+        };
+        state
+            .storage
+            .load_supervisor_current_user_bound_clear_readback(
+                &reference,
+                &body.target,
+                &observe_execution,
+            )
+            .await
+            .map(|(session, observed, active)| (session, observed, Some(active)))
+    } else {
+        state
+            .storage
+            .load_supervisor_current_user_bound_history(&reference, &body.target)
+            .await
+            .map(|(session, observed)| (session, observed, None))
+    };
+    let (session, observed, execution_active) = match snapshot {
         Ok(snapshot) => snapshot,
         Err(failure) => {
             tracing::warn!(%session_id, %failure, "bound Supervisor history unavailable");
@@ -281,6 +323,18 @@ pub async fn inspect_managed_history(
     // Token state belongs to this same immutable snapshot. A managed client
     // can safely recover after a clear without a separate ID-only detail read.
     let bound_token_usage = session.token_usage.clone();
+    // Execution is a Host-local registry observation, not proof that a
+    // different process or physical child has stopped.
+    let bound_clear_evidence = execution_active.map(|active| {
+        json!({
+            "full_message_count": session.messages.len(),
+            "execution_active": active,
+            "has_pending_question": session.has_pending_question(),
+            "has_pending_approval": session.agent_runtime_state.as_ref()
+                .and_then(|runtime| runtime.plan_mode.as_ref())
+                .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval),
+        })
+    });
     let mut result =
         crate::handlers::agent::history::render_history(&session_id, session, &body.query);
     let object = result
@@ -290,6 +344,9 @@ pub async fn inspect_managed_history(
     object.insert("current_user_target".into(), json!(observed));
     object.insert("history_snapshot_source".into(), json!("durable"));
     object.insert("bound_token_usage".into(), json!(bound_token_usage));
+    if let Some(evidence) = bound_clear_evidence {
+        object.insert("bound_clear_evidence".into(), evidence);
+    }
     Ok(HttpResponse::Ok()
         .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
         .insert_header((
