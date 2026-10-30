@@ -70,6 +70,72 @@ const MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES: usize = 2;
 const LOADED_BROWSER_ACKNOWLEDGEMENT: &str =
     "Browser loaded. Its complete schema is in the tools for this request.";
 
+struct ModelUsageGuard {
+    runner: Arc<crate::runtime::hooks::HookRunner>,
+    snapshot: Option<bamboo_domain::ModelCallUsage>,
+    session_birth: chrono::DateTime<chrono::Utc>,
+    root_session_id: Option<String>,
+}
+
+impl ModelUsageGuard {
+    fn finish(
+        &mut self,
+        status: bamboo_domain::ModelCallStatus,
+        usage: Option<crate::runtime::stream::handler::ProviderUsageSnapshot>,
+    ) {
+        if let Some(mut snapshot) = self.snapshot.take() {
+            snapshot.status = status;
+            snapshot.usage = reported_token_usage(usage);
+            self.runner.notify_model_usage(
+                snapshot,
+                self.session_birth,
+                self.root_session_id.clone(),
+            );
+        }
+    }
+}
+
+impl Drop for ModelUsageGuard {
+    fn drop(&mut self) {
+        self.finish(
+            bamboo_infrastructure::telemetry::dropped_model_call_status(),
+            None,
+        );
+    }
+}
+
+fn usage_status(error: &AgentError) -> bamboo_domain::ModelCallStatus {
+    if matches!(error, AgentError::Cancelled) {
+        bamboo_domain::ModelCallStatus::Cancelled
+    } else {
+        bamboo_domain::ModelCallStatus::Error
+    }
+}
+
+fn token_usage(
+    value: crate::runtime::stream::handler::ProviderUsageSnapshot,
+) -> bamboo_domain::ModelTokenUsage {
+    fn representable(value: Option<u64>) -> Option<u64> {
+        value.filter(|value| i64::try_from(*value).is_ok())
+    }
+    bamboo_domain::ModelTokenUsage {
+        input_tokens: representable(value.input_tokens),
+        output_tokens: representable(value.output_tokens),
+        reasoning_tokens: representable(value.reasoning_tokens),
+        cache_read_input_tokens: representable(value.cache_read_input_tokens),
+        cache_creation_input_tokens: representable(value.cache_creation_input_tokens),
+        cache_write_input_tokens: representable(value.cache_write_input_tokens),
+    }
+}
+
+fn reported_token_usage(
+    value: Option<crate::runtime::stream::handler::ProviderUsageSnapshot>,
+) -> Option<bamboo_domain::ModelTokenUsage> {
+    value
+        .map(token_usage)
+        .filter(|usage| usage != &Default::default())
+}
+
 fn context_management_telemetry(
     session: &Session,
     config: &AgentLoopConfig,
@@ -1659,6 +1725,31 @@ pub(super) async fn execute_llm_stream(
     // not an LLM request. The same span remains alive through stream consumption.
     let observation =
         bamboo_infrastructure::telemetry::Observation::llm(provider_type, model, session_id);
+    let call_id = uuid::Uuid::new_v4().to_string();
+    observation.model_call_id(&call_id);
+    let trace_ids = observation.trace_ids();
+    let mut usage_guard = ModelUsageGuard {
+        runner: config.hook_runner.clone(),
+        session_birth: session.created_at,
+        root_session_id: bamboo_infrastructure::telemetry::session_reference(
+            &session.root_session_id,
+        ),
+        snapshot: bamboo_infrastructure::telemetry::session_reference(session_id).map(
+            |session_id| bamboo_domain::ModelCallUsage {
+                schema_version: 1,
+                event_id: call_id.clone(),
+                call_id,
+                run_id: bamboo_infrastructure::telemetry::current_run_id(&session_id),
+                session_id,
+                provider: provider_type.and_then(bamboo_infrastructure::telemetry::safe_provider),
+                model: bamboo_infrastructure::telemetry::safe_identifier(model),
+                status: bamboo_domain::ModelCallStatus::Cancelled,
+                trace_id: trace_ids.as_ref().map(|ids| ids.0.clone()),
+                span_id: trace_ids.map(|ids| ids.1),
+                usage: None,
+            },
+        ),
+    };
     let (http_retry_observer, live_offer) = if live_bootstrap.is_some() {
         let (observer, receiver) =
             bamboo_llm::retry::InitialHttpRetryObserver::with_live_bootstrap();
@@ -1765,6 +1856,7 @@ pub(super) async fn execute_llm_stream(
     let stream = match stream {
         Ok(stream) => stream,
         Err(error) => {
+            usage_guard.finish(usage_status(&error), None);
             observation.finish(crate::runtime::runner::telemetry_error_outcome(&error));
             return Err(error);
         }
@@ -1884,8 +1976,12 @@ pub(super) async fn execute_llm_stream(
                 other => other,
             };
             if let Some(usage) = failure.partial_output.provider_usage {
-                observation.usage(usage.input_tokens, usage.output_tokens);
+                observation.model_usage(&token_usage(usage));
             }
+            usage_guard.finish(
+                usage_status(&failure.error),
+                failure.partial_output.provider_usage,
+            );
             observation.finish(crate::runtime::runner::telemetry_error_outcome(
                 &failure.error,
             ));
@@ -1905,8 +2001,12 @@ pub(super) async fn execute_llm_stream(
     };
 
     if let Some(usage) = stream_output.provider_usage {
-        observation.usage(usage.input_tokens, usage.output_tokens);
+        observation.model_usage(&token_usage(usage));
     }
+    usage_guard.finish(
+        bamboo_domain::ModelCallStatus::Success,
+        stream_output.provider_usage,
+    );
     observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
 
     if config.features_final_evidence_check
@@ -1942,8 +2042,15 @@ pub(super) async fn execute_llm_stream(
             cache_read_input_tokens: stream_output.cache_read_input_tokens,
             retained_from_previous_call: false,
         };
-        usage.provider_prompt_usage =
-            (provider_prompt_usage.total_input_tokens() > 0).then_some(provider_prompt_usage);
+        // This legacy DTO has no per-field unknown representation. Avoid
+        // publishing an exact-looking cache ratio when the authoritative
+        // provider snapshot omitted or invalidated its input or cache count.
+        let prompt_fields_known = stream_output.provider_usage.is_none_or(|snapshot| {
+            snapshot.input_tokens.is_some() && snapshot.cache_read_input_tokens.is_some()
+        });
+        usage.provider_prompt_usage = (prompt_fields_known
+            && provider_prompt_usage.total_input_tokens() > 0)
+            .then_some(provider_prompt_usage);
     }
 
     if let Some(usage) = session.token_usage.clone() {

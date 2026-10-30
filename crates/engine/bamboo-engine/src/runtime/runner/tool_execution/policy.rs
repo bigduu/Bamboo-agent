@@ -9,6 +9,27 @@ const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
 const UNCHANGED_OBSERVATION_ROUNDS: usize = 3;
 const MAX_TRACKED_OBSERVATIONS: usize = 80;
+const SUBAGENT_INSPECTION_LABEL: &str = "SubAgent (inspect)";
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum ToolCircuitKey {
+    Tool(String),
+    SubAgentInspection,
+}
+
+impl ToolCircuitKey {
+    fn name(&self) -> &str {
+        match self {
+            Self::Tool(name) => name,
+            Self::SubAgentInspection => SUBAGENT_INSPECTION_LABEL,
+        }
+    }
+
+    fn run_scoped(&self) -> bool {
+        matches!(self, Self::SubAgentInspection)
+            || matches!(self, Self::Tool(name) if name == "SubAgent")
+    }
+}
 
 /// Compare complete successful filesystem-observation rounds.
 /// Keep fingerprints, not arguments or output, and forget everything at run end.
@@ -137,6 +158,46 @@ fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Optio
     }
 }
 
+/// Separate read-only SubAgent inspection from delegation only when the
+/// arguments unambiguously select an inspection route. Ambiguous or malformed
+/// requests remain in the delegation circuit, including compact/legacy mixes.
+fn tool_policy_key(tool_call: &ToolCall, admitted_execution_name: Option<&str>) -> ToolCircuitKey {
+    let name = normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
+    if name != "SubAgent" {
+        return ToolCircuitKey::Tool(name);
+    }
+    let Ok(args) = parse_tool_args(&tool_call.function.arguments) else {
+        return ToolCircuitKey::Tool(name);
+    };
+    let Some(object) = args.as_object() else {
+        return ToolCircuitKey::Tool(name);
+    };
+    let compact_inspection = object.get("intent").and_then(|value| value.as_str())
+        == Some("inspect")
+        && object.keys().all(|key| {
+            matches!(
+                key.as_str(),
+                "intent" | "target" | "message" | "role" | "reply_to"
+            )
+        })
+        && ["role", "reply_to"].iter().all(|key| {
+            object
+                .get(*key)
+                .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+        });
+    let legacy_inspection = matches!(
+        object.get("action").and_then(|value| value.as_str()),
+        Some("get" | "list" | "list_models")
+    ) && ["intent", "target", "role", "reply_to"]
+        .iter()
+        .all(|key| !object.contains_key(*key));
+    if compact_inspection || legacy_inspection {
+        ToolCircuitKey::SubAgentInspection
+    } else {
+        ToolCircuitKey::Tool(name)
+    }
+}
+
 #[cfg(test)]
 pub(super) fn validate_tool_call_arguments(tool_call: &ToolCall) -> Result<(), String> {
     validate_tool_call_arguments_for_execution(tool_call, "")
@@ -198,6 +259,7 @@ pub(super) enum ToolPolicyPrecheckViolation {
         tool_name: String,
         consecutive_failures: usize,
         limit: usize,
+        run_scoped: bool,
     },
 }
 
@@ -216,12 +278,9 @@ impl ToolPolicyPrecheckViolation {
                 tool_name,
                 consecutive_failures,
                 limit,
+                run_scoped,
             } => {
-                let scope = if tool_name == "SubAgent" {
-                    "run"
-                } else {
-                    "round"
-                };
+                let scope = if run_scoped { "run" } else { "round" };
                 format!(
                     "Tool policy blocked '{}': {} consecutive failures reached circuit limit ({}) in this {}",
                     tool_name, consecutive_failures, limit, scope
@@ -236,7 +295,7 @@ pub(crate) struct ToolPolicyGuard {
     max_tool_calls_per_round: usize,
     max_consecutive_failures_per_tool: usize,
     executed_calls: usize,
-    consecutive_failures: HashMap<String, usize>,
+    consecutive_failures: HashMap<ToolCircuitKey, usize>,
     observation_progress: ObservationProgress,
     pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
     progress_feedback: super::progress_feedback::ProgressFeedbackBudget,
@@ -266,14 +325,15 @@ impl ToolPolicyGuard {
         self.max_tool_calls_per_round = max_tool_calls_per_round;
         self.max_consecutive_failures_per_tool = max_consecutive_failures_per_tool;
         self.executed_calls = 0;
-        // Preserve delegation failures across model turns. Other tools keep
+        // Preserve each SubAgent circuit across model turns. Other tools keep
         // their existing per-round circuit behavior.
-        self.consecutive_failures
-            .retain(|name, _| name == "SubAgent");
+        self.consecutive_failures.retain(|key, _| key.run_scoped());
     }
 
     pub(crate) fn delegation_failure_message(&self) -> Option<String> {
-        let failures = *self.consecutive_failures.get("SubAgent")?;
+        let failures = *self
+            .consecutive_failures
+            .get(&ToolCircuitKey::Tool("SubAgent".into()))?;
         (failures >= self.max_consecutive_failures_per_tool).then(|| format!(
             "SubAgent delegation stopped after {failures} consecutive failures in this run \
              (limit {}). Review the tool errors and correct the call before starting a new run. \
@@ -357,27 +417,23 @@ impl ToolPolicyGuard {
         reserved_calls: usize,
         admitted_execution_name: Option<&str>,
     ) -> Result<(), ToolPolicyPrecheckViolation> {
-        let normalized_tool_name =
-            normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
+        let key = tool_policy_key(tool_call, admitted_execution_name);
         let projected_executions = self.executed_calls.saturating_add(reserved_calls);
 
         if projected_executions >= self.max_tool_calls_per_round {
             return Err(ToolPolicyPrecheckViolation::RoundToolLimit {
                 limit: self.max_tool_calls_per_round,
-                tool_name: normalized_tool_name,
+                tool_name: key.name().to_owned(),
             });
         }
 
-        let failures = self
-            .consecutive_failures
-            .get(&normalized_tool_name)
-            .copied()
-            .unwrap_or(0);
+        let failures = self.consecutive_failures.get(&key).copied().unwrap_or(0);
         if failures >= self.max_consecutive_failures_per_tool {
             return Err(ToolPolicyPrecheckViolation::ToolCircuitOpen {
-                tool_name: normalized_tool_name,
+                tool_name: key.name().to_owned(),
                 consecutive_failures: failures,
                 limit: self.max_consecutive_failures_per_tool,
+                run_scoped: key.run_scoped(),
             });
         }
 
@@ -421,8 +477,7 @@ impl ToolPolicyGuard {
     ) {
         self.executed_calls = self.executed_calls.saturating_add(1);
 
-        let normalized_tool_name =
-            normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
+        let key = tool_policy_key(tool_call, admitted_execution_name);
 
         let succeeded = match shell_accounting {
             super::per_call::ShellAccountingOutcome::Ordinary => {
@@ -442,14 +497,11 @@ impl ToolPolicyGuard {
         }
 
         if succeeded {
-            self.consecutive_failures.remove(&normalized_tool_name);
+            self.consecutive_failures.remove(&key);
             return;
         }
 
-        *self
-            .consecutive_failures
-            .entry(normalized_tool_name)
-            .or_insert(0) += 1;
+        *self.consecutive_failures.entry(key).or_insert(0) += 1;
     }
 }
 
@@ -609,7 +661,12 @@ mod tests {
         guard.observe_execution_outcome(&call, &outcome("running", false), Some("exec_command"));
         assert!(guard.observation_progress.current.is_none());
         guard.observe_execution_outcome(&call, &outcome("completed", true), Some("exec_command"));
-        assert_eq!(guard.consecutive_failures.get("exec_command"), Some(&2));
+        assert_eq!(
+            guard
+                .consecutive_failures
+                .get(&ToolCircuitKey::Tool("exec_command".into())),
+            Some(&2)
+        );
         assert!(matches!(
             guard.check_before_execution_for_name(&call, 0, Some("exec_command")),
             Err(ToolPolicyPrecheckViolation::RoundToolLimit { .. })
@@ -664,6 +721,92 @@ mod tests {
         }
         assert!(guard.check_before_execution(&call, 0).is_ok());
         assert!(guard.delegation_failure_message().is_none());
+    }
+
+    #[test]
+    fn inspection_failures_do_not_spend_the_delegation_circuit() {
+        let mut guard = ToolPolicyGuard::default();
+        let inspect = tool_call(
+            "SubAgent",
+            r#"{"intent":"inspect","target":"child","message":"result"}"#,
+        );
+        let create = tool_call("SubAgent", r#"{"role":"implementer","message":"task"}"#);
+        for _ in 0..2 {
+            guard.begin_round(80, 3);
+            guard.observe_outcome(&inspect, &Err("bad cursor".into()));
+        }
+        guard.begin_round(80, 3);
+        guard.observe_outcome(&create, &Err("budget exceeded".into()));
+        assert!(guard.delegation_failure_message().is_none());
+        assert!(guard.check_before_execution(&create, 0).is_ok());
+        assert_eq!(
+            guard
+                .consecutive_failures
+                .get(&ToolCircuitKey::SubAgentInspection),
+            Some(&2)
+        );
+        assert_eq!(
+            guard
+                .consecutive_failures
+                .get(&ToolCircuitKey::Tool("SubAgent".into())),
+            Some(&1)
+        );
+
+        guard.observe_outcome(&inspect, &Err("bad cursor".into()));
+        guard.begin_round(80, 3);
+        assert!(matches!(
+            guard.check_before_execution(&inspect, 0),
+            Err(ToolPolicyPrecheckViolation::ToolCircuitOpen { .. })
+        ));
+        assert!(guard.check_before_execution(&create, 0).is_ok());
+        assert!(guard.delegation_failure_message().is_none());
+        guard.observe_outcome(&create, &Ok(ToolResult::text(true, "child created")));
+        assert!(guard.delegation_failure_message().is_none());
+        assert!(guard.check_before_execution(&inspect, 0).is_err());
+    }
+
+    #[test]
+    fn inspection_circuit_only_accepts_unambiguous_read_routes() {
+        for args in [
+            r#"{"intent":"inspect","target":"child","message":"messages"}"#,
+            r#"{"intent":"inspect","target":"child","role":null,"reply_to":""}"#,
+            r#"{"action":"get","child_session_id":"child"}"#,
+            r#"{"action":"list"}"#,
+            r#"{"action":"list_models"}"#,
+        ] {
+            assert_eq!(
+                tool_policy_key(&tool_call("SubAgent", args), Some("SubAgent")),
+                ToolCircuitKey::SubAgentInspection
+            );
+        }
+        for args in [
+            r#"{"intent":"inspect","action":"create","message":"task"}"#,
+            r#"{"intent":"inspect","target":"child","reply_to":"request"}"#,
+            r#"{"intent":"inspect","role":"implementer"}"#,
+            r#"{"intent":"inspect","unknown":"value"}"#,
+            r#"{"action":"get","target":"child"}"#,
+            r#"{"target":"child","message":"result"}"#,
+            "not-json",
+        ] {
+            assert_eq!(
+                tool_policy_key(&tool_call("SubAgent", args), Some("SubAgent")),
+                ToolCircuitKey::Tool("SubAgent".into())
+            );
+        }
+        assert_eq!(
+            tool_policy_key(
+                &tool_call("vendor::SubAgent", r#"{"intent":"inspect"}"#),
+                Some("vendor::SubAgent")
+            ),
+            ToolCircuitKey::Tool("vendor::SubAgent".into())
+        );
+        assert_eq!(
+            tool_policy_key(
+                &tool_call(SUBAGENT_INSPECTION_LABEL, r#"{"intent":"inspect"}"#),
+                Some(SUBAGENT_INSPECTION_LABEL)
+            ),
+            ToolCircuitKey::Tool(SUBAGENT_INSPECTION_LABEL.into())
+        );
     }
 
     #[test]

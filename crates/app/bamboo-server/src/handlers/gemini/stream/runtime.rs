@@ -69,6 +69,7 @@ pub(super) fn build_gemini_event_stream(
                 | Ok(LLMChunk::ProviderTranscriptItem(_))
                 | Ok(LLMChunk::CacheUsage { .. })
                 | Ok(LLMChunk::ProviderUsage { .. })
+                | Ok(LLMChunk::ProviderUsageReplace(_))
                 | Ok(LLMChunk::UsageSummary { .. })
                 | Ok(LLMChunk::ReasoningSignature(_)) => {}
                 Err(error) => {

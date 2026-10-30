@@ -12,6 +12,9 @@ mod terminal;
 include!("token_budget_outer_guard_fixture.rs");
 
 enum Script {
+    ReplacementInvalidAfterDone,
+    ReplacementOverCapWhileOpen,
+    ReplacementInputOverCapWhileOpen,
     Known,
     KnownText,
     DoneError,
@@ -106,6 +109,68 @@ impl LLMProvider for Provider {
             *cache_read_input_tokens = None;
         }
         let chunks = match self.script {
+            Script::ReplacementInvalidAfterDone => {
+                let first = bamboo_llm::types::ProviderUsageReplacement {
+                    input_tokens: Some(20),
+                    output_tokens: Some(10),
+                    total_tokens: Some(30),
+                    cache_read_input_tokens: Some(5),
+                    ..Default::default()
+                };
+                let invalid = bamboo_llm::types::ProviderUsageReplacement {
+                    cache_read_input_tokens: None,
+                    invalid_fields: bamboo_llm::types::ProviderUsageInvalidFields {
+                        cache_read_input_tokens: true,
+                        ..Default::default()
+                    },
+                    ..first
+                };
+                vec![
+                    Ok(LLMChunk::ProviderUsageReplace(first)),
+                    Ok(first.legacy_chunk().unwrap()),
+                    Ok(LLMChunk::Done),
+                    Ok(LLMChunk::ProviderUsageReplace(invalid)),
+                    Ok(invalid.legacy_chunk().unwrap()),
+                ]
+            }
+            Script::ReplacementOverCapWhileOpen => {
+                let first = bamboo_llm::types::ProviderUsageReplacement {
+                    input_tokens: Some(20),
+                    output_tokens: Some(10),
+                    total_tokens: Some(30),
+                    ..Default::default()
+                };
+                let over = bamboo_llm::types::ProviderUsageReplacement {
+                    output_tokens: None,
+                    output_floor: Some(41),
+                    total_tokens: None,
+                    ..first
+                };
+                let prefix = futures::stream::iter(vec![
+                    Ok(LLMChunk::ProviderUsageReplace(first)),
+                    Ok(LLMChunk::ProviderUsageReplace(over)),
+                ]);
+                return Ok(Box::pin(prefix.chain(futures::stream::pending())));
+            }
+            Script::ReplacementInputOverCapWhileOpen => {
+                let first = bamboo_llm::types::ProviderUsageReplacement {
+                    input_tokens: Some(20),
+                    output_tokens: Some(10),
+                    total_tokens: Some(30),
+                    ..Default::default()
+                };
+                let over = bamboo_llm::types::ProviderUsageReplacement {
+                    input_tokens: None,
+                    input_floor: Some(101),
+                    total_tokens: None,
+                    ..first
+                };
+                let prefix = futures::stream::iter(vec![
+                    Ok(LLMChunk::ProviderUsageReplace(first)),
+                    Ok(LLMChunk::ProviderUsageReplace(over)),
+                ]);
+                return Ok(Box::pin(prefix.chain(futures::stream::pending())));
+            }
             Script::KnownText => vec![
                 Ok(LLMChunk::Token("Fixture result".into())),
                 Ok(complete.clone()),

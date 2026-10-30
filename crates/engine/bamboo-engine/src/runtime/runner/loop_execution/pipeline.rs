@@ -8484,6 +8484,184 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 5);
     }
 
+    struct MixedSubAgentLoopProvider {
+        calls: AtomicUsize,
+    }
+
+    struct OversizedSubAgentPageProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for OversizedSubAgentPageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("Inspection budget reported.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: "oversized-subagent-page".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "SubAgent".into(),
+                            arguments:
+                                r#"{"intent":"inspect","target":"child","message":"result"}"#.into(),
+                        },
+                    },
+                ])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct OversizedSubAgentPageExecutor;
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for OversizedSubAgentPageExecutor {
+        async fn execute(
+            &self,
+            _: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            Ok(bamboo_agent_core::tools::ToolResult::text(
+                true,
+                serde_json::json!({"view":"result", "text":"界🦀".repeat(800),
+                    "byte_start":0, "byte_end":5600, "next_cursor":"opaque-next-cursor"})
+                .to_string(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            bamboo_agent_core::tools::ToolExecutor::list_tools(&DelegationLoopExecutor {
+                calls: AtomicUsize::new(0),
+                success_on: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_subagent_page_is_not_persisted_as_success_in_the_real_loop() {
+        let mut session = Session::new("subagent-page-budget-loop", "model");
+        session.token_budget = Some(bamboo_domain::TokenBudget {
+            max_tool_output_tokens: 512,
+            ..Default::default()
+        });
+        session.add_message(Message::user("Inspect the child result"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let mut state = e2e_loop_state(&session.id);
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(OversizedSubAgentPageProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(OversizedSubAgentPageExecutor),
+            &tokio_util::sync::CancellationToken::new(),
+            &delegation_loop_config(),
+            &mut state,
+        )
+        .await
+        .expect("the run should report an oversized page as a tool failure");
+        let message = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("oversized-subagent-page"))
+            .expect("the tool call must have a durable response");
+        assert_eq!(message.tool_success, Some(false));
+        let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(payload["error"], "subagent_page_exceeds_tool_output_budget");
+        assert!(payload.get("next_cursor").is_none());
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for MixedSubAgentLoopProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let round = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == 4 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("Delegation corrected.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            let arguments = if round < 2 {
+                r#"{"intent":"inspect","target":"child","message":"result"}"#
+            } else {
+                r#"{"role":"implementer","message":"Complete bounded work"}"#
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: format!("mixed-subagent-{round}"),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "SubAgent".into(),
+                            arguments: arguments.into(),
+                        },
+                    },
+                ])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_inspections_do_not_stop_a_corrected_delegation_in_the_real_loop() {
+        use std::sync::atomic::Ordering;
+        let mut session = Session::new("mixed-subagent-circuit-loop", "model");
+        session.add_message(Message::user("Complete bounded work"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let provider = Arc::new(MixedSubAgentLoopProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(DelegationLoopExecutor {
+            calls: AtomicUsize::new(0),
+            success_on: Some(3),
+        });
+        let mut state = e2e_loop_state(&session.id);
+        let complete = super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            executor.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            &delegation_loop_config(),
+            &mut state,
+        )
+        .await
+        .expect("inspection failures must not terminate the corrected delegation");
+        assert!(complete);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
+        for round in 0..4 {
+            assert_eq!(
+                session
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.as_deref()
+                        == Some(format!("mixed-subagent-{round}").as_str()))
+                    .count(),
+                1,
+                "each call needs one durable response"
+            );
+        }
+    }
+
     struct CancelAfterThirdDelegationRound(tokio_util::sync::CancellationToken);
 
     #[async_trait::async_trait]

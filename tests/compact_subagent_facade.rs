@@ -685,7 +685,10 @@ async fn fixture(role: Option<&'static str>, fast_grandchild: bool) {
                                     serde_json::from_str::<Value>(payload).ok()
                                 })
                                 .is_some_and(|packet| {
-                                    packet["objective"] == TASK && packet["task_brief"] == TASK
+                                    packet["task_brief"] == TASK
+                                        && packet["objective"].as_str().is_some_and(|objective| {
+                                            !objective.trim().is_empty() && objective != TASK
+                                        })
                                 })
                     } else {
                         content.contains(TASK)

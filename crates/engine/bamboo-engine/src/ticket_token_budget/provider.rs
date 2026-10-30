@@ -337,6 +337,7 @@ impl BudgetedProvider {
                                 if !matches!(
                                     &chunk,
                                     LLMChunk::ProviderUsage { .. }
+                                        | LLMChunk::ProviderUsageReplace(_)
                                         | LLMChunk::CacheUsage { .. }
                                         | LLMChunk::UsageSummary { .. }
                                         | LLMChunk::TransportActivity
@@ -391,7 +392,9 @@ struct Usage {
     cache_read: Option<u64>,
     cache_write: Option<u64>,
     output_floor: Option<u64>,
+    replacement_input_floor: Option<u64>,
     reported_total: Option<u64>,
+    latest_replacement: Option<(Option<u64>, Option<u64>)>,
     done: bool,
     inconsistent: bool,
 }
@@ -399,6 +402,26 @@ impl Usage {
     fn observe(&mut self, chunk: &LLMChunk) {
         match chunk {
             LLMChunk::Done => self.done = true,
+            LLMChunk::ProviderUsageReplace(usage) => {
+                // Retain observed maxima for immediate over-cap checks, but
+                // never refund from stale data after malformed evidence.
+                self.inconsistent |= usage.invalid_fields.any();
+                self.latest_replacement = Some((usage.input_tokens, usage.output_tokens));
+                if let (Some(input), Some(output), Some(total)) =
+                    (usage.input_tokens, usage.output_tokens, usage.total_tokens)
+                {
+                    self.inconsistent |= input.checked_add(output) != Some(total);
+                }
+                self.input = self.input.max(usage.input_tokens);
+                self.output = self.output.max(usage.output_tokens);
+                self.reported_total = self.reported_total.max(usage.total_tokens);
+                self.cache_creation = self.cache_creation.max(usage.cache_creation_input_tokens);
+                self.cache_read = self.cache_read.max(usage.cache_read_input_tokens);
+                self.cache_write = self.cache_write.max(usage.cache_write_input_tokens);
+                self.output_floor = self.output_floor.max(usage.reasoning_tokens);
+                self.replacement_input_floor = self.replacement_input_floor.max(usage.input_floor);
+                self.output_floor = self.output_floor.max(usage.output_floor);
+            }
             LLMChunk::ProviderUsage {
                 input_tokens,
                 output_tokens,
@@ -458,7 +481,10 @@ impl Usage {
         });
         // Canonical input already includes cache. Cache-write has no disjoint
         // relationship to the legacy counters, so compare it independently.
-        self.input.max(disjoint).max(self.cache_write)
+        self.input
+            .max(disjoint)
+            .max(self.cache_write)
+            .max(self.replacement_input_floor)
     }
     fn over_cap_report(&self, request: &WorkTokenRequest) -> Option<ExecutionTokenOverCapUsage> {
         let input_tokens = self.input_floor();
@@ -476,6 +502,14 @@ impl Usage {
     }
     fn measured(&self) -> Option<ExecutionTokenUsage> {
         let (input_tokens, output_tokens) = (self.input?, self.output?);
+        if let Some((latest_input, latest_output)) = self.latest_replacement {
+            // Previous maxima remain safe over-cap lower bounds but are not
+            // exact settlement evidence when the latest snapshot is incomplete
+            // or lower. A later complete, consistent snapshot can recover.
+            if latest_input != Some(input_tokens) || latest_output != Some(output_tokens) {
+                return None;
+            }
+        }
         if self.inconsistent
             || self.input_floor().is_some_and(|floor| floor > input_tokens)
             || self.output_floor.is_some_and(|floor| floor > output_tokens)
@@ -629,5 +663,73 @@ impl LLMProvider for BudgetedProvider {
             request.await
         }?;
         Ok(Self::meter(stream, admission))
+    }
+}
+
+#[cfg(test)]
+mod replacement_tests {
+    use super::*;
+    use bamboo_llm::types::{ProviderUsageInvalidFields, ProviderUsageReplacement};
+
+    #[test]
+    fn invalid_replacement_retains_over_cap_floor_and_prevents_refund() {
+        let mut observed = Usage::default();
+        let mut snapshot = ProviderUsageReplacement {
+            input_tokens: Some(100),
+            output_tokens: Some(23),
+            total_tokens: Some(123),
+            cache_read_input_tokens: Some(25),
+            ..Default::default()
+        };
+        observed.observe(&LLMChunk::ProviderUsageReplace(snapshot));
+        assert!(observed.measured().is_some());
+        snapshot.cache_read_input_tokens = None;
+        snapshot.invalid_fields = ProviderUsageInvalidFields {
+            cache_read_input_tokens: true,
+            ..Default::default()
+        };
+        observed.observe(&LLMChunk::ProviderUsageReplace(snapshot));
+        assert!(observed.measured().is_none());
+        let request = WorkTokenRequest {
+            operation_id: "synthetic".into(),
+            project_id: bamboo_domain::ProjectId::new(),
+            work_id: "synthetic".into(),
+            purpose: ExecutionBudgetPurpose::Worker,
+            request_hash: "synthetic".into(),
+            observed_seq: 0,
+            input_cap: 99,
+            output_cap: 100,
+            attempt: None,
+        };
+        assert!(observed.over_cap_report(&request).is_some());
+        snapshot.cache_read_input_tokens = Some(0);
+        snapshot.invalid_fields = Default::default();
+        observed.observe(&LLMChunk::ProviderUsageReplace(snapshot));
+        assert!(
+            observed.measured().is_none(),
+            "invalid evidence keeps the reservation"
+        );
+        assert!(observed.over_cap_report(&request).is_some());
+    }
+
+    #[test]
+    fn incomplete_replacement_cannot_settle_from_older_maxima() {
+        let mut observed = Usage::default();
+        let mut snapshot = ProviderUsageReplacement {
+            input_tokens: Some(20),
+            output_tokens: Some(10),
+            total_tokens: Some(30),
+            ..Default::default()
+        };
+        observed.observe(&LLMChunk::ProviderUsageReplace(snapshot));
+        assert!(observed.measured().is_some());
+        snapshot.output_tokens = None;
+        snapshot.total_tokens = None;
+        observed.observe(&LLMChunk::ProviderUsageReplace(snapshot));
+        assert!(observed.measured().is_none());
+        snapshot.output_tokens = Some(11);
+        snapshot.total_tokens = Some(31);
+        observed.observe(&LLMChunk::ProviderUsageReplace(snapshot));
+        assert!(observed.measured().is_some());
     }
 }

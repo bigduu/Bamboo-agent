@@ -32,6 +32,7 @@ where
             LLMChunk::TransportActivity
             | LLMChunk::CacheUsage { .. }
             | LLMChunk::ProviderUsage { .. }
+            | LLMChunk::ProviderUsageReplace(_)
             | LLMChunk::UsageSummary { .. }
             | LLMChunk::ReasoningSignature(_) => {}
         }

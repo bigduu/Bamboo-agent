@@ -185,6 +185,11 @@ pub enum ExecutePreparationOutcome {
         model_source: &'static str,
         reasoning_source: &'static str,
         is_child_session: bool,
+        /// The Schedule binding observed before the model cascade. The outer
+        /// option distinguishes a Schedule session from an ordinary one.
+        scheduled_binding: Option<Option<ProviderModelRef>>,
+        /// Original durable Schedule profile for the atomic startup save.
+        scheduled_startup_expected: Option<Box<Session>>,
     },
     /// Agent is already running for this session.
     AlreadyRunning {

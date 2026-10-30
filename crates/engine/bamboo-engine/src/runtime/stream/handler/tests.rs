@@ -509,6 +509,38 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
 }
 
 #[tokio::test]
+async fn replacement_clears_previous_flat_values_when_components_become_unknown() {
+    use bamboo_llm::types::ProviderUsageReplacement;
+
+    let output = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsageReplace(ProviderUsageReplacement {
+                input_tokens: Some(100),
+                output_tokens: Some(23),
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                ..Default::default()
+            })),
+            Ok(LLMChunk::ProviderUsageReplace(ProviderUsageReplacement {
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                ..Default::default()
+            })),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-replacement",
+    )
+    .await
+    .expect("replacement snapshot");
+    assert_eq!(output.provider_usage.unwrap().input_tokens, None);
+    assert_eq!(output.provider_usage.unwrap().output_tokens, None);
+    assert_eq!(output.input_tokens, 0);
+    assert_eq!(output.output_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 25);
+}
+
+#[tokio::test]
 async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field() {
     let omitted = consume_llm_stream_silent(
         build_stream(vec![
@@ -649,6 +681,57 @@ async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() 
             assert_eq!(log_record.output_tokens, expected_output);
             assert_eq!(log_record.thinking_tokens, expected_reasoning);
         }
+    }
+}
+
+#[tokio::test]
+async fn provider_snapshots_reconcile_anthropic_and_gemini_legacy_chunks_once() {
+    let cases = [
+        (10, 2, 3, 7, 0, 15, 7, None),
+        (75, 0, 25, 20, 3, 100, 23, Some(3)),
+    ];
+    for (fresh, creation, read, legacy_output, thinking, input_total, output_total, reasoning) in
+        cases
+    {
+        let snapshot = LLMChunk::ProviderUsage {
+            input_tokens: Some(input_total),
+            output_tokens: Some(output_total),
+            total_tokens: None,
+            reasoning_tokens: reasoning,
+            cache_creation_input_tokens: (creation > 0).then_some(creation),
+            cache_read_input_tokens: Some(read),
+            cache_write_input_tokens: None,
+        };
+        let chunks = vec![
+            Ok(LLMChunk::CacheUsage {
+                cache_creation_input_tokens: creation,
+                cache_read_input_tokens: read,
+                input_tokens: fresh,
+            }),
+            Ok(LLMChunk::UsageSummary {
+                output_tokens: legacy_output,
+                thinking_tokens: thinking,
+            }),
+            Ok(snapshot.clone()),
+            Ok(snapshot),
+            Ok(LLMChunk::Done),
+        ];
+        let output = consume_llm_stream_silent(
+            build_stream(chunks),
+            &CancellationToken::new(),
+            "synthetic-provider-usage",
+        )
+        .await
+        .expect("provider usage stream");
+        assert_eq!(output.input_tokens, fresh);
+        assert_eq!(output.cache_creation_input_tokens, creation);
+        assert_eq!(output.cache_read_input_tokens, read);
+        assert_eq!(output.output_tokens, output_total);
+        assert_eq!(output.thinking_tokens, thinking);
+        let usage = output.provider_usage.expect("provider snapshot");
+        assert_eq!(usage.input_tokens, Some(input_total));
+        assert_eq!(usage.output_tokens, Some(output_total));
+        assert_eq!(usage.reasoning_tokens, reasoning);
     }
 }
 

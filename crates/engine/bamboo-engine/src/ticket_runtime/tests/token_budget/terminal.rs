@@ -3,6 +3,63 @@ use super::*;
 use std::time::Duration;
 
 #[tokio::test]
+async fn replacement_after_done_with_invalid_usage_never_refunds() {
+    let (f, _registration) = admitted().await;
+    configure(&f, 140);
+    let decorated = provider(&f, Provider::new(Script::ReplacementInvalidAfterDone)).await;
+    let mut stream = decorated
+        .chat_stream(&[], &[], None, "fixture-model")
+        .await
+        .unwrap();
+    let mut replacements = 0;
+    while let Some(chunk) = stream.next().await {
+        if matches!(chunk.unwrap(), LLMChunk::ProviderUsageReplace(_)) {
+            replacements += 1;
+        }
+    }
+    assert_eq!(replacements, 2);
+    let budget = ledger(&f);
+    assert_eq!(budget.total_charged, 140);
+    assert!(matches!(
+        budget.reservations.values().next().unwrap().usage,
+        Some(ExecutionTokenUsage::Unknown)
+    ));
+}
+
+#[tokio::test]
+async fn replacement_over_cap_is_rejected_before_an_open_stream_ends() {
+    for script in [
+        Script::ReplacementOverCapWhileOpen,
+        Script::ReplacementInputOverCapWhileOpen,
+    ] {
+        let (f, _registration) = admitted().await;
+        configure(&f, 140);
+        let decorated = provider(&f, Provider::new(script)).await;
+        let mut stream = decorated
+            .chat_stream(&[], &[], None, "fixture-model")
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await.unwrap().unwrap(),
+            LLMChunk::ProviderUsageReplace(_)
+        ));
+        let error = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("over-cap detection must not await EOF")
+            .unwrap()
+            .unwrap_err();
+        assert!(error.to_string().contains("Work token budget"));
+        assert!(ledger(&f)
+            .reservations
+            .values()
+            .next()
+            .unwrap()
+            .over_cap_usage
+            .is_some());
+    }
+}
+
+#[tokio::test]
 async fn token_budget_summary_and_vision_stop_at_done_with_measured_charges() {
     use crate::llm_summarizer::{LlmSummarizer, SummaryRequestBudget};
     use crate::runtime::{

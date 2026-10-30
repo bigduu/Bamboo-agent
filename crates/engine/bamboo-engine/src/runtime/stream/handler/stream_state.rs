@@ -131,6 +131,60 @@ impl StreamAccumulationState {
         self.normalize_provider_input_compatibility_view();
     }
 
+    /// Replace a provider-local cumulative snapshot, including explicit
+    /// invalidations. Legacy counters have no unknown representation; clear
+    /// stale values so later compatibility fallbacks do not reuse them as
+    /// provider-reported measurements.
+    pub(super) fn replace_provider_usage(
+        &mut self,
+        usage: bamboo_llm::types::ProviderUsageReplacement,
+    ) {
+        let previous = self.provider_usage.unwrap_or_default();
+        self.provider_usage = Some(ProviderUsageSnapshot {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            total_tokens: usage.total_tokens,
+            reasoning_tokens: usage.reasoning_tokens,
+            cache_creation_input_tokens: usage.cache_creation_input_tokens,
+            cache_read_input_tokens: usage.cache_read_input_tokens,
+            cache_write_input_tokens: usage.cache_write_input_tokens,
+        });
+        if usage.invalid_fields.input_tokens
+            || (previous.input_tokens.is_some() && usage.input_tokens.is_none())
+        {
+            self.input_tokens = 0;
+        }
+        if usage.invalid_fields.output_tokens
+            || (previous.output_tokens.is_some() && usage.output_tokens.is_none())
+        {
+            self.output_tokens = 0;
+        }
+        if usage.invalid_fields.reasoning_tokens
+            || (previous.reasoning_tokens.is_some() && usage.reasoning_tokens.is_none())
+        {
+            self.thinking_tokens = 0;
+        }
+        if usage.invalid_fields.cache_creation_input_tokens
+            || (previous.cache_creation_input_tokens.is_some()
+                && usage.cache_creation_input_tokens.is_none())
+        {
+            self.cache_creation_input_tokens = 0;
+        }
+        if usage.invalid_fields.cache_read_input_tokens
+            || (previous.cache_read_input_tokens.is_some()
+                && usage.cache_read_input_tokens.is_none())
+        {
+            self.cache_read_input_tokens = 0;
+        }
+        if let Some(output) = usage.output_tokens {
+            self.output_tokens = output;
+        }
+        if let Some(reasoning) = usage.reasoning_tokens {
+            self.thinking_tokens = reasoning;
+        }
+        self.normalize_provider_input_compatibility_view();
+    }
+
     /// Record an authoritative provider usage snapshot.
     ///
     /// Snapshot values replace previously observed values rather than being

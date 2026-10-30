@@ -77,6 +77,22 @@ pub fn resolve_resume_config_snapshot(
     }
 }
 
+/// Host-only execution variant. Preserve the public snapshot resolver above,
+/// while treating its config-derived Vision model as a live role selection.
+#[doc(hidden)]
+pub fn resolve_resume_config_snapshot_for_execution(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    session: &Session,
+    gold_config_override: Option<GoldConfig>,
+) -> ResumeConfigSnapshot {
+    let mut snapshot =
+        resolve_resume_config_snapshot(config, registry, session, gold_config_override);
+    snapshot.image_fallback =
+        crate::model_config_helper::live_config_image_fallback(snapshot.image_fallback);
+    snapshot
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

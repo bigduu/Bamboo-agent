@@ -3435,7 +3435,10 @@ async fn message_only_fixture(
         .0;
     let fields: Value = serde_json::from_str(brief).unwrap();
     assert_eq!(fields["task_brief"], MESSAGE_ONLY_TASK);
-    assert_eq!(fields["objective"], MESSAGE_ONLY_TASK);
+    assert!(fields["objective"].as_str().is_some_and(|objective| {
+        !objective.trim().is_empty() && objective != MESSAGE_ONLY_TASK
+    }));
+    assert_eq!(assignment.content.matches(MESSAGE_ONLY_TASK).count(), 1);
     assert!(!before
         .messages
         .iter()
