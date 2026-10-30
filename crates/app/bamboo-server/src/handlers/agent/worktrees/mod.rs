@@ -161,7 +161,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         let mut sources = Vec::new();
         let mut diagnostics = Vec::new();
         for source in &bound_sources {
-            let discovered = git::discover_repositories(source);
+            let discovered = git::discover_until(source, scan_deadline);
             sources.extend(discovered.repositories);
             diagnostics.extend(discovered.diagnostics);
         }

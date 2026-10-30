@@ -260,11 +260,22 @@ fn git_bytes_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Vec<
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    String::from_utf8(git_bytes(repo, args)?).map_err(|_| "Git returned non-UTF-8 text".into())
+    git_by(repo, args, Instant::now() + git_command_timeout())
+}
+
+/// Deadline-aware variant: discovery scans many candidates under one shared
+/// inventory budget, so its probes must not each restart the clock.
+fn git_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<String, String> {
+    String::from_utf8(git_bytes_by(repo, args, deadline_at)?)
+        .map_err(|_| "Git returned non-UTF-8 text".into())
 }
 
 fn git_path(repo: &Path, args: &[&str]) -> Result<PathBuf, String> {
-    let mut bytes = git_bytes(repo, args)?;
+    git_path_by(repo, args, Instant::now() + git_command_timeout())
+}
+
+fn git_path_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<PathBuf, String> {
+    let mut bytes = git_bytes_by(repo, args, deadline_at)?;
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
     }
@@ -294,9 +305,14 @@ pub fn path_label(path: &Path) -> String {
 }
 
 pub fn repository(repo: &Path) -> Result<PathBuf, String> {
-    let value = git_path(
+    repository_by(repo, Instant::now() + git_command_timeout())
+}
+
+fn repository_by(repo: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+    let value = git_path_by(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline_at,
     )?;
     fs::canonicalize(value).map_err(|e| format!("Repository metadata is unavailable: {e}"))
 }
@@ -317,12 +333,16 @@ pub(super) fn workspace_root_queries_for_test(path: &Path) -> usize {
 }
 
 pub fn workspace_root(path: &Path) -> Result<PathBuf, String> {
+    workspace_root_by(path, Instant::now() + git_command_timeout())
+}
+
+fn workspace_root_by(path: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
     #[cfg(test)]
     WORKSPACE_ROOT_QUERIES
         .lock()
         .unwrap()
         .push(path.to_path_buf());
-    let value = git_path(path, &["rev-parse", "--show-toplevel"])?;
+    let value = git_path_by(path, &["rev-parse", "--show-toplevel"], deadline_at)?;
     fs::canonicalize(value).map_err(|e| e.to_string())
 }
 
@@ -344,16 +364,24 @@ struct DiscoveryLimits {
 /// Each root is bounded to 12 levels and 20,000 directory entries, including
 /// ignored entries. Truncation is reported rather than presented as complete.
 pub fn discover_repositories(root: &Path) -> Discovery {
+    discover_until(root, Instant::now() + inventory_budget())
+}
+
+/// Discovery under the caller's inventory deadline. Every Git probe inside the
+/// walk inherits this deadline, so a root whose metadata is on stalled storage
+/// cannot spend more than the request budget before `list_until` even runs.
+pub fn discover_until(root: &Path, deadline_at: Instant) -> Discovery {
     discover_with_limits(
         root,
         DiscoveryLimits {
             max_depth: 12,
             max_entries: 20_000,
         },
+        deadline_at,
     )
 }
 
-fn discover_with_limits(root: &Path, limits: DiscoveryLimits) -> Discovery {
+fn discover_with_limits(root: &Path, limits: DiscoveryLimits, deadline_at: Instant) -> Discovery {
     let mut result = Discovery::default();
     let canonical = match fs::canonicalize(root) {
         Ok(path) if path.is_dir() => path,
@@ -377,6 +405,7 @@ fn discover_with_limits(root: &Path, limits: DiscoveryLimits) -> Discovery {
         limits,
         remaining_entries: limits.max_entries,
         exhausted: false,
+        deadline_at,
         result: &mut result,
     };
     scan.visit(&canonical, 0);
@@ -392,6 +421,8 @@ struct RepositoryScan<'a> {
     limits: DiscoveryLimits,
     remaining_entries: usize,
     exhausted: bool,
+    /// Shared inventory deadline; every Git probe in the walk is bounded by it.
+    deadline_at: Instant,
     result: &'a mut Discovery,
 }
 
@@ -402,7 +433,21 @@ impl RepositoryScan<'_> {
             .push((path.to_path_buf(), message.into()));
     }
 
+    /// True once the shared budget is spent. The walk then stops probing and
+    /// reports the remainder as uninspected instead of overrunning the
+    /// request budget one command timeout per candidate.
+    fn expired(&self) -> bool {
+        Instant::now() >= self.deadline_at
+    }
+
     fn visit(&mut self, path: &Path, depth: usize) {
+        if self.expired() {
+            self.diagnostic(
+                path,
+                "Discovery budget exhausted; the remaining tree was not inspected",
+            );
+            return;
+        }
         // Recheck each path at use time. Directory symlinks are never followed,
         // including aliases that lead back inside the same Project.
         let metadata = match fs::symlink_metadata(path) {
@@ -443,7 +488,11 @@ impl RepositoryScan<'_> {
             && path.join("objects").is_dir()
             && path.join("refs").is_dir();
         if metadata_shape {
-            match git(path, &["rev-parse", "--is-bare-repository"]) {
+            match git_by(
+                path,
+                &["rev-parse", "--is-bare-repository"],
+                self.deadline_at,
+            ) {
                 Ok(value) if value.trim() == "true" => {
                     // Explicit bare source bindings already support worktree
                     // creation. Preserve that path without scanning metadata.
@@ -459,8 +508,12 @@ impl RepositoryScan<'_> {
                     return;
                 }
                 Ok(_) => {
-                    if git(path, &["rev-parse", "--is-inside-git-dir"])
-                        .is_ok_and(|value| value.trim() == "true")
+                    if git_by(
+                        path,
+                        &["rev-parse", "--is-inside-git-dir"],
+                        self.deadline_at,
+                    )
+                    .is_ok_and(|value| value.trim() == "true")
                     {
                         self.diagnostic(
                             path,
@@ -472,13 +525,13 @@ impl RepositoryScan<'_> {
             }
         }
         if depth == 0 || marker {
-            match workspace_root(path) {
+            match workspace_root_by(path, self.deadline_at) {
                 Ok(checkout) if (depth == 0 && path.starts_with(&checkout)) || checkout == path => {
                     if depth > 0 {
                         // A .git file alone can point at an unrelated repository.
                         // Git's native registry must also identify this checkout
                         // before a discovered path can authorize branch creation.
-                        match registered_worktree(path) {
+                        match registered_worktree_by(path, self.deadline_at) {
                             Ok(true) => {}
                             Ok(false) => {
                                 self.diagnostic(
@@ -591,8 +644,19 @@ impl RepositoryScan<'_> {
     }
 }
 
+/// Test-only convenience wrapper; production callers must share the inventory
+/// deadline through `registered_worktree_by`.
+#[cfg(test)]
 fn registered_worktree(path: &Path) -> Result<bool, String> {
-    let listing = git_bytes(path, &["worktree", "list", "--porcelain", "-z"])?;
+    registered_worktree_by(path, Instant::now() + git_command_timeout())
+}
+
+fn registered_worktree_by(path: &Path, deadline_at: Instant) -> Result<bool, String> {
+    let listing = git_bytes_by(
+        path,
+        &["worktree", "list", "--porcelain", "-z"],
+        deadline_at,
+    )?;
     for field in listing.split(|byte| *byte == 0) {
         if let Some(registered) = field.strip_prefix(b"worktree ") {
             let registered = path_from_bytes(registered)?;
@@ -604,16 +668,25 @@ fn registered_worktree(path: &Path) -> Result<bool, String> {
     // Git lists a submodule's separate metadata directory as its main entry.
     // Accept its reverse checkout binding only from the shared metadata's own
     // config, never a candidate-controlled config.worktree, include or global.
-    let common = repository(path)?;
-    Ok(configured_main_worktree(path, &common)?.is_some_and(|configured| configured == path))
+    let common = repository_by(path, deadline_at)?;
+    Ok(configured_main_worktree_by(path, &common, deadline_at)?
+        .is_some_and(|configured| configured == path))
 }
 
 fn configured_main_worktree(repo: &Path, common: &Path) -> Result<Option<PathBuf>, String> {
+    configured_main_worktree_by(repo, common, Instant::now() + git_command_timeout())
+}
+
+fn configured_main_worktree_by(
+    repo: &Path,
+    common: &Path,
+    deadline_at: Instant,
+) -> Result<Option<PathBuf>, String> {
     let config = common.join("config");
     let config = config
         .to_str()
         .ok_or("Git metadata configuration path contains non-UTF-8 bytes")?;
-    let output = command(
+    let output = command_by(
         repo,
         &[
             "config",
@@ -625,6 +698,7 @@ fn configured_main_worktree(repo: &Path, common: &Path) -> Result<Option<PathBuf
             "--get",
             "core.worktree",
         ],
+        deadline_at,
     )?;
     if output.status.code() == Some(1) {
         return Ok(None);
@@ -762,6 +836,9 @@ pub fn root(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Single-repository convenience wrapper used by tests; the inventory handler
+/// shares one deadline across repositories through `list_until`.
+#[cfg(test)]
 pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
     list_until(repo, Instant::now() + list_inspect_budget())
 }
@@ -1387,6 +1464,7 @@ mod tests {
                 max_depth: 1,
                 max_entries: 100,
             },
+            std::time::Instant::now() + inventory_budget(),
         );
         assert_eq!(discovery.repositories, vec![shallow]);
         assert!(discovery
@@ -1399,6 +1477,7 @@ mod tests {
                 max_depth: 12,
                 max_entries: 1,
             },
+            std::time::Instant::now() + inventory_budget(),
         );
         assert!(discovery.repositories.is_empty());
         assert_eq!(discovery.diagnostics.len(), 1);
@@ -2315,5 +2394,45 @@ mod tests {
             .status()
             .expect("mkfifo is available on unix hosts");
         assert!(status.success(), "mkfifo {path:?} failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_discovery_budget_stops_probing_and_reports_partial_results() {
+        let f = Fixture::new();
+        let container = f.roots();
+        for name in ["a", "b", "c", "d"] {
+            let repo = container.join(name);
+            init_discovery_repo(&repo);
+            // A FIFO as .git/config stalls every probe that needs config
+            // (workspace_root/repository/bare detection), the shape Codex
+            // reproduced against stalled metadata storage.
+            fs::remove_file(repo.join(".git/config")).unwrap();
+            let _guard = FifoSentinel::create(repo.join(".git/config"));
+            std::mem::forget(_guard);
+        }
+        let started = std::time::Instant::now();
+        let discovery = discover_until(
+            &container,
+            std::time::Instant::now() + Duration::from_millis(1500),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(6000),
+            "discovery took {elapsed:?}; the shared deadline must apply to every probe"
+        );
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|(_, message)| message.contains("budget exhausted")),
+            "expiry must be reported as a diagnostic: {:?}",
+            discovery.diagnostics
+        );
+        // Unblock teardown: the Fixture drop removes the tree, and an open FIFO
+        // reader would otherwise hold the walk.
+        for name in ["a", "b", "c", "d"] {
+            let _ = fs::remove_file(container.join(name).join(".git/config"));
+        }
     }
 }
