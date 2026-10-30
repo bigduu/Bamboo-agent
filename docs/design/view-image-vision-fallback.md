@@ -59,6 +59,17 @@ errors or partial descriptions.
 Images and returned descriptions are untrusted data. Description text has a
 clear Vision-model label and JSON quoting. Provider errors are sanitized;
 failed, empty, overlong or timed-out descriptions are explicit tool errors.
+A `ViewImage` call may include an optional `prompt` describing the user's
+question or the details to examine. The configured Vision model receives that
+focus as untrusted, JSON-quoted context alongside the image; omitting it preserves the
+general description. For example: `{"path":"/tmp/screenshot.png","prompt":"Describe the sidebar creation control"}`.
+The tool call does not impose a separate output-token
+limit on protocols that allow the field to be omitted. Anthropic requires
+`max_tokens`: the native adapter respects an explicit provider setting and
+otherwise uses 16,384 tokens, matching the Bodhi proxy's default.
+An empty description records a sanitized provider finish reason when available;
+unreported reasons remain `unavailable`, and unrecognized provider strings are
+reported only as `other`.
 A semantic `Done` event finishes a valid description without waiting for
 transport EOF; an open connection after completion is not a timeout.
 The request/stream remain inside cancellation scopes, with bounded time/output

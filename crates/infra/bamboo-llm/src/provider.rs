@@ -13,7 +13,7 @@ use futures::Stream;
 use serde::Serialize;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 
 /// Observes the concrete provider selected for one scoped main dispatch.
@@ -234,6 +234,101 @@ pub struct ResponsesRequestOptions {
     /// request field. Agent/runtime calls leave it disabled to avoid cloning
     /// every SSE payload when only normalized chunks are needed.
     pub retain_protocol_events: bool,
+}
+
+/// Request-scoped, payload-free completion diagnostics. Provider strings are
+/// untrusted: only recognized reason codes are retained, never arbitrary text.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionDiagnostics(Arc<Mutex<Option<&'static str>>>);
+
+tokio::task_local! {
+    static COMPLETION_DIAGNOSTICS: CompletionDiagnostics;
+}
+
+/// Scope diagnostics to the inline construction of one provider stream.
+/// Built-in adapters capture this handle in their stream parser; no payload or
+/// mutable global state is shared between concurrent requests.
+pub async fn scope_completion_diagnostics<F: Future>(
+    diagnostics: CompletionDiagnostics,
+    future: F,
+) -> F::Output {
+    COMPLETION_DIAGNOSTICS.scope(diagnostics, future).await
+}
+
+pub(crate) fn current_completion_diagnostics() -> Option<CompletionDiagnostics> {
+    COMPLETION_DIAGNOSTICS.try_with(Clone::clone).ok()
+}
+
+impl CompletionDiagnostics {
+    /// The sanitized provider reason, or `unavailable` if none was reported.
+    pub fn finish_reason(&self) -> &'static str {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .unwrap_or("unavailable")
+    }
+
+    /// Observe a protocol event without retaining its payload.
+    pub fn observe_event(&self, event: &str, value: &serde_json::Value) {
+        let event = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(event);
+        let reason = [
+            "/choices/0/finish_reason",
+            "/delta/stop_reason",
+            "/candidates/0/finishReason",
+            "/promptFeedback/blockReason",
+            "/response/incomplete_details/reason",
+            "/incomplete_details/reason",
+        ]
+        .into_iter()
+        .find_map(|path| {
+            value
+                .pointer(path)
+                .and_then(serde_json::Value::as_str)
+                .filter(|reason| !reason.is_empty())
+        })
+        .or_else(|| (event == "response.completed").then_some("completed"));
+        if let Some(reason) = reason {
+            let safe = match reason {
+                "stop" => "stop",
+                "length" => "length",
+                "content_filter" => "content_filter",
+                "tool_calls" => "tool_calls",
+                "function_call" => "function_call",
+                "end_turn" => "end_turn",
+                "max_tokens" => "max_tokens",
+                "stop_sequence" => "stop_sequence",
+                "tool_use" => "tool_use",
+                "pause_turn" => "pause_turn",
+                "refusal" => "refusal",
+                "model_context_window_exceeded" => "model_context_window_exceeded",
+                "STOP" => "STOP",
+                "MAX_TOKENS" => "MAX_TOKENS",
+                "SAFETY" => "SAFETY",
+                "RECITATION" => "RECITATION",
+                "LANGUAGE" => "LANGUAGE",
+                "OTHER" => "OTHER",
+                "BLOCKLIST" => "BLOCKLIST",
+                "PROHIBITED_CONTENT" => "PROHIBITED_CONTENT",
+                "SPII" => "SPII",
+                "MALFORMED_FUNCTION_CALL" => "MALFORMED_FUNCTION_CALL",
+                "IMAGE_SAFETY" => "IMAGE_SAFETY",
+                "UNEXPECTED_TOOL_CALL" => "UNEXPECTED_TOOL_CALL",
+                "max_output_tokens" => "max_output_tokens",
+                "completed" => "completed",
+                _ => "other",
+            };
+            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(safe);
+        }
+    }
+
+    pub(crate) fn observe_sse(&self, event: &str, data: &str) {
+        if let Ok(value) = serde_json::from_str(data) {
+            self.observe_event(event, &value);
+        }
+    }
 }
 
 /// Optional request-time controls for provider calls.
@@ -1107,5 +1202,38 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(opts.request_purpose.as_deref(), Some("title_generation"));
+    }
+
+    #[tokio::test]
+    async fn completion_diagnostics_are_isolated_and_never_retain_unknown_text() {
+        let first = CompletionDiagnostics::default();
+        let second = CompletionDiagnostics::default();
+        let a = scope_completion_diagnostics(first.clone(), async {
+            current_completion_diagnostics().unwrap().observe_event(
+                "",
+                &serde_json::json!({"choices":[{"finish_reason":"length"}]}),
+            );
+            tokio::task::yield_now().await;
+        });
+        let b = scope_completion_diagnostics(second.clone(), async {
+            current_completion_diagnostics().unwrap().observe_event(
+                "",
+                &serde_json::json!({"choices":[{"finish_reason":"private provider text"}]}),
+            );
+            tokio::task::yield_now().await;
+        });
+        tokio::join!(a, b);
+        assert_eq!(first.finish_reason(), "length");
+        assert_eq!(second.finish_reason(), "other");
+        assert!(current_completion_diagnostics().is_none());
+        let mixed = CompletionDiagnostics::default();
+        mixed.observe_event(
+            "",
+            &serde_json::json!({
+                "choices": [{"finish_reason": null}],
+                "promptFeedback": {"blockReason": "SAFETY"}
+            }),
+        );
+        assert_eq!(mixed.finish_reason(), "SAFETY");
     }
 }

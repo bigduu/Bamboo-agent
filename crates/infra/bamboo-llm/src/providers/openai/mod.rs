@@ -265,6 +265,7 @@ impl OpenAIProvider {
         session_log_id: &str,
         capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let mut effective_responses_options = responses_options.cloned();
         if let Some(options) = effective_responses_options.as_mut() {
             retain_provider_transcript_family(options, bamboo_domain::ProviderFamily::OpenAi);
@@ -431,9 +432,13 @@ impl OpenAIProvider {
                     ResponsesSseParser::new_with_context("OpenAI", model, reasoning_effort)
                         .with_protocol_events(retain_protocol_events);
                 let model_for_debug = model.to_string();
+                let completion_diagnostics = completion_diagnostics.clone();
                 let stream = llm_stream_from_sse_multi_requiring_done(
                     fallback,
                     move |event, data| {
+                        if let Some(diagnostics) = &completion_diagnostics {
+                            diagnostics.observe_sse(event, data);
+                        }
                         let parsed = parser.handle_event_multi(event, data);
                         append_responses_sse_record(
                             "OpenAI",
@@ -458,6 +463,9 @@ impl OpenAIProvider {
         let stream = llm_stream_from_sse_multi_requiring_done(
             response,
             move |event, data| {
+                if let Some(diagnostics) = &completion_diagnostics {
+                    diagnostics.observe_sse(event, data);
+                }
                 let parsed = parser.handle_event_multi(event, data);
                 append_responses_sse_record("OpenAI", &model_for_debug, event, data, &parsed);
                 parsed
@@ -763,9 +771,13 @@ impl LLMProvider for OpenAIProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = openai_compat_chat_stream_from_sse(response, move |_event, data| {
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let stream = openai_compat_chat_stream_from_sse(response, move |event, data| {
             if data.trim().is_empty() {
                 return Ok(Vec::new());
+            }
+            if let Some(diagnostics) = &completion_diagnostics {
+                diagnostics.observe_sse(event, data);
             }
 
             let mut reasoning_chunk_to_emit: Option<String> = None;
