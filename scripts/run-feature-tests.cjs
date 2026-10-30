@@ -92,11 +92,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // compression library counts content pages against the dispatch cap; the
 // test-utils diagnostic records each read attempt. No additive feature-only
 // cases were added. Actual compact/actor integration targets stay in agent-tests-0.
-// The llm_retry policy work (PR #2429) touches bamboo-config/src/config.rs with
-// unconditional validation tests only: no feature cfg, new owner, or additive
-// feature-only case changed; the 20 explicit additive cases and four contexts
-// remain unchanged.
-const FEATURE_SOURCE_SHA256 = "ac3c34883c429b8258d74bd35920bddb07cf5b0b42258cf24d9c25f6202d63ac";
+// Bound Supervisor history adds four ordinary Actix cases to the existing
+// server-handlers owner and two storage guard cases to packages-0. They have
+// no feature-only cfg and are not excluded by the serial storage selectors;
+// the 20 explicit additive cases and their owners remain unchanged.
+const FEATURE_SOURCE_SHA256 = "f0898c4a91f8f690cb0b78fa6fb21ba5bdbeba92a7c9b6519b96f2480ed89fae";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
