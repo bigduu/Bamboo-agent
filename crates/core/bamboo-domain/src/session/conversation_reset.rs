@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{AgentStatusState, Role, Session, SessionKind};
+use super::{AgentStatusState, PlanModeStatus, Role, Session, SessionKind};
 
 pub const CONVERSATION_RESET_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_RESET_RECEIPT_LIMIT: usize = 8;
@@ -210,6 +210,21 @@ impl ConversationResetState {
 pub fn conversation_reset_pending_rejection(
     session: &Session,
 ) -> Option<ConversationResetRejection> {
+    pending_snapshot_rejection(session, false)
+}
+
+/// C1 preserves an idle, non-approval Plan. Every other pending or uncertain
+/// state remains a blocker; this observation does not authorize the C1 write.
+pub fn conversation_clear_readback_pending_rejection(
+    session: &Session,
+) -> Option<ConversationResetRejection> {
+    pending_snapshot_rejection(session, true)
+}
+
+fn pending_snapshot_rejection(
+    session: &Session,
+    allow_idle_plan: bool,
+) -> Option<ConversationResetRejection> {
     use ConversationResetRejection as Rejection;
     if session
         .metadata
@@ -250,7 +265,23 @@ pub fn conversation_reset_pending_rejection(
         if runtime.suspension.is_some()
             || runtime.waiting_for_children.is_some()
             || runtime.waiting_for_bash.is_some()
-            || runtime.plan_mode.is_some()
+            || runtime.plan_mode.as_ref().is_some_and(|plan| {
+                !allow_idle_plan
+                    || !matches!(
+                        runtime.status,
+                        AgentStatusState::Idle
+                            | AgentStatusState::Completed
+                            | AgentStatusState::Cancelled
+                            | AgentStatusState::Failed
+                    )
+                    || !matches!(
+                        plan.status,
+                        PlanModeStatus::Exploring
+                            | PlanModeStatus::Designing
+                            | PlanModeStatus::Reviewing
+                            | PlanModeStatus::Finalizing
+                    )
+            })
             || runtime.status == AgentStatusState::Suspended
         {
             return Some(Rejection::PendingWait);
