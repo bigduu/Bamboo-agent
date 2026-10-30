@@ -33,11 +33,12 @@ identity and ancestry commitments. The server checks the canonical Supervisor
 and obtains the Session plus its target observation in one guarded storage
 read. It compares that observation before returning the normal history shape
 with additive `supervisor`, `current_user_target` and
-`history_snapshot_source` fields. `durable` is the guarded persisted snapshot;
-`matched_cache` is the ordinary quiet-session cache read while that same
-storage guard is held, after matching its complete caller/generation, project and
-metadata to the guarded snapshot. Active runs
-use durable history, as the ordinary history handler does. A new append or run
+`history_snapshot_source` and `bound_token_usage` fields. `durable` is the
+history and optional token state read together under the canonical guard. The
+response always includes `bound_token_usage`, including explicit null. A cache
+with matching identity can still be older than a durable append, edit or
+truncation and is therefore not used for this endpoint. Active runs use the
+latest persisted checkpoint, as the ordinary history handler does. A new append or run
 in the same generation is not automatically a new Session.
 
 A stale Supervisor or target returns HTTP 409 with no history. An unavailable

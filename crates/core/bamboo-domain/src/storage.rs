@@ -645,25 +645,20 @@ pub trait Storage: Send + Sync {
         ))
     }
 
-    /// Whether this backend can read UI history and select a matching in-memory
-    /// snapshot while retaining the same canonical target/ancestry guard.
+    /// Whether this backend supports the guarded, target-bound durable history read.
     fn supports_supervisor_current_user_bound_history(&self) -> bool {
         false
     }
 
-    /// Match the expected target, then read durable history and optionally a
-    /// quiet cache snapshot while retaining the same physical authority guard.
-    /// The callback must be nonblocking and must not reenter storage. A backend
-    /// must independently reject a cache candidate whose caller/generation,
-    /// Project or metadata version differs from the guarded durable Session.
-    /// The bool reports whether the matching cache snapshot was selected.
-    /// Unknown/custom backends fail closed until they implement this contract.
+    /// Match the original target and read its durable Session under the same
+    /// canonical Supervisor, target and ancestry guards. A cache with the same
+    /// identity is not necessarily as fresh as durable history. Custom stores
+    /// fail closed until they implement the same atomic contract.
     async fn load_supervisor_current_user_bound_history(
         &self,
         _supervisor: &crate::SupervisorReference,
         _expected: &crate::SupervisorCurrentUserTarget,
-        _read_cache: Option<Box<dyn FnOnce() -> Option<Session> + Send>>,
-    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget, bool)> {
+    ) -> std::io::Result<(Session, crate::SupervisorCurrentUserTarget)> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "guarded current-user Session history is unsupported",

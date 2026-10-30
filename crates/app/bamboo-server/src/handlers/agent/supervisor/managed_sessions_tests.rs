@@ -535,6 +535,12 @@ async fn managed_history_binds_snapshot_to_observed_target_and_keeps_legacy_hist
         .await
         .unwrap()
         .unwrap();
+    // The pre-existing quiet cache has the same birth, but misses the newly
+    // persisted history. Identity equality is not a freshness proof.
+    f.state.sessions.insert(
+        "target-a".into(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(original.clone())),
+    );
     original.add_message(Message::user("synthetic same-birth append"));
     f.state.storage.save_session(&original).await.unwrap();
     let mut delta_request = binding.clone();
@@ -549,6 +555,49 @@ async fn managed_history_binds_snapshot_to_observed_target_and_keeps_legacy_hist
         delta["messages"][0]["content"],
         "synthetic same-birth append"
     );
+
+    assert_eq!(delta["history_snapshot_source"], "durable");
+    assert!(delta.get("bound_token_usage").is_some());
+
+    // Same-identity edits and truncations must also beat the old cached copy.
+    original.messages[1].content = "synthetic edited".into();
+    f.state.storage.save_session(&original).await.unwrap();
+    let (status, edited) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(edited["messages"][1]["content"], "synthetic edited");
+    original.messages.truncate(1);
+    original.token_usage = Some(bamboo_domain::TokenBudgetUsage {
+        system_tokens: 2,
+        summary_tokens: 0,
+        window_tokens: 3,
+        total_tokens: 5,
+        max_context_tokens: 100,
+        budget_limit: 100,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
+    });
+    f.state.storage.save_session(&original).await.unwrap();
+    let (status, shortened) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{shortened}");
+    assert_eq!(shortened["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(shortened["bound_token_usage"]["total_tokens"], 5);
 
     // Actual supported replacement in the isolated temporary store: the old
     // selector cannot retrieve the new birth's transcript.
@@ -570,6 +619,8 @@ async fn managed_history_binds_snapshot_to_observed_target_and_keeps_legacy_hist
     assert!(!stale.to_string().contains("PRIVATE replacement history"));
     assert!(stale.get("messages").is_none());
 
+    // Legacy cache publication is independent of this bound endpoint.
+    let _ = f.state.sessions.remove("target-a");
     // Legacy GET remains available with its existing, weaker ID-only contract.
     let app = test::init_service(
         App::new()
@@ -641,7 +692,7 @@ async fn managed_history_requires_owner_and_matching_supervisor_and_path() {
 }
 
 #[actix_web::test]
-async fn managed_history_uses_quiet_cache_only_for_the_guarded_birth() {
+async fn managed_history_uses_durable_snapshot_even_with_a_same_birth_cache() {
     let f = Fixture::new(false).await;
     let (_, directory) = f.call(Method::GET, None, None).await;
     let target = directory["sessions"]
@@ -672,8 +723,9 @@ async fn managed_history_uses_quiet_cache_only_for_the_guarded_birth() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{matching}");
-    assert_eq!(matching["history_snapshot_source"], "matched_cache");
-    assert!(matching
+    assert_eq!(matching["history_snapshot_source"], "durable");
+    assert!(matching.get("bound_token_usage").is_some());
+    assert!(!matching
         .to_string()
         .contains("synthetic cache-only same-birth message"));
 

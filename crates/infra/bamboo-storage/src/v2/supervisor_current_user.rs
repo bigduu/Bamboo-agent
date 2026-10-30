@@ -477,71 +477,8 @@ mod observed_history_guard_tests {
         assert_eq!(history.messages[0].content, "synthetic replacement");
         Ok(())
     }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn bound_history_selects_cache_before_recreation_can_pass_the_guard() -> io::Result<()> {
-        let home = tempfile::tempdir()?;
-        let store = Arc::new(SessionStoreV2::new(home.path().to_path_buf()).await?);
-        let supervisor: SupervisorReference = (&store
-            .get_or_create_default_supervisor("synthetic-model")
-            .await?)
-            .into();
-        let mut original = Session::new("bound-history-root", "synthetic-model");
-        original.add_message(Message::user("synthetic durable"));
-        store.save_session(&original).await?;
-        let expected = store
-            .inspect_supervisor_current_user_target(&supervisor, &original.id)
-            .await?;
-        let mut cached = store.load_session(&original.id).await?.unwrap();
-        cached.add_message(Message::user("synthetic matching cache"));
-        let (entered, ready) = tokio::sync::oneshot::channel();
-        let (release, continue_read) = std::sync::mpsc::channel();
-        let read_store = Arc::clone(&store);
-        let read_supervisor = supervisor.clone();
-        let read_expected = expected.clone();
-        let reader = tokio::spawn(async move {
-            read_store
-                .load_supervisor_current_user_bound_history(
-                    &read_supervisor,
-                    &read_expected,
-                    Some(Box::new(move || {
-                        let _ = entered.send(());
-                        continue_read.recv().expect("test releases the held read");
-                        Some(cached)
-                    })),
-                )
-                .await
-        });
-        tokio::time::timeout(Duration::from_secs(5), ready)
-            .await
-            .map_err(io::Error::other)?
-            .map_err(io::Error::other)?;
-        let writer_store = Arc::clone(&store);
-        let target_id = original.id.clone();
-        let mut writer = tokio::spawn(async move {
-            assert!(writer_store.delete_session(&target_id).await?);
-            writer_store
-                .recreate_root_session(&target_id, "synthetic-model")
-                .await
-        });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut writer)
-                .await
-                .is_err(),
-            "recreation must not pass while cache is selected"
-        );
-        release.send(()).map_err(io::Error::other)?;
-        let (history, observed, cache_selected) = reader.await.map_err(io::Error::other)??;
-        assert!(cache_selected);
-        assert_eq!(observed, expected);
-        assert_eq!(history.messages[1].content, "synthetic matching cache");
-        let replacement = writer.await.map_err(io::Error::other)??;
-        assert_ne!(replacement.created_at, observed.created_at);
-        Ok(())
-    }
     #[tokio::test]
-    async fn bound_history_rejects_stale_target_before_cache_and_falls_back_for_wrong_birth(
-    ) -> io::Result<()> {
-        use std::sync::atomic::{AtomicBool, Ordering};
+    async fn bound_history_rejects_stale_target() -> io::Result<()> {
         let home = tempfile::tempdir()?;
         let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
         let supervisor: SupervisorReference = (&store
@@ -556,33 +493,14 @@ mod observed_history_guard_tests {
             .await?;
         let mut stale = expected.clone();
         stale.metadata_version += 1;
-        let called = Arc::new(AtomicBool::new(false));
-        let callback_called = Arc::clone(&called);
         let error = store
-            .load_supervisor_current_user_bound_history(
-                &supervisor,
-                &stale,
-                Some(Box::new(move || {
-                    callback_called.store(true, Ordering::SeqCst);
-                    None
-                })),
-            )
+            .load_supervisor_current_user_bound_history(&supervisor, &stale)
             .await
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert!(!called.load(Ordering::SeqCst));
-
-        let mut wrong = Session::new(&original.id, "synthetic-model");
-        wrong.created_at = original.created_at + chrono::Duration::seconds(1);
-        wrong.add_message(Message::user("synthetic wrong birth"));
-        let (history, observed, cache_selected) = store
-            .load_supervisor_current_user_bound_history(
-                &supervisor,
-                &expected,
-                Some(Box::new(move || Some(wrong))),
-            )
+        let (history, observed) = store
+            .load_supervisor_current_user_bound_history(&supervisor, &expected)
             .await?;
-        assert!(!cache_selected);
         assert_eq!(observed, expected);
         assert_eq!(history.messages[0].content, "synthetic durable");
         Ok(())
