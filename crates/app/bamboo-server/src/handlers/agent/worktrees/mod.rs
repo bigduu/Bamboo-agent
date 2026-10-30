@@ -401,77 +401,85 @@ pub async fn merge_state(
         let mut seen = HashSet::new();
         for source in project.workspace_roots() {
             // Same scoping rule as `list`: only namespaces this Project owns.
-            let path = PathBuf::from(source);
-            let common = match git::repository(&path) {
-                Ok(common) => common,
-                Err(_) => continue,
-            };
-            // Several bound roots may resolve to one repository.
-            if !seen.insert(common) {
-                continue;
-            }
-            // A forge answer is only meaningful when the remote names one this
-            // build may query; resolve that once per repository, up front.
-            let remote = forge::github_remote(&path);
-            let base = match merge_state::merge_base(&path, deadline) {
-                Ok(base) => base,
-                Err(reason) => {
-                    repositories.push(ComputedRepository {
-                        path: source.to_owned(),
-                        base_ref: None,
-                        base_commit: None,
-                        error: Some(reason),
-                        remote,
-                        entries: Vec::new(),
-                    });
+            let root = PathBuf::from(source);
+            // A registered root may be a checkout or a container of several
+            // repositories. Assuming it is always a checkout would return no
+            // state for a container Project whose checkouts the inventory does
+            // list, so discover within the root, bounded like everything here.
+            for path in merge_state::discover_bounded(&root, deadline) {
+                let Ok(common) = merge_state::repository_bounded(&path, deadline) else {
+                    continue;
+                };
+                // Several bound roots may resolve to one repository.
+                if !seen.insert(common) {
                     continue;
                 }
-            };
-            // The primary checkout is the workspace itself, never outstanding work.
-            let main_checkout = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            let entries = match git::list(&path) {
-                Ok(entries) => entries,
-                Err(_) => {
-                    repositories.push(ComputedRepository {
-                        path: source.to_owned(),
-                        base_ref: Some(base.label()),
-                        base_commit: Some(base.commit.clone()),
-                        error: Some("inventory_unavailable"),
-                        remote,
-                        entries: Vec::new(),
-                    });
-                    continue;
-                }
-            };
-            let entries = entries
-                .into_iter()
-                .filter(|entry| entry.path.to_str().is_some())
-                .map(|entry| {
-                    let verdict = merge_state::merge_verdict(
-                        &path,
-                        &entry,
-                        &main_checkout,
-                        &base,
-                        std::time::Instant::now() + merge_state::PER_ENTRY_BUDGET,
-                    );
-                    ComputedEntry {
-                        path: git::path_label(&entry.path),
-                        state: verdict.state,
-                        reason: verdict.reason,
-                        forge: forge::ForgeReason::NotRequired.as_str(),
-                        branch: entry.branch,
-                        head: entry.head,
+                let label = git::path_label(&path);
+                // A forge answer is only meaningful when the remote names one
+                // this build may query; resolve that once per repository.
+                let remote = forge::github_remote(&path);
+                let base = match merge_state::merge_base(&path, deadline) {
+                    Ok(base) => base,
+                    Err(reason) => {
+                        repositories.push(ComputedRepository {
+                            path: label,
+                            base_ref: None,
+                            base_commit: None,
+                            error: Some(reason),
+                            remote,
+                            entries: Vec::new(),
+                        });
+                        continue;
                     }
-                })
-                .collect();
-            repositories.push(ComputedRepository {
-                path: source.to_owned(),
-                base_ref: Some(base.label()),
-                base_commit: Some(base.commit),
-                error: None,
-                remote,
-                entries,
-            });
+                };
+                // The primary checkout is the workspace itself, never outstanding work.
+                let main_checkout = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                let entries = match merge_state::list_metadata(&path, deadline) {
+                    Ok(entries) => entries,
+                    Err(_) => {
+                        repositories.push(ComputedRepository {
+                            path: label,
+                            base_ref: Some(base.label()),
+                            base_commit: Some(base.commit.clone()),
+                            error: Some("inventory_unavailable"),
+                            remote,
+                            entries: Vec::new(),
+                        });
+                        continue;
+                    }
+                };
+                let entries = entries
+                    .into_iter()
+                    .filter(|entry| entry.path.to_str().is_some())
+                    .map(|entry| {
+                        let verdict = merge_state::merge_verdict(
+                            &path,
+                            &entry,
+                            &main_checkout,
+                            &base,
+                            // Never a fresh full allowance: the request budget bounds
+                            // every entry, so later entries degrade promptly.
+                            merge_state::entry_deadline(deadline),
+                        );
+                        ComputedEntry {
+                            path: git::path_label(&entry.path),
+                            state: verdict.state,
+                            reason: verdict.reason,
+                            forge: forge::ForgeReason::NotRequired.as_str(),
+                            branch: entry.branch,
+                            head: entry.head,
+                        }
+                    })
+                    .collect();
+                repositories.push(ComputedRepository {
+                    path: label,
+                    base_ref: Some(base.label()),
+                    base_commit: Some(base.commit),
+                    error: None,
+                    remote,
+                    entries,
+                });
+            }
         }
         Ok(repositories)
     })
@@ -587,7 +595,11 @@ async fn enrich_with_forge(repositories: &mut [ComputedRepository]) {
                 continue;
             }
             budget -= 1;
-            let pr = forge::query_github(&client, &remote, &branch, &token).await;
+            // The PR must cover this exact checkout against this exact base, so
+            // a merge into another branch or a since-moved branch is not proof.
+            let base_ref = repository.base_ref.clone().unwrap_or_default();
+            let pr = forge::query_github(&client, &remote, &branch, &entry.head, &base_ref, &token)
+                .await;
             let local = merge_state::MergeVerdict {
                 state: entry.state,
                 reason: entry.reason,

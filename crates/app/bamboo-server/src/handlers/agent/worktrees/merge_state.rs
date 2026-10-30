@@ -223,6 +223,131 @@ fn resolve_ref(repo: &Path, reference: &str, deadline: Instant) -> Option<String
     (!commit.is_empty()).then_some(commit)
 }
 
+/// The checkout's repository metadata directory, bounded.
+///
+/// `git::repository` uses `Command::output()`, which has no kill path (#2402);
+/// this endpoint runs on a sidebar poll, so every Git access it makes must be
+/// killable.
+pub fn repository_bounded(repo: &Path, deadline: Instant) -> Result<PathBuf, &'static str> {
+    let output = run_bounded(
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline,
+    )?;
+    if !output.success {
+        return Err("not_a_repository");
+    }
+    let text = String::from_utf8(output.stdout).map_err(|_| "git_error")?;
+    std::fs::canonicalize(PathBuf::from(text.trim())).map_err(|_| "not_a_repository")
+}
+
+/// Metadata-only worktree inventory, bounded.
+///
+/// `git worktree list --porcelain` reads only `.git/worktrees/*` metadata and
+/// never touches working-tree files, so it cannot hang on storage that evicted
+/// files. It also costs nothing per checkout: the merge-state question needs
+/// path/branch/HEAD and nothing else, whereas `git::list` additionally runs
+/// `ls-files` and `status` per entry — the unbounded behaviour #2402 describes.
+pub fn list_metadata(repo: &Path, deadline: Instant) -> Result<Vec<Worktree>, &'static str> {
+    let listing = run_bounded(repo, &["worktree", "list", "--porcelain", "-z"], deadline)?;
+    if !listing.success {
+        return Err("not_a_repository");
+    }
+    let mut result = Vec::new();
+    let mut entry: Option<Worktree> = None;
+    for field in listing.stdout.split(|byte| *byte == 0) {
+        if let Some(path) = field.strip_prefix(b"worktree ") {
+            if let Some(previous) = entry.take() {
+                result.push(previous);
+            }
+            // A raw-byte path cannot be opened by this UI, so it is skipped
+            // rather than shown as a lossy label.
+            entry = std::str::from_utf8(path).ok().map(|path| Worktree {
+                path: PathBuf::from(path),
+                ..Default::default()
+            });
+        } else if let Some(current) = entry.as_mut() {
+            if let Some(head) = field.strip_prefix(b"HEAD ") {
+                current.head = String::from_utf8_lossy(head).into_owned();
+            }
+            if let Some(branch) = field.strip_prefix(b"branch refs/heads/") {
+                current.branch = Some(String::from_utf8_lossy(branch).into_owned());
+            }
+            if field == b"bare" {
+                current.bare = true;
+            }
+        }
+    }
+    if let Some(previous) = entry {
+        result.push(previous);
+    }
+    Ok(result)
+}
+
+/// The deadline for one checkout: never later than the whole-scan deadline.
+///
+/// Giving every entry a fresh full allowance would let a repository with many
+/// slow checkouts spend that allowance again and again, so the request could
+/// outlast its own budget.
+pub fn entry_deadline(scan_deadline: Instant) -> Instant {
+    (Instant::now() + PER_ENTRY_BUDGET).min(scan_deadline)
+}
+
+/// Repositories to inspect for one registered Project root, bounded.
+///
+/// A root may be a checkout itself, or a container directory holding several
+/// repositories — the layout the worktree inventory supports. Assuming every
+/// root is a repository would return no state at all for a container Project
+/// whose checkouts the inventory does list.
+///
+/// Bounded by depth, entry count and the caller's deadline, so a large tree
+/// cannot turn a sidebar poll into a directory walk.
+pub fn discover_bounded(root: &Path, deadline: Instant) -> Vec<PathBuf> {
+    const MAX_DEPTH: usize = 4;
+    const MAX_ENTRIES: usize = 2_000;
+
+    let mut found = Vec::new();
+    let mut pending = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+    while let Some((directory, depth)) = pending.pop() {
+        if Instant::now() >= deadline || visited >= MAX_ENTRIES {
+            break;
+        }
+        if repository_bounded(&directory, deadline).is_ok() {
+            // A checkout stops the descent: nested repositories are not this
+            // Project's checkouts, and the inventory does not own them either.
+            found.push(directory);
+            continue;
+        }
+        if depth >= MAX_DEPTH {
+            continue;
+        }
+        let Ok(entries) = std::fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited >= MAX_ENTRIES || Instant::now() >= deadline {
+                break;
+            }
+            // Never follow symlinks: a link could escape the Project root or loop.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            pending.push((entry.path(), depth + 1));
+        }
+    }
+    found
+}
+
 /// Resolve the integration base once per repository. `refs/remotes/origin/HEAD`
 /// is authoritative; the ordered fallbacks cover clones that never created it.
 /// A repository with none of these is answered `unknown`, never assumed.

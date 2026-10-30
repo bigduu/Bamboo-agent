@@ -238,6 +238,77 @@ fn a_non_github_remote_is_reported_before_any_credential_question() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+fn pr(merged: bool, base: &str, head: &str) -> PullRequest {
+    PullRequest {
+        merged_at: merged.then(|| "2026-10-30T00:00:00Z".to_owned()),
+        state: Some(if merged { "closed" } else { "open" }.to_owned()),
+        base: Some(PullRequestRef {
+            reference: Some(base.to_owned()),
+            sha: None,
+        }),
+        head: Some(PullRequestRef {
+            reference: None,
+            sha: Some(head.to_owned()),
+        }),
+    }
+}
+
+#[test]
+fn a_merge_only_proves_the_work_when_it_covers_this_exact_checkout() {
+    // The checkout has not moved and the PR targets the same branch: proof.
+    assert!(proves_checkout(
+        &pr(true, "dev", "aaa"),
+        "origin/dev",
+        "aaa"
+    ));
+    // Aliases of the same base branch.
+    assert!(proves_checkout(
+        &pr(true, "dev", "aaa"),
+        "refs/remotes/origin/dev",
+        "aaa"
+    ));
+    // `release/1.0`-style names keep their slash in the comparison.
+    assert!(proves_checkout(
+        &pr(true, "release/1.0", "aaa"),
+        "origin/release/1.0",
+        "aaa"
+    ));
+}
+
+#[test]
+fn a_merge_into_another_branch_is_not_proof_for_this_base() {
+    // PR merged into a release branch says nothing about origin/dev.
+    assert!(!proves_checkout(
+        &pr(true, "release/1.0", "aaa"),
+        "origin/dev",
+        "aaa"
+    ));
+}
+
+#[test]
+fn commits_made_after_the_merge_are_not_hidden_by_it() {
+    // The PR merged `aaa`, but the checkout has since moved to `bbb`: its work
+    // is outstanding and must not be reported merged.
+    assert!(!proves_checkout(
+        &pr(true, "dev", "aaa"),
+        "origin/dev",
+        "bbb"
+    ));
+}
+
+#[test]
+fn an_unattributable_merge_keeps_the_local_verdict_and_says_why() {
+    let verdict = local(MergeState::InProgress, "unique_commits");
+    let (state, reason, forge) = resolve(&verdict, PrState::MergedButNotThisCheckout);
+    assert_eq!(
+        state,
+        MergeState::InProgress,
+        "outstanding work must stay visible"
+    );
+    assert_eq!(reason, "unique_commits");
+    assert_eq!(forge.as_str(), "merged_pull_request_elsewhere");
+}
+
 #[test]
 fn every_reason_code_is_stable_and_machine_readable() {
     for (reason, code) in [
@@ -250,6 +321,10 @@ fn every_reason_code_is_stable_and_machine_readable() {
         (ForgeReason::RequestFailed, "request_failed"),
         (ForgeReason::RateLimited, "rate_limited"),
         (ForgeReason::NotRequired, "not_required"),
+        (
+            ForgeReason::MergedPullRequestElsewhere,
+            "merged_pull_request_elsewhere",
+        ),
     ] {
         assert_eq!(reason.as_str(), code);
     }

@@ -50,6 +50,9 @@ pub enum ForgeReason {
     RateLimited,
     /// The forge asked for an answer but the entry needs no forge check.
     NotRequired,
+    /// A merged pull request exists but does not cover this checkout: it targets
+    /// another branch, or the checkout has commits the merge never contained.
+    MergedPullRequestElsewhere,
 }
 
 impl ForgeReason {
@@ -64,6 +67,7 @@ impl ForgeReason {
             Self::RequestFailed => "request_failed",
             Self::RateLimited => "rate_limited",
             Self::NotRequired => "not_required",
+            Self::MergedPullRequestElsewhere => "merged_pull_request_elsewhere",
         }
     }
 }
@@ -71,9 +75,15 @@ impl ForgeReason {
 /// What the forge said about one branch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrState {
+    /// A merged pull request that provably covers this checkout, targeting the
+    /// same integration branch the local verdict was measured against.
     Merged,
     Open,
     None,
+    /// A merged pull request exists, but it does not prove *this* checkout's
+    /// work landed: it targets another branch, or the checkout has moved on
+    /// since that merge. Never treated as proof.
+    MergedButNotThisCheckout,
     Unavailable(ForgeReason),
 }
 
@@ -243,6 +253,13 @@ pub fn resolve(local: &MergeVerdict, pr: PrState) -> (MergeState, &'static str, 
             ForgeReason::OpenPullRequest,
         ),
         PrState::None => (local.state, local.reason, ForgeReason::NoPullRequest),
+        // A merge we cannot attribute to this checkout is not proof, so the
+        // local verdict stands and the code says why.
+        PrState::MergedButNotThisCheckout => (
+            local.state,
+            local.reason,
+            ForgeReason::MergedPullRequestElsewhere,
+        ),
         PrState::Unavailable(reason) => (local.state, local.reason, reason),
     }
 }
@@ -259,11 +276,56 @@ pub fn needs_forge(state: MergeState) -> bool {
 const API_TIMEOUT: Duration = Duration::from_secs(6);
 
 #[derive(Deserialize)]
-struct PullRequest {
+pub(super) struct PullRequest {
     #[serde(default)]
-    merged_at: Option<String>,
+    pub(super) merged_at: Option<String>,
     #[serde(default)]
-    state: Option<String>,
+    pub(super) state: Option<String>,
+    /// The branch this PR was opened against.
+    #[serde(default)]
+    pub(super) base: Option<PullRequestRef>,
+    /// The head commit this PR carried. Comparing it with the checkout head is
+    /// what makes a merged PR evidence about *this* work.
+    #[serde(default)]
+    pub(super) head: Option<PullRequestRef>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct PullRequestRef {
+    #[serde(default)]
+    #[serde(rename = "ref")]
+    pub(super) reference: Option<String>,
+    #[serde(default)]
+    pub(super) sha: Option<String>,
+}
+
+/// What a merged pull request must prove before it may override a local verdict.
+///
+/// Two independent facts, both required:
+/// - it targeted the same integration branch the local verdict was measured
+///   against (a PR merged into a release branch says nothing about `dev`), and
+/// - its head is exactly the checkout's head, so a branch that received commits
+///   after the merge — including unpushed local work — is not reported merged.
+pub fn proves_checkout(pr: &PullRequest, base_ref: &str, checkout_head: &str) -> bool {
+    // The API reports a bare branch name; the local base is `origin/dev` or a
+    // full `refs/remotes/...` ref. Compare on the branch name only, keeping any
+    // `release/1.0`-style slash intact.
+    let local_branch = base_ref
+        .strip_prefix("refs/remotes/")
+        .unwrap_or(base_ref)
+        .split_once('/')
+        .map_or(base_ref, |(_, rest)| rest);
+    let base_matches = pr
+        .base
+        .as_ref()
+        .and_then(|base| base.reference.as_deref())
+        .is_some_and(|reference| reference == local_branch || reference == base_ref);
+    let head_matches = pr
+        .head
+        .as_ref()
+        .and_then(|head| head.sha.as_deref())
+        .is_some_and(|sha| sha == checkout_head);
+    base_matches && head_matches
 }
 
 /// One bounded GitHub query for one branch.
@@ -274,6 +336,8 @@ pub async fn query_github(
     client: &reqwest::Client,
     remote: &Remote,
     branch: &str,
+    checkout_head: &str,
+    base_ref: &str,
     token: &str,
 ) -> PrState {
     let url = format!(
@@ -325,7 +389,15 @@ pub async fn query_github(
     };
     match pulls.first() {
         None => PrState::None,
-        Some(pull) if pull.merged_at.is_some() => PrState::Merged,
+        // A merge only proves this checkout's work landed when it covers the
+        // same base branch and the exact head being classified.
+        Some(pull) if pull.merged_at.is_some() => {
+            if proves_checkout(pull, base_ref, checkout_head) {
+                PrState::Merged
+            } else {
+                PrState::MergedButNotThisCheckout
+            }
+        }
         Some(pull) if pull.state.as_deref() == Some("open") => PrState::Open,
         // A closed-and-unmerged PR is not proof of anything: the work may have
         // landed under another PR, so keep the local verdict and report "none".
