@@ -14,10 +14,10 @@ pub struct Worktree {
     pub dirty: Option<bool>,
     pub error: Option<String>,
     pub openable: bool,
-    bare: bool,
+    pub(super) bare: bool,
 }
 
-fn git_command(repo: &Path) -> Command {
+pub(super) fn git_command(repo: &Path) -> Command {
     let mut command = Command::new("git");
     command
         .args([
