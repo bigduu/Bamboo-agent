@@ -289,6 +289,16 @@ pub async fn handler(
         }));
     };
 
+    HttpResponse::Ok().json(render_history(&session_id, session, &query))
+}
+
+/// Render an already selected immutable Session using the legacy UI history
+/// rules. Callers choose and authenticate the snapshot before reaching here.
+pub(super) fn render_history(
+    session_id: &str,
+    session: bamboo_agent_core::Session,
+    query: &HistoryQuery,
+) -> serde_json::Value {
     if query.projection == Some(HistoryProjection::Messages) {
         let mut messages: Vec<_> = session
             .messages
@@ -318,14 +328,14 @@ pub async fn handler(
             messages.drain(..messages.len() - MAX_HISTORY_MESSAGES);
         }
 
-        return HttpResponse::Ok().json(serde_json::json!({
+        return serde_json::json!({
             "session_id": session_id,
             "projection": "messages",
             "messages": messages,
             "is_delta": is_delta,
             "truncated": truncated,
             "total_message_count": total_message_count
-        }));
+        });
     }
 
     let mut messages: Vec<_> = session
@@ -395,7 +405,7 @@ pub async fn handler(
             .insert("goal_state".to_string(), gs);
     }
 
-    HttpResponse::Ok().json(response)
+    response
 }
 
 // Pure cold-fetch-cap unit test — kept in its own module that does NOT import

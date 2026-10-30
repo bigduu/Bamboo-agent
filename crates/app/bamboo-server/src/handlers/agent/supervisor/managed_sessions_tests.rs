@@ -23,7 +23,10 @@ struct Fixture {
 impl Fixture {
     async fn new(exact_authorizer: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let mut state = Box::pin(AppState::new(home.path().into())).await.unwrap();
+        let memory = bamboo_memory::memory_store::MemoryStore::new(home.path().join("jiandu"));
+        let mut state = Box::pin(AppState::new_with_memory_store(home.path().into(), memory))
+            .await
+            .unwrap();
         if exact_authorizer {
             state = state.with_supervisor_project_scope_authorizer(Arc::new(ApprovedHostIntent));
         }
@@ -482,5 +485,268 @@ async fn managed_sessions_corrupt_canonical_target_and_source_fail_closed_withou
     assert_eq!(status, StatusCode::CONFLICT, "{error}");
     assert!(error.get("sessions").is_none());
     assert_eq!(f.target_bytes("target-a").await, before);
+    f.state.shutdown().await;
+}
+
+/// These requests use a temporary AppState and synthetic Sessions only.  The
+/// stale selector is data, not authorization, and must never select a new birth.
+#[actix_web::test]
+async fn managed_history_binds_snapshot_to_observed_target_and_keeps_legacy_history() {
+    let f = Fixture::new(false).await;
+    let (status, directory) = f.call(Method::GET, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{directory}");
+    assert_eq!(
+        directory["capabilities"]["current_user_bound_history_v1"],
+        true
+    );
+    let old_target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let binding = json!({"supervisor": f.supervisor, "target": old_target});
+    let (status, initial) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bound history must exist: {initial}"
+    );
+    assert_eq!(initial["current_user_target"], old_target);
+    assert_eq!(
+        initial["messages"][0]["content"],
+        "PRIVATE target-a original history"
+    );
+    let cursor = initial["messages"][0]["id"].as_str().unwrap().to_string();
+
+    // A normal append in the same birth is still the same target, including
+    // when a client requests the existing cursor/projection semantics.
+    let mut original = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    original.add_message(Message::user("synthetic same-birth append"));
+    f.state.storage.save_session(&original).await.unwrap();
+    let mut delta_request = binding.clone();
+    delta_request["query"] = json!({"since_message_id": cursor, "projection": "messages"});
+    let (status, delta) = f
+        .call(Method::POST, Some("target-a/history"), Some(delta_request))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{delta}");
+    assert_eq!(delta["is_delta"], true);
+    assert_eq!(delta["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        delta["messages"][0]["content"],
+        "synthetic same-birth append"
+    );
+
+    // Actual supported replacement in the isolated temporary store: the old
+    // selector cannot retrieve the new birth's transcript.
+    assert!(f.state.storage.delete_session("target-a").await.unwrap());
+    let mut replacement = f
+        .state
+        .storage
+        .recreate_root_session("target-a", "model")
+        .await
+        .unwrap();
+    replacement.set_project_id_meta(f.project.to_string());
+    replacement.add_message(Message::user("PRIVATE replacement history"));
+    f.state.storage.save_session(&replacement).await.unwrap();
+    let (status, stale) = f
+        .call(Method::POST, Some("target-a/history"), Some(binding))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["code"], "target_observation_stale");
+    assert!(!stale.to_string().contains("PRIVATE replacement history"));
+    assert!(stale.get("messages").is_none());
+
+    // Legacy GET remains available with its existing, weaker ID-only contract.
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let request = test::TestRequest::get()
+        .uri("/api/v1/history/target-a")
+        .peer_addr("127.0.0.1:12345".parse().unwrap())
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let legacy: Value = test::read_body_json(response).await;
+    assert_eq!(
+        legacy["messages"][0]["content"],
+        "PRIVATE replacement history"
+    );
+    assert!(legacy.get("current_user_target").is_none());
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn managed_history_requires_owner_and_matching_supervisor_and_path() {
+    let f = Fixture::new(false).await;
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let binding = json!({"supervisor": f.supervisor, "target": target});
+    for (remote, worker) in [(true, false), (false, true)] {
+        let (status, denied) = call(
+            f.state.clone(),
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+            remote,
+            worker,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert!(denied.get("messages").is_none());
+    }
+    let (status, mismatch) = f
+        .call(
+            Method::POST,
+            Some("target-b/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{mismatch}");
+    let mut stale_supervisor = binding;
+    stale_supervisor["supervisor"]["incarnation_id"] = json!(uuid::Uuid::new_v4());
+    let (status, stale) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(stale_supervisor),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert!(stale.get("messages").is_none());
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn managed_history_uses_quiet_cache_only_for_the_guarded_birth() {
+    let f = Fixture::new(false).await;
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let binding = json!({"supervisor": f.supervisor, "target": target});
+    let mut cached = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    cached.add_message(Message::user("synthetic cache-only same-birth message"));
+    f.state.sessions.insert(
+        "target-a".into(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(cached)),
+    );
+    let (status, matching) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{matching}");
+    assert_eq!(matching["history_snapshot_source"], "matched_cache");
+    assert!(matching
+        .to_string()
+        .contains("synthetic cache-only same-birth message"));
+
+    // The live runner owns its local mutable Session; like the legacy handler,
+    // bound history chooses the persisted snapshot rather than a lagging cache.
+    f.state
+        .agent_runners
+        .write()
+        .await
+        .insert("target-a".into(), bamboo_engine::AgentRunner::new());
+    let (status, active) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{active}");
+    assert_eq!(active["history_snapshot_source"], "durable");
+    assert!(!active
+        .to_string()
+        .contains("synthetic cache-only same-birth message"));
+    f.state.agent_runners.write().await.remove("target-a");
+
+    let mut other = Session::new("target-a", "model");
+    other.set_project_id_meta(f.project.to_string());
+    other.add_message(Message::user("PRIVATE wrong-birth cache"));
+    f.state.sessions.insert(
+        "target-a".into(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(other)),
+    );
+    let (status, safe) = f
+        .call(Method::POST, Some("target-a/history"), Some(binding))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{safe}");
+    assert_eq!(safe["history_snapshot_source"], "durable");
+    assert!(!safe.to_string().contains("PRIVATE wrong-birth cache"));
+    assert!(safe
+        .to_string()
+        .contains("PRIVATE target-a original history"));
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn managed_history_binds_ordinary_child_and_its_ancestry() {
+    let f = Fixture::new(false).await;
+    let parent = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut child = Session::new_child_of("child-a", &parent, "model", "Synthetic child");
+    child.set_project_id_meta(f.project.to_string());
+    child.add_message(Message::user("synthetic child history"));
+    f.state.storage.save_session(&child).await.unwrap();
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "child-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    assert_eq!(target["kind"], "child");
+    assert_eq!(target["parent_session_id"], "target-a");
+    let binding = json!({"supervisor": f.supervisor, "target": target});
+    let (status, history) = f
+        .call(Method::POST, Some("child-a/history"), Some(binding))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["current_user_target"], target);
+    assert_eq!(history["messages"][0]["content"], "synthetic child history");
     f.state.shutdown().await;
 }

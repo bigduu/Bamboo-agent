@@ -645,6 +645,12 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Whether this backend implements the retained observed-Session reader.
+    /// Custom backends must opt in only when they provide its atomic contract.
+    fn supports_supervisor_current_user_observed_session(&self) -> bool {
+        false
+    }
+
     /// Return history and its target selector from one retained canonical read.
     /// A second unguarded load must not pair old progress with a replacement
     /// Session's new selector. Custom stores fail closed until implemented.

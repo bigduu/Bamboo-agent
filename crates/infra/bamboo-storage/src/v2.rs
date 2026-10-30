@@ -7697,6 +7697,10 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    fn supports_supervisor_current_user_observed_session(&self) -> bool {
+        true
+    }
+
     async fn load_supervisor_current_user_observed_session(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,
