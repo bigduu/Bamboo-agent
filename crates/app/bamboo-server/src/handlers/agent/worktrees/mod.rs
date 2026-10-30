@@ -311,6 +311,13 @@ pub async fn create(
     Ok(HttpResponse::Created().json(json!({"path": path})))
 }
 
+/// Capabilities this build serves to an independently released frontend.
+///
+/// Advertised in `GET /sessions`, which every client already calls at boot, so a
+/// client can gate an optional request without probing and collecting a 404. An
+/// older server omits the list entirely; absence means "do not ask".
+pub const FEATURES: &[&str] = &["worktree_merge_state"];
+
 /// Per-checkout merge state, derived from local refs and optionally corroborated
 /// by a forge.
 #[derive(Serialize)]

@@ -100,6 +100,7 @@ pub async fn list_sessions(
         limit,
         offset,
         next_offset,
+        features: crate::handlers::agent::worktrees::FEATURES.to_vec(),
     }))
 }
 
