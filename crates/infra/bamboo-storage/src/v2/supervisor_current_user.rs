@@ -415,3 +415,66 @@ fn current_user_link(
         authorized: true,
     }
 }
+
+#[cfg(test)]
+mod observed_history_guard_tests {
+    use super::*;
+    use bamboo_domain::{Message, Storage};
+    use std::{sync::Arc, time::Duration};
+
+    #[tokio::test]
+    async fn observed_history_guard_fences_same_id_recreation_until_snapshot_finishes(
+    ) -> io::Result<()> {
+        let home = tempfile::tempdir()?;
+        let store = Arc::new(SessionStoreV2::new(home.path().to_path_buf()).await?);
+        let supervisor: SupervisorReference = (&store
+            .get_or_create_default_supervisor("synthetic-model")
+            .await?)
+            .into();
+        let mut original = Session::new("observed-history-root", "synthetic-model");
+        original.add_message(Message::user("synthetic original"));
+        store.save_session(&original).await?;
+
+        // This is the exact guard retained by the public observed-session port.
+        let guard = store
+            .lock_current_user_target(&supervisor, &original.id)
+            .await?;
+        let old_observation = guard.reference.clone();
+        let writer_store = Arc::clone(&store);
+        let target_id = original.id.clone();
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let mut writer = tokio::spawn(async move {
+            let _ = started.send(());
+            assert!(writer_store.delete_session(&target_id).await?);
+            let mut replacement = writer_store
+                .recreate_root_session(&target_id, "synthetic-model")
+                .await?;
+            replacement.add_message(Message::user("synthetic replacement"));
+            writer_store.save_session(&replacement).await?;
+            Ok::<_, io::Error>(replacement)
+        });
+        ready.await.map_err(io::Error::other)?;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut writer)
+                .await
+                .is_err(),
+            "recreation must wait while the observed history guard is held"
+        );
+        let guarded = store
+            .peer_delivery_session(&original.id, &guard.target.root_session_id)
+            .await?;
+        assert_eq!(guarded.created_at, old_observation.created_at);
+        assert_eq!(guarded.messages[0].content, "synthetic original");
+        drop(guard);
+
+        let replacement = writer.await.map_err(io::Error::other)??;
+        let (history, new_observation) = store
+            .load_supervisor_current_user_observed_session(&supervisor, &original.id)
+            .await?;
+        assert_ne!(new_observation.created_at, old_observation.created_at);
+        assert_eq!(history.created_at, replacement.created_at);
+        assert_eq!(history.created_at, new_observation.created_at);
+        assert_eq!(history.messages[0].content, "synthetic replacement");
+        Ok(())
+    }
+}
