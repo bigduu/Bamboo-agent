@@ -71,7 +71,6 @@ fn bounded_output(mut command: Command, deadline_at: Instant) -> Result<Output, 
         }
         let _ = stderr_tx.send(buf);
     });
-    let started = Instant::now();
     let mut status = None;
     while Instant::now() < deadline_at {
         match child.try_wait() {
@@ -92,10 +91,23 @@ fn bounded_output(mut command: Command, deadline_at: Instant) -> Result<Output, 
         let _ = child.kill();
         let _ = child.wait();
     }
-    let stdout = stdout_rx.recv().unwrap_or_default();
-    let stderr = stderr_rx.recv().unwrap_or_default();
-    let _ = stdout_reader.join();
-    let _ = stderr_reader.join();
+    // A descendant that inherited the pipes (a content filter, a pager) can
+    // outlive the direct child and keep them open. Collect output with a
+    // bounded grace period so an orphaned writer cannot reintroduce the hang
+    // this wrapper exists to prevent. `join()` cannot time out, so a reader
+    // that did not report within the grace period is detached instead: it owns
+    // no shared state and exits on its own once the last writer closes.
+    let grace = Duration::from_secs(1);
+    let stdout = stdout_rx.recv_timeout(grace);
+    let stderr = stderr_rx.recv_timeout(grace);
+    if stdout.is_ok() {
+        let _ = stdout_reader.join();
+    }
+    if stderr.is_ok() {
+        let _ = stderr_reader.join();
+    }
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
     match status {
         Some(status) => Ok(Output {
             status,
