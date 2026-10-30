@@ -305,6 +305,37 @@ test("feature inventory catches new cases in inherited gated modules and require
   assert.notEqual(sourceFeatureHash([owner], root), afterTarget);
 });
 
+// Serial families can share any number of module ancestors. Emit each Rust
+// module once so the real Cargo fixture still owns every family exactly once.
+function serialStorageFixture(families, record) {
+  const root = new Map();
+  for (const [index, prefix] of families.entries()) {
+    let children = root;
+    let node;
+    for (const part of prefix.slice(4, -2).split("::")) {
+      if (!children.has(part)) children.set(part, { children: new Map(), body: "" });
+      node = children.get(part);
+      children = node.children;
+    }
+    assert.equal(node.body, "", `duplicate serial fixture family: ${prefix}`);
+    node.body = "#[test]fn selected(){" + record("serial-" + index) + "}";
+  }
+  const render = (children) => [...children].map(([name, node]) =>
+    "mod " + name + "{" + node.body + render(node.children) + "}").join("\n");
+  return render(root);
+}
+
+test("serial storage fixture shares nested modules without dropping owners", () => {
+  const families = ["v2::supervisor_management::observer_lock_order_tests::",
+    "v2::supervisor_management::current_user::observed_history_guard_tests::",
+    "v2::supervisor_management::current_user::another_guard_tests::"];
+  const source = serialStorageFixture(families, (name) => `/*${name}*/`);
+  assert.equal((source.match(/\bmod supervisor_management\{/g) ?? []).length, 1);
+  assert.equal((source.match(/\bmod current_user\{/g) ?? []).length, 1);
+  for (const [index] of families.entries()) assert.equal(source.split(`/*serial-${index}*/`).length - 1, 1);
+  assert.throws(() => serialStorageFixture([families[0], families[0]], () => ""), /duplicate serial fixture family/);
+});
+
 test("actual Cargo preserves a default-only production witness and reuses compatible artifacts without repeating cases", (t) => {
   const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "bamboo-feature-configurations-")));
   t.after(() => fs.rmSync(root, { recursive: true, force: true }));
@@ -326,10 +357,7 @@ test("actual Cargo preserves a default-only production witness and reuses compat
   fs.writeFileSync(path.join(root, "recorder/tests/tool_event_lifecycle.rs"), '#[test]fn lifecycle(){' + record("recorder-lifecycle") + '}\n');
   fs.writeFileSync(path.join(root, "storage/src/lib.rs"), "mod v2{mod root_birth_tests{" +
     ROOT_BIRTH_CASES.map((name) => "#[test]fn " + name + '(){assert_eq!(std::env::var("CARGO_MANIFEST_DIR").unwrap(),env!("CARGO_MANIFEST_DIR"));assert_eq!(std::env::current_dir().unwrap(),std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")));' + record(name) + "}").join("\n") + "}\n" +
-    SERIAL_STORAGE_FAMILIES.slice(1).map((prefix, index) => {
-      const parts = prefix.slice(4, -2).split("::");
-      return parts.map((part) => "mod " + part + "{").join("") + "#[test]fn selected(){" + record("serial-" + index) + "}" + "}".repeat(parts.length);
-    }).join("\n") + '}\nmod session_merge{mod tests{#[test]fn ' + SERIAL_STORAGE_SELECTORS.at(-1).split("::").at(-1) + "(){" +
+    serialStorageFixture(SERIAL_STORAGE_FAMILIES.slice(1), record) + '}\nmod session_merge{mod tests{#[test]fn ' + SERIAL_STORAGE_SELECTORS.at(-1).split("::").at(-1) + "(){" +
     record("serial-merge") + '}}}\n#[test]fn ordinary_storage(){' + record("storage-ordinary") + "}\n");
   const negative = DEFAULT_TELEMETRY_CASE.split("::").at(-1);
   fs.writeFileSync(path.join(root, "infra/src/lib.rs"), '#[cfg(test)]mod telemetry{mod config{mod tests{' +
