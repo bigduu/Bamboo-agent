@@ -10,6 +10,8 @@ import net from 'node:net'
 import path from 'node:path'
 import { spawn, spawnSync } from 'node:child_process'
 import { setTimeout as delay } from 'node:timers/promises'
+import { clearOutcome, waitForManagedBinding } from './binding.mjs'
+import { runIndependentScenarios } from './scenarios.mjs'
 
 const bamboo = process.env.DIAG_BAMBOO
 const lotus = process.env.DIAG_LOTUS
@@ -214,6 +216,14 @@ try {
       if (stores.length !== 1) throw new Error(`Expected one chat store, got ${stores.length}`)
       return stores[0].getState().currentSessionId
     }, storeAsset)
+    const uiState = () => page.evaluate(async ({ asset, sessionId }) => {
+      const module = await import(asset)
+      const stores = Object.values(module).filter(x => typeof x === 'function' && typeof x.getState === 'function' && Array.isArray(x.getState()?.chats))
+      if (stores.length !== 1) throw new Error(`Expected one chat store, got ${stores.length}`)
+      const state = stores[0].getState()
+      return { selected: state.currentSessionId, binding: state.managedHistoryBindings?.[sessionId] ?? null,
+        clear: state.conversationClears?.[sessionId] ?? null }
+    }, { asset: storeAsset, sessionId: id })
     async function openManaged() {
       await page.getByRole('textbox', { name: 'Messages', exact: true }).first().waitFor({ state: 'visible', timeout: 30000 })
       await page.locator('aside').first().getByRole('button', { name: 'Supervisor', exact: true }).click()
@@ -261,6 +271,7 @@ try {
         assert.equal((await conflict.json()).code, 'target_observation_stale')
         const rebound = await retry.json()
         assert.deepEqual(sameTarget(rebound.current_user_target), sameTarget(before.current_user_target))
+        await waitForManagedBinding(async () => (await uiState()).binding, rebound.current_user_target)
         check('success: UI handles real 409 by re-reading the same identity', racePatch?.status === 200 && await selected() === id)
       }
       const sessionRow = page.locator(`[data-sidebar-session="${id}"]`)
@@ -290,8 +301,32 @@ try {
         const receipt = await clear.json()
         assert.equal(receipt.success, true)
         assert.equal(receipt.session_id, id)
+        check('success: Host acknowledges exactly one C1 request', clearCount === 1)
         assert.equal(actualReadback.status(), 200)
         assertEmptyReadback(before, await actualReadback.json())
+        check('success: Host returns complete identity-bound clear evidence', true)
+        // A clear-feed event may retire an in-flight read. The UI deliberately
+        // offers an explicit read-only refresh in that case; never resend C1.
+        const settleBy = Date.now() + 10000
+        let clearState
+        do {
+          clearState = (await uiState()).clear
+          if (clearOutcome(clearState) !== 'waiting') break
+          await delay(100)
+        } while (Date.now() < settleBy)
+        result.success_initial_clear_state = clearState
+        if (clearOutcome(clearState) === 'refresh') {
+          const retryReadback = page.waitForResponse(r => new URL(r.url()).pathname === historyPath
+            && r.request().method() === 'POST' && r.request().postDataJSON()?.clear_readback === true,
+          { timeout: 20000 })
+          await dialog.getByRole('button', { name: 'Refresh stored state', exact: true }).click()
+          const refreshedReadback = await retryReadback
+          assert.equal(refreshedReadback.status(), 200)
+          assertEmptyReadback(before, await refreshedReadback.json())
+          check('success: explicit read-only refresh sent no second C1 request', clearCount === 1)
+        } else {
+          assert.equal(clearOutcome(clearState), 'confirmed', `unexpected initial C1 UI state: ${JSON.stringify(clearState)}`)
+        }
         await dialog.getByText('Clearing acknowledged; stored messages and empty token usage verified.', { exact: false })
           .waitFor({ state: 'visible', timeout: 10000 })
         check('success: UI confirms one C1 receipt and complete bound readback', clearCount === 1)
@@ -301,12 +336,21 @@ try {
         check('success: reload reopens the actual cleared bound history', reloaded.messages.every(m => m.content !== marker))
       }
       result[`${label}_screenshot_sha256`] = hash(await page.screenshot({ animations: 'disabled' }))
+    } catch (error) {
+      result[`${label}_failure_state`] = {
+        ui: await uiState().catch(() => null),
+        dialogs: await page.getByRole('dialog').allTextContents().catch(() => []),
+        clear_requests: clearCount,
+      }
+      throw error
     } finally { await context.close() }
   }
-  await scenario('success', false)
-  await scenario('unknown', true)
+  const scenarioFailures = await runIndependentScenarios([['success', false], ['unknown', true]], scenario,
+    (label, error) => console.error(`FAIL ${label}:`, error))
+  result.scenario_failures = scenarioFailures
   check('no browser requests escaped the loopback allowlist', result.blocked.length === 0)
   check('no uncaught browser page errors', result.page_errors.length === 0)
+  check('all real Host scenarios completed', scenarioFailures.length === 0)
   result.status = 'PASS'
 } catch (error) {
   result.status = 'FAIL'

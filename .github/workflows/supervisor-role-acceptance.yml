@@ -72,7 +72,7 @@ jobs:
           test "$(git -C lotus rev-parse 'HEAD^{tree}')" = "$LOTUS_TREE"
           echo "Bamboo $BAMBOO_SOURCE tree $BAMBOO_TREE"
           echo "Lotus $LOTUS_SOURCE tree $LOTUS_TREE"
-          shasum -a 256 bamboo/Cargo.lock lotus/package-lock.json controller/diagnostics/bound-history/seed.rs controller/diagnostics/bound-history/browser.mjs
+          shasum -a 256 bamboo/Cargo.lock lotus/package-lock.json controller/diagnostics/bound-history/seed.rs controller/diagnostics/bound-history/browser.mjs controller/diagnostics/bound-history/binding.mjs controller/diagnostics/bound-history/scenarios.mjs
       - uses: actions/setup-node@v7
         with:
           node-version: '24'
