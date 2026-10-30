@@ -80,6 +80,7 @@ async fn uploaded_and_inline_history_images_remain_durable_and_resolve_without_t
         assert!(prepared.iter().all(|m| m.content_parts.is_none()));
         assert!(prepared[0].content.contains(&reference));
         assert!(prepared[0].content.contains("not inspected"));
+        assert!(prepared[0].content.contains("prompt field"));
         assert!(prepared[0].content.contains("defaults.vision"));
         assert!(!prepared[0].content.contains(&encoded));
         assert!(reference.starts_with("bamboo-"));

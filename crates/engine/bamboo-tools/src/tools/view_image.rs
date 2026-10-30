@@ -19,6 +19,9 @@ use super::read_tracker::{self, MAX_TRACKED_FILE_SIZE};
 struct ViewImageArgs {
     /// Absolute local image path or exact image reference supplied by this conversation
     path: String,
+    /// Optional question or details to focus on when describing the image
+    #[serde(default)]
+    prompt: Option<String>,
 }
 
 /// Host-owned reader for references from the executing Session's original image parts.
@@ -109,7 +112,7 @@ impl Tool for ViewImageTool {
     }
 
     fn description(&self) -> &str {
-        "View a local PNG, JPEG, GIF, or WebP image, or the exact image reference supplied in this conversation. Vision-capable main models receive image content directly. For a main without Vision, an explicitly configured Vision model returns a labeled, untrusted description. Uploaded images remain preserved; only this requested tool call sends them to the configured Vision model. Missing or unsupported Vision configuration returns actionable feedback. Never claim to have inspected an image before receiving a successful result."
+        "View a local PNG, JPEG, GIF, or WebP image, or the exact image reference supplied in this conversation. Optionally provide a prompt describing the question or details to focus on. Vision-capable main models receive image content directly. For a main without Vision, an explicitly configured Vision model returns a labeled, untrusted description. Uploaded images remain preserved; only this requested tool call sends them to the configured Vision model. Missing or unsupported Vision configuration returns actionable feedback. Never claim to have inspected an image before receiving a successful result."
     }
 
     fn classify(&self, _args: &serde_json::Value) -> ToolClass {
@@ -190,15 +193,22 @@ impl Tool for ViewImageTool {
             read_tracker::mark_stable_read(session_id, raw_path, stable).await;
         }
 
+        let mut result = json!({
+            "path": raw_path,
+            "mime_type": mime_type,
+            "size_bytes": bytes.len(),
+            "delivery": "base64_image"
+        });
+        if let Some(prompt) = parsed
+            .prompt
+            .as_deref()
+            .filter(|prompt| !prompt.trim().is_empty())
+        {
+            result["prompt"] = json!(prompt);
+        }
         Ok(ToolOutcome::Completed(ToolResult {
             success: true,
-            result: json!({
-                "path": raw_path,
-                "mime_type": mime_type,
-                "size_bytes": bytes.len(),
-                "delivery": "base64_image"
-            })
-            .to_string(),
+            result: result.to_string(),
             display_preference: None,
             images: vec![ToolResultImage {
                 mime_type: mime_type.to_string(),
@@ -234,6 +244,27 @@ mod tests {
         assert_eq!(result.images[0].mime_type, "image/png");
         assert_eq!(result.images[0].data, STANDARD.encode(bytes));
         assert!(!result.result.contains(&result.images[0].data));
+    }
+
+    #[tokio::test]
+    async fn view_image_retains_optional_focus_for_the_description() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        tokio::fs::write(file.path(), b"\x89PNG\r\n\x1a\nimage")
+            .await
+            .unwrap();
+        let output = ViewImageTool::new()
+            .invoke(
+                json!({"path": file.path().to_string_lossy(), "prompt": "请重点描述左侧 section"}),
+                ToolCtx::none("focused-image"),
+            )
+            .await
+            .unwrap();
+        let ToolOutcome::Completed(result) = output else {
+            panic!("expected completed result")
+        };
+        let metadata: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(metadata["prompt"], "请重点描述左侧 section");
+        assert_eq!(result.images.len(), 1);
     }
 
     #[tokio::test]

@@ -60,6 +60,7 @@ pub async fn apply_image_fallback_to_llm_messages(
         attachment_reader,
         llm,
         rewrite::VisionFailurePolicy::OmitImage,
+        None,
     )
     .await
 }
@@ -71,6 +72,7 @@ async fn apply_strict_image_fallback_to_llm_messages(
     fallback: ImageFallbackConfig,
     attachment_reader: Option<&dyn AttachmentReader>,
     llm: Option<&Arc<dyn LLMProvider>>,
+    focus: Option<&str>,
 ) -> std::result::Result<(), AgentError> {
     bamboo_llm::validate_tool_image_budget(messages.iter()).map_err(AgentError::LLM)?;
     tokio::time::timeout(
@@ -81,6 +83,7 @@ async fn apply_strict_image_fallback_to_llm_messages(
             attachment_reader,
             llm,
             rewrite::VisionFailurePolicy::Error,
+            focus,
         ),
     )
     .await
@@ -159,6 +162,16 @@ pub(crate) async fn describe_tool_images(
     result: &mut bamboo_agent_core::ToolResult,
 ) -> Result<(), AgentError> {
     bamboo_llm::validate_tool_result_images(&result.images).map_err(AgentError::LLM)?;
+    // The tool's result reflects the arguments actually used by dispatch,
+    // including any authorized pre-tool rewrite.
+    let focus = serde_json::from_str::<serde_json::Value>(&result.result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("prompt")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        });
     let mut messages = [Message::tool_result_with_images(
         "vision-description",
         &result.result,
@@ -173,6 +186,7 @@ pub(crate) async fn describe_tool_images(
         },
         None,
         Some(&target.provider),
+        focus.as_deref(),
     )
     .await?;
     result.result = std::mem::take(&mut messages[0].content);

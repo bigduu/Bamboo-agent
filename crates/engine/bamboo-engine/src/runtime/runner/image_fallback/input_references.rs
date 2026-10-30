@@ -85,6 +85,7 @@ pub(crate) fn project_nonvision_images(messages: &mut [Message], session_id: &st
                     content.push_str(&format!(
                         "\n[Image retained; not inspected by this non-Vision main]\n\
                          If ViewImage is currently callable, call it with {call}. \
+                         You may add an optional prompt field describing the user's question or details to inspect. \
                          If permitted Deferred discovery is available, discover it first. \
                          If the tool is disabled, unavailable or cannot be loaded in this mode, \
                          report that actual blocker instead of claiming this reference was inspected. \

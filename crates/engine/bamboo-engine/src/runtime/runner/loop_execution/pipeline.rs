@@ -15297,7 +15297,7 @@ mod tests {
             model: &str,
         ) -> Result<LLMStream, LLMError> {
             assert_eq!(model, "configured-vision");
-            assert_eq!(max, Some(1024));
+            assert_eq!(max, None);
             assert!(tools.is_empty());
             assert!(messages[0].content.contains("untrusted"));
             assert!(messages[1]
