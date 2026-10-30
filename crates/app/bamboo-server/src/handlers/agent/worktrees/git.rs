@@ -270,6 +270,9 @@ fn git_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<String, St
         .map_err(|_| "Git returned non-UTF-8 text".into())
 }
 
+/// Test-only convenience wrapper; production callers share the inventory
+/// deadline through `git_path_by`.
+#[cfg(test)]
 fn git_path(repo: &Path, args: &[&str]) -> Result<PathBuf, String> {
     git_path_by(repo, args, Instant::now() + git_command_timeout())
 }
@@ -575,8 +578,12 @@ impl RepositoryScan<'_> {
                     if !ordinary_directory {
                         self.diagnostic(path, error);
                         if depth == 0
-                            && git(path, &["rev-parse", "--is-inside-git-dir"])
-                                .is_ok_and(|value| value.trim() == "true")
+                            && git_by(
+                                path,
+                                &["rev-parse", "--is-inside-git-dir"],
+                                self.deadline_at,
+                            )
+                            .is_ok_and(|value| value.trim() == "true")
                         {
                             return;
                         }
@@ -673,6 +680,9 @@ fn registered_worktree_by(path: &Path, deadline_at: Instant) -> Result<bool, Str
         .is_some_and(|configured| configured == path))
 }
 
+/// Test-only convenience wrapper; the list path threads its deadline through
+/// `configured_main_worktree_by`.
+#[cfg(test)]
 fn configured_main_worktree(repo: &Path, common: &Path) -> Result<Option<PathBuf>, String> {
     configured_main_worktree_by(repo, common, Instant::now() + git_command_timeout())
 }
@@ -716,15 +726,26 @@ fn configured_main_worktree_by(
         .map_err(|error| format!("Configured Git checkout is unavailable: {error}"))
 }
 
+/// Test-only convenience wrapper; `list_until` calls `main_worktree_by` with
+/// the inventory deadline.
+#[cfg(test)]
 fn main_worktree_for_list(repo: &Path, common: &Path) -> Result<PathBuf, String> {
+    main_worktree_by(repo, common, Instant::now() + git_command_timeout())
+}
+
+/// Deadline-aware variant: called from `list_until`, so its probes must stay
+/// inside the inventory budget instead of restarting the clock per call.
+fn main_worktree_by(repo: &Path, common: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
     let verify = |checkout: PathBuf| {
-        if repository(&checkout)? == common && workspace_root(&checkout)? == checkout {
+        if repository_by(&checkout, deadline_at)? == common
+            && workspace_root_by(&checkout, deadline_at)? == checkout
+        {
             Ok(checkout)
         } else {
             Err("Configured Git main checkout belongs to a different repository".to_string())
         }
     };
-    let configured = configured_main_worktree(repo, common)
+    let configured = configured_main_worktree_by(repo, common, deadline_at)
         .and_then(|checkout| {
             checkout.ok_or_else(|| {
                 "Native Git main entry points to metadata without a verified checkout binding"
@@ -738,11 +759,11 @@ fn main_worktree_for_list(repo: &Path, common: &Path) -> Result<PathBuf, String>
             // An explicitly bound main checkout may use separate metadata with
             // no reverse config. Its own Git directory proves it is the main
             // caller; a linked worktree must never impersonate that record.
-            let main_caller = git_path(repo, &["rev-parse", "--absolute-git-dir"])
+            let main_caller = git_path_by(repo, &["rev-parse", "--absolute-git-dir"], deadline_at)
                 .and_then(|path| fs::canonicalize(path).map_err(|error| error.to_string()))
                 .is_ok_and(|path| path == common);
             if main_caller {
-                workspace_root(repo).and_then(verify)
+                workspace_root_by(repo, deadline_at).and_then(verify)
             } else {
                 Err(error)
             }
@@ -892,7 +913,7 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
         // its metadata path. Never expose that path as an openable workspace.
         // Linked entries have their own registry paths and are left unchanged.
         if fs::canonicalize(&entry.path).is_ok_and(|path| path == common) {
-            match main_worktree_for_list(repo, &common) {
+            match main_worktree_by(repo, &common, deadline) {
                 Ok(path) => entry.path = path,
                 Err(error) => {
                     entry.error = Some(error);
@@ -912,7 +933,9 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
             }
             let canonical = fs::canonicalize(&entry.path)
                 .map_err(|e| format!("{} is unavailable: {e}", entry.path.display()))?;
-            if repository(&canonical)? != common || workspace_root(&canonical)? != canonical {
+            if repository_by(&canonical, deadline)? != common
+                || workspace_root_by(&canonical, deadline)? != canonical
+            {
                 return Err("Worktree path now belongs to a different repository".into());
             }
             // Opening depends on checkout identity, not whether Git can report
