@@ -7998,6 +7998,7 @@ async fn compact_result_adapts_page_size_and_keeps_cursor_snapshot_checks() {
     h.storage.save_session(&child).await.unwrap();
     let mut cursor: Option<String> = None;
     let mut first_cursor: Option<String> = None;
+    let mut result_message_id: Option<String> = None;
     let mut observed = String::new();
     for _ in 0..32 {
         let query = match &cursor {
@@ -8013,6 +8014,9 @@ async fn compact_result_adapts_page_size_and_keeps_cursor_snapshot_checks() {
         .unwrap();
         assert!(serde_json::to_vec(&result).unwrap().len() <= 8192);
         let page: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        if result_message_id.is_none() {
+            result_message_id = page["message_id"].as_str().map(str::to_owned);
+        }
         assert_eq!(
             page["byte_start"].as_u64().unwrap() as usize,
             observed.len()
@@ -8031,6 +8035,40 @@ async fn compact_result_adapts_page_size_and_keeps_cursor_snapshot_checks() {
     }
     assert_eq!(observed, escaped);
     let first_cursor = first_cursor.expect("escaped result needs more than one page");
+    let result_message_id = result_message_id.expect("result identifies its message");
+    let wrong_result_query = json!({"view":"result", "cursor":first_cursor,
+        "message_id":result_message_id})
+    .to_string();
+    assert!(invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect", "target":h.child_session_id, "message":wrong_result_query}),
+        subagent_test_ctx(&h.parent_session_id, "compact-result-disallows-message-id"),
+    )
+    .await
+    .is_err());
+    let message_query = json!({"view":"message", "message_id":result_message_id}).to_string();
+    let first_message = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect", "target":h.child_session_id, "message":message_query}),
+        subagent_test_ctx(&h.parent_session_id, "compact-message-first-page"),
+    )
+    .await
+    .unwrap();
+    let first_message: serde_json::Value = serde_json::from_str(&first_message.result).unwrap();
+    let message_cursor = first_message["next_cursor"].as_str().unwrap();
+    let next_query = json!({"view":"message", "message_id":result_message_id,
+        "cursor":message_cursor})
+    .to_string();
+    let next_message = invoke_completed(
+        &h.tool,
+        json!({"intent":"inspect", "target":h.child_session_id, "message":next_query}),
+        subagent_test_ctx(&h.parent_session_id, "compact-message-next-page"),
+    )
+    .await
+    .unwrap();
+    let next_message: serde_json::Value = serde_json::from_str(&next_message.result).unwrap();
+    assert_eq!(next_message["byte_start"], first_message["byte_end"]);
+    assert!(!next_message["text"].as_str().unwrap().is_empty());
     child.messages.last_mut().unwrap().content.push('x');
     child.metadata_version += 1;
     h.storage.save_session(&child).await.unwrap();
@@ -8042,6 +8080,78 @@ async fn compact_result_adapts_page_size_and_keeps_cursor_snapshot_checks() {
     )
     .await;
     assert!(error.is_err());
+}
+
+#[tokio::test]
+async fn compact_result_respects_dispatch_output_budget_without_losing_content() {
+    use bamboo_compression::TokenCounter;
+
+    let h = build_test_harness_with_storage(None, None, true).await;
+    let mut child = h
+        .storage
+        .load_session(&h.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let text = "界🦀".repeat(400);
+    child.add_message(Message::assistant(text.clone(), None));
+    child.set_last_run_status("completed");
+    child.metadata_version += 1;
+    h.storage.save_session(&child).await.unwrap();
+
+    let mut cursor: Option<String> = None;
+    let mut observed = String::new();
+    let counter = bamboo_compression::TiktokenTokenCounter::default();
+    for _ in 0..256 {
+        let query = cursor.as_ref().map_or_else(
+            || "result".to_string(),
+            |cursor| json!({"view":"result", "cursor":cursor}).to_string(),
+        );
+        let call_id = "compact-result-capped";
+        let result = bamboo_agent_core::tools::scope_tool_output_cap(
+            &h.parent_session_id,
+            call_id,
+            Some(512),
+            invoke_completed(
+                &h.tool,
+                json!({"intent":"inspect", "target":h.child_session_id, "message":query}),
+                subagent_test_ctx(&h.parent_session_id, call_id),
+            ),
+        )
+        .await
+        .unwrap();
+        assert!(counter.count_text(&result.result) <= 512);
+        let page: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+        assert_eq!(
+            page["byte_start"].as_u64().unwrap() as usize,
+            observed.len()
+        );
+        let fragment = page["text"].as_str().unwrap();
+        assert!(!fragment.is_empty());
+        observed.push_str(fragment);
+        cursor = page["next_cursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            break;
+        }
+    }
+    assert_eq!(observed, text);
+
+    let call_id = "compact-result-tiny-cap";
+    let error = bamboo_agent_core::tools::scope_tool_output_cap(
+        &h.parent_session_id,
+        call_id,
+        Some(16),
+        invoke_completed(
+            &h.tool,
+            json!({"intent":"inspect", "target":h.child_session_id, "message":"result"}),
+            subagent_test_ctx(&h.parent_session_id, call_id),
+        ),
+    )
+    .await
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("increase max_tool_output_tokens"));
 }
 
 #[tokio::test]

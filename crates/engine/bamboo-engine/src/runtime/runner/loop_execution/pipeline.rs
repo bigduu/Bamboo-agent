@@ -8488,6 +8488,101 @@ mod tests {
         calls: AtomicUsize,
     }
 
+    struct OversizedSubAgentPageProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for OversizedSubAgentPageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("Inspection budget reported.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: "oversized-subagent-page".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "SubAgent".into(),
+                            arguments:
+                                r#"{"intent":"inspect","target":"child","message":"result"}"#.into(),
+                        },
+                    },
+                ])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct OversizedSubAgentPageExecutor;
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for OversizedSubAgentPageExecutor {
+        async fn execute(
+            &self,
+            _: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            Ok(bamboo_agent_core::tools::ToolResult::text(
+                true,
+                serde_json::json!({"view":"result", "text":"界🦀".repeat(800),
+                    "byte_start":0, "byte_end":5600, "next_cursor":"opaque-next-cursor"})
+                .to_string(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            bamboo_agent_core::tools::ToolExecutor::list_tools(&DelegationLoopExecutor {
+                calls: AtomicUsize::new(0),
+                success_on: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_subagent_page_is_not_persisted_as_success_in_the_real_loop() {
+        let mut session = Session::new("subagent-page-budget-loop", "model");
+        session.token_budget = Some(bamboo_domain::TokenBudget {
+            max_tool_output_tokens: 512,
+            ..Default::default()
+        });
+        session.add_message(Message::user("Inspect the child result"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let mut state = e2e_loop_state(&session.id);
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(OversizedSubAgentPageProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(OversizedSubAgentPageExecutor),
+            &tokio_util::sync::CancellationToken::new(),
+            &delegation_loop_config(),
+            &mut state,
+        )
+        .await
+        .expect("the run should report an oversized page as a tool failure");
+        let message = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("oversized-subagent-page"))
+            .expect("the tool call must have a durable response");
+        assert_eq!(message.tool_success, Some(false));
+        let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(payload["error"], "subagent_page_exceeds_tool_output_budget");
+        assert!(payload.get("next_cursor").is_none());
+    }
+
     #[async_trait::async_trait]
     impl LLMProvider for MixedSubAgentLoopProvider {
         async fn chat_stream(

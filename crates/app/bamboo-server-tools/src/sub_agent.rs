@@ -927,9 +927,14 @@ impl Tool for SubAgentTool {
         }
         if projection == Some(Projection::Content) {
             // Retry only this read with a smaller slice when JSON escaping makes
-            // the projected result exceed the wire budget. Each attempt repeats
-            // the normal authorization and cursor/snapshot checks; no effects
-            // or caller-supplied cursor are changed.
+            // the projected result exceed the wire budget or this dispatch's
+            // configured output cap using the runtime's own token counter.
+            // Each attempt repeats authorization and cursor/snapshot checks;
+            // no caller-supplied cursor is changed.
+            use bamboo_compression::TokenCounter;
+            let output_cap =
+                bamboo_agent_core::tools::observed_tool_output_cap(&ctx).filter(|cap| *cap > 0);
+            let counter = bamboo_compression::TiktokenTokenCounter::default();
             let mut page_args = args;
             loop {
                 let result = self
@@ -939,14 +944,21 @@ impl Tool for SubAgentTool {
                 test_diagnostics::record(&diagnostic, &result);
                 let projected = facade::finish(projection, result);
                 let current = page_args["max_bytes"].as_u64().unwrap_or(4);
-                match projected {
-                    Err(ToolError::InvalidArguments(ref message))
-                        if message == facade::OBSERVATION_LIMIT_ERROR && current > 4 =>
-                    {
-                        page_args["max_bytes"] = json!((current / 2).max(4));
-                    }
-                    other => return other,
+                let over_wire = matches!(&projected,
+                    Err(ToolError::InvalidArguments(message)) if message == facade::OBSERVATION_LIMIT_ERROR);
+                let over_output = matches!(&projected,
+                    Ok(ToolOutcome::Completed(result))
+                        if output_cap.is_some_and(|cap| counter.count_text(&result.result) > cap));
+                if (over_wire || over_output) && current > 4 {
+                    page_args["max_bytes"] = json!((current / 2).max(4));
+                    continue;
                 }
+                if over_output {
+                    return Err(ToolError::Execution(
+                        "SubAgent content page exceeds the tool output budget; increase max_tool_output_tokens".into(),
+                    ));
+                }
+                return projected;
             }
         }
         let result = self

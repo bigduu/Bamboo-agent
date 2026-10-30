@@ -11,6 +11,7 @@ test-utils = []
 
 [dependencies]
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-compression = { path = "../../infra/bamboo-compression" }
 bamboo-engine = { path = "../../engine/bamboo-engine" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
