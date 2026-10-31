@@ -112,14 +112,6 @@ impl SupervisorSessionDirectory {
     ) -> Result<Vec<SessionDirectoryEntry>, ToolError> {
         let mut entries: Vec<SessionDirectoryEntry> = Vec::new();
         let state = caller.state.as_ref();
-        let allowed_projects = state.map_or_else(std::collections::BTreeSet::new, |s| {
-            s.allowed_projects.clone()
-        });
-
-        // 1) Supervisor-created roots: authoritative management links. Each
-        // link is revalidated against the current target: a moved Project, a
-        // changed metadata version or a different lifetime means the stale
-        // link no longer authorizes exposing the target's current metadata.
         if let Some(state) = state {
             if state.links.len() > MAX_SUPERVISOR_LINKS {
                 return Err(ToolError::Execution(
@@ -127,79 +119,44 @@ impl SupervisorSessionDirectory {
                         .into(),
                 ));
             }
-            for (id, link) in &state.links {
-                if !allowed_projects.contains(&link.target_project_id) {
-                    continue;
-                }
-                let Some(index) = self.session_store.get_index_entry(id).await else {
-                    // A link without an index entry still belongs in the
-                    // directory; report it with link-carried metadata only.
-                    entries.push(SessionDirectoryEntry {
-                        session_id: id.clone(),
-                        origin: SessionDirectoryOrigin::SupervisorCreated,
-                        linked: link.enabled,
-                        project_id: link.target_project_id.to_string(),
-                        title: String::new(),
-                        created_at: link.target_created_at,
-                        last_activity_at: link.target_created_at,
-                        last_run_status: "unknown".into(),
-                        has_pending_question: false,
-                        last_human_input: None,
-                    });
-                    continue;
-                };
-                // The link's Project must still match the target's CURRENT
-                // Project. A target PATCH-moved to another Project keeps its
-                // historical link; that stale link no longer authorizes
-                // exposing the moved target's current metadata. The created_at
-                // lifetime check fences rebirth under the same id.
-                let current_project_matches = index.project_id.as_deref()
-                    == Some(link.target_project_id.as_str())
-                    && index.created_at == link.target_created_at;
-                if !current_project_matches {
-                    continue;
-                }
-                if let Some(query) = query {
-                    let id_match = id.to_lowercase().contains(query);
-                    let project_match = link
-                        .target_project_id
-                        .to_string()
-                        .to_lowercase()
-                        .contains(query);
-                    let title_match = index.title.to_lowercase().contains(query);
-                    if !id_match && !project_match && !title_match {
-                        continue;
-                    }
-                }
-                entries.push(entry_from_index(
-                    index,
-                    SessionDirectoryOrigin::SupervisorCreated,
-                    link.enabled,
-                ));
-            }
         }
-
-        // 2) User-opened sessions: authorized-Project top-level roots that are
-        // neither the caller nor any management link.
-        let linked: std::collections::BTreeSet<&String> = state
-            .map(|state| state.links.keys().collect())
-            .unwrap_or_default();
+        // Scope follows the current-user authority contract: the canonical
+        // Supervisor manages every Project/Session in this user's domain by
+        // default. The legacy `allowed_projects` list is compatibility
+        // metadata only (scope reports `legacy_scope_is_authorization=false`);
+        // an empty legacy list must not empty the directory.
+        //
+        // Single index scan is the source of entry metadata. Creation
+        // provenance comes from the durable origin mark minted by the Host
+        // creation route, never from management-link membership: `create`
+        // deliberately attaches no link, and attaching an existing user
+        // session must not relabel its origin.
         for index in self.session_store.list_index_entries().await {
-            let Some(project) = index.project_id.as_deref() else {
-                continue;
-            };
-            if !allowed_projects.iter().any(|p| p.as_str() == project) {
+            if index.project_id.as_deref().is_none() {
                 continue;
             }
             if index.parent_session_id.is_some() || index.id == caller.session_id {
                 continue;
             }
-            if linked.contains(&index.id) {
-                continue;
+            let supervisor_created = index.session_origin.as_deref() == Some("supervisor_created");
+            let link = state.and_then(|state| state.links.get(&index.id));
+            if let Some(link) = link {
+                // A retained link must still match the target's CURRENT row:
+                // a moved Project or a reborn id fences the whole entry.
+                if index.project_id.as_deref() != Some(link.target_project_id.as_str())
+                    || index.created_at != link.target_created_at
+                {
+                    continue;
+                }
             }
             if let Some(query) = query {
                 let id_match = index.id.to_lowercase().contains(query);
-                let project_match = project.to_lowercase().contains(query);
+                let project_match = index
+                    .project_id
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_lowercase()
+                    .contains(query);
                 let title_match = index.title.to_lowercase().contains(query);
                 if !id_match && !project_match && !title_match {
                     continue;
@@ -207,8 +164,12 @@ impl SupervisorSessionDirectory {
             }
             entries.push(entry_from_index(
                 index,
-                SessionDirectoryOrigin::UserOpened,
-                false,
+                if supervisor_created {
+                    SessionDirectoryOrigin::SupervisorCreated
+                } else {
+                    SessionDirectoryOrigin::UserOpened
+                },
+                link.is_some_and(|link| link.enabled),
             ));
         }
         entries.sort_by(|a, b| a.session_id.cmp(&b.session_id));

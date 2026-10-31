@@ -113,7 +113,8 @@ async fn directory_merges_link_origin_and_user_opened_with_engagement() {
         .unwrap();
 
     // User-opened in an authorized project, with human engagement; a second
-    // one in an unauthorized project must stay invisible.
+    // one in another project is visible too: the current-user authority
+    // domain spans all Projects (legacy allowed_projects is not a gate).
     let mut engaged = root(&store, "zzz-user-engaged", "project-a").await;
     with_human_input(&mut engaged);
     store.save_session(&engaged).await.unwrap();
@@ -134,14 +135,17 @@ async fn directory_merges_link_origin_and_user_opened_with_engagement() {
         .iter()
         .all(|e| e.session_id != DEFAULT_SUPERVISOR_SESSION_ID));
 
+    // A legacy-attached root keeps origin=user_opened (attachment is not
+    // creation provenance) but reports linked=true.
     let created_entry = page
         .entries
         .iter()
         .find(|e| e.session_id == "aaa-created-root")
-        .expect("supervisor-created entry");
+        .expect("attached entry");
     assert_eq!(
         created_entry.origin,
-        bamboo_server_tools::session_control::directory::SessionDirectoryOrigin::SupervisorCreated
+        bamboo_server_tools::session_control::directory::SessionDirectoryOrigin::UserOpened,
+        "attachment must not relabel origin"
     );
     assert!(created_entry.linked);
     assert!(created_entry.last_human_input.is_none());
@@ -159,13 +163,46 @@ async fn directory_merges_link_origin_and_user_opened_with_engagement() {
     assert!(user_entry.last_human_input.is_some());
 
     assert!(
-        !page
-            .entries
+        page.entries
             .iter()
             .any(|e| e.session_id == "other-project-root"),
-        "unauthorized Project sessions stay invisible"
+        "current-user domain spans all Projects; legacy allowlist is not a gate"
     );
     let _ = &mut created;
+}
+
+/// Codex P2 follow-up: a root minted by the Host creation route carries the
+/// durable origin mark and is classified supervisor_created even without any
+/// management link (create deliberately attaches none).
+#[tokio::test]
+async fn directory_marks_host_created_roots_by_provenance_not_links() {
+    let (_home, store, reference) = fixture().await;
+    let supervisor = authorized_supervisor(&store, &reference).await;
+    let mut created = root(&store, "mmm-host-created", "project-a").await;
+    created
+        .metadata
+        .insert("session.origin.v1".into(), "supervisor_created".into());
+    store.save_session(&created).await.unwrap();
+    // No management link: the creation route deliberately mints none.
+
+    let directory = SupervisorSessionDirectory::new(store.clone(), store.clone());
+    let page = directory
+        .directory(
+            &supervisor_ctx(&supervisor),
+            SupervisorDirectoryRequest::default(),
+        )
+        .await
+        .unwrap();
+    let entry = page
+        .entries
+        .iter()
+        .find(|e| e.session_id == "mmm-host-created")
+        .expect("host-created entry without a link");
+    assert_eq!(
+        entry.origin,
+        bamboo_server_tools::session_control::directory::SessionDirectoryOrigin::SupervisorCreated
+    );
+    assert!(!entry.linked);
 }
 
 /// Codex P1: a linked target that was PATCH-moved to an unauthorized Project

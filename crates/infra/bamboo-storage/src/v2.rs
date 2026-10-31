@@ -926,6 +926,12 @@ pub struct SessionIndexEntry {
     /// If the session was created by a schedule, store the schedule id here for fast filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
+    /// Creation provenance mirrored from `session.metadata["session.origin.v1"]`
+    /// for the supervisor session directory. Currently only
+    /// `Some("supervisor_created")` is minted, by the Host Root creation route.
+    /// An observation label only; it never grants authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_origin: Option<String>,
     /// If the session was created by a specific schedule run, keep the run id here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_run_id: Option<String>,
@@ -5353,6 +5359,11 @@ impl SessionStoreV2 {
             .get("created_by_schedule_id")
             .cloned()
             .filter(|v| !v.trim().is_empty());
+        let session_origin = session
+            .metadata
+            .get("session.origin.v1")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
         let schedule_run_id = session
             .metadata
             .get("schedule_run_id")
@@ -5420,6 +5431,7 @@ impl SessionStoreV2 {
             project_id,
             gold_config_json,
             created_by_schedule_id,
+            session_origin,
             schedule_run_id,
             created_at: session.created_at,
             updated_at: session.updated_at,
