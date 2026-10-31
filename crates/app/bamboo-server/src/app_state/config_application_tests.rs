@@ -379,8 +379,32 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
             })
             .await
             .unwrap();
+        // Legal receipt metadata may contain the synthetic endpoint's digits.
+        // Pin that collision so the disclosure assertion cannot pass by chance.
+        let applied_at = chrono::DateTime::parse_from_rfc3339("2026-10-26T02:54:49.987600Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        {
+            let mut application = state.config_application.write().unwrap();
+            for id in [ConfigConsumer::ProviderRuntime, ConfigConsumer::McpRuntime] {
+                application
+                    .receipts
+                    .get_mut(&id)
+                    .unwrap()
+                    .applied
+                    .as_mut()
+                    .unwrap()
+                    .applied_at = applied_at;
+            }
+        }
         let defaults = application_report(&state).await;
         assert_eq!(consumer(&defaults, "provider-runtime")["state"], "in_sync");
+        for id in ["provider-runtime", "mcp-runtime"] {
+            assert_eq!(
+                consumer(&defaults, id)["last_applied_at"],
+                json!(applied_at)
+            );
+        }
         for id in [
             "connect-manager",
             "agent-loop-defaults",
@@ -395,15 +419,42 @@ fn actual_provider_and_mcp_publications_preserve_unrelated_receipts() {
             assert_eq!(consumer(&defaults, id)["applied_dependencies"], Value::Null);
         }
         let serialized = serde_json::to_string(&defaults).unwrap();
-        for forbidden in [
-            "application-secret-sentinel",
-            "old-model",
-            "next-model",
-            "credential_ref",
-            "digest",
-            "9876",
+        assert!(
+            serialized.contains("9876"),
+            "exercise the timestamp collision"
+        );
+        // Only port digits can overlap valid diagnostic timestamps. Keep the
+        // complete report for every secret, model and private-field check.
+        let mut endpoint_report = defaults.clone();
+        let clear_timestamp = |value: &mut Value| {
+            if !value.is_null() {
+                chrono::DateTime::parse_from_rfc3339(value.as_str().unwrap()).unwrap();
+                *value = Value::Null;
+            }
+        };
+        assert!(endpoint_report["observed_at"].is_string());
+        clear_timestamp(&mut endpoint_report["observed_at"]);
+        for consumer in endpoint_report["consumers"].as_array_mut().unwrap() {
+            clear_timestamp(&mut consumer["last_applied_at"]);
+        }
+        let endpoint_serialized = serde_json::to_string(&endpoint_report).unwrap();
+        for (fixture_marker, forbidden) in [
+            ("provider-secret", "application-secret-sentinel"),
+            ("previous-model", "old-model"),
+            ("updated-model", "next-model"),
+            ("credential-reference-field", "credential_ref"),
+            ("private-digest-field", "digest"),
+            ("provider-endpoint-port", "9876"),
         ] {
-            assert!(!serialized.contains(forbidden));
+            let scanned = if fixture_marker == "provider-endpoint-port" {
+                &endpoint_serialized
+            } else {
+                &serialized
+            };
+            assert!(
+                !scanned.contains(forbidden),
+                "application diagnostics contain forbidden fixture marker: {fixture_marker}"
+            );
         }
     });
 }

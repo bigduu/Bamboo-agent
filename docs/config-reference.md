@@ -62,7 +62,7 @@ default. The full field list of `Config`:
 | `http_proxy` / `https_proxy` | `String` | Outbound proxy URLs for provider HTTP calls. |
 | `proxy_auth_credential_ref` | `Option<String>` | Stable reference to isolated proxy credentials (normally `proxy.default.auth`); no proxy plaintext, ciphertext, or mask is stored in ordinary config. |
 | `provider` | `String` | Default provider name. Default `"anthropic"`. |
-| `defaults` | `Option<DefaultsConfig>` | Per-role model routing (`chat`/`fast`/`vision`/`planning`/...); only consulted when `features.provider_model_ref` is on. |
+| `defaults` | `Option<DefaultsConfig>` | Per-role model routing (`chat`/`fast`/`vision`/`planning`/...). Primary chat routing uses `features.provider_model_ref`; explicit ViewImage Vision targets are honored independently. |
 | `providers` | `ProviderConfigs` | Legacy single-instance-per-type provider configs. See [Providers](#providers). |
 | `provider_instances` | `HashMap<String, ProviderInstanceConfig>` | Authoritative provider configs, keyed by a stable routing id (e.g. two Anthropic keys under different labels). Runtime construction, model resolution, model discovery and child-agent credential scoping read these entries directly. |
 | `default_provider_instance` | `Option<String>` | Which enabled `provider_instances` entry is the default. A missing id is accepted only as a temporary hybrid reference to a real legacy provider stanza. |

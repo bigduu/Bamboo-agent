@@ -206,7 +206,21 @@ impl ChildSessionAdapter {
                 .provider_name()
                 .unwrap_or_else(|| config.effective_default_provider().to_string()),
         };
-        let provider = bamboo_config::configured_provider_routing_key(config, &provider);
+        let routing_key = bamboo_config::configured_provider_routing_key(config, &provider);
+        let exact_provider = provider.trim();
+        let unavailable_hybrid_alias = !config.provider_instances.is_empty()
+            && !config.provider_instances.contains_key(exact_provider)
+            && config.effective_default_provider() != exact_provider;
+        if child.model_ref.is_some() && (routing_key != exact_provider || unavailable_hybrid_alias)
+        {
+            // Managed hybrid registries contain instance IDs and only the
+            // effective legacy default, not arbitrary provider-type aliases.
+            // Do not validate against one key and later route another.
+            return Err(ChildSessionError::InvalidArguments(format!(
+                "Provider '{provider}' is not admitted as an exact child routing key"
+            )));
+        }
+        let provider = routing_key;
         let model = child.model.trim();
         let admitted = bamboo_config::provider_runtime_models(config, &provider)
             .map_err(ChildSessionError::InvalidArguments)?;
@@ -966,14 +980,35 @@ impl ChildSessionAdapter {
     /// The parent's currently-active (non-terminal) children, derived from the
     /// session index (single source of truth).
     pub async fn active_child_ids(&self, parent_session_id: &str) -> Vec<String> {
-        self.storage
+        let active = self
+            .storage
             .list_child_run_statuses(parent_session_id)
             .await
             .unwrap_or_default()
             .into_iter()
             .filter(|(_, status)| !status.as_deref().is_some_and(is_terminal_child_status))
             .map(|(id, _)| id)
-            .collect()
+            .collect::<Vec<_>>();
+        let parent = self
+            .storage
+            .load_runtime_control_plane(parent_session_id)
+            .await
+            .ok()
+            .flatten();
+        let mut ordinary = Vec::with_capacity(active.len());
+        for id in active {
+            if let Some(parent) = &parent {
+                if matches!(
+                    self.storage.is_supervisor_observer_child(parent, &id).await,
+                    Ok(true)
+                ) {
+                    continue;
+                }
+            }
+            // An unavailable classification never removes a work obligation.
+            ordinary.push(id);
+        }
+        ordinary
     }
 
     /// The subset of `candidates` the session index POSITIVELY reports as

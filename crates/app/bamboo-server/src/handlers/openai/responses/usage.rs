@@ -22,6 +22,21 @@ pub(super) struct ResponsesUsageAccumulator {
 }
 
 impl ResponsesUsageAccumulator {
+    pub(super) fn replace(&mut self, usage: bamboo_llm::types::ProviderUsageReplacement) {
+        self.saw_provider_usage = usage.input_tokens.is_some()
+            || usage.output_tokens.is_some()
+            || usage.total_tokens.is_some()
+            || usage.reasoning_tokens.is_some()
+            || usage.cache_read_input_tokens.is_some()
+            || usage.cache_write_input_tokens.is_some();
+        self.input_tokens = usage.input_tokens;
+        self.output_tokens = usage.output_tokens;
+        self.total_tokens = usage.total_tokens;
+        self.reasoning_tokens = usage.reasoning_tokens;
+        self.cached_tokens = usage.cache_read_input_tokens;
+        self.cache_write_tokens = usage.cache_write_input_tokens;
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn record(
         &mut self,
@@ -117,6 +132,52 @@ impl ResponsesUsageAccumulator {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacement_clears_invalid_fields_without_inventing_zero() {
+        let mut usage = ResponsesUsageAccumulator::default();
+        usage.record(Some(100), Some(23), Some(123), Some(3), Some(25), None);
+        usage.replace(bamboo_llm::types::ProviderUsageReplacement {
+            input_tokens: Some(100),
+            output_tokens: None,
+            total_tokens: None,
+            reasoning_tokens: None,
+            cache_read_input_tokens: None,
+            invalid_fields: bamboo_llm::types::ProviderUsageInvalidFields {
+                output_tokens: true,
+                reasoning_tokens: true,
+                cache_read_input_tokens: true,
+                total_tokens: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let response = usage.response_usage().unwrap();
+        assert_eq!(response.input_tokens, Some(100));
+        assert_eq!(response.output_tokens, None);
+        assert_eq!(response.total_tokens, None);
+        assert!(response.input_tokens_details.is_none());
+        assert!(response.output_tokens_details.is_none());
+    }
+
+    #[test]
+    fn replacement_without_known_fields_omits_usage_but_zero_is_known() {
+        let mut usage = ResponsesUsageAccumulator::default();
+        usage.replace(Default::default());
+        assert!(usage.response_usage().is_none());
+        usage.record(Some(9), None, None, None, None, None);
+        usage.replace(Default::default());
+        assert!(usage.response_usage().is_none());
+        usage.replace(bamboo_llm::types::ProviderUsageReplacement {
+            cache_read_input_tokens: Some(0),
+            ..Default::default()
+        });
+        let response = usage.response_usage().unwrap();
+        assert_eq!(
+            response.input_tokens_details.unwrap().cached_tokens,
+            Some(0)
+        );
+    }
 
     #[test]
     fn preserves_openai_details_and_explicit_zeroes() {

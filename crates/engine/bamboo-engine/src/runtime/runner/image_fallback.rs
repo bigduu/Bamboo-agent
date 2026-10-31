@@ -14,11 +14,13 @@ pub(crate) use input_references::conversation_image_reference;
 pub(crate) use input_references::{
     image_reference_reader, project_nonvision_images, round_needs_image_references,
 };
+mod legacy_target;
 #[cfg(windows)]
 mod ocr;
 mod placeholder;
 mod rewrite;
 mod vision_target;
+pub(crate) use legacy_target::legacy_vision_resolver;
 pub(crate) use vision_target::{configured_vision_resolver, validate_configured_vision_target};
 
 #[cfg(windows)]
@@ -58,6 +60,7 @@ pub async fn apply_image_fallback_to_llm_messages(
         attachment_reader,
         llm,
         rewrite::VisionFailurePolicy::OmitImage,
+        None,
     )
     .await
 }
@@ -69,6 +72,7 @@ async fn apply_strict_image_fallback_to_llm_messages(
     fallback: ImageFallbackConfig,
     attachment_reader: Option<&dyn AttachmentReader>,
     llm: Option<&Arc<dyn LLMProvider>>,
+    focus: Option<&str>,
 ) -> std::result::Result<(), AgentError> {
     bamboo_llm::validate_tool_image_budget(messages.iter()).map_err(AgentError::LLM)?;
     tokio::time::timeout(
@@ -79,6 +83,7 @@ async fn apply_strict_image_fallback_to_llm_messages(
             attachment_reader,
             llm,
             rewrite::VisionFailurePolicy::Error,
+            focus,
         ),
     )
     .await
@@ -96,10 +101,18 @@ pub(crate) type VisionModelResolver = Arc<
         + Sync,
 >;
 
+/// Independent port for an explicitly opted-in legacy conversation transform.
+/// It must never consume the strict ViewImage tool-result resolver field.
+pub(crate) type LegacyVisionModelResolver = Arc<
+    dyn Fn() -> futures::future::BoxFuture<'static, Result<ResolvedModel, AgentError>>
+        + Send
+        + Sync,
+>;
+
 pub(crate) const VISION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const VISION_TIMEOUT_MESSAGE: &str =
     "Vision description timed out; no image or partial description was sent to the main model.";
-pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Original images and attachment references were preserved. Configure defaults.vision (provider instance and model, with features.provider_model_ref enabled), or vision_model on the active provider, or select a genuinely Vision-capable main model. No image was sent.";
+pub(crate) const VISION_CONFIGURATION_ERROR: &str = "ViewImage requires a configured Vision model for a main model without Vision. Original images and attachment references were preserved. Configure defaults.vision (provider instance and model), or vision_model on the active provider, or select a genuinely Vision-capable main model. No image was sent.";
 
 pub(crate) async fn resolve_vision_target(
     config: &crate::runtime::config::AgentLoopConfig,
@@ -108,6 +121,26 @@ pub(crate) async fn resolve_vision_target(
         .vision_model_resolver
         .as_ref()
         .ok_or_else(|| AgentError::LLM(VISION_CONFIGURATION_ERROR.into()))?;
+    resolve_checked_vision_target(resolver).await
+}
+
+pub(crate) async fn resolve_legacy_vision_target(
+    config: &crate::runtime::config::AgentLoopConfig,
+) -> Result<ResolvedModel, AgentError> {
+    let resolver = config
+        .legacy_vision_model_resolver
+        .as_ref()
+        .ok_or_else(|| {
+            AgentError::LLM(
+                "Legacy Vision target is unavailable; original images were preserved.".into(),
+            )
+        })?;
+    resolve_checked_vision_target(resolver).await
+}
+
+async fn resolve_checked_vision_target(
+    resolver: &VisionModelResolver,
+) -> Result<ResolvedModel, AgentError> {
     tokio::time::timeout(VISION_TIMEOUT, async {
         let target = resolver().await?;
         if target.model_name.trim().is_empty() {
@@ -129,6 +162,16 @@ pub(crate) async fn describe_tool_images(
     result: &mut bamboo_agent_core::ToolResult,
 ) -> Result<(), AgentError> {
     bamboo_llm::validate_tool_result_images(&result.images).map_err(AgentError::LLM)?;
+    // The tool's result reflects the arguments actually used by dispatch,
+    // including any authorized pre-tool rewrite.
+    let focus = serde_json::from_str::<serde_json::Value>(&result.result)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("prompt")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        });
     let mut messages = [Message::tool_result_with_images(
         "vision-description",
         &result.result,
@@ -143,6 +186,7 @@ pub(crate) async fn describe_tool_images(
         },
         None,
         Some(&target.provider),
+        focus.as_deref(),
     )
     .await?;
     result.result = std::mem::take(&mut messages[0].content);

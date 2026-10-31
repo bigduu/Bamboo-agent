@@ -2,7 +2,7 @@ use crate::config::GoldConfig;
 use bamboo_agent_core::{AgentEvent, Session};
 
 use crate::app_context::AgentSessionContext;
-use crate::session_app::resolution::resolve_resume_config_snapshot;
+use crate::session_app::resolution::resolve_resume_config_snapshot_for_execution as resolve_resume_config_snapshot;
 use crate::session_app::respond::PlanModeTransition;
 use crate::session_app::types::ResumeConfigSnapshot;
 

@@ -154,6 +154,11 @@ pub struct AgentBuilder {
     /// `bodhi`) in `with_defaults_for_data_dir`, overriding `config.json`'s
     /// `provider`. `None` keeps the configured default.
     provider_name: Option<String>,
+    assembled_provider_scope: Option<String>,
+    // Remember which source produced the native client, even if later config
+    // introduces or removes an explicit instance with the same identifier.
+    assembled_provider_is_instance: Option<bool>,
+    assembled_native_bindings: Vec<Arc<bamboo_llm::provider_registry::SdkProviderBinding>>,
     /// API key applied to the active provider's config before provider creation.
     api_key: Option<String>,
     /// MCP servers to connect and merge into the tool surface in
@@ -215,6 +220,9 @@ impl AgentBuilder {
             session_model: None,
             project_id: None,
             provider_name: None,
+            assembled_provider_scope: None,
+            assembled_provider_is_instance: None,
+            assembled_native_bindings: Vec::new(),
             api_key: None,
             mcp_servers: Vec::new(),
             permission_checker: None,
@@ -519,6 +527,15 @@ impl AgentBuilder {
         self
     }
 
+    #[cfg(test)]
+    pub(super) fn test_memory_store(
+        mut self,
+        store: bamboo_memory::memory_store::MemoryStore,
+    ) -> Self {
+        self.inner = self.inner.memory_store(store);
+        self
+    }
+
     /// Inject a pre-built default tool executor.
     pub fn default_tools(mut self, tools: Arc<dyn bamboo_agent_core::tools::ToolExecutor>) -> Self {
         self.default_tools_override = Some(tools);
@@ -564,6 +581,9 @@ impl AgentBuilder {
     /// defaults regardless of whether they are called before or after this
     /// method. An explicit [`tools`](Self::tools)/[`no_tools`](Self::no_tools)
     /// policy has final precedence over both assembled and injected executors.
+    /// Replacing config after creating a native client cannot change that
+    /// client's account. Supply a matching client or assemble defaults again;
+    /// otherwise `build` rejects an incompatible or invalid Chat selection.
     ///
     /// # Precondition
     ///
@@ -586,21 +606,76 @@ impl AgentBuilder {
     pub async fn with_defaults_for_data_dir(mut self, data_dir: PathBuf) -> Result<Self, SdkError> {
         // 1. Config.
         let mut config = Config::from_data_dir(Some(data_dir.clone()));
-        // Select the provider first, so `api_key` and provider creation both act
-        // on the chosen provider rather than config.json's default.
+        // Use the same effective config for model selection and client creation.
+        // A caller-owned live handle is never mutated by SDK assembly.
+        let mut provider_config = match self.config_override.as_ref() {
+            Some(shared) => shared.read().await.clone(),
+            None => config.clone(),
+        };
         if let Some(provider) = self.provider_name.clone() {
-            select_provider_override(&mut config, &provider);
+            select_provider_override(&mut provider_config, &provider);
+        }
+        let chat_target = if self.provider_override.is_none()
+            && self.provider_name.is_none()
+            && self.model.is_none()
+            && provider_config.features.provider_model_ref
+        {
+            provider_config
+                .defaults
+                .as_ref()
+                .map(|defaults| defaults.chat.clone())
+        } else {
+            None
+        };
+        if let Some(target) = chat_target.as_ref() {
+            select_configured_chat_target(&mut provider_config, target)?;
+        }
+        let provider_scope = provider_config.effective_default_provider().to_string();
+        // Keep opaque witnesses for both the original Config and the
+        // effective Config after an API-key overlay. A later `.config(...)`
+        // may choose either already-authorized input without retaining keys.
+        self.assembled_native_bindings.clear();
+        if self.provider_override.is_none() {
+            self.assembled_native_bindings.push(Arc::new(
+                bamboo_llm::provider_registry::SdkProviderBinding::capture(
+                    &provider_config,
+                    &provider_scope,
+                    self.api_key.is_some(),
+                )
+                .map_err(|error| SdkError::Config(error.to_string()))?,
+            ));
         }
         if let Some(api_key) = self.api_key.clone() {
-            apply_api_key(&mut config, &api_key)?;
+            apply_api_key(&mut provider_config, &api_key)?;
+            if self.provider_override.is_none() {
+                self.assembled_native_bindings.push(Arc::new(
+                    bamboo_llm::provider_registry::SdkProviderBinding::capture(
+                        &provider_config,
+                        &provider_scope,
+                        self.api_key.is_some(),
+                    )
+                    .map_err(|error| SdkError::Config(error.to_string()))?,
+                ));
+            }
         }
+        self.assembled_provider_scope = Some(provider_scope.clone());
+        self.assembled_provider_is_instance = Some(
+            provider_config
+                .provider_instances
+                .contains_key(&provider_scope),
+        );
 
         // Capture the effective configured model for `Agent::new_session` when
         // the caller did not provide a stronger `.model(...)` override.
         if self.model.is_none() {
-            self.session_model = match &self.config_override {
-                Some(config_override) => config_override.read().await.get_model(),
-                None => config.get_model(),
+            self.session_model = if self.provider_name.is_some() {
+                bamboo_engine::model_config_helper::get_default_model_for_provider(
+                    &provider_config,
+                    &provider_scope,
+                )
+                .ok()
+            } else {
+                provider_config.get_model()
             };
         }
 
@@ -610,13 +685,16 @@ impl AgentBuilder {
         // having supplied a usable provider.
         let provider = if self.provider_override.is_none() {
             Some(
-                create_provider_with_dir(&config, data_dir.clone())
+                create_provider_with_dir(&provider_config, data_dir.clone())
                     .await
                     .map_err(|e| SdkError::ProviderInit(e.to_string()))?,
             )
         } else {
             None
         };
+        if self.config_override.is_none() {
+            config = provider_config;
+        }
 
         // 7. Connect MCP now (the fallible/async part), but defer construction
         // of the built-in/default executor until `build()`. That lets a later
@@ -720,6 +798,103 @@ impl AgentBuilder {
     /// `instruction` and `model` are carried onto the `Agent` for
     /// [`Agent::run`](super::Agent::run).
     pub fn build(mut self) -> Result<Agent, SdkError> {
+        let effective_config = self
+            .config_override
+            .clone()
+            .or_else(|| self.assembled_config.clone());
+        // Use one coherent snapshot. A locked replacement must not silently
+        // bypass the client/account and Chat admission checks.
+        let config_snapshot = effective_config
+            .as_ref()
+            .map(|shared| {
+                shared.try_read().map(|config| config.clone()).map_err(|_| {
+                    SdkError::Config(
+                        "SDK provider configuration is busy; retry after the update".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let routing_config = effective_config.clone();
+        let declared_scope = config_snapshot
+            .as_ref()
+            .map(|config| config.effective_default_provider().to_string());
+        let provider_scope = if self.provider_override.is_some() && self.provider_name.is_none() {
+            declared_scope
+        } else {
+            self.assembled_provider_scope.clone().or(declared_scope)
+        };
+        // A caller-injected client owns the provider pairing declared by its
+        // final config. Native clients retain their original assembly source.
+        let provider_scope_is_instance = if self.provider_override.is_some() {
+            provider_scope
+                .as_deref()
+                .zip(config_snapshot.as_ref())
+                .map(|(scope, config)| config.provider_instances.contains_key(scope))
+        } else {
+            self.assembled_provider_is_instance
+        };
+        let native_binding = if self.provider_override.is_none()
+            && !self.assembled_native_bindings.is_empty()
+        {
+            let config = config_snapshot.as_ref().ok_or_else(|| {
+                SdkError::Config("SDK native provider configuration is unavailable".into())
+            })?;
+            Some(self.assembled_native_bindings.iter()
+                .find(|binding| binding.validate(config).is_ok())
+                .cloned().ok_or_else(|| SdkError::Config(
+                    "SDK native provider configuration changed; rebuild defaults or supply a matching client".into(),
+                ))?)
+        } else {
+            None
+        };
+        let caller_binding = if self.provider_override.is_some() {
+            config_snapshot
+                .as_ref()
+                .zip(provider_scope.as_deref())
+                .map(|(config, scope)| {
+                    super::sdk_provider_guard::caller_binding(config, scope, Some(scope))
+                })
+        } else {
+            None
+        };
+        if self.model.is_none()
+            && (self.provider_override.is_some() || self.provider_name.is_some())
+        {
+            // An injected or explicitly named client is authoritative for
+            // its declared account, regardless of config/defaults call order.
+            if let (Some(scope), Some(config)) = (provider_scope.as_ref(), config_snapshot.as_ref())
+            {
+                self.session_model =
+                    bamboo_engine::model_config_helper::get_default_model_for_provider(
+                        config, scope,
+                    )
+                    .ok();
+            }
+        }
+        if self.provider_override.is_none() && self.model.is_none() && self.provider_name.is_none()
+        {
+            if let (Some(scope), Some(config)) = (
+                provider_scope.as_ref(),
+                config_snapshot
+                    .as_ref()
+                    .filter(|_| self.config_override.is_some()),
+            ) {
+                if let Some(target) =
+                    bamboo_engine::resolved_defaults::default_chat_model_ref(config)
+                {
+                    if &target.provider != scope {
+                        return Err(SdkError::Config(format!(
+                            "SDK client is bound to provider '{scope}', but replacement Chat configuration targets '{}'; rebuild defaults or supply a matching client", target.provider
+                        )));
+                    }
+                    if config.features.provider_model_ref && config.defaults.is_some() {
+                        // The native client was created earlier. Replacing
+                        // its metadata must still pass exact admission.
+                        select_configured_chat_target(&mut config.clone(), &target)?;
+                    }
+                }
+            }
+        }
         if self.session_root_creator.is_some()
             && self.session_store.is_none()
             && self.tools.is_none()
@@ -916,6 +1091,11 @@ impl AgentBuilder {
             self.permission_mode,
         );
         agent.sdk_skills = sdk_skills;
+        agent.provider_scope = provider_scope;
+        agent.provider_scope_is_instance = provider_scope_is_instance;
+        agent.native_provider_binding = native_binding;
+        agent.caller_provider_binding = caller_binding;
+        agent.routing_config = routing_config;
         Ok(agent)
     }
 }
@@ -1030,6 +1210,57 @@ fn select_provider_override(config: &mut Config, requested: &str) {
 
     config.default_provider_instance = None;
     config.provider = requested_type;
+}
+
+/// A configured Chat reference names an exact account, not a provider-type
+/// alias that may silently choose a different enabled instance.
+fn select_configured_chat_target(
+    config: &mut Config,
+    target: &bamboo_domain::ProviderModelRef,
+) -> Result<(), SdkError> {
+    if target.provider.trim().is_empty()
+        || target.model.trim().is_empty()
+        || target.provider.trim() != target.provider
+        || target.model.trim() != target.model
+    {
+        return Err(SdkError::Config(
+            "Configured Chat provider/model reference is invalid".into(),
+        ));
+    }
+    if let Some(instance) = config.provider_instances.get(&target.provider) {
+        if !instance.enabled {
+            return Err(SdkError::Config(format!(
+                "Configured Chat provider '{}' is disabled",
+                target.provider
+            )));
+        }
+        if bamboo_config::explicit_runtime_models(instance)
+            .map_err(SdkError::Config)?
+            .is_some_and(|models| !models.contains(&target.model))
+        {
+            return Err(SdkError::Config(format!(
+                "Configured Chat model '{}' is not admitted for '{}'",
+                target.model, target.provider
+            )));
+        }
+        config.default_provider_instance = Some(target.provider.clone());
+        return Ok(());
+    }
+    let exact_legacy = bamboo_config::synthesize_legacy_instances(config)
+        .into_iter()
+        .any(|(id, _)| id == target.provider);
+    let active_legacy = config.provider_instances.is_empty()
+        && config.effective_default_provider() == target.provider
+        && bamboo_llm::AVAILABLE_PROVIDERS.contains(&target.provider.as_str());
+    if !exact_legacy && !active_legacy {
+        return Err(SdkError::Config(format!(
+            "Configured Chat provider '{}' is unavailable",
+            target.provider
+        )));
+    }
+    config.default_provider_instance = None;
+    config.provider = target.provider.clone();
+    Ok(())
 }
 
 fn permission_checker_for_mode(mode: PermissionMode) -> Option<Arc<dyn PermissionChecker>> {
@@ -2811,7 +3042,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_config_model_is_captured_before_or_after_defaults() {
+    async fn explicit_config_model_is_captured_before_or_after_defaults_with_matching_client() {
         let copilot_config = || {
             let mut config = Config::default();
             config.provider = "copilot".to_string();
@@ -2840,10 +3071,26 @@ mod tests {
             .with_defaults_for_data_dir(after_dir.path().to_path_buf())
             .await
             .unwrap()
+            .provider(Arc::new(NeverCalledProvider))
             .config(copilot_config())
             .build()
             .unwrap();
         assert_eq!(after.new_session("after").unwrap().model, "gpt-4o");
+
+        let mismatch_dir = tempfile::tempdir().unwrap();
+        write_test_config(mismatch_dir.path());
+        let mismatch = AgentBuilder::new()
+            .model("explicit-model")
+            .with_defaults_for_data_dir(mismatch_dir.path().to_path_buf())
+            .await
+            .unwrap()
+            .config(copilot_config())
+            .build();
+        assert!(
+            matches!(mismatch, Err(super::SdkError::Config(message))
+            if message.contains("SDK native provider configuration changed")),
+            "a native Anthropic client must not be retained for Copilot configuration"
+        );
 
         let explicit_dir = tempfile::tempdir().unwrap();
         write_test_config(explicit_dir.path());
@@ -2852,6 +3099,7 @@ mod tests {
             .with_defaults_for_data_dir(explicit_dir.path().to_path_buf())
             .await
             .unwrap()
+            .provider(Arc::new(NeverCalledProvider))
             .config(copilot_config())
             .build()
             .unwrap();

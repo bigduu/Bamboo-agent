@@ -25,13 +25,13 @@ pub struct ProjectScopeUpdate {
 fn error(status: StatusCode, code: &str, message: impl ToString) -> HttpResponse {
     HttpResponse::build(status).json(json!({
         "error":crate::error::error_value(message.to_string()), "code":code,
-        "recovery":"Read the current scope and explicitly choose the complete Project set using the existing access mode. Refresh incarnation/revision after a conflict; never auto-grant, attach historical Sessions or change Work/security settings."
+        "recovery":"Reload canonical identity/revision after a conflict. Legacy Project-list updates do not grant or revoke current-user Supervisor management. Worker/Observer rights and Work/security settings remain independent."
     }))
 }
 
 // Once canonical publication is issued, an untyped I/O error cannot prove
 // no commit occurred. Match the existing native adapter's conservative boundary.
-fn publication_error(failure: io::Error) -> HttpResponse {
+pub(super) fn publication_error(failure: io::Error) -> HttpResponse {
     if failure
         .get_ref()
         .is_some_and(|inner| inner.is::<bamboo_domain::SessionAuthorityConflict>())
@@ -42,7 +42,7 @@ fn publication_error(failure: io::Error) -> HttpResponse {
     }
 }
 
-fn storage_error(error_value: io::Error) -> HttpResponse {
+pub(super) fn storage_error(error_value: io::Error) -> HttpResponse {
     let (status, code) = match error_value.kind() {
         io::ErrorKind::WouldBlock => (StatusCode::CONFLICT, "scope_revision_conflict"),
         io::ErrorKind::PermissionDenied => (StatusCode::FORBIDDEN, "supervisor_identity_mismatch"),
@@ -54,7 +54,9 @@ fn storage_error(error_value: io::Error) -> HttpResponse {
     error(status, code, error_value)
 }
 
-async fn canonical_reference(state: &AppState) -> Result<SupervisorReference, Box<HttpResponse>> {
+pub(super) async fn canonical_reference(
+    state: &AppState,
+) -> Result<SupervisorReference, Box<HttpResponse>> {
     let canonical =
         match state
             .storage
@@ -95,16 +97,32 @@ pub async fn inspect_project_scope(
         Ok(reference) => reference,
         Err(response) => return Ok(*response),
     };
-    match SupervisorSessionService::new(state.storage.clone()).inspect_scope(&reference).await {
-        Ok(scope) => Ok(HttpResponse::Ok().insert_header((actix_web::http::header::CACHE_CONTROL,"no-store")).insert_header((actix_web::http::header::VARY,"Origin, Cookie, Authorization")).json(json!({
-            "code":if scope.allowed_projects.is_empty() {"project_scope_uninitialized"} else {"project_scope_configured"},
-            "capabilities":{"project_scope_v1":true,"supervised_root_create_v1":true,"project_scope_http_write_v1":true},
+    let scope = match state.storage.inspect_supervisor_scope(&reference).await {
+        Ok(scope) => scope,
+        Err(failure) => return Ok(storage_error(failure)),
+    };
+    let domain = match state
+        .storage
+        .inspect_supervisor_current_user_scope(&reference)
+        .await
+    {
+        Ok(scope) => scope,
+        Err(failure) => return Ok(storage_error(failure)),
+    };
+    Ok(HttpResponse::Ok()
+        .insert_header((actix_web::http::header::CACHE_CONTROL,"no-store"))
+        .insert_header((actix_web::http::header::VARY,"Origin, Cookie, Authorization"))
+        .json(json!({
+            "code":"current_user_scope_ready",
+            "capabilities":{"project_scope_v1":true,"supervised_root_create_v1":true,
+                "project_scope_http_write_v1":true,"supervisor_current_user_scope_v1":true},
             "scope":scope,
+            "management_access":{"kind":"current_user", "default_all_projects":true,
+                "default_all_sessions":true, "requires_project_authorization":false,
+                "requires_session_attachment":false, "orchestration_revision":domain.orchestration_revision},
             "owner_authorization":{"available":true,"required":true,"kind":"existing_access","http_registration":false,"code":null},
-            "note":"This management scope enables only subsequent authorized Root operations. It does not initialize Work, bind a workspace, attach an existing Session or grant shell/build permissions."
-        }))),
-        Err(failure) => Ok(storage_error(failure)),
-    }
+            "note":"The canonical Supervisor manages this application's current-user Projects/Sessions by default. Legacy scope/link fields are retained metadata, not access restrictions. Worker/Observer target rights, authentication, Work feature initialization and file permissions remain independent."
+        })))
 }
 
 /// Replace the complete explicitly selected set. The existing storage CAS
@@ -217,7 +235,7 @@ pub async fn configure_project_scope(
         )
         .await
     {
-        Ok(receipt) => Ok(HttpResponse::Ok().json(json!({"receipt":receipt}))),
+        Ok(receipt) => Ok(HttpResponse::Ok().json(json!({"receipt":receipt,"legacy_scope_is_authorization":false,"management_access":"current_user"}))),
         Err(failure) => Ok(publication_error(failure)),
     }
 }

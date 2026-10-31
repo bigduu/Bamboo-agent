@@ -314,14 +314,15 @@ where
         &updated_session,
         Some(gold_config.clone()),
     );
-    let resume_outcome = crate::session_app::resume::resume_session_execution_with_handoff(
-        resume_port,
-        session_id,
-        updated_session,
-        resume_config,
-        handoff,
-    )
-    .await;
+    let resume_outcome =
+        crate::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
+            resume_port,
+            session_id,
+            updated_session,
+            resume_config,
+            handoff,
+        )
+        .await;
     drop(response_guard);
 
     // The execution handoff is already owned by a detached task, so this

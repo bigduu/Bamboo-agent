@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use bamboo_agent_core::tools::{FunctionSchema, ToolCall, ToolSchema};
 use bamboo_agent_core::{AgentError, AgentEvent, GoldCheckpoint, GoldConfidence, GoldDecision};
@@ -8,7 +11,7 @@ use bamboo_domain::ReasoningEffort;
 use bamboo_llm::{LLMProvider, LLMRequestOptions};
 use chrono::Utc;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::GoldConfig;
@@ -67,13 +70,34 @@ pub(crate) struct AsyncGoldEvaluationResult {
     pub(crate) evaluation_result: GoldEvaluationResult,
 }
 
-fn normalize_lightweight_reasoning_effort(
-    reasoning_effort: Option<ReasoningEffort>,
-) -> Option<ReasoningEffort> {
-    reasoning_effort.map(|effort| match effort {
-        ReasoningEffort::Xhigh | ReasoningEffort::Max => ReasoningEffort::High,
-        other => other,
-    })
+// A known local routing refusal is not an evaluator verdict. Other evaluator
+// errors retain the existing low-confidence fallback for async Gold.
+#[derive(Debug)]
+pub(crate) enum GoldEvaluationError {
+    Routing(AgentError),
+    Evaluation(AgentError),
+}
+
+impl From<AgentError> for GoldEvaluationError {
+    fn from(error: AgentError) -> Self {
+        Self::Evaluation(error)
+    }
+}
+
+impl std::fmt::Display for GoldEvaluationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Routing(error) | Self::Evaluation(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl GoldEvaluationError {
+    pub(crate) fn into_agent_error(self) -> AgentError {
+        match self {
+            Self::Routing(error) | Self::Evaluation(error) => error,
+        }
+    }
 }
 
 fn estimate_prompt_tokens(messages: &[Message]) -> u64 {
@@ -132,12 +156,32 @@ pub(crate) fn build_async_gold_evaluation_request(
     }))
 }
 
+// The standalone test helper owns its own claim. The real runner shares it
+// with its InFlight state so run cleanup cannot emit a second terminal event.
+#[cfg(test)]
 pub(crate) async fn execute_async_gold_evaluation(
     request: AsyncGoldEvaluationRequest,
     llm: Arc<dyn LLMProvider>,
     event_tx: mpsc::Sender<AgentEvent>,
     configured_limit: usize,
-) -> AsyncGoldEvaluationResult {
+) -> Result<AsyncGoldEvaluationResult, AgentError> {
+    execute_async_gold_evaluation_with_terminal(
+        request,
+        llm,
+        event_tx,
+        configured_limit,
+        Arc::new(GoldEvaluationTerminal::default()),
+    )
+    .await
+}
+
+pub(crate) async fn execute_async_gold_evaluation_with_terminal(
+    request: AsyncGoldEvaluationRequest,
+    llm: Arc<dyn LLMProvider>,
+    event_tx: mpsc::Sender<AgentEvent>,
+    configured_limit: usize,
+    terminal_claimed: Arc<GoldEvaluationTerminal>,
+) -> Result<AsyncGoldEvaluationResult, AgentError> {
     let budget_provider = llm.clone();
     let budget_model = request.model_name.clone();
     let acquire_dispatch_guard = async move {
@@ -148,7 +192,7 @@ pub(crate) async fn execute_async_gold_evaluation(
         )
         .await
     };
-    let evaluation_result = match evaluate_gold_with_dispatch(
+    let evaluation_result = match evaluate_gold_with_dispatch_and_terminal(
         &request.session_snapshot,
         request.task_context_snapshot.as_ref(),
         &request.gold_config,
@@ -163,11 +207,13 @@ pub(crate) async fn execute_async_gold_evaluation(
             iteration: request.round_number as u32,
         },
         acquire_dispatch_guard,
+        Some(terminal_claimed.as_ref()),
     )
     .await
     {
         Ok(result) => result,
-        Err(error) => GoldEvaluationResult {
+        Err(GoldEvaluationError::Routing(error)) => return Err(error),
+        Err(GoldEvaluationError::Evaluation(error)) => GoldEvaluationResult {
             checkpoint: request.checkpoint,
             iteration: request.round_number as u32,
             decision: GoldDecision::Continue,
@@ -180,11 +226,11 @@ pub(crate) async fn execute_async_gold_evaluation(
         },
     };
 
-    AsyncGoldEvaluationResult {
+    Ok(AsyncGoldEvaluationResult {
         round_number: request.round_number,
         model_name: request.model_name,
         evaluation_result,
-    }
+    })
 }
 
 pub async fn evaluate_gold(
@@ -203,6 +249,7 @@ pub async fn evaluate_gold(
         std::future::ready(()),
     )
     .await
+    .map_err(GoldEvaluationError::into_agent_error)
 }
 
 pub(crate) async fn evaluate_gold_with_dispatch<G, Fut>(
@@ -212,10 +259,86 @@ pub(crate) async fn evaluate_gold_with_dispatch<G, Fut>(
     llm: Arc<dyn LLMProvider>,
     frame: &GoldEvalFrame<'_>,
     acquire_dispatch_guard: Fut,
-) -> Result<GoldEvaluationResult, AgentError>
+) -> Result<GoldEvaluationResult, GoldEvaluationError>
 where
     Fut: std::future::Future<Output = G>,
 {
+    evaluate_gold_with_dispatch_and_terminal(
+        session,
+        task_context,
+        config,
+        llm,
+        frame,
+        acquire_dispatch_guard,
+        None,
+    )
+    .await
+}
+
+// One claim is shared by an async Gold evaluator and its cleanup. The
+// notification lets a losing sender stop waiting for channel capacity.
+#[derive(Default)]
+pub(crate) struct GoldEvaluationTerminal {
+    claimed: AtomicBool,
+    published: Notify,
+}
+
+pub(crate) async fn emit_gold_cancelled_once(
+    event_tx: &mpsc::Sender<AgentEvent>,
+    terminal: &GoldEvaluationTerminal,
+    session_id: &str,
+    reason: &str,
+) {
+    // Register before checking the flag so a concurrent publication cannot be
+    // missed between the check and polling the notification.
+    let published = terminal.published.notified();
+    tokio::pin!(published);
+    published.as_mut().enable();
+    if terminal.claimed.load(Ordering::Acquire) {
+        return;
+    }
+    let permit = tokio::select! {
+        biased;
+        _ = &mut published => return,
+        result = event_tx.reserve() => match result {
+            Ok(permit) => permit,
+            Err(_) => return,
+        },
+    };
+    let event = AgentEvent::GoldEvaluationCancelled {
+        session_id: session_id.to_string(),
+        reason: reason.to_string(),
+    };
+    if terminal
+        .claimed
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+    {
+        // Enqueue and notify are synchronous after the claim: an aborted task
+        // cannot yield in between them. This is not a consumer acknowledgement.
+        permit.send(event);
+        terminal.published.notify_waiters();
+    }
+}
+
+async fn evaluate_gold_with_dispatch_and_terminal<G, Fut>(
+    session: &Session,
+    task_context: Option<&TaskLoopContext>,
+    config: &GoldConfig,
+    llm: Arc<dyn LLMProvider>,
+    frame: &GoldEvalFrame<'_>,
+    acquire_dispatch_guard: Fut,
+    terminal_claimed: Option<&GoldEvaluationTerminal>,
+) -> Result<GoldEvaluationResult, GoldEvaluationError>
+where
+    Fut: std::future::Future<Output = G>,
+{
+    if let Some(error) = llm.known_pre_dispatch_error() {
+        return Err(GoldEvaluationError::Routing(AgentError::LLM(
+            error.to_string(),
+        )));
+    }
+
     // Bind frame fields as locals so the rest of the function body stays unchanged.
     let event_tx = frame.event_tx;
     let session_id = frame.session_id;
@@ -236,10 +359,9 @@ where
     let prompt_tokens = estimate_prompt_tokens(&messages);
     let tools = get_gold_evaluation_tools();
 
-    let request_reasoning_effort = normalize_lightweight_reasoning_effort(reasoning_effort);
     let request_options = LLMRequestOptions {
         session_id: Some(session_id.to_string()),
-        reasoning_effort: request_reasoning_effort,
+        reasoning_effort,
         parallel_tool_calls: None,
         required_tool: None,
         responses: None,
@@ -262,8 +384,34 @@ where
         session_id,
         &timeout_context,
     )
-    .await?
-    .map_err(|error| AgentError::LLM(error.to_string()))?;
+    .await?;
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) if llm.local_dispatch_refused() => {
+            // No provider request was dispatched. Free the scarce slot before
+            // waiting for a potentially backpressured event consumer.
+            drop(_dispatch_guard);
+            if let Some(terminal_claimed) = terminal_claimed {
+                emit_gold_cancelled_once(event_tx, terminal_claimed, session_id, "route_rejected")
+                    .await;
+            } else {
+                let _ = event_tx
+                    .send(AgentEvent::GoldEvaluationCancelled {
+                        session_id: session_id.to_string(),
+                        reason: "route_rejected".to_string(),
+                    })
+                    .await;
+            }
+            return Err(GoldEvaluationError::Routing(AgentError::LLM(
+                error.to_string(),
+            )));
+        }
+        Err(error) => {
+            return Err(GoldEvaluationError::Evaluation(AgentError::LLM(
+                error.to_string(),
+            )))
+        }
+    };
     let stream_output =
         consume_llm_stream_silent_with_context(stream, &cancel_token, session_id, &timeout_context)
             .await?;
@@ -629,6 +777,440 @@ pub(crate) fn apply_gold_evaluation_result(
 mod tests {
     use super::*;
     use bamboo_agent_core::tools::FunctionCall;
+
+    // This witness supports both the old return shape and the corrected one,
+    // allowing the same assertions to run as a RED test on the baseline.
+    trait GoldOutcomeWitness {
+        fn is_routing_refusal(&self) -> bool;
+        fn ordinary_failure_reasoning(&self) -> Option<&str>;
+    }
+
+    impl GoldOutcomeWitness for AsyncGoldEvaluationResult {
+        fn is_routing_refusal(&self) -> bool {
+            false
+        }
+        fn ordinary_failure_reasoning(&self) -> Option<&str> {
+            Some(&self.evaluation_result.reasoning)
+        }
+    }
+
+    impl GoldOutcomeWitness for Result<AsyncGoldEvaluationResult, AgentError> {
+        fn is_routing_refusal(&self) -> bool {
+            self.is_err()
+        }
+        fn ordinary_failure_reasoning(&self) -> Option<&str> {
+            self.as_ref()
+                .ok()
+                .map(|result| result.evaluation_result.reasoning.as_str())
+        }
+    }
+
+    fn synthetic_request(model: &str) -> AsyncGoldEvaluationRequest {
+        AsyncGoldEvaluationRequest {
+            session_id: "gold-preflight-fixture".into(),
+            round_number: 1,
+            model_name: model.into(),
+            timeout_context: StreamTimeoutContext::default(),
+            reasoning_effort: None,
+            checkpoint: GoldCheckpoint::PostRound,
+            session_snapshot: Session::new("gold-preflight-fixture", model),
+            task_context_snapshot: None,
+            gold_config: GoldConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn gold_terminal_wakes_losing_sender_without_another_channel_slot() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(AgentEvent::Token {
+                content: "occupy".into(),
+            })
+            .await
+            .unwrap();
+        let terminal = GoldEvaluationTerminal::default();
+        let mut route = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "route_rejected",
+        ));
+        let mut cleanup = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "run_cancelled",
+        ));
+        // Poll both to Pending while the same one-slot channel is full.
+        assert!(futures::poll!(route.as_mut()).is_pending());
+        assert!(futures::poll!(cleanup.as_mut()).is_pending());
+        assert!(!terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(event_rx.try_recv(), Ok(AgentEvent::Token { .. })));
+
+        // Both must return while the one terminal event still fills the only
+        // channel slot. The losing reservation cannot wait for another drain.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(route, cleanup);
+        })
+        .await
+        .expect("the losing terminal sender must be notified");
+        assert!(terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationCancelled { ref session_id, ref reason })
+                if session_id == "synthetic-session"
+                    && (reason == "route_rejected" || reason == "run_cancelled")
+        ));
+        assert!(event_rx.try_recv().is_err(), "exactly one terminal event");
+    }
+
+    #[tokio::test]
+    async fn gold_terminal_closed_channel_never_claims_a_terminal() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(AgentEvent::Token {
+                content: "occupy".into(),
+            })
+            .await
+            .unwrap();
+        let terminal = GoldEvaluationTerminal::default();
+        let mut route = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "route_rejected",
+        ));
+        let mut cleanup = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "run_cancelled",
+        ));
+        assert!(futures::poll!(route.as_mut()).is_pending());
+        assert!(futures::poll!(cleanup.as_mut()).is_pending());
+        event_rx.close();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(route, cleanup);
+        })
+        .await
+        .expect("closed channel must unblock both reservations");
+        assert!(!terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(event_rx.try_recv(), Ok(AgentEvent::Token { .. })));
+        assert!(
+            event_rx.try_recv().is_err(),
+            "no terminal could be enqueued"
+        );
+    }
+
+    #[tokio::test]
+    async fn gold_terminal_cancelled_waiter_leaves_claim_available_for_cleanup() {
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx
+            .send(AgentEvent::Token {
+                content: "occupy".into(),
+            })
+            .await
+            .unwrap();
+        let terminal = GoldEvaluationTerminal::default();
+        let mut route = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "route_rejected",
+        ));
+        let mut cleanup = Box::pin(emit_gold_cancelled_once(
+            &event_tx,
+            &terminal,
+            "synthetic-session",
+            "run_cancelled",
+        ));
+        assert!(futures::poll!(route.as_mut()).is_pending());
+        assert!(futures::poll!(cleanup.as_mut()).is_pending());
+        drop(route);
+        assert!(!terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(event_rx.try_recv(), Ok(AgentEvent::Token { .. })));
+        tokio::time::timeout(std::time::Duration::from_secs(5), cleanup)
+            .await
+            .expect("cleanup must claim the released slot");
+        assert!(terminal.claimed.load(Ordering::Acquire));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationCancelled { ref session_id, ref reason })
+                if session_id == "synthetic-session" && reason == "run_cancelled"
+        ));
+        assert!(event_rx.try_recv().is_err(), "exactly one terminal event");
+    }
+
+    #[tokio::test]
+    async fn rejected_fast_never_waits_for_budget_or_emits_a_gold_verdict() {
+        let routing = crate::app_context::model_routing_test_support::RoutingContext::new(None);
+        let mut config = routing.config.read().await.clone();
+        config.provider_instances.get_mut("fast-b").unwrap().enabled = false;
+        let (model, provider) = crate::model_config_helper::resolve_fast_model_for_runner(
+            Some(&config),
+            "chat-a",
+            &routing.registry,
+        );
+        let model = model.unwrap();
+        let provider = provider.unwrap();
+        // Also verify trait-object propagation through the role decorator.
+        let mut reference = bamboo_domain::ProviderModelRef::new("fast-b", model.as_str());
+        reference.reasoning_effort = Some(bamboo_domain::ReasoningEffort::Low);
+        let decorated = bamboo_llm::ResolvedModel::from_ref(provider.clone(), &reference).provider;
+
+        for selected in [provider, decorated] {
+            let held =
+                crate::runtime::runner::auxiliary_budget::acquire(&selected, &model, 1).await;
+            let (event_tx, mut event_rx) = mpsc::channel(8);
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                execute_async_gold_evaluation(synthetic_request(&model), selected, event_tx, 1),
+            )
+            .await
+            .expect("rejected Fast must not wait for an auxiliary permit");
+            assert!(
+                outcome.is_routing_refusal(),
+                "refusal must not become a Gold verdict"
+            );
+            assert!(
+                event_rx.try_recv().is_err(),
+                "no Gold Started or Completed event"
+            );
+            drop(held);
+        }
+        assert!(routing.requests("fast-b").is_empty());
+        assert!(routing.requests("chat-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn managed_gold_route_revoked_after_started_has_route_terminal_and_releases_permit() {
+        use crate::app_context::model_routing_test_support::CaptureProvider;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, ProviderRegistry};
+        use std::time::Duration;
+        use tokio::sync::RwLock;
+
+        // This managed handle is only constructed and validated. If routing
+        // incorrectly dispatches, the only delegate is a synthetic capture;
+        // no LLM request is sent to the loopback address in the config.
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = "gold-a".into();
+        config.default_provider_instance = Some("gold-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.insert(
+            "gold-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type": "openai",
+                "enabled": true,
+                "api_key": "synthetic-only",
+                "base_url": "http://127.0.0.1:1",
+                "model": "main-model",
+                "runtime_models": ["main-model", "explicit-gold"]
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let target = ProviderModelRef::new("gold-a", "explicit-gold");
+        let (selected, origin) = registry.provider_for_model_with_origin(&target).unwrap();
+        let capture = Arc::new(CaptureProvider::default());
+        let live = Arc::new(RwLock::new(config));
+        let guard = bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            live.clone(),
+            origin.expect("the factory-built registry is managed"),
+            target,
+            selected,
+            capture.clone(),
+        );
+        assert!(guard.known_pre_dispatch_error().is_none());
+
+        let held =
+            crate::runtime::runner::auxiliary_budget::acquire(&guard, "explicit-gold", 1).await;
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        let runner_guard = guard.clone();
+        let runner_tx = event_tx.clone();
+        let handle = tokio::spawn(async move {
+            execute_async_gold_evaluation(
+                synthetic_request("explicit-gold"),
+                runner_guard,
+                runner_tx,
+                1,
+            )
+            .await
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), event_rx.recv())
+            .await
+            .expect("Gold should start before waiting for its auxiliary slot")
+            .expect("Gold event sender must remain open");
+        assert!(matches!(
+            started,
+            AgentEvent::GoldEvaluationStarted {
+                ref session_id,
+                checkpoint: GoldCheckpoint::PostRound,
+                iteration: 1,
+            } if session_id == "gold-preflight-fixture"
+        ));
+        assert!(!handle.is_finished(), "the held permit blocks dispatch");
+        assert!(capture.requests.lock().unwrap().is_empty());
+        // Fill the event channel to ensure a failure event cannot be sent yet.
+        // The refused evaluation must release its auxiliary slot before it
+        // waits for the event sink to accept that event.
+        event_tx
+            .send(AgentEvent::Token {
+                content: "saturation-fixture".into(),
+            })
+            .await
+            .unwrap();
+
+        live.write()
+            .await
+            .provider_instances
+            .get_mut("gold-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["main-model"]));
+        drop(held);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !guard.local_dispatch_refused() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the managed guard must refuse the revoked route");
+        assert!(
+            capture.requests.lock().unwrap().is_empty(),
+            "no provider call"
+        );
+        let available = tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::runtime::runner::auxiliary_budget::acquire(&guard, "explicit-gold", 1),
+        )
+        .await
+        .expect("the refused evaluation must release its auxiliary permit before its event send");
+        drop(available);
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::Token { ref content }) if content == "saturation-fixture"
+        ));
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("the revoked evaluation must stop")
+            .expect("the evaluation task must not panic");
+        let error = outcome.expect_err("a revoked route must not become a verdict");
+        match error {
+            AgentError::LLM(message) => assert!(
+                message.contains("no longer admitted"),
+                "unexpected routing error: {message}"
+            ),
+            other => panic!("expected an LLM routing error, got {other:?}"),
+        }
+        assert!(guard.local_dispatch_refused());
+        assert!(
+            capture.requests.lock().unwrap().is_empty(),
+            "no provider call"
+        );
+
+        // This describes the auxiliary evaluation's route refusal, not a user
+        // cancellation of the owning run and not a completed Gold verdict.
+        let terminal = event_rx
+            .try_recv()
+            .expect("Started must have a route terminal");
+        let terminal = serde_json::to_value(terminal).unwrap();
+        assert_eq!(terminal["type"], "gold_evaluation_cancelled");
+        assert_eq!(terminal["session_id"], "gold-preflight-fixture");
+        assert_eq!(terminal["reason"], "route_rejected");
+        assert!(event_rx.try_recv().is_err(), "exactly one terminal event");
+    }
+
+    #[tokio::test]
+    async fn ordinary_provider_failure_keeps_existing_async_gold_behavior() {
+        use crate::app_context::model_routing_test_support::{Failure, RoutingContext};
+        let routing = RoutingContext::new(None);
+        *routing.providers["fast-b"].failure.lock().unwrap() = Some(Failure::Network);
+        let provider: Arc<dyn LLMProvider> = routing.providers["fast-b"].clone();
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let outcome =
+            execute_async_gold_evaluation(synthetic_request("cheap-b"), provider, event_tx, 1)
+                .await;
+        assert!(outcome
+            .ordinary_failure_reasoning()
+            .unwrap()
+            .contains("Gold evaluation failed"));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationStarted { .. })
+        ));
+        assert!(event_rx.try_recv().is_err());
+        assert_eq!(routing.requests("fast-b").len(), 1);
+        assert!(routing.requests("chat-a").is_empty());
+    }
+
+    #[tokio::test]
+    async fn network_error_is_not_reclassified_after_provider_state_changes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct SwitchAfterNetworkError {
+            changed: AtomicBool,
+            calls: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for SwitchAfterNetworkError {
+            fn known_pre_dispatch_error(&self) -> Option<bamboo_llm::LLMError> {
+                self.changed
+                    .load(Ordering::SeqCst)
+                    .then(|| bamboo_llm::LLMError::Auth("different later provider state".into()))
+            }
+
+            async fn chat_stream(
+                &self,
+                _: &[bamboo_agent_core::Message],
+                _: &[bamboo_agent_core::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.changed.store(true, Ordering::SeqCst);
+                Err(bamboo_llm::LLMError::RequestFailed(
+                    "synthetic network failure".into(),
+                ))
+            }
+        }
+        let provider = Arc::new(SwitchAfterNetworkError {
+            changed: AtomicBool::new(false),
+            calls: AtomicUsize::new(0),
+        });
+        let (event_tx, mut event_rx) = mpsc::channel(8);
+        let outcome = execute_async_gold_evaluation(
+            synthetic_request("fixture-model"),
+            provider.clone(),
+            event_tx,
+            1,
+        )
+        .await
+        .expect("an ordinary request error retains the previous async fallback");
+        assert!(outcome
+            .evaluation_result
+            .reasoning
+            .contains("synthetic network failure"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        assert!(provider.known_pre_dispatch_error().is_some());
+        assert!(matches!(
+            event_rx.try_recv(),
+            Ok(AgentEvent::GoldEvaluationStarted { .. })
+        ));
+        assert!(event_rx.try_recv().is_err());
+    }
 
     fn report_call(arguments: serde_json::Value) -> ToolCall {
         ToolCall {

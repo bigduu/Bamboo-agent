@@ -200,10 +200,6 @@ impl LLMProvider for BodhiProvider {
                 .await
             }
             "gemini" => {
-                crate::providers::common::validate_max_thinking_budget(
-                    reasoning_effort,
-                    max_output_tokens,
-                )?;
                 self.proxy_gemini(
                     messages,
                     tools,
@@ -273,7 +269,7 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
             self.client.post(&url).headers(headers.clone()).json(&body)
         })
         .await?;
@@ -287,7 +283,11 @@ impl BodhiProvider {
             )));
         }
 
-        let stream = openai_compat_chat_stream_from_sse(response, |_event, data| {
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let stream = openai_compat_chat_stream_from_sse(response, move |event, data| {
+            if let Some(diagnostics) = &completion_diagnostics {
+                diagnostics.observe_sse(event, data);
+            }
             if data.trim().is_empty() {
                 return Ok(Vec::new());
             }
@@ -307,22 +307,12 @@ impl BodhiProvider {
         required_tool: Option<&str>,
     ) -> Result<LLMStream> {
         use crate::providers::anthropic::{
-            apply_required_tool_auto_fallback, apply_required_tool_choice, build_anthropic_request,
-            looks_like_thinking_forced_tool_choice_error, parse_anthropic_sse_event,
-            reasoning_effort_for_budget_validation, reasoning_effort_for_required_tool,
+            apply_required_tool_choice, build_anthropic_request, parse_anthropic_sse_event,
             AnthropicStreamState,
         };
 
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
         let max_tokens = max_output_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-        let reasoning_effort = reasoning_effort_for_required_tool(reasoning_effort, required_tool);
-        let budget_reasoning_effort =
-            reasoning_effort_for_budget_validation(reasoning_effort, messages, false, &[]);
-        crate::providers::common::validate_max_thinking_budget(
-            budget_reasoning_effort,
-            Some(max_tokens),
-        )?;
-
         let mut body = build_anthropic_request(
             messages,
             tools,
@@ -340,7 +330,7 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let mut response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
             self.client.post(&url).headers(headers.clone()).json(&body)
         })
         .await?;
@@ -348,48 +338,14 @@ impl BodhiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await?;
-            if required_tool.is_some()
-                && looks_like_thinking_forced_tool_choice_error(status, &text)
-            {
-                tracing::warn!(
-                    "Bodhi/Anthropic model_hash {} rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
-                    log_identity(model)
-                );
-                let mut fallback_body = build_anthropic_request(
-                    messages,
-                    tools,
-                    model,
-                    max_tokens,
-                    true,
-                    None,
-                    Some(false),
-                );
-                apply_required_tool_auto_fallback(&mut fallback_body, required_tool);
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
-                    self.client
-                        .post(&url)
-                        .headers(headers.clone())
-                        .json(&fallback_body)
-                })
-                .await?;
-                if !response.status().is_success() {
-                    let fallback_status = response.status();
-                    let fallback_text = response.text().await?;
-                    return Err(LLMError::Api(format!(
-                        "Bodhi/Anthropic proxy after tool_choice=auto activation fallback HTTP {}: {}",
-                        fallback_status, fallback_text
-                    )));
-                }
-            } else {
-                return Err(LLMError::Api(format!(
-                    "Bodhi/Anthropic proxy HTTP {}: {}",
-                    status, text
-                )));
-            }
+            return Err(LLMError::Api(format!(
+                "Bodhi/Anthropic proxy HTTP {}: {}",
+                status, text
+            )));
         }
 
         let mut state = AnthropicStreamState::default();
+        state.completion_diagnostics = crate::provider::current_completion_diagnostics();
         let stream = llm_stream_from_sse(response, move |event, data| {
             parse_anthropic_sse_event(&mut state, event, data)
         });
@@ -437,7 +393,7 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_with_retry(crate::retry::global(), "Bodhi", || {
+        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
             self.client
                 .post(&url)
                 .headers(headers.clone())
@@ -458,20 +414,18 @@ impl BodhiProvider {
         // Multi-chunk adapter: a final Gemini `usageMetadata` carries both a
         // cache hit and output/thinking usage in one event, and the stream sends
         // no [DONE], so both must be emitted from that single event (issue #27).
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
-            move |event, data| parse_gemini_sse_event(&mut state, event, data),
+            move |event, data| {
+                if let Some(diagnostics) = &completion_diagnostics {
+                    diagnostics.observe_sse(event, data);
+                }
+                parse_gemini_sse_event(&mut state, event, data)
+            },
         );
 
         Ok(stream)
-    }
-
-    #[cfg(test)]
-    fn thinking_budget_for_effort(
-        effort: ReasoningEffort,
-        max_output_tokens: Option<u32>,
-    ) -> Option<u32> {
-        crate::providers::common::bounded_thinking_budget(effort, max_output_tokens)
     }
 }
 
@@ -484,38 +438,6 @@ mod tests {
     use serde_json::Value;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
-
-    #[test]
-    fn max_reasoning_uses_a_distinct_larger_gemini_thinking_budget() {
-        assert_eq!(
-            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, None),
-            Some(8_192)
-        );
-        assert_eq!(
-            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, None),
-            Some(16_384)
-        );
-        assert_eq!(
-            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(16_384)),
-            Some(8_192)
-        );
-        assert_eq!(
-            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(16_384)),
-            Some(12_288)
-        );
-        assert_eq!(
-            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Xhigh, Some(8_320)),
-            Some(4_160)
-        );
-        assert_eq!(
-            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(8_320)),
-            Some(6_240)
-        );
-        assert_eq!(
-            BodhiProvider::thinking_budget_for_effort(ReasoningEffort::Max, Some(1_024)),
-            None
-        );
-    }
 
     struct ThinkingToolChoiceResponder;
 
@@ -662,50 +584,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn anthropic_proxy_retries_exact_thinking_error_with_auto_choice() {
+    async fn proxy_targets_capture_request_scoped_finish_reasons() {
+        for (target, body, expected) in [
+            ("openai", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", "length"),
+            ("anthropic", "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", "max_tokens"),
+            ("gemini", "data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}\n\n", "MAX_TOKENS"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body))
+                .expect(1).mount(&server).await;
+            let provider = BodhiProvider::new("test-key").with_base_url(server.uri())
+                .with_target_provider(target);
+            let diagnostics = crate::provider::CompletionDiagnostics::default();
+            let messages = [Message::user("describe")];
+            let mut stream = crate::provider::scope_completion_diagnostics(
+                diagnostics.clone(), provider.chat_stream(&messages, &[], None, "model"),
+            ).await.unwrap();
+            while let Some(chunk) = stream.next().await { chunk.unwrap(); }
+            assert_eq!(diagnostics.finish_reason(), expected, "{target}");
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_proxy_returns_tool_choice_error_without_retrying() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/proxy/anthropic/v1/messages"))
             .respond_with(ThinkingToolChoiceResponder)
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         let provider = BodhiProvider::new("test-key")
             .with_base_url(server.uri())
             .with_target_provider("anthropic")
             .with_reasoning_effort(Some(ReasoningEffort::High));
-        let tools = vec![load_skill_tool()];
         let options = LLMRequestOptions {
             required_tool: Some("load_skill".to_string()),
-            parallel_tool_calls: Some(false),
             ..Default::default()
         };
-
-        let _stream = provider
+        let result = provider
             .chat_stream_with_options(
                 &[Message::user("activate")],
-                &tools,
-                Some(8192),
-                "deepseek-v4-pro",
+                &[load_skill_tool()],
+                Some(1024),
+                "custom-route",
                 Some(&options),
             )
-            .await
-            .expect("Bodhi Anthropic proxy should retry with auto choice");
-
-        let requests = server.received_requests().await.expect("requests recorded");
-        assert_eq!(requests.len(), 2);
-        let named: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let fallback: Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert_eq!(named["tool_choice"]["type"], "tool");
-        assert_eq!(named["tool_choice"]["name"], "load_skill");
-        assert_eq!(fallback["tool_choice"]["type"], "auto");
-        assert_eq!(fallback["tool_choice"]["disable_parallel_tool_use"], true);
-        assert_eq!(fallback["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(fallback["tools"][0]["name"], "load_skill");
+            .await;
+        assert!(matches!(result, Err(LLMError::Api(message)) if message.contains("HTTP 400")));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["tool_choice"]["type"], "tool");
     }
 
     #[tokio::test]
-    async fn anthropic_required_tool_disables_max_before_small_budget_validation() {
+    async fn anthropic_required_tool_keeps_selected_max_without_budget_conversion() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/proxy/anthropic/v1/messages"))
@@ -736,50 +674,48 @@ mod tests {
                 Some(&options),
             )
             .await
-            .expect("required tool should disable thinking before Max budget validation");
+            .expect("selected max must be preserved with required tools");
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body.get("thinking").is_none());
+        assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["max_tokens"], 2_048);
+        assert_eq!(body["output_config"]["effort"], "max");
         assert_eq!(body["tool_choice"]["type"], "tool");
         assert_eq!(body["tool_choice"]["name"], "load_skill");
     }
 
     #[tokio::test]
-    async fn anthropic_max_without_required_tool_rejects_impossible_small_budget() {
+    async fn anthropic_proxy_sends_max_and_returns_upstream_budget_error() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/proxy/anthropic/v1/messages"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"error":{"message":"Unsupported effort max"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let provider = BodhiProvider::new("test-key")
             .with_base_url(server.uri())
             .with_target_provider("anthropic")
             .with_reasoning_effort(Some(ReasoningEffort::Max));
-
         let result = provider
-            .chat_stream(
-                &[Message::user("hello")],
-                &[],
-                Some(2_048),
-                "claude-sonnet-4-5",
-            )
+            .chat_stream(&[Message::user("hello")], &[], Some(2048), "custom-route")
             .await;
-
-        match result {
-            Err(LLMError::Api(message)) => {
-                assert!(message.contains("requires max_output_tokens of at least 2049"));
-            }
-            Err(other) => panic!("unexpected error: {other}"),
-            Ok(_) => panic!("impossible Max budget should fail before the request"),
-        }
-        assert!(server
-            .received_requests()
-            .await
-            .expect("requests recorded")
-            .is_empty());
+        assert!(
+            matches!(result, Err(LLMError::Api(message)) if message.contains("Unsupported effort max"))
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["output_config"]["effort"], "max");
     }
 
     #[tokio::test]
-    async fn anthropic_unsigned_tool_turn_disables_max_before_small_budget_validation() {
+    async fn anthropic_unsigned_tool_turn_keeps_selected_max_without_budget_conversion() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/proxy/anthropic/v1/messages"))
@@ -804,12 +740,13 @@ mod tests {
                 "claude-sonnet-4-5",
             )
             .await
-            .expect("unsigned tool turn should disable thinking before Max validation");
+            .expect("selected max must be preserved with unsigned history");
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body.get("thinking").is_none());
+        assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["max_tokens"], 2_048);
+        assert_eq!(body["output_config"]["effort"], "max");
     }
 }

@@ -1,7 +1,7 @@
 use super::*;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::runner::image_fallback::{describe_tool_images, resolve_vision_target};
-use bamboo_agent_core::{ToolResult, ToolResultImage};
+use bamboo_agent_core::{Tool, ToolCtx, ToolOutcome, ToolResult, ToolResultImage};
 use serde_json::json;
 use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
 
@@ -32,6 +32,124 @@ fn config_for(protocol: &str, endpoint: &str) -> Config {
         );
     }
     config
+}
+
+fn with_chat_routing_flag(config: Config, enabled: Option<bool>) -> Config {
+    let mut value = serde_json::to_value(&config).unwrap();
+    if let Some(enabled) = enabled {
+        value["features"]["provider_model_ref"] = json!(enabled);
+    } else {
+        value["features"]
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_model_ref");
+    }
+    let mut restored: Config = serde_json::from_value(value).unwrap();
+    // Public Config serialization omits plaintext credentials. Rehydrate only
+    // this fixture's mock keys, as the real config loader does for credentials.
+    for (id, instance) in &mut restored.provider_instances {
+        instance.api_key = config.provider_instances[id].api_key.clone();
+    }
+    restored
+}
+
+#[test]
+fn saved_vision_role_and_preflight_do_not_depend_on_the_chat_routing_flag() {
+    for enabled in [None, Some(false), Some(true)] {
+        // Pure preflight must not construct this deliberately unsupported
+        // provider. The saved role wins over a valid active-account fallback.
+        let mut config =
+            with_chat_routing_flag(config_for("not-a-provider", "http://127.0.0.1:1"), enabled);
+        let active = config.provider_instances.get_mut("main-account").unwrap();
+        active.vision_model = Some("active-vision".into());
+        active.extra.insert(
+            "runtime_models".into(),
+            json!(["same-name", "active-vision"]),
+        );
+        let role = config.defaults.as_mut().unwrap().vision.as_mut().unwrap();
+        role.reasoning_effort = Some(bamboo_domain::reasoning::ReasoningEffort::Low);
+        let before = serde_json::to_vec(&config).unwrap();
+
+        let (target, instance) = configured_target(&config, "main-account").unwrap();
+        assert_eq!(target.provider, "vision-account", "flag {enabled:?}");
+        assert_eq!(target.model, "same-name");
+        assert_eq!(
+            target.reasoning_effort,
+            Some(bamboo_domain::reasoning::ReasoningEffort::Low)
+        );
+        assert_eq!(instance.provider_type, "not-a-provider");
+        crate::model_config_helper::validate_image_reference_vision_config(&config, "main-account")
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&config).unwrap(), before);
+
+        // Only an unset global role permits the active account's explicit
+        // compatibility setting, regardless of the chat-routing rollout.
+        config.defaults.as_mut().unwrap().vision = None;
+        let (target, _) = configured_target(&config, "main-account").unwrap();
+        assert_eq!(target.provider, "main-account");
+        assert_eq!(target.model, "active-vision");
+    }
+}
+
+#[test]
+fn invalid_saved_vision_role_never_uses_a_valid_legacy_target_for_any_chat_flag() {
+    for enabled in [None, Some(false), Some(true)] {
+        for variant in 0..8 {
+            let mut config =
+                with_chat_routing_flag(config_for("openai", "http://127.0.0.1:1"), enabled);
+            let active = config.provider_instances.get_mut("main-account").unwrap();
+            active.vision_model = Some("active-vision".into());
+            active.extra.insert(
+                "runtime_models".into(),
+                json!(["same-name", "active-vision"]),
+            );
+            let target = config.defaults.as_mut().unwrap().vision.as_mut().unwrap();
+            match variant {
+                0 => target.provider = "unknown-account".into(),
+                1 => target.provider = "openai".into(),
+                2 => target.model = "unadmitted".into(),
+                3 => target.model = " same-name ".into(),
+                4 => target.model.clear(),
+                5 => {
+                    config
+                        .provider_instances
+                        .get_mut("vision-account")
+                        .unwrap()
+                        .enabled = false
+                }
+                6 => {
+                    config
+                        .provider_instances
+                        .get_mut("vision-account")
+                        .unwrap()
+                        .extra
+                        .insert(
+                            "model_capabilities".into(),
+                            json!({"same-name":{"supports_vision":false}}),
+                        );
+                }
+                _ => {
+                    config
+                        .provider_instances
+                        .get_mut("vision-account")
+                        .unwrap()
+                        .extra
+                        .insert("runtime_models".into(), json!([]));
+                }
+            }
+            assert!(
+                configured_target(&config, "main-account").is_err(),
+                "flag {enabled:?}, variant {variant}"
+            );
+            assert!(
+                crate::model_config_helper::validate_image_reference_vision_config(
+                    &config,
+                    "main-account"
+                )
+                .is_err()
+            );
+        }
+    }
 }
 
 #[test]
@@ -150,6 +268,7 @@ fn vision_configuration_preserves_default_on_null_and_legacy_selections() {
             .insert("model_capabilities".into(), capability);
         assert!(configured_target(&config, config.effective_default_provider()).is_ok());
         // Legacy mode uses the active instance's explicitly selected vision_model.
+        config.defaults.as_mut().unwrap().vision = None;
         config.features.provider_model_ref = false;
         config.default_provider_instance = Some("vision-account".into());
         config
@@ -176,6 +295,7 @@ fn vision_configuration_preserves_default_on_null_and_legacy_selections() {
 fn sse(protocol: &str) -> &'static str {
     match protocol {
         "openai" => concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"internal reasoning\"},\"finish_reason\":null}]}\n\n",
             "data: {\"id\":\"mock\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"same-name\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"mock visual description\"},\"finish_reason\":null}]}\n\n",
             "data: [DONE]\n\n",
         ),
@@ -201,6 +321,240 @@ fn image_result() -> ToolResult {
         }],
         ..Default::default()
     }
+}
+
+#[tokio::test]
+async fn view_image_focus_reaches_vision_without_a_caller_output_cap() {
+    let vision = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"},\"finish_reason\":null}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\n",
+                "data: [DONE]\n\n",
+            )))
+        .expect(1).mount(&vision).await;
+    let config = Arc::new(RwLock::new(config_for("openai", &vision.uri())));
+    let dir = tempfile::tempdir().unwrap();
+    let loop_config = AgentLoopConfig {
+        vision_model_resolver: Some(configured_vision_resolver(
+            config,
+            Some(dir.path().to_owned()),
+            "main-account".into(),
+        )),
+        ..Default::default()
+    };
+    let target = resolve_vision_target(&loop_config).await.unwrap();
+    let image_path = dir.path().join("focus.png");
+    tokio::fs::write(&image_path, b"\x89PNG\r\n\x1a\nimage")
+        .await
+        .unwrap();
+    let output = bamboo_tools::tools::view_image::ViewImageTool::new()
+        .invoke(
+            json!({"path":image_path, "prompt":"请详细描述左侧 section 的创建入口"}),
+            ToolCtx::none("focus"),
+        )
+        .await
+        .unwrap();
+    let ToolOutcome::Completed(mut result) = output else {
+        panic!("expected image")
+    };
+    let before = serde_json::to_value(&result).unwrap();
+    let error = describe_tool_images(&target, &mut result)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("finish reason: length"));
+    assert_eq!(serde_json::to_value(&result).unwrap(), before);
+
+    let requests = vision.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.get("max_tokens").is_none());
+    assert!(body.get("max_completion_tokens").is_none());
+    let focus_prompt = body["messages"][1]["content"][0]["text"].as_str().unwrap();
+    assert!(focus_prompt.contains("请详细描述左侧 section 的创建入口"));
+    assert!(focus_prompt.contains("untrusted data"));
+    assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+}
+
+#[tokio::test]
+async fn empty_vision_descriptions_record_native_finish_reasons() {
+    for (protocol, response, expected) in [
+        ("anthropic", concat!(
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n"), "max_tokens"),
+        ("gemini", "data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}\n\n", "MAX_TOKENS"),
+        ("openai", concat!(
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"PRIVATE-UPSTREAM-TEXT\"}]}\n\n",
+            "data: [DONE]\n\n"), "other"),
+        ("openai-responses", "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n", "max_output_tokens"),
+    ] {
+        let vision = MockServer::start().await;
+        Mock::given(method("POST")).respond_with(
+            ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                .set_body_string(response),
+        ).expect(1).mount(&vision).await;
+        let mut configured = config_for(
+            if protocol == "openai-responses" { "openai" } else { protocol },
+            &vision.uri(),
+        );
+        if protocol == "openai-responses" {
+            configured.provider_instances.get_mut("vision-account").unwrap()
+                .responses_only_models.push("same-name".into());
+        }
+        let config = Arc::new(RwLock::new(configured));
+        let dir = tempfile::tempdir().unwrap();
+        let loop_config = AgentLoopConfig {
+            vision_model_resolver: Some(configured_vision_resolver(
+                config, Some(dir.path().to_owned()), "main-account".into(),
+            )),
+            ..Default::default()
+        };
+        let target = resolve_vision_target(&loop_config).await.unwrap();
+        let error = describe_tool_images(&target, &mut image_result()).await.unwrap_err().to_string();
+        assert!(error.contains(&format!("finish reason: {expected}")), "{protocol}: {error}");
+        assert!(!error.contains("PRIVATE-UPSTREAM-TEXT"));
+    }
+}
+
+#[tokio::test]
+async fn anthropic_vision_respects_an_explicit_provider_output_limit() {
+    let vision = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse("anthropic")),
+        )
+        .expect(1)
+        .mount(&vision)
+        .await;
+    let mut configured = config_for("anthropic", &vision.uri());
+    configured
+        .provider_instances
+        .get_mut("vision-account")
+        .unwrap()
+        .extra
+        .insert("max_tokens".into(), json!(4096));
+    let config = Arc::new(RwLock::new(configured));
+    let dir = tempfile::tempdir().unwrap();
+    let loop_config = AgentLoopConfig {
+        vision_model_resolver: Some(configured_vision_resolver(
+            config,
+            Some(dir.path().to_owned()),
+            "main-account".into(),
+        )),
+        ..Default::default()
+    };
+    let target = resolve_vision_target(&loop_config).await.unwrap();
+    describe_tool_images(&target, &mut image_result())
+        .await
+        .unwrap();
+    let requests = vision.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["max_tokens"], 4096);
+}
+
+#[tokio::test]
+async fn saved_vision_role_reloads_the_complete_target_between_calls_with_chat_routing_off() {
+    let main = MockServer::start().await;
+    let first = MockServer::start().await;
+    let second = MockServer::start().await;
+    for endpoint in [&first, &second] {
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse("openai")),
+            )
+            .expect(1)
+            .mount(endpoint)
+            .await;
+    }
+    let mut initial = with_chat_routing_flag(config_for("openai", &first.uri()), None);
+    initial
+        .provider_instances
+        .get_mut("main-account")
+        .unwrap()
+        .base_url = Some(main.uri());
+    let saved_role = initial.defaults.as_mut().unwrap().vision.take().unwrap();
+    let config = Arc::new(RwLock::new(initial));
+    let dir = tempfile::tempdir().unwrap();
+    let loop_config = AgentLoopConfig {
+        vision_model_resolver: Some(configured_vision_resolver(
+            config.clone(),
+            Some(dir.path().to_owned()),
+            "main-account".into(),
+        )),
+        ..Default::default()
+    };
+    assert!(resolve_vision_target(&loop_config).await.is_err());
+    config.write().await.defaults.as_mut().unwrap().vision = Some(saved_role);
+    let first_target = resolve_vision_target(&loop_config).await.unwrap();
+    {
+        let mut live = config.write().await;
+        let mut replacement = live
+            .provider_instances
+            .get("vision-account")
+            .unwrap()
+            .clone();
+        replacement.base_url = Some(second.uri());
+        replacement
+            .extra
+            .insert("runtime_models".into(), json!(["replacement-vision"]));
+        replacement.extra.insert(
+            "model_capabilities".into(),
+            json!({"replacement-vision":{"supports_vision":true}}),
+        );
+        live.provider_instances
+            .insert("replacement-account".into(), replacement);
+        live.provider_instances
+            .get_mut("vision-account")
+            .unwrap()
+            .enabled = false;
+        live.defaults.as_mut().unwrap().vision = Some(bamboo_domain::ProviderModelRef::new(
+            "replacement-account",
+            "replacement-vision",
+        ));
+    }
+    // An already resolved request keeps its coherent provider/model snapshot;
+    // the next request observes the newly saved global pair without a restart.
+    describe_tool_images(&first_target, &mut image_result())
+        .await
+        .unwrap();
+    let second_target = resolve_vision_target(&loop_config).await.unwrap();
+    describe_tool_images(&second_target, &mut image_result())
+        .await
+        .unwrap();
+    assert!(main.received_requests().await.unwrap().is_empty());
+    for (endpoint, model) in [(&first, "same-name"), (&second, "replacement-vision")] {
+        let requests = endpoint.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["model"], model);
+    }
+    config
+        .write()
+        .await
+        .provider_instances
+        .get_mut("replacement-account")
+        .unwrap()
+        .extra
+        .insert(
+            "model_capabilities".into(),
+            json!({"replacement-vision":{"supports_vision":false}}),
+        );
+    assert!(resolve_vision_target(&loop_config).await.is_err());
+    assert!(main.received_requests().await.unwrap().is_empty());
+    assert_eq!(first.received_requests().await.unwrap().len(), 1);
+    assert_eq!(second.received_requests().await.unwrap().len(), 1);
+    let live = config.read().await;
+    assert!(!live.features.provider_model_ref);
+    assert_eq!(
+        live.defaults.as_ref().unwrap().chat.provider,
+        "main-account"
+    );
 }
 
 #[tokio::test]
@@ -238,24 +592,31 @@ async fn configured_vision_factory_uses_native_protocols_only_at_the_selected_mo
         };
         let target = resolve_vision_target(&loop_config).await.unwrap();
         let mut result = image_result();
+        result.result = json!({"prompt":"Describe the sidebar creation control"}).to_string();
         describe_tool_images(&target, &mut result).await.unwrap();
         assert!(result.images.is_empty());
         assert!(result.result.contains("Vision model output"));
         assert!(result.result.contains("untrusted data"));
         assert!(result.result.contains("mock visual description"));
+        assert!(!result.result.contains("internal reasoning"));
         assert!(!result.result.contains("iVBORw0KGgo="));
         assert!(main.received_requests().await.unwrap().is_empty());
         let requests = vision.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert!(String::from_utf8_lossy(&requests[0].body)
+            .contains("Describe the sidebar creation control"));
         match protocol {
             "openai" => {
                 assert_eq!(requests[0].url.path(), "/chat/completions");
                 assert_eq!(body["model"], "same-name");
+                assert!(body.get("max_tokens").is_none());
+                assert!(body.get("max_completion_tokens").is_none());
                 assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
             }
             "anthropic" => {
                 assert_eq!(requests[0].url.path(), "/messages");
+                assert_eq!(body["max_tokens"], 16_384);
                 assert_eq!(body["messages"][0]["content"][1]["type"], "image");
                 assert_eq!(
                     body["messages"][0]["content"][1]["source"]["type"],
@@ -263,6 +624,7 @@ async fn configured_vision_factory_uses_native_protocols_only_at_the_selected_mo
                 );
             }
             "gemini" => {
+                assert!(body.pointer("/generationConfig/maxOutputTokens").is_none());
                 assert_eq!(
                     requests[0].url.path(),
                     "/models/same-name:streamGenerateContent"

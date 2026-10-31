@@ -25,6 +25,98 @@ async fn legacy(root: &std::path::Path) -> SessionStoreV2 {
 }
 
 #[tokio::test]
+async fn offline_cli_preserves_historical_work_revision_without_restart_reconciliation() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("source");
+    let destination = dir.path().join("destination");
+    std::fs::create_dir(&data).unwrap();
+    std::fs::create_dir(&destination).unwrap();
+    let storage = legacy(&data).await;
+    let (mut historical, _) =
+        ticket_runtime::verified_scope_binding(&storage, DEFAULT_SUPERVISOR_SESSION_ID)
+            .await
+            .unwrap();
+    historical.binding_revision = 7;
+    let root = data
+        .join("tickets")
+        .join(historical.scope_id.strip_prefix("supervisor/").unwrap());
+    let original = TicketService::initialize_empty(&root, historical.clone()).unwrap();
+    let before = original.published().unwrap();
+    drop(original);
+    let head = std::fs::read(root.join("HEAD")).unwrap();
+
+    let plan = ticket_cli::migration_plan(&data, &destination, "historical-readonly")
+        .await
+        .expect("historical Work must remain readable without a writer restart");
+    let request: MigrationRequest = serde_json::from_value(plan["request"].clone()).unwrap();
+    assert_eq!(request.binding, historical);
+    assert_eq!(request.expected_seq, before.1.seq);
+    assert_eq!(request.expected_epoch, before.1.authority_epoch);
+    assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), head);
+
+    let backup_root = dir.path().join("backup");
+    ticket_cli::run(ticket_cli::TicketCommands::Backup {
+        data_dir: data.clone(),
+        destination: backup_root.clone(),
+    })
+    .await
+    .unwrap();
+    let backup = TicketService::open_offline(&backup_root, historical.clone()).unwrap();
+    assert_eq!(backup.published().unwrap().1.binding, historical);
+    drop(backup);
+    assert_eq!(std::fs::read(root.join("HEAD")).unwrap(), head);
+
+    // Reuse the original offline import/receipt path, then migrate the same
+    // sealed binding. No Worker, provider, claim or runtime lease is created.
+    let preview = ticket_cli::preview(&data, DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap();
+    let hash = preview["source_snapshot_hash"].as_str().unwrap();
+    let first = ticket_cli::legacy_commit(
+        &data,
+        DEFAULT_SUPERVISOR_SESSION_ID,
+        hash,
+        "historical-import",
+        &["old-a".into()],
+        true,
+    )
+    .await
+    .unwrap();
+    let replay = ticket_cli::legacy_commit(
+        &data,
+        DEFAULT_SUPERVISOR_SESSION_ID,
+        hash,
+        "historical-import",
+        &["old-a".into()],
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["receipt"], replay["receipt"]);
+    let plan = ticket_cli::migration_plan(&data, &destination, "historical-migrate")
+        .await
+        .unwrap();
+    let request: MigrationRequest = serde_json::from_value(plan["request"].clone()).unwrap();
+    assert_eq!(request.binding, historical);
+    let moved = ticket_cli::migrate(&data, &request).await.unwrap();
+    let repeated = ticket_cli::migrate(&data, &request).await.unwrap();
+    assert_eq!(moved["status"], "migrated");
+    assert_eq!(repeated["receipt"], moved["receipt"]);
+    let copy = TicketService::open_offline(&request.destination_root, historical.clone()).unwrap();
+    let copied = copy.published().unwrap().1;
+    assert_eq!(copied.binding, historical);
+    assert_eq!(
+        serde_json::to_value(&copied.receipts["historical-import"]).unwrap(),
+        first["receipt"]
+    );
+    assert!(copied.assignments.is_empty());
+    assert!(copied
+        .tickets
+        .values()
+        .all(|work| work.accepted_submission.is_none()));
+}
+
+#[tokio::test]
 async fn explicit_attach_preview_full_source_receipt_replay_and_old_completed_needs_review() {
     let dir = tempfile::tempdir().unwrap();
     let storage = legacy(dir.path()).await;

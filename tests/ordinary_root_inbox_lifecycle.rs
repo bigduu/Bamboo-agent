@@ -29,6 +29,7 @@ const SUCCESSOR_ID: &str = "ordinary-successor-input";
 const SUCCESSOR: &str = "ROOT_SUCCESSOR_INPUT: replace the cancelled execution.";
 const SUCCESSOR_REPLY: &str = "ROOT_SUCCESSOR_COMMITTED";
 const WRITE_CALL: &str = "root-write-after-permission-tightening";
+const RETRY_WRITE_CALL: &str = "root-write-with-current-permission";
 const RESTART_WAIT: &str = "ROOT_RESTART_WAIT: hold this provider boundary without delegating.";
 
 #[derive(Clone, Copy)]
@@ -162,10 +163,16 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     probe.late_response_emitted.store(true, Ordering::SeqCst);
                     (json!({"content":STALE_REPLY}), "stop")
                 }
-                Case::Permission if call == 0 => {
-                    released(&probe.release_root).await;
+                Case::Permission if call <= 1 => {
+                    if call == 0 {
+                        released(&probe.release_root).await;
+                    }
                     tool_call(
-                        WRITE_CALL,
+                        if call == 0 {
+                            WRITE_CALL
+                        } else {
+                            RETRY_WRITE_CALL
+                        },
                         "Write",
                         json!({"file_path":probe.workspace.join("permission-boundary.txt"),"content":"must require approval"}),
                     )
@@ -921,7 +928,35 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
             move |_| probe.root_ready.load(Ordering::SeqCst),
         )
         .await;
-    let version = fixture.canonical().await.metadata_version;
+    let authority_path = fixture
+        .data
+        .join("sessions")
+        .join(ROOT_ID)
+        .join("actor-authority.json");
+    let authority = || {
+        let entry: bamboo_domain::ActorDirectoryEntry =
+            serde_json::from_slice(&std::fs::read(&authority_path).unwrap()).unwrap();
+        entry.validate().unwrap();
+        entry
+    };
+    let original_run_id = authority().activation.unwrap().run_id;
+    let before_tightening = fixture.canonical().await;
+    assert_eq!(
+        before_tightening
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .effective_permission_mode(),
+        bamboo_domain::SessionPermissionMode::Bypass,
+        "the fixture must actually tighten an existing bypass grant"
+    );
+    let original_user_ids: Vec<_> = before_tightening
+        .messages
+        .iter()
+        .filter(|message| message.role == Role::User)
+        .map(|message| message.id.clone())
+        .collect();
+    let version = before_tightening.metadata_version;
     let response = fixture
         .client
         .patch(format!("{}/sessions/{ROOT_ID}", fixture.base))
@@ -937,9 +972,12 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
     );
     fixture.probe.release_root.send_replace(true);
     let sentinel = fixture.probe.workspace.join("permission-boundary.txt");
+    // Ordinary tools retain this owner and consult the current permission
+    // gate. Tightening bypass must park the original Write without executing
+    // it, starting a replacement run, or replaying its acknowledged input.
     let parked = fixture
         .wait(
-            "next Write asks for approval after bypass is removed",
+            "the original Write asks for approval after bypass is removed",
             move |session| {
                 assert!(
                     !sentinel.exists(),
@@ -952,6 +990,24 @@ async fn root_input_tool_boundary_observes_permission_tightening() {
             },
         )
         .await;
+    assert_eq!(
+        authority().activation.as_ref().unwrap().run_id,
+        original_run_id
+    );
+    assert_eq!(
+        fixture.probe.input_calls.load(Ordering::SeqCst),
+        1,
+        "tightening must not replay the already acknowledged input"
+    );
+    assert_eq!(
+        parked
+            .messages
+            .iter()
+            .filter(|message| message.role == Role::User)
+            .map(|message| message.id.clone())
+            .collect::<Vec<_>>(),
+        original_user_ids
+    );
     assert_eq!(
         parked
             .agent_runtime_state

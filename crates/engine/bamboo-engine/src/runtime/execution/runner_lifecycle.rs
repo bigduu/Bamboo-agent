@@ -231,6 +231,7 @@ pub async fn finalize_runner_exact(
     }
     runner.status = status_from_execution_result(result);
     runner.completed_at = Some(Utc::now());
+    runner.execution_finalized = true;
     true
 }
 

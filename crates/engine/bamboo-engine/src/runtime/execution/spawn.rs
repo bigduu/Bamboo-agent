@@ -1335,8 +1335,7 @@ mod launch_hook_tests {
                 None,
                 Err("fresh Host resources rejected".into()),
             )
-            .err()
-            .expect("resource failure cannot commit");
+            .expect_err("resource failure cannot commit");
             assert_eq!(error, "fresh Host resources rejected");
             assert!(!gate.is_committed());
             assert!(!gate.is_cancelled());
@@ -1426,8 +1425,7 @@ mod launch_hook_tests {
                 Some(&check),
                 Ok(()),
             )
-            .err()
-            .expect("the final synchronous fence remains authoritative");
+            .expect_err("the final synchronous fence remains authoritative");
             assert_eq!(error, "Ready policy expired during resource preflight");
             assert!(!gate.is_committed());
             assert!(!gate.is_cancelled());

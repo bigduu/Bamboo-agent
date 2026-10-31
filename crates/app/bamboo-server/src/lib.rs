@@ -104,6 +104,9 @@
 //!
 //! Google Gemini API compatible endpoints.
 
+#[cfg(test)]
+mod background_live_consumer_tests;
+
 pub mod app_state;
 pub mod browser;
 pub(crate) mod codex_run_tokens;
@@ -151,6 +154,9 @@ pub mod workflow;
 
 // Re-export commonly used types
 pub use app_state::{AgentRunner, AgentStatus, AppState};
+
+#[cfg(test)]
+pub(crate) mod model_routing_test_support;
 pub use config::{build_cors, build_security_headers};
 pub use error::AppError;
 pub use routes::{

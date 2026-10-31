@@ -113,6 +113,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
                 .route(web::get().to(agent::supervisor::inspect_project_scope))
                 .route(web::put().to(agent::supervisor::configure_project_scope)),
         )
+        .route(
+            "/supervisor/default/sessions",
+            web::get().to(agent::supervisor::inspect_managed_sessions),
+        )
+        .route(
+            "/supervisor/default/sessions/{target_id}",
+            web::put().to(agent::supervisor::configure_managed_session),
+        )
         .service(
             web::scope("/tickets")
                 .configure(agent::tickets::sprints::configure)
@@ -238,6 +246,14 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::dead_letters::inspect),
         )
         .route(
+            "/sessions/{session_id}/traces",
+            web::get().to(agent::traces::list),
+        )
+        .route(
+            "/sessions/{session_id}/traces/{trace_id}",
+            web::get().to(agent::traces::detail),
+        )
+        .route(
             "/sessions/{session_id}/dead-letters/{message_id}/retry",
             web::post().to(agent::dead_letters::retry),
         )
@@ -268,6 +284,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/projects/{project_id}/worktrees",
             web::post().to(agent::worktrees::create),
+        )
+        .route(
+            "/projects/{project_id}/worktrees/merge-state",
+            web::get().to(agent::worktrees::merge_state),
         )
         .route("/projects", web::get().to(agent::projects::list_projects))
         .route("/projects", web::post().to(agent::projects::create_project))
@@ -310,6 +330,11 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}/root-mode-operations/{operation_id}",
             web::post().to(agent::sessions::select_root_mode),
+        )
+        .service(
+            web::resource("/sessions/{session_id}/version-migration")
+                .route(web::get().to(agent::sessions::inspect_session_version_migration))
+                .route(web::post().to(agent::sessions::migrate_session_version)),
         )
         .route(
             "/sessions/{session_id}/named-agent-profiles",
@@ -423,6 +448,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // the exact same handlers — old clients (Lotus, bamboo CLI/SDK, magpie)
         // keep working unchanged. New callers should prefer the nested form.
         .route(
+            "/sessions/{session_id}/execute/retry",
+            web::get().to(agent::execute::retry_waiting_handler),
+        )
+        .route(
             "/sessions/{session_id}/execute",
             web::post().to(agent::execute::handler),
         )
@@ -471,6 +500,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         // ── Legacy flat aliases (#251 finding 4) — kept byte-identical to their
         // pre-refactor paths, wired to the SAME handlers as the nested routes
         // above, so no existing client breaks.
+        .route(
+            "/execute/{session_id}/retry",
+            web::get().to(agent::execute::retry_waiting_handler),
+        )
         .route(
             "/execute/{session_id}",
             web::post().to(agent::execute::handler),

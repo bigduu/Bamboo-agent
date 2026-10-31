@@ -262,8 +262,10 @@ fn read_exact_counted(
                 if expected.is_some_and(|prefix| {
                     destination[..count] != prefix[offset..offset + count]
                         && (prefix != super::compact_main::PREFIX
-                            || destination[..count]
-                                != super::compact_main::PREFIX_V2[offset..offset + count])
+                            || (destination[..count]
+                                != super::compact_main::PREFIX_V2[offset..offset + count]
+                                && destination[..count]
+                                    != super::compact_main::PREFIX_V3[offset..offset + count]))
                 }) {
                     return Err(Error::UnsupportedAuthority);
                 }

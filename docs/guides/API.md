@@ -76,7 +76,7 @@ worktree registry; Core configuration stores directory preferences only.
 | --- | --- |
 | `GET /worktrees/preferences` | Read `default_root` and `project_roots` |
 | `PUT /worktrees/preferences` | Set or clear one directory scope |
-| `GET /projects/{project_id}/worktrees` | Discover bound repositories and native Git worktrees |
+| `GET /projects/{project_id}/worktrees` | Discover repositories within Project source directories and native Git worktrees |
 | `POST /projects/{project_id}/worktrees` | Create a new branch and user worktree |
 
 A preference write is `{"root":"/Volumes/External/worktrees"}` for the global
@@ -92,7 +92,7 @@ Creation accepts:
 
 ```json
 {
-  "repository": "/existing/bound/repository",
+  "repository": "/existing/project/backend",
   "root": "/Volumes/External/worktrees",
   "name": "task-42",
   "branch": "feature/task-42"
@@ -101,15 +101,26 @@ Creation accepts:
 
 `root` may be omitted to use the Project override or global default, in that
 order. An absent default is an error. `repository` must exactly match a canonical
-Project source path. The new branch starts at that checkout's current `HEAD`.
+source returned by current Project repository discovery. Creation repeats discovery;
+being below the Project directory or sharing Git metadata alone does not authorize
+a source. The new branch starts at that checkout's current `HEAD`.
 Folder names accept 1–80 ASCII letters, digits, hyphens or underscores.
 Success returns HTTP 201 with `{"path":"<canonical-root>/task-42"}`.
 
 Listing returns `project_id`, effective `default_root`, and `repositories`.
 Each repository includes `path`, `common_dir` when available, `error`, and
-`worktrees`. A worktree contains `path`, `branch` (null for detached HEAD),
+`worktrees`. Optional `warnings` contains discovery diagnostics affecting an
+otherwise usable repository; clients should display them without disabling that
+source. A worktree contains `path`, `branch` (null for detached HEAD),
 `head`, `dirty` (null when inspection fails), `locked`, `prunable`, `occupied`,
-`error`, and observed `sessions` (`id`, `title`, `active`). Occupancy is an
+`error`, `openable`, `project_owned`, and observed `sessions` (`id`, `title`, `active`).
+`openable` is false when a path cannot be verified as an available checkout;
+clients must disable opening it. Such entries remain visible with diagnostics,
+and other usable linked worktrees remain available. This includes Git metadata
+entries that cannot be mapped to a verified main checkout.
+`project_owned` means the canonical checkout is already covered by a registered
+Project root. Clients may skip redundant child-directory binding when opening it;
+session creation still applies the existing backend ownership checks. Occupancy is an
 observation of Bamboo Sessions/Git locks, not a cross-application lease.
 Unavailable paths are reported rather than dropped or pruned.
 Path-bearing Git output is parsed as raw OS bytes. `path_encoding` is `utf-8`
@@ -120,6 +131,26 @@ native Git lock/prunable facts remain unchanged, and other checkouts remain
 available. Raw filenames inside a Unicode checkout do not prevent dirty/clean
 inspection. Creation/preferences require Unicode paths because their authority
 is JSON; no raw-byte path is silently replaced or migrated.
+
+A Project may keep a plain parent folder such as `/existing/project` while its
+`frontend` and `services/backend` children are separate Git repositories. Discovery
+reads `.git` directories and files (including submodules and linked worktrees),
+returns each repository for selection, and does not change `project_path` or
+`workspace_bindings`. An empty ordinary folder returns an empty repository list,
+not a Git failure. Broken metadata and unreadable paths remain diagnostics.
+Discovered checkouts must also match Git's registered worktree paths or the
+common metadata's explicit `core.worktree` back-reference; an arbitrary `.git`
+pointer is not sufficient. Sources sharing a Git common directory are grouped
+once, and the displayed source path determines the `HEAD` used for creation.
+
+Scanning is limited to 12 descendant levels and 20,000 directory entries per
+registered root; reaching a limit is reported explicitly. Child-directory symlinks
+are not followed. Git metadata and common dependency/build directories
+(`.git`, `.hg`, `.svn`, `node_modules`, `target`, `dist`, `build`, `.next`, `.nuxt`,
+`.venv`, `venv`, `__pycache__`, `.cache`, `.turbo`, `.parcel-cache`, `coverage`) are
+not traversed. A directly registered source remains selectable even when its
+directory name is normally excluded from descendant scanning. Explicit bare
+sources remain supported, but their metadata is never scanned for children.
 
 Offline volumes, unwritable paths, existing destinations/branches, traversal,
 creation locks and boundary violations return explicit errors. There is no
@@ -203,7 +234,13 @@ The trusted default Supervisor uses this bounded orchestration posture in both
 Standard and Ultra, with `session_control` and scoped `session_history` admitted
 only through their existing Supervisor checks. Its independent-Root followup
 requires an explicitly attached target in current authorized Project/lifetime
-scope. Ordinary Ultra Roots do not gain that exception. Neither mode nor tool
+scope. Main execution first lists and inspects suitable managed independent
+Sessions; bounded Child agents assist with planning, review and verification.
+The owner-facing `GET /api/v1/supervisor/default/sessions` observes these links,
+and explicit `PUT /api/v1/supervisor/default/sessions/{target_id}` attaches or
+detaches an existing Root with the current incarnation and management revision.
+These operations start no task and preserve the target's context and permissions.
+Ordinary Ultra Roots do not gain that exception. Neither mode nor tool
 exposure initializes Work, enables its feature flags, or proves worker readiness.
 Unavailable delegation is a recoverable blocker; the Supervisor does not switch
 to direct implementation. See [Supervisor role and scope](../supervisor-identity.md#model-role-and-thinking-mode).

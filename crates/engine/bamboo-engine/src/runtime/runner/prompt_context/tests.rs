@@ -269,8 +269,10 @@ async fn external_memory_includes_ledger_agenda_when_records_are_open() {
     assert!(system_prompt.contains("record it with the `ledger` tool"));
 
     // Flag off → the section disappears even with open records.
-    let mut flags = crate::runtime::config::PromptMemoryFlags::default();
-    flags.ledger_agenda = false;
+    let flags = crate::runtime::config::PromptMemoryFlags {
+        ledger_agenda: false,
+        ..Default::default()
+    };
     super::refresh_external_memory_context_with_stores(
         &mut session,
         &store,
@@ -1210,6 +1212,245 @@ async fn external_memory_omits_relevant_recall_and_uses_global_dream_when_projec
     assert_eq!(observability.relevant_memory_status, "disabled");
     assert_eq!(observability.global_dream_fallback_status, "forced_loaded");
     assert_eq!(observability.dream_source, "global_fallback");
+}
+
+#[tokio::test]
+async fn legacy_background_rerank_retains_session_provider_and_explicit_admission() {
+    use bamboo_domain::{ProjectId, ProviderModelRef};
+    use bamboo_memory::memory_store::{DurableMemoryType, MemoryScope, MemoryStore};
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server_a = MockServer::start().await;
+    let server_b = MockServer::start().await;
+    let temp = tempfile::tempdir().unwrap();
+    let store = MemoryStore::new(temp.path());
+    let project = ProjectId::parse("legacy-background-rerank").unwrap();
+    let project_key = project.to_string();
+    let project_memory = store.for_project(&project);
+    let first = project_memory
+        .write_memory(
+            MemoryScope::Project,
+            Some(&project_key),
+            DurableMemoryType::Feedback,
+            "release checklist",
+            "release freeze checklist",
+            &["release".into()],
+            Some("legacy-rerank"),
+            "chat-a",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let second = project_memory
+        .write_memory(
+            MemoryScope::Project,
+            Some(&project_key),
+            DurableMemoryType::Feedback,
+            "mobile release",
+            "mobile release freeze decision",
+            &["release".into()],
+            Some("legacy-rerank"),
+            "chat-a",
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+    let rerank_content = json!({"ids":[second.frontmatter.id, first.frontmatter.id]}).to_string();
+    let chunk =
+        json!({"choices":[{"index":0,"delta":{"content":rerank_content.clone()}}]}).to_string();
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n")),
+        )
+        .mount(&server_a)
+        .await;
+    let b_start = json!({"type":"content_block_start", "index":0, "content_block":{"type":"text", "text":""}});
+    let b_delta = json!({"type":"content_block_delta", "index":0, "delta":{"type":"text_delta", "text":rerank_content}});
+    let b_stop = json!({"type":"content_block_stop", "index":0});
+    let b_end = json!({"type":"message_stop"});
+    let b_sse = format!("event: content_block_start\ndata: {b_start}\n\nevent: content_block_delta\ndata: {b_delta}\n\nevent: content_block_stop\ndata: {b_stop}\n\nevent: message_stop\ndata: {b_end}\n\n");
+    Mock::given(method("POST"))
+        .and(path("/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(b_sse),
+        )
+        .mount(&server_b)
+        .await;
+
+    // The older global field is a model only; the current session provider
+    // supplies its account. Both accounts and endpoints are synthetic.
+    let mut config = bamboo_llm::Config::default();
+    config.provider = "openai".into();
+    config.default_provider_instance = None;
+    config.defaults = None;
+    config.http_proxy = "http://127.0.0.1:9".into();
+    config.https_proxy.clear();
+    config.proxy_auth = None;
+    config.providers_mut().openai = Some(
+        serde_json::from_value(json!({
+            "api_key":"synthetic-a", "base_url":server_a.uri(),
+            "model":"chat-a", "fast_model":"fast-a"
+        }))
+        .unwrap(),
+    );
+    config.providers_mut().anthropic = Some(
+        serde_json::from_value(json!({
+            "api_key":"synthetic-b", "base_url":server_b.uri(),
+            "model":"chat-b", "fast_model":"fast-b"
+        }))
+        .unwrap(),
+    );
+    config
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .background_model = Some("background-only".into());
+    let registry = Arc::new(
+        bamboo_llm::ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+
+    let current_a =
+        crate::model_areas::resolve_global_area_models(&config, "openai", &registry).background;
+    let current_b =
+        crate::model_areas::resolve_global_area_models(&config, "anthropic", &registry).background;
+    let b_generic_denied = registry
+        .provider_for_model(&ProviderModelRef::new("anthropic", "background-only"))
+        .is_err();
+    let b_is_session_provider = current_b.as_ref().is_some_and(|selected| {
+        selected.model_name == "background-only"
+            && registry
+                .get("anthropic")
+                .is_some_and(|handle| Arc::ptr_eq(&selected.provider, &handle))
+    });
+
+    // Build a valid managed generation, then set an excluded legacy role. The
+    // existing explicit allowlist must still reject it without using account B.
+    let mut explicit = config.clone();
+    explicit.memory_mut().as_mut().unwrap().background_model = None;
+    explicit
+        .providers_mut()
+        .openai
+        .as_mut()
+        .unwrap()
+        .extra
+        .insert("runtime_models".into(), json!(["chat-a", "fast-a"]));
+    let explicit_registry = Arc::new(
+        bamboo_llm::ProviderRegistry::from_config(&explicit, temp.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    explicit.memory_mut().as_mut().unwrap().background_model = Some("background-only".into());
+    let explicit_denied = crate::model_config_helper::try_resolve_background_model(
+        &explicit,
+        "openai",
+        &explicit_registry,
+    )
+    .is_err();
+
+    // Follow the interactive runtime's background context construction into
+    // the actual memory rerank consumer, with a loopback-only synthetic server.
+    let runtime_context = super::PromptMemoryRuntimeContext {
+        llm: current_a
+            .as_ref()
+            .map(|model| model.provider.clone())
+            .unwrap_or_else(|| registry.get("openai").unwrap()),
+        background_model_name: current_a.as_ref().map(|model| model.model_name.clone()),
+    };
+    let workspace = temp.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let mut session = bamboo_agent_core::Session::new("legacy-rerank", "chat-a");
+    session.set_project_id_meta(project_key.clone());
+    session.add_message(Message::system("Synthetic test"));
+    session.metadata.insert(
+        "workspace_path".into(),
+        workspace.to_string_lossy().into_owned(),
+    );
+    session.add_message(Message::user("mobile release freeze"));
+    let exposure = super::refresh_external_memory_context_with_store(
+        &mut session,
+        &store,
+        crate::runtime::config::PromptMemoryFlags {
+            relevant_recall_rerank: true,
+            ..Default::default()
+        },
+        Some(&runtime_context),
+    )
+    .await;
+    let a_after_a = server_a.received_requests().await.unwrap().len();
+    let b_after_a = server_b.received_requests().await.unwrap().len();
+    let a_outcome = exposure
+        .observation("round-a", &session.id, chrono::Utc::now())
+        .recall_outcome;
+
+    // A second actual rerank runs under session B. It must use only B even
+    // though the global default remains A.
+    let b_context = super::PromptMemoryRuntimeContext {
+        llm: current_b
+            .as_ref()
+            .map(|model| model.provider.clone())
+            .unwrap_or_else(|| registry.get("anthropic").unwrap()),
+        background_model_name: current_b.as_ref().map(|model| model.model_name.clone()),
+    };
+    let mut session_b = bamboo_agent_core::Session::new("legacy-rerank-b", "chat-b");
+    session_b.set_project_id_meta(project_key);
+    session_b.add_message(Message::system("Synthetic test"));
+    session_b.metadata.insert(
+        "workspace_path".into(),
+        workspace.to_string_lossy().into_owned(),
+    );
+    session_b.add_message(Message::user("mobile release freeze"));
+    let b_exposure = super::refresh_external_memory_context_with_store(
+        &mut session_b,
+        &store,
+        crate::runtime::config::PromptMemoryFlags {
+            relevant_recall_rerank: true,
+            ..Default::default()
+        },
+        Some(&b_context),
+    )
+    .await;
+    let b_outcome = b_exposure
+        .observation("round-b", &session_b.id, chrono::Utc::now())
+        .recall_outcome;
+    let requests_a = server_a.received_requests().await.unwrap();
+    let requests_b = server_b.received_requests().await.unwrap();
+    let requested_model = |requests: &[wiremock::Request]| {
+        requests
+            .first()
+            .and_then(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+            .and_then(|body| {
+                body.get("model")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+            })
+    };
+    let model_a = requested_model(&requests_a);
+    let model_b = requested_model(&requests_b);
+    let reranked = bamboo_metrics::types::PromptMemoryRecallOutcome::Reranked;
+    let all_ok = explicit_denied
+        && b_generic_denied
+        && b_is_session_provider
+        && a_outcome == reranked
+        && b_outcome == reranked
+        && a_after_a == 1
+        && b_after_a == 0
+        && requests_a.len() == 1
+        && requests_b.len() == 1
+        && model_a.as_deref() == Some("background-only")
+        && model_b.as_deref() == Some("background-only");
+    assert!(all_ok,
+        "A outcome={a_outcome:?} A after A={a_after_a} A final={} A model={model_a:?}; B outcome={b_outcome:?} B after A={b_after_a} B final={} B model={model_b:?}; B pair={b_is_session_provider} B generic denied={b_generic_denied} explicit denied={explicit_denied}",
+        requests_a.len(), requests_b.len());
 }
 
 #[tokio::test]

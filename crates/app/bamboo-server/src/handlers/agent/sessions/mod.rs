@@ -6,9 +6,9 @@ mod types;
 pub use handlers::{
     activate_discoverable_tools, cleanup_sessions, clear_session, copy_session, create_session,
     deactivate_discoverable_tools, get_attachment, get_session, get_session_create_operation,
-    get_system_prompt_snapshot, list_discoverable_tools, list_sessions, patch_session,
-    recover_root_mode, regenerate_session_title, run_project_dream, running_sessions_snapshot,
-    select_root_mode,
+    get_system_prompt_snapshot, inspect_session_version_migration, list_discoverable_tools,
+    list_sessions, migrate_session_version, patch_session, recover_root_mode,
+    regenerate_session_title, run_project_dream, running_sessions_snapshot, select_root_mode,
 };
 pub use types::{
     ActivateDiscoverableToolsRequest, CleanupRequest, CopySessionResponse, CreateSessionRequest,

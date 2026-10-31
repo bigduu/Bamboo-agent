@@ -27,6 +27,8 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, Semaphore};
 use tokio::time::{sleep, timeout, Duration};
 
+include!("gold_router_registry_fixture.rs");
+
 fn auto_answer_call(arguments: serde_json::Value) -> ToolCall {
     ToolCall {
         id: "call-1".to_string(),
@@ -215,6 +217,198 @@ fn build_pending_session(
     );
     session.agent_runtime_state = Some(awaiting_clarification_state("run-awaiting-clarification"));
     session
+}
+
+#[tokio::test]
+async fn host_gold_config_changes_reject_stale_registry_without_dispatch() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .respond_with(|request: &Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let tool = body["tools"][0]["function"]["name"].as_str().unwrap();
+            let args = match tool {
+                "report_gold_evaluation" => json!({
+                    "decision": "continue",
+                    "confidence": "high",
+                    "reasoning": "synthetic Host state",
+                    "missing_information": [],
+                    "next_action": "Continue the synthetic task"
+                }),
+                "report_gold_auto_answer" => json!({
+                    "apply": false,
+                    "confidence": "high",
+                    "reasoning": "synthetic Host decline"
+                }),
+                _ => panic!("unexpected synthetic tool: {tool}"),
+            };
+            let frame = json!({
+                "id": "synthetic-host",
+                "object": "chat.completion.chunk",
+                "created": 0,
+                "model": "test-model",
+                "choices": [{"index": 0, "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "synthetic-host-tool",
+                    "type": "function",
+                    "function": {"name": tool, "arguments": args.to_string()}
+                }]}, "finish_reason": null}]
+            });
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"))
+        })
+        .mount(&mock)
+        .await;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut config = Config::default();
+    config.provider = "relay".into();
+    config.default_provider_instance = Some("relay".into());
+    config.http_proxy = "https://127.0.0.1:9".into();
+    config.https_proxy.clear();
+    config.proxy_auth = None;
+    config.provider_instances.insert(
+        "relay".into(),
+        serde_json::from_value(json!({
+            "provider_type": "openai",
+            "enabled": true,
+            "api_key": "synthetic-host-only",
+            "base_url": mock.uri(),
+            "model": "main-model",
+            "runtime_models": ["main-model", "test-model"]
+        }))
+        .unwrap(),
+    );
+
+    // The injected handle is a control: the constructor itself builds a
+    // config-managed registry, and the current target must use that registry.
+    let injected = ScriptedProvider::new("unused");
+    let injected_trait: Arc<dyn LLMProvider> = injected.clone();
+    let mut app_state =
+        AppState::new_with_provider(temp_dir.path().to_path_buf(), config, injected_trait)
+            .await
+            .expect("isolated Host state");
+    app_state.stop_config_watcher_for_test();
+    let state = Data::new(app_state);
+    let baseline = state.config.read().await.clone();
+    let old_handle = state.provider_registry.get("relay").expect("managed relay");
+    let session_id = "host-gold-stale-managed-route";
+    let mut session = build_pending_session(
+        session_id,
+        "synthetic-call",
+        "conclusion_with_options",
+        "Continue the synthetic task?",
+        &["OK", "Need changes"],
+        true,
+        json!({"summary": "synthetic fixture"}),
+    );
+    session.model_ref = Some(bamboo_domain::ProviderModelRef::new("relay", "test-model"));
+    state.save_and_cache_session(&mut session).await;
+    let resume_port = AppStateResumeRef(state.clone());
+    let mut expected_requests = 0usize;
+
+    for flag in [None, Some(false), Some(true)] {
+        for change in ["disabled", "removed", "revoked"] {
+            let mut current = baseline.clone();
+            current.features = serde_json::from_value(match flag {
+                None => json!({}),
+                Some(value) => json!({"provider_model_ref": value}),
+            })
+            .unwrap();
+            *state.config.write().await = current;
+
+            // Both Gold consumers must be reached before invalidating the
+            // config. The synthetic answer declines, so no resume is started.
+            let valid = maybe_auto_answer_pending_question(
+                state.get_ref(),
+                &resume_port,
+                session_id,
+                Some(test_gold_config()),
+            )
+            .await;
+            assert!(
+                matches!(
+                    valid,
+                    GoldAutoAnswerOutcome::Skipped { ref reason }
+                        if reason.starts_with("question_decision_declined:")
+                ),
+                "valid flag={flag:?}, change={change}: {valid:?}"
+            );
+            expected_requests += 2;
+            let requests = mock.received_requests().await.unwrap();
+            assert_eq!(requests.len(), expected_requests);
+            for (request, tool) in requests[expected_requests - 2..]
+                .iter()
+                .zip(["report_gold_evaluation", "report_gold_auto_answer"])
+            {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(body["model"], "test-model");
+                assert_eq!(body["tools"][0]["function"]["name"], tool);
+            }
+
+            {
+                let mut current = state.config.write().await;
+                match change {
+                    "disabled" => {
+                        current.provider_instances.get_mut("relay").unwrap().enabled = false
+                    }
+                    "removed" => {
+                        current.provider_instances.remove("relay");
+                    }
+                    "revoked" => {
+                        current
+                            .provider_instances
+                            .get_mut("relay")
+                            .unwrap()
+                            .extra
+                            .insert("runtime_models".into(), json!(["main-model"]));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(Arc::ptr_eq(
+                &old_handle,
+                &state.provider_registry.get("relay").unwrap(),
+            ));
+            let blocked = maybe_auto_answer_pending_question(
+                state.get_ref(),
+                &resume_port,
+                session_id,
+                Some(test_gold_config()),
+            )
+            .await;
+            let expected_reason = match change {
+                "disabled" => "is disabled",
+                "removed" => "has no available current configuration",
+                "revoked" => "admitted",
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(
+                    blocked,
+                    GoldAutoAnswerOutcome::Skipped { ref reason }
+                        if reason.starts_with("state_evaluation_failed:")
+                            && reason.contains(expected_reason)
+                ),
+                "blocked flag={flag:?}, change={change}: {blocked:?}"
+            );
+            assert_eq!(
+                mock.received_requests().await.unwrap().len(),
+                expected_requests
+            );
+            assert!(injected.request_purposes().is_empty());
+            assert!(state
+                .load_session_merged(session_id)
+                .await
+                .unwrap()
+                .pending_question
+                .is_some());
+        }
+    }
 }
 
 #[tokio::test]

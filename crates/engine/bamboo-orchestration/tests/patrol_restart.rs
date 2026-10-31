@@ -239,6 +239,340 @@ impl CheckpointPort for EncodedJournal {
     }
 }
 
+#[test]
+fn program_entry_reads_canonical_ticket_facts_without_an_execution_or_delivery() {
+    let fixture = Fixture::new();
+    let before = fixture.service().published().unwrap();
+    let before_bytes = bamboo_tickets::canonical_bytes(&before.1).unwrap();
+    let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+    let project = ProjectId::parse(fixture.scope.project_id.clone()).unwrap();
+    let work_ids = [fixture.scope.work_id.clone()];
+    let selection = program::ProgramSelection {
+        project_id: &project,
+        work_ids: &work_ids,
+    };
+    let mut journal = EncodedJournal::default();
+    assert_eq!(
+        program
+            .tick_project(
+                fixture.service(),
+                &fixture.runtime(),
+                &selection,
+                &ClockAt(100),
+                &mut journal
+            )
+            .unwrap(),
+        1
+    );
+    let original_bytes = journal.bytes.clone();
+    assert_eq!(
+        program
+            .tick_project(
+                fixture.service(),
+                &fixture.runtime(),
+                &selection,
+                &ClockAt(101),
+                &mut journal
+            )
+            .unwrap(),
+        0,
+        "unchanged facts wait for the existing next check"
+    );
+    assert_eq!(journal.bytes, original_bytes);
+    assert_eq!(
+        program
+            .tick_project(
+                fixture.service(),
+                &fixture.runtime(),
+                &selection,
+                &ClockAt(30_100),
+                &mut journal
+            )
+            .unwrap(),
+        1
+    );
+    let saved = journal.load(&fixture.scope).unwrap().unwrap();
+    let incident = saved.checkpoint.incident.unwrap();
+    assert_eq!(incident.reason, Reason::EvidenceUnknown);
+    assert_eq!(incident.attempts, 0);
+    let escalation = incident.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+    let after = fixture.service().published().unwrap();
+    assert_eq!(after.0, before.0);
+    assert_eq!(
+        bamboo_tickets::canonical_bytes(&after.1).unwrap(),
+        before_bytes
+    );
+}
+
+#[test]
+fn program_entry_reopen_preserves_original_incident_scope_and_checks_fresh_authority() {
+    let mut fixture = Fixture::new();
+    let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+    let project = ProjectId::parse(fixture.scope.project_id.clone()).unwrap();
+    let work_ids = [fixture.scope.work_id.clone()];
+    let selection = program::ProgramSelection {
+        project_id: &project,
+        work_ids: &work_ids,
+    };
+    let mut journal = EncodedJournal::default();
+    program
+        .tick_project(
+            fixture.service(),
+            &fixture.runtime(),
+            &selection,
+            &ClockAt(100),
+            &mut journal,
+        )
+        .unwrap();
+    let original = journal
+        .load(&fixture.scope)
+        .unwrap()
+        .unwrap()
+        .checkpoint
+        .incident
+        .unwrap()
+        .id;
+    fixture.reopen();
+    assert!(
+        fixture.service().published().unwrap().1.authority_epoch > fixture.scope.authority_epoch
+    );
+    let before = fixture.service().published().unwrap().0;
+    program
+        .tick_project(
+            fixture.service(),
+            &fixture.runtime(),
+            &selection,
+            &ClockAt(30_100),
+            &mut journal,
+        )
+        .unwrap();
+    let incident = journal
+        .load(&fixture.scope)
+        .unwrap()
+        .unwrap()
+        .checkpoint
+        .incident
+        .unwrap();
+    assert_eq!(incident.id, original);
+    let escalation = incident.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+    assert_eq!(fixture.service().published().unwrap().0, before);
+
+    let denied = fixture.authority(Principal::User {
+        user_id: "owner".into(),
+    });
+    assert!(matches!(
+        program.tick_project(
+            fixture.service(),
+            &denied,
+            &selection,
+            &ClockAt(30_101),
+            &mut journal
+        ),
+        Err(Error::Port(PortError::Denied))
+    ));
+}
+
+#[test]
+fn program_entry_observes_cancelled_attempt_after_runtime_stop_clears_the_active_pointer() {
+    let mut fixture = Fixture::new();
+    let project = ProjectId::parse(fixture.scope.project_id.clone()).unwrap();
+    let ids = [fixture.scope.work_id.clone()];
+    let selection = program::ProgramSelection {
+        project_id: &project,
+        work_ids: &ids,
+    };
+    let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+    let mut journal = EncodedJournal::default();
+    for now in [100, 30_100] {
+        assert_eq!(
+            program
+                .tick_project(
+                    fixture.service(),
+                    &fixture.runtime(),
+                    &selection,
+                    &ClockAt(now),
+                    &mut journal,
+                )
+                .unwrap(),
+            1
+        );
+    }
+    let original = journal.load(&fixture.scope).unwrap().unwrap();
+    let incident = original.checkpoint.incident.unwrap();
+    assert!(!matches!(incident.phase, Phase::Resolved { .. }));
+    let escalation = incident.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+
+    fixture.apply(
+        Principal::Supervisor {
+            session_id: "supervisor".into(),
+        },
+        vec![Operation::Cancel {
+            work_id: fixture.scope.work_id.clone(),
+        }],
+    );
+    assert_eq!(
+        program
+            .tick_project(
+                fixture.service(),
+                &fixture.runtime(),
+                &selection,
+                &ClockAt(30_101),
+                &mut journal,
+            )
+            .unwrap(),
+        1
+    );
+    assert!(!matches!(
+        journal
+            .load(&fixture.scope)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .incident
+            .unwrap()
+            .phase,
+        Phase::Resolved { .. }
+    ));
+
+    fixture.apply(
+        Principal::Runtime,
+        vec![Operation::RuntimeStopped {
+            assignment_id: fixture.scope.assignment_id.clone(),
+            receipt: fixture.receipt.clone(),
+            completed: false,
+        }],
+    );
+    let (before, snapshot) = fixture.service().published().unwrap();
+    let work = &snapshot.tickets[&fixture.scope.work_id];
+    assert_eq!(work.state, WorkState::Cancelled);
+    assert!(work.active_assignment.is_none());
+    assert!(work.current_submission.is_none());
+    assert!(snapshot.assignments[&fixture.scope.assignment_id].process_stopped);
+    assert_eq!(
+        program
+            .tick_project(
+                fixture.service(),
+                &fixture.runtime(),
+                &selection,
+                &ClockAt(30_102),
+                &mut journal,
+            )
+            .unwrap(),
+        1
+    );
+    let resolved = journal.load(&fixture.scope).unwrap().unwrap();
+    assert!(resolved.version > original.version);
+    let resolved = resolved.checkpoint.incident.unwrap();
+    assert_eq!(resolved.id, incident.id);
+    assert!(matches!(resolved.phase, Phase::Resolved { .. }));
+    let escalation = resolved.escalation.unwrap();
+    assert_eq!(escalation.deliveries, 0);
+    assert!(!escalation.queued);
+    assert_eq!(fixture.service().published().unwrap().0, before);
+}
+
+#[test]
+fn program_entry_selection_cannot_cross_project_or_duplicate_a_work() {
+    let fixture = Fixture::new();
+    let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+    let project = ProjectId::parse(fixture.scope.project_id.clone()).unwrap();
+    let other = ProjectId::parse("other-project").unwrap();
+    let ids = [fixture.scope.work_id.clone()];
+    let duplicate = [fixture.scope.work_id.clone(), fixture.scope.work_id.clone()];
+    let mut journal = EncodedJournal::default();
+    assert!(matches!(
+        program.tick_project(
+            fixture.service(),
+            &fixture.runtime(),
+            &program::ProgramSelection {
+                project_id: &other,
+                work_ids: &ids
+            },
+            &ClockAt(100),
+            &mut journal
+        ),
+        Err(Error::Port(PortError::Denied))
+    ));
+    assert!(journal.bytes.is_none());
+    assert!(matches!(
+        program.tick_project(
+            fixture.service(),
+            &fixture.runtime(),
+            &program::ProgramSelection {
+                project_id: &project,
+                work_ids: &duplicate
+            },
+            &ClockAt(100),
+            &mut journal
+        ),
+        Err(Error::InvalidConfiguration)
+    ));
+    assert!(journal.bytes.is_none());
+}
+
+#[test]
+fn program_entry_authorizes_all_valid_ready_selections_above_the_inspect_batch_limit() {
+    for count in [33, 64] {
+        let mut fixture = Fixture::new();
+        let project = ProjectId::parse(fixture.scope.project_id.clone()).unwrap();
+        let contract = fixture.service().published().unwrap().1.tickets[&fixture.scope.work_id]
+            .contract
+            .clone();
+        let mut work_ids = vec![fixture.scope.work_id.clone()];
+        for first in (1..count).step_by(16) {
+            let mut operations = Vec::new();
+            for index in first..(first + 16).min(count) {
+                let id = format!("batch-work-{index}");
+                operations.push(Operation::Create {
+                    temp_id: id.clone(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract.clone(),
+                    depends_on: BTreeSet::new(),
+                });
+                operations.push(Operation::AssociateProject {
+                    ticket_id: id,
+                    project_id: project.clone(),
+                });
+            }
+            let receipt = fixture.apply(
+                Principal::Supervisor {
+                    session_id: "supervisor".into(),
+                },
+                operations,
+            );
+            work_ids.extend(receipt.ids.into_values());
+        }
+        assert_eq!(work_ids.len(), count);
+        let before = fixture.service().published().unwrap().0;
+        let mut journal = EncodedJournal::default();
+        let program = program::ProgramPatrol::new(Policy::default()).unwrap();
+        assert_eq!(
+            program
+                .tick_project(
+                    fixture.service(),
+                    &fixture.runtime(),
+                    &program::ProgramSelection {
+                        project_id: &project,
+                        work_ids: &work_ids
+                    },
+                    &ClockAt(100),
+                    &mut journal
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(fixture.service().published().unwrap().0, before);
+        assert!(journal.load(&fixture.scope).unwrap().is_some());
+    }
+}
+
 struct Probe {
     observed: host::TicketObservation,
     journal: EncodedJournal,
@@ -623,4 +957,121 @@ fn checkpoint_keeps_original_pending_diagnostic_request_and_budget_receipt_on_re
     assert_eq!(recovered.version, 7);
     assert_eq!(recovered.checkpoint, cp);
     assert_eq!(recovered.checkpoint.incident.unwrap().attempts, 1);
+}
+
+#[test]
+fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation() {
+    use bamboo_tickets::WorkTokenLimits;
+    let mut fixture = Fixture::new();
+    let owner = fixture.authority(Principal::User {
+        user_id: "budget-owner".into(),
+    });
+    fixture
+        .service()
+        .configure_work_token_budget(
+            &owner,
+            0,
+            WorkTokenLimits {
+                work_tokens: BTreeMap::from([(fixture.scope.work_id.clone(), 120)]),
+                utc_day_tokens: 120,
+                total_tokens: 120,
+            },
+        )
+        .unwrap();
+    let observation = fixture
+        .observation()
+        .observation(&fixture.scope, 0)
+        .unwrap();
+    let request = DiagnosticRequest {
+        operation: OperationId {
+            incident: IncidentId {
+                scope: fixture.scope.clone(),
+                progress_sequence: 0,
+            },
+            kind: OperationKind::Diagnostic(1),
+        },
+        model: Model {
+            provider: "unexecuted-provider".into(),
+            model: "unexecuted-model".into(),
+            max_input_tokens: 100,
+            max_output_tokens: 20,
+            max_evidence_bytes: 1024,
+            max_evidence_refs: 2,
+        },
+        deadline_ms: 1000,
+        input: DiagnosticInput {
+            scope: fixture.scope.clone(),
+            source_revision: observation.source_revision,
+            since_cursor: observation.cursor,
+            through_cursor: observation.cursor,
+            summary: "Authoritative scoped facts".into(),
+            references: vec![],
+            input_tokens: 10,
+        },
+    };
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    budget.settle(&receipt, Usage::Unknown).unwrap();
+    drop(budget);
+    fixture.reopen();
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(101),
+    };
+    assert_eq!(budget.reserve(&request).unwrap(), receipt);
+    assert_eq!(
+        fixture
+            .service()
+            .work_token_budget(&authority)
+            .unwrap()
+            .unwrap()
+            .total_charged,
+        120
+    );
+    let mut changed = request.clone();
+    changed.model.max_output_tokens += 1;
+    assert_eq!(budget.reserve(&changed), Err(BudgetBlock::Unavailable));
+    drop(budget);
+    let work_id = fixture.scope.work_id.clone();
+    fixture.apply(
+        Principal::Supervisor {
+            session_id: "supervisor".into(),
+        },
+        vec![Operation::Cancel { work_id }],
+    );
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(102),
+    };
+    budget
+        .settle(
+            &receipt,
+            Usage::Known {
+                input_tokens: 10,
+                output_tokens: 5,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        fixture
+            .service()
+            .work_token_budget(&authority)
+            .unwrap()
+            .unwrap()
+            .total_charged,
+        15
+    );
+    assert_eq!(
+        fixture.service().published().unwrap().1.tickets[&fixture.scope.work_id].state,
+        WorkState::Cancelled
+    );
 }

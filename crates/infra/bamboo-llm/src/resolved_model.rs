@@ -72,6 +72,43 @@ impl RoleReasoningProvider {
 
 #[async_trait]
 impl LLMProvider for RoleReasoningProvider {
+    fn fixed_gold_policy_delegate(&self) -> Option<Arc<dyn LLMProvider>> {
+        Some(self.inner.clone())
+    }
+
+    fn local_dispatch_refused(&self) -> bool {
+        self.inner.local_dispatch_refused()
+    }
+
+    fn queue_requires_current_route(&self) -> bool {
+        self.inner.queue_requires_current_route()
+    }
+    fn queued_route_identity(&self) -> crate::provider::QueuedRouteIdentity {
+        crate::provider::queued_identity_for(&self.inner)
+    }
+
+    fn queued_provider_snapshot(&self) -> Result<Option<Arc<dyn LLMProvider>>> {
+        let Some(inner) = self.inner.queued_provider_snapshot()? else {
+            return Ok(None);
+        };
+        Ok(Some(Arc::new(Self {
+            inner,
+            reasoning_effort: self.reasoning_effort,
+        })))
+    }
+
+    fn known_pre_dispatch_error(&self) -> Option<crate::provider::LLMError> {
+        self.inner.known_pre_dispatch_error()
+    }
+
+    fn resource_allocation_identity(&self) -> Option<usize> {
+        Some(
+            self.inner
+                .resource_allocation_identity()
+                .unwrap_or(Arc::as_ptr(&self.inner) as *const () as usize),
+        )
+    }
+
     async fn vision_support_override(&self, model: &str) -> Option<bool> {
         self.inner.vision_support_override(model).await
     }

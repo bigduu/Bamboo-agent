@@ -44,6 +44,7 @@ mod approval_replay;
 mod builder;
 mod error;
 mod execute_request;
+mod sdk_provider_guard;
 mod skill_runtime;
 mod tools;
 
@@ -56,7 +57,7 @@ use async_trait::async_trait;
 pub use builder::AgentBuilder;
 pub use execute_request::{
     inspect_loop, CountedLoopConfig, ExecuteRequestBuilder, LoopControlConfig, LoopControlReceipt,
-    LoopStatusSnapshot,
+    LoopStatusSnapshot, UpstreamRetry,
 };
 use tokio::sync::mpsc;
 
@@ -160,6 +161,15 @@ pub struct Agent {
     /// Effective configured model used only when creating a new session. This
     /// must not alter an existing caller-supplied session during execution.
     session_model: Option<String>,
+    /// Account identity of the assembled client, independent of live defaults.
+    provider_scope: Option<String>,
+    /// Whether the bound client originated from an explicit provider instance.
+    provider_scope_is_instance: Option<bool>,
+    /// Opaque factory-input witness only for an SDK-created native client.
+    native_provider_binding: Option<Arc<bamboo_llm::provider_registry::SdkProviderBinding>>,
+    caller_provider_binding: Option<sdk_provider_guard::SdkBinding>,
+    /// Live metadata used to resolve aliases against the assembled client identity.
+    routing_config: Option<Arc<tokio::sync::RwLock<bamboo_llm::Config>>>,
     /// Default first-class Project membership for newly-created/unassigned sessions.
     project_id: Option<bamboo_domain::ProjectId>,
     /// Concrete session-index handle, present only when assembled via
@@ -267,6 +277,7 @@ impl Agent {
         session
             .check_execution_compatibility()
             .map_err(|error| AgentError::Tool(error.to_string()))?;
+        self.sdk_bound_session_target(session)?;
         let skills = self.sdk_skills.as_ref().ok_or_else(|| {
             SdkError::Unsupported(
                 "typed Skills require the complete defaults-backed built-in SDK host".into(),
@@ -307,6 +318,11 @@ impl Agent {
             system_prompt: None,
             model: None,
             session_model: None,
+            provider_scope: None,
+            provider_scope_is_instance: None,
+            native_provider_binding: None,
+            caller_provider_binding: None,
+            routing_config: None,
             project_id: None,
             session_store: None,
             permission_checker: None,
@@ -332,6 +348,11 @@ impl Agent {
             system_prompt,
             model,
             session_model,
+            provider_scope: None,
+            provider_scope_is_instance: None,
+            native_provider_binding: None,
+            caller_provider_binding: None,
+            routing_config: None,
             project_id,
             session_store,
             permission_checker,
@@ -365,6 +386,7 @@ impl Agent {
         session
             .check_execution_compatibility()
             .map_err(|error| AgentError::Tool(error.to_string()))?;
+        self.sdk_bound_session_target(session)?;
         let durable = self
             .inner
             .persistence()
@@ -562,7 +584,8 @@ impl Agent {
             {
                 if matches!(&error, AgentError::Tool(message)
                     if message.starts_with("session_execution_incompatible:")
-                        || message.starts_with("session_conversation_changed:"))
+                        || message.starts_with("session_conversation_changed:")
+                        || message.starts_with("sdk_provider_binding:"))
                 {
                     let _ = event_tx
                         .send(AgentEvent::Error {
@@ -577,6 +600,348 @@ impl Agent {
         event_rx
     }
 
+    fn sdk_binding_error(message: impl Into<String>) -> AgentError {
+        AgentError::Tool(format!("sdk_provider_binding: {}", message.into()))
+    }
+
+    /// One request must resolve aliases and admission from one config snapshot.
+    fn sdk_routing_snapshot(&self) -> Result<Option<bamboo_llm::Config>, AgentError> {
+        self.routing_config
+            .as_ref()
+            .map(|shared| {
+                shared.try_read().map(|config| config.clone()).map_err(|_| {
+                    Self::sdk_binding_error(
+                        "provider configuration is busy; retry after the update",
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    fn sdk_default_binding(&self) -> Option<sdk_provider_guard::SdkBinding> {
+        self.native_provider_binding
+            .as_ref()
+            .map(|binding| sdk_provider_guard::SdkBinding::Native(binding.clone()))
+            .or_else(|| self.caller_provider_binding.clone())
+    }
+
+    fn sdk_validate_default_binding(
+        &self,
+        config: Option<&bamboo_llm::Config>,
+        model: Option<&str>,
+    ) -> Result<(), AgentError> {
+        let Some(binding) = self.sdk_default_binding() else {
+            return Ok(());
+        };
+        let config = config
+            .ok_or_else(|| Self::sdk_binding_error("provider configuration is unavailable"))?;
+        let scope = self
+            .provider_scope
+            .as_deref()
+            .ok_or_else(|| Self::sdk_binding_error("provider scope is unavailable"))?;
+        sdk_provider_guard::validate_binding(&binding, config, scope, model)
+            .map_err(|error| Self::sdk_binding_error(error.to_string()))
+    }
+
+    fn sdk_guarded_inner(&self, inner: &bamboo_engine::Agent) -> bamboo_engine::Agent {
+        match (
+            self.sdk_default_binding(),
+            &self.routing_config,
+            &self.provider_scope,
+        ) {
+            (Some(binding), Some(config), Some(provider)) => {
+                let config = config.clone();
+                let provider = provider.clone();
+                inner.with_default_provider_adapter(move |delegate| {
+                    Arc::new(sdk_provider_guard::BoundSdkProvider {
+                        delegate,
+                        config,
+                        binding,
+                        provider,
+                        single_use: false,
+                        refused: std::sync::atomic::AtomicBool::new(false),
+                    })
+                })
+            }
+            _ => inner.clone(),
+        }
+    }
+
+    /// Resolve a named account without manufacturing a client for it. Exact
+    /// instance IDs win; built-in type aliases follow the Host resolution order.
+    fn sdk_canonical_provider(
+        &self,
+        requested: &str,
+        config: Option<&bamboo_llm::Config>,
+    ) -> Result<String, AgentError> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return Err(Self::sdk_binding_error("provider name is empty"));
+        }
+        if let Some(instance) = config.and_then(|value| value.provider_instances.get(requested)) {
+            if !instance.enabled {
+                return Err(Self::sdk_binding_error(format!(
+                    "provider instance '{requested}' is disabled"
+                )));
+            }
+            return Ok(requested.to_string());
+        }
+        if self.provider_scope.as_deref() == Some(requested) {
+            return Ok(requested.to_string());
+        }
+        let config = config.ok_or_else(|| {
+            Self::sdk_binding_error("provider alias cannot be verified for this client")
+        })?;
+        if !bamboo_llm::AVAILABLE_PROVIDERS.contains(&requested) {
+            return Err(Self::sdk_binding_error(format!(
+                "unknown provider instance or type '{requested}'"
+            )));
+        }
+        if let Some(id) = config.default_provider_instance.as_deref() {
+            if let Some(instance) = config.provider_instances.get(id) {
+                if instance.provider_type == requested {
+                    if !instance.enabled {
+                        return Err(Self::sdk_binding_error(format!(
+                            "default provider instance '{id}' is disabled"
+                        )));
+                    }
+                    return Ok(id.to_string());
+                }
+            }
+        }
+        let mut matching = config
+            .provider_instances
+            .iter()
+            .filter(|(_, instance)| instance.enabled && instance.provider_type == requested)
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>();
+        matching.sort_unstable();
+        matching.first().map(|id| (*id).to_string()).ok_or_else(|| {
+            Self::sdk_binding_error(format!(
+                "no enabled provider instance is available for type '{requested}'"
+            ))
+        })
+    }
+
+    /// A caller-provided client is authoritative for its declared name.
+    /// Normalize known aliases; preserve unknown custom names.
+    fn sdk_override_provider_name(
+        &self,
+        requested: &str,
+        config: Option<&bamboo_llm::Config>,
+    ) -> Result<String, AgentError> {
+        let requested = requested.trim();
+        if requested.is_empty() {
+            return Err(Self::sdk_binding_error("provider name is empty"));
+        }
+        let configured = config.is_some_and(|config| {
+            config.provider_instances.contains_key(requested)
+                || (bamboo_llm::AVAILABLE_PROVIDERS.contains(&requested)
+                    && config
+                        .provider_instances
+                        .values()
+                        .any(|instance| instance.provider_type == requested))
+        });
+        if configured {
+            self.sdk_canonical_provider(requested, config)
+        } else {
+            Ok(requested.to_string())
+        }
+    }
+
+    fn sdk_admit_model(
+        &self,
+        config: Option<&bamboo_llm::Config>,
+        provider: &str,
+        model: &str,
+    ) -> Result<(), AgentError> {
+        let Some(config) = config else {
+            return Ok(());
+        };
+        let admitted = bamboo_config::explicit_runtime_models_for_provider_key(config, provider)
+            .map_err(Self::sdk_binding_error)?;
+        if admitted.is_some_and(|models| !models.iter().any(|allowed| allowed == model)) {
+            return Err(Self::sdk_binding_error(format!(
+                "model '{model}' is not admitted for provider '{provider}'"
+            )));
+        }
+        Ok(())
+    }
+
+    fn sdk_session_target(
+        &self,
+        session: &Session,
+    ) -> Result<Option<bamboo_domain::ProviderModelRef>, AgentError> {
+        if session.model_ref.as_ref().is_some_and(|target| {
+            target.provider.trim().is_empty()
+                || target.model.trim().is_empty()
+                || target.model.trim() == "unknown"
+        }) {
+            return Err(Self::sdk_binding_error(
+                "the saved Session model reference is invalid",
+            ));
+        }
+        Ok(bamboo_engine::session_app::provider_model::session_effective_model_ref(session))
+    }
+
+    fn sdk_require_bound_provider(
+        &self,
+        target: &bamboo_domain::ProviderModelRef,
+        config: Option<&bamboo_llm::Config>,
+    ) -> Result<(), AgentError> {
+        let scope = self.provider_scope.as_deref().ok_or_else(|| {
+            Self::sdk_binding_error(
+                "the wrapped runtime has no verifiable provider binding; use an explicit client and provider name",
+            )
+        })?;
+        let selected = self.sdk_canonical_provider(&target.provider, config)?;
+        if selected != scope {
+            return Err(Self::sdk_binding_error(format!(
+                "Session targets provider '{selected}', but the SDK client is bound to '{scope}'; supply a matching client"
+            )));
+        }
+        Ok(())
+    }
+
+    fn sdk_bound_session_target_with_config(
+        &self,
+        session: &Session,
+        config: Option<&bamboo_llm::Config>,
+    ) -> Result<Option<bamboo_domain::ProviderModelRef>, AgentError> {
+        let target = self.sdk_session_target(session)?;
+        self.sdk_validate_default_binding(config, None)?;
+        if let Some(target) = target.as_ref() {
+            self.sdk_require_bound_provider(target, config)?;
+        }
+        if let Some(scope) = self.provider_scope.as_deref() {
+            let model = self
+                .model
+                .as_deref()
+                .or_else(|| target.as_ref().map(|target| target.model.as_str()))
+                .or_else(|| (!session.model.trim().is_empty()).then_some(session.model.as_str()));
+            if let Some(model) = model {
+                self.sdk_admit_model(config, scope, model)?;
+            }
+        }
+        Ok(target)
+    }
+
+    fn sdk_bound_session_target(
+        &self,
+        session: &Session,
+    ) -> Result<Option<bamboo_domain::ProviderModelRef>, AgentError> {
+        let snapshot = self.sdk_routing_snapshot()?;
+        self.sdk_bound_session_target_with_config(session, snapshot.as_ref())
+    }
+
+    fn prepare_sdk_direct_request(
+        &self,
+        session: &Session,
+        request: &mut ExecuteRequest,
+    ) -> Result<(), AgentError> {
+        let snapshot = self.sdk_routing_snapshot()?;
+        let config = snapshot.as_ref();
+        let explicit_model = request.model_roster.model.is_some();
+        let explicit_provider = request.model_roster.provider_name.is_some();
+        let session_target = if !explicit_model || !explicit_provider {
+            self.sdk_session_target(session)?
+        } else {
+            None
+        };
+        if let Some(target) = session_target.as_ref() {
+            if !explicit_model {
+                if let Some(requested) = request.model_roster.provider_name.as_deref() {
+                    if requested.trim() != target.provider.trim()
+                        && self.sdk_canonical_provider(requested, config)?
+                            != self.sdk_canonical_provider(&target.provider, config)?
+                    {
+                        return Err(Self::sdk_binding_error(
+                            "the requested provider does not match the saved Session model",
+                        ));
+                    }
+                } else {
+                    request.model_roster.provider_name = Some(target.provider.clone());
+                }
+                request.model_roster.model = Some(target.model.clone());
+            } else if !explicit_provider && self.provider_scope.is_some() {
+                self.sdk_require_bound_provider(target, config)?;
+            }
+        } else if !explicit_model && !session.model.trim().is_empty() {
+            request.model_roster.model = Some(session.model.clone());
+        }
+        if request.provider_override.is_none() {
+            self.sdk_validate_default_binding(config, request.model_roster.model.as_deref())?;
+        }
+        if request.provider_override.is_some() {
+            if !explicit_provider
+                || request
+                    .model_roster
+                    .provider_name
+                    .as_deref()
+                    .is_none_or(|name| name.trim().is_empty())
+            {
+                return Err(Self::sdk_binding_error(
+                    "a per-request client override requires its explicitly declared provider name",
+                ));
+            }
+            let selected = self.sdk_override_provider_name(
+                request
+                    .model_roster
+                    .provider_name
+                    .as_deref()
+                    .expect("checked above"),
+                config,
+            )?;
+            request.model_roster.provider_name = Some(selected);
+        } else if let Some(scope) = self.provider_scope.as_deref() {
+            let selected = self.sdk_canonical_provider(
+                request
+                    .model_roster
+                    .provider_name
+                    .as_deref()
+                    .unwrap_or(scope),
+                config,
+            )?;
+            if selected != scope {
+                return Err(Self::sdk_binding_error(format!(
+                    "request targets provider '{selected}', but the SDK client is bound to '{scope}'; supply a matching client"
+                )));
+            }
+            request.model_roster.provider_name = Some(scope.to_string());
+        } else if request.model_roster.provider_name.is_some() {
+            return Err(Self::sdk_binding_error(
+                "the wrapped runtime has no verifiable provider binding; use an explicit client and provider name",
+            ));
+        }
+        if let (Some(provider), Some(model)) = (
+            request.model_roster.provider_name.as_deref(),
+            request.model_roster.model.as_deref(),
+        ) {
+            self.sdk_admit_model(config, provider, model)?;
+        }
+        if let (Some(snapshot), Some(shared), Some(provider)) = (
+            config,
+            self.routing_config.as_ref(),
+            request.model_roster.provider_name.as_ref(),
+        ) {
+            if let Some(delegate) = request.provider_override.take() {
+                request.provider_override = Some(Arc::new(sdk_provider_guard::BoundSdkProvider {
+                    binding: sdk_provider_guard::caller_binding(
+                        snapshot,
+                        provider,
+                        self.provider_scope.as_deref(),
+                    ),
+                    provider: provider.clone(),
+                    config: shared.clone(),
+                    delegate,
+                    single_use: false,
+                    refused: std::sync::atomic::AtomicBool::new(false),
+                }));
+            }
+        }
+        Ok(())
+    }
+
     /// Escape hatch for full per-request control: run a fully-specified
     /// [`ExecuteRequest`] (split fast/background/summarization models, provider
     /// handle, skill selection, custom event channel, cancellation token, …) on
@@ -585,7 +950,9 @@ impl Agent {
     ///
     /// Unlike `run`/`run_stream`, this does NOT apply the builder's configured
     /// instruction or model: the caller owns the request entirely. Build it with
-    /// [`ExecuteRequestBuilder`].
+    /// [`ExecuteRequestBuilder`]. A request-level provider override must also
+    /// declare its provider name so auxiliary targets cannot borrow another
+    /// account's client. The caller is responsible for pairing that client and name.
     ///
     /// ```rust,no_run
     /// # use bamboo_sdk::agent::{Agent, CancellationToken, ExecuteRequestBuilder, Session};
@@ -601,11 +968,30 @@ impl Agent {
     pub async fn execute(
         &self,
         session: &mut Session,
-        request: ExecuteRequest,
+        mut request: ExecuteRequest,
     ) -> Result<(), AgentError> {
+        self.prepare_sdk_direct_request(session, &mut request)?;
         #[cfg(test)]
         constructor_parity_tests::observe_inputs(&session.id, None);
-        self.inner.execute_direct(session, request).await
+        self.sdk_guarded_inner(&self.inner)
+            .execute_direct(session, request)
+            .await
+    }
+
+    /// Execute with an explicit per-run upstream retry policy through the same
+    /// direct owner, compatibility and session preparation checks as execute.
+    pub async fn execute_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        mut request: ExecuteRequest,
+        upstream_retry: UpstreamRetry,
+    ) -> Result<(), AgentError> {
+        self.prepare_sdk_direct_request(session, &mut request)?;
+        #[cfg(test)]
+        constructor_parity_tests::observe_inputs(&session.id, None);
+        self.sdk_guarded_inner(&self.inner)
+            .execute_direct_with_upstream_retry(session, request, upstream_retry)
+            .await
     }
 
     /// Shared execution path: prepare the session (system prompt + model), build
@@ -639,6 +1025,23 @@ impl Agent {
             session
                 .check_execution_compatibility()
                 .map_err(|error| AgentError::Tool(error.to_string()))?;
+            let (routing_snapshot, session_target) =
+                match self.sdk_routing_snapshot().and_then(|snapshot| {
+                    let target =
+                        self.sdk_bound_session_target_with_config(session, snapshot.as_ref())?;
+                    Ok((snapshot, target))
+                }) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        if let Some(snapshot) = preappend_snapshot {
+                            *session = snapshot;
+                        }
+                        if let Some(lease) = supplied_lease {
+                            lease.abandon().await;
+                        }
+                        return Err(error);
+                    }
+                };
             // One execution-private view covers Project assignment, approved
             // tool replay and all later runtime checkpoints. Freeze None too.
             let mut execution = self.clone();
@@ -653,7 +1056,8 @@ impl Agent {
             } else {
                 self.persistence().clone()
             };
-            execution.inner = self.inner.with_execution_persistence(persistence);
+            execution.inner =
+                self.sdk_guarded_inner(&self.inner.with_execution_persistence(persistence));
             // Own the logical session before any pre-execution mutation or approved
             // tool replay. Two cloned SDK Session values must collide before either
             // can duplicate a mutating side effect.
@@ -672,12 +1076,33 @@ impl Agent {
                 // error semantics.
                 if matches!(&error, AgentError::Tool(message)
                     if message.starts_with("session_execution_incompatible:")
-                        || message.starts_with("session_conversation_changed:"))
+                        || message.starts_with("session_conversation_changed:")
+                        || message.starts_with("sdk_provider_binding:"))
                 {
                     if let Some(snapshot) = preappend_snapshot {
                         *session = snapshot;
                     }
                 }
+                return Err(error);
+            }
+            // Configuration may have changed while durable admission was
+            // awaiting. Refuse before approved-tool replay as well as at each
+            // provider dispatch; never silently reuse the old native client.
+            let current = execution.sdk_routing_snapshot().and_then(|snapshot| {
+                let model = execution
+                    .model
+                    .as_deref()
+                    .or_else(|| session_target.as_ref().map(|target| target.model.as_str()))
+                    .or_else(|| {
+                        (!session.model.trim().is_empty()).then_some(session.model.as_str())
+                    });
+                execution.sdk_validate_default_binding(snapshot.as_ref(), model)
+            });
+            if let Err(error) = current {
+                if let Some(snapshot) = preappend_snapshot {
+                    *session = snapshot;
+                }
+                direct_lease.abandon().await;
                 return Err(error);
             }
             drop(preappend_snapshot);
@@ -853,10 +1278,23 @@ impl Agent {
             // follows replay: a failed replay remains observable without replacing
             // caller System bytes, while a successful handoff always reaches the
             // provider with one clean configured System message.
+            if let (Some(target), Some(model)) =
+                (session.model_ref.as_mut(), execution.model.as_ref())
+            {
+                if target.model.trim() != model.trim() {
+                    // A per-model setting belongs to the previous target and
+                    // cannot be carried onto an explicitly different model.
+                    target.reasoning_effort = None;
+                }
+                target.model = model.clone();
+            }
             bamboo_engine::session_app::execution_prep::prepare_session_for_execution(
                 session,
                 execution.system_prompt.as_deref(),
-                execution.model.as_deref(),
+                execution
+                    .model
+                    .as_deref()
+                    .or_else(|| session_target.as_ref().map(|target| target.model.as_str())),
             );
 
             // The last user message in the session drives execution (the engine
@@ -876,8 +1314,11 @@ impl Agent {
             if let Some(store) = execution.session_store.as_ref() {
                 builder = builder.app_data_dir(store.bamboo_home_dir().to_path_buf());
             }
-            if let Some(model) = execution.model.clone() {
-                builder = builder.model(model);
+            // Preparation already applied any explicit SDK model override.
+            // Without one the caller's existing Session model stays authoritative.
+            builder = builder.model(session.model.clone());
+            if let Some(provider) = execution.provider_scope.clone() {
+                builder = builder.provider_name(provider);
             }
             if let Some(guard) = sdk_guard.as_ref() {
                 builder = builder.tools(guard.tools(execution.inner.default_tools().clone()));
@@ -885,14 +1326,64 @@ impl Agent {
 
             #[cfg(test)]
             constructor_parity_tests::observe_inputs(&session.id, inputs.as_ref());
+            let mut request = builder.build();
+            // The saved Session choice is authoritative. Take a Chat-role
+            // setting from the same config snapshot used to admit this run,
+            // and only when both its account and model match the actual target.
+            let model_effort = session
+                .model_ref
+                .as_ref()
+                .filter(|target| target.model.trim() == session.model.trim())
+                .and_then(|target| target.reasoning_effort);
+            let role_effort = routing_snapshot.as_ref().and_then(|config| {
+                if !config.features.provider_model_ref {
+                    return None;
+                }
+                let target = &config.defaults.as_ref()?.chat;
+                // Unlike a legacy Session reference, a configured role must
+                // already be a valid exact reference before it can lend its
+                // model-specific reasoning setting to this run.
+                if target.provider.trim().is_empty()
+                    || target.provider.trim() != target.provider
+                    || target.model.trim().is_empty()
+                    || target.model.trim() != target.model
+                    || target.model != session.model.trim()
+                {
+                    return None;
+                }
+                let scope = execution.provider_scope.as_deref()?;
+                // An explicit instance and a legacy client can have the same
+                // key but still represent different accounts.
+                if execution.provider_scope_is_instance
+                    != Some(config.provider_instances.contains_key(scope))
+                {
+                    return None;
+                }
+                // A legacy type key can name the old client or an instance
+                // selected by newer config. Without a registry binding, do not
+                // treat the two as the same account after the default moved.
+                if target.provider == scope
+                    && !config.provider_instances.contains_key(scope)
+                    && config.effective_default_provider() != scope
+                    && bamboo_llm::AVAILABLE_PROVIDERS.contains(&scope)
+                    && config
+                        .provider_instances
+                        .values()
+                        .any(|instance| instance.provider_type == scope)
+                {
+                    return None;
+                }
+                let provider = execution
+                    .sdk_canonical_provider(&target.provider, Some(config))
+                    .ok()?;
+                (provider == scope)
+                    .then_some(target.reasoning_effort)
+                    .flatten()
+            });
+            request.reasoning_effort = session.reasoning_effort.or(model_effort).or(role_effort);
             execution
                 .inner
-                .execute_direct_registered_with_inputs(
-                    session,
-                    builder.build(),
-                    direct_lease,
-                    inputs,
-                )
+                .execute_direct_registered_with_inputs(session, request, direct_lease, inputs)
                 .await
         })
     }
@@ -3069,11 +3560,261 @@ mod constructor_parity_tests {
             .session_delivery(bamboo_engine::SessionActivationRouter::new())
             .model("claude-test")
             .instruction("constructor fixture")
+            .test_memory_store(bamboo_memory::memory_store::MemoryStore::new(
+                root.join("jiandu"),
+            ))
             .with_defaults_for_data_dir(root.into())
             .await
             .unwrap()
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn explicit_upstream_retry_preserves_direct_execution_ownership() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(RecordingProvider::default());
+        let agent = agent(root.path(), provider.clone()).await;
+        let mut session = Session::new("retry-sdk-owned", "claude-test");
+        session.add_message(Message::user("retained"));
+        let before = serde_json::to_value(&session).unwrap();
+        let lease = agent
+            .inner
+            .begin_direct_execution(&session.id)
+            .await
+            .unwrap();
+        let (tx, _rx) = mpsc::channel(16);
+        let request = ExecuteRequestBuilder::new("", tx, CancellationToken::new()).build();
+        let result = agent
+            .execute_with_upstream_retry(&mut session, request, UpstreamRetry::UntilCancelled)
+            .await;
+        assert!(
+            result.is_err(),
+            "an occupied direct owner must refuse execution"
+        );
+        assert_eq!(serde_json::to_value(&session).unwrap(), before);
+        assert!(provider.0.lock().unwrap().is_empty());
+        lease.abandon().await;
+    }
+
+    struct ManagedRetrySdkProvider {
+        url: String,
+        calls: AtomicUsize,
+        messages: Mutex<Vec<Vec<Message>>>,
+        entered: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LLMProvider for ManagedRetrySdkProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.messages.lock().unwrap().push(messages.to_vec());
+            self.entered.notify_one();
+            self.resume.notified().await;
+
+            let retry = bamboo_llm::retry::RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(5),
+            };
+            // A local proxy and the HTTP client's loopback exclusion disable
+            // inherited system proxies without changing process-global config.
+            let mut config = bamboo_llm::Config::default();
+            config.http_proxy = "http://127.0.0.1:9".into();
+            let client = bamboo_llm::http_client::build_http_client(&config)?;
+            let response =
+                bamboo_llm::retry::send_provider_request(&retry, "sdk-controlled-upstream", || {
+                    client.post(&self.url).json(messages)
+                })
+                .await?;
+            if !response.status().is_success() {
+                return Err(bamboo_llm::LLMError::RequestFailed(
+                    "controlled upstream returned a transient failure".into(),
+                ));
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(bamboo_llm::LLMChunk::Token("controlled completion".into())),
+                Ok(bamboo_llm::LLMChunk::Done),
+            ])))
+        }
+    }
+
+    async fn read_controlled_sdk_post(socket: &mut tokio::net::TcpStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 2048];
+        let header_end = loop {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "request closed before headers");
+            request.extend_from_slice(&chunk[..count]);
+            if let Some(index) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+            assert!(
+                request.len() < 65_536,
+                "request headers exceeded fixture limit"
+            );
+        };
+        let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+        assert!(headers.starts_with("POST /controlled HTTP/1.1\r\n"));
+        let body_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            .expect("the controlled JSON body has a known length");
+        while request.len() < header_end + body_length {
+            let count = socket.read(&mut chunk).await.unwrap();
+            assert!(count > 0, "request closed before its body");
+            request.extend_from_slice(&chunk[..count]);
+        }
+        request[header_end..header_end + body_length].to_vec()
+    }
+
+    #[tokio::test]
+    async fn sdk_explicit_upstream_retry_reaches_managed_consumer_under_direct_owner() {
+        use tokio::io::AsyncWriteExt;
+
+        fn assert_send<T: Send>(_: &T) {}
+
+        fn assert_original_user_once(messages: &[Message], user_id: &str) {
+            let matches: Vec<_> = messages
+                .iter()
+                .filter(|message| message.id == user_id)
+                .collect();
+            assert_eq!(matches.len(), 1);
+            assert_eq!(matches[0].role, Role::User);
+            assert_eq!(matches[0].content, "one retained SDK user");
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|message| message.role == Role::User
+                        && message.content == "one retained SDK user")
+                    .count(),
+                1
+            );
+        }
+
+        for continuous in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let mut requests = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        accepted = listener.accept() => {
+                            let (mut socket, _) = accepted.unwrap();
+                            let body = read_controlled_sdk_post(&mut socket).await;
+                            let status = if requests.len() < 3 {
+                                "503 Service Unavailable"
+                            } else {
+                                "200 OK"
+                            };
+                            requests.push(body);
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            socket.write_all(response.as_bytes()).await.unwrap();
+                        }
+                    }
+                }
+                requests
+            });
+            let root = tempfile::tempdir().unwrap();
+            let provider = Arc::new(ManagedRetrySdkProvider {
+                url: format!("http://{address}/controlled"),
+                calls: AtomicUsize::new(0),
+                messages: Mutex::new(Vec::new()),
+                entered: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            });
+            let agent = agent(root.path(), provider.clone()).await;
+            let mut session =
+                Session::new(format!("sdk-managed-retry-{continuous}"), "claude-test");
+            let user = Message::user("one retained SDK user");
+            let user_id = user.id.clone();
+            session.add_message(user);
+            agent.storage().save_session(&session).await.unwrap();
+            let session_id = session.id.clone();
+            let (tx, _rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
+            let request = ExecuteRequestBuilder::new("", tx, CancellationToken::new())
+                .model("claude-test")
+                .build();
+
+            let execution = async {
+                if continuous {
+                    agent
+                        .execute_with_upstream_retry(
+                            &mut session,
+                            request,
+                            UpstreamRetry::UntilCancelled,
+                        )
+                        .await
+                } else {
+                    agent.execute(&mut session, request).await
+                }
+            };
+            // Both SDK execution branches are held across await by this future.
+            assert_send(&execution);
+            let verify_owner = async {
+                provider.entered.notified().await;
+                let competing = agent.inner.begin_direct_execution(&session_id).await;
+                assert!(
+                    competing.is_err(),
+                    "the SDK direct owner must already be held"
+                );
+                provider.resume.notify_one();
+            };
+            let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                tokio::join!(execution, verify_owner)
+            })
+            .await
+            .expect("the controlled SDK execution and owner check must finish");
+            if continuous {
+                result.expect("the explicit continuous mode must recover");
+            } else {
+                assert!(matches!(result, Err(AgentError::LLMNonRetryable(_))));
+            }
+
+            stop_tx.send(()).unwrap();
+            let requests = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+                .await
+                .expect("the controlled server must finish")
+                .unwrap();
+            assert_eq!(requests.len(), if continuous { 4 } else { 1 });
+            assert!(requests.iter().all(|body| body == &requests[0]));
+            let sent: Vec<Message> = serde_json::from_slice(&requests[0]).unwrap();
+            assert_original_user_once(&sent, &user_id);
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+            let observed = provider.messages.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            assert_original_user_once(&observed[0], &user_id);
+            drop(observed);
+
+            let persisted = agent
+                .storage()
+                .load_session(&session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            let users = persisted
+                .messages
+                .iter()
+                .filter(|m| m.role == Role::User)
+                .collect::<Vec<_>>();
+            assert_eq!(users.len(), 1);
+            assert_eq!(users[0].id, user_id);
+            assert_eq!(users[0].content, "one retained SDK user");
+        }
     }
 
     struct ObservedInput(Arc<AtomicUsize>);

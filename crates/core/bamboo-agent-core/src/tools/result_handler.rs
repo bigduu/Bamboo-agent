@@ -996,21 +996,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn versioned_nested_spawn_uses_session_owner_and_preserves_legacy_aliases() {
+    async fn fresh_nested_spawn_uses_installed_root_owner_in_every_supported_version() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        // Fresh Root calls retain their installed owner across legacy behavior stamps.
         for version in [None, Some(1), Some(2)] {
-            for ultra in [false, true] {
+            for (supervisor, ultra) in [(true, false), (true, true), (false, true)] {
                 for reference in [
                     "spawn_session",
                     "spawnSession",
                     "default::spawn_session",
                     "default::spawnSession",
                 ] {
-                    let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+                    let mut session = Session::new(
+                        if supervisor {
+                            DEFAULT_SUPERVISOR_SESSION_ID
+                        } else {
+                            "ordinary-root"
+                        },
+                        "model",
+                    );
                     session.session_version = version;
-                    session.authority_identity = SessionAuthorityIdentity::Supervisor {
-                        incarnation_id: uuid::Uuid::new_v4(),
-                    };
+                    if supervisor {
+                        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                            incarnation_id: uuid::Uuid::new_v4(),
+                        };
+                    }
                     session.set_root_orchestration_only(ultra).unwrap();
                     let action = make_tool_call(
                         "nested-original",
@@ -1019,7 +1029,7 @@ mod tests {
                     );
                     let original = action.clone();
                     let tools = NestedOwnerRecorder {
-                        installed_root: version == Some(2),
+                        installed_root: true,
                         entered: Default::default(),
                     };
                     let flags = ToolExecutionSessionFlags::from_session(&session);
@@ -1035,15 +1045,10 @@ mod tests {
                     )
                     .await;
                     assert_eq!(outcome, ToolHandlingOutcome::Continue);
-                    let expected = if version == Some(2) {
-                        "spawn_session"
-                    } else {
-                        "SubAgent"
-                    };
                     assert_eq!(
                         *tools.entered.lock().unwrap(),
-                        vec![(expected.into(), original.clone(), true)],
-                        "version={version:?} ultra={ultra} reference={reference}"
+                        vec![("spawn_session".into(), original.clone(), supervisor)],
+                        "version={version:?} supervisor={supervisor} ultra={ultra} reference={reference}"
                     );
                     assert!(session
                         .messages
@@ -1071,73 +1076,71 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn versioned_nested_spawn_missing_owner_or_ordinary_ultra_refuses_without_child_fallback()
-    {
+    async fn fresh_nested_spawn_missing_or_plan_denied_root_owner_refuses_without_child_fallback() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
-        for (supervisor, ultra, installed_root) in [
-            (true, false, false),
-            (true, true, false),
-            (false, true, true),
-        ] {
-            for reference in [
-                "spawn_session",
-                "spawnSession",
-                "default::spawn_session",
-                "default::spawnSession",
-            ] {
-                let mut session = Session::new(
-                    if supervisor {
-                        DEFAULT_SUPERVISOR_SESSION_ID
-                    } else {
-                        "ordinary-root"
-                    },
-                    "model",
-                );
-                session.session_version = Some(2);
-                if supervisor {
-                    session.authority_identity = SessionAuthorityIdentity::Supervisor {
-                        incarnation_id: uuid::Uuid::new_v4(),
-                    };
+        for version in [None, Some(1), Some(2)] {
+            for (supervisor, ultra) in [(true, false), (true, true), (false, true)] {
+                for (installed_root, plan_read_only) in [(false, false), (true, true)] {
+                    for reference in [
+                        "spawn_session",
+                        "spawnSession",
+                        "default::spawn_session",
+                        "default::spawnSession",
+                    ] {
+                        let mut session = Session::new(
+                            if supervisor {
+                                DEFAULT_SUPERVISOR_SESSION_ID
+                            } else {
+                                "ordinary-root"
+                            },
+                            "model",
+                        );
+                        session.session_version = version;
+                        if supervisor {
+                            session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                                incarnation_id: uuid::Uuid::new_v4(),
+                            };
+                        }
+                        session.set_root_orchestration_only(ultra).unwrap();
+                        let action = make_tool_call("refused-nested", reference, "{}");
+                        let original = action.clone();
+                        let tools = NestedOwnerRecorder {
+                            installed_root,
+                            entered: Default::default(),
+                        };
+                        let mut flags = ToolExecutionSessionFlags::from_session(&session);
+                        flags.plan_read_only = plan_read_only;
+                        let (tx, mut rx) = mpsc::channel(16);
+                        handle_tool_result_with_agentic_support(
+                            &nested_owner_result(action),
+                            &make_tool_call("parent", "Read", "{}"),
+                            &tx,
+                            &mut session,
+                            &tools,
+                            flags,
+                            None,
+                        )
+                        .await;
+                        assert!(tools.entered.lock().unwrap().is_empty(), "version={version:?} supervisor={supervisor} ultra={ultra} installed={installed_root} plan={plan_read_only} reference={reference}");
+                        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+                        assert!(!events
+                            .iter()
+                            .any(|e| matches!(e, AgentEvent::ToolStart { .. })));
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|e| matches!(e, AgentEvent::ToolError { .. }))
+                                .count(),
+                            1
+                        );
+                        assert!(session.messages.iter().any(|message| message
+                            .tool_call_id
+                            .as_deref()
+                            == Some("refused-nested")
+                            && message.tool_success == Some(false)));
+                        assert_eq!(original.function.name, reference);
+                    }
                 }
-                session.set_root_orchestration_only(ultra).unwrap();
-                let action = make_tool_call("refused-nested", reference, "{}");
-                let original = action.clone();
-                let tools = NestedOwnerRecorder {
-                    installed_root,
-                    entered: Default::default(),
-                };
-                let flags = ToolExecutionSessionFlags::from_session(&session);
-                let (tx, mut rx) = mpsc::channel(16);
-                handle_tool_result_with_agentic_support(
-                    &nested_owner_result(action),
-                    &make_tool_call("parent", "Read", "{}"),
-                    &tx,
-                    &mut session,
-                    &tools,
-                    flags,
-                    None,
-                )
-                .await;
-                assert!(tools.entered.lock().unwrap().is_empty(), "supervisor={supervisor} ultra={ultra} installed={installed_root} reference={reference}");
-                let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
-                assert!(!events
-                    .iter()
-                    .any(|e| matches!(e, AgentEvent::ToolStart { .. })));
-                assert_eq!(
-                    events
-                        .iter()
-                        .filter(|e| matches!(e, AgentEvent::ToolError { .. }))
-                        .count(),
-                    1
-                );
-                assert!(session
-                    .messages
-                    .iter()
-                    .any(
-                        |message| message.tool_call_id.as_deref() == Some("refused-nested")
-                            && message.tool_success == Some(false)
-                    ));
-                assert_eq!(original.function.name, reference);
             }
         }
     }
@@ -1154,7 +1157,7 @@ mod tests {
             async fn execute(&self, call: &ToolCall) -> crate::tools::executor::Result<ToolResult> {
                 self.calls.lock().unwrap().push(call.function.name.clone());
                 match call.function.name.as_str() {
-                    "Read" => Ok(ToolResult::text(
+                    "work_inspect" => Ok(ToolResult::text(
                         true,
                         serde_json::to_string(&AgenticToolResult::NeedMoreActions {
                             actions: vec![make_tool_call("queued-edit", "Edit", "{}")],
@@ -1173,24 +1176,31 @@ mod tests {
                 }
             }
             fn list_tools(&self) -> Vec<ToolSchema> {
-                ["Read", "SubAgent", "Edit", "exec_command", "vendor::Read"]
-                    .into_iter()
-                    .map(|name| ToolSchema {
-                        schema_type: "function".into(),
-                        function: crate::tools::FunctionSchema {
-                            name: name.into(),
-                            description: "probe".into(),
-                            parameters: serde_json::json!({"type":"object"}),
-                        },
-                    })
-                    .collect()
+                [
+                    "work_inspect",
+                    "Read",
+                    "SubAgent",
+                    "Edit",
+                    "exec_command",
+                    "vendor::Read",
+                ]
+                .into_iter()
+                .map(|name| ToolSchema {
+                    schema_type: "function".into(),
+                    function: crate::tools::FunctionSchema {
+                        name: name.into(),
+                        description: "probe".into(),
+                        parameters: serde_json::json!({"type":"object"}),
+                    },
+                })
+                .collect()
             }
         }
         for ultra in [false, true] {
             for failure in [
                 None,
                 Some("worker_unavailable: configure an authorized worker and retry"),
-                Some("scope_denied: target is not attached; owner action required"),
+                Some("worker_permission_denied: target requires a human decision"),
             ] {
                 let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
                 session.authority_identity = SessionAuthorityIdentity::Supervisor {
@@ -1205,8 +1215,9 @@ mod tests {
                 let flags = ToolExecutionSessionFlags::from_session(&session);
                 execute_sub_actions(
                     &[
-                        make_tool_call("read", "Read", "{}"),
+                        make_tool_call("view", "work_inspect", "{}"),
                         make_tool_call("delegate", "SubAgent", "{}"),
+                        make_tool_call("direct-read", "Read", "{}"),
                         make_tool_call("direct-shell", "exec_command", "{}"),
                         make_tool_call("external-read", "vendor::Read", "{}"),
                     ],
@@ -1219,7 +1230,7 @@ mod tests {
                 .await;
                 assert_eq!(
                     *tools.calls.lock().unwrap(),
-                    ["Read", "SubAgent"],
+                    ["work_inspect", "SubAgent"],
                     "ultra={ultra}, failure={failure:?}"
                 );
                 if let Some(reason) = failure {
@@ -1236,7 +1247,22 @@ mod tests {
                         _ => None,
                     })
                     .collect::<Vec<_>>();
-                assert_eq!(started, ["read", "delegate"]);
+                assert_eq!(started, ["view", "delegate"]);
+                for id in [
+                    "queued-edit",
+                    "direct-read",
+                    "direct-shell",
+                    "external-read",
+                ] {
+                    assert!(
+                        session.messages.iter().any(|message| {
+                            message.tool_call_id.as_deref() == Some(id)
+                                && message.tool_success == Some(false)
+                                && message.content.contains("supervisor_delegation_required")
+                        }),
+                        "missing blocked result for {id}"
+                    );
+                }
             }
         }
     }

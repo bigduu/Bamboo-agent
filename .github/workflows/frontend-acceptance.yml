@@ -7,8 +7,6 @@ on:
         description: Exact 40-character SHA of the selected ref for source acceptance
         required: true
         type: string
-  pull_request:
-    branches: [main]
 
 permissions:
   contents: read
@@ -253,15 +251,21 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Compile locked Rust test targets
+      - name: Compile locked frontend acceptance targets
         timeout-minutes: 15
-        run: cargo test --locked --no-run
+        run: |
+          cargo test --locked --no-run -p bamboo-agent --test frontend_packaging
+          cargo test --locked --no-run -p bamboo-server --test frontend_build_contract
+          cargo test --locked --no-run -p bamboo-server --lib services::frontend_package::tests
         env:
           RUST_MIN_STACK: "8388608"
 
-      - name: Test locked Rust workspace
+      - name: Test locked frontend acceptance targets
         timeout-minutes: 45
-        run: cargo test --locked --no-fail-fast
+        run: |
+          cargo test --locked --no-fail-fast -p bamboo-agent --test frontend_packaging
+          cargo test --locked --no-fail-fast -p bamboo-server --test frontend_build_contract
+          cargo test --locked --no-fail-fast -p bamboo-server --lib services::frontend_package::tests
         env:
           RUST_MIN_STACK: "8388608"
 

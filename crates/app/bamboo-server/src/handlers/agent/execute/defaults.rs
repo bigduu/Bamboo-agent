@@ -30,6 +30,17 @@ use bamboo_engine::config::GoldConfig;
 
 use crate::app_state::AppState;
 
+/// Capability for an explicit continuation of a still-live bootstrap.
+/// The per-session waiting endpoint remains authoritative for availability.
+#[derive(Debug, Serialize)]
+pub struct LiveBootstrapResumeCapability {
+    pub protocol_version: u8,
+    pub offer_timeout_ms: u64,
+    pub waiting_endpoint: &'static str,
+    pub continue_run_header: &'static str,
+    pub initial_opt_in_field: &'static str,
+}
+
 /// Response body for `GET /api/v1/execute/defaults`.
 #[derive(Debug, Serialize)]
 pub struct ExecuteDefaultsResponse {
@@ -40,6 +51,9 @@ pub struct ExecuteDefaultsResponse {
     pub provider: Option<String>,
     /// Underlying provider type (e.g. `openai`, `anthropic`, `copilot`).
     pub provider_type: Option<String>,
+    /// Present when a saved explicit primary target fails admission.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_error: Option<String>,
     /// Resolved reasoning effort, if any.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The session-scoped permission mode a NEW session would be stamped with
@@ -62,6 +76,10 @@ pub struct ExecuteDefaultsResponse {
     pub background_model: Option<String>,
     /// Task-summary/compression auxiliary model.
     pub summarization_model: Option<String>,
+    /// Negotiated retry contract. Clients must check support before opting in.
+    pub upstream_retry: bamboo_llm::retry::UpstreamRetryDefaults,
+    /// Separate from per-run retry modes: this selects an existing live offer.
+    pub live_bootstrap_resume: LiveBootstrapResumeCapability,
 }
 
 /// `GET /api/v1/execute/defaults`
@@ -85,6 +103,7 @@ pub async fn handler(state: web::Data<AppState>) -> impl Responder {
         model: resolved.model_roster.model.clone(),
         provider: resolved.model_roster.provider_name.clone(),
         provider_type: resolved.model_roster.provider_type.clone(),
+        model_error: resolved.model_error,
         reasoning_effort: resolved.reasoning_effort,
         default_session_permission_mode,
         system_prompt: resolved.system_prompt,
@@ -94,6 +113,14 @@ pub async fn handler(state: web::Data<AppState>) -> impl Responder {
         fast_model: resolved.model_roster.fast_model(),
         background_model: resolved.model_roster.background_model(),
         summarization_model: resolved.model_roster.summarization_model(),
+        upstream_retry: bamboo_llm::retry::upstream_retry_defaults(),
+        live_bootstrap_resume: LiveBootstrapResumeCapability {
+            protocol_version: 1,
+            offer_timeout_ms: bamboo_llm::retry::LIVE_BOOTSTRAP_OFFER_TTL.as_millis() as u64,
+            waiting_endpoint: "execute/{session_id}/retry",
+            continue_run_header: "Bamboo-Run-Id",
+            initial_opt_in_field: "live_bootstrap_resume",
+        },
     })
 }
 
@@ -178,6 +205,18 @@ mod tests {
         assert_eq!(resp.status(), actix_web::http::StatusCode::OK);
         let body: Value = test::read_body_json(resp).await;
         assert_eq!(body["model"], "gpt-chat");
+        assert_eq!(body["upstream_retry"]["default_mode"], "bounded");
+        assert_eq!(body["live_bootstrap_resume"]["protocol_version"], 1);
+        assert_eq!(body["live_bootstrap_resume"]["offer_timeout_ms"], 600_000);
+        assert_eq!(
+            body["upstream_retry"]["supported_modes"],
+            serde_json::json!(["bounded", "until_cancelled"])
+        );
+        assert_eq!(
+            body["upstream_retry"]["max_attempts"],
+            bamboo_llm::retry::global().max_attempts
+        );
+
         assert_eq!(body["fast_model"], "gpt-fast");
         assert_eq!(body["background_model"], "gpt-memory");
         assert_eq!(body["summarization_model"], "gpt-summary");

@@ -242,6 +242,11 @@ pub struct AppState {
     /// This avoids stale provider snapshots after runtime config updates.
     provider_handle: Arc<dyn LLMProvider>,
 
+    /// Exact Arc supplied by an injection constructor, never inferred from a
+    /// nearby registry. Future Host run factories capture and compare this tag.
+    #[allow(dead_code)]
+    pub(crate) initial_injected_provider: Option<Arc<dyn LLMProvider>>,
+
     /// Active conversation sessions (in-memory cache)
     ///
     /// Maps session IDs to Session objects. Persisted to storage
@@ -299,6 +304,7 @@ pub struct AppState {
     /// Durable logical-session delivery plane. These are internal runtime
     /// capabilities; no public messaging endpoint is registered.
     pub session_inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+    observer_subscriptions: Arc<observer_subscriptions::ObserverSubscriptionCoordinator>,
     pub session_activation_router: Arc<bamboo_engine::SessionActivationRouter>,
     pub session_messenger: Arc<bamboo_engine::SessionMessenger>,
 
@@ -436,6 +442,12 @@ pub struct AppState {
     /// Each runner manages event broadcasting and cancellation
     /// for an active agent execution.
     pub agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
+
+    /// Offers tied to the exact live Root execution and producer future.
+    pub(crate) live_retry: Arc<live_retry::LiveRetryBridge>,
+
+    /// Retains only a genuinely admitted owner during a client resync.
+    pub(crate) fresh_sync: Arc<fresh_sync::FreshSyncRegistry>,
 
     /// Reference-counted execute handlers still preparing a runner, keyed by
     /// session. This server-scoped registry closes the durable pending-turn
@@ -590,6 +602,9 @@ pub(crate) mod actor_events;
 mod agent_session_context;
 mod builder;
 mod config_application;
+pub(crate) mod fresh_sync;
+pub(crate) mod host_gold_origin;
+pub(crate) mod live_retry;
 pub(crate) use config_application::ConfigApplicationState;
 mod config_runtime;
 pub(crate) use config_runtime::ConfigLiveHealth;
@@ -614,9 +629,12 @@ mod wake_reconciler;
 // `session_events::NotificationRelayDeps`, so external callers that build a
 // `ScheduleContext` by hand (e.g. integration tests) need to name it.
 pub(crate) mod mutation_idempotency;
+mod observer_subscriptions;
 pub(crate) mod session_create_operations;
 pub mod session_events;
 mod session_loader;
+mod supervisor_observers;
+pub use observer_subscriptions::ObserverSubscriptionStart;
 pub mod supervisor_owner_authorization;
 pub mod ticket_application;
 mod tools;
@@ -627,6 +645,9 @@ mod tests;
 
 #[cfg(test)]
 mod model_limit_snapshot_tests;
+
+#[cfg(test)]
+mod supervisor_epic_acceptance_tests;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigUpdateEffects {
@@ -653,6 +674,7 @@ mod local_task_conversation_tests;
 mod supervised_root_create_tests;
 
 pub(super) mod supervised_root_create;
+mod supervised_root_run;
 pub(super) mod supervisor_directory;
 #[cfg(test)]
 mod supervisor_directory_tests;

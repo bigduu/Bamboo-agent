@@ -205,6 +205,202 @@ fn ensure_scoped_loop_checkpoint_known(session: &Session) -> std::io::Result<()>
     Ok(())
 }
 
+/// The ordinary checkpoint and the live-bootstrap checkpoint must reconcile
+/// exactly the same authoritative lanes. The latter subsequently refuses any
+/// reconciliation that changes its already-prepared Session.
+fn reconcile_runtime_checkpoint(
+    session: &mut Session,
+    latest: &Session,
+) -> std::io::Result<(usize, bool)> {
+    ensure_model_context_checkpoint_is_current(session, latest)?;
+    let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
+    bamboo_domain::merge_session_inbox_admission(session, latest);
+    let adopted_response = adopt_durable_consumed_clarification(session, latest);
+    apply_authoritative_metadata(session, latest);
+    adopt_fresher_disk_permission_posture(session, latest);
+    let _ = adopt_durable_tagged_child_wait(session, latest);
+    Ok((appended, adopted_response))
+}
+
+// This limit applies only to the optional recovery proof, never ordinary saves.
+pub(crate) const LIVE_BOOTSTRAP_SESSION_JSON_LIMIT: usize = 4 * 1024 * 1024;
+
+struct CancelLiveBootstrapOnDrop(Option<bamboo_domain::AdmissionGate>);
+
+impl Drop for CancelLiveBootstrapOnDrop {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.0 {
+            gate.cancel_if_pending();
+        }
+    }
+}
+
+#[derive(Default)]
+struct LiveBootstrapSizeCounter(usize);
+
+impl LiveBootstrapSizeCounter {
+    fn add(&mut self, bytes: usize) -> std::io::Result<()> {
+        self.0 = self
+            .0
+            .checked_add(bytes)
+            .filter(|total| *total <= LIVE_BOOTSTRAP_SESSION_JSON_LIMIT)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "live bootstrap Session exceeds recovery proof limit",
+                )
+            })?;
+        Ok(())
+    }
+}
+
+impl std::io::Write for LiveBootstrapSizeCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.add(bytes.len())?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn live_bootstrap_skipped_size_counter(
+    session: &Session,
+) -> std::io::Result<LiveBootstrapSizeCounter> {
+    let mut counter = LiveBootstrapSizeCounter::default();
+    if let Some(value) = &session.force_manual_compression {
+        counter.add(value.len())?;
+    }
+    if let Some((model, _)) = &session.resolved_token_budget {
+        counter.add(model.len())?;
+    }
+    if let Some(runtime) = &session.agent_runtime_state {
+        for id in runtime
+            .children
+            .active_ids
+            .iter()
+            .chain(&runtime.children.completed_ids)
+        {
+            counter.add(id.len())?;
+            counter.add(std::mem::size_of::<String>())?;
+        }
+    }
+    Ok(counter)
+}
+
+fn ensure_live_bootstrap_session_size(session: &Session) -> std::io::Result<()> {
+    // Count both formats before cloning or constructing Value nodes. The V2
+    // full writer uses a pretty runtime sidecar; deeply nested small compact
+    // values can otherwise expand dramatically when indented.
+    let mut compact = live_bootstrap_skipped_size_counter(session)?;
+    serde_json::to_writer(&mut compact, session)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    let mut pretty = live_bootstrap_skipped_size_counter(session)?;
+    serde_json::to_writer_pretty(&mut pretty, session)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+pub(crate) fn bounded_live_bootstrap_value(
+    session: &Session,
+) -> std::io::Result<serde_json::Value> {
+    ensure_live_bootstrap_session_size(session)?;
+    serde_json::to_value(session).map_err(std::io::Error::other)
+}
+
+/// Called only after V2 holds the cross-process Root and Session guards.
+pub(crate) fn validate_live_bootstrap_candidate(
+    prepared: &Session,
+    latest: &Session,
+) -> std::io::Result<()> {
+    ensure_scoped_loop_checkpoint_known(prepared)?;
+    ensure_session_execution_compatible(prepared)?;
+    let expected = bounded_live_bootstrap_value(prepared)?;
+    let durable = bounded_live_bootstrap_value(latest)?;
+
+    // Append-safe reconciliation intentionally does not adopt every possible
+    // canonical field (for example, a newer conversation summary). Compare the
+    // entire durable value first. For this narrow initial slice only a strict
+    // transcript prefix followed by already-executed tool results, plus the
+    // normal non-regressing message timestamp, can differ.
+    let expected_messages = expected
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing prepared transcript",
+            )
+        })?;
+    let durable_messages = durable
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing canonical transcript",
+            )
+        })?;
+    let invalid_prefix = expected_messages.len() < durable_messages.len()
+        || expected_messages[..durable_messages.len()] != durable_messages[..];
+    let invalid_suffix = prepared
+        .messages
+        .iter()
+        .skip(durable_messages.len())
+        .any(|message| {
+            message.role != bamboo_domain::Role::Tool
+                || message
+                    .tool_call_id
+                    .as_deref()
+                    .is_none_or(|id| id.trim().is_empty())
+        });
+    if invalid_prefix || invalid_suffix || prepared.updated_at < latest.updated_at {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "live bootstrap transcript is not an exact tool-result extension".into(),
+            ),
+        ));
+    }
+    let mut normalized = expected.clone();
+    let object = normalized.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid prepared Session")
+    })?;
+    object.insert(
+        "messages".into(),
+        serde_json::Value::Array(durable_messages.clone()),
+    );
+    object.insert(
+        "updated_at".into(),
+        durable.get("updated_at").cloned().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing canonical update time",
+            )
+        })?,
+    );
+    if normalized != durable {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "live bootstrap canonical Session changed".into(),
+            ),
+        ));
+    }
+    let mut reconciled = prepared.clone();
+    reconcile_runtime_checkpoint(&mut reconciled, latest)?;
+    let actual = bounded_live_bootstrap_value(&reconciled)?;
+    if actual != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "live bootstrap prepared Session changed during reconciliation".into(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     !result.as_ref().err().is_some_and(|error| {
         error.get_ref().is_some_and(|cause| {
@@ -794,7 +990,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.save_session_rebasing_task_conflicts_with_input(session, None, None)
+        self.save_session_rebasing_task_conflicts_with_input(session, None, None, None)
             .await
     }
 
@@ -806,12 +1002,40 @@ impl LockedSessionStore {
             bamboo_domain::SessionInboxOwnedClaim,
         )>,
         inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
+        startup_expected: Option<&Session>,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if let Some(provenance) = self.inherited_for_session(session) {
                 provenance.validate_session(session)?;
             }
-            let result = if self.child_actor_writer.is_some() {
+            let result = if let Some(expected) = startup_expected {
+                if self.child_actor_writer.is_some() || input.is_some() || inherited.is_some() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        bamboo_domain::SessionAuthorityConflict(
+                            "bound startup requires its Root execution writer".into(),
+                        ),
+                    ));
+                }
+                let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        bamboo_domain::SessionAuthorityConflict(
+                            "bound startup has no bound Root execution writer".into(),
+                        ),
+                    )
+                })?;
+                let carried_wait = self.inherited_for_session(session).cloned();
+                self.storage
+                    .save_root_actor_bound_startup(
+                        owner,
+                        session,
+                        expected,
+                        carried_wait.as_ref(),
+                        publish.clone(),
+                    )
+                    .await
+            } else if self.child_actor_writer.is_some() {
                 self.save_child_snapshot(session, false, input.cloned(), inherited)
                     .await
             } else if inherited.is_none() && self.inherited_for_session(session).is_some() {
@@ -1408,8 +1632,39 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, false, None, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, false, None, None, publish)
             .await
+    }
+
+    /// Persist a bound startup only while its original profile remains
+    /// current. The bound Root writer and its physical authority are required.
+    pub async fn merge_save_bound_startup(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.merge_save_bound_startup_and_publish(session, expected, |_, _| {})
+            .await
+    }
+
+    pub async fn merge_save_bound_startup_and_publish<F>(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+        publish: F,
+    ) -> std::io::Result<()>
+    where
+        F: FnOnce(&Session, bool) + Send,
+    {
+        self.merge_save_runtime_inner_and_publish(
+            session,
+            true,
+            false,
+            None,
+            Some(expected),
+            publish,
+        )
+        .await
     }
 
     /// Final runner save with a lock-scoped check for a synchronous child
@@ -1429,7 +1684,7 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, true, None, publish)
+        self.merge_save_runtime_inner_and_publish(session, true, true, None, None, publish)
             .await
     }
 
@@ -1442,8 +1697,67 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session, bool) + Send,
     {
-        self.merge_save_runtime_inner_and_publish(session, true, true, Some(inherited), publish)
-            .await
+        self.merge_save_runtime_inner_and_publish(
+            session,
+            true,
+            true,
+            Some(inherited),
+            None,
+            publish,
+        )
+        .await
+    }
+
+    /// Forward only this execution's captured Root writer; never accept one
+    /// from the caller or fall back to an ordinary Session save.
+    pub async fn checkpoint_live_bootstrap(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        gate: bamboo_domain::AdmissionGate,
+    ) -> std::io::Result<bamboo_domain::LiveBootstrapProof> {
+        // Also covers cancellation while waiting for this outer process lock,
+        // before V2 can install its own physical-job cancellation fence.
+        let mut cancel_on_drop = CancelLiveBootstrapOnDrop(Some(gate.clone()));
+        let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bound Root writer required",
+            )
+        })?;
+        let _guard = self.acquire_lock(&session.id).await;
+        let result = self
+            .storage
+            .checkpoint_root_live_bootstrap(owner, session, inbox, gate, publish.clone())
+            .await;
+        if result.is_ok() {
+            cancel_on_drop.0 = None;
+        }
+        result
+    }
+
+    pub async fn confirm_live_bootstrap(
+        &self,
+        proof: &bamboo_domain::LiveBootstrapProof,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        let mut cancel_on_drop = CancelLiveBootstrapOnDrop(Some(proof.storage_gate()));
+        let (owner, _) = self.root_actor_writer.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "bound Root writer required",
+            )
+        })?;
+        let _guard = self.acquire_lock(&owner.fence.actor_id).await;
+        let result = self
+            .storage
+            .confirm_root_live_bootstrap(owner, proof, inbox, publish)
+            .await;
+        if result.is_ok() {
+            cancel_on_drop.0 = None;
+        }
+        result
     }
 
     /// Persist an execute-boundary transcript checkpoint without allowing a
@@ -1526,12 +1840,9 @@ impl LockedSessionStore {
         };
 
         if let Some(latest) = latest.as_ref() {
-            ensure_model_context_checkpoint_is_current(session, latest)?;
             let incoming_count = session.messages.len();
             let durable_count = latest.messages.len();
-            let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
-            bamboo_domain::merge_session_inbox_admission(session, latest);
-            let adopted_response = adopt_durable_consumed_clarification(session, latest);
+            let (appended, adopted_response) = reconcile_runtime_checkpoint(session, latest)?;
             tracing::debug!(
                 "[{}] append-safe runtime checkpoint: durable={}, incoming={}, appended={}, adopted_response={}, saved={}",
                 session.id,
@@ -1541,9 +1852,6 @@ impl LockedSessionStore {
                 adopted_response,
                 session.messages.len(),
             );
-            apply_authoritative_metadata(session, latest);
-            adopt_fresher_disk_permission_posture(session, latest);
-            let _ = adopt_durable_tagged_child_wait(session, latest);
         }
 
         if let Some(prompt) = input_prompt.as_deref() {
@@ -1555,7 +1863,7 @@ impl LockedSessionStore {
                 .insert(0, bamboo_domain::Message::system(prompt));
         }
         let mut result = self
-            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
+            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None, None)
             .await;
         for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if !result
@@ -1572,13 +1880,7 @@ impl LockedSessionStore {
             let Some(durable) = self.storage.load_session(&session.id).await? else {
                 break;
             };
-            ensure_model_context_checkpoint_is_current(session, &durable)?;
-            bamboo_domain::append_missing_runtime_messages(session, &durable);
-            bamboo_domain::merge_session_inbox_admission(session, &durable);
-            adopt_durable_consumed_clarification(session, &durable);
-            apply_authoritative_metadata(session, &durable);
-            adopt_fresher_disk_permission_posture(session, &durable);
-            let _ = adopt_durable_tagged_child_wait(session, &durable);
+            reconcile_runtime_checkpoint(session, &durable)?;
             if let Some(prompt) = input_prompt.as_deref() {
                 session
                     .messages
@@ -1588,7 +1890,12 @@ impl LockedSessionStore {
                     .insert(0, bamboo_domain::Message::system(prompt));
             }
             result = self
-                .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None)
+                .save_session_rebasing_task_conflicts_with_input(
+                    session,
+                    input.as_ref(),
+                    None,
+                    None,
+                )
                 .await;
         }
         if may_publish_runtime_result(&result) {
@@ -1770,7 +2077,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.merge_save_runtime_inner_and_publish(session, false, false, None, |_, _| {})
+        self.merge_save_runtime_inner_and_publish(session, false, false, None, None, |_, _| {})
             .await
     }
 
@@ -1780,6 +2087,7 @@ impl LockedSessionStore {
         adopt_bypass: bool,
         finalize_child_wait: bool,
         inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
+        startup_expected: Option<&Session>,
         publish: F,
     ) -> std::io::Result<()>
     where
@@ -1861,7 +2169,12 @@ impl LockedSessionStore {
             adopt_fresher_durable_model_context_state(session, latest);
         }
         let result = self
-            .save_session_rebasing_task_conflicts_with_input(session, None, inherited)
+            .save_session_rebasing_task_conflicts_with_input(
+                session,
+                None,
+                inherited,
+                startup_expected,
+            )
             .await;
         if may_publish_runtime_result(&result) {
             *original = candidate;
@@ -2209,11 +2522,28 @@ impl LockedSessionStore {
         else {
             return Ok(Ok(None));
         };
+        // Backends with the profile CAS prevent a Root-bound response from
+        // overwriting a cross-instance profile or pending-question change.
+        // Older backends retain their original fenced response save; Connect
+        // verifies this capability before consuming a non-terminal answer.
+        let expected = (self.root_actor_writer.is_some()
+            && self.storage.supports_root_actor_bound_startup())
+        .then(|| session.clone());
         if let Err(error) = mutate(&mut session) {
             return Ok(Err(error));
         }
-        self.save_session_rebasing_task_conflicts(&mut session)
+        if let Some(expected) = expected.as_ref() {
+            self.save_session_rebasing_task_conflicts_with_input(
+                &mut session,
+                None,
+                None,
+                Some(expected),
+            )
             .await?;
+        } else {
+            self.save_session_rebasing_task_conflicts(&mut session)
+                .await?;
+        }
         publish(&session);
         Ok(Ok(Some(session)))
     }
@@ -2349,6 +2679,20 @@ impl RuntimeSessionPersistence for LockedSessionStore {
         self.merge_save_runtime(session).await
     }
 
+    fn supports_bound_startup_session(&self) -> bool {
+        self.root_actor_writer.is_some()
+            && self.child_actor_writer.is_none()
+            && self.storage.supports_root_actor_bound_startup()
+    }
+
+    async fn save_bound_startup_session(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.merge_save_bound_startup(session, expected).await
+    }
+
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.merge_save_finalized_runtime(session).await
     }
@@ -2441,6 +2785,24 @@ impl RuntimeSessionPersistence for LockedSessionStore {
             |_, _| {},
         )
         .await
+    }
+
+    async fn checkpoint_live_bootstrap(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        gate: bamboo_domain::AdmissionGate,
+    ) -> std::io::Result<bamboo_domain::LiveBootstrapProof> {
+        LockedSessionStore::checkpoint_live_bootstrap(self, session, inbox, gate).await
+    }
+
+    async fn confirm_live_bootstrap(
+        &self,
+        proof: &bamboo_domain::LiveBootstrapProof,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        LockedSessionStore::confirm_live_bootstrap(self, proof, inbox, publish).await
     }
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {

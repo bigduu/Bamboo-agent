@@ -21,7 +21,7 @@ use bamboo_engine::execution::{
     create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
     spawn_session_execution, SessionExecutionArgs, SessionExecutionReserveOutcome,
 };
-use bamboo_engine::{AuxiliaryModelConfig, SessionRepository};
+use bamboo_engine::{AuxiliaryModelConfig, ModelRoster, SessionRepository};
 use bamboo_llm::{Config, ProviderRegistry};
 
 use crate::permission_audit::record_bamboo_runtime_permission_metadata;
@@ -211,6 +211,94 @@ fn resolve_connect_run_config(
     bamboo_engine::resolved_defaults::resolve_default_run_config(config_snapshot, provider_registry)
 }
 
+// Construct the same resolver used by Connect's new-run execution. The
+// provider key comes from the resolved run, not a later global default.
+pub(super) fn connect_auxiliary_model_resolver(
+    config: Arc<TokioRwLock<Config>>,
+    registry: Arc<ProviderRegistry>,
+    model_roster: &ModelRoster,
+) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> {
+    bamboo_engine::model_areas::live_auxiliary_model_resolver(
+        config,
+        registry,
+        model_roster.provider_name.clone().unwrap_or_default(),
+    )
+}
+
+fn bind_connect_session_to_run(
+    session: &mut Session,
+    resolved: &ResolvedConnectRunConfig,
+) -> Result<(), String> {
+    let provider = resolved
+        .model_roster
+        .provider_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Connect provider is unavailable".to_string())?;
+    let model = resolved
+        .model_roster
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "Connect model is unavailable".to_string())?;
+    let target = bamboo_domain::ProviderModelRef::new(provider, model);
+    bamboo_engine::session_app::provider_model::persist_model_ref(session, &target);
+    session.reasoning_effort = resolved.reasoning_effort;
+    if let Some(effort) = resolved.reasoning_effort {
+        session.set_reasoning_effort_meta(effort.as_str());
+    } else {
+        session.clear_reasoning_effort_meta();
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod startup_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+
+    pub(super) struct Hook {
+        pub(super) reached: Notify,
+        pub(super) resume: Notify,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Arc<Hook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<Hook>>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(key: &str) -> Arc<Hook> {
+        let hook = Arc::new(Hook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+        });
+        hooks()
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause(key: &str) {
+        let hook = hooks().lock().unwrap().remove(key);
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
+}
+
+fn connect_session_matches_run(session: &Session, resolved: &ResolvedConnectRunConfig) -> bool {
+    session.model_ref.as_ref().is_some_and(|target| {
+        resolved.model_roster.provider_name.as_deref() == Some(target.provider.as_str())
+            && resolved.model_roster.model.as_deref() == Some(target.model.as_str())
+            && session.provider_name().as_deref() == Some(target.provider.as_str())
+            && session.model == target.model
+            && session.reasoning_effort == resolved.reasoning_effort
+    })
+}
+
 /// Builds a fresh session for a connect chat key. Mirrors
 /// `schedule_app::session_factory::create_schedule_session`.
 ///
@@ -258,6 +346,7 @@ fn create_connect_session(
             "connect",
         );
     }
+    session.reasoning_effort = reasoning_effort;
     if let Some(effort) = reasoning_effort {
         session.set_reasoning_effort_meta(effort.as_str());
     }
@@ -843,11 +932,15 @@ impl ConnectBridge {
         // Root activation validates durable birth before owning the first User
         // turn. Publish the inert identity before registering its chat mapping.
         let mut session = session;
+        bind_connect_session_to_run(&mut session, resolved)?;
         self.ctx
             .session_repo
             .save(&mut session)
             .await
             .map_err(|error| format!("Unable to persist the new Connect session: {error}"))?;
+        if !connect_session_matches_run(&session, resolved) {
+            return Err("Connect session model changed while it was saved".to_string());
+        }
         self.set_session_id_for_key(key, &session.id).await;
         Ok(session)
     }
@@ -868,6 +961,16 @@ impl ConnectBridge {
     ) {
         let config_snapshot = self.ctx.config.read().await.clone();
         let resolved = resolve_connect_run_config(&config_snapshot, &self.ctx.provider_registry);
+
+        if let Some(error) = resolved.model_error.as_ref() {
+            reply_text(
+                &platform,
+                reply_ctx,
+                format!("Configured model is unavailable: {error}"),
+            )
+            .await;
+            return;
+        }
 
         if resolved
             .model_roster
@@ -902,6 +1005,10 @@ impl ConnectBridge {
             }
         };
 
+        // Preserve the durable profile observed before this run changes it.
+        let expected_profile = session.clone();
+        #[cfg(test)]
+        startup_test_hooks::pause(key).await;
         let session_id = session.id.clone();
         let session_tx =
             get_or_create_event_sender(&self.ctx.session_event_senders, &session_id).await;
@@ -946,6 +1053,11 @@ impl ConnectBridge {
 
         // Only the exact shared runner/router owner may publish a new prompt or
         // mutate process-global permission workspace state.
+        if let Err(error) = bind_connect_session_to_run(&mut session, &resolved) {
+            execution_reservation.abandon().await;
+            reply_text(&platform, reply_ctx, &error).await;
+            return;
+        }
         session.add_message(Message::user(text.to_string()));
         if let Some(config) = self.ctx.permission_checker.permission_config() {
             config.set_session_workspace(session_id.clone(), session.workspace.clone());
@@ -956,19 +1068,36 @@ impl ConnectBridge {
                 return;
             }
         }
-        if let Some(persistence) = execution_reservation.execution_persistence() {
-            if let Err(error) = persistence.save_runtime_session(&mut session).await {
-                execution_reservation.abandon().await;
-                reply_text(
-                    &platform,
-                    reply_ctx,
-                    &format!("Unable to persist this turn: {error}"),
-                )
-                .await;
-                return;
+        let saved = match execution_reservation.execution_persistence() {
+            Some(persistence) => {
+                persistence
+                    .save_bound_startup_session(&mut session, &expected_profile)
+                    .await
             }
-        } else {
-            self.ctx.session_repo.save_and_cache(&mut session).await;
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Connect startup requires a bound Root writer",
+            )),
+        };
+        if let Err(error) = saved {
+            execution_reservation.abandon().await;
+            reply_text(
+                &platform,
+                reply_ctx,
+                format!("Unable to persist this turn: {error}"),
+            )
+            .await;
+            return;
+        }
+        if !connect_session_matches_run(&session, &resolved) {
+            execution_reservation.abandon().await;
+            reply_text(
+                &platform,
+                reply_ctx,
+                "The turn was saved, but its model or provider changed before execution.",
+            )
+            .await;
+            return;
         }
 
         self.set_cancel_token(key, execution_reservation.cancel_token().clone())
@@ -984,32 +1113,32 @@ impl ConnectBridge {
                 root_publication,
             );
 
-        // Auxiliary (fast/background/summarization) model resolver — mirrors
-        // `schedule_app::manager::run_schedule_job` exactly.
-        let aux_fast_model = resolved.model_roster.fast_model();
-        let aux_fast_provider = resolved.model_roster.fast_model_provider();
-        let aux_background_model = resolved.model_roster.background_model();
-        let aux_background_provider = resolved.model_roster.background_model_provider();
-        let aux_summarization_model = resolved.model_roster.summarization_model();
-        let aux_summarization_provider = resolved.model_roster.summarization_model_provider();
-        let auxiliary_model_resolver = Arc::new(move || AuxiliaryModelConfig {
-            fast_model_name: aux_fast_model.clone(),
-            fast_model_provider: aux_fast_provider.clone(),
-            background_model_name: aux_background_model.clone(),
-            planning_model_name: None,
-            search_model_name: None,
-            summarization_model_name: aux_summarization_model.clone(),
-            background_model_provider: aux_background_provider.clone(),
-            summarization_model_provider: aux_summarization_provider.clone(),
-        });
+        let auxiliary_model_resolver = connect_auxiliary_model_resolver(
+            self.ctx.config.clone(),
+            self.ctx.provider_registry.clone(),
+            &resolved.model_roster,
+        );
 
+        let agent = match crate::app_state::host_gold_origin::managed_selection_resolver(
+            self.ctx.config.clone(),
+            resolved
+                .model_roster
+                .provider_name
+                .as_deref()
+                .unwrap_or_default(),
+            resolved.model_provider.as_ref(),
+            resolved.model_origin.as_ref(),
+        ) {
+            Some(policy) => Arc::new(self.ctx.agent.with_composed_gold_target_resolver(policy)),
+            None => self.ctx.agent.clone(),
+        };
         spawn_session_execution(SessionExecutionArgs {
-            agent: self.ctx.agent.clone(),
+            agent,
             session_id: session_id.clone(),
             session,
             execution_reservation,
             tools_override: Some(self.ctx.tools.clone()),
-            provider_override: None,
+            provider_override: resolved.model_provider.clone(),
             model_roster: resolved.model_roster.clone(),
             reasoning_effort: resolved.reasoning_effort,
             reasoning_effort_source: "connect".to_string(),
@@ -1310,6 +1439,51 @@ async fn atomic_write(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<(
 
 #[cfg(test)]
 mod tests {
+
+    // Exercise the exact builder installed for a Connect new run. This is a
+    // resolver-level test, not a complete platform/session execution.
+    #[tokio::test]
+    async fn connect_new_run_legacy_background_rechecks_managed_admission() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let snapshot =
+            tokio::time::timeout(std::time::Duration::from_secs(5), fixture.config.read())
+                .await
+                .expect("config snapshot timeout")
+                .clone();
+        let resolved = resolve_connect_run_config(&snapshot, &fixture.registry);
+        assert_eq!(
+            resolved.model_roster.provider_name.as_deref(),
+            Some("account-a")
+        );
+        let resolver = connect_auxiliary_model_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+            &resolved.model_roster,
+        );
+        let initial = resolver();
+        assert_eq!(initial.fast_model_name.as_deref(), Some("fast-a"));
+        assert!(initial
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+        let mut guard = fixture.config.write().await;
+        guard.default_provider_instance = Some("account-b".into());
+        let blocked = resolver();
+        assert!(blocked.background_model_provider.is_none());
+        assert!(blocked.summarization_model_error.is_some());
+        drop(guard);
+        let current = resolver();
+        assert!(current
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+
+        fixture.verify_live(resolver).await;
+    }
     use super::*;
     use crate::app_state::AppState;
     use crate::tools::ToolSurface;
@@ -1596,6 +1770,16 @@ mod tests {
                 extra: Default::default(),
             });
         }
+        // Keep the original terminal-auth fixture while exercising the new
+        // explicit admission path; no real keyed provider is constructed.
+        state.provider_registry.replace_with(ProviderRegistry::new(
+            HashMap::from([("openai".into(), state.provider.read().await.clone())]),
+            "openai".into(),
+        ));
+        state.provider_registry.set_runtime_models(HashMap::from([(
+            "openai".into(),
+            vec!["gpt-4o-mini".into()],
+        )]));
         let ctx = ConnectContext {
             agent: state.agent.clone(),
             tools: state.tools_for(ToolSurface::Root),
@@ -1627,6 +1811,240 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn connect_startup_rejects_concurrent_model_patch_before_provider_call() {
+        use actix_web::{test, web, App};
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let state = web::Data::new(state);
+        let ctx = ConnectContext {
+            agent: state.agent.clone(),
+            tools: state.tools_for(ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
+            permission_checker: state.permission_checker.clone(),
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+        let key = "fake:connect-startup-race:user";
+        let snapshot = state.config.read().await.clone();
+        let resolved = resolve_connect_run_config(&snapshot, &state.provider_registry);
+        let initial = bridge
+            .create_and_register_session(key, &resolved)
+            .await
+            .unwrap();
+        let hook = startup_test_hooks::install(key);
+        let platform = FakePlatform::new("fake");
+        let platform_trait: Arc<dyn Platform> = platform.clone();
+        let reply = inbound("connect-startup-race", "user", "m1", "racing turn").reply_ctx;
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let run = bridge.run_prompt(key, platform_trait, &reply, "racing turn");
+        let patch = async {
+            tokio::time::timeout(Duration::from_secs(5), hook.reached.notified())
+                .await
+                .expect("Connect must reach the startup gate");
+            let response = test::call_service(&app, test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{}", initial.id))
+                .set_json(serde_json::json!({"model_ref": {"provider":"startup-a", "model":"startup-model"}}))
+                .to_request()).await;
+            hook.resume.notify_one();
+            response
+        };
+        let (_, patch) = tokio::join!(run, patch);
+        assert!(
+            patch.status().is_success(),
+            "PATCH status: {}",
+            patch.status()
+        );
+        assert!(platform
+            .sent_texts()
+            .await
+            .iter()
+            .any(|text| text.contains("bound startup execution profile changed")));
+        let durable = state
+            .storage
+            .load_session(&initial.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            durable.model_ref,
+            Some(bamboo_domain::ProviderModelRef::new(
+                "startup-a",
+                "startup-model"
+            ))
+        );
+        assert!(!durable
+            .messages
+            .iter()
+            .any(|message| message.content == "racing turn"));
+        for provider in providers.values() {
+            assert!(provider.models.lock().unwrap().is_empty());
+        }
+        state.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn routing_contract_connect_dispatches_chat_role_pair_and_rejects_invalid_updates() {
+        let (_dir, state, providers) = crate::model_routing_test_support::state().await;
+        let ctx = ConnectContext {
+            agent: state.agent.clone(),
+            tools: state.tools_for(ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
+            permission_checker: state.permission_checker.clone(),
+        };
+        let bridge = ConnectBridge::new(ctx, None);
+        let platform = FakePlatform::new("fake");
+        let reply = inbound(
+            "routing-chat",
+            "routing-user",
+            "synthetic-1",
+            "Synthetic routing prompt",
+        )
+        .reply_ctx;
+        let platform_trait: Arc<dyn Platform> = platform.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.run_prompt(
+                "fake:routing-chat:routing-user",
+                platform_trait.clone(),
+                &reply,
+                "Synthetic routing prompt",
+            ),
+        )
+        .await
+        .expect("synthetic Connect run must settle");
+        assert_eq!(
+            *providers["chat-b"].models.lock().unwrap(),
+            vec!["chat-model"]
+        );
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        let key = "fake:routing-chat:routing-user";
+        let id = bridge
+            .session_id_for_key(key)
+            .await
+            .expect("Connect session");
+        let saved = state
+            .session_repo
+            .load_merged(&id)
+            .await
+            .expect("saved Connect session");
+        assert_eq!(
+            saved.model_ref,
+            Some(bamboo_domain::ProviderModelRef::new("chat-b", "chat-model"))
+        );
+        // Rendering returns on the terminal frame; the reserved Root may
+        // still be publishing its history barrier. Wait for the runner and
+        // router to release before testing a subsequent turn on this session.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let active = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(&id)
+                    .is_some_and(|runner| {
+                        matches!(
+                            runner.status,
+                            crate::app_state::AgentStatus::Pending
+                                | crate::app_state::AgentStatus::Running
+                        )
+                    });
+                if !active
+                    && state
+                        .session_activation_router
+                        .current_run_id(&id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first Connect run must release its Root reservation");
+
+        state.config.write().await.defaults.as_mut().unwrap().chat =
+            bamboo_domain::ProviderModelRef::new("fast-c", "cheap-model")
+                .with_reasoning_effort(bamboo_domain::ReasoningEffort::High);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.run_prompt(key, platform_trait.clone(), &reply, "Synthetic follow-up"),
+        )
+        .await
+        .expect("follow-up must settle");
+        let saved = state
+            .session_repo
+            .load_merged(&id)
+            .await
+            .expect("updated Connect session");
+        assert_eq!(
+            saved.model_ref,
+            Some(bamboo_domain::ProviderModelRef::new(
+                "fast-c",
+                "cheap-model"
+            ))
+        );
+        assert_eq!(
+            saved.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::High)
+        );
+        assert_eq!(saved.reasoning_effort_meta().as_deref(), Some("high"));
+        assert_eq!(
+            providers["fast-c"]
+                .efforts
+                .lock()
+                .unwrap()
+                .last()
+                .copied()
+                .flatten(),
+            Some(bamboo_domain::ReasoningEffort::High)
+        );
+
+        state.config.write().await.defaults.as_mut().unwrap().chat =
+            bamboo_domain::ProviderModelRef::new("unknown-account", "unadmitted-chat");
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.run_prompt(
+                "fake:routing-chat:routing-user",
+                platform_trait,
+                &reply,
+                "Synthetic rejected routing prompt",
+            ),
+        )
+        .await
+        .expect("invalid Connect route must settle before dispatch");
+        assert_eq!(providers["chat-b"].models.lock().unwrap().len(), 1);
+        assert!(providers["startup-a"].models.lock().unwrap().is_empty());
+        assert_eq!(
+            *providers["fast-c"].models.lock().unwrap(),
+            vec!["cheap-model"]
+        );
+    }
+
     fn key_for(chat_id: &str, user_id: &str) -> String {
         SessionKey {
             platform: "fake".to_string(),
@@ -1634,6 +2052,174 @@ mod tests {
             user_id: user_id.to_string(),
         }
         .as_string()
+    }
+
+    // Focused safety regression for the real Connect run_prompt path.
+    #[tokio::test]
+    async fn connect_gold_stays_with_accepted_main_origin_after_swap() {
+        use bamboo_domain::ProviderModelRef;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let model = body["model"].as_str().unwrap();
+                let delta = match model {
+                    "main-a" => serde_json::json!({"content":"synthetic answer"}),
+                    "only-a-gold" => serde_json::json!({"tool_calls":[{"index":0,
+                        "id":"fixture-gold","type":"function","function":{
+                            "name":"report_gold_evaluation","arguments":
+                            "{\"decision\":\"achieved\",\"confidence\":\"high\",\"reasoning\":\"synthetic\",\"missing_information\":[]}"}}]}),
+                    other => panic!("unexpected synthetic model {other}"),
+                };
+                let frame = serde_json::json!({"id":"fixture","object":"chat.completion.chunk","created":0,
+                    "model":model,"choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                let response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"));
+                if model == "main-a" { response.set_delay(Duration::from_secs(4)) } else { response }
+            }).mount(&a).await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("synthetic refusal"))
+            .mount(&b)
+            .await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(dir.path().to_path_buf()).await.unwrap();
+        state.stop_config_watcher_for_test();
+        let mut config = state.config.read().await.clone();
+        config.provider = "account-a".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.clear();
+        for (name, model, admitted, endpoint) in [
+            (
+                "account-a",
+                "main-a",
+                serde_json::json!(["main-a", "only-a-gold"]),
+                a.uri(),
+            ),
+            (
+                "account-b",
+                "main-b",
+                serde_json::json!(["main-b"]),
+                b.uri(),
+            ),
+        ] {
+            config.provider_instances.insert(
+                name.into(),
+                serde_json::from_value(serde_json::json!({
+                    "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+                    "base_url":endpoint, "model":model, "runtime_models":admitted
+                }))
+                .unwrap(),
+            );
+        }
+        config.extra.insert(
+            "gold".into(),
+            serde_json::json!({"enabled":true,
+            "auto_continue_enabled":true,"goal":"synthetic Connect goal",
+            "model_name":"only-a-gold", "max_auto_continuations":1}),
+        );
+        state
+            .provider_registry
+            .reload_from_config(&config, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let main_a = state
+            .provider_registry
+            .provider_for_configured_model(&config, &ProviderModelRef::new("account-a", "main-a"))
+            .unwrap();
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-a", "only-a-gold")
+            )
+            .is_ok());
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-b", "only-a-gold")
+            )
+            .is_err());
+        *state.config.write().await = config;
+        *state.provider.write().await = main_a;
+        let ctx = ConnectContext {
+            agent: Arc::new(state.agent.with_host_gold_origin_resolver(
+                crate::app_state::host_gold_origin::origin_resolver(
+                    state.provider_registry.clone(),
+                    state.initial_injected_provider.clone(),
+                ),
+            )),
+            tools: state.tools_for(ToolSurface::Root),
+            session_repo: state.session_repo.clone(),
+            agent_runners: state.agent_runners.clone(),
+            session_event_senders: state.session_event_senders.clone(),
+            account_feed_inbox: None,
+            root_account_sink: Some(state.account_sink.clone()),
+            app_data_dir: Some(state.app_data_dir.clone()),
+            config: state.config.clone(),
+            provider_registry: state.provider_registry.clone(),
+            project_store: state.project_store.clone(),
+            workspace_resolver: state.workspace_resolver.clone(),
+            project_ids_by_platform: Arc::new(HashMap::new()),
+            permission_checker: state.permission_checker.clone(),
+        };
+        let bridge = Arc::new(ConnectBridge::new(ctx, None));
+        let task = tokio::spawn(async move {
+            let platform: Arc<dyn Platform> = FakePlatform::new("fake");
+            bridge
+                .run_prompt(
+                    "fake:chat:user",
+                    platform,
+                    &ReplyCtx(serde_json::json!({})),
+                    "synthetic Connect task",
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if !a.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed A Connect main request did not arrive");
+        *state.provider.write().await = state.provider_registry.get("account-b").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if a.received_requests().await.unwrap().iter().any(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                        == "only-a-gold"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the captured account A did not receive Gold");
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("Connect run did not settle")
+            .unwrap();
+        let seen_b = b.received_requests().await.unwrap();
+        assert!(
+            !seen_b.iter().any(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                    == "only-a-gold"
+            }),
+            "Gold must never be sent to B"
+        );
     }
 
     #[test]

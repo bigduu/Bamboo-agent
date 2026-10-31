@@ -229,7 +229,7 @@ fn project(snapshot: &Snapshot, scope: &Scope) -> Result<Observation, PortError>
     Ok(Observation {
         scope: scope.clone(),
         kind: ObservationKind::Snapshot,
-        source_revision: snapshot.seq,
+        source_revision: snapshot.execution_facts_revision(),
         cursor: snapshot.seq,
         evidence_revision: work.updated_seq.max(assignment.updated_seq),
         started_at_ms: None,
@@ -242,7 +242,7 @@ fn project(snapshot: &Snapshot, scope: &Scope) -> Result<Observation, PortError>
     })
 }
 
-fn ticket_error(error: bamboo_tickets::Error) -> PortError {
+pub(super) fn ticket_error(error: bamboo_tickets::Error) -> PortError {
     match error {
         bamboo_tickets::Error::ScopeDenied(_) => PortError::Denied,
         bamboo_tickets::Error::RevisionConflict | bamboo_tickets::Error::ResyncRequired => {

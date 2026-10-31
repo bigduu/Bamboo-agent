@@ -18,6 +18,7 @@ pub enum LlmRequestStopReason {
     AttemptsExhausted,
     TimeBudgetExhausted,
     RetryDelayExceedsBudget,
+    RetryDelayTooLarge,
     NonRetryableTransport,
     UnclassifiedErrorBody,
     CancelledOrDropped,
@@ -31,6 +32,7 @@ impl LlmRequestStopReason {
             Self::RetryDelayExceedsBudget => {
                 "Required retry delay exceeds the remaining time budget"
             }
+            Self::RetryDelayTooLarge => "Required retry delay is too large to schedule safely",
             Self::NonRetryableTransport => "Transport failure is not automatically retryable",
             Self::UnclassifiedErrorBody => "Upstream error response could not be safely classified",
             Self::CancelledOrDropped => "Request cancelled or its caller stopped waiting",
@@ -42,7 +44,7 @@ impl LlmRequestStopReason {
 // Validation applies on every deserialize, including cold canonical reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DiagnosticFields {
+struct InitialRequestDiagnosticFields {
     schema_version: u8,
     diagnostic_id: Uuid,
     request_id: Uuid,
@@ -52,19 +54,159 @@ struct DiagnosticFields {
     session_hash: Option<String>,
     run_id: Option<Uuid>,
     attempt: u32,
-    attempt_limit: u32,
+    attempt_limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_mode: Option<String>,
     event: String,
     phase: String,
     failure: String,
     status: Option<u16>,
     attempt_timeout_ms: u64,
-    total_budget_ms: u64,
+    total_budget_ms: Option<u64>,
     attempt_elapsed_ms: u64,
     total_elapsed_ms: u64,
-    remaining_budget_ms: u64,
+    remaining_budget_ms: Option<u64>,
     retry_delay_ms: Option<u64>,
     stop_reason: LlmRequestStopReason,
     upstream_outcome: String,
+}
+
+/// Public watchdog evidence only. The validated wrapper below is required
+/// before these fields may be persisted or attached to a client error event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StreamTimeoutDiagnostic {
+    pub schema_version: u8,
+    pub kind: String,
+    pub diagnostic_id: Uuid,
+    pub error_id: Uuid,
+    pub observed_at: DateTime<Utc>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub session_hash: String,
+    pub run_id: Option<Uuid>,
+    pub phase: String,
+    pub deadline_ms: u64,
+    pub last_transport_ms_ago: u64,
+    pub last_semantic_ms_ago: Option<u64>,
+    pub semantic_output_started: bool,
+    pub retry_safe: bool,
+    pub last_http_status: Option<u16>,
+    pub retry_delay_ms: Option<u64>,
+}
+
+impl StreamTimeoutDiagnostic {
+    /// Identifiers are bounded labels, never URLs or credential-like values.
+    /// This same check applies before formatting the timeout message and on
+    /// cold metadata reads, so redaction cannot break exact error binding.
+    pub fn valid_identifier(value: &str) -> bool {
+        !value.is_empty()
+            && value.len() <= 120
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.:/@".contains(&b))
+            && !value.contains("://")
+            && !value.to_ascii_lowercase().starts_with("sk-")
+            && !value.to_ascii_lowercase().starts_with("bearer")
+    }
+
+    fn valid(&self) -> bool {
+        // JavaScript consumers must not round a correlation-relevant duration.
+        const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+        let has_semantic = self.last_semantic_ms_ago.is_some();
+        self.schema_version == 1
+            && self.kind == "stream_timeout"
+            && self.error_id == self.diagnostic_id
+            && valid_session_hash(&self.session_hash)
+            && self.provider.as_deref().is_none_or(Self::valid_identifier)
+            && self.model.as_deref().is_none_or(Self::valid_identifier)
+            && (1_000..=86_400_000).contains(&self.deadline_ms)
+            && self.last_transport_ms_ago <= MAX_SAFE_INTEGER
+            && self.last_semantic_ms_ago.is_none_or(|elapsed| {
+                elapsed <= MAX_SAFE_INTEGER && self.last_transport_ms_ago <= elapsed
+            })
+            && self.semantic_output_started == has_semantic
+            && (!self.retry_safe || !has_semantic)
+            && match self.phase.as_str() {
+                "bootstrap" | "first_semantic" => !has_semantic,
+                "transport_idle" => true,
+                "semantic_idle" => has_semantic,
+                _ => false,
+            }
+            && match (self.last_http_status, self.retry_delay_ms) {
+                (None, None) => true,
+                (Some(status), Some(delay)) => {
+                    self.phase == "bootstrap"
+                        && (100..=599).contains(&status)
+                        && delay <= MAX_SAFE_INTEGER
+                }
+                _ => false,
+            }
+    }
+
+    fn error_message(&self) -> String {
+        let last_semantic = self
+            .last_semantic_ms_ago
+            .map(|elapsed| format!("{elapsed}ms"))
+            .unwrap_or_else(|| "never".into());
+        let mut message = format!(
+            "Stream timed out: phase={}, deadline_ms={}, provider={}, model={}, last_transport_ms_ago={}, \
+             last_semantic_ms_ago={}, semantic_output_started={}, retry_safe={}",
+            self.phase,
+            self.deadline_ms,
+            self.provider.as_deref().unwrap_or("unknown"),
+            self.model.as_deref().unwrap_or("unknown"),
+            self.last_transport_ms_ago,
+            last_semantic,
+            self.semantic_output_started,
+            self.retry_safe,
+        );
+        if let (Some(status), Some(delay)) = (self.last_http_status, self.retry_delay_ms) {
+            use std::fmt::Write;
+            let _ = write!(
+                message,
+                ", last_http_status={status}, retry_delay_ms={delay}"
+            );
+        }
+        format!("{message}. Diagnostic ID: {}.", self.diagnostic_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+enum DiagnosticFields {
+    InitialRequest(InitialRequestDiagnosticFields),
+    StreamTimeout(StreamTimeoutDiagnostic),
+}
+
+impl DiagnosticFields {
+    fn valid(&self) -> bool {
+        match self {
+            Self::InitialRequest(fields) => fields.valid(),
+            Self::StreamTimeout(fields) => fields.valid(),
+        }
+    }
+
+    fn run_id(&self) -> Option<Uuid> {
+        match self {
+            Self::InitialRequest(fields) => fields.run_id,
+            Self::StreamTimeout(fields) => fields.run_id,
+        }
+    }
+
+    fn set_run_id(&mut self, run_id: Option<Uuid>) {
+        match self {
+            Self::InitialRequest(fields) => fields.run_id = run_id,
+            Self::StreamTimeout(fields) => fields.run_id = run_id,
+        }
+    }
+}
+
+fn valid_session_hash(hash: &str) -> bool {
+    hash.len() == 16
+        && hash
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
 /// A validated, content-free stop record. Unknown fields and free-text values
@@ -83,27 +225,43 @@ impl<'de> Deserialize<'de> for LlmRequestDiagnostic {
     }
 }
 
-impl DiagnosticFields {
+impl InitialRequestDiagnosticFields {
     fn valid(&self) -> bool {
         self.schema_version == 1
             && self.provider == "anthropic"
             && self.event == "stop"
             && self.request_id == self.diagnostic_id
             && self.error_id == Some(self.diagnostic_id)
-            && self.session_hash.as_deref().is_some_and(|hash| {
-                hash.len() == 16
-                    && hash
-                        .bytes()
-                        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-            })
-            && (1..=4).contains(&self.attempt_limit)
-            && self.attempt <= self.attempt_limit
+            && self.session_hash.as_deref().is_some_and(valid_session_hash)
+            && match self.retry_mode.as_deref() {
+                None => {
+                    self.attempt_limit
+                        .is_some_and(|limit| limit > 0 && self.attempt <= limit)
+                        && self
+                            .total_budget_ms
+                            .is_some_and(|budget| budget <= 3_600_000)
+                        && self
+                            .remaining_budget_ms
+                            .zip(self.total_budget_ms)
+                            .is_some_and(|(remaining, total)| remaining <= total)
+                }
+                Some("until_cancelled") => {
+                    self.attempt_limit.is_none()
+                        && self.total_budget_ms.is_none()
+                        && self.remaining_budget_ms.is_none()
+                        && !matches!(
+                            self.stop_reason,
+                            LlmRequestStopReason::AttemptsExhausted
+                                | LlmRequestStopReason::TimeBudgetExhausted
+                                | LlmRequestStopReason::RetryDelayExceedsBudget
+                        )
+                }
+                _ => false,
+            }
             && self
                 .status
                 .is_none_or(|status| (100..=599).contains(&status))
             && self.attempt_timeout_ms <= 60_000
-            && self.total_budget_ms <= 60_000
-            && self.remaining_budget_ms <= self.total_budget_ms
             && ["send_headers", "error_body", "response_status", "backoff"]
                 .contains(&self.phase.as_str())
             && ["unknown", "response_received"].contains(&self.upstream_outcome.as_str())
@@ -138,6 +296,12 @@ pub fn llm_diagnostic_session_hash(session_id: &str) -> String {
 }
 
 impl LlmRequestDiagnostic {
+    pub fn from_stream_timeout(fields: StreamTimeoutDiagnostic) -> Option<Self> {
+        fields
+            .valid()
+            .then_some(Self(DiagnosticFields::StreamTimeout(fields)))
+    }
+
     pub fn from_json(raw: &str) -> Option<Self> {
         (raw.len() <= MAX_DIAGNOSTIC_BYTES)
             .then(|| serde_json::from_str(raw).ok())
@@ -145,28 +309,50 @@ impl LlmRequestDiagnostic {
     }
 
     pub fn diagnostic_id(&self) -> Uuid {
-        self.0.diagnostic_id
+        match &self.0 {
+            DiagnosticFields::InitialRequest(fields) => fields.diagnostic_id,
+            DiagnosticFields::StreamTimeout(fields) => fields.diagnostic_id,
+        }
     }
 
     pub fn matches_session(&self, session_id: &str) -> bool {
-        self.0.session_hash.as_deref() == Some(llm_diagnostic_session_hash(session_id).as_str())
+        let hash = llm_diagnostic_session_hash(session_id);
+        match &self.0 {
+            DiagnosticFields::InitialRequest(fields) => {
+                fields.session_hash.as_deref() == Some(hash.as_str())
+            }
+            DiagnosticFields::StreamTimeout(fields) => fields.session_hash == hash,
+        }
     }
 
     /// Exact generated error text only. An arbitrary upstream error containing
     /// a copied UUID cannot acquire a receipt through substring matching.
     pub fn matches_error_message(&self, message: &str) -> bool {
-        message.strip_prefix("LLM error: ").unwrap_or(message) == self.error_message()
+        let message = match &self.0 {
+            DiagnosticFields::InitialRequest(_) => {
+                message.strip_prefix("LLM error: ").unwrap_or(message)
+            }
+            DiagnosticFields::StreamTimeout(_) => message,
+        };
+        message == self.error_message()
     }
 
     pub fn error_message(&self) -> String {
-        let f = &self.0;
+        let f = match &self.0 {
+            DiagnosticFields::InitialRequest(fields) => fields,
+            DiagnosticFields::StreamTimeout(fields) => return fields.error_message(),
+        };
         let status = f
             .status
             .map(|s| format!("HTTP {s}"))
             .unwrap_or_else(|| "no HTTP response".into());
+        let limit = f
+            .attempt_limit
+            .map(|n| format!(" (limit {n})"))
+            .unwrap_or_default();
         format!(
-            "Anthropic upstream request failed ({status}): {}. {} after {} request(s) (limit {}). Diagnostic ID: {}. Try again later or contact the upstream gateway administrator.",
-            f.failure, f.stop_reason.guidance(), f.attempt, f.attempt_limit, f.diagnostic_id,
+            "Anthropic upstream request failed ({status}): {}. {} after {} request(s){limit}. Diagnostic ID: {}. Try again later or contact the upstream gateway administrator.",
+            f.failure, f.stop_reason.guidance(), f.attempt, f.diagnostic_id,
         )
     }
 }
@@ -203,7 +389,7 @@ impl Session {
             .and_then(|state| Uuid::parse_str(&state.run_id).ok());
         let expected_run = self.llm_diagnostic_run_fingerprint();
         (diagnostic.matches_session(&self.id)
-            && diagnostic.0.run_id == run_id
+            && diagnostic.0.run_id() == run_id
             && self.metadata.get(DIAGNOSTIC_RUN_FINGERPRINT_KEY) == expected_run.as_ref())
         .then_some(diagnostic)
     }
@@ -214,10 +400,11 @@ impl Session {
         if !diagnostic.matches_session(&self.id) {
             return false;
         }
-        diagnostic.0.run_id = self
-            .agent_runtime_state
-            .as_ref()
-            .and_then(|state| Uuid::parse_str(&state.run_id).ok());
+        diagnostic.0.set_run_id(
+            self.agent_runtime_state
+                .as_ref()
+                .and_then(|state| Uuid::parse_str(&state.run_id).ok()),
+        );
         let Ok(raw) = serde_json::to_string(&diagnostic) else {
             return false;
         };
@@ -260,6 +447,30 @@ impl Session {
 mod tests {
     use super::*;
 
+    fn timeout_sample(session: &Session) -> LlmRequestDiagnostic {
+        let id = Uuid::new_v4();
+        LlmRequestDiagnostic::from_stream_timeout(StreamTimeoutDiagnostic {
+            schema_version: 1,
+            kind: "stream_timeout".into(),
+            diagnostic_id: id,
+            error_id: id,
+            observed_at: Utc::now(),
+            provider: Some("a2a3cebf-8abc-45cb-8407-66c90fd9a978".into()),
+            model: Some("gpt-6-astra".into()),
+            session_hash: llm_diagnostic_session_hash(&session.id),
+            run_id: None,
+            phase: "transport_idle".into(),
+            deadline_ms: 120_000,
+            last_transport_ms_ago: 120_002,
+            last_semantic_ms_ago: Some(120_002),
+            semantic_output_started: true,
+            retry_safe: false,
+            last_http_status: None,
+            retry_delay_ms: None,
+        })
+        .unwrap()
+    }
+
     fn sample(session: &Session) -> LlmRequestDiagnostic {
         let id = Uuid::new_v4();
         LlmRequestDiagnostic::from_json(
@@ -298,6 +509,32 @@ mod tests {
         let mut cleared = cold;
         cleared.clear_last_run_error();
         assert!(!cleared.metadata.contains_key(LAST_RUN_LLM_DIAGNOSTIC_KEY));
+    }
+
+    #[test]
+    fn configured_and_continuous_receipts_keep_distinct_validated_limits() {
+        let session = Session::new("retry-diagnostic", "model");
+        let mut bounded = serde_json::to_value(sample(&session)).unwrap();
+        bounded["attempt_limit"] = 12.into();
+        bounded["total_budget_ms"] = 300_000.into();
+        assert!(LlmRequestDiagnostic::from_json(&bounded.to_string()).is_some());
+        let mut continuous = bounded.clone();
+        continuous["retry_mode"] = "until_cancelled".into();
+        for field in ["attempt_limit", "total_budget_ms", "remaining_budget_ms"] {
+            continuous[field] = serde_json::Value::Null;
+        }
+        continuous["stop_reason"] = "cancelled_or_dropped".into();
+        let diagnostic = LlmRequestDiagnostic::from_json(&continuous.to_string()).unwrap();
+        assert!(diagnostic.matches_error_message(&diagnostic.error_message()));
+        for field in ["attempt_limit", "total_budget_ms", "remaining_budget_ms"] {
+            let mut invalid = continuous.clone();
+            invalid[field] = 1.into();
+            assert!(LlmRequestDiagnostic::from_json(&invalid.to_string()).is_none());
+        }
+        continuous["retry_mode"] = "unrecognized".into();
+        assert!(LlmRequestDiagnostic::from_json(&continuous.to_string()).is_none());
+        bounded["total_budget_ms"] = 3_600_001.into();
+        assert!(LlmRequestDiagnostic::from_json(&bounded.to_string()).is_none());
     }
 
     #[test]
@@ -349,5 +586,91 @@ mod tests {
         cold.agent_runtime_state.as_mut().unwrap().execution_id =
             Some("private-execution-b".into());
         assert!(cold.last_run_diagnostic().is_none());
+    }
+
+    #[test]
+    fn stream_timeout_receipt_survives_cold_read_only_for_its_exact_run_and_error() {
+        let mut session = Session::new("timeout-session-private", "model");
+        let mut runtime = crate::AgentRuntimeState::new(Uuid::new_v4().to_string());
+        runtime.execution_id = Some("private-execution".into());
+        session.agent_runtime_state = Some(runtime);
+        let receipt = timeout_sample(&session);
+        assert!(session.record_llm_request_diagnostic(receipt.clone()));
+        assert!(session.last_run_diagnostic().is_none());
+        session.set_last_run_error(receipt.error_message());
+        let encoded = serde_json::to_string(&session).unwrap();
+        let cold: Session = serde_json::from_str(&encoded).unwrap();
+        let actual = cold.last_run_diagnostic().unwrap();
+        assert_eq!(actual.diagnostic_id(), receipt.diagnostic_id());
+        assert_eq!(actual.error_message(), receipt.error_message());
+        let public = serde_json::to_value(&actual).unwrap();
+        assert_eq!(
+            public["run_id"],
+            session.agent_runtime_state.as_ref().unwrap().run_id
+        );
+        assert!(!public.to_string().contains("timeout-session-private"));
+        assert!(!public.to_string().contains("private-execution"));
+
+        let mut wrong_session = cold.clone();
+        wrong_session.id = "other-session".into();
+        assert!(wrong_session.last_run_diagnostic().is_none());
+        let mut wrong_run = cold.clone();
+        wrong_run.agent_runtime_state.as_mut().unwrap().run_id = Uuid::new_v4().to_string();
+        assert!(wrong_run.last_run_diagnostic().is_none());
+        let mut wrong_execution = cold.clone();
+        wrong_execution
+            .agent_runtime_state
+            .as_mut()
+            .unwrap()
+            .execution_id = Some("next-execution".into());
+        assert!(wrong_execution.last_run_diagnostic().is_none());
+        let mut repeated_timeout = cold;
+        repeated_timeout.set_last_run_error(timeout_sample(&session).error_message());
+        assert!(repeated_timeout.last_run_diagnostic().is_none());
+        assert!(!repeated_timeout
+            .metadata
+            .contains_key(LAST_RUN_LLM_DIAGNOSTIC_KEY));
+    }
+
+    #[test]
+    fn timeout_receipt_rejects_inconsistent_observations_unknown_keys_and_unsafe_labels() {
+        let session = Session::new("session", "model");
+        let value = serde_json::to_value(timeout_sample(&session)).unwrap();
+        for (field, invalid) in [
+            ("schema_version", serde_json::json!(2)),
+            ("kind", serde_json::json!("another_timeout")),
+            ("error_id", serde_json::json!(Uuid::new_v4())),
+            ("phase", serde_json::json!("first_semantic")),
+            ("deadline_ms", serde_json::json!(0)),
+            ("deadline_ms", serde_json::json!(86_400_001_u64)),
+            ("last_transport_ms_ago", serde_json::json!(120_003)),
+            (
+                "last_semantic_ms_ago",
+                serde_json::json!(9_007_199_254_740_992_u64),
+            ),
+            ("semantic_output_started", serde_json::json!(false)),
+            ("retry_safe", serde_json::json!(true)),
+            ("last_http_status", serde_json::json!(429)),
+            ("retry_delay_ms", serde_json::json!(5_000)),
+            (
+                "provider",
+                serde_json::json!("https://private.invalid/token"),
+            ),
+            ("model", serde_json::json!("sk-private")),
+            ("model", serde_json::json!("Bearer_private")),
+            ("future_secret", serde_json::json!("PRIVATE_CANARY")),
+        ] {
+            let mut forged = value.clone();
+            forged[field] = invalid;
+            assert!(
+                LlmRequestDiagnostic::from_json(&forged.to_string()).is_none(),
+                "accepted invalid {field}"
+            );
+        }
+        let receipt = timeout_sample(&session);
+        assert!(
+            !receipt.matches_error_message(&format!("upstream said {}", receipt.error_message()))
+        );
+        assert!(!receipt.matches_error_message(&format!("LLM error: {}", receipt.error_message())));
     }
 }

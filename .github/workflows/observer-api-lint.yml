@@ -1,0 +1,112 @@
+name: Observer API-only Clippy
+
+on:
+  pull_request:
+    branches: [dev]
+    paths:
+      - 'crates/core/bamboo-domain/src/session/supervisor_management.rs'
+      - 'crates/core/bamboo-domain/src/storage.rs'
+      - 'crates/infra/bamboo-storage/src/v2.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor*.rs'
+      - 'crates/infra/bamboo-storage/src/v2/child_wait_control_plane.rs'
+      - 'crates/engine/bamboo-engine/src/external_agents/**'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/loop_execution/pipeline.rs'
+      - 'crates/app/bamboo-server/src/app_state/supervisor_observer*.rs'
+      - 'crates/app/bamboo-server/src/tools/child_session_adapter.rs'
+      - 'crates/app/bamboo-server-tools/src/session_inspector/scoped_context.rs'
+      - '.github/workflows/trusted-observer.yml'
+      - 'crates/core/bamboo-domain/src/observer_subscription.rs'
+      - 'crates/infra/bamboo-storage/src/context_view.rs'
+      - 'crates/infra/bamboo-storage/src/session_inbox*.rs'
+      - 'crates/infra/bamboo-storage/src/v2/observer_subscriptions.rs'
+      - 'crates/infra/bamboo-storage/src/v2/supervisor_management.rs'
+      - 'crates/app/bamboo-server-tools/src/session_inspector/**'
+      - 'crates/app/bamboo-server/src/app_state/observer_subscription*.rs'
+      - 'crates/app/bamboo-server/src/app_state/observer_fault_tests.rs'
+      - 'crates/app/bamboo-server/src/app_state/builder.rs'
+      - 'crates/app/bamboo-server/src/app_state/mod.rs'
+      - 'crates/app/bamboo-server/src/app_state/wake_reconciler.rs'
+      - 'crates/engine/bamboo-engine/src/runtime/runner/state_bridge.rs'
+      - '.github/workflows/observer-subscriptions.yml'
+      - '.github/workflows/observer-api-lint.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: observer-api-lint-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Observer API-only Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: '1'
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/grouped-default
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: '8388608'
+      BAMBOO_FRONTEND_BUILD_MODE: api-only
+      EXPECTED_SOURCE_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Bind acceptance to the exact clean source and lock
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$EXPECTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE_SHA"
+          test -z "$status"
+          git show -s --format='Observer lint source: %H tree: %T' HEAD | tee "$RUNNER_TEMP/observer-api-lint-source.log"
+          sha256sum Cargo.lock | tee -a "$RUNNER_TEMP/observer-api-lint-source.log"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Record actual compiler and build mode
+        run: |
+          set -euo pipefail
+          rustc -vV | tee -a "$RUNNER_TEMP/observer-api-lint-source.log"
+          cargo -V | tee -a "$RUNNER_TEMP/observer-api-lint-source.log"
+          printf 'frontend=%s jobs=%s incremental=%s target=%s\n' "$BAMBOO_FRONTEND_BUILD_MODE" "$CARGO_BUILD_JOBS" "$CARGO_INCREMENTAL" "$CARGO_TARGET_DIR" | tee -a "$RUNNER_TEMP/observer-api-lint-source.log"
+          df -h .
+
+      - name: Restore existing dependencies without saving cache storage
+        uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-ci-test-${{ runner.os }}
+          workspaces: . -> target/grouped-default
+          save-if: false
+
+      - name: Run the shared five-library API-only Clippy policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          policy=(-D warnings -A deprecated -A clippy::module_inception
+            -A clippy::incompatible_msrv -A clippy::needless_borrows_for_generic_args
+            -A clippy::too-many-arguments -A clippy::while-let-loop
+            -A clippy::type_complexity -A dead-code)
+          cargo clippy --locked --all-features --lib -p bamboo-domain -p bamboo-storage \
+            -p bamboo-engine -p bamboo-server-tools -p bamboo-server -- "${policy[@]}" \
+            2>&1 | tee "$RUNNER_TEMP/observer-api-clippy.log"
+
+      - name: Verify exact source stayed clean
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git rev-parse HEAD)
+          status=$(git status --porcelain --untracked-files=all)
+          test "$actual" = "$EXPECTED_SOURCE_SHA"
+          test -z "$status"
+          git show -s --format='Final Observer lint source: %H tree: %T' HEAD | tee -a "$RUNNER_TEMP/observer-api-lint-source.log"
+          sha256sum Cargo.lock | tee -a "$RUNNER_TEMP/observer-api-lint-source.log"

@@ -27,12 +27,29 @@ pub enum AdmissionCommit<T> {
 struct AdmissionState {
     state: State,
     cancellation_waiters: Vec<Waker>,
+    deadline: Option<std::time::Instant>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AdmissionGate(Arc<Mutex<AdmissionState>>);
 
 impl AdmissionGate {
+    /// Bound the physical commit itself. This is not a timer or a recovered
+    /// grant; caller cancellation still uses the same commit/cancel mutex.
+    pub fn with_deadline(deadline: std::time::Instant) -> Self {
+        Self(Arc::new(Mutex::new(AdmissionState {
+            deadline: Some(deadline),
+            ..AdmissionState::default()
+        })))
+    }
+
+    /// Compare the process-local cancellation fence, never its current state.
+    /// This lets an execution bind a producer offer to the proof captured for
+    /// that same fence without trusting a client-provided identifier.
+    pub fn same_instance(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub fn cancel_if_pending(&self) {
         let mut inner = self
             .0
@@ -99,6 +116,19 @@ impl AdmissionGate {
             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inner.state == State::Pending
+            && inner
+                .deadline
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            inner.state = State::Cancelled;
+            let waiters = std::mem::take(&mut inner.cancellation_waiters);
+            drop(inner);
+            for waiter in waiters {
+                waiter.wake();
+            }
+            return Ok(AdmissionCommit::Cancelled);
+        }
         match inner.state {
             State::Cancelled => Ok(AdmissionCommit::Cancelled),
             State::Committed => Ok(AdmissionCommit::AlreadyCommitted),
@@ -115,6 +145,16 @@ impl AdmissionGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_physical_commit_is_cancelled_without_running_the_effect() {
+        let gate = AdmissionGate::with_deadline(std::time::Instant::now());
+        assert_eq!(
+            gate.commit(|| -> Result<(), ()> { panic!("expired effect") }),
+            Ok(AdmissionCommit::Cancelled)
+        );
+        assert!(gate.is_cancelled());
+    }
 
     #[test]
     fn cancellation_and_commit_are_linearized_and_idempotent() {

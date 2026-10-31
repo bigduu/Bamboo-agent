@@ -17,7 +17,10 @@ const {
 
 const ROOT = path.resolve(__dirname, "..");
 const LOTUS_NEXT_PACKAGE_NAME = "@bigduu/lotus-next";
-const LOTUS_NEXT_VERSION = "2026.10.19";
+// The committed lock is the declared release input, independent of the resolver.
+const LOTUS_NEXT_VERSION = JSON.parse(
+  fs.readFileSync(path.join(__dirname, "frontend-package-lock.json"), "utf8"),
+).packageVersion;
 
 test("defaults releases and tag events to the exact locked Lotus Next artifact", () => {
   assert.deepEqual(resolveReleaseFrontend(), {
@@ -42,7 +45,12 @@ test("accepts only the locked Lotus Next version", () => {
     }).packageVersion,
     LOTUS_NEXT_VERSION,
   );
-  for (const requestedVersion of ["latest", "2026.9.13", "2026.9.15"]) {
+  for (const requestedVersion of [
+    "latest",
+    "2026.9.13",
+    "2026.9.15",
+    "2026.10.23",
+  ]) {
     assert.throws(
       () =>
         resolveReleaseFrontend({
@@ -143,6 +151,13 @@ test("CLI appends the exact resolution to GITHUB_OUTPUT", (t) => {
   );
 });
 
+function frontendPolicyOwners(ci) {
+  ci = ci.replace(/\r\n/g, "\n");
+  return Object.fromEntries([...ci.matchAll(/\n  ([a-z][a-z0-9-]*):\n([\s\S]*?)(?=\n  [a-z][a-z0-9-]*:\n|$)/g)]
+    .filter(([, , body]) => body.includes("scripts/release-frontend-policy.test.cjs"))
+    .map(([, name, body]) => [name, body]));
+}
+
 test("crate and Docker publishers share the fail-closed resolver contract", () => {
   const workflowPaths = [
     ".github/workflows/publish-crate.yml",
@@ -150,11 +165,8 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
   ];
   for (const relativePath of workflowPaths) {
     const source = fs.readFileSync(path.join(ROOT, relativePath), "utf8");
-    assert.match(source, /frontend_package:\r?\n/);
-    assert.match(source, /default: "@bigduu\/lotus-next"/);
-    assert.match(source, /- "@bigduu\/lotus-next"/);
-    assert.match(source, /- "@bigduu\/lotus"/);
-    assert.match(source, /default: "from_lock"/);
+    assert.match(source, /FRONTEND_PACKAGE: ["']@bigduu\/lotus-next["']/);
+    assert.match(source, /FRONTEND_VERSION: ["']?from_lock["']?/);
     assert.match(source, /node scripts\/release-frontend-policy\.cjs/);
     assert.match(
       source,
@@ -177,10 +189,16 @@ test("crate and Docker publishers share the fail-closed resolver contract", () =
     path.join(ROOT, ".github/workflows/ci.yml"),
     "utf8",
   );
-  assert.equal(
-    ci.match(/scripts\/release-frontend-policy\.test\.cjs/g)?.length,
-    2,
-  );
+  for (const newline of ["\n", "\r\n"]) {
+    const owners = frontendPolicyOwners(ci.replace(/\r?\n/g, newline));
+    assert.deepEqual(Object.keys(owners), ["quick-checks", "native-feature-tests"]);
+    for (const body of Object.values(owners)) {
+      assert.equal(body.match(/scripts\/release-frontend-policy\.test\.cjs/g)?.length, 1);
+    }
+    assert.match(owners["quick-checks"], /if: needs.validation-source.outputs.feature == 'true'/);
+    assert.match(owners["native-feature-tests"], /if: needs.validation-source.outputs.feature == 'true'/);
+    assert.match(owners["native-feature-tests"], /os: \[windows-2025, macos-latest\]/);
+  }
 });
 
 function publicationGuard(workflow) {
@@ -194,8 +212,8 @@ function publicationGuard(workflow) {
 }
 
 for (const [ending, newline] of [["LF", "\n"], ["CRLF", "\r\n"]]) {
-  test(`crate publication ${ending} guard rejects a moved, mismatched or dirty source before package work`, (t) => {
-    const workflow = fs.readFileSync(path.join(ROOT, ".github/workflows/publish-crate.yml"), "utf8").replace(/\r?\n/g, newline);
+  test(`historical crate publication ${ending} guard rejects a moved, mismatched or dirty source before package work`, (t) => {
+    const workflow = require("./tests/main-authority-bootstrap-fixture.cjs").legacyData().publisher.replace(/\r?\n/g, newline);
     const guard = publicationGuard(workflow);
     assert.throws(() => publicationGuard(workflow.replace("name: Require the exact accepted publication source", "name: Missing publication guard")), /publication guard must precede/);
     const guardStart = workflow.indexOf("      - &manual-source");

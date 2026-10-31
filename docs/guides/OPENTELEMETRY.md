@@ -1,7 +1,9 @@
-# Optional OpenTelemetry traces
+# Local and optional exported OpenTelemetry traces
 
-This source increment adds a small, **disabled-by-default trace foundation** for
-Bamboo's engine. Existing logs, `metrics.db`, token-usage journals and runtime
+The Bamboo executable keeps a bounded local trace projection by default; see
+[local trace inspection](LOCAL_TRACE_INSPECTION.md) for retention, the API and
+read-only usage hooks. **OTLP export remains disabled by default.** Existing logs,
+`metrics.db`, token-usage journals and runtime
 identities retain their current behavior and authority. It does not export OTel
 metrics or logs, install a `tracing` subscriber bridge, or change permissions.
 
@@ -68,12 +70,18 @@ The application attribute allowlist is:
 - `gen_ai.provider.name`, `gen_ai.request.model`
 - `gen_ai.tool.name`, `gen_ai.tool.call.id`
 - `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`
+- `bamboo.usage.reasoning_tokens`, `bamboo.usage.cache_read_input_tokens`,
+  `bamboo.usage.cache_creation_input_tokens`, `bamboo.usage.cache_write_input_tokens`
+- `bamboo.session.birth`, `bamboo.model_call.id`
 - `bamboo.root_session.id`, `bamboo.execution.id`, `bamboo.run.id`, `bamboo.round.id`
 - `bamboo.tool.observation` (`dispatch`), `bamboo.outcome`, `error.type`
 
 Identifiers must be 1–128 ASCII letters, digits, underscores, hyphens or periods;
 other values are omitted, and span names fall back to the operation alone. The
-provider family is restricted to OpenAI, Anthropic, Gemini/Google and Copilot;
+local viewer can still associate sessions outside that policy using a process-
+keyed reference; Bamboo's OTLP exporter strips that reference and omits the
+original ID. The provider family is restricted to OpenAI, Anthropic,
+Gemini/Google and Copilot;
 free-form provider instance names are omitted. These are correlation fields,
 not a place to put sensitive data. Even syntactically valid IDs/model/tool names
 must not contain secrets. IDs are high-cardinality trace metadata, not metric

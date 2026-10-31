@@ -406,6 +406,8 @@ impl Fixture {
             is_child_session: false,
             provider_name: "test-provider".into(),
             provider_override: Some(self.probe.clone()),
+            provider_override_managed_registry: None,
+            legacy_vision_provider_source: None,
             model_roster: bamboo_engine::ModelRoster {
                 model: Some("test-model".into()),
                 ..Default::default()

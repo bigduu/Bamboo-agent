@@ -509,6 +509,38 @@ async fn consume_llm_stream_records_provider_usage_snapshots_without_double_coun
 }
 
 #[tokio::test]
+async fn replacement_clears_previous_flat_values_when_components_become_unknown() {
+    use bamboo_llm::types::ProviderUsageReplacement;
+
+    let output = consume_llm_stream_silent(
+        build_stream(vec![
+            Ok(LLMChunk::ProviderUsageReplace(ProviderUsageReplacement {
+                input_tokens: Some(100),
+                output_tokens: Some(23),
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                ..Default::default()
+            })),
+            Ok(LLMChunk::ProviderUsageReplace(ProviderUsageReplacement {
+                reasoning_tokens: Some(3),
+                cache_read_input_tokens: Some(25),
+                ..Default::default()
+            })),
+            Ok(LLMChunk::Done),
+        ]),
+        &CancellationToken::new(),
+        "session-provider-replacement",
+    )
+    .await
+    .expect("replacement snapshot");
+    assert_eq!(output.provider_usage.unwrap().input_tokens, None);
+    assert_eq!(output.provider_usage.unwrap().output_tokens, None);
+    assert_eq!(output.input_tokens, 0);
+    assert_eq!(output.output_tokens, 0);
+    assert_eq!(output.cache_read_input_tokens, 25);
+}
+
+#[tokio::test]
 async fn provider_usage_snapshot_distinguishes_omitted_from_zero_for_every_field() {
     let omitted = consume_llm_stream_silent(
         build_stream(vec![
@@ -649,6 +681,57 @@ async fn provider_output_and_reasoning_reconcile_independently_in_both_orders() 
             assert_eq!(log_record.output_tokens, expected_output);
             assert_eq!(log_record.thinking_tokens, expected_reasoning);
         }
+    }
+}
+
+#[tokio::test]
+async fn provider_snapshots_reconcile_anthropic_and_gemini_legacy_chunks_once() {
+    let cases = [
+        (10, 2, 3, 7, 0, 15, 7, None),
+        (75, 0, 25, 20, 3, 100, 23, Some(3)),
+    ];
+    for (fresh, creation, read, legacy_output, thinking, input_total, output_total, reasoning) in
+        cases
+    {
+        let snapshot = LLMChunk::ProviderUsage {
+            input_tokens: Some(input_total),
+            output_tokens: Some(output_total),
+            total_tokens: None,
+            reasoning_tokens: reasoning,
+            cache_creation_input_tokens: (creation > 0).then_some(creation),
+            cache_read_input_tokens: Some(read),
+            cache_write_input_tokens: None,
+        };
+        let chunks = vec![
+            Ok(LLMChunk::CacheUsage {
+                cache_creation_input_tokens: creation,
+                cache_read_input_tokens: read,
+                input_tokens: fresh,
+            }),
+            Ok(LLMChunk::UsageSummary {
+                output_tokens: legacy_output,
+                thinking_tokens: thinking,
+            }),
+            Ok(snapshot.clone()),
+            Ok(snapshot),
+            Ok(LLMChunk::Done),
+        ];
+        let output = consume_llm_stream_silent(
+            build_stream(chunks),
+            &CancellationToken::new(),
+            "synthetic-provider-usage",
+        )
+        .await
+        .expect("provider usage stream");
+        assert_eq!(output.input_tokens, fresh);
+        assert_eq!(output.cache_creation_input_tokens, creation);
+        assert_eq!(output.cache_read_input_tokens, read);
+        assert_eq!(output.output_tokens, output_total);
+        assert_eq!(output.thinking_tokens, thinking);
+        let usage = output.provider_usage.expect("provider snapshot");
+        assert_eq!(usage.input_tokens, Some(input_total));
+        assert_eq!(usage.output_tokens, Some(output_total));
+        assert_eq!(usage.reasoning_tokens, reasoning);
     }
 }
 
@@ -1018,7 +1101,9 @@ async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
         Ok(_) => panic!("expected bootstrap StreamTimeout, got success"),
     };
     assert_eq!(timeout.phase(), StreamTimeoutPhase::Bootstrap);
-    assert!(timeout.retry_safe());
+    // The legacy helper keeps its finite headers owner, but an outer turn
+    // retry must not reset a server-directed backoff that has already begun.
+    assert!(!timeout.retry_safe());
     assert_eq!(
         timeout.last_http_retry(),
         Some((429, Duration::from_secs(2)))
@@ -1026,6 +1111,9 @@ async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
     let message = timeout.to_string();
     assert!(message.contains("last_http_status=429, retry_delay_ms=2000"));
     assert!(!message.contains("private provider response body"));
+    assert!(message.contains("retry_safe=false"));
+    tokio::time::sleep(Duration::from_millis(1_100)).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1397,4 +1485,100 @@ async fn consume_llm_stream_continues_when_subscriber_disconnects() {
     assert_eq!(output.reasoning_content, "think");
     assert_eq!(output.content, "helloworld");
     assert_eq!(output.token_count, 10);
+}
+
+#[tokio::test]
+async fn managed_headers_policy_outlives_outer_bootstrap_idle_without_losing_cancellation() {
+    use bamboo_llm::{providers::anthropic::AnthropicProvider, LLMProvider};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_millis(1200))
+                .set_body_string("unread controlled body"),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("fixture-only").with_base_url(server.uri());
+    let context = timeout_context(1, 1, 1).begin_request();
+    let cancel = CancellationToken::new();
+    let result = await_stream_bootstrap(
+        provider.chat_stream(&[], &[], None, "controlled"),
+        &cancel,
+        "managed-headers",
+        &context,
+    )
+    .await;
+    assert!(
+        result.unwrap().is_ok(),
+        "headers have their own finite policy; outer idle must not reset it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn managed_response_starts_a_fresh_bounded_stream_watchdog_and_forbids_turn_replay() {
+    let mut context = timeout_context(1, 1, 1)
+        .allow_turn_retry_before_semantic_output()
+        .begin_request();
+    tokio::time::advance(Duration::from_secs(30)).await;
+    context.managed_response_established();
+    let output = consume_llm_stream_internal(
+        build_stream(vec![
+            Ok(LLMChunk::Token("original".into())),
+            Ok(LLMChunk::Done),
+        ]),
+        None,
+        &CancellationToken::new(),
+        "managed-stream",
+        &context,
+    )
+    .await;
+    assert!(
+        output.is_ok(),
+        "headers wait must not consume the new stream's first-semantic allowance"
+    );
+    let error = consume_llm_stream_internal(
+        Box::pin(stream::pending()),
+        None,
+        &CancellationToken::new(),
+        "managed-stream",
+        &context,
+    )
+    .await
+    .err()
+    .expect("managed stream must time out");
+    assert!(matches!(error, AgentError::StreamTimeout(t) if !t.retry_safe()));
+}
+
+#[tokio::test]
+async fn managed_send_does_not_disable_the_outer_watchdog_for_a_later_provider_hang() {
+    use bamboo_llm::{providers::anthropic::AnthropicProvider, LLMProvider};
+    use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("controlled body"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = AnthropicProvider::new("fixture-only").with_base_url(server.uri());
+    let future = async {
+        let _stream = provider
+            .chat_stream(&[], &[], None, "controlled")
+            .await
+            .unwrap();
+        std::future::pending::<()>().await;
+    };
+    let context = timeout_context(1, 1, 1)
+        .allow_turn_retry_before_semantic_output()
+        .begin_request();
+    let cancel = CancellationToken::new();
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        await_stream_bootstrap(future, &cancel, "managed-post-send-hang", &context),
+    )
+    .await
+    .expect("the post-send bootstrap remains bounded");
+    assert!(matches!(result, Err(AgentError::StreamTimeout(t)) if !t.retry_safe()));
 }

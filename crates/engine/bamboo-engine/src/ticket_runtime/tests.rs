@@ -6,6 +6,7 @@ use bamboo_domain::{SessionInboxLimits, DEFAULT_SUPERVISOR_SESSION_ID};
 use bamboo_storage::{FileSessionInbox, LockedSessionStore, SessionStoreV2};
 use bamboo_tickets::{Contract, FaultPoint, TicketKind};
 use std::collections::BTreeSet;
+mod token_budget;
 
 fn save_owned_stop_fixture(child: &mut Session, completed: bool) {
     let receipt = read_dispatch(child).unwrap().unwrap().receipt.unwrap();
@@ -254,12 +255,26 @@ async fn ticket_unsuccessful_terminal_without_exact_stop_proof_keeps_quarantine(
 async fn only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wait() {
     let f = Fixture::new().await;
     assert!(is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await);
+    let mut current = f.supervisor.clone();
+    for ultra in [false, true, false, true] {
+        current.set_root_orchestration_only(ultra).unwrap();
+        f.storage.save_session(&current).await.unwrap();
+        assert!(
+            is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &f.child.id).await,
+            "independent Work ownership survives a parent thinking-mode change"
+        );
+    }
     let ordinary = Session::new_child_of("ordinary", &f.supervisor, "model", "ordinary");
     f.storage.save_session(&ordinary).await.unwrap();
     assert!(!is_independent_ticket_child(f.storage.as_ref(), &f.supervisor, &ordinary.id).await);
     let mut old_parent = f.supervisor.clone();
     old_parent.created_at -= chrono::Duration::seconds(1);
     assert!(!is_independent_ticket_child(f.storage.as_ref(), &old_parent, &f.child.id).await);
+    let mut forged = f.supervisor.clone();
+    forged.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    assert!(!is_independent_ticket_child(f.storage.as_ref(), &forged, &f.child.id).await);
     let mut changed = f.child.clone();
     changed.metadata.insert(
         crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
@@ -276,7 +291,71 @@ async fn only_canonical_ticket_child_of_the_current_supervisor_avoids_orphan_wai
 
 impl Fixture {
     async fn new() -> Self {
+        Self::with_project(false).await
+    }
+
+    async fn with_project(project: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
+        let workspace = if project {
+            let repo = dir.path().join("repo");
+            std::fs::create_dir(&repo).unwrap();
+            let git = |args: &[&str]| {
+                let output = std::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args([
+                        "-c",
+                        "core.hooksPath=/dev/null",
+                        "-c",
+                        "commit.gpgsign=false",
+                    ])
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                String::from_utf8(output.stdout).unwrap().trim().to_owned()
+            };
+            git(&["init", "-b", "fixture"]);
+            git(&[
+                "-c",
+                "user.name=Budget fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "fixture",
+            ]);
+            let base_commit = git(&["rev-parse", "HEAD"]);
+            let worktree = dir.path().join("worktree");
+            git(&[
+                "worktree",
+                "add",
+                "-b",
+                "budget-work",
+                worktree.to_str().unwrap(),
+                &base_commit,
+            ]);
+            let worktree = worktree
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            Some(bamboo_tickets::ExecutionWorkspace {
+                repo: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
+                base_commit,
+                branch: "budget-work".into(),
+                worktree: worktree.clone(),
+                write_roots: vec![worktree.clone()],
+                claims: BTreeSet::from([format!("worktree:{worktree}")]),
+            })
+        } else {
+            None
+        };
         let storage = Arc::new(SessionStoreV2::new(dir.path().join("host")).await.unwrap());
         storage
             .get_or_create_default_supervisor("fixture-model")
@@ -300,35 +379,58 @@ impl Fixture {
                 session_id: supervisor.id.clone(),
             },
         );
+        let mut operations = vec![Operation::Create {
+            temp_id: "work".into(),
+            kind: TicketKind::Work,
+            parent: None,
+            depends_on: BTreeSet::new(),
+            contract: Contract {
+                title: "Own work".into(),
+                objective: "One result".into(),
+                constraints: vec!["Root private".into()],
+                acceptance: vec!["Exact evidence".into()],
+                user_acceptance_required: true,
+                allowed_tools: BTreeSet::from(["Task".into()]),
+            },
+        }];
+        if project {
+            let contract = match &operations[0] {
+                Operation::Create { contract, .. } => contract.clone(),
+                _ => unreachable!(),
+            };
+            operations.push(Operation::AssociateProject {
+                ticket_id: "work".into(),
+                project_id: "budget-fixture-project".parse().unwrap(),
+            });
+            operations.push(Operation::SetProjectContext {
+                work_id: "work".into(),
+                context: bamboo_tickets::ProjectContextSnapshot {
+                    project_id: "budget-fixture-project".parse().unwrap(),
+                    project_revision: 1,
+                    resource_revision: 1,
+                    workspace_binding: bamboo_domain::WorkspaceBinding {
+                        path: workspace.as_ref().unwrap().repo.clone(),
+                        label: None,
+                        git_common_dir: None,
+                    },
+                    contract_revision: 1,
+                    contract,
+                    sources: Default::default(),
+                },
+            });
+        }
+        operations.extend([
+            Operation::Ready {
+                work_id: "work".into(),
+            },
+            Operation::Start {
+                work_id: "work".into(),
+                temp_id: "assignment".into(),
+                workspace,
+            },
+        ]);
         let command = service
-            .prepare_command(
-                &authority,
-                "create",
-                vec![
-                    Operation::Create {
-                        temp_id: "work".into(),
-                        kind: TicketKind::Work,
-                        parent: None,
-                        depends_on: BTreeSet::new(),
-                        contract: Contract {
-                            title: "Own work".into(),
-                            objective: "One result".into(),
-                            constraints: vec!["Root private".into()],
-                            acceptance: vec!["Exact evidence".into()],
-                            user_acceptance_required: true,
-                            allowed_tools: BTreeSet::from(["Task".into()]),
-                        },
-                    },
-                    Operation::Ready {
-                        work_id: "work".into(),
-                    },
-                    Operation::Start {
-                        work_id: "work".into(),
-                        temp_id: "assignment".into(),
-                        workspace: None,
-                    },
-                ],
-            )
+            .prepare_command(&authority, "create", operations)
             .unwrap();
         let receipt = service.execute(&authority, &command).unwrap();
         let snapshot = service.published().unwrap().1;

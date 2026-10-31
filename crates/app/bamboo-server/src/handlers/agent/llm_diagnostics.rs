@@ -152,4 +152,69 @@ mod tests {
             serde_json::to_string(&token).unwrap()
         );
     }
+
+    #[test]
+    fn timeout_live_sse_websocket_and_cold_error_share_one_exact_receipt() {
+        use bamboo_agent_core::{AgentError, StreamTimeoutError, StreamTimeoutPhase};
+        use std::time::Duration;
+
+        let mut session = Session::new(&format!("timeout-live-{}", uuid::Uuid::new_v4()), "model");
+        session.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(
+            uuid::Uuid::new_v4().to_string(),
+        ));
+        let timeout = StreamTimeoutError::new(
+            StreamTimeoutPhase::TransportIdle,
+            Duration::from_secs(120),
+            Some("provider-id".into()),
+            Some("gpt-6-astra".into()),
+            Duration::from_millis(120_002),
+            Some(Duration::from_millis(120_002)),
+            true,
+        );
+        let diagnostic = timeout.diagnostic(&session).unwrap();
+        let message = AgentError::StreamTimeout(timeout).to_string();
+        let event = AgentEvent::Error {
+            message: message.clone(),
+        };
+        // The live event is emitted before the terminal owner's final save.
+        bamboo_llm::retry::record_stream_timeout_diagnostic(diagnostic.clone());
+        let websocket = event_value(&event, &session.id, None).unwrap();
+        let sse: serde_json::Value =
+            serde_json::from_str(&event_json(&event, &session.id, None).unwrap()).unwrap();
+        assert_eq!(sse, websocket);
+        assert_eq!(
+            websocket["diagnostic"],
+            serde_json::to_value(&diagnostic).unwrap()
+        );
+        assert_eq!(websocket["message"], message);
+
+        session.record_llm_request_diagnostic(diagnostic);
+        session.set_last_run_error(message.clone());
+        let cold: Session =
+            serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        let persisted = cold.last_run_diagnostic().unwrap();
+        assert_eq!(
+            event_value(&event, &cold.id, Some(&persisted)).unwrap(),
+            websocket
+        );
+        assert!(event_value(&event, "foreign", None)
+            .unwrap()
+            .get("diagnostic")
+            .is_none());
+        let forged = AgentEvent::Error {
+            message: format!("upstream said {message}"),
+        };
+        assert!(event_value(&forged, &session.id, Some(&persisted))
+            .unwrap()
+            .get("diagnostic")
+            .is_none());
+        let old_message = message.split(". Diagnostic ID:").next().unwrap().to_owned();
+        let legacy = AgentEvent::Error {
+            message: old_message,
+        };
+        assert!(event_value(&legacy, &session.id, Some(&persisted))
+            .unwrap()
+            .get("diagnostic")
+            .is_none());
+    }
 }

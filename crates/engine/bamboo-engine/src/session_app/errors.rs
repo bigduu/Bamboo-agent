@@ -51,6 +51,8 @@ pub enum ExecutePreparationError {
     SaveFailed(#[from] SessionSaveError),
     #[error("invalid model: model is required")]
     ModelRequired,
+    #[error("invalid model reference: {0}")]
+    InvalidModelReference(String),
     #[error("invalid image fallback configuration: {0}")]
     ImageFallbackError(String),
 }

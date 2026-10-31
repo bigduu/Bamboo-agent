@@ -6,7 +6,7 @@
 //! the three duplicated `AgentLoopConfig` construction sites in the server
 //! layer (HTTP handler, spawn scheduler, schedule manager).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
@@ -18,7 +18,7 @@ use bamboo_agent_core::{AgentEvent, Role, Session};
 use bamboo_config::PermissionMode;
 use bamboo_domain::ReasoningEffort;
 use bamboo_llm::Config;
-use bamboo_llm::LLMProvider;
+use bamboo_llm::{LLMProvider, ProviderRegistry};
 use bamboo_metrics::MetricsCollector;
 use bamboo_skills::SkillManager;
 
@@ -35,6 +35,98 @@ use bamboo_domain::{RuntimeSessionPersistence, SessionInboxPort};
 use crate::session_activation::SessionActivationRouter;
 use crate::session_messaging::SessionMessenger;
 
+pub(crate) type AuxiliaryModelResolver = Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync>;
+pub(crate) type AuxiliaryModelResolverFactory =
+    Arc<dyn Fn(&str) -> AuxiliaryModelResolver + Send + Sync>;
+
+// A host factory is installed only on the Schedule Agent clone. Explicitly
+// absent roster keys are passed as empty, never substituted with a global key.
+fn select_auxiliary_model_resolver(
+    factory: Option<&AuxiliaryModelResolverFactory>,
+    roster_provider: Option<&str>,
+    fallback: Option<AuxiliaryModelResolver>,
+) -> Option<AuxiliaryModelResolver> {
+    factory
+        .map(|create| create(roster_provider.unwrap_or_default()))
+        .or(fallback)
+}
+
+#[cfg(test)]
+mod auxiliary_resolver_factory_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    #[test]
+    fn factory_receives_each_roster_key_and_sdk_fallback_is_unchanged() {
+        let keys = Arc::new(Mutex::new(Vec::new()));
+        let recorded = keys.clone();
+        let factory: AuxiliaryModelResolverFactory = Arc::new(move |key| {
+            recorded.lock().unwrap().push(key.to_string());
+            let name = key.to_string();
+            Arc::new(move || AuxiliaryModelConfig {
+                fast_model_name: Some(name.clone()),
+                ..Default::default()
+            })
+        });
+        let fallback: AuxiliaryModelResolver = Arc::new(|| AuxiliaryModelConfig {
+            fast_model_name: Some("snapshot".into()),
+            ..Default::default()
+        });
+        let a = select_auxiliary_model_resolver(
+            Some(&factory),
+            Some("account-a"),
+            Some(fallback.clone()),
+        )
+        .unwrap();
+        let b = select_auxiliary_model_resolver(
+            Some(&factory),
+            Some("account-b"),
+            Some(fallback.clone()),
+        )
+        .unwrap();
+        let missing = select_auxiliary_model_resolver(Some(&factory), None, None).unwrap();
+        assert_eq!(a().fast_model_name.as_deref(), Some("account-a"));
+        assert_eq!(b().fast_model_name.as_deref(), Some("account-b"));
+        assert_eq!(missing().fast_model_name.as_deref(), Some(""));
+        assert_eq!(*keys.lock().unwrap(), vec!["account-a", "account-b", ""]);
+        let unchanged =
+            select_auxiliary_model_resolver(None, Some("account-a"), Some(fallback.clone()))
+                .unwrap();
+        assert!(Arc::ptr_eq(&unchanged, &fallback));
+        assert!(select_auxiliary_model_resolver(None, None, None).is_none());
+    }
+}
+
+// Preserve the exact managed child-resume route through the optional Work
+// decorator. `main` is the undecorated override and `decorated_main` was built
+// from it by execute_bound. Do not trust a later resolver caller to supply the
+// matching delegate, and do not silently downgrade an invariant violation.
+pub(crate) fn bind_child_gold_delegate(
+    config: &mut AgentLoopConfig,
+    selected: Option<&Arc<dyn LLMProvider>>,
+    main: &Arc<dyn LLMProvider>,
+    decorated_main: &Arc<dyn LLMProvider>,
+) -> crate::runtime::runner::Result<()> {
+    let Some(selected) = selected else {
+        return Ok(());
+    };
+    if !Arc::ptr_eq(selected, main) {
+        return Err(bamboo_agent_core::AgentError::LLM(
+            "Managed child-resume provider differs from its selected route".into(),
+        ));
+    }
+    let resolve = config.gold_target_resolver.take().ok_or_else(|| {
+        bamboo_agent_core::AgentError::LLM(
+            "Managed child-resume Gold route is missing its guard".into(),
+        )
+    })?;
+    let delegate = decorated_main.clone();
+    config.gold_target_resolver = Some(Arc::new(move |model, _untrusted_delegate| {
+        resolve(model, delegate.clone())
+    }));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // AgentRuntime — shared resources (assembled once)
 // ---------------------------------------------------------------------------
@@ -49,11 +141,23 @@ pub struct AgentRuntime {
     pub persistence: Arc<dyn RuntimeSessionPersistence>,
     /// Capturing no inherited wait is also immutable for this execution.
     pub(crate) inherited_child_wait_captured: bool,
+    /// Config-derived fallback is an explicit per-run Host choice.
+    pub(crate) legacy_image_from_config: bool,
+    pub(crate) legacy_image_provider_source:
+        Option<Arc<bamboo_llm::provider_registry::LegacyVisionProviderSource>>,
     pub(crate) sdk_skill_execution_host:
         Option<Arc<dyn crate::runtime::config::SdkSkillExecutionHost>>,
     pub(crate) workspace_execution_host:
         Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>,
     pub session_inbox: Option<Arc<dyn SessionInboxPort>>,
+    pub(crate) live_bootstrap_host: Option<Arc<dyn crate::runtime::config::LiveBootstrapHost>>,
+    pub(crate) gold_target_resolver: Option<crate::runtime::config::GoldTargetResolver>,
+    pub(crate) host_gold_origin_resolver: Option<crate::runtime::host_gold::HostGoldOriginResolver>,
+    // Private to managed child resume; never inferred from a registry name.
+    pub(crate) child_resume_gold_selected: Option<Arc<dyn LLMProvider>>,
+    pub(crate) background_model_resolver: Option<crate::runtime::config::BackgroundModelResolver>,
+    pub(crate) auxiliary_model_resolver_factory: Option<AuxiliaryModelResolverFactory>,
+    pub(crate) resume_auxiliary_resolver: Option<crate::runtime::config::ResumeAuxiliaryResolver>,
     pub activation_router: Option<Arc<SessionActivationRouter>>,
     pub session_messenger: Option<Arc<SessionMessenger>>,
     pub attachment_reader: Arc<dyn AttachmentReader>,
@@ -243,6 +347,8 @@ impl AgentRuntimeBuilder {
         }
         Ok(AgentRuntime {
             inherited_child_wait_captured: false,
+            legacy_image_from_config: false,
+            legacy_image_provider_source: None,
             sdk_skill_execution_host: None,
             workspace_execution_host: None,
             storage: self.storage.ok_or_else(|| format_missing("storage"))?,
@@ -250,6 +356,13 @@ impl AgentRuntimeBuilder {
                 .persistence
                 .ok_or_else(|| format_missing("persistence"))?,
             session_inbox: self.session_inbox,
+            live_bootstrap_host: None,
+            gold_target_resolver: None,
+            host_gold_origin_resolver: None,
+            child_resume_gold_selected: None,
+            background_model_resolver: None,
+            auxiliary_model_resolver_factory: None,
+            resume_auxiliary_resolver: None,
             activation_router: self.activation_router,
             session_messenger: self.session_messenger,
             attachment_reader: self
@@ -308,6 +421,8 @@ impl Default for AgentRuntimeBuilder {
 /// be provided.  The provider is taken from [`AgentRuntime::provider`]; tools
 /// default to [`AgentRuntime::default_tools`] when `None`.
 pub struct ExecuteRequest {
+    /// Native Host attribution, never decoded from HTTP or Worker arguments.
+    pub ticket_token_budget: Option<Arc<crate::ticket_token_budget::NativeWorkTokenBudget>>,
     /// Host-installed, per-run private plan capability. Never decoded from HTTP.
     pub ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     // -- Required ----------------------------------------------------------
@@ -389,6 +504,7 @@ pub struct ExecuteRequest {
 /// schedule manager) and the root `bamboo_agent` SDK facade (which re-exports
 /// it) construct requests through one shared builder — no forked assembly.
 pub struct ExecuteRequestBuilder {
+    ticket_token_budget: Option<Arc<crate::ticket_token_budget::NativeWorkTokenBudget>>,
     ticket_worker_plan: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
     initial_message: String,
     event_tx: mpsc::Sender<AgentEvent>,
@@ -428,6 +544,14 @@ pub struct ExecuteRequestBuilder {
 }
 
 impl ExecuteRequestBuilder {
+    pub(crate) fn ticket_token_budget(
+        mut self,
+        budget: Arc<crate::ticket_token_budget::NativeWorkTokenBudget>,
+    ) -> Self {
+        self.ticket_token_budget = Some(budget);
+        self
+    }
+
     /// Create a builder with the three required fields. All optional overrides
     /// default to `None`.
     pub fn new(
@@ -438,6 +562,7 @@ impl ExecuteRequestBuilder {
         Self {
             initial_message: initial_message.into(),
             ticket_worker_plan: None,
+            ticket_token_budget: None,
             event_tx,
             cancel_token,
             tools: None,
@@ -704,6 +829,7 @@ impl ExecuteRequestBuilder {
         };
         ExecuteRequest {
             ticket_worker_plan: self.ticket_worker_plan,
+            ticket_token_budget: self.ticket_token_budget,
             initial_message: self.initial_message,
             event_tx: self.event_tx,
             cancel_token: self.cancel_token,
@@ -776,11 +902,38 @@ impl AgentRuntime {
         self.execute_with_inputs(session, req, None).await
     }
 
+    /// Select an initial-request retry policy for this execution only.
+    pub async fn execute_with_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    ) -> crate::runtime::runner::Result<()> {
+        self.execute_with_inputs_and_upstream_retry(session, req, None, upstream_retry)
+            .await
+    }
+
     pub(crate) async fn execute_with_inputs(
         &self,
         session: &mut Session,
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+    ) -> crate::runtime::runner::Result<()> {
+        self.execute_with_inputs_and_upstream_retry(
+            session,
+            req,
+            inputs,
+            bamboo_llm::retry::UpstreamRetry::Bounded,
+        )
+        .await
+    }
+
+    pub(crate) async fn execute_with_inputs_and_upstream_retry(
+        &self,
+        session: &mut Session,
+        req: ExecuteRequest,
+        inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
     ) -> crate::runtime::runner::Result<()> {
         struct WorkspaceFinish(Option<Arc<dyn crate::runtime::config::WorkspaceExecutionHost>>);
         impl Drop for WorkspaceFinish {
@@ -839,9 +992,12 @@ impl AgentRuntime {
                     .map_err(|error| bamboo_agent_core::AgentError::LLM(error.to_string()))?;
             }
             runtime.inherited_child_wait_captured = true;
-            return runtime.execute_bound(session, req, inputs).await;
+            return runtime
+                .execute_bound(session, req, inputs, upstream_retry)
+                .await;
         }
-        self.execute_bound(session, req, inputs).await
+        self.execute_bound(session, req, inputs, upstream_retry)
+            .await
     }
 
     async fn execute_bound(
@@ -849,6 +1005,7 @@ impl AgentRuntime {
         session: &mut Session,
         req: ExecuteRequest,
         inputs: Option<crate::runtime::config::UntrustedExecutionInputs>,
+        upstream_retry: bamboo_llm::retry::UpstreamRetry,
     ) -> crate::runtime::runner::Result<()> {
         if self.persistence.root_actor_execution_required(session) {
             return Err(bamboo_agent_core::AgentError::Tool(
@@ -879,6 +1036,7 @@ impl AgentRuntime {
         let config = self.config.read().await;
         let ExecuteRequest {
             ticket_worker_plan,
+            ticket_token_budget,
             initial_message,
             event_tx,
             cancel_token,
@@ -904,6 +1062,7 @@ impl AgentRuntime {
             loop_control,
         } = req;
         let tools = tools.unwrap_or_else(|| self.default_tools.clone());
+        let uses_default_provider = provider_override.is_none();
         let llm = provider_override.unwrap_or_else(|| self.provider.clone());
         let configured_permission_mode = self
             .permission_config
@@ -915,10 +1074,13 @@ impl AgentRuntime {
             .as_ref()
             .is_some_and(|state| state.plan_mode.is_some());
 
-        // Decompose the roster back into the loose locals the resolution logic
-        // below expects. This preserves the byte-for-byte `None → Config`
-        // fallbacks: a `None` role yields `None` name/provider exactly as the
-        // old loose fields did.
+        // Explicit SDK role overrides retain their supplied client/name seam.
+        // Unset roles use the same strict live defaults as Host consumers.
+        let explicit_roles = [
+            model_roster.fast.is_some(),
+            model_roster.background.is_some(),
+            model_roster.summarization.is_some(),
+        ];
         let fast_model = model_roster.fast_model();
         let fast_model_provider = model_roster.fast_model_provider();
         let background_model = model_roster.background_model();
@@ -931,8 +1093,62 @@ impl AgentRuntime {
             provider_type,
             ..
         } = model_roster;
+        let auxiliary_model_resolver = select_auxiliary_model_resolver(
+            self.auxiliary_model_resolver_factory.as_ref(),
+            provider_name.as_deref(),
+            auxiliary_model_resolver,
+        );
         let active_provider =
             provider_name.unwrap_or_else(|| config.effective_default_provider().to_string());
+        let auxiliary_model_resolver = auxiliary_model_resolver.or_else(|| {
+            // A direct SDK client authorizes this declared account only. A
+            // different configured role needs an explicit Host resolver/client;
+            // never borrow the main client for another account's model name.
+            let registry = Arc::new(ProviderRegistry::new(
+                HashMap::from([(active_provider.clone(), llm.clone())]),
+                active_provider.clone(),
+            ));
+            let resolve = crate::model_areas::live_auxiliary_model_resolver(
+                self.config.clone(),
+                registry,
+                active_provider.clone(),
+            );
+            let overrides = AuxiliaryModelConfig {
+                fast_model_name: fast_model.clone().or_else(|| config.get_fast_model()),
+                fast_model_provider: fast_model_provider.clone(),
+                background_model_name: background_model
+                    .clone()
+                    .or_else(|| config.get_memory_background_model()),
+                background_model_provider: background_model_provider.clone(),
+                summarization_model_name: summarization_model
+                    .clone()
+                    .or_else(|| config.get_task_summary_model()),
+                summarization_model_provider: summarization_model_provider.clone(),
+                ..Default::default()
+            };
+            let resolver: Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> =
+                Arc::new(move || {
+                    let mut current = resolve();
+                    if explicit_roles[0] {
+                        current.fast_model_name = overrides.fast_model_name.clone();
+                        current.fast_model_provider = overrides.fast_model_provider.clone();
+                    }
+                    if explicit_roles[1] {
+                        current.background_model_name = overrides.background_model_name.clone();
+                        current.background_model_provider =
+                            overrides.background_model_provider.clone();
+                    }
+                    if explicit_roles[2] {
+                        current.summarization_model_name =
+                            overrides.summarization_model_name.clone();
+                        current.summarization_model_provider =
+                            overrides.summarization_model_provider.clone();
+                        current.summarization_model_error = None;
+                    }
+                    current
+                });
+            Some(resolver)
+        });
         let hook_runner = inputs
             .as_ref()
             .and_then(|inputs| inputs.sdk_hook_runner())
@@ -944,6 +1160,20 @@ impl AgentRuntime {
             });
 
         let mut effective_run_budget = config.run_budget.merged_with_override(run_budget.as_ref());
+        let legacy_vision_model_resolver = image_fallback
+            .as_ref()
+            .filter(|fallback| fallback.mode == crate::ImageFallbackMode::Vision)
+            .map(|fallback| {
+                crate::runtime::runner::image_fallback::legacy_vision_resolver(
+                    config.clone(),
+                    active_provider.clone(),
+                    llm.clone(),
+                    fallback.vision_model.clone(),
+                    app_data_dir.clone(),
+                    self.legacy_image_from_config,
+                    self.legacy_image_provider_source.clone(),
+                )
+            });
         if let Some(control) = loop_control.as_ref() {
             effective_run_budget.max_rounds = Some(
                 effective_run_budget
@@ -953,7 +1183,7 @@ impl AgentRuntime {
                     }),
             );
         }
-        let loop_config = AgentLoopConfig {
+        let mut loop_config = AgentLoopConfig {
             ticket_worker_plan: ticket_worker_plan.clone(),
             guidance_active_run_id,
             system_prompt,
@@ -973,6 +1203,8 @@ impl AgentRuntime {
             storage: Some(self.storage.clone()),
             persistence: Some(self.persistence.clone()),
             session_inbox: self.session_inbox.clone(),
+            live_bootstrap_host: self.live_bootstrap_host.clone(),
+            gold_target_resolver: self.gold_target_resolver.clone(),
             session_activation_notifications,
             attachment_reader: Some(self.attachment_reader.clone()),
             metrics_collector: Some(self.metrics_collector.clone()),
@@ -1018,6 +1250,8 @@ impl AgentRuntime {
             provider_type,
             reasoning_effort,
             auxiliary_model_resolver,
+            background_model_resolver: self.background_model_resolver.clone(),
+            resume_auxiliary_resolver: self.resume_auxiliary_resolver.clone(),
             disabled_filter_resolver,
             disabled_tools: {
                 let mut merged = config.disabled_tool_references();
@@ -1027,6 +1261,7 @@ impl AgentRuntime {
                 merged
             },
             image_fallback,
+            legacy_vision_model_resolver,
             vision_model_resolver: Some(
                 crate::runtime::runner::image_fallback::configured_vision_resolver(
                     self.config.clone(),
@@ -1067,10 +1302,106 @@ impl AgentRuntime {
             counted_loop,
             loop_control,
             stream_timeout: config.stream_timeout,
+            upstream_retry,
             ..Default::default()
         };
 
         drop(config);
+        let undecorated_main = llm.clone();
+        let llm = match ticket_token_budget.as_ref() {
+            Some(budget) => budget.decorate(&mut loop_config, llm),
+            None => llm,
+        };
+        // A Host default provider can change between main and Gold. Capture
+        // each accepted main dispatch rather than asking the mutable handle
+        // again when a dedicated Gold request starts.
+        if uses_default_provider
+            && loop_config
+                .gold_config
+                .as_ref()
+                .is_some_and(|gold| gold.enabled && gold.model_name.is_some())
+        {
+            if let Some(origin_resolver) = self.host_gold_origin_resolver.clone() {
+                let tracker = crate::runtime::host_gold::HostGoldRun::new(origin_resolver);
+                let source_tracker = tracker.clone();
+                let live_config = self.config.clone();
+                let original_main = undecorated_main.clone();
+                let budget = ticket_token_budget.clone();
+                let limits = Arc::new(AgentLoopConfig {
+                    app_data_dir: loop_config.app_data_dir.clone(),
+                    model_limits_section: loop_config.model_limits_section.clone(),
+                    legacy_model_limits: loop_config.legacy_model_limits.clone(),
+                    ..Default::default()
+                });
+                let inherited = loop_config.gold_target_resolver.take();
+                loop_config.gold_target_resolver = Some(Arc::new(move |model, _mutable_main| {
+                    let receipt = match source_tracker.accepted() {
+                        Ok(receipt) => receipt,
+                        Err(reason) => {
+                            return Arc::new(crate::runtime::host_gold::UnprovenGold {
+                                reason,
+                                refused: std::sync::atomic::AtomicBool::new(false),
+                            }) as Arc<dyn LLMProvider>
+                        }
+                    };
+                    let fixed = match &receipt.origin {
+                        crate::runtime::host_gold::HostGoldOrigin::Injected => {
+                            bamboo_llm::provider::fixed_injected_provider_with_identity(
+                                receipt.selected.clone(),
+                                original_main.clone(),
+                            )
+                        }
+                        crate::runtime::host_gold::HostGoldOrigin::Managed { .. } => {
+                            bamboo_llm::provider::fixed_provider_with_identity(
+                                receipt.selected.clone(),
+                                original_main.clone(),
+                            )
+                        }
+                    };
+                    let delegate = match budget.as_ref() {
+                        Some(budget) => budget.wrap(fixed, &limits),
+                        None => fixed,
+                    };
+                    match receipt.origin {
+                        crate::runtime::host_gold::HostGoldOrigin::Injected => inherited
+                            .as_ref()
+                            .map(|policy| policy(model, delegate.clone()))
+                            .unwrap_or(delegate),
+                        crate::runtime::host_gold::HostGoldOrigin::Managed {
+                            provider_name,
+                            origin,
+                        } => {
+                            let selected = receipt.selected;
+                            let config = live_config.clone();
+                            let managed: crate::runtime::config::GoldTargetResolver =
+                                Arc::new(move |model, delegate| {
+                                    bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+                                        config.clone(),
+                                        origin.clone(),
+                                        bamboo_domain::ProviderModelRef::new(
+                                            provider_name.as_str(),
+                                            model,
+                                        ),
+                                        selected.clone(),
+                                        delegate,
+                                    )
+                                });
+                            crate::runtime::agent::compose_child_gold_policy(
+                                inherited.clone(),
+                                managed,
+                            )(model, delegate)
+                        }
+                    }
+                }));
+                loop_config.host_gold_run = Some(tracker);
+            }
+        }
+        bind_child_gold_delegate(
+            &mut loop_config,
+            self.child_resume_gold_selected.as_ref(),
+            &undecorated_main,
+            &llm,
+        )?;
         #[cfg(test)]
         crate::runtime::tests::observe_untrusted_inputs(
             &session.id,
@@ -1115,6 +1446,18 @@ impl AgentRuntime {
             &session_end_event_tx,
         )
         .await;
+
+        // Capture only the typed terminal watchdog error from this execution.
+        // The existing checkpoint and exact run fingerprint own durable state;
+        // the existing bounded live projection attaches the same receipt to the
+        // error event without changing terminal ordering or retry decisions.
+        if let Err(bamboo_agent_core::AgentError::StreamTimeout(timeout)) = &result {
+            if let Some(diagnostic) = timeout.diagnostic(session) {
+                if session.record_llm_request_diagnostic(diagnostic.clone()) {
+                    bamboo_llm::retry::record_stream_timeout_diagnostic(diagnostic);
+                }
+            }
+        }
 
         // The runtime is the one shared execute boundary for HTTP, child-agent
         // and direct SDK callers.  Checkpoint here on every outcome so durable

@@ -313,6 +313,12 @@ pub struct ListSessionsResponse {
     /// Offset to request the next page, or `None` when this is the last page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_offset: Option<usize>,
+    /// Capabilities this build serves, so a frontend released independently can
+    /// gate an optional request instead of probing and collecting a 404.
+    ///
+    /// An older server simply omits this field; consumers must read absence as
+    /// "no optional capability" and make no speculative request.
+    pub features: Vec<&'static str>,
 }
 
 /// Snapshot of an actively running session for frontend boot/reconnect replay.
@@ -666,6 +672,7 @@ mod tests {
             limit: 200,
             offset: 0,
             next_offset: None,
+            features: vec!["worktree_merge_state"],
         };
 
         let json = serde_json::to_string(&response).unwrap();

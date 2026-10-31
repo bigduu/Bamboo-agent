@@ -80,9 +80,9 @@ pub(crate) fn validate_migration(snapshot: &Snapshot) -> Result<()> {
         .assignments
         .values()
         .any(|a| a.effects.values().any(|e| e.artifact.is_some()));
-    if files && !matches!(snapshot.schema, 3..=7) {
+    if files && !matches!(snapshot.schema, 3..=8) {
         return Err(Error::AuthorityUnavailable(
-            "file effect ledger requires schema 3..=7".into(),
+            "file effect ledger requires schema 3..=8".into(),
         ));
     }
     match (&snapshot.migration, snapshot.schema) {
@@ -104,7 +104,8 @@ pub(crate) fn validate_migration(snapshot: &Snapshot) -> Result<()> {
         (None, 5) if !snapshot.project.is_empty() => {}
         (None, 6) if !snapshot.sprint.is_empty() => {}
         (None, 7) => {}
-        (Some(r), 2..=7) => {
+        (None, 8) if snapshot.execution_budget.is_some() => {}
+        (Some(r), 2..=8) => {
             let activation_seq = r
                 .retired_seq
                 .checked_add(1)
@@ -288,12 +289,34 @@ impl TicketService {
     /// Inspection takes the writer OS lock but grants no runtime permission,
     /// increments no epoch, and requires an existing verified HEAD.
     pub fn open_offline(root: impl AsRef<Path>, binding: ScopeBinding) -> Result<Self> {
-        if !root.as_ref().join("HEAD").exists() {
+        Self::open_offline_with_policy(root.as_ref(), binding, false)
+    }
+
+    /// Canonical Supervisor Host inspection may retain an existing positive
+    /// binding revision in its exact namespace. Like ordinary offline opening,
+    /// this never reconciles a writer restart or publishes an epoch/HEAD.
+    pub fn open_offline_supervisor_mode_compatible(
+        root: impl AsRef<Path>,
+        binding: ScopeBinding,
+    ) -> Result<Self> {
+        Self::open_offline_with_policy(root.as_ref(), binding, true)
+    }
+
+    fn open_offline_with_policy(
+        root: &Path,
+        binding: ScopeBinding,
+        preserve_supervisor_revision: bool,
+    ) -> Result<Self> {
+        if !root.join("HEAD").exists() {
             return Err(Error::AuthorityUnavailable(
                 "offline inspection requires existing HEAD".into(),
             ));
         }
-        let mut store = FileStore::open(root.as_ref(), binding)?;
+        let mut store = if preserve_supervisor_revision {
+            FileStore::open_supervisor_mode_compatible(root, binding)?
+        } else {
+            FileStore::open(root, binding)?
+        };
         let (_, snapshot) = store
             .published
             .as_ref()

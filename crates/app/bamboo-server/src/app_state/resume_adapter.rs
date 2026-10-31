@@ -102,7 +102,28 @@ impl ResumeExecutionPort for AppStateResumeRef {
         Ok(())
     }
 
+    fn dispatch_configured_resume_execution(
+        &self,
+        request: ResumeSpawnRequest,
+    ) -> Result<(), ResumeSpawnRequest> {
+        let owner = AppStateResumeRef(self.0.clone());
+        tokio::spawn(async move {
+            ResumeExecutionPort::spawn_configured_resume_execution(&owner, request).await;
+        });
+        Ok(())
+    }
+
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, false).await;
+    }
+
+    async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
+        self.spawn_resume_with_origin(request, true).await;
+    }
+}
+
+impl AppStateResumeRef {
+    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -144,6 +165,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 return;
             }
         };
+        let workspace_agent = if from_config {
+            std::sync::Arc::new(workspace_agent.with_config_derived_image_fallback())
+        } else {
+            workspace_agent
+        };
         let execution_binding = Some((
             workspace_agent,
             self.0
@@ -182,7 +208,11 @@ impl ResumeExecutionPort for AppStateResumeRef {
             model_ref.provider = resolved_provider_name.clone();
             persist_model_ref(&mut session, &model_ref);
         }
-        let provider_override = match self.0.provider_registry.get(&resolved_provider_name) {
+        let (provider_override, provider_override_managed_registry) = match self
+            .0
+            .provider_registry
+            .get_with_origin(&resolved_provider_name)
+        {
             Some(provider) => provider,
             None => {
                 tracing::error!(
@@ -194,6 +224,15 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 return;
             }
         };
+        let legacy_vision_provider_source =
+            bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+                &config_snapshot,
+                &resolved_provider_name,
+                provider_override.clone(),
+                provider_override_managed_registry.clone(),
+            )
+            .ok()
+            .map(std::sync::Arc::new);
         let resolved_provider_type = resolve_provider_type(
             &config_snapshot,
             &resolved_provider_name,
@@ -327,6 +366,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                     is_child_session,
                     provider_name: resolved_provider_name,
                     provider_override: Some(provider_override.clone()),
+                    provider_override_managed_registry,
+                    legacy_vision_provider_source,
                     model_roster,
                     reasoning_effort,
                     reasoning_effort_source,
@@ -707,6 +748,8 @@ impl ResumeExecutionPort for AppStateResumeRef {
                 is_child_session,
                 provider_name: resolved_provider_name,
                 provider_override: Some(provider_override),
+                provider_override_managed_registry,
+                legacy_vision_provider_source,
                 model_roster,
                 reasoning_effort,
                 reasoning_effort_source,

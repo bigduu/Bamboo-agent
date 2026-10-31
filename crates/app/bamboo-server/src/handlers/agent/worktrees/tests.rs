@@ -43,11 +43,7 @@ async fn inventory_diagnostics_keep_the_success_contract_separate_from_http_erro
     assert_eq!(response.status(), actix_web::http::StatusCode::OK);
     let body: Value = test::read_body_json(response).await;
     assert_eq!(body["project_id"], project.id.to_string());
-    let inventory = &body["repositories"][0];
-    assert_eq!(inventory["path"], repo.to_str().unwrap());
-    assert!(!inventory["error"].as_str().unwrap().is_empty());
-    assert_eq!(inventory["worktrees"].as_array().unwrap().len(), 0);
-    assert!(inventory.get("common_dir").is_none());
+    assert!(body["repositories"].as_array().unwrap().is_empty());
     assert!(!repo.join(".git").exists());
 
     run_git(&repo, &["init", "-b", "main"]);
@@ -78,6 +74,7 @@ async fn inventory_diagnostics_keep_the_success_contract_separate_from_http_erro
     assert!(checkout["error"].is_null());
     assert_eq!(checkout["dirty"], false);
     assert_eq!(checkout["occupied"], false);
+    assert_eq!(checkout["project_owned"], true);
     assert!(checkout["sessions"].as_array().unwrap().is_empty());
 
     let missing = format!("/projects/{}/worktrees", uuid::Uuid::new_v4());
@@ -176,6 +173,7 @@ async fn directory_preferences_native_create_discovery_and_session_association_r
         .unwrap();
     assert_eq!(entry["dirty"], true);
     assert_eq!(entry["occupied"], true);
+    assert_eq!(entry["project_owned"], false);
     assert_eq!(entry["sessions"][0]["id"], "worktree-session");
     // Clearing a preference does not move or remove any Git checkout.
     let response = test::call_service(
@@ -580,6 +578,20 @@ async fn inventory_scopes_and_deduplicates_session_git_queries_without_losing_sh
         "shared/legacy and nested workspaces remain associated; nested repositories do not"
     );
     assert_eq!(entry["occupied"], true);
+    let embedded_entry = body["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|repository| repository["path"] == embedded.to_str().unwrap())
+        .unwrap()["worktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["path"] == embedded.to_str().unwrap())
+        .unwrap();
+    assert_eq!(embedded_entry["project_owned"], true);
+    assert_eq!(embedded_entry["sessions"].as_array().unwrap().len(), 1);
+    assert_eq!(embedded_entry["sessions"][0]["id"], "embedded-repository");
     assert_eq!(
         git::workspace_root_queries_for_test(&unrelated_nested),
         0,

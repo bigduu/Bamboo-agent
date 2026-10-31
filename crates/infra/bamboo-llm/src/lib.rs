@@ -2,6 +2,8 @@
 
 pub mod cache;
 pub mod error;
+#[doc(hidden)]
+pub mod gold_admission;
 pub mod http_client;
 mod image_budget;
 pub mod masking;

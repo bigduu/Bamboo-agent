@@ -2565,11 +2565,7 @@ async fn root_catalog_fixture() {
         .port();
     let mut host = start(&data, port);
     let base = format!("http://127.0.0.1:{port}/api/v1");
-    let client = reqwest::Client::builder()
-        .no_proxy()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .unwrap();
+    let client = fixture_http_client();
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(status) = host.0.try_wait().unwrap() {
@@ -3439,7 +3435,10 @@ async fn message_only_fixture(
         .0;
     let fields: Value = serde_json::from_str(brief).unwrap();
     assert_eq!(fields["task_brief"], MESSAGE_ONLY_TASK);
-    assert_eq!(fields["objective"], MESSAGE_ONLY_TASK);
+    assert!(fields["objective"].as_str().is_some_and(|objective| {
+        !objective.trim().is_empty() && objective != MESSAGE_ONLY_TASK
+    }));
+    assert_eq!(assignment.content.matches(MESSAGE_ONLY_TASK).count(), 1);
     assert!(!before
         .messages
         .iter()

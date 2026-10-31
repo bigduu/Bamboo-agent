@@ -64,6 +64,8 @@ pub struct CopilotProvider {
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
     models_cache: RwLock<Option<CopilotModelsCache>>,
+    #[cfg(test)]
+    test_model_base_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -73,6 +75,14 @@ struct CopilotModelsCache {
 }
 
 impl CopilotProvider {
+    fn model_endpoint(&self, path: &str) -> String {
+        #[cfg(test)]
+        if let Some(base) = &self.test_model_base_url {
+            return format!("{}/{}", base.trim_end_matches('/'), path);
+        }
+        format!("https://api.githubcopilot.com/{path}")
+    }
+
     /// Create new Copilot provider (without auth handler)
     pub fn new() -> Self {
         Self {
@@ -87,6 +97,8 @@ impl CopilotProvider {
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
+            #[cfg(test)]
+            test_model_base_url: None,
         }
     }
 
@@ -104,6 +116,8 @@ impl CopilotProvider {
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
+            #[cfg(test)]
+            test_model_base_url: None,
         }
     }
 
@@ -140,6 +154,8 @@ impl CopilotProvider {
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
             models_cache: RwLock::new(None),
+            #[cfg(test)]
+            test_model_base_url: None,
         }
     }
 
@@ -480,11 +496,6 @@ impl CopilotProvider {
         b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
     }
 
-    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        // Shared, tightened heuristic (#237 finding 5).
-        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
-    }
-
     fn looks_like_previous_response_id_unsupported_error(
         status: reqwest::StatusCode,
         body: &str,
@@ -527,6 +538,20 @@ impl CopilotProvider {
             || Self::is_retryable_transport_message(&error.to_string())
     }
 
+    // Model POSTs use the advertised finite or explicitly continuous policy.
+    // Model discovery keeps its existing bounded transport/auth contract.
+    async fn send_model_request<F>(
+        &self,
+        build_request: F,
+        _operation: &str,
+        _session_id: Option<&str>,
+    ) -> std::result::Result<reqwest::Response, LLMError>
+    where
+        F: Fn() -> reqwest::RequestBuilder,
+    {
+        crate::retry::send_provider_request(crate::retry::global(), "Copilot", build_request).await
+    }
+
     async fn send_with_transport_retry<F>(
         &self,
         mut build_request: F,
@@ -538,6 +563,7 @@ impl CopilotProvider {
     {
         let session_log_id = session_id.unwrap_or("unknown-session");
         for attempt in 1..=COPILOT_TRANSPORT_MAX_ATTEMPTS {
+            crate::retry::claim_work_physical_request()?;
             match build_request().send().await {
                 Ok(response) => return Ok(response),
                 Err(error) => {
@@ -581,7 +607,8 @@ impl CopilotProvider {
         session_log_id: &str,
         request_purpose: &str,
     ) -> Result<LLMStream> {
-        let url = "https://api.githubcopilot.com/responses";
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let url = self.model_endpoint("responses");
         let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
         if effective_responses_options.store == Some(true) {
             tracing::warn!(
@@ -617,6 +644,11 @@ impl CopilotProvider {
             parallel_tool_calls,
             None,
         );
+        request_overrides::validate_budgeted_overrides(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_RESPONSES,
+            Some(model),
+        )?;
         request_overrides::apply_overrides_to_body(
             &mut body,
             self.request_overrides.as_ref(),
@@ -661,10 +693,10 @@ impl CopilotProvider {
             Some(model),
         )?;
         let mut response = self
-            .send_with_transport_retry(
+            .send_model_request(
                 || {
                     self.client
-                        .post(url)
+                        .post(&url)
                         .headers(request_headers.clone())
                         .json(&body)
                 },
@@ -687,10 +719,10 @@ impl CopilotProvider {
                             Some(model),
                         )?;
                         response = self
-                            .send_with_transport_retry(
+                            .send_model_request(
                                 || {
                                     self.client
-                                        .post(url)
+                                        .post(&url)
                                         .headers(refreshed_headers.clone())
                                         .json(&body)
                                 },
@@ -713,113 +745,6 @@ impl CopilotProvider {
                     .to_string();
                 let response_header_count = response.headers().len();
                 let text = response.text().await.unwrap_or_default();
-
-                if reasoning_effort.is_some()
-                    && Self::looks_like_reasoning_unsupported_error(status, &text)
-                {
-                    tracing::warn!(
-                        "[session_hash={}] Copilot /responses rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                        log_identity(session_log_id),
-                        log_identity(model)
-                    );
-                    let mut fallback_options = effective_responses_options.clone();
-                    fallback_options.reasoning_summary = None;
-                    let mut fallback_body = build_responses_body(
-                        model,
-                        messages,
-                        tools,
-                        max_output_tokens,
-                        None,
-                        Some(&fallback_options),
-                        parallel_tool_calls,
-                        None,
-                    );
-                    request_overrides::apply_overrides_to_body(
-                        &mut fallback_body,
-                        self.request_overrides.as_ref(),
-                        request_overrides::ENDPOINT_RESPONSES,
-                        Some(model),
-                    );
-                    if let Some(name) = required_tool {
-                        fallback_body["tool_choice"] = json!({"type": "function", "name": name});
-                    }
-                    crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                    let fallback_headers = self.build_llm_headers(
-                        token,
-                        messages,
-                        tools,
-                        request_overrides::ENDPOINT_RESPONSES,
-                        Some(model),
-                    )?;
-                    let mut fallback = self
-                        .send_with_transport_retry(
-                            || {
-                                self.client
-                                    .post(url)
-                                    .headers(fallback_headers.clone())
-                                    .json(&fallback_body)
-                            },
-                            "copilot responses reasoning fallback",
-                            Some(session_log_id),
-                        )
-                        .await?;
-
-                    if !fallback.status().is_success() {
-                        let fallback_status = fallback.status();
-                        if (fallback_status == 401 || fallback_status == 403)
-                            && self.auth_handler.is_some()
-                        {
-                            if let Some(handler) = &self.auth_handler {
-                                if let Ok(Some(refreshed)) =
-                                    handler.force_refresh_chat_token().await
-                                {
-                                    let refreshed_fallback_headers = self.build_llm_headers(
-                                        &refreshed,
-                                        messages,
-                                        tools,
-                                        request_overrides::ENDPOINT_RESPONSES,
-                                        Some(model),
-                                    )?;
-                                    fallback = self
-                                        .send_with_transport_retry(
-                                            || {
-                                                self.client
-                                                    .post(url)
-                                                    .headers(refreshed_fallback_headers.clone())
-                                                    .json(&fallback_body)
-                                            },
-                                            "copilot responses reasoning fallback auth-refresh retry",
-                                            Some(session_log_id),
-                                        )
-                                        .await?;
-                                }
-                            }
-                        }
-                    }
-
-                    if fallback.status().is_success() {
-                        let mut parser =
-                            ResponsesSseParser::new_with_context("Copilot", model, None)
-                                .with_protocol_events(retain_protocol_events);
-                        let model_for_debug = model.to_string();
-                        let stream = llm_stream_from_sse_multi_requiring_done(
-                            fallback,
-                            move |event, data| {
-                                let parsed = parser.handle_event_multi(event, data);
-                                append_responses_sse_record(
-                                    "Copilot",
-                                    &model_for_debug,
-                                    event,
-                                    data,
-                                    &parsed,
-                                );
-                                parsed
-                            },
-                            "Copilot Responses",
-                        );
-                        return Ok(stream);
-                    }
-                }
 
                 if status == 401 || status == 403 {
                     return Err(LLMError::Auth(format!(
@@ -872,6 +797,9 @@ impl CopilotProvider {
         let stream = llm_stream_from_sse_multi_requiring_done(
             response,
             move |event, data| {
+                if let Some(diagnostics) = &completion_diagnostics {
+                    diagnostics.observe_sse(event, data);
+                }
                 let parsed = parser.handle_event_multi(event, data);
                 append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
                 parsed
@@ -1221,8 +1149,13 @@ impl LLMProvider for CopilotProvider {
         set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
         if let Some(reasoning_effort) = reasoning_effort {
-            body["reasoning_effort"] = json!(reasoning_effort.to_wire_format(upstream_model));
+            body["reasoning_effort"] = json!(reasoning_effort.as_str());
         }
+        request_overrides::validate_budgeted_overrides(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            Some(upstream_model),
+        )?;
         request_overrides::apply_overrides_to_body(
             &mut body,
             self.request_overrides.as_ref(),
@@ -1255,7 +1188,7 @@ impl LLMProvider for CopilotProvider {
             tools.len()
         );
 
-        let url = "https://api.githubcopilot.com/chat/completions";
+        let url = self.model_endpoint("chat/completions");
 
         let request_headers = self.build_llm_headers(
             &token,
@@ -1265,10 +1198,10 @@ impl LLMProvider for CopilotProvider {
             Some(upstream_model),
         )?;
         let mut response = self
-            .send_with_transport_retry(
+            .send_model_request(
                 || {
                     self.client
-                        .post(url)
+                        .post(&url)
                         .headers(request_headers.clone())
                         .json(&body)
                 },
@@ -1292,10 +1225,10 @@ impl LLMProvider for CopilotProvider {
                             Some(upstream_model),
                         )?;
                         response = self
-                            .send_with_transport_retry(
+                            .send_model_request(
                                 || {
                                     self.client
-                                        .post(url)
+                                        .post(&url)
                                         .headers(refreshed_headers.clone())
                                         .json(&body)
                                 },
@@ -1326,109 +1259,6 @@ impl LLMProvider for CopilotProvider {
                         "Authentication failed: {}. Please run authenticate() again.",
                         text
                     )));
-                }
-
-                if reasoning_effort.is_some()
-                    && Self::looks_like_reasoning_unsupported_error(status, &text)
-                {
-                    tracing::warn!(
-                        "[session_hash={}] Copilot /chat/completions rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                        log_identity(session_log_id),
-                        log_identity(upstream_model)
-                    );
-
-                    let mut body_no_reasoning = json!({
-                        "model": upstream_model,
-                        "messages": messages_to_openai_compat_json(messages),
-                        "stream": true,
-                    });
-                    if !tools.is_empty() {
-                        body_no_reasoning["tools"] = json!(tools_to_openai_compat_json(tools));
-                        body_no_reasoning["tool_choice"] = required_tool.map_or_else(
-                            || json!("auto"),
-                            |name| json!({"type": "function", "function": {"name": name}}),
-                        );
-                    }
-                    if let Some(parallel_tool_calls) = parallel_tool_calls {
-                        body_no_reasoning["parallel_tool_calls"] = json!(parallel_tool_calls);
-                    }
-                    if let Some(max_tokens) = max_output_tokens {
-                        body_no_reasoning["max_tokens"] = json!(max_tokens);
-                    }
-                    request_overrides::apply_overrides_to_body(
-                        &mut body_no_reasoning,
-                        self.request_overrides.as_ref(),
-                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                        Some(upstream_model),
-                    );
-                    if let Some(name) = required_tool {
-                        body_no_reasoning["tool_choice"] =
-                            json!({"type": "function", "function": {"name": name}});
-                    }
-                    crate::masking::mask_outbound_body(
-                        &mut body_no_reasoning,
-                        &self.masking_config,
-                    );
-
-                    let retry_headers = self.build_llm_headers(
-                        &token,
-                        messages,
-                        tools,
-                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                        Some(upstream_model),
-                    )?;
-                    let mut retry = self
-                        .send_with_transport_retry(
-                            || {
-                                self.client
-                                    .post(url)
-                                    .headers(retry_headers.clone())
-                                    .json(&body_no_reasoning)
-                            },
-                            "copilot chat/completions reasoning fallback",
-                            Some(session_log_id),
-                        )
-                        .await?;
-
-                    if !retry.status().is_success() {
-                        let retry_status = retry.status();
-                        if (retry_status == 401 || retry_status == 403)
-                            && self.auth_handler.is_some()
-                        {
-                            if let Some(handler) = &self.auth_handler {
-                                if let Ok(Some(refreshed)) =
-                                    handler.force_refresh_chat_token().await
-                                {
-                                    let refreshed_retry_headers = self.build_llm_headers(
-                                        &refreshed,
-                                        messages,
-                                        tools,
-                                        request_overrides::ENDPOINT_CHAT_COMPLETIONS,
-                                        Some(upstream_model),
-                                    )?;
-                                    retry = self
-                                        .send_with_transport_retry(
-                                            || {
-                                                self.client
-                                                    .post(url)
-                                                    .headers(refreshed_retry_headers.clone())
-                                                    .json(&body_no_reasoning)
-                                            },
-                                            "copilot chat/completions reasoning fallback auth-refresh retry",
-                                            Some(session_log_id),
-                                        )
-                                        .await?;
-                                }
-                            }
-                        }
-                    }
-
-                    if retry.status().is_success() {
-                        let stream = openai_compat_chat_stream_from_sse(retry, |_event, data| {
-                            parse_openai_compat_sse_data_lenient_multi(data)
-                        });
-                        return Ok(stream);
-                    }
                 }
 
                 // If this model only supports Responses API, retry with /responses.
@@ -1488,7 +1318,11 @@ impl LLMProvider for CopilotProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = openai_compat_chat_stream_from_sse(response, move |_event, data| {
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let stream = openai_compat_chat_stream_from_sse(response, move |event, data| {
+            if let Some(diagnostics) = &completion_diagnostics {
+                diagnostics.observe_sse(event, data);
+            }
             let mut reasoning_chunk_to_emit: Option<String> = None;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 if let Some(delta) = v
@@ -2025,31 +1859,12 @@ mod tests {
     }
 
     #[test]
-    fn copilot_reasoning_and_previous_response_id_fallback_detectors_do_not_overlap() {
-        assert!(CopilotProvider::looks_like_reasoning_unsupported_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            "reasoning_effort is not supported for this model",
-        ));
+    fn reasoning_error_does_not_trigger_previous_response_fallback() {
         assert!(
             !CopilotProvider::looks_like_previous_response_id_unsupported_error(
                 reqwest::StatusCode::BAD_REQUEST,
-                "reasoning_effort is not supported for this model",
-            ),
-            "reasoning fallback classifier should not misclassify as previous_response_id fallback"
-        );
-
-        assert!(
-            CopilotProvider::looks_like_previous_response_id_unsupported_error(
-                reqwest::StatusCode::BAD_REQUEST,
-                "previous_response_id unsupported_value",
+                "reasoning_effort is not supported for this model"
             )
-        );
-        assert!(
-            !CopilotProvider::looks_like_reasoning_unsupported_error(
-                reqwest::StatusCode::BAD_REQUEST,
-                "previous_response_id unsupported_value",
-            ),
-            "previous_response_id fallback classifier should not misclassify as reasoning fallback"
         );
     }
 
@@ -2323,5 +2138,475 @@ mod operational_log_privacy_tests {
                 "private-session-999-sentinel",
             ],
         );
+    }
+}
+
+#[cfg(test)]
+mod continuous_model_request_tests {
+    use super::*;
+    use crate::retry::{
+        observe_initial_http_retries, with_upstream_retry, InitialHttpRetryObserver, UpstreamRetry,
+        WorkPhysicalRequest,
+    };
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn continuous_model_posts_retry_transient_statuses_and_keep_terminal_responses_unread() {
+        for operation in [
+            "copilot responses initial request",
+            "copilot chat/completions initial request",
+        ] {
+            for status in [429, 503, 400, 401, 403, 422] {
+                let server = MockServer::start().await;
+                let count = Arc::new(AtomicUsize::new(0));
+                let hits = count.clone();
+                Mock::given(method("POST"))
+                    .respond_with(move |_: &wiremock::Request| {
+                        let n = hits.fetch_add(1, Ordering::SeqCst);
+                        ResponseTemplate::new(if n == 0 { status } else { 200 })
+                            .set_body_string("synthetic unread response")
+                    })
+                    .mount(&server)
+                    .await;
+                let provider = CopilotProvider::with_token("synthetic-token");
+                let client = reqwest::Client::builder().no_proxy().build().unwrap();
+                let observer = Arc::new(InitialHttpRetryObserver::default());
+                let response = with_upstream_retry(
+                    UpstreamRetry::UntilCancelled,
+                    observe_initial_http_retries(
+                        observer.clone(),
+                        provider.send_model_request(
+                            || client.post(server.uri()),
+                            operation,
+                            Some("synthetic-session"),
+                        ),
+                    ),
+                )
+                .await
+                .unwrap();
+                let transient = matches!(status, 429 | 503);
+                assert_eq!(
+                    response.status().as_u16(),
+                    if transient { 200 } else { status }
+                );
+                assert_eq!(response.text().await.unwrap(), "synthetic unread response");
+                assert_eq!(count.load(Ordering::SeqCst), if transient { 2 } else { 1 });
+                assert!(observer.request_budget_managed());
+                assert!(!observer.request_policy_active());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn copilot_continuous_long_hint_is_cancellable_and_discovery_remains_bounded() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429).insert_header("Retry-After", "120"))
+            .mount(&server)
+            .await;
+        let observer = Arc::new(InitialHttpRetryObserver::default());
+        let observed = observer.clone();
+        let url = server.uri();
+        let task = tokio::spawn(async move {
+            let provider = CopilotProvider::with_token("synthetic-token");
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            with_upstream_retry(
+                UpstreamRetry::UntilCancelled,
+                observe_initial_http_retries(
+                    observed,
+                    provider.send_model_request(
+                        || client.post(&url),
+                        "copilot responses initial request",
+                        None,
+                    ),
+                ),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while observer.last().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(observer.last().unwrap().delay >= Duration::from_secs(120));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        assert!(!observer.request_policy_active());
+        let provider = CopilotProvider::with_token("synthetic-token");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let discovery = with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            provider.send_with_transport_retry(
+                || client.post(server.uri()),
+                "copilot models list",
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(discovery.status(), 429);
+        assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn copilot_continuous_mode_keeps_the_work_single_physical_send_guard() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(503))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = CopilotProvider::with_token("synthetic-token");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let scope = WorkPhysicalRequest::default();
+        with_upstream_retry(
+            UpstreamRetry::UntilCancelled,
+            scope.scope(async {
+                let first = provider
+                    .send_model_request(
+                        || client.post(server.uri()),
+                        "copilot responses initial request",
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(first.status(), 503);
+                let second = provider
+                    .send_model_request(
+                        || client.post(server.uri()),
+                        "copilot responses auth-refresh retry",
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(second, LLMError::RequestFailed(_)));
+            }),
+        )
+        .await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+}
+
+#[cfg(test)]
+mod actual_model_consumer_tests {
+    use super::*;
+    use crate::retry::{with_upstream_retry, UpstreamRetry, WorkPhysicalRequest};
+    use futures::StreamExt;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const MODEL: &str = "controlled-model";
+    const CHAT_SSE: &str =
+        "data: {\"choices\":[{\"delta\":{\"content\":\"synthetic reply\"}}]}\n\ndata: [DONE]\n\n";
+    const RESPONSES_SSE: &str = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"synthetic reply\"}\n\nevent: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"synthetic-response\"}}\n\n";
+
+    fn provider(base: String, responses_only: bool) -> CopilotProvider {
+        let mut provider = CopilotProvider::with_token("synthetic-token");
+        provider.client = Client::builder().no_proxy().build().unwrap();
+        provider.test_model_base_url = Some(base);
+        if responses_only {
+            provider = provider.with_responses_only_models(vec![MODEL.into()]);
+        }
+        provider
+    }
+
+    async fn assert_completed_stream(mut stream: LLMStream) {
+        let mut text = String::new();
+        let mut done = 0;
+        while let Some(item) = stream.next().await {
+            match item.expect("controlled stream must decode") {
+                LLMChunk::Token(token) => text.push_str(&token),
+                LLMChunk::Done => done += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(text, "synthetic reply");
+        assert_eq!(done, 1);
+    }
+
+    fn expected_error(result: Result<LLMStream>) -> LLMError {
+        match result {
+            Ok(_) => panic!("controlled request must fail before a stream is established"),
+            Err(error) => error,
+        }
+    }
+
+    #[test]
+    fn production_model_endpoints_remain_fixed_without_a_test_override() {
+        let provider = CopilotProvider::new();
+        assert_eq!(
+            provider.model_endpoint("chat/completions"),
+            "https://api.githubcopilot.com/chat/completions"
+        );
+        assert_eq!(
+            provider.model_endpoint("responses"),
+            "https://api.githubcopilot.com/responses"
+        );
+    }
+
+    #[tokio::test]
+    async fn actual_chat_and_responses_continuously_retry_transient_status_then_consume_sse() {
+        for (responses_only, endpoint, sse) in [
+            (false, "/chat/completions", CHAT_SSE),
+            (true, "/responses", RESPONSES_SSE),
+        ] {
+            for transient_status in [429, 503] {
+                let server = MockServer::start().await;
+                let hits = Arc::new(AtomicUsize::new(0));
+                let responder_hits = hits.clone();
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(move |_: &wiremock::Request| {
+                        if responder_hits.fetch_add(1, Ordering::SeqCst) == 0 {
+                            ResponseTemplate::new(transient_status)
+                        } else {
+                            ResponseTemplate::new(200)
+                                .insert_header("content-type", "text/event-stream")
+                                .set_body_string(sse)
+                        }
+                    })
+                    .expect(2)
+                    .mount(&server)
+                    .await;
+                let provider = provider(server.uri(), responses_only);
+                let messages = [Message::user("controlled user")];
+                let stream = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    with_upstream_retry(
+                        UpstreamRetry::UntilCancelled,
+                        provider.chat_stream(&messages, &[], Some(64), MODEL),
+                    ),
+                )
+                .await
+                .expect("the actual model route must finish")
+                .expect("the transient response must be retried");
+                tokio::time::timeout(Duration::from_secs(2), assert_completed_stream(stream))
+                    .await
+                    .expect("the successful SSE stream must finish");
+                assert_eq!(hits.load(Ordering::SeqCst), 2);
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 2);
+                assert_eq!(requests[0].url.path(), endpoint);
+                assert_eq!(requests[1].url.path(), endpoint);
+                assert_eq!(requests[0].body, requests[1].body);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_model_terminal_statuses_stop_once_without_an_auth_handler() {
+        for (responses_only, endpoint) in [(false, "/chat/completions"), (true, "/responses")] {
+            for status in [400, 401, 403] {
+                let server = MockServer::start().await;
+                Mock::given(method("POST"))
+                    .and(path(endpoint))
+                    .respond_with(ResponseTemplate::new(status).set_body_string("terminal error"))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let provider = provider(server.uri(), responses_only);
+                assert!(provider.auth_handler.is_none());
+                let messages = [Message::user("controlled user")];
+                let error = expected_error(
+                    tokio::time::timeout(
+                        Duration::from_secs(5),
+                        with_upstream_retry(
+                            UpstreamRetry::UntilCancelled,
+                            provider.chat_stream(&messages, &[], Some(64), MODEL),
+                        ),
+                    )
+                    .await
+                    .expect("a terminal response must finish"),
+                );
+                if status == 400 {
+                    assert!(matches!(error, LLMError::Api(_)));
+                } else {
+                    assert!(matches!(error, LLMError::Auth(_)));
+                }
+                let requests = server.received_requests().await.unwrap();
+                assert_eq!(requests.len(), 1);
+                assert_eq!(requests[0].url.path(), endpoint);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_chat_responses_only_error_falls_back_to_the_responses_route() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("use Responses API"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(RESPONSES_SSE),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = provider(server.uri(), false);
+        let messages = [Message::user("controlled user")];
+        let stream = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_upstream_retry(
+                UpstreamRetry::UntilCancelled,
+                provider.chat_stream(&messages, &[], Some(64), MODEL),
+            ),
+        )
+        .await
+        .expect("the compatibility fallback must finish")
+        .expect("the Responses fallback must succeed");
+        tokio::time::timeout(Duration::from_secs(2), assert_completed_stream(stream))
+            .await
+            .expect("the fallback stream must finish");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0].url.path(), "/chat/completions");
+        assert_eq!(requests[1].url.path(), "/responses");
+    }
+
+    #[tokio::test]
+    async fn work_actual_chat_rejection_cannot_send_the_responses_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("use Responses API"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/responses"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(RESPONSES_SSE))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let provider = provider(server.uri(), false);
+        let messages = [Message::user("controlled user")];
+        let work = WorkPhysicalRequest::default();
+        let error = expected_error(
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                with_upstream_retry(
+                    UpstreamRetry::UntilCancelled,
+                    work.scope(provider.chat_stream(&messages, &[], Some(64), MODEL)),
+                ),
+            )
+            .await
+            .expect("the Work reservation must reject the fallback"),
+        );
+        assert!(matches!(error, LLMError::RequestFailed(ref message)
+            if message.contains("new Host reservation is required")));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/chat/completions");
+    }
+
+    async fn read_complete_post(socket: &mut TcpStream) -> Vec<u8> {
+        let mut received = Vec::new();
+        let mut buffer = [0u8; 2048];
+        let header_end = loop {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "peer closed before completing request headers");
+            received.extend_from_slice(&buffer[..count]);
+            if let Some(index) = received.windows(4).position(|part| part == b"\r\n\r\n") {
+                break index + 4;
+            }
+            assert!(
+                received.len() < 65_536,
+                "controlled request headers exceeded limit"
+            );
+        };
+        let headers = std::str::from_utf8(&received[..header_end]).unwrap();
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .map(|(_, value)| value.trim().parse::<usize>().unwrap())
+            .expect("controlled JSON POST has a known body size");
+        while received.len() < header_end + content_length {
+            let count = socket.read(&mut buffer).await.unwrap();
+            assert!(count > 0, "peer closed before completing the request body");
+            received.extend_from_slice(&buffer[..count]);
+        }
+        received
+    }
+
+    fn post_body(request: &[u8]) -> &[u8] {
+        let header_end = request
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .expect("controlled POST headers")
+            + 4;
+        &request[header_end..]
+    }
+
+    #[tokio::test]
+    async fn actual_model_routes_retry_closed_connection_after_complete_post() {
+        for (responses_only, endpoint, sse) in [
+            (false, "/chat/completions", CHAT_SSE),
+            (true, "/responses", RESPONSES_SSE),
+        ] {
+            for policy in [UpstreamRetry::Bounded, UpstreamRetry::UntilCancelled] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                let server = tokio::spawn(async move {
+                    let (mut first, _) = listener.accept().await.unwrap();
+                    let original = read_complete_post(&mut first).await;
+                    assert!(
+                        original.starts_with(format!("POST {endpoint} HTTP/1.1\r\n").as_bytes())
+                    );
+                    // Close only after the entire first model POST arrived, before headers.
+                    drop(first);
+                    let (mut second, _) = listener.accept().await.unwrap();
+                    let retry = read_complete_post(&mut second).await;
+                    assert!(retry.starts_with(format!("POST {endpoint} HTTP/1.1\r\n").as_bytes()));
+                    assert_eq!(post_body(&original), post_body(&retry));
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        sse.len(),
+                        sse
+                    );
+                    second.write_all(response.as_bytes()).await.unwrap();
+                });
+                let provider = provider(format!("http://{address}"), responses_only);
+                let messages = [Message::user("controlled user")];
+                let stream = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    with_upstream_retry(
+                        policy,
+                        provider.chat_stream(&messages, &[], Some(64), MODEL),
+                    ),
+                )
+                .await
+                .expect("the initial disconnect retry must finish")
+                .expect("a closed connection before headers is transient");
+                tokio::time::timeout(Duration::from_secs(2), assert_completed_stream(stream))
+                    .await
+                    .expect("the retried stream must finish");
+                tokio::time::timeout(Duration::from_secs(2), server)
+                    .await
+                    .expect("the controlled server must finish")
+                    .unwrap();
+            }
+        }
     }
 }

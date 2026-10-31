@@ -1235,3 +1235,6 @@ fn unavailable_start_measurement_is_unknown_without_semantic_calls_or_invented_p
 
 #[path = "patrol/settlement.rs"]
 mod settlement;
+
+#[path = "patrol/program.rs"]
+mod program;

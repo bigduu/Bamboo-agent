@@ -6,6 +6,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use bamboo_agent_core::tools::{Tool, ToolCtx, ToolError, ToolOutcome};
+use bamboo_engine::session_app::child_session::planner_artifact;
 use bamboo_engine::session_app::child_session::{
     self, ChildSessionError, ChildSessionPort, CreateChildInput, SubagentResolutionPort,
 };
@@ -42,6 +43,10 @@ struct PlanArgs {
     /// repeat in `task`.
     #[serde(default)]
     fork_last_messages: Option<usize>,
+    /// Explicit selected context uses the ordinary Host-validated Child packet.
+    /// Its content never supplies a role, permission, or execution approval.
+    #[serde(default)]
+    context_packet: Option<Box<bamboo_domain::ChildContextPacket>>,
 }
 
 /// Delegate planning to one runtime-enforced read-only child while the root
@@ -49,6 +54,7 @@ struct PlanArgs {
 pub struct PlanTool {
     sessions: Arc<dyn ChildSessionPort>,
     resolver: Arc<dyn SubagentResolutionPort>,
+    artifact_home: Option<std::path::PathBuf>,
 }
 
 impl PlanTool {
@@ -56,7 +62,16 @@ impl PlanTool {
         sessions: Arc<dyn ChildSessionPort>,
         resolver: Arc<dyn SubagentResolutionPort>,
     ) -> Self {
-        Self { sessions, resolver }
+        Self {
+            sessions,
+            resolver,
+            artifact_home: None,
+        }
+    }
+
+    pub fn with_artifact_home(mut self, home: std::path::PathBuf) -> Self {
+        self.artifact_home = Some(home);
+        self
     }
 }
 
@@ -80,6 +95,42 @@ fn normalize_task(task: String) -> Result<String, ToolError> {
         ));
     }
     Ok(task.to_string())
+}
+
+fn parse_plan_args(args: serde_json::Value) -> Result<PlanArgs, ToolError> {
+    let has_packet = args.get("context_packet").is_some();
+    if has_packet && !args["context_packet"].is_object() {
+        return Err(ToolError::InvalidArguments(
+            bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+        ));
+    }
+    if has_packet
+        && serde_json::to_vec(&args).map_or(true, |bytes| {
+            bytes.len() > bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES
+        })
+    {
+        return Err(ToolError::InvalidArguments(
+            bamboo_domain::ChildContextPacketError::Budget.to_string(),
+        ));
+    }
+    let parsed: PlanArgs = serde_json::from_value(args).map_err(|error| {
+        ToolError::InvalidArguments(if has_packet {
+            bamboo_domain::ChildContextPacketError::Invalid.to_string()
+        } else {
+            format!("Invalid Plan args: {error}")
+        })
+    })?;
+    if let Some(packet) = &parsed.context_packet {
+        packet
+            .validate()
+            .map_err(|error| ToolError::InvalidArguments(error.to_string()))?;
+        if parsed.fork_last_messages.unwrap_or_default() > 0 {
+            return Err(ToolError::InvalidArguments(
+                "required_child_context_unsupported: fresh one-shot only".into(),
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 fn plan_title(explicit: Option<String>, task: &str) -> String {
@@ -177,6 +228,7 @@ impl Tool for PlanTool {
         json!({
             "type": "object",
             "properties": {
+                "action": {"type":"string","enum":["create","read"],"description":"Defaults to create. read uses the exact versioned artifact reference returned on parent resume."},
                 "task": {
                     "type": "string",
                     "description": "Self-contained planning request, including scope, constraints, and expected decision or deliverable."
@@ -194,9 +246,32 @@ impl Tool for PlanTool {
                     "minimum": 0,
                     "maximum": MAX_CONTEXT_FORK_MESSAGES,
                     "description": "Optional bounded recent parent-context fork. Prefer a self-contained task; use this only when recent discussion is essential."
-                }
+                },
+                "context_packet": {
+                    "type": "object",
+                    "description": "Optional selected ContextPacket v1, validated against the current canonical parent by the Host. Cannot be combined with a transcript fork. Unsupported worker routes fail before Child creation; content grants no authority.",
+                    "properties": {
+                        "version": {"type": "integer", "enum": [1]},
+                        "objective": {"type": "string"},
+                        "constraints": {"type": "array", "items": {"type": "string"}},
+                        "acceptance": {"type": "array", "minItems": 1, "items": {"type": "string"}},
+                        "non_goals": {"type": "array", "items": {"type": "string"}},
+                        "necessary_user_instructions": {"type": "array", "items": {"type": "string"}},
+                        "recorded_decisions": {"type": "array", "items": {"type": "string"}},
+                        "source_user_message_ids": {"type": "array", "maxItems": 16, "items": {"type": "string"}},
+                        "background_message_ids": {"type": "array", "maxItems": 64, "items": {"type": "string"}}
+                    },
+                    "required": ["version", "objective", "constraints", "acceptance", "non_goals", "necessary_user_instructions", "recorded_decisions"],
+                    "additionalProperties": false
+                },
+                "child_session_id": {"type":"string"},
+                "expected_child_created_at": {"type":"string"},
+                "expected_assignment_sha256": {"type":"string"},
+                "revision": {"type":"string"},
+                "section_id": {"type":"string","description":"Omit to list bounded section IDs; supply one to read only that section."},
+                "offset": {"type":"integer","minimum":0},
+                "max_bytes": {"type":"integer","minimum":4,"maximum":4096}
             },
-            "required": ["task"],
             "additionalProperties": false
         })
     }
@@ -209,8 +284,31 @@ impl Tool for PlanTool {
         let parent_session_id = ctx.session_id().ok_or_else(|| {
             ToolError::Execution("Plan requires a session_id in tool context".to_string())
         })?;
-        let parsed: PlanArgs = serde_json::from_value(args)
-            .map_err(|error| ToolError::InvalidArguments(format!("Invalid Plan args: {error}")))?;
+        if args.get("action").and_then(|v| v.as_str()) == Some("read") {
+            let args: planner_artifact::ReadArgs = serde_json::from_value(args)
+                .map_err(|e| ToolError::InvalidArguments(e.to_string()))?;
+            let home = self.artifact_home.as_ref().ok_or_else(|| {
+                ToolError::Execution(
+                    "versioned planner artifacts are unavailable in this runtime".into(),
+                )
+            })?;
+            let value =
+                planner_artifact::read(self.sessions.as_ref(), home, parent_session_id, args)
+                    .await
+                    .map_err(child_error)?;
+            return Ok(ToolOutcome::Completed(
+                bamboo_agent_core::tools::ToolResult::text(true, value.to_string()),
+            ));
+        }
+        if args.get("action").is_some_and(|v| v != "create") {
+            return Err(ToolError::InvalidArguments("unknown Plan action".into()));
+        }
+        let parsed = parse_plan_args(args)?;
+        if parsed.context_packet.is_some() && !cfg!(unix) {
+            return Err(ToolError::Execution(
+                "required_child_context_unsupported: versioned Plan publication requires the nofollow directory-FD route".into(),
+            ));
+        }
         let task = normalize_task(parsed.task)?;
         if !bamboo_agent_core::tools::suspension_allowed() {
             return Err(ToolError::Execution(
@@ -251,8 +349,24 @@ impl Tool for PlanTool {
         let reasoning_effort = model_ref_override
             .as_ref()
             .and_then(|model_ref| model_ref.reasoning_effort);
-        let runtime_metadata =
+        let mut runtime_metadata =
             require_actor_runtime(self.resolver.resolve_runtime_metadata(PLANNER_ROLE).await)?;
+        if let Some(packet) = &parsed.context_packet {
+            // The canonical creator reloads the durable parent, resolves only
+            // its selected sources, and validates route support before saving.
+            runtime_metadata.insert(
+                bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+                serde_json::to_string(packet).map_err(|_| {
+                    ToolError::InvalidArguments(
+                        bamboo_domain::ChildContextPacketError::Invalid.to_string(),
+                    )
+                })?,
+            );
+            runtime_metadata.insert(
+                planner_artifact::CONTRACT_KEY.into(),
+                planner_artifact::CONTRACT_VERSION.into(),
+            );
+        }
         let child_id = Uuid::new_v4().to_string();
         let result = child_session::create_child_action(
             self.sessions.as_ref(),
@@ -261,7 +375,15 @@ impl Tool for PlanTool {
                 child_id: child_id.clone(),
                 title: title.clone(),
                 responsibility: PLANNER_RESPONSIBILITY.to_string(),
-                assignment_prompt: planner_assignment(&task),
+                assignment_prompt: if parsed.context_packet.is_some() {
+                    format!(
+                        "{}\n{}",
+                        planner_assignment(&task),
+                        planner_artifact::REPORT_INSTRUCTION
+                    )
+                } else {
+                    planner_assignment(&task)
+                },
                 subagent_type: PLANNER_ROLE.to_string(),
                 workspace,
                 workspace_source,
@@ -339,7 +461,7 @@ mod tests {
     use super::*;
     use bamboo_agent_core::tools::ToolExecutionContext;
     use bamboo_domain::session::runtime_state::ChildWaitPolicy;
-    use bamboo_domain::Session;
+    use bamboo_domain::{Message, Session};
     use bamboo_engine::session_app::child_session::{
         ChildRunnerInfo, ChildSessionEntry, DeleteChildResult,
     };
@@ -352,6 +474,7 @@ mod tests {
         calls: Mutex<Vec<&'static str>>,
         wait_armed: AtomicBool,
         fail_enqueue: bool,
+        required_context_supported: bool,
     }
 
     impl RecordingPlanPort {
@@ -364,6 +487,7 @@ mod tests {
                 calls: Mutex::new(Vec::new()),
                 wait_armed: AtomicBool::new(false),
                 fail_enqueue,
+                required_context_supported: true,
             }
         }
 
@@ -398,6 +522,26 @@ mod tests {
         async fn load_root_session(&self, _root_id: &str) -> Result<Session, ChildSessionError> {
             self.record("load_parent");
             Ok(self.parent.clone())
+        }
+
+        async fn validate_required_child_context_route(
+            &self,
+            metadata: &HashMap<String, String>,
+            role: &str,
+        ) -> Result<(), ChildSessionError> {
+            // Component port only: the production adapter delegates this
+            // decision to the real scheduler/worker capability check.
+            self.record("validate_required_context_route");
+            if self.required_context_supported
+                && role == PLANNER_ROLE
+                && metadata.get("external.protocol").map(String::as_str) == Some("actor")
+            {
+                Ok(())
+            } else {
+                Err(ChildSessionError::Execution(
+                    "required_child_context_unsupported: fixture worker".into(),
+                ))
+            }
         }
 
         async fn load_child_for_parent(
@@ -577,6 +721,177 @@ mod tests {
             plan_test_ctx(),
         )
         .await
+    }
+
+    fn selected_packet() -> serde_json::Value {
+        json!({
+            "version": 1,
+            "objective": "Return a bounded migration plan.",
+            "constraints": ["Observe only; do not execute the plan."],
+            "acceptance": ["Return evidence and open decisions."],
+            "non_goals": ["Implementation and approval"],
+            "necessary_user_instructions": [],
+            "recorded_decisions": [],
+            "source_user_message_ids": ["selected-user"],
+            "background_message_ids": []
+        })
+    }
+
+    fn selected_plan_port(workspace: &str) -> RecordingPlanPort {
+        let mut port = RecordingPlanPort::new(workspace, false);
+        let mut selected = Message::user("SELECTED_INPUT: preserve the migration constraints.");
+        selected.id = "selected-user".into();
+        port.parent.add_message(selected);
+        let mut excluded = Message::assistant("UNSELECTED_INPUT: unrelated background", None);
+        excluded.id = "unselected-assistant".into();
+        port.parent.add_message(excluded);
+        port
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selected_context_uses_canonical_child_binding_without_changing_parent_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        for mode in [
+            bamboo_domain::SessionPermissionMode::Default,
+            bamboo_domain::SessionPermissionMode::Auto,
+            bamboo_domain::SessionPermissionMode::Bypass,
+        ] {
+            let mut port = selected_plan_port(&dir.path().to_string_lossy());
+            port.parent
+                .agent_runtime_state
+                .get_or_insert_with(Default::default)
+                .set_permission_mode(mode);
+            let parent_before = serde_json::to_value(&port.parent).unwrap();
+            let port = Arc::new(port);
+            let outcome = PlanTool::new(port.clone(), Arc::new(ActorPlannerResolver))
+                .invoke(
+                    json!({"task":"Inspect the migration.", "context_packet":selected_packet()}),
+                    plan_test_ctx(),
+                )
+                .await
+                .expect("the declared component worker supports required packets");
+            assert!(matches!(outcome, ToolOutcome::Completed(_)));
+            assert_eq!(serde_json::to_value(&port.parent).unwrap(), parent_before);
+            let child = port.child.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                child.parent_session_id.as_deref(),
+                Some(port.parent.id.as_str())
+            );
+            assert_eq!(child.subagent_type().as_deref(), Some(PLANNER_ROLE));
+            assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
+            assert!(child
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .plan_mode
+                .is_none());
+            assert_eq!(
+                bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
+                    .unwrap()
+                    .resolution
+                    .effective,
+                bamboo_domain::PermissionMode::Plan
+            );
+            let binding = bamboo_domain::ChildContextBinding::from_session(&child)
+                .unwrap()
+                .expect("the ordinary creator persisted a valid binding");
+            assert_eq!(binding.payload.parent_session_id, port.parent.id);
+            assert_eq!(binding.payload.parent_created_at, port.parent.created_at);
+            assert_eq!(binding.payload.sources.len(), 1);
+            assert_eq!(binding.payload.sources[0].message_id, "selected-user");
+            assert!(binding
+                .payload
+                .required_assignment
+                .contains("SELECTED_INPUT"));
+            assert!(!binding
+                .payload
+                .required_assignment
+                .contains("UNSELECTED_INPUT"));
+            let calls = port.calls();
+            let position = |name| calls.iter().position(|call| *call == name).unwrap();
+            assert!(position("validate_required_context_route") < position("save_child"));
+            assert!(position("register_wait") < position("enqueue_child"));
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_selected_context_never_saves_a_child_or_arms_a_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = json!({"task":"Inspect only.", "context_packet":selected_packet()});
+        let mut cases = Vec::new();
+        for source in ["foreign-user", "unselected-assistant"] {
+            let mut args = base.clone();
+            args["context_packet"]["source_user_message_ids"] = json!([source]);
+            cases.push(("invalid source", args));
+        }
+        let mut null = base.clone();
+        null["context_packet"] = serde_json::Value::Null;
+        cases.push(("null", null));
+        let mut unknown = base.clone();
+        unknown["context_packet"]["approved"] = json!(true);
+        cases.push(("invented authority", unknown));
+        let mut version = base.clone();
+        version["context_packet"]["version"] = json!(99);
+        cases.push(("unsupported version", version));
+        let mut fork = base.clone();
+        fork["fork_last_messages"] = json!(1);
+        cases.push(("implicit transcript fork", fork));
+        let mut oversized = base;
+        oversized["context_packet"]["constraints"] =
+            json!(["x".repeat(bamboo_domain::MAX_CHILD_PACKET_INPUT_BYTES)]);
+        cases.push(("byte budget", oversized));
+        for (label, args) in cases {
+            let port = Arc::new(selected_plan_port(&dir.path().to_string_lossy()));
+            let before = serde_json::to_value(&port.parent).unwrap();
+            assert!(
+                PlanTool::new(port.clone(), Arc::new(ActorPlannerResolver))
+                    .invoke(args, plan_test_ctx())
+                    .await
+                    .is_err(),
+                "{label}"
+            );
+            assert!(port.child.lock().unwrap().is_none(), "{label}");
+            assert!(!port.wait_armed.load(Ordering::SeqCst), "{label}");
+            assert!(
+                !port
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(*call, "save_child" | "register_wait" | "enqueue_child")),
+                "{label}"
+            );
+            assert_eq!(
+                serde_json::to_value(&port.parent).unwrap(),
+                before,
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unsupported_selected_context_route_fails_before_persist_without_legacy_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut port = selected_plan_port(&dir.path().to_string_lossy());
+        port.required_context_supported = false;
+        let port = Arc::new(port);
+        let error = PlanTool::new(port.clone(), Arc::new(ActorPlannerResolver))
+            .invoke(
+                json!({"task":"Inspect only.", "context_packet":selected_packet()}),
+                plan_test_ctx(),
+            )
+            .await
+            .expect_err("a compatible planner role alone cannot attest packet support");
+        assert!(error
+            .to_string()
+            .contains("required_child_context_unsupported"));
+        assert!(port.child.lock().unwrap().is_none());
+        assert!(!port.wait_armed.load(Ordering::SeqCst));
+        assert_eq!(
+            port.calls().contains(&"validate_required_context_route"),
+            cfg!(unix),
+            "unsupported platforms reject before querying the worker route"
+        );
+        assert!(!port.calls().contains(&"save_child"));
     }
 
     #[test]

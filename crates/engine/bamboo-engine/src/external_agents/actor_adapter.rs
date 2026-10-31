@@ -7049,7 +7049,17 @@ async fn invoke_active_subagent(
     use bamboo_agent_core::tools::{ToolCtx, ToolOutcome};
     let mut ctx = ToolCtx::none(tool_call_id.to_owned());
     ctx.session_id = Some(Arc::from(caller.id.as_str()));
-    match tool.invoke(args, ctx).await {
+    let output_cap = caller
+        .effective_token_budget()
+        .map(|budget| budget.max_tool_output_tokens);
+    let outcome = bamboo_agent_core::tools::scope_tool_output_cap(
+        &caller.id,
+        tool_call_id,
+        output_cap,
+        tool.invoke(args, ctx),
+    )
+    .await;
+    match outcome {
         Ok(ToolOutcome::Completed(result))
             if result.images.is_empty()
                 && serde_json::to_vec(&result).is_ok_and(|bytes| bytes.len() <= 16 * 1024) =>
@@ -7148,6 +7158,12 @@ async fn ensure_active_nested_wait(
     creation: &bamboo_subagent::proto::ChildCreationIdentity,
     plain_input: Option<&PlainActorActivation>,
 ) -> Result<bool, AgentError> {
+    fn is_terminal_status(status: &str) -> bool {
+        matches!(
+            status,
+            "completed" | "error" | "timeout" | "cancelled" | "skipped"
+        )
+    }
     use bamboo_agent_core::storage::Storage;
     use bamboo_agent_core::tools::{ToolCtx, ToolOutcome};
 
@@ -7172,21 +7188,23 @@ async fn ensure_active_nested_wait(
         return Ok(true);
     }
 
-    let active = store
+    let statuses = store
         .list_child_run_statuses(child_id)
         .await
-        .map_err(|error| AgentError::LLM(format!("nested child status scan failed: {error}")))?
-        .into_iter()
-        .filter(|(_, status)| {
-            !status.as_deref().is_some_and(|status| {
-                matches!(
-                    status,
-                    "completed" | "error" | "timeout" | "cancelled" | "skipped"
-                )
-            })
-        })
-        .map(|(id, _)| id)
-        .collect::<Vec<_>>();
+        .map_err(|error| AgentError::LLM(format!("nested child status scan failed: {error}")))?;
+    let mut active = Vec::new();
+    for (id, status) in statuses {
+        if !status.as_deref().is_some_and(is_terminal_status)
+            && !store
+                .is_supervisor_observer_child(&caller, &id)
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!("nested Observer classification failed: {error}"))
+                })?
+        {
+            active.push(id);
+        }
+    }
     if active.is_empty() {
         return Ok(false);
     }
@@ -7238,21 +7256,26 @@ async fn ensure_active_nested_wait(
     {
         return Ok(true);
     }
-    let still_active = store
+    let statuses = store
         .list_child_run_statuses(child_id)
         .await
         .map_err(|error| {
             AgentError::LLM(format!("nested child wait verification failed: {error}"))
-        })?
-        .into_iter()
-        .any(|(_, status)| {
-            !status.as_deref().is_some_and(|status| {
-                matches!(
-                    status,
-                    "completed" | "error" | "timeout" | "cancelled" | "skipped"
-                )
-            })
-        });
+        })?;
+    let mut still_active = false;
+    for (id, status) in statuses {
+        if !status.as_deref().is_some_and(is_terminal_status)
+            && !store
+                .is_supervisor_observer_child(&latest, &id)
+                .await
+                .map_err(|error| {
+                    AgentError::LLM(format!("nested Observer classification failed: {error}"))
+                })?
+        {
+            still_active = true;
+            break;
+        }
+    }
     if still_active {
         return Err(AgentError::LLM(
             "nested child remains active without a durable parent wait".into(),
@@ -9197,6 +9220,62 @@ mod tests {
     include!("expired_plain_owner_tests.rs");
 
     include!("owned_cold_input_tests.rs");
+
+    struct SubAgentCapProbe;
+
+    #[async_trait]
+    impl bamboo_agent_core::tools::Tool for SubAgentCapProbe {
+        fn name(&self) -> &str {
+            "SubAgent"
+        }
+
+        fn description(&self) -> &str {
+            "Capture the Host's output-cap observation"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn invoke(
+            &self,
+            _args: serde_json::Value,
+            ctx: bamboo_agent_core::tools::ToolCtx,
+        ) -> Result<bamboo_agent_core::tools::ToolOutcome, bamboo_agent_core::tools::ToolError>
+        {
+            let cap = bamboo_agent_core::tools::observed_tool_output_cap(&ctx);
+            Ok(bamboo_agent_core::tools::ToolOutcome::Completed(
+                bamboo_agent_core::tools::ToolResult::text(
+                    true,
+                    serde_json::json!(cap).to_string(),
+                ),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn host_subagent_dispatch_scopes_the_callers_current_output_cap() {
+        for cap in [None, Some(0), Some(512)] {
+            let mut caller = Session::new_child("cap-child", "cap-parent", "model", "Child");
+            caller.token_budget = cap.map(|max_tool_output_tokens| bamboo_domain::TokenBudget {
+                max_tool_output_tokens,
+                ..Default::default()
+            });
+            let response = invoke_active_subagent(
+                &SubAgentCapProbe,
+                &caller,
+                serde_json::json!({}),
+                "cap-call",
+            )
+            .await;
+            let result: bamboo_agent_core::tools::ToolResult =
+                serde_json::from_value(response["result"].clone()).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Option<u32>>(&result.result).unwrap(),
+                cap
+            );
+        }
+    }
 
     #[test]
     fn plain_rejection_logs_branch_and_run_without_changing_error() {
@@ -12922,7 +13001,12 @@ mod tests {
                 })
                 .await
                 .unwrap();
-            drop(registration);
+            // Drop schedules cleanup; the retry needs the old owner released first.
+            registration.abandon().await;
+            assert!(
+                !binding.router.owns_run(&child.id, "first-run").await,
+                "{case}: abandoned first run must release its owner before retry"
+            );
             let envelope = bamboo_domain::SessionMessageEnvelope::user_input(
                 &child.id,
                 if case == "oversize" {
@@ -13686,7 +13770,7 @@ mod tests {
                 arguments: r#"{"pattern":"marker.txt"}"#.into(),
             },
         };
-        let messages = vec![
+        let messages = [
             bamboo_agent_core::Message::assistant("", Some(vec![call])),
             bamboo_agent_core::Message::tool_result("glob", "marker.txt"),
             bamboo_agent_core::Message::assistant("done", None),
@@ -18476,8 +18560,7 @@ mod tests {
         let error = runner
             .execute_external_child(&mut session, &job, event_tx, CancellationToken::new())
             .await
-            .err()
-            .expect("direct remote transport must fail closed");
+            .expect_err("direct remote transport must fail closed");
         assert!(error
             .to_string()
             .contains("remote_broker_activation_unavailable"));

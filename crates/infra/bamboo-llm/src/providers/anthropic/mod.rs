@@ -15,11 +15,10 @@ pub use stream::{
 };
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::{Arc, Mutex};
 
 use crate::providers::common::log_identity;
 use async_trait::async_trait;
-use bamboo_domain::bounded_dedup::{BoundedFingerprintSet, DEFAULT_BOUNDED_FINGERPRINT_CAPACITY};
 use bamboo_domain::{
     resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
     ClassifiedToolIdentity, ToolSchema,
@@ -56,9 +55,6 @@ fn anthropic_auth_error(status: reqwest::StatusCode, body: String) -> LLMError {
         status.as_u16()
     ))
 }
-
-static STATIC_WARNINGS: LazyLock<BoundedFingerprintSet> =
-    LazyLock::new(|| BoundedFingerprintSet::new(DEFAULT_BOUNDED_FINGERPRINT_CAPACITY));
 
 const ANTHROPIC_TOOL_SEARCH_TYPE: &str = "tool_search_tool_regex_20251119";
 const ANTHROPIC_TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
@@ -106,53 +102,8 @@ fn supports_anthropic_tool_search(model: &str) -> bool {
     })
 }
 
-pub(crate) fn reasoning_effort_for_required_tool(
-    configured: Option<ReasoningEffort>,
-    required_tool: Option<&str>,
-) -> Option<ReasoningEffort> {
-    if required_tool.is_some() {
-        None
-    } else {
-        configured
-    }
-}
-
-/// Return the reasoning effort that will still need a numeric thinking budget
-/// after Anthropic's request-scoped compatibility downgrades run.
-///
-/// Keep the original effort for the request builder so it can emit the existing
-/// #520 warning and apply its full history conversion. This helper is only for
-/// deciding whether an impossible Max budget should reject the request before
-/// that builder runs.
-pub(crate) fn reasoning_effort_for_budget_validation(
-    reasoning_effort: Option<ReasoningEffort>,
-    messages: &[Message],
-    thinking_replay_always: bool,
-    native_groups: &[ProviderTranscriptGroup],
-) -> Option<ReasoningEffort> {
-    if reasoning_effort.is_some()
-        && !thinking_replay_always
-        && must_downgrade_thinking_for_unsigned_tool_turn(
-            messages,
-            native_groups,
-            thinking_replay_always,
-        )
-    {
-        None
-    } else {
-        reasoning_effort
-    }
-}
-
 pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option<&str>) {
     if let Some(name) = required_tool {
-        // Anthropic-compatible reasoning models (including DeepSeek through an
-        // Anthropic endpoint) reject forced named-tool choice while thinking is
-        // enabled. This is a request-scoped activation turn, so remove thinking
-        // after all request overrides and restore normal behavior next round.
-        if let Some(object) = body.as_object_mut() {
-            object.remove("thinking");
-        }
         body["tool_choice"] = json!({
             "type": "tool",
             "name": name,
@@ -161,34 +112,13 @@ pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option
     }
 }
 
-pub(crate) fn apply_required_tool_auto_fallback(body: &mut Value, required_tool: Option<&str>) {
-    if required_tool.is_some() {
-        if let Some(object) = body.as_object_mut() {
-            object.remove("thinking");
-        }
-        body["tool_choice"] = json!({
-            "type": "auto",
-            "disable_parallel_tool_use": true
-        });
-    }
-}
-
-pub(crate) fn looks_like_thinking_forced_tool_choice_error(
-    status: reqwest::StatusCode,
-    body: &str,
-) -> bool {
-    status == reqwest::StatusCode::BAD_REQUEST
-        && body
-            .to_ascii_lowercase()
-            .contains("thinking mode does not support this tool_choice")
-}
-
 /// Anthropic Messages API provider.
 pub struct AnthropicProvider {
     client: Client,
     api_key: String,
     base_url: String,
     max_tokens: u32,
+    max_tokens_configured: bool,
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
@@ -219,6 +149,7 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,
+            max_tokens_configured: false,
             default_reasoning_effort: None,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
@@ -246,6 +177,7 @@ impl AnthropicProvider {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self.max_tokens_configured = true;
         self
     }
 
@@ -289,12 +221,6 @@ impl AnthropicProvider {
         );
 
         Ok(headers)
-    }
-
-    fn looks_like_reasoning_unsupported_error(status: reqwest::StatusCode, body: &str) -> bool {
-        // Shared, tightened heuristic (#237 finding 5). `budget_tokens` (Anthropic's
-        // thinking-budget param) is in the shared reasoning-token set.
-        crate::providers::common::looks_like_reasoning_unsupported_error(status, body)
     }
 }
 
@@ -467,35 +393,28 @@ impl AnthropicProvider {
         capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
-        let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
+        // Anthropic's wire protocol requires max_tokens even when the caller
+        // does not set a limit. Use the existing Bodhi proxy default for an
+        // unconfigured Vision request; preserve explicit provider settings.
+        let vision_request =
+            options.and_then(|o| o.request_purpose.as_deref()) == Some("vision_description");
+        let max_tokens =
+            max_output_tokens.unwrap_or(if vision_request && !self.max_tokens_configured {
+                16_384
+            } else {
+                self.max_tokens
+            });
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
-        let configured_reasoning_effort = options
+        let reasoning_effort = options
             .and_then(|o| o.reasoning_effort)
             .or(self.default_reasoning_effort);
-        let reasoning_effort =
-            reasoning_effort_for_required_tool(configured_reasoning_effort, required_tool);
-        let budget_reasoning_effort = reasoning_effort_for_budget_validation(
-            reasoning_effort,
-            messages,
-            self.thinking_replay_always,
-            native_groups,
-        );
-        crate::providers::common::validate_max_thinking_budget(
-            budget_reasoning_effort,
-            Some(max_tokens),
-        )?;
-        let request_reasoning_effort = reasoning_effort_for_required_tool(
-            options.and_then(|o| o.reasoning_effort),
-            required_tool,
-        );
+        let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let cache_plan = options.and_then(|o| o.cache.as_ref());
         let extended_cache_ttl = cache_plan
             .map(|plan| plan.ttl == CacheTtl::Extended)
             .unwrap_or(false);
-        let reasoning_source = if required_tool.is_some() {
-            "required_tool_disabled"
-        } else if request_reasoning_effort.is_some() {
+        let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
             "provider_default"
@@ -529,6 +448,11 @@ impl AnthropicProvider {
             native_groups,
             capability_loading_mode,
         );
+        request_overrides::validate_budgeted_overrides(
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            Some(model),
+        )?;
         request_overrides::apply_overrides_to_body(
             &mut body,
             self.request_overrides.as_ref(),
@@ -571,9 +495,12 @@ impl AnthropicProvider {
             image_blocks_on_wire,
             log_identity(model)
         );
-        let mut applied_reasoning_effort = reasoning_effort;
-        let mut thinking_enabled = body.get("thinking").is_some();
-        let mut thinking_budget_tokens = body
+        let applied_reasoning_effort = reasoning_effort;
+        let thinking_enabled = body
+            .pointer("/thinking/type")
+            .and_then(Value::as_str)
+            .is_some_and(|mode| mode != "disabled");
+        let thinking_budget_tokens = body
             .get("thinking")
             .and_then(|thinking| thinking.get("budget_tokens"))
             .and_then(|value| value.as_u64());
@@ -609,7 +536,7 @@ impl AnthropicProvider {
         let request_budget = crate::retry::InitialRequestBudget::new(crate::retry::global())
             .with_session_id(options.and_then(|o| o.session_id.as_deref()));
         let messages_url = format!("{}/messages", self.base_url);
-        let mut response = crate::retry::send_anthropic_with_retry(
+        let response = crate::retry::send_anthropic_with_retry(
             crate::retry::global(),
             &request_budget,
             || {
@@ -625,151 +552,26 @@ impl AnthropicProvider {
             let status = response.status();
             let text = response.text().await.map_err(LLMError::Http)?;
 
-            if required_tool.is_some()
-                && looks_like_thinking_forced_tool_choice_error(status, &text)
-            {
-                tracing::warn!(
-                    "[session_hash={}] Anthropic model_hash {} rejected forced named tool_choice in thinking mode; retrying activation with tool_choice=auto and parallel tool use disabled",
-                    log_identity(session_log_id),
-                    log_identity(model)
-                );
-                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
-                    messages,
-                    system_blocks,
-                    tools,
-                    model,
-                    max_tokens,
-                    true,
-                    None,
-                    Some(false),
-                    cache_plan,
-                    false,
-                    native_groups,
-                    capability_loading_mode,
-                );
-                request_overrides::apply_overrides_to_body(
-                    &mut fallback_body,
-                    self.request_overrides.as_ref(),
-                    request_overrides::ENDPOINT_MESSAGES,
-                    Some(model),
-                );
-                apply_required_tool_auto_fallback(&mut fallback_body, required_tool);
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                response = crate::retry::send_anthropic_with_retry(
-                    crate::retry::global(),
-                    &request_budget,
-                    || {
-                        self.client
-                            .post(&messages_url)
-                            .headers(headers.clone())
-                            .json(&fallback_body)
-                    },
-                )
-                .await?;
-
-                if !response.status().is_success() {
-                    let fallback_status = response.status();
-                    let fallback_text = response.text().await.map_err(LLMError::Http)?;
-                    if fallback_status == 401 || fallback_status == 403 {
-                        return Err(anthropic_auth_error(fallback_status, fallback_text));
-                    }
-                    return Err(LLMError::Api(format!(
-                        "Anthropic API error after tool_choice=auto activation fallback: HTTP {}: {}",
-                        fallback_status, fallback_text
-                    )));
-                }
-            } else if reasoning_effort.is_some()
-                && Self::looks_like_reasoning_unsupported_error(status, &text)
-            {
-                tracing::warn!(
-                    "Anthropic /messages rejected reasoning for model_hash {}; retrying without reasoning_effort",
-                    log_identity(model)
-                );
-
-                let mut fallback_body = build_anthropic_request_with_cache_blocks_native_mode(
-                    messages,
-                    system_blocks,
-                    tools,
-                    model,
-                    max_tokens,
-                    true,
-                    None,
-                    parallel_tool_calls,
-                    cache_plan,
-                    self.thinking_replay_always,
-                    native_groups,
-                    capability_loading_mode,
-                );
-                request_overrides::apply_overrides_to_body(
-                    &mut fallback_body,
-                    self.request_overrides.as_ref(),
-                    request_overrides::ENDPOINT_MESSAGES,
-                    Some(model),
-                );
-                apply_required_tool_choice(&mut fallback_body, required_tool);
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
-                applied_reasoning_effort = None;
-                thinking_enabled = false;
-                thinking_budget_tokens = None;
-                tracing::info!(
-                    "[session_hash={}] Anthropic request retry model_hash={} reasoning_effort=none reasoning_source={} request_reasoning_enabled=false thinking_enabled=false thinking_budget_tokens=none max_tokens={} purpose_hash={}",
-                    log_identity(session_log_id),
-                    log_identity(model),
-                    reasoning_source,
-                    max_tokens,
-                    log_identity(request_purpose)
-                );
-                response = crate::retry::send_anthropic_with_retry(
-                    crate::retry::global(),
-                    &request_budget,
-                    || {
-                        self.client
-                            .post(&messages_url)
-                            .headers(headers.clone())
-                            .json(&fallback_body)
-                    },
-                )
-                .await?;
-
-                if !response.status().is_success() {
-                    let status = response.status();
-                    let text = response.text().await.map_err(LLMError::Http)?;
-
-                    if status == 401 || status == 403 {
-                        return Err(anthropic_auth_error(status, text));
-                    }
-
-                    return Err(LLMError::Api(format!(
-                        "Anthropic API error: HTTP {}: {}",
-                        status, text
-                    )));
-                }
-            } else {
-                if status == 401 || status == 403 {
-                    return Err(anthropic_auth_error(status, text));
-                }
-
-                return Err(LLMError::Api(format!(
-                    "Anthropic API error: HTTP {}: {}",
-                    status, text
-                )));
+            if status == 401 || status == 403 {
+                return Err(anthropic_auth_error(status, text));
             }
+            return Err(LLMError::Api(format!(
+                "Anthropic API error: HTTP {}: {}",
+                status, text
+            )));
         }
 
-        // Use shared SSE adapter with Anthropic-specific parser
-        let mut state = AnthropicStreamState {
+        let state = Arc::new(Mutex::new(AnthropicStreamState {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
             request_thinking_budget_tokens: thinking_budget_tokens,
+            completion_diagnostics: crate::provider::current_completion_diagnostics(),
             ..Default::default()
-        };
-
-        let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+        }));
+        Ok(anthropic_stream_with_usage_on_error(
             response.into_response(),
-            move |event, data| parse_anthropic_sse_event_multi(&mut state, event, data),
-        );
-
-        Ok(stream)
+            state,
+        ))
     }
 }
 
@@ -939,44 +741,10 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     let plan = cache.unwrap_or(&default_plan);
     let ttl = plan.ttl;
 
-    // Whether the CURRENT request enables extended thinking — a `thinking`
-    // block can never be replayed when it's disabled (Anthropic rejects it in
-    // that case too, issue #520).
-    let requested_thinking = anthropic_thinking_from_effort(reasoning_effort, max_tokens);
-    // Thinking-downgrade guard (#520): real Anthropic requires the final
-    // assistant turn whose tool_results this request submits to START with its
-    // original SIGNED thinking block whenever thinking is enabled. After a
-    // mid-session model switch (or a session recorded before signature capture
-    // existed) no such block can ever be produced, so the only way to submit
-    // the tool results without a 400 ("Expected `thinking` or
-    // `redacted_thinking`...") is to disable thinking for this request. An
-    // upstream on `thinking_replay_always` (GLM-style) replays the unsigned
-    // block instead, which satisfies its presence requirement.
-    let thinking_downgraded = requested_thinking.is_some()
-        && !thinking_replay_always
-        && must_downgrade_thinking_for_unsigned_tool_turn(
-            messages,
-            native_groups,
-            thinking_replay_always,
-        );
-    if thinking_downgraded {
-        let key = ("unsigned-tool-turn-thinking-downgrade", model);
-        let error = "final assistant tool_use turn lacks a signed thinking block";
-        if STATIC_WARNINGS.insert_if_new(&key, error) {
-            tracing::warn!(
-                "Anthropic request: disabling extended thinking for this request — the final \
-                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
-                 minted by another provider before a mid-session model switch, #520)"
-            );
-        } else {
-            tracing::debug!(
-                "Anthropic request: disabling extended thinking for this request — the final \
-                 assistant tool_use turn has no signed thinking block to replay (e.g. it was \
-                 minted by another provider before a mid-session model switch, #520)"
-            );
-        }
-    }
-    let thinking_enabled = requested_thinking.is_some() && !thinking_downgraded;
+    // Effort is transmitted independently of thinking-history replay. Keep
+    // signed block validation in the existing history/native transcript owners.
+    let thinking_enabled =
+        reasoning_effort.is_some_and(|effort| effort != ReasoningEffort::Disabled);
 
     let (mut system, mut anthropic_messages, source_spans) = messages_to_anthropic_json(
         messages,
@@ -1063,10 +831,13 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
         body["system"] = system;
     }
 
-    if thinking_enabled {
-        if let Some(thinking) = requested_thinking {
-            body["thinking"] = thinking;
-        }
+    if let Some(effort) = reasoning_effort {
+        // Effort controls depth, not activation. Enable the protocol's adaptive
+        // mode without deriving a budget or changing the selected effort.
+        body["output_config"] = json!({"effort": effort.as_str()});
+        body["thinking"] = json!({
+            "type": if effort == ReasoningEffort::Disabled { "disabled" } else { "adaptive" }
+        });
     }
 
     if !tools.is_empty() {
@@ -1267,128 +1038,6 @@ fn add_cache_control_to_block(message: &mut Value, block_idx: usize, ttl: CacheT
     if let Some(block) = target.and_then(Value::as_object_mut) {
         block.insert("cache_control".to_string(), cache_control_value(ttl));
     }
-}
-
-/// Whether enabling extended thinking on this request would be rejected by
-/// real Anthropic because the final assistant turn — the one whose
-/// tool_results this request submits — contains `tool_use` but no replayable
-/// SIGNED thinking block. Anthropic requires that turn to start with its
-/// original signed thinking block whenever thinking is enabled; when it was
-/// minted by another provider (mid-session model switch) or recorded before
-/// signature capture existed, no valid block can be produced, so the request
-/// must run with thinking disabled instead of 400ing (#520).
-///
-/// Turns whose reasoning text exists but whose signature was invalidated
-/// (multi-block / redacted thinking) downgrade too: a partial replay would
-/// fail verification.
-fn must_downgrade_thinking_for_unsigned_tool_turn(
-    messages: &[Message],
-    native_groups: &[ProviderTranscriptGroup],
-    thinking_replay_always: bool,
-) -> bool {
-    let Some(last_assistant_idx) = messages
-        .iter()
-        .rposition(|message| matches!(message.role, Role::Assistant))
-    else {
-        return false;
-    };
-    let last_assistant = &messages[last_assistant_idx];
-    let has_tool_use = last_assistant
-        .tool_calls
-        .as_ref()
-        .is_some_and(|calls| !calls.is_empty());
-    if !has_tool_use {
-        return false;
-    }
-    // The constraint only bites when this request actually submits the
-    // tool_results for that turn (the conversation continues past it with
-    // `Role::Tool` messages).
-    let submits_tool_results = messages[last_assistant_idx + 1..]
-        .iter()
-        .any(|message| matches!(message.role, Role::Tool));
-    if !submits_tool_results {
-        return false;
-    }
-    let anchor_is_leading =
-        native_thinking_anchor_is_leading(messages, &last_assistant.id, thinking_replay_always);
-    let has_signed_thinking = anchor_is_leading
-        && last_assistant
-            .reasoning
-            .as_deref()
-            .is_some_and(|reasoning| !reasoning.is_empty())
-        && last_assistant
-            .reasoning_signature
-            .as_deref()
-            .is_some_and(|signature| !signature.is_empty());
-    let has_native_thinking =
-        has_replayable_native_thinking_prefix(&last_assistant.id, native_groups)
-            && anchor_is_leading;
-    !has_signed_thinking && !has_native_thinking
-}
-
-fn native_thinking_anchor_is_leading(
-    messages: &[Message],
-    anchor_message_id: &str,
-    thinking_replay_always: bool,
-) -> bool {
-    let (_, _, source_spans) =
-        messages_to_anthropic_json(messages, &[], true, thinking_replay_always);
-    source_spans.iter().any(|spans| {
-        spans.iter().enumerate().any(|(span_index, span)| {
-            span.id == anchor_message_id && span.is_assistant && span_index == 0
-        })
-    })
-}
-
-fn has_replayable_native_thinking_prefix(
-    anchor_message_id: &str,
-    native_groups: &[ProviderTranscriptGroup],
-) -> bool {
-    let mut groups = native_groups
-        .iter()
-        .filter(|group| {
-            group.family() == ProviderFamily::Anthropic
-                && group.protocol() == ProviderProtocol::AnthropicMessages2023_06_01
-                && group.anchor_message_id() == anchor_message_id
-        })
-        .collect::<Vec<_>>();
-    groups.sort_by_key(|group| group.sequence());
-    let items = groups
-        .into_iter()
-        .flat_map(|group| group.items().iter().cloned())
-        .collect::<Vec<_>>();
-    ProviderTranscriptGroup::validate_items(&items).is_ok()
-        && matches!(
-            items
-                .first()
-                .and_then(|item| item.payload().get("type"))
-                .and_then(Value::as_str),
-            Some("thinking" | "redacted_thinking")
-        )
-        && items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.payload().get("type").and_then(Value::as_str),
-                    Some("thinking" | "redacted_thinking")
-                )
-            })
-            .count()
-            == 1
-}
-
-fn anthropic_thinking_from_effort(
-    reasoning_effort: Option<ReasoningEffort>,
-    max_tokens: u32,
-) -> Option<Value> {
-    let budget = reasoning_effort.and_then(|effort| {
-        crate::providers::common::bounded_thinking_budget(effort, Some(max_tokens))
-    })?;
-
-    Some(json!({
-        "type": "enabled",
-        "budget_tokens": budget,
-    }))
 }
 
 /// Render Bamboo's canonical structured system blocks into an Anthropic `system`
@@ -1627,8 +1276,8 @@ fn message_to_anthropic_json(
             // also 400s if a thinking block is sent while thinking is disabled
             // for the current request. Anthropic does not require prior-turn
             // thinking to continue a plain conversation, so the safe default
-            // is to omit it entirely (the final tool_use turn is handled by
-            // the thinking-downgrade guard in the request builder).
+            // is to omit unsigned material. The selected effort is unchanged;
+            // upstream history validation failures are returned to the caller.
             if thinking_enabled {
                 if let Some(reasoning) = &message.reasoning {
                     if !reasoning.is_empty() {
@@ -2015,6 +1664,7 @@ fn validated_anthropic_reference_definitions_in_order<'a>(
 /// Tracks tool_use blocks by index so we can emit partial ToolCall chunks with correct id/name.
 #[derive(Default)]
 pub struct AnthropicStreamState {
+    pub(crate) completion_diagnostics: Option<crate::provider::CompletionDiagnostics>,
     tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
     thinking_blocks_by_index: HashSet<usize>,
     thinking_blocks_started: usize,
@@ -2044,6 +1694,145 @@ pub struct AnthropicStreamState {
     native_open_indices: HashSet<usize>,
     native_capture_bytes: usize,
     native_capture_invalid: bool,
+    usage_snapshot: AnthropicUsageSnapshot,
+}
+
+/// Anthropic reports uncached input, cache read and cache creation as disjoint
+/// fields. Keep their presence until the terminal event; omitted is not zero.
+#[derive(Default)]
+struct AnthropicUsageSnapshot {
+    fresh_input: Option<u64>,
+    cache_creation: Option<u64>,
+    cache_read: Option<u64>,
+    output: Option<u64>,
+    reasoning: Option<u64>,
+    emitted: bool,
+}
+
+impl AnthropicUsageSnapshot {
+    fn observe(&mut self, event_type: &str, data: &str) {
+        if !matches!(event_type, "message_start" | "message_delta") {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(data) else {
+            return;
+        };
+        let usage = if event_type == "message_start" {
+            value
+                .get("message")
+                .and_then(|message| message.get("usage"))
+                .or_else(|| value.get("usage"))
+        } else {
+            value.get("usage")
+        };
+        let Some(usage) = usage.and_then(Value::as_object) else {
+            return;
+        };
+        fn update(field: &mut Option<u64>, usage: &serde_json::Map<String, Value>, key: &str) {
+            if let Some(value) = usage.get(key) {
+                *field = value.as_u64();
+            }
+        }
+        update(&mut self.fresh_input, usage, "input_tokens");
+        update(
+            &mut self.cache_creation,
+            usage,
+            "cache_creation_input_tokens",
+        );
+        update(&mut self.cache_read, usage, "cache_read_input_tokens");
+        // Output usage on message_start is an intermediate value; deltas are
+        // cumulative and the last observed delta is used at message_stop.
+        if event_type == "message_delta" {
+            update(&mut self.output, usage, "output_tokens");
+            if let Some(details) = usage.get("output_tokens_details") {
+                self.reasoning = details.get("thinking_tokens").and_then(Value::as_u64);
+            } else if let Some(value) = usage
+                .get("thinking_tokens")
+                .or_else(|| usage.get("reasoning_tokens"))
+            {
+                self.reasoning = value.as_u64();
+            }
+        }
+    }
+
+    fn take_terminal(&mut self) -> Option<LLMChunk> {
+        if std::mem::replace(&mut self.emitted, true) {
+            return None;
+        }
+        let input_tokens = self.fresh_input.and_then(|fresh| {
+            fresh
+                .checked_add(self.cache_creation?)?
+                .checked_add(self.cache_read?)
+        });
+        if input_tokens.is_none()
+            && self.output.is_none()
+            && self.reasoning.is_none()
+            && self.cache_creation.is_none()
+            && self.cache_read.is_none()
+        {
+            return None;
+        }
+        Some(LLMChunk::ProviderUsage {
+            input_tokens,
+            output_tokens: self.output,
+            total_tokens: None,
+            reasoning_tokens: self.reasoning,
+            cache_creation_input_tokens: self.cache_creation,
+            cache_read_input_tokens: self.cache_read,
+            cache_write_input_tokens: None,
+        })
+    }
+}
+
+fn anthropic_stream_with_usage_on_error(
+    response: reqwest::Response,
+    state: Arc<Mutex<AnthropicStreamState>>,
+) -> LLMStream {
+    let parser_state = Arc::clone(&state);
+    let stream =
+        crate::providers::common::sse::llm_stream_from_sse_multi(response, move |event, data| {
+            let mut state = parser_state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            parse_anthropic_sse_event_multi(&mut state, event, data)
+        });
+    usage_before_anthropic_stream_error(stream, state)
+}
+
+// Preserve the latest presence-aware snapshot before propagating an actual
+// stream error. Success remains terminal-only, so a later malformed field can
+// invalidate an earlier value without changing the shared chunk contract.
+fn usage_before_anthropic_stream_error(
+    upstream: LLMStream,
+    state: Arc<Mutex<AnthropicStreamState>>,
+) -> LLMStream {
+    use futures::StreamExt;
+
+    Box::pin(futures::stream::unfold(
+        (upstream, state, None),
+        |(mut upstream, state, pending_error)| async move {
+            if let Some(error) = pending_error {
+                return Some((Err(error), (upstream, state, None)));
+            }
+            match upstream.next().await {
+                Some(Err(error)) => {
+                    let snapshot = {
+                        let mut state = state
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        state.usage_snapshot.take_terminal()
+                    };
+                    if let Some(snapshot) = snapshot {
+                        Some((Ok(snapshot), (upstream, state, Some(error))))
+                    } else {
+                        Some((Err(error), (upstream, state, None)))
+                    }
+                }
+                Some(item) => Some((item, (upstream, state, None))),
+                None => None,
+            }
+        },
+    ))
 }
 
 impl AnthropicStreamState {
@@ -2500,12 +2289,16 @@ fn parse_anthropic_sse_event_multi(
     data: &str,
 ) -> Result<Vec<LLMChunk>> {
     capture_anthropic_native_event(state, event_type, data);
+    state.usage_snapshot.observe(event_type, data);
     let normalized = parse_anthropic_sse_event(state, event_type, data)?;
     let mut chunks = if event_type == "message_stop" {
         take_anthropic_provider_transcript_items(state)
     } else {
         Vec::new()
     };
+    if event_type == "message_stop" {
+        chunks.extend(state.usage_snapshot.take_terminal());
+    }
     chunks.extend(normalized);
     Ok(chunks)
 }
@@ -2566,6 +2359,9 @@ pub fn parse_anthropic_sse_event(
         }
         "message_delta" => {
             if !data.is_empty() {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.observe_sse(event_type, data);
+                }
                 match serde_json::from_str::<Value>(data) {
                     Ok(v) => {
                         if let Some(stop_reason) = v
@@ -2970,6 +2766,7 @@ mod anthropic_request_building {
     use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
     use crate::provider::{LLMProvider, ProviderVisibleToolSegmentKind};
     use bamboo_domain::Message;
+    use bamboo_domain::ReasoningEffort;
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
     use serde_json::{json, Value};
@@ -4378,7 +4175,8 @@ mod anthropic_request_building {
                 false,
                 &[],
             );
-            assert!(next_request.get("thinking").is_none());
+            assert_eq!(next_request["output_config"]["effort"], "medium");
+            assert_eq!(next_request["thinking"]["type"], "adaptive");
             assert!(next_request["messages"][1]["content"]
                 .as_array()
                 .unwrap()
@@ -4611,7 +4409,7 @@ mod anthropic_request_building {
     }
 
     #[test]
-    fn native_thinking_replay_obeys_current_mode_and_prevents_false_downgrade() {
+    fn native_thinking_replay_preserves_effort_and_signature_fences() {
         let mut items = vec![native_item(
             super::ProviderTranscriptAuthor::Model,
             json!({"type":"thinking","thinking":"private","signature":"signed"}),
@@ -4655,7 +4453,7 @@ mod anthropic_request_building {
             &groups,
             super::CapabilityLoadingMode::Progressive,
         );
-        assert!(enabled.get("thinking").is_some());
+        assert_eq!(enabled["output_config"]["effort"], "medium");
         assert_eq!(enabled["messages"][1]["content"][0]["type"], "thinking");
         assert_eq!(
             enabled["messages"][1]["content"][1]["type"],
@@ -4687,7 +4485,7 @@ mod anthropic_request_building {
     }
 
     #[test]
-    fn interior_native_thinking_cannot_suppress_the_required_downgrade() {
+    fn interior_native_thinking_cannot_change_effort_or_bypass_replay_fences() {
         for prior_has_native_group in [false, true] {
             let mut items = vec![native_item(
                 super::ProviderTranscriptAuthor::Model,
@@ -4753,7 +4551,8 @@ mod anthropic_request_building {
                 false,
                 &groups,
             );
-            assert!(body.get("thinking").is_none());
+            assert_eq!(body["output_config"]["effort"], "medium");
+            assert_eq!(body["thinking"]["type"], "adaptive");
             let content = body["messages"][1]["content"].as_array().unwrap();
             assert!(content.iter().all(|block| !matches!(
                 block.get("type").and_then(Value::as_str),
@@ -4806,7 +4605,7 @@ mod anthropic_request_building {
             &groups,
         );
 
-        assert!(body.get("thinking").is_some());
+        assert_eq!(body["output_config"]["effort"], "medium");
         assert_eq!(body["messages"][1]["content"][0]["type"], "thinking");
         assert_eq!(
             body["messages"][1]["content"][0]["thinking"],
@@ -4873,78 +4672,38 @@ mod anthropic_request_building {
     }
 
     #[test]
-    fn max_reasoning_uses_a_distinct_larger_thinking_budget() {
-        let xhigh = super::anthropic_thinking_from_effort(
-            Some(bamboo_domain::ReasoningEffort::Xhigh),
-            32_000,
-        )
-        .expect("xhigh enables thinking");
-        let max = super::anthropic_thinking_from_effort(
-            Some(bamboo_domain::ReasoningEffort::Max),
-            32_000,
-        )
-        .expect("max enables thinking");
-
-        assert_eq!(xhigh["budget_tokens"], 8192);
-        assert_eq!(max["budget_tokens"], 16384);
-
-        let xhigh_at_default = super::anthropic_thinking_from_effort(
-            Some(bamboo_domain::ReasoningEffort::Xhigh),
-            16_384,
-        )
-        .expect("xhigh fits the common 16K output limit");
-        let max_at_default = super::anthropic_thinking_from_effort(
-            Some(bamboo_domain::ReasoningEffort::Max),
-            16_384,
-        )
-        .expect("max fits while reserving visible output");
-        assert_eq!(xhigh_at_default["budget_tokens"], 8_192);
-        assert_eq!(max_at_default["budget_tokens"], 12_288);
-
-        let xhigh_at_tight = super::anthropic_thinking_from_effort(
-            Some(bamboo_domain::ReasoningEffort::Xhigh),
-            8_320,
-        )
-        .expect("xhigh scales under a tight limit");
-        let max_at_tight =
-            super::anthropic_thinking_from_effort(Some(bamboo_domain::ReasoningEffort::Max), 8_320)
-                .expect("max remains distinct under a tight limit");
-        assert_eq!(xhigh_at_tight["budget_tokens"], 4_160);
-        assert_eq!(max_at_tight["budget_tokens"], 6_240);
-
-        assert!(super::anthropic_thinking_from_effort(
-            Some(bamboo_domain::ReasoningEffort::Max),
-            2_048,
-        )
-        .is_none());
-        assert!(super::anthropic_thinking_from_effort(
-            Some(bamboo_domain::ReasoningEffort::Max),
-            1_024,
-        )
-        .is_none());
-
-        let request = super::build_anthropic_request(
-            &[bamboo_domain::Message::user("hello")],
-            &[],
-            "claude-sonnet-4-5",
-            16_384,
-            true,
-            Some(bamboo_domain::ReasoningEffort::Max),
-            None,
-        );
-        assert_eq!(request["max_tokens"], 16_384);
-        assert_eq!(request["thinking"]["budget_tokens"], 12_288);
-
-        let impossible = super::build_anthropic_request(
-            &[bamboo_domain::Message::user("hello")],
-            &[],
-            "claude-sonnet-4-5",
-            1_024,
-            true,
-            Some(bamboo_domain::ReasoningEffort::Max),
-            None,
-        );
-        assert!(impossible.get("thinking").is_none());
+    fn selected_effort_is_not_converted_to_a_thinking_budget() {
+        for effort in [
+            ReasoningEffort::Disabled,
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh,
+            ReasoningEffort::Max,
+        ] {
+            for max_tokens in [1, 1024, 16384] {
+                let body = super::build_anthropic_request(
+                    &[Message::user("hello")],
+                    &[],
+                    "custom-route",
+                    max_tokens,
+                    true,
+                    Some(effort),
+                    None,
+                );
+                assert_eq!(body["output_config"]["effort"], effort.as_str());
+                assert_eq!(body["max_tokens"], max_tokens);
+                assert_eq!(
+                    body["thinking"]["type"],
+                    if effort == ReasoningEffort::Disabled {
+                        "disabled"
+                    } else {
+                        "adaptive"
+                    }
+                );
+                assert!(body.pointer("/thinking/budget_tokens").is_none());
+            }
+        }
     }
 
     #[test]
@@ -6167,95 +5926,38 @@ mod anthropic_request_building {
     }
 
     #[test]
-    fn required_tool_choice_uses_anthropic_named_tool_shape() {
-        assert_eq!(
-            super::reasoning_effort_for_required_tool(
-                Some(bamboo_domain::ReasoningEffort::High),
-                Some("load_skill"),
-            ),
-            None
-        );
-        let messages = vec![Message::user("activate")];
-        let tools = sample_tools();
+    fn required_tool_choice_preserves_selected_effort_and_thinking_override() {
         let mut body = super::build_anthropic_request(
-            &messages,
-            &tools,
-            "deepseek-v4-pro",
-            8192,
-            false,
-            Some(bamboo_domain::ReasoningEffort::High),
-            Some(false),
-        );
-        assert!(body.get("thinking").is_some(), "test precondition");
-        super::apply_required_tool_choice(&mut body, Some("load_skill"));
-        assert!(
-            body.get("thinking").is_none(),
-            "forced named-tool request must disable thinking"
-        );
-        assert_eq!(
-            body["tool_choice"],
-            serde_json::json!({
-                "type": "tool",
-                "name": "load_skill",
-                "disable_parallel_tool_use": true
-            })
-        );
-    }
-
-    #[test]
-    fn thinking_forced_tool_error_detector_is_exact() {
-        assert!(super::looks_like_thinking_forced_tool_choice_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#,
-        ));
-        assert!(!super::looks_like_thinking_forced_tool_choice_error(
-            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
-            "Thinking mode does not support this tool_choice",
-        ));
-        assert!(!super::looks_like_thinking_forced_tool_choice_error(
-            reqwest::StatusCode::BAD_REQUEST,
-            "tool_choice is invalid for this request",
-        ));
-    }
-
-    #[test]
-    fn thinking_forced_tool_fallback_uses_auto_and_disables_parallel() {
-        let mut body = serde_json::json!({
-            "thinking": {"type": "enabled", "budget_tokens": 4096},
-            "tool_choice": {"type": "tool", "name": "overridden"}
-        });
-        super::apply_required_tool_auto_fallback(&mut body, Some("load_skill"));
-
-        assert!(body.get("thinking").is_none());
-        assert_eq!(
-            body["tool_choice"],
-            serde_json::json!({
-                "type": "auto",
-                "disable_parallel_tool_use": true
-            })
-        );
-    }
-
-    #[test]
-    fn normal_anthropic_request_keeps_configured_thinking() {
-        assert_eq!(
-            super::reasoning_effort_for_required_tool(
-                Some(bamboo_domain::ReasoningEffort::High),
-                None,
-            ),
-            Some(bamboo_domain::ReasoningEffort::High)
-        );
-        let body = super::build_anthropic_request(
-            &[Message::user("answer normally")],
+            &[Message::user("activate")],
             &sample_tools(),
-            "deepseek-v4-pro",
-            8192,
-            false,
-            Some(bamboo_domain::ReasoningEffort::High),
+            "custom-route",
+            1024,
+            true,
+            Some(ReasoningEffort::Max),
+            None,
+        );
+        body["thinking"] = json!({"type":"adaptive"});
+        super::apply_required_tool_choice(&mut body, Some("load_skill"));
+        assert_eq!(body["output_config"]["effort"], "max");
+        assert_eq!(body["thinking"], json!({"type":"adaptive"}));
+        assert_eq!(
+            body["tool_choice"],
+            json!({"type":"tool", "name":"load_skill", "disable_parallel_tool_use":true})
+        );
+    }
+
+    #[test]
+    fn normal_anthropic_request_keeps_selected_effort() {
+        let body = super::build_anthropic_request(
+            &[Message::user("hello")],
+            &sample_tools(),
+            "custom-route",
+            1024,
+            true,
+            Some(ReasoningEffort::High),
             Some(true),
         );
-
-        assert!(body.get("thinking").is_some());
+        assert_eq!(body["output_config"]["effort"], "high");
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tool_choice"]["disable_parallel_tool_use"], false);
     }
@@ -6283,6 +5985,213 @@ mod anthropic_request_building {
 #[cfg(test)]
 mod anthropic_stream_parse {
     use crate::types::LLMChunk;
+
+    #[tokio::test]
+    async fn production_stream_delivers_anthropic_usage_before_done() {
+        use futures::StreamExt;
+        let body = concat!(
+            "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":2,\"cache_read_input_tokens\":3}}}\n\n",
+            "event: message_delta\ndata: {\"usage\":{\"output_tokens\":7}}\n\n",
+            "event: message_stop\ndata: {}\n\n",
+        );
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(body)
+                .unwrap(),
+        );
+        let mut state = super::AnthropicStreamState::default();
+        let mut stream = crate::providers::common::sse::llm_stream_from_sse_multi(
+            response,
+            move |event, data| super::parse_anthropic_sse_event_multi(&mut state, event, data),
+        );
+        let mut chunks = Vec::new();
+        while let Some(item) = stream.next().await {
+            chunks.push(item.unwrap());
+        }
+        let usage = chunks
+            .iter()
+            .position(|chunk| {
+                matches!(
+                    chunk,
+                    LLMChunk::ProviderUsage {
+                        input_tokens: Some(15),
+                        output_tokens: Some(7),
+                        cache_creation_input_tokens: Some(2),
+                        cache_read_input_tokens: Some(3),
+                        ..
+                    }
+                )
+            })
+            .expect("provider snapshot");
+        let done = chunks
+            .iter()
+            .position(|chunk| matches!(chunk, LLMChunk::Done))
+            .expect("terminal event");
+        assert!(usage < done);
+    }
+
+    #[test]
+    fn terminal_usage_preserves_anthropic_components_and_emits_once() {
+        let mut state = super::AnthropicStreamState::default();
+        let start = r#"{"message":{"usage":{"input_tokens":17,"cache_creation_input_tokens":1370,"cache_read_input_tokens":0,"output_tokens":1}}}"#;
+        let delta =
+            r#"{"usage":{"output_tokens":874,"output_tokens_details":{"thinking_tokens":24}}}"#;
+        for (event, data) in [("message_start", start), ("message_delta", delta)] {
+            let chunks = super::parse_anthropic_sse_event_multi(&mut state, event, data).unwrap();
+            assert!(!chunks
+                .iter()
+                .any(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. })));
+        }
+        let chunks =
+            super::parse_anthropic_sse_event_multi(&mut state, "message_stop", "{}").unwrap();
+        assert!(chunks.iter().any(|chunk| matches!(
+            chunk,
+            LLMChunk::ProviderUsage {
+                input_tokens: Some(1387),
+                output_tokens: Some(874),
+                reasoning_tokens: Some(24),
+                cache_creation_input_tokens: Some(1370),
+                cache_read_input_tokens: Some(0),
+                cache_write_input_tokens: None,
+                total_tokens: None,
+            }
+        )));
+        let repeated =
+            super::parse_anthropic_sse_event_multi(&mut state, "message_stop", "{}").unwrap();
+        assert!(!repeated
+            .iter()
+            .any(|chunk| matches!(chunk, LLMChunk::ProviderUsage { .. })));
+    }
+
+    #[tokio::test]
+    async fn interrupted_usage_flushes_once_before_transport_error() {
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        for (delta, expected_input, expected_read) in [
+            (r#"{"usage":{"output_tokens":7}}"#, Some(15), Some(3)),
+            (
+                r#"{"usage":{"output_tokens":7,"cache_read_input_tokens":-1}}"#,
+                None,
+                None,
+            ),
+        ] {
+            let state = Arc::new(Mutex::new(super::AnthropicStreamState::default()));
+            {
+                let mut state = state.lock().unwrap();
+                super::parse_anthropic_sse_event_multi(
+                    &mut state,
+                    "message_start",
+                    r#"{"message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}"#,
+                )
+                .unwrap();
+                super::parse_anthropic_sse_event_multi(&mut state, "message_delta", delta).unwrap();
+            }
+            let upstream: super::LLMStream = Box::pin(futures::stream::iter(vec![Err(
+                super::LLMError::Stream("synthetic interruption".into()),
+            )]));
+            let mut stream = super::usage_before_anthropic_stream_error(upstream, state);
+            assert!(matches!(
+                stream.next().await.unwrap().unwrap(),
+                LLMChunk::ProviderUsage {
+                    input_tokens,
+                    output_tokens: Some(7),
+                    cache_creation_input_tokens: Some(2),
+                    cache_read_input_tokens,
+                    ..
+                } if input_tokens == expected_input && cache_read_input_tokens == expected_read
+            ));
+            assert!(matches!(
+                stream.next().await.unwrap(),
+                Err(super::LLMError::Stream(message)) if message == "synthetic interruption"
+            ));
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_body_error_flushes_reported_usage_before_error() {
+        use bytes::Bytes;
+        use futures::StreamExt;
+        use std::sync::{Arc, Mutex};
+
+        let sse = concat!(
+            "event: message_start\ndata: {\"message\":{\"usage\":{\"input_tokens\":10,\"cache_creation_input_tokens\":0,\"cache_read_input_tokens\":3}}}\n\n",
+            "event: message_delta\ndata: {\"usage\":{\"output_tokens\":7}}\n\n",
+        );
+        let parts = vec![
+            Ok(Bytes::from(sse)),
+            Err(std::io::Error::other("synthetic body interruption")),
+        ];
+        let body_stream = futures::stream::unfold(parts.into_iter(), |mut parts| async move {
+            tokio::task::yield_now().await;
+            parts.next().map(|part| (part, parts))
+        });
+        let response = reqwest::Response::from(
+            http::Response::builder()
+                .status(200)
+                .header("content-type", "text/event-stream")
+                .body(reqwest::Body::wrap_stream(body_stream))
+                .unwrap(),
+        );
+        let state = Arc::new(Mutex::new(super::AnthropicStreamState::default()));
+        let mut stream = super::anthropic_stream_with_usage_on_error(response, state);
+        let mut usage_count = 0;
+        let mut saw_error = false;
+        while let Some(item) = stream.next().await {
+            match item {
+                Ok(LLMChunk::ProviderUsage {
+                    input_tokens: Some(13),
+                    output_tokens: Some(7),
+                    cache_creation_input_tokens: Some(0),
+                    cache_read_input_tokens: Some(3),
+                    ..
+                }) => {
+                    assert!(!saw_error);
+                    usage_count += 1;
+                }
+                Err(_) => {
+                    assert!(!saw_error);
+                    assert_eq!(usage_count, 1);
+                    saw_error = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_error);
+        assert_eq!(usage_count, 1);
+    }
+
+    #[test]
+    fn terminal_usage_does_not_infer_missing_or_overflowing_input() {
+        for start in [
+            r#"{"message":{"usage":{"input_tokens":17,"cache_read_input_tokens":0}}}"#,
+            r#"{"message":{"usage":{"input_tokens":18446744073709551615,"cache_creation_input_tokens":1,"cache_read_input_tokens":0}}}"#,
+            r#"{"message":{"usage":{"input_tokens":17,"cache_creation_input_tokens":0,"cache_read_input_tokens":-1}}}"#,
+        ] {
+            let mut state = super::AnthropicStreamState::default();
+            super::parse_anthropic_sse_event_multi(&mut state, "message_start", start).unwrap();
+            super::parse_anthropic_sse_event_multi(
+                &mut state,
+                "message_delta",
+                r#"{"usage":{"output_tokens":0}}"#,
+            )
+            .unwrap();
+            let chunks =
+                super::parse_anthropic_sse_event_multi(&mut state, "message_stop", "{}").unwrap();
+            assert!(chunks.iter().any(|chunk| matches!(
+                chunk,
+                LLMChunk::ProviderUsage {
+                    input_tokens: None,
+                    output_tokens: Some(0),
+                    reasoning_tokens: None,
+                    ..
+                }
+            )));
+        }
+    }
 
     #[test]
     fn message_start_is_ignored() {
@@ -7063,13 +6972,10 @@ mod anthropic_request_building_edge_cases {
         ]
     }
 
-    /// #520 thinking-downgrade guard: submitting tool_results for a final
-    /// assistant tool_use turn that has NO signed thinking block (e.g. it was
-    /// minted by GPT before a mid-session switch to Claude) must DISABLE
-    /// thinking for the request — with thinking on, real Anthropic 400s
-    /// ("Expected `thinking` or `redacted_thinking`, but found `tool_use`").
+    /// Unsigned history does not alter the selected effort. Historical thinking
+    /// still requires its existing signature/provenance checks.
     #[test]
-    fn thinking_downgraded_when_final_tool_turn_has_no_signed_thinking() {
+    fn unsigned_tool_history_preserves_selected_effort() {
         let out = super::build_anthropic_request_with_cache_blocks(
             &tool_loop_messages(None),
             &[],
@@ -7083,10 +6989,8 @@ mod anthropic_request_building_edge_cases {
             false,
         );
 
-        assert!(
-            out.get("thinking").is_none(),
-            "thinking must be downgraded for an unsigned final tool_use turn: {out}"
-        );
+        assert_eq!(out["output_config"]["effort"], "medium");
+        assert_eq!(out["thinking"]["type"], "adaptive");
         // And no unsigned thinking block leaks into the turn either.
         let content = out["messages"][1]["content"].as_array().unwrap();
         assert!(content
@@ -7095,7 +6999,7 @@ mod anthropic_request_building_edge_cases {
     }
 
     /// With the signature captured, the same tool loop keeps thinking enabled
-    /// and replays the signed block — no downgrade.
+    /// and replays the signed block with the selected effort unchanged.
     #[test]
     fn thinking_kept_when_final_tool_turn_has_signed_thinking() {
         let out = super::build_anthropic_request_with_cache_blocks(
@@ -7111,7 +7015,7 @@ mod anthropic_request_building_edge_cases {
             false,
         );
 
-        assert_eq!(out["thinking"]["type"], "enabled");
+        assert_eq!(out["output_config"]["effort"], "medium");
         let content = out["messages"][1]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "thinking");
         assert_eq!(content[0]["signature"], "sig_tool_turn");
@@ -7119,7 +7023,7 @@ mod anthropic_request_building_edge_cases {
     }
 
     /// Compat upstreams (`thinking_replay_always`) replay the unsigned block,
-    /// which satisfies their presence requirement — no downgrade there.
+    /// with the selected effort unchanged.
     #[test]
     fn thinking_kept_in_compat_mode_even_without_signature() {
         let out = super::build_anthropic_request_with_cache_blocks(
@@ -7135,15 +7039,13 @@ mod anthropic_request_building_edge_cases {
             true, // compat mode
         );
 
-        assert_eq!(out["thinking"]["type"], "enabled");
+        assert_eq!(out["output_config"]["effort"], "medium");
         let content = out["messages"][1]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "thinking");
         assert!(content[0].get("signature").is_none());
     }
 
-    /// The guard only bites when tool_results are actually being submitted:
-    /// a plain conversation continuing past a final ANSWER turn (no tool_use)
-    /// keeps thinking enabled even though history has unsigned reasoning.
+    /// A final answer without tool use does not change the selected effort.
     #[test]
     fn thinking_kept_when_final_assistant_turn_has_no_tool_use() {
         let messages = vec![
@@ -7168,7 +7070,7 @@ mod anthropic_request_building_edge_cases {
             false,
         );
 
-        assert_eq!(out["thinking"]["type"], "enabled");
+        assert_eq!(out["output_config"]["effort"], "medium");
     }
 }
 
@@ -7340,51 +7242,41 @@ mod anthropic_provider_tests {
     }
 
     #[tokio::test]
-    async fn forced_named_tool_retries_exact_thinking_error_with_auto_choice() {
+    async fn forced_named_tool_returns_error_without_changing_reasoning_or_tool_choice() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/messages"))
             .respond_with(ThinkingToolChoiceResponder)
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         let provider = AnthropicProvider::new("test-key")
             .with_base_url(server.uri())
             .with_reasoning_effort(Some(ReasoningEffort::High));
-        let tools = vec![load_skill_tool()];
         let options = LLMRequestOptions {
             required_tool: Some("load_skill".to_string()),
-            parallel_tool_calls: Some(false),
             ..Default::default()
         };
-
-        let _stream = provider
+        let result = provider
             .chat_stream_with_options(
                 &[Message::user("activate")],
-                &tools,
-                Some(8192),
-                "deepseek-v4-pro",
+                &[load_skill_tool()],
+                Some(1024),
+                "custom-route",
                 Some(&options),
             )
-            .await
-            .expect("exact incompatibility should retry with auto choice");
-
-        let requests = server.received_requests().await.expect("requests recorded");
-        assert_eq!(requests.len(), 2);
-        let named: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        let fallback: Value = serde_json::from_slice(&requests[1].body).unwrap();
-        assert!(named.get("thinking").is_none());
-        assert_eq!(named["tool_choice"]["type"], "tool");
-        assert_eq!(named["tool_choice"]["name"], "load_skill");
-        assert!(fallback.get("thinking").is_none());
-        assert_eq!(fallback["tool_choice"]["type"], "auto");
-        assert_eq!(fallback["tool_choice"]["disable_parallel_tool_use"], true);
-        assert_eq!(fallback["tools"].as_array().map(Vec::len), Some(1));
-        assert_eq!(fallback["tools"][0]["name"], "load_skill");
+            .await;
+        assert!(matches!(result, Err(LLMError::Api(message)) if message.contains("HTTP 400")));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["output_config"]["effort"], "high");
+        assert_eq!(body["tool_choice"]["type"], "tool");
+        assert_eq!(body["tool_choice"]["name"], "load_skill");
     }
 
     #[tokio::test]
-    async fn unsigned_tool_turn_disables_max_before_small_budget_validation() {
+    async fn unsigned_tool_turn_keeps_selected_max_without_budget_conversion() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/messages"))
@@ -7408,44 +7300,47 @@ mod anthropic_provider_tests {
                 "claude-sonnet-4-5",
             )
             .await
-            .expect("unsigned tool turn should disable thinking before Max validation");
+            .expect("selected max must reach the request unchanged");
 
         let requests = server.received_requests().await.expect("requests recorded");
         assert_eq!(requests.len(), 1);
         let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert!(body.get("thinking").is_none());
+        assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["max_tokens"], 2_048);
+        assert_eq!(body["output_config"]["effort"], "max");
     }
 
     #[tokio::test]
-    async fn compat_replay_keeps_max_small_budget_validation_enabled() {
+    async fn compat_replay_keeps_max_and_surfaces_upstream_validation_error() {
         let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(
+                ResponseTemplate::new(400)
+                    .set_body_json(json!({"error":{"message":"Unsupported effort max"}})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
         let provider = AnthropicProvider::new("test-key")
             .with_base_url(server.uri())
             .with_reasoning_effort(Some(ReasoningEffort::Max))
             .with_thinking_replay_always(true);
-
         let result = provider
             .chat_stream(
                 &unsigned_tool_loop_messages(),
                 &[],
-                Some(2_048),
-                "glm-compatible",
+                Some(2048),
+                "custom-route",
             )
             .await;
-
-        match result {
-            Err(LLMError::Api(message)) => {
-                assert!(message.contains("requires max_output_tokens of at least 2049"));
-            }
-            Err(other) => panic!("unexpected error: {other}"),
-            Ok(_) => panic!("compat replay still requires a valid Max thinking budget"),
-        }
-        assert!(server
-            .received_requests()
-            .await
-            .expect("requests recorded")
-            .is_empty());
+        assert!(
+            matches!(result, Err(LLMError::Api(message)) if message.contains("Unsupported effort max"))
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+        assert_eq!(body["output_config"]["effort"], "max");
     }
 
     #[test]

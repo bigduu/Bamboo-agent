@@ -200,6 +200,19 @@ impl SessionRepository {
         Ok(bound)
     }
 
+    /// Preserve the exact inherited wait carried by the reserved successor.
+    pub(crate) fn bind_root_response_writer_with_inherited(
+        &self,
+        owner: bamboo_domain::RootActorRuntimeWrite,
+        inherited: Option<bamboo_domain::InheritedChildWait>,
+    ) -> std::io::Result<Self> {
+        let mut bound = self.bind_root_response_writer(owner)?;
+        if let Some(inherited) = inherited {
+            bound.persistence = Arc::new(bound.persistence.bind_inherited_child_wait(inherited));
+        }
+        Ok(bound)
+    }
+
     /// Enable durable ordinary Root execution ownership in a Host whose
     /// storage implements the named final writer boundary.
     pub fn with_root_actor_directory(
@@ -647,6 +660,27 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .await
     }
 
+    fn supports_bound_startup_session(&self) -> bool {
+        bamboo_domain::RuntimeSessionPersistence::supports_bound_startup_session(
+            self.persistence.as_ref(),
+        )
+    }
+
+    async fn save_bound_startup_session(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.persistence
+            .merge_save_bound_startup_and_publish(session, expected, |saved, _| {
+                self.cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            })
+            .await
+    }
+
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
         self.persistence
             .merge_save_finalized_runtime_and_publish(session, |saved, _| {
@@ -856,6 +890,28 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                     }
                 },
             )
+            .await
+    }
+
+    async fn checkpoint_live_bootstrap(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        gate: bamboo_domain::AdmissionGate,
+    ) -> std::io::Result<bamboo_domain::LiveBootstrapProof> {
+        self.persistence
+            .checkpoint_live_bootstrap(session, inbox, gate)
+            .await
+    }
+
+    async fn confirm_live_bootstrap(
+        &self,
+        proof: &bamboo_domain::LiveBootstrapProof,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> std::io::Result<()> {
+        self.persistence
+            .confirm_live_bootstrap(proof, inbox, publish)
             .await
     }
 
@@ -1129,6 +1185,30 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
             .append_token_usage_record(session_id, json_line)
             .await
     }
+}
+
+fn validate_bound_root_snapshot(
+    owner: &bamboo_domain::RootActorRuntimeWrite,
+    snapshot: &Session,
+) -> std::io::Result<()> {
+    if snapshot.id != owner.fence.actor_id
+        || snapshot.created_at != owner.created_at
+        || snapshot.kind != bamboo_domain::SessionKind::Root
+        || !snapshot.authority_identity.is_ordinary()
+    {
+        return Err(root_actor_binding_error("bound Root identity changed"));
+    }
+    owner
+        .conversation_generation
+        .check_canonical(snapshot)
+        .map_err(root_actor_binding_error)
+}
+
+fn root_actor_binding_error(reason: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        bamboo_domain::SessionAuthorityConflict(format!("Root Actor execution rejected: {reason}")),
+    )
 }
 
 #[cfg(test)]
@@ -2921,28 +3001,4 @@ mod tests {
             );
         }
     }
-}
-
-fn validate_bound_root_snapshot(
-    owner: &bamboo_domain::RootActorRuntimeWrite,
-    snapshot: &Session,
-) -> std::io::Result<()> {
-    if snapshot.id != owner.fence.actor_id
-        || snapshot.created_at != owner.created_at
-        || snapshot.kind != bamboo_domain::SessionKind::Root
-        || !snapshot.authority_identity.is_ordinary()
-    {
-        return Err(root_actor_binding_error("bound Root identity changed"));
-    }
-    owner
-        .conversation_generation
-        .check_canonical(snapshot)
-        .map_err(root_actor_binding_error)
-}
-
-fn root_actor_binding_error(reason: impl std::fmt::Display) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::WouldBlock,
-        bamboo_domain::SessionAuthorityConflict(format!("Root Actor execution rejected: {reason}")),
-    )
 }

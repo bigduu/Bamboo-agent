@@ -71,6 +71,7 @@ async fn run_stream_worker(mut args: StreamWorkerArgs) {
             | Ok(LLMChunk::ProviderTranscriptItem(_))
             | Ok(LLMChunk::CacheUsage { .. })
             | Ok(LLMChunk::ProviderUsage { .. })
+            | Ok(LLMChunk::ProviderUsageReplace(_))
             | Ok(LLMChunk::UsageSummary { .. })
             | Ok(LLMChunk::ReasoningSignature(_)) => {}
             Err(error) => {

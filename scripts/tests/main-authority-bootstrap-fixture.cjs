@@ -7,6 +7,70 @@ const path = require('node:path')
 const { spawnSync } = require('node:child_process')
 const { createHash } = require('node:crypto')
 const copy = (value) => JSON.parse(JSON.stringify(value))
+let legacy
+function legacyData() {
+  if (legacy) return legacy
+  const bytes = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-v8-testdata.json.gz'))
+  const hash = value => createHash('sha256').update(value).digest('hex')
+  assert.ok(bytes.length <= 32768)
+  assert.equal(hash(bytes), '2f65416fb350f64999d9a1edec374d36fc57c1c978072533e97a2feb1b79730a')
+  const value = JSON.parse(require('node:zlib').gunzipSync(bytes, { maxOutputLength: 256 * 1024 }))
+  assert.equal(value.schemaVersion, 1); assert.equal(value.kind, 'bamboo-legacy-ci-publication-testdata/v8')
+  assert.equal(value.fixtureOnly, true); assert.equal(value.sourceRevision, 'ce89b4fcf4a45014cccb3bc7f817613ddcfa7eb2')
+  for (const [name, digest] of Object.entries({
+    ci: 'f6dfca960521d915245bb3371064a3cbcf0424fa7cd739034f4228f29c20fd6f',
+    publisher: 'ba29001500fd40eed3858d9b687b1f5c32d2cc1bb60e03738bfa416353961fb2',
+    contributingRelease: 'a38c33761f09031417fcf6b0af6ee4e7744c0474164eed25c0d1ecead1c7daa7',
+    gitflowLegacy: 'bdfc9e9de85708b83df24bd468ebcaaf85fa543dfd3afd9637377d5cf1b92af4',
+  })) {
+    assert.equal(typeof value[name], 'string'); assert.ok(Buffer.byteLength(value[name]) <= 128000)
+    assert.equal(hash(value[name]), digest); assert.equal(value.sha256[name], digest)
+  }
+  assert.equal(value.sha256.admissionHelper, 'b87e7054a19a0a1d6fcda8d722d91059ec0d2838087dc0a27cefa7c8a73e7d54')
+  // Exact UTF-8 byte ranges from the named immutable source files; not current guidance.
+  assert.deepEqual(value.documentRanges, {
+    contributingRelease: { path: 'CONTRIBUTING.md',
+      fileSha256: 'd936324de3dbbfabc8a824af243b94a6328e6a17d8d898699377d650bafd542e',
+      offset: 7614, length: 11506 },
+    gitflowLegacy: { path: 'gitflow.md',
+      fileSha256: 'fbb6f01a339ba6a921073a0f4f26ad5fa42fe076d3b70b0aafb2c3168d47c32f',
+      offset: 4492, length: 2016 },
+  })
+  for (const [name, range] of Object.entries(value.documentRanges)) {
+    assert.equal(Buffer.byteLength(value[name]), range.length)
+  }
+  legacy = Object.freeze({ ci: value.ci, publisher: value.publisher,
+    contributingRelease: value.contributingRelease, gitflowLegacy: value.gitflowLegacy })
+  return legacy
+}
+// Complete raw producer/controller tuple from the final accepted protected Dev.
+// The earlier ce89 policy/docs fixture above retains its own immutable identity.
+let acceptedDev
+function acceptedDevData() {
+  if (acceptedDev) return acceptedDev
+  const bytes = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-v8-accepted-dev.json.gz'))
+  const hash = value => createHash('sha256').update(value).digest('hex')
+  assert.ok(bytes.length <= 32768)
+  assert.equal(hash(bytes), '17e281c13ec9973bc2fd4452c99ff0c4155433cbea1c42c0c48c37d0c74626a7')
+  const value = JSON.parse(require('node:zlib').gunzipSync(bytes, { maxOutputLength: 256 * 1024 }))
+  assert.equal(value.schemaVersion, 1); assert.equal(value.fixtureOnly, true)
+  assert.equal(value.kind, 'bamboo-accepted-dev-ci-publication-testdata/v8')
+  assert.equal(value.sourceRevision, 'f0eb67c378e87e203fe490c85c54a89683608624')
+  for (const [name, digest] of Object.entries({
+    ci: '511180e1a71c8b62db12324c2082b63a1c38ee289547c10b58a8b09ce4bbdc86',
+    publisher: 'f60967494a4ff359e71078aad7dd57ff6c75d3d16cd9f0dfd13fa9f35a684a7c',
+    admissionHelper: 'cf41d9e30e2deb65f191e705e2e74e94f747b76cdf8574ea57b2d4a26fadf449',
+  })) {
+    assert.equal(typeof value[name], 'string'); assert.ok(Buffer.byteLength(value[name]) <= 128000)
+    assert.equal(hash(value[name]), digest); assert.equal(value.sha256[name], digest)
+  }
+  const normalized = value.ci.replace(/ADMISSION_HELPER_SHA256: "[0-9a-f]{64}"/g,
+    'ADMISSION_HELPER_SHA256: "<PINNED_ADMISSION_HELPER>"')
+  assert.equal(hash(normalized), '64e739dc9583c0bf6969c5a297564c48cfa2b8afbdad66a0355116aab96d0902')
+  assert.equal(value.sha256.normalizedCi, hash(normalized))
+  acceptedDev = Object.freeze({ ci: value.ci, publisher: value.publisher, admissionHelper: value.admissionHelper })
+  return acceptedDev
+}
 const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
   'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
   'Documentation', 'TLS Fixture (macos-latest)', 'TLS Fixture (windows-latest)',
@@ -16,8 +80,15 @@ const FULL = ['Validation Source', 'Test', 'E2E Tests', 'Lint',
 const PLATFORMS = ['Build (ubuntu-latest)', 'Build (macos-latest)', 'Build (windows-latest)']
 
 async function verify(t, bootstrap, producer = 'v1', mode = 'publication', options = {}) {
-  assert.match(producer, /^v[123]$/)
+  assert.match(producer, /^v(?:[1234568]|4-main-3488)$/)
   assert.ok(['publication', 'main'].includes(mode))
+  const current = producer === 'v8', grouped = producer === 'v3'
+  const serverPartitioned = current || producer === 'v6'
+  const actualMain = producer === 'v4-main-3488'
+  const legacyCrates = producer === 'v4' || actualMain
+  const crates = legacyCrates || producer === 'v5' || serverPartitioned, light = grouped || crates
+  const platformLabel = serverPartitioned || producer === 'v5' ? 'Platform Tests' : 'Build'
+  const platforms = PLATFORMS.map(name => name.replace('Build', platformLabel))
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'bamboo-main-authority-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
   const git = (...args) => {
@@ -27,10 +98,23 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   }
   git('init', '-q')
   // Frozen producer bytes, not an active workflow or a caller-authored receipt.
-  const definition = fs.readFileSync(producer === 'v3' ? '.github/workflows/ci.yml'
-    : path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
-  const helper = fs.readFileSync('scripts/main-release-admission.py')
+  const definition = current ? Buffer.from(acceptedDevData().ci)
+    : fs.readFileSync(path.join(__dirname, `fixtures/main-authority-ci-${producer}.yml`))
+  const helper = current ? Buffer.from(acceptedDevData().admissionHelper) : fs.readFileSync('scripts/main-release-admission.py')
   const helperDigest = createHash('sha256').update(helper).digest('hex')
+  const producerHelper = grouped || (crates && !current)
+    ? fs.readFileSync(path.join(__dirname, `fixtures/main-authority-admission-${producer}.py`)) : helper
+  const producerHelperDigest = createHash('sha256').update(producerHelper).digest('hex')
+  const packagesByLabel = {}, blocksByLabel = {}
+  for (const [label, id] of [['Test', 'test-crates'], ['E2E', 'e2e-crates']]) {
+    const job = crates ? definition.toString().split(`  ${id}:\n`)[1].split(/\n  [a-z0-9-]+:/)[0] : ''
+    packagesByLabel[label] = [...job.matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1])
+    blocksByLabel[label] = serverPartitioned ? [...job.matchAll(/^            server_block: ([a-z-]+)$/gm)].map(match => match[1]) : []
+  }
+  const cratePackages = packagesByLabel.Test
+  const crateNames = ['Test SSH', ...['Test', 'E2E'].flatMap(label => [
+    ...packagesByLabel[label].map(crate => `${label} (${crate})`),
+    ...blocksByLabel[label].map(block => `${label} (bamboo-server/${block})`)])]
   fs.mkdirSync(path.join(directory, '.github/workflows'), { recursive: true })
   fs.writeFileSync(path.join(directory, '.github/workflows/ci.yml'), definition)
   git('add', '.github/workflows/ci.yml')
@@ -97,18 +181,27 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
   const emptyNames = plans.filter(p => p.profile !== 'ssh-live' && !p.blocks.some(b => b.kind !== 'doctest' && b.matrixFamily === 2))
     .map(p => p.label + ' Block 2 (${{ matrix.id }})')
   const groupedNames = [...plans.flatMap(p => [p.label + ' Build', ...p.blocks.map(b => blockName(p, b))]), ...emptyNames]
-  const mainSkipped = ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
+  const mainSkipped = grouped ? ['Test Build', 'E2E Build', 'Test SSH Build', 'Test SSH',
     'Test Block (${{ matrix.id }})', 'E2E Block (${{ matrix.id }})', 'Test Doctest (${{ matrix.id }})',
     'Test Block 2 (${{ matrix.id }})', 'E2E Block 2 (${{ matrix.id }})']
-  const jobs = (id, promotion) => ({ jobs: (!promotion && producer === 'v3'
+    : ['Test SSH', ...['Test', 'E2E'].map(label => serverPartitioned
+      ? label + " (${{ matrix.crate }}${{ ((matrix.server_block && format('/{0}', matrix.server_block)) || '') }})"
+      : label + ' (${{ matrix.crate }})')]
+  const jobs = (id, promotion) => ({ jobs: (!promotion && light
     ? ['Validation Source', 'Test', 'Main Release Admission', 'Quick Checks', 'Promotion Source',
       'E2E Tests', 'Lint', 'MSRV (Rust 1.95)', 'Security Audit', 'cargo-deny (licenses/bans/advisories/sources)',
-      'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', 'Build (${{ matrix.os }})', ...mainSkipped]
-    : [...FULL, ...(producer === 'v3' ? groupedNames : []), ...(promotion ? [...PLATFORMS, 'Promotion Source'] : [])]).map((name, i) => ({
+      'Documentation', 'TLS Fixture (${{ matrix.os }})', 'ToolEvent Recorder E2E (${{ matrix.os }})', platformLabel + ' (${{ matrix.os }})', ...mainSkipped,
+      ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})'] : [])]
+    : [...FULL, ...(grouped ? groupedNames : crates ? crateNames : []), ...(current ? ['Feature Unit and E2E', 'Native Feature (${{ matrix.os }})'] : []),
+      ...(promotion ? [...platforms, 'Promotion Source'] : [])]).map((name, i) => ({
     id: id * 100 + i, name, run_id: id, run_attempt: 1,
     head_sha: promotion ? head : source, head_branch: promotion ? release : 'main',
-    steps, status: 'completed', conclusion: (promotion && producer === 'v3' && emptyNames.includes(name)) ||
-      (!promotion && producer === 'v3' && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
+    steps: crates && promotion && crateNames.includes(name) ? ['Set up job', name === 'Test SSH' ? 'Run SSH fixture'
+      : name.startsWith('Test (') ? (name.includes('bamboo-server/') ? 'Test server block' : 'Test crate')
+      : (name.includes('bamboo-server/') ? 'Run E2E server block' : 'Run E2E crate tests'), 'Complete job']
+      .map((name, i) => ({ name, number: i + 1, status: 'completed', conclusion: 'success' })) : steps,
+    status: 'completed', conclusion: name === 'Feature Unit and E2E' || name === 'Native Feature (${{ matrix.os }})' || (promotion && grouped && emptyNames.includes(name)) ||
+      (!promotion && light && !['Validation Source', 'Test', 'Main Release Admission'].includes(name)) ? 'skipped' : 'success',
     completed_at: '2026-10-20T02:59:00Z' })) })
   const commitObject = (sha) => ({ sha, tree: { sha: git('rev-parse', `${sha}^{tree}`) },
     parents: git('show', '-s', '--format=%P', sha).split(' ').map(sha => ({ sha })) })
@@ -117,8 +210,8 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     'branches/dev': { name: 'dev', protected: true, commit: { sha: controller } },
     'actions/runs/111': mainCI,
     'actions/runs/222': pre,
-    'actions/runs/111/jobs?filter=latest&per_page=100&page=1': jobs(111, false),
-    'actions/runs/222/jobs?filter=latest&per_page=100&page=1': jobs(222, true),
+    'actions/runs/111/jobs?filter=latest&per_page=10&page=1': jobs(111, false),
+    'actions/runs/222/jobs?filter=latest&per_page=10&page=1': jobs(222, true),
     [`commits/${source}/pulls?per_page=100&page=1`]: [pull],
     'pulls/42': pull,
     [`git/commits/${source}`]: commitObject(source),
@@ -128,9 +221,10 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     [`contents/.github/workflows/ci.yml?ref=${snapshot}`]: { encoding: 'base64', content: definition.toString('base64') },
     [`contents/.github/workflows/ci.yml?ref=${source}`]: { encoding: 'base64', content: definition.toString('base64') },
     ...Object.fromEntries([controller, head, snapshot, source].map(sha => [
-      `contents/scripts/main-release-admission.py?ref=${sha}`, { encoding: 'base64', content: helper.toString('base64') }])),
-    'actions/runs/111/attempts/1/jobs?per_page=100&page=1': jobs(111, false),
-    'actions/runs/222/attempts/1/jobs?per_page=100&page=1': jobs(222, true),
+      `contents/scripts/main-release-admission.py?ref=${sha}`,
+      { encoding: 'base64', content: (sha === controller ? helper : producerHelper).toString('base64') }])),
+    'actions/runs/111/attempts/1/jobs?per_page=10&page=1': jobs(111, false),
+    'actions/runs/222/attempts/1/jobs?per_page=10&page=1': jobs(222, true),
     'actions/jobs/22200': jobs(222, true).jobs[0],
     'actions/jobs/22200/logs': { raw: `2026-10-20T02:58:00Z \x1b[36;1mSet up runner\x1b[0m\n2026-10-20T02:58:00.0000000Z Event source: ${snapshot}; full validation: true\n` },
     graphql: { data: { node: { databaseId: 444, repository: { databaseId: repo.id, nameWithOwner: repository },
@@ -142,7 +236,7 @@ async function verify(t, bootstrap, producer = 'v1', mode = 'publication', optio
     [`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`]: { workflow_runs: [pre] },
   }
   const recordLog = (marker, record) => `2026-10-20T02:58:00Z ${marker} ${Buffer.from(JSON.stringify(record)).toString('base64')}\n`
-  if (producer === 'v3') for (const job of jobs(222, true).jobs) {
+  if (grouped) for (const job of jobs(222, true).jobs) {
     let raw = ''
     for (const plan of plans) {
       if (job.name === plan.label + ' Build') raw += recordLog('GROUPED_TEST_PLAN', plan)
@@ -188,6 +282,7 @@ calls = pathlib.Path(os.environ['FIXTURE_CALLS'])
 previous = calls.read_text().splitlines()
 with calls.open('a') as stream: stream.write(route + '\\n')
 if os.environ.get('FIXTURE_API_FAILURE') == 'true': sys.exit(1)
+if route == os.environ.get('FIXTURE_API_FAILURE_ROUTE'): sys.exit(1)
 rows = json.loads(pathlib.Path(os.environ['FIXTURE_ROUTES']).read_text())
 if route.startswith('compare/'):
     source, target = route.removeprefix('compare/').split('...')
@@ -195,7 +290,7 @@ if route.startswith('compare/'):
     print(json.dumps({'base_commit': {'sha': source}, 'merge_base_commit': {'sha': base},
       'status': 'identical' if source == target else 'ahead' if base == source else 'diverged'}))
 else:
-    page = re.search(r'([?&])per_page=100&page=([0-9]+)$', route)
+    page = re.search(r'([?&])per_page=([0-9]+)&page=([0-9]+)$', route)
     canonical = re.sub(r'page=[0-9]+$', 'page=1', route) if page else route
     lookup = canonical if page and canonical in rows and isinstance(rows[canonical], dict) and 'jobs' in rows[canonical] else route
     assert lookup in rows, 'Unexpected route: ' + route
@@ -203,8 +298,9 @@ else:
     if isinstance(value, dict) and 'sequence' in value:
         value = value['sequence'][min(previous.count(route), len(value['sequence']) - 1)]
     if page and isinstance(value, dict) and 'jobs' in value:
-        start = (int(page.group(2)) - 1) * 100
-        value = dict(value, jobs=value['jobs'][start:start + 100])
+        size = int(page.group(2))
+        start = (int(page.group(3)) - 1) * size
+        value = dict(value, jobs=value['jobs'][start:start + size])
     print(value['raw'] if isinstance(value, dict) and 'raw' in value else json.dumps(value), end='\\n')
 `, { mode: 0o755 })
   const calls = path.join(directory, 'calls')
@@ -251,21 +347,28 @@ with patch('subprocess.check_output', output):
       FIXTURE_CALLS: calls, FIXTURE_ROUTES: routeFile, FIXTURE_REPOSITORY: directory, ...environment } })
     return { ...result, output: fs.readFileSync(output, 'utf8'), calls: fs.readFileSync(calls, 'utf8') }
   }
-  if (options.exercise) return options.exercise({run, base, source, head, controller, plans, blockName})
+  if (options.exercise) return options.exercise({run, base, source, head, controller, plans, blockName, cratePackages})
   const empty = x => {
     x.routes['actions/runs/222'].pull_requests = []
     x.routes[`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`].workflow_runs[0].pull_requests = []
   }
   const expandedSkipped = x => {
     const expand = list => list.flatMap(job => {
+      if (job.name.includes('${{ matrix.crate }}')) {
+        const label = job.name.startsWith('Test ') ? 'Test' : 'E2E'
+        return [...packagesByLabel[label], ...blocksByLabel[label].map(block => `bamboo-server/${block}`)].map((crate, index) => ({
+          ...copy(job), id: job.id * 100 + index, name: `${label} (${crate})` }))
+      }
       if (!job.name.includes('${{ matrix.os }}')) return [job]
       const platforms = job.name.startsWith('TLS Fixture') ? ['macos-latest', 'windows-latest']
+        : job.name.startsWith('Native Feature') ? ['windows-2025', 'macos-latest']
         : ['ubuntu-latest', 'macos-latest', 'windows-latest']
       return platforms.map((platform, index) => ({ ...copy(job), id: job.id * 10 + index,
         name: job.name.replace('${{ matrix.os }}', platform) }))
     })
-    for (const route of ['actions/runs/111/jobs?filter=latest&per_page=100&page=1',
-      'actions/runs/111/attempts/1/jobs?per_page=100&page=1']) x.routes[route].jobs = expand(x.routes[route].jobs)
+    for (const route of ['actions/runs/111/jobs?filter=latest&per_page=10&page=1',
+      'actions/runs/111/attempts/1/jobs?per_page=10&page=1',
+      ...(current ? ['actions/runs/222/jobs?filter=latest&per_page=10&page=1', 'actions/runs/222/attempts/1/jobs?per_page=10&page=1'] : [])]) x.routes[route].jobs = expand(x.routes[route].jobs)
   }
   for (const [name, change] of [
     ['empty association uses authenticated historical source job', empty],
@@ -276,7 +379,7 @@ with patch('subprocess.check_output', output):
     }],
     ['unprotected main with complete normal merge evidence', () => {}],
     ['main push legitimately skips platform builds already checked before merge', x => {
-      x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs.push(...PLATFORMS.map(name => ({ name, run_id: 111, status: 'completed', conclusion: 'skipped' })))
+      x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs.push(...platforms.map(name => ({ name, run_id: 111, status: 'completed', conclusion: 'skipped' })))
     }],
     ['protected main does not change the evidence requirement', x => { x.routes['branches/main'].protected = true }],
     ['normal dev advancement and deleted release ref need no historical ref lookup', x => {
@@ -285,29 +388,54 @@ with patch('subprocess.check_output', output):
     ['failed-only CI rerun retains earlier successful job attempts', x => {
       x.routes['actions/runs/222'].run_attempt = 2
       x.routes.graphql.data.node.workflowRun.runAttempt = 2
-      x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs[0].run_attempt = 2
-      x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = copy(x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'])
+      x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs[0].run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = copy(x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'])
       x.routes['actions/jobs/22200'].run_attempt = 2
     }],
-    ...(producer === 'v3' ? [['failed shard alone can rerun while earlier build and shards remain valid', x => {
+    ...(grouped ? [['failed shard alone can rerun while earlier build and shards remain valid', x => {
       x.routes['actions/runs/222'].run_attempt = 2
       x.routes.graphql.data.node.workflowRun.runAttempt = 2
-      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs
+      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs
       const job = list.find(j => j.name.startsWith('Test Block ('))
       job.run_attempt = 2
-      x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = {jobs: [copy(job)]}
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
       const route = `actions/jobs/${job.id}/logs`
       const encoded = x.routes[route].raw.trim().split(' ').at(-1)
       const record = JSON.parse(Buffer.from(encoded, 'base64')); record.attempt = 2
       x.routes[route].raw = recordLog('GROUPED_TEST_RESULT', record)
     }]] : []),
-    ...(producer === 'v3' && mode === 'publication' ? [['complete expanded skipped matrices remain compatible', expandedSkipped]] : []),
-  ].filter(([name]) => !(producer === 'v3' && name === 'main push legitimately skips platform builds already checked before merge'))) await t.test(name, () => {
+    ...(crates ? [['failed crate alone can rerun while earlier successful crates remain valid', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name.startsWith('Test ('))
+      job.run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
+    }], ['failed platform alone can rerun while earlier successful jobs remain valid', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name === platforms[0])
+      job.run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
+    }]] : []),
+    ...(serverPartitioned ? [['failed server block alone retains the other native job attempts', x => {
+      x.routes['actions/runs/222'].run_attempt = 2
+      x.routes.graphql.data.node.workflowRun.runAttempt = 2
+      const job = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.name === 'Test (bamboo-server/browser)')
+      job.run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = {jobs: [copy(job)]}
+    }]] : []),
+    ...(light && mode === 'publication' ? [['complete expanded skipped matrices remain compatible', expandedSkipped]] : []),
+  ].filter(([name]) => !(light && name === 'main push legitimately skips platform builds already checked before merge'))) await t.test(name, () => {
     const result = run(change)
     assert.equal(result.status, 0, result.stderr)
+    if (crates) assert.deepEqual(result.calls.trim().split('\n').filter(route => route.endsWith('/logs')),
+      ['actions/jobs/22200/logs'], 'Native crate jobs need no grouped result logs or receipts')
+    if (serverPartitioned) for (const label of ['Test', 'E2E']) for (const block of blocksByLabel[label]) {
+      assert.ok(result.stdout.includes(`${label} (bamboo-server/${block})=`), 'The authenticated job-attempt log includes every server block')
+    }
     const output = result.output.trimEnd().split('\n')
     assert.equal(output[0], `revision=${source}`)
-    if (producer === 'v3' && mode === 'publication') {
+    if (light && mode === 'publication') {
       assert.equal(output.length, 2)
       assert.ok(output[1].startsWith('validation='))
       const proof = JSON.parse(output[1].slice('validation='.length))
@@ -345,11 +473,11 @@ with patch('subprocess.check_output', output):
     ['stale delivered main CI attempt', x => { x.routes['actions/runs/111'].run_attempt = 2 }],
     ['wrong CI workflow path', x => { x.routes['actions/runs/111'].path = '.github/workflows/other.yml' }],
     ['foreign main CI source repo', x => { x.routes['actions/runs/111'].head_repository.full_name = 'foreign/repo' }],
-    ['pre-merge CI completes too late', x => { x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs[0].completed_at = '2026-10-20T03:01:00Z' }],
-    ['same-second CI completion is not proven before merge', x => { x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs[0].completed_at = pull.merged_at }],
+    ['pre-merge CI completes too late', x => { x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs[0].completed_at = '2026-10-20T03:01:00Z' }],
+    ['same-second CI completion is not proven before merge', x => { x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs[0].completed_at = pull.merged_at }],
     ['main CI attempt changes during proof', x => { x.routes['actions/runs/111'] = { sequence: [mainCI, { ...mainCI, run_attempt: 2 }] } }],
     ['pre-merge CI attempt changes during proof', x => { x.routes['actions/runs/222'] = { sequence: [pre, { ...pre, run_attempt: 2 }] } }],
-    ['Promotion Source skipped', x => { x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.at(-1).conclusion = 'skipped' }],
+    ['Promotion Source skipped', x => { x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.at(-1).conclusion = 'skipped' }],
     ['newer exact-input red must not fall back to old green', x => {
       const red = { ...copy(pre), id: 333, conclusion: 'failure' }
       x.routes[`actions/workflows/ci.yml/runs?event=pull_request&head_sha=${head}&per_page=100&page=1`].workflow_runs.unshift(red)
@@ -364,14 +492,29 @@ with patch('subprocess.check_output', output):
     ['full job claims an unexecuted attempt', x => {
       x.routes['actions/runs/222'].run_attempt = 2
       x.routes.graphql.data.node.workflowRun.runAttempt = 2
-      x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs[1].run_attempt = 2
-      x.routes['actions/runs/222/attempts/2/jobs?per_page=100&page=1'] = { jobs: [] }
+      x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs[1].run_attempt = 2
+      x.routes['actions/runs/222/attempts/2/jobs?per_page=10&page=1'] = { jobs: [] }
     }],
   ]
-  for (const name of producer === 'v3' ? ['Validation Source', 'Test', 'Main Release Admission'] : FULL) negatives.push([`main CI cannot skip ${name}`, x => {
-    x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
+  if (current) for (const [runId, label] of [[222, 'legacy premerge'], ...(mode === 'publication' ? [[111, 'main admission']] : [])]) {
+    const route = `actions/runs/${runId}/jobs?filter=latest&per_page=10&page=1`
+    for (const state of ['missing', 'success', 'failure', 'in_progress']) negatives.push([`${label} native skip must be complete: ${state}`, x => {
+      const jobs = x.routes[route].jobs
+      const index = jobs.findIndex(job => job.name === 'Native Feature (${{ matrix.os }})')
+      if (state === 'missing') jobs.splice(index, 1)
+      else if (state === 'in_progress') jobs[index].status = state
+      else jobs[index].conclusion = state
+    }])
+    negatives.push([`${label} cannot accept a partial expanded native skip`, x => {
+      expandedSkipped(x)
+      const jobs = x.routes[route].jobs
+      jobs.splice(jobs.findIndex(job => job.name === 'Native Feature (macos-latest)'), 1)
+    }])
+  }
+  for (const name of light ? ['Validation Source', 'Test', 'Main Release Admission'] : FULL) negatives.push([`main CI cannot skip ${name}`, x => {
+    x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
   }])
-  if (producer === 'v3') {
+  if (grouped) {
     const shard = jobs(222, true).jobs.find(j => j.name.startsWith('Test Block ('))
     const mutateShardRecord = (x, change) => {
       const route = `actions/jobs/${shard.id}/logs`
@@ -379,16 +522,66 @@ with patch('subprocess.check_output', output):
       change(record); x.routes[route].raw = recordLog('GROUPED_TEST_RESULT', record)
     }
     for (const conclusion of ['skipped', 'failure', 'cancelled']) negatives.push([`aggregate green cannot hide ${conclusion} shard`, x => {
-      x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(j => j.id === shard.id).conclusion = conclusion
+      x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(j => j.id === shard.id).conclusion = conclusion
     }])
     negatives.push(['missing shard cannot hide behind green summaries', x => {
-      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs
+      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs
       list.splice(list.findIndex(j => j.id === shard.id), 1)
     }])
     negatives.push(['different compile input cannot reuse an old green shard', x => mutateShardRecord(x, r => { r.planKey = 'e'.repeat(64) })])
     negatives.push(['shard over twenty minutes cannot be admitted', x => mutateShardRecord(x, r => { r.testDurationMs = 1200001 })])
     negatives.push(['ignored cases cannot hide failed shard cases', x => mutateShardRecord(x, r => { r.counts.ignored = r.expected; r.counts.passed = 0 })])
     negatives.push(['shard has no source-bound count receipt', x => { x.routes[`actions/jobs/${shard.id}/logs`].raw = 'no result\n' }])
+  }
+  if (crates) {
+    const eachCrate = (x, change) => {
+      const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs
+      change(list, list.find(job => job.name.startsWith('Test (')))
+    }
+    for (const conclusion of ['skipped', 'failure', 'cancelled']) negatives.push([`aggregate green cannot hide ${conclusion} crate`, x => {
+      eachCrate(x, (_, job) => { job.conclusion = conclusion })
+    }])
+    for (const [name, change] of [
+      ['missing crate', (list, job) => list.splice(list.indexOf(job), 1)],
+      ['duplicate crate', (list, job) => list.push({...copy(job), id: 999999})],
+      ['unexpected crate', (list, job) => list.push({...copy(job), id: 999999, name: 'Test (bamboo-foreign)'})],
+      ['wrong crate source', (_, job) => { job.head_sha = foreign }],
+      ['wrong crate run', (_, job) => { job.run_id++ }],
+      ['future crate attempt', (_, job) => { job.run_attempt = 2 }],
+      ['late crate completion', (_, job) => { job.completed_at = pull.merged_at }],
+      ['missing Cargo step', (_, job) => { job.steps.splice(1, 1) }],
+      ['skipped Cargo step', (_, job) => { job.steps[1].conclusion = 'skipped' }],
+      ['failed Cargo step', (_, job) => { job.steps[1].conclusion = 'failure' }],
+    ]) negatives.push([`${name} cannot hide behind green summaries`, x => eachCrate(x, change)])
+    for (const name of ['Test SSH', `E2E (${packagesByLabel.E2E.at(-1)})`]) {
+      negatives.push([`full acceptance requires successful ${name}`, x => {
+        x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
+      }])
+    }
+    if (serverPartitioned) for (const label of ['Test', 'E2E']) for (const block of blocksByLabel[label]) {
+      const name = `${label} (bamboo-server/${block})`
+      for (const state of ['missing', 'skipped']) negatives.push([`server block ${name} cannot be ${state}`, x => {
+        const list = x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs
+        const index = list.findIndex(job => job.name === name)
+        if (state === 'missing') list.splice(index, 1)
+        else list[index].conclusion = state
+      }])
+    }
+    if (serverPartitioned) for (const [name, change] of [
+      ['an unsplit server job cannot replace its blocks', list => {
+        list.splice(list.findIndex(job => job.name === 'Test (bamboo-server/browser)'), 1)
+        list.push({ ...copy(list[1]), name: 'Test (bamboo-server)' })
+      }],
+      ['server Cargo step cannot be skipped', list => {
+        list.find(job => job.name === 'E2E (bamboo-server/integration)').steps[1].conclusion = 'skipped'
+      }],
+      ['server job must match its original attempt', (_, input) => {
+        const list = input.routes['actions/runs/222/attempts/1/jobs?per_page=10&page=1'].jobs
+        list.splice(list.findIndex(job => job.name === 'Test (bamboo-server/browser)'), 1)
+      }],
+    ]) negatives.push([name, x => change(x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs, x)])
+  }
+  if (light) {
     const changeDefinition = (x, transform, revision = head) => {
       x.routes[`contents/.github/workflows/ci.yml?ref=${revision}`].content =
         Buffer.from(transform(definition.toString())).toString('base64')
@@ -396,9 +589,9 @@ with patch('subprocess.check_output', output):
     for (const [name, transform] of [
       ['changed required job command', text => text.replace('cargo test --locked --no-fail-fast', 'true')],
       ['changed trigger', text => text.replace('branches: [ dev, main ]', 'branches: [ dev ]')],
-      ['changed helper pin', text => text.replace(helperDigest, 'f'.repeat(64))],
-      ['duplicate helper pin', text => `${text}\n# ADMISSION_HELPER_SHA256: "${helperDigest}"\n`],
-      ['missing helper pin', text => text.replace(`ADMISSION_HELPER_SHA256: "${helperDigest}"`, 'REMOVED_PIN: true')],
+      ['changed helper pin', text => text.replace(producerHelperDigest, 'f'.repeat(64))],
+      ['duplicate helper pin', text => `${text}\n# ADMISSION_HELPER_SHA256: "${producerHelperDigest}"\n`],
+      ['missing helper pin', text => text.replace(`ADMISSION_HELPER_SHA256: "${producerHelperDigest}"`, 'REMOVED_PIN: true')],
     ]) negatives.push([name, x => changeDefinition(x, transform)])
     negatives.push(['changed immutable producer helper bytes', x => {
       x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = Buffer.from('raise Exception("foreign helper")\n').toString('base64')
@@ -406,23 +599,70 @@ with patch('subprocess.check_output', output):
     negatives.push(['changed controller helper bytes', x => {
       x.routes[`contents/scripts/main-release-admission.py?ref=${mode === 'main' ? source : controller}`].content = Buffer.from('raise Exception("foreign controller")\n').toString('base64')
     }])
+    if (crates) {
+      const alternate = fs.readFileSync(path.join(__dirname,
+        `fixtures/main-authority-admission-${actualMain ? 'v4' : 'v4-main-3488'}.py`))
+      const alternateDigest = createHash('sha256').update(alternate).digest('hex')
+      if (legacyCrates) {
+        negatives.push(['approved sibling pin cannot authenticate unchanged verifier bytes', x =>
+          changeDefinition(x, text => text.replace(producerHelperDigest, alternateDigest))])
+        negatives.push(['approved pin cannot authenticate sibling verifier bytes', x => {
+          x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = alternate.toString('base64')
+        }])
+      }
+      const platformHelper = fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v5.py'))
+      const foreignHelpers = current ? [alternate, platformHelper,
+        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py')),
+        fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v6.py'))]
+        : producer === 'v6' ? [helper, alternate, platformHelper]
+        : producer === 'v5' ? [helper, alternate,
+          fs.readFileSync(path.join(__dirname, 'fixtures/main-authority-admission-v4.py'))] : [helper, platformHelper]
+      for (const body of foreignHelpers) negatives.push(['verifier digest cannot cross its authenticated workflow family: ' +
+        createHash('sha256').update(body).digest('hex'), x => {
+        const digest = createHash('sha256').update(body).digest('hex')
+        changeDefinition(x, text => text.replace(producerHelperDigest, digest))
+        x.routes[`contents/scripts/main-release-admission.py?ref=${head}`].content = body.toString('base64')
+      }])
+      if (current) negatives.push(['unpublished prior current pin is not a historical producer', x =>
+        changeDefinition(x, text => text.replace(producerHelperDigest,
+          'cf8c4f01856f32da8fd5f3d824cbe367a458b8e38d4feac85107b84ab6f864ef'))])
+      if (current) negatives.push(['unpublished v7 cannot become complete v8 native evidence', x =>
+        changeDefinition(x, text => text.replace(producerHelperDigest,
+          'cfed0ee23810e25fe086660fb94ba7806450255878c7f3da6f68a738f5ba4ff4'))])
+    }
     if (mode === 'publication') {
       negatives.push(['light main admission cannot hide a full test failure', x => {
-        x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === 'Lint').conclusion = 'failure'
+        x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === 'Lint').conclusion = 'failure'
       }])
       negatives.push(['unknown main definition cannot claim admission', x => changeDefinition(x, text => `${text}\n# foreign main\n`, source)])
       negatives.push(['main admission attempt membership differs', x => {
-        x.routes['actions/runs/111/attempts/1/jobs?per_page=100&page=1'].jobs.find(job => job.name === 'Main Release Admission').run_attempt = 9
+        x.routes['actions/runs/111/attempts/1/jobs?per_page=10&page=1'].jobs.find(job => job.name === 'Main Release Admission').run_attempt = 9
       }])
       negatives.push(['mixed literal and expanded skipped matrix is ambiguous', x => {
-        const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs
-        jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: 'Build (ubuntu-latest)' })
+        const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+        jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: platforms[0] })
       }])
       negatives.push(['partial expanded skipped matrix cannot hide a platform', x => {
         expandedSkipped(x)
-        const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=100&page=1'].jobs
-        jobs.splice(jobs.findIndex(job => job.name === 'Build (windows-latest)'), 1)
+        const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+        jobs.splice(jobs.findIndex(job => job.name === platforms.at(-1)), 1)
       }])
+      if (serverPartitioned) for (const label of ['Test', 'E2E']) {
+        negatives.push([`${label} skipped matrix must use the observed jobs API literal`, x => {
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.find(job => job.name.startsWith(`${label} (`)).name =
+            label + " (${{ matrix.crate }}${{ matrix.server_block && format('/{0}', matrix.server_block) || '' }})"
+        }])
+        negatives.push([`${label} partial expanded skipped matrix cannot hide a server block`, x => {
+          expandedSkipped(x)
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.splice(jobs.findIndex(job => job.name === `${label} (bamboo-server/${blocksByLabel[label][0]})`), 1)
+        }])
+        negatives.push([`${label} literal and expanded skipped native jobs cannot be mixed`, x => {
+          const jobs = x.routes['actions/runs/111/jobs?filter=latest&per_page=10&page=1'].jobs
+          jobs.push({ ...copy(jobs.at(-1)), id: 99999, name: `${label} (bamboo-server/${blocksByLabel[label][0]})` })
+        }])
+      }
     } else {
       for (const [name, change] of [
         ['main push payload changed source', x => { x.event.after = foreign }],
@@ -431,11 +671,31 @@ with patch('subprocess.check_output', output):
       ]) negatives.push([name, change])
     }
   }
-  for (const name of PLATFORMS) negatives.push([`pre-merge CI cannot skip ${name}`, x => {
-    x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
+  for (const name of platforms) negatives.push([`pre-merge CI cannot skip ${name}`, x => {
+    x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs.find(job => job.name === name).conclusion = 'skipped'
   }])
+  if (crates) {
+    const latest = 'actions/runs/222/jobs?filter=latest&per_page=10&page=1'
+    const attempt = 'actions/runs/222/attempts/1/jobs?per_page=10&page=1'
+    negatives.push(['platform labels must match the authenticated producer', x => {
+      for (const route of [latest, attempt]) for (const job of x.routes[route].jobs) {
+        if (platforms.includes(job.name)) job.name = job.name.replace(platformLabel, platformLabel === 'Platform Tests' ? 'Build' : 'Platform Tests')
+      }
+    }])
+    for (const [name, change] of [
+      ['missing platform', list => list.splice(list.findIndex(job => job.name === platforms[0]), 1)],
+      ['duplicate platform', list => list.push(copy(list.find(job => job.name === platforms[0])))],
+      ['failed platform', list => { list.find(job => job.name === platforms[0]).conclusion = 'failure' }],
+      ['wrong platform source', list => { list.find(job => job.name === platforms[0]).head_sha = foreign }],
+      ['late platform completion', list => { list.find(job => job.name === platforms[0]).completed_at = pull.merged_at }],
+    ]) negatives.push([name, x => change(x.routes[latest].jobs)])
+    negatives.push(['platform must belong to its original attempt', x => {
+      const list = x.routes[attempt].jobs
+      list.splice(list.findIndex(job => job.name === platforms[0]), 1)
+    }])
+  }
   const suite = x => x.routes.graphql.data.node
-  const sourceJob = x => x.routes['actions/runs/222/jobs?filter=latest&per_page=100&page=1'].jobs[0]
+  const sourceJob = x => x.routes['actions/runs/222/jobs?filter=latest&per_page=10&page=1'].jobs[0]
   const raw = x => x.routes['actions/jobs/22200/logs']
   for (const [name, change] of [
     ['missing association field is not empty', x => { delete x.routes['actions/runs/222'].pull_requests }],
@@ -458,8 +718,8 @@ with patch('subprocess.check_output', output):
     ['GraphQL errors', x => { x.routes.graphql.errors = [{ message: 'unavailable' }] }],
     ['missing source attempt', x => { delete sourceJob(x).run_attempt }],
     ['source job from a future attempt', x => { sourceJob(x).run_attempt = 2 }],
-    ['job absent from its attempt', x => { x.routes['actions/runs/222/attempts/1/jobs?per_page=100&page=1'].jobs.shift() }],
-    ['duplicate source job in attempt', x => { x.routes['actions/runs/222/attempts/1/jobs?per_page=100&page=1'].jobs.push(copy(sourceJob(x))) }],
+    ['job absent from its attempt', x => { x.routes['actions/runs/222/attempts/1/jobs?per_page=10&page=1'].jobs.shift() }],
+    ['duplicate source job in attempt', x => { x.routes['actions/runs/222/attempts/1/jobs?per_page=10&page=1'].jobs.push(copy(sourceJob(x))) }],
     ['wrong job identity', x => { x.routes['actions/jobs/22200'].run_id++ }],
     ['wrong job head', x => { sourceJob(x).head_sha = foreign }],
     ['unexpected source step', x => { sourceJob(x).steps.push({ name: 'Run untrusted checkout' }) }],
@@ -514,4 +774,4 @@ with patch('subprocess.check_output', output):
     assert.equal(result.output, '')
   })
 }
-module.exports = { verify }
+module.exports = { verify, legacyData, acceptedDevData }

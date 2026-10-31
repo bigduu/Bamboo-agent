@@ -44,6 +44,10 @@ pub struct ResolvedRunConfig {
     /// Primary + auxiliary model/provider selection for the scheduled run.
     /// The primary `model` is required; resolve it via `roster.model`.
     pub model_roster: ModelRoster,
+    pub model_provider: Option<Arc<dyn bamboo_llm::LLMProvider>>,
+    pub model_gold_resolver: Option<bamboo_engine::config::GoldTargetResolver>,
+    pub model_is_injected: bool,
+    pub model_error: Option<String>,
     pub reasoning_effort: Option<ReasoningEffort>,
     pub gold_config: Option<GoldConfig>,
     pub system_prompt: String,
@@ -94,6 +98,46 @@ pub struct ScheduleManager {
     tx: mpsc::Sender<ScheduleRunJob>,
     #[cfg(test)]
     guard_progress: ScheduleGuardObservers,
+}
+
+#[cfg(test)]
+mod startup_test_hooks {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::Notify;
+
+    pub(super) struct Hook {
+        pub(super) reached: Notify,
+        pub(super) resume: Notify,
+        pub(super) session_id: Mutex<Option<String>>,
+    }
+
+    fn hooks() -> &'static Mutex<HashMap<String, Arc<Hook>>> {
+        static HOOKS: OnceLock<Mutex<HashMap<String, Arc<Hook>>>> = OnceLock::new();
+        HOOKS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    pub(super) fn install(run_id: &str) -> Arc<Hook> {
+        let hook = Arc::new(Hook {
+            reached: Notify::new(),
+            resume: Notify::new(),
+            session_id: Mutex::new(None),
+        });
+        hooks()
+            .lock()
+            .unwrap()
+            .insert(run_id.to_string(), hook.clone());
+        hook
+    }
+
+    pub(super) async fn pause(run_id: &str, session_id: &str) {
+        let hook = hooks().lock().unwrap().remove(run_id);
+        if let Some(hook) = hook {
+            *hook.session_id.lock().unwrap() = Some(session_id.to_string());
+            hook.reached.notify_one();
+            hook.resume.notified().await;
+        }
+    }
 }
 
 // Only explicitly observed fixture runs are retained. Observations never read
@@ -479,6 +523,9 @@ async fn run_schedule_job(
         validate_workflow_schedule_target(&schedule.trigger, &job.run_config)?;
     }
     let mut resolved = (ctx.resolve_run_config)(&job);
+    if let Some(error) = resolved.model_error.as_ref() {
+        return Err(format!("Configured schedule model is unavailable: {error}"));
+    }
     let explicit_workspace = job
         .run_config
         .workspace_path
@@ -565,6 +612,16 @@ async fn run_schedule_job(
         resolved.reasoning_effort,
         &ctx.workspace_resolver,
     );
+    if resolved.model_provider.is_some() && !resolved.model_is_injected {
+        let provider = resolved
+            .model_roster
+            .provider_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "Configured schedule provider is unavailable".to_string())?;
+        let target = bamboo_domain::ProviderModelRef::new(provider, &resolved_model);
+        bamboo_engine::session_app::provider_model::persist_model_ref(&mut session, &target);
+    }
     let session_id = session.id.clone();
     if let Some(config) = ctx.permission_config.as_ref() {
         config.set_session_workspace(session_id.clone(), session.workspace.clone());
@@ -604,6 +661,9 @@ async fn run_schedule_job(
         .save_runtime_authoritative_flags(&mut session)
         .await
         .map_err(|e| format!("failed to save scheduled session: {e}"))?;
+    // Preserve the exact profile that was exposed by the initial save. A later
+    // PATCH must win over this run's selected provider before execution starts.
+    let scheduled_startup_expected = session.clone();
     #[cfg(test)]
     progress.at("session_bind_pending");
     if let Err(error) = ctx
@@ -630,6 +690,8 @@ async fn run_schedule_job(
     );
     #[cfg(test)]
     progress.at("session_bound");
+    #[cfg(test)]
+    startup_test_hooks::pause(&job.run_id, &session_id).await;
 
     if let Some(reason) = prompt_hook_block {
         return Err(format!(
@@ -724,6 +786,28 @@ async fn run_schedule_job(
         execution_reservation.abandon().await;
         return Err(format!("Root schedule execution binding failed: {error}"));
     }
+    // Configured Schedule runs must atomically recheck the exact model pair
+    // after claiming their Root. Legacy unconfigured injected agents have no
+    // configured binding and retain their existing compatibility path.
+    if resolved.model_provider.is_some() && !resolved.model_is_injected {
+        let saved = match execution_reservation.execution_persistence() {
+            Some(persistence) => {
+                persistence
+                    .save_bound_startup_session(&mut session, &scheduled_startup_expected)
+                    .await
+            }
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "configured Schedule startup requires a bound Root writer",
+            )),
+        };
+        if let Err(error) = saved {
+            execution_reservation.abandon().await;
+            return Err(format!(
+                "Scheduled startup profile was not committed: {error}"
+            ));
+        }
+    }
     let root_publication = execution_reservation.root_actor_writer().map(|owner| {
         bamboo_engine::events::RootActorEventPublication::new(
             ctx.persistence.storage().clone(),
@@ -762,6 +846,8 @@ async fn run_schedule_job(
     // (marking the run terminal, and writing a visible failure marker) is
     // carried by the `on_complete` hook, which runs after the runner is
     // finalized but before the session is persisted — so the marker is saved.
+    // Unmodified custom contexts retain their roster snapshot. The standard
+    // builder's Agent factory replaces this with a live resolver for this run.
     let aux_fast_model = resolved.model_roster.fast_model();
     let aux_fast_provider = resolved.model_roster.fast_model_provider();
     let aux_background_model = resolved.model_roster.background_model();
@@ -772,11 +858,10 @@ async fn run_schedule_job(
         fast_model_name: aux_fast_model.clone(),
         fast_model_provider: aux_fast_provider.clone(),
         background_model_name: aux_background_model.clone(),
-        planning_model_name: None,
-        search_model_name: None,
-        summarization_model_name: aux_summarization_model.clone(),
         background_model_provider: aux_background_provider.clone(),
+        summarization_model_name: aux_summarization_model.clone(),
         summarization_model_provider: aux_summarization_provider.clone(),
+        ..Default::default()
     });
 
     let schedule_store = ctx.schedule_store.clone();
@@ -864,13 +949,17 @@ async fn run_schedule_job(
         })
     });
 
+    let agent = match resolved.model_gold_resolver.clone() {
+        Some(policy) => Arc::new(ctx.agent.with_composed_gold_target_resolver(policy)),
+        None => ctx.agent.clone(),
+    };
     spawn_session_execution(SessionExecutionArgs {
-        agent: ctx.agent.clone(),
+        agent,
         session_id,
         session,
         execution_reservation,
         tools_override: Some(ctx.tools.clone()),
-        provider_override: None,
+        provider_override: resolved.model_provider.clone(),
         model_roster: resolved.model_roster.clone(),
         reasoning_effort: resolved.reasoning_effort,
         reasoning_effort_source: "schedule".to_string(),
@@ -1150,10 +1239,17 @@ pub fn build_schedule_context(
     config: std::sync::Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     provider_registry: Arc<bamboo_llm::ProviderRegistry>,
 ) -> ScheduleContext {
+    // Each execution supplies its own roster key to this shared immutable
+    // resolver. The Agent clone is scoped to Schedule; the caller's Agent and
+    // the public ScheduleContext/ResolvedRunConfig layout remain unchanged.
+    let injected_agent = base.agent.clone();
+    let schedule_agent = Arc::new(base.agent.with_auxiliary_model_resolver_factory(
+        schedule_auxiliary_model_resolver_factory(config.clone(), provider_registry.clone()),
+    ));
     ScheduleContext {
         schedule_store: base.schedule_store,
         workflow_runs: base.workflow_runs,
-        agent: base.agent,
+        agent: schedule_agent,
         tools: base.tools,
         permission_config: base.permission_config,
         sessions_cache: base.sessions_cache,
@@ -1168,17 +1264,77 @@ pub fn build_schedule_context(
         persistence: base.persistence,
         notification_relay: base.notification_relay,
         resolve_run_config: std::sync::Arc::new(move |job: &ScheduleRunJob| {
-            resolve_run_config_from_config(job, &config, &provider_registry)
+            resolve_run_config_from_config(
+                job,
+                &config,
+                &provider_registry,
+                Some(injected_agent.as_ref()),
+            )
         }),
     }
+}
+
+fn schedule_auxiliary_model_resolver_factory(
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    registry: Arc<bamboo_llm::ProviderRegistry>,
+) -> Arc<dyn Fn(&str) -> Arc<dyn Fn() -> AuxiliaryModelConfig + Send + Sync> + Send + Sync> {
+    Arc::new(move |provider_name| {
+        bamboo_engine::model_areas::live_auxiliary_model_resolver(
+            config.clone(),
+            registry.clone(),
+            provider_name.to_string(),
+        )
+    })
+}
+
+#[cfg(test)]
+fn schedule_background_model_resolver(
+    config: Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
+    registry: Arc<bamboo_llm::ProviderRegistry>,
+) -> bamboo_engine::runtime::config::BackgroundModelResolver {
+    Arc::new(move |provider_name| {
+        if provider_name.is_empty() {
+            return None;
+        }
+        config.try_read().ok().and_then(|current| {
+            bamboo_engine::model_config_helper::resolve_background_model(
+                &current,
+                provider_name,
+                &registry,
+            )
+        })
+    })
+}
+
+fn unconfigured_injected_schedule_provider(
+    config: &bamboo_llm::Config,
+    registry: &Arc<bamboo_llm::ProviderRegistry>,
+    target: &bamboo_domain::ProviderModelRef,
+    agent: Option<&bamboo_engine::Agent>,
+) -> Result<Option<Arc<dyn bamboo_llm::LLMProvider>>, bamboo_llm::LLMError> {
+    let Some(agent) = agent else { return Ok(None) };
+    let Some(provider) = agent.legacy_injected_provider_snapshot()? else {
+        return Ok(None);
+    };
+    if !registry.validate_legacy_direct_provider(config, target, &provider, true)? {
+        return Ok(None);
+    }
+    agent.fixed_legacy_injected_provider(&provider)
 }
 
 fn resolve_run_config_from_config(
     job: &ScheduleRunJob,
     config: &std::sync::Arc<tokio::sync::RwLock<bamboo_llm::Config>>,
     provider_registry: &Arc<bamboo_llm::ProviderRegistry>,
+    injected_agent: Option<&bamboo_engine::Agent>,
 ) -> ResolvedRunConfig {
-    let config_snapshot = config.try_read().map(|g| g.clone()).unwrap_or_default();
+    let (config_snapshot, snapshot_error) = match config.try_read() {
+        Ok(snapshot) => (snapshot.clone(), None),
+        Err(_) => (
+            bamboo_llm::Config::default(),
+            Some("Live schedule model configuration is temporarily unavailable".to_string()),
+        ),
+    };
 
     let requested_model = job
         .run_config
@@ -1188,14 +1344,113 @@ fn resolve_run_config_from_config(
         .filter(|v| !v.is_empty())
         .map(|v| v.to_string());
 
-    let model = if let Some(m) = requested_model {
-        m
+    let has_requested_model = requested_model.is_some();
+    let mut target = requested_model
+        .map(|model| {
+            bamboo_domain::ProviderModelRef::new(
+                config_snapshot.effective_default_provider(),
+                model,
+            )
+        })
+        .or_else(|| {
+            if let Some(defaults) = config_snapshot.defaults.as_ref() {
+                Some(defaults.fast.as_ref().unwrap_or(&defaults.chat).clone())
+            } else {
+                bamboo_engine::model_config_helper::get_schedule_model_from_config(&config_snapshot)
+                    .ok()
+                    .map(|model| {
+                        bamboo_domain::ProviderModelRef::new(
+                            config_snapshot.effective_default_provider(),
+                            model,
+                        )
+                    })
+            }
+        })
+        .filter(|_| snapshot_error.is_none());
+    if let (Some(target), Some(effort)) = (target.as_mut(), job.run_config.reasoning_effort) {
+        target.reasoning_effort = Some(effort);
+    }
+    let (model_provider, model_origin, model_error, model_is_injected) = if job
+        .run_config
+        .workflow_target
+        .is_some()
+    {
+        // Tool-only workflows do not need an admitted model/provider pair.
+        (None, None, snapshot_error, false)
     } else {
-        bamboo_engine::model_config_helper::get_schedule_model_from_config(&config_snapshot)
-            .unwrap_or_default()
+        match target.as_ref() {
+            Some(requested) => match bamboo_engine::model_config_helper::try_resolve_primary_model(
+                &config_snapshot,
+                provider_registry,
+                requested,
+            ) {
+                Ok(selected) => {
+                    target = Some(selected.target);
+                    (
+                        Some(selected.provider),
+                        selected.managed_origin,
+                        snapshot_error,
+                        false,
+                    )
+                }
+                Err(error) => {
+                    // Preserve the explicit Host injection only for an entirely
+                    // unconfigured legacy model-only schedule. Never use it to
+                    // replace a missing or rejected configured account.
+                    let providers = config_snapshot.providers();
+                    let legacy_injected = has_requested_model
+                        && !config_snapshot.features.provider_model_ref
+                        && config_snapshot.defaults.is_none()
+                        && config_snapshot.default_provider_instance.is_none()
+                        && config_snapshot.provider_instances.is_empty()
+                        && config_snapshot.provider == bamboo_llm::Config::default().provider
+                        && providers.openai.is_none()
+                        && providers.anthropic.is_none()
+                        && providers.gemini.is_none()
+                        && providers.copilot.is_none()
+                        && providers.bodhi.is_none()
+                        && providers.extra.is_empty();
+                    if legacy_injected && !job.run_config.auto_execute {
+                        // A model-only legacy schedule can create an inert
+                        // session before any provider has been configured.
+                        // No model call or provider binding is claimed here.
+                        (None, None, snapshot_error, false)
+                    } else if legacy_injected {
+                        match unconfigured_injected_schedule_provider(
+                            &config_snapshot,
+                            provider_registry,
+                            requested,
+                            injected_agent,
+                        ) {
+                            Ok(Some(provider)) => (Some(provider), None, None, true),
+                            Ok(None) => (None, None, Some(error.to_string()), false),
+                            Err(snapshot_error) => {
+                                (None, None, Some(snapshot_error.to_string()), false)
+                            }
+                        }
+                    } else {
+                        (None, None, Some(error.to_string()), false)
+                    }
+                }
+            },
+            None => (None, None, snapshot_error, false),
+        }
     };
-
-    let provider_name = Some(config_snapshot.effective_default_provider().to_string());
+    let model = target.as_ref().map(|target| target.model.clone());
+    let provider_name = Some(
+        target
+            .as_ref()
+            .map(|target| target.provider.clone())
+            .unwrap_or_else(|| config_snapshot.effective_default_provider().to_string()),
+    );
+    let model_gold_resolver = provider_name.as_deref().and_then(|name| {
+        crate::app_state::host_gold_origin::managed_selection_resolver(
+            config.clone(),
+            name,
+            model_provider.as_ref(),
+            model_origin.as_ref(),
+        )
+    });
     let provider_type = provider_name.as_deref().and_then(|name| {
         bamboo_engine::model_config_helper::resolve_provider_type(
             &config_snapshot,
@@ -1215,7 +1470,12 @@ fn resolve_run_config_from_config(
     );
 
     let requested_reasoning_effort = job.run_config.reasoning_effort;
-    let reasoning_effort = requested_reasoning_effort.or(config_snapshot.get_reasoning_effort());
+    let reasoning_effort = requested_reasoning_effort.or_else(|| match target.as_ref() {
+        Some(target) => target
+            .reasoning_effort
+            .or_else(|| config_snapshot.reasoning_effort_for_key(&target.provider)),
+        None => config_snapshot.get_reasoning_effort(),
+    });
 
     let global_default_prompt =
         bamboo_engine::prompt_defaults::read_global_default_system_prompt_template();
@@ -1254,10 +1514,14 @@ fn resolve_run_config_from_config(
     );
 
     let model_roster =
-        bamboo_engine::ModelRoster::from_areas(Some(model), provider_name, provider_type, areas);
+        bamboo_engine::ModelRoster::from_areas(model, provider_name, provider_type, areas);
 
     ResolvedRunConfig {
         model_roster,
+        model_provider,
+        model_gold_resolver,
+        model_is_injected,
+        model_error,
         reasoning_effort,
         gold_config: bamboo_engine::model_config_helper::resolve_gold_config(
             &config_snapshot,
@@ -1272,6 +1536,84 @@ fn resolve_run_config_from_config(
 
 #[cfg(test)]
 mod build_context_tests {
+
+    // The standard builder's factory binds the actual run key even when the
+    // current default differs. It also fails closed during config publication.
+    #[tokio::test]
+    async fn schedule_factory_uses_run_provider_and_live_config() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let factory = super::schedule_auxiliary_model_resolver_factory(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+        );
+        let a = factory("account-a");
+        let b = factory("account-b");
+        assert!(a()
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+        assert!(b()
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-b").unwrap())
+            }));
+        let mut guard = fixture.config.write().await;
+        guard.default_provider_instance = Some("account-b".into());
+        let blocked = a();
+        assert!(blocked.background_model_provider.is_none());
+        assert!(blocked.summarization_model_error.is_some());
+        drop(guard);
+        assert!(a()
+            .background_model_provider
+            .as_ref()
+            .is_some_and(|provider| {
+                Arc::ptr_eq(provider, &fixture.registry.get("account-a").unwrap())
+            }));
+        fixture.verify_live(a).await;
+    }
+
+    // Use the Schedule configuration and background callback builders, then
+    // compose their results for the matrix; this is not a whole scheduled run.
+    #[tokio::test]
+    async fn scheduled_run_legacy_background_rechecks_managed_admission() {
+        let fixture = crate::background_live_consumer_tests::Fixture::new().await;
+        let resolved =
+            resolve_run_config_from_config(&test_job(), &fixture.config, &fixture.registry, None);
+        assert_eq!(
+            resolved.model_roster.provider_name.as_deref(),
+            Some("account-a")
+        );
+        // The retained legacy background-only helper receives the frozen roster
+        // key and is composed with fixed roles for this compatibility matrix.
+        // The full live factory and per-run key forwarding are tested separately.
+        let fixed = bamboo_engine::AuxiliaryModelConfig {
+            fast_model_name: resolved.model_roster.fast_model(),
+            fast_model_provider: resolved.model_roster.fast_model_provider(),
+            background_model_name: resolved.model_roster.background_model(),
+            background_model_provider: resolved.model_roster.background_model_provider(),
+            summarization_model_name: resolved.model_roster.summarization_model(),
+            summarization_model_provider: resolved.model_roster.summarization_model_provider(),
+            ..Default::default()
+        };
+        let callback = super::schedule_background_model_resolver(
+            fixture.config.clone(),
+            fixture.registry.clone(),
+        );
+        let provider = resolved.model_roster.provider_name.unwrap();
+        fixture
+            .verify(Arc::new(move || {
+                let mut models = fixed.clone();
+                let background = callback(&provider);
+                models.background_model_name =
+                    background.as_ref().map(|model| model.model_name.clone());
+                models.background_model_provider = background.map(|model| model.provider);
+                models
+            }))
+            .await;
+    }
     use super::ScheduleRunJob;
     use super::{
         resolve_run_config_from_config, schedule_workspace_source,
@@ -1381,8 +1723,12 @@ mod build_context_tests {
             Default::default(),
             "openai".to_string(),
         ));
-        let resolved =
-            resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
+        let resolved = resolve_run_config_from_config(
+            &test_job(),
+            &Arc::new(RwLock::new(config)),
+            &registry,
+            None,
+        );
         assert_eq!(resolved.model_roster.model.as_deref(), Some("gpt-4o-mini"));
     }
 
@@ -1413,8 +1759,12 @@ mod build_context_tests {
             Default::default(),
             "openai".to_string(),
         ));
-        let resolved =
-            resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
+        let resolved = resolve_run_config_from_config(
+            &test_job(),
+            &Arc::new(RwLock::new(config)),
+            &registry,
+            None,
+        );
         assert_eq!(resolved.model_roster.model.as_deref(), Some("gpt-chat"));
     }
 
@@ -1440,12 +1790,20 @@ mod build_context_tests {
             "openai".to_string(),
         ));
 
-        let resolved =
-            resolve_run_config_from_config(&test_job(), &Arc::new(RwLock::new(config)), &registry);
+        let resolved = resolve_run_config_from_config(
+            &test_job(),
+            &Arc::new(RwLock::new(config)),
+            &registry,
+            None,
+        );
 
         assert_eq!(resolved.lifecycle_hooks, lifecycle_hooks);
     }
 }
+
+#[cfg(test)]
+#[path = "model_routing_tests.rs"]
+mod model_routing_tests;
 
 #[cfg(test)]
 mod notify_outcome_tests {
@@ -1922,6 +2280,186 @@ budgets:
         })
         .await;
         result.unwrap_or_else(|_| guard.failed("terminal", last_record, Some(poll_pending)))
+    }
+
+    // Focused safety regression: exercises the real non-Workflow Schedule run
+    // with two isolated config-managed OpenAI-compatible loopback endpoints.
+    #[tokio::test]
+    async fn scheduled_gold_stays_with_accepted_main_origin_after_swap() {
+        use bamboo_domain::ProviderModelRef;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let a = MockServer::start().await;
+        let b = MockServer::start().await;
+        Mock::given(method("POST")).and(path("/chat/completions"))
+            .respond_with(move |request: &wiremock::Request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let model = body["model"].as_str().unwrap();
+                let delta = match model {
+                    "main-a" => serde_json::json!({"content":"synthetic answer"}),
+                    "only-a-gold" => serde_json::json!({"tool_calls":[{"index":0,
+                        "id":"fixture-gold","type":"function","function":{
+                            "name":"report_gold_evaluation","arguments":
+                            "{\"decision\":\"achieved\",\"confidence\":\"high\",\"reasoning\":\"synthetic\",\"missing_information\":[]}"}}]}),
+                    other => panic!("unexpected synthetic model {other}"),
+                };
+                let frame = serde_json::json!({"id":"fixture","object":"chat.completion.chunk","created":0,
+                    "model":model,"choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+                let response = ResponseTemplate::new(200).insert_header("content-type", "text/event-stream")
+                    .set_body_string(format!("data: {frame}\n\ndata: [DONE]\n\n"));
+                if model == "main-a" { response.set_delay(Duration::from_secs(4)) } else { response }
+            }).mount(&a).await;
+        // Auth rejection is deliberate: observe the incorrectly dispatched
+        // request without allowing additional model work or retries.
+        Mock::given(method("POST"))
+            .and(path("/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("synthetic refusal"))
+            .mount(&b)
+            .await;
+
+        let (dir, state, _fixture_provider, tools) = fixture().await;
+        let mut config = state.config.read().await.clone();
+        config.provider = "account-a".into();
+        config.default_provider_instance = Some("account-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.clear();
+        for (name, model, admitted, endpoint) in [
+            (
+                "account-a",
+                "main-a",
+                json!(["main-a", "only-a-gold"]),
+                a.uri(),
+            ),
+            ("account-b", "main-b", json!(["main-b"]), b.uri()),
+        ] {
+            config.provider_instances.insert(
+                name.into(),
+                serde_json::from_value(json!({
+                    "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+                    "base_url":endpoint, "model":model, "runtime_models":admitted
+                }))
+                .unwrap(),
+            );
+        }
+        config.extra.insert(
+            "gold".into(),
+            json!({"enabled":true,
+            "auto_continue_enabled":true,"goal":"synthetic scheduled goal",
+            "model_name":"only-a-gold", "max_auto_continuations":1}),
+        );
+        state
+            .provider_registry
+            .reload_from_config(&config, dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let main_a = state
+            .provider_registry
+            .provider_for_configured_model(&config, &ProviderModelRef::new("account-a", "main-a"))
+            .unwrap();
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-a", "only-a-gold")
+            )
+            .is_ok());
+        assert!(state
+            .provider_registry
+            .provider_for_configured_model(
+                &config,
+                &ProviderModelRef::new("account-b", "only-a-gold")
+            )
+            .is_err());
+        *state.config.write().await = config;
+        *state.provider.write().await = main_a;
+        let mut ctx = context(&state, state.schedule_store.clone(), tools).await;
+        ctx.agent = Arc::new(ctx.agent.with_host_gold_origin_resolver(
+            crate::app_state::host_gold_origin::origin_resolver(
+                state.provider_registry.clone(),
+                state.initial_injected_provider.clone(),
+            ),
+        ));
+        let run_config: ScheduleRunConfig = serde_json::from_value(json!({
+            "auto_execute":true,"model":"main-a","task_message":"synthetic scheduled task"
+        }))
+        .unwrap();
+        let schedule = state
+            .schedule_store
+            .create_schedule(
+                "Gold witness".into(),
+                ScheduleTrigger::Once {
+                    at: Utc::now() + chrono::Duration::hours(1),
+                },
+                true,
+                run_config,
+            )
+            .await
+            .unwrap();
+        let claim = state
+            .schedule_store
+            .create_run_now(&schedule.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let started = run_schedule_job(ctx, job(&claim), None).await.unwrap();
+        assert!(matches!(
+            started,
+            ScheduleRunLifecycleResult::BackgroundExecutionInProgress
+        ));
+
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if !a.received_requests().await.unwrap().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("managed A main request did not arrive");
+        // Reproduce the provider-lock publication step of a reload while A's
+        // response remains delayed; no configuration or network is external.
+        *state.provider.write().await = state.provider_registry.get("account-b").unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if a.received_requests().await.unwrap().iter().any(|request| {
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                        == "only-a-gold"
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the captured account A did not receive Gold");
+        let terminal = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let record = state
+                    .schedule_store
+                    .get_run_record(&claim.run_id)
+                    .await
+                    .unwrap();
+                if record.status.is_terminal() {
+                    break record;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled run did not reach a terminal state");
+        assert_eq!(terminal.status, ScheduleRunStatus::Success);
+        let seen_b = b.received_requests().await.unwrap();
+        assert!(
+            !seen_b.iter().any(|request| {
+                serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                    == "only-a-gold"
+            }),
+            "Gold must never be sent to B"
+        );
     }
 
     mod guard_metadata_tests {

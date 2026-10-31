@@ -139,14 +139,26 @@ impl FileStore {
     }
 
     pub fn open(root: &Path, binding: ScopeBinding) -> Result<Self> {
-        Self::open_with_policy(root, binding, false)
+        Self::open_with_policy(root, binding, false, false)
+    }
+
+    pub(crate) fn open_supervisor_mode_compatible(
+        root: &Path,
+        binding: ScopeBinding,
+    ) -> Result<Self> {
+        Self::open_with_policy(root, binding, false, true)
     }
 
     pub(crate) fn initialize_empty(root: &Path, binding: ScopeBinding) -> Result<Self> {
-        Self::open_with_policy(root, binding, true)
+        Self::open_with_policy(root, binding, true, false)
     }
 
-    fn open_with_policy(root: &Path, binding: ScopeBinding, empty_only: bool) -> Result<Self> {
+    fn open_with_policy(
+        root: &Path,
+        binding: ScopeBinding,
+        empty_only: bool,
+        preserve_supervisor_revision: bool,
+    ) -> Result<Self> {
         if !Self::is_platform_supported() {
             return Err(Error::AuthorityUnavailable(
                 "filesystem platform not validated".into(),
@@ -223,7 +235,15 @@ impl FileStore {
         let head = store.root.join("HEAD");
         if head.exists() {
             match store.load_head() {
-                Ok((hash, snapshot)) if snapshot.binding == binding => {
+                Ok((hash, snapshot))
+                    if snapshot.binding == binding
+                        || (preserve_supervisor_revision
+                            && binding.binding_revision > 0
+                            && snapshot.binding.binding_revision > 0
+                            && snapshot.binding.scope_id == binding.scope_id
+                            && snapshot.binding.supervisor_session_id
+                                == binding.supervisor_session_id) =>
+                {
                     store.published = Some((hash, snapshot));
                 }
                 Ok(_) => {
@@ -365,7 +385,40 @@ impl FileStore {
         Ok(bytes)
     }
 
-    pub fn publish(&mut self, snapshot: Snapshot) -> Result<String> {
+    pub fn publish(&mut self, mut snapshot: Snapshot) -> Result<String> {
+        if snapshot.execution_budget.is_some() || snapshot.execution_facts_seq.is_some() {
+            snapshot.execution_facts_seq = Some(snapshot.seq);
+        }
+        self.publish_snapshot(snapshot)
+    }
+
+    /// The caller holds the original Ticket transaction mutex. Only budget,
+    /// schema and publication sequence may change through this private path;
+    /// compare the complete remaining snapshot so a future caller cannot hide
+    /// a Work, authority, Project or Runtime change as token accounting.
+    pub(crate) fn publish_accounting(&mut self, mut snapshot: Snapshot) -> Result<String> {
+        let current = &self
+            .published
+            .as_ref()
+            .ok_or_else(|| {
+                Error::AuthorityUnavailable("accounting needs a published Ticket snapshot".into())
+            })?
+            .1;
+        let mut unchanged = snapshot.clone();
+        unchanged.seq = current.seq;
+        unchanged.schema = current.schema;
+        unchanged.execution_budget = current.execution_budget.clone();
+        unchanged.execution_facts_seq = current.execution_facts_seq;
+        if canonical_bytes(&unchanged)? != canonical_bytes(current)? {
+            return Err(Error::ScopeDenied(
+                "accounting cannot change execution facts".into(),
+            ));
+        }
+        snapshot.execution_facts_seq = Some(current.execution_facts_revision());
+        self.publish_snapshot(snapshot)
+    }
+
+    fn publish_snapshot(&mut self, snapshot: Snapshot) -> Result<String> {
         if self.health != Health::Writable {
             return Err(Error::AuthorityUnavailable(format!("{:?}", self.health)));
         }
@@ -481,7 +534,7 @@ impl FileStore {
         let commit: Commit = serde_json::from_slice(&self.read_object("commits", hash)?)?;
         let manifest: Manifest =
             serde_json::from_slice(&self.read_object("manifests", &commit.manifest)?)?;
-        if !matches!(commit.schema, 1..=7) || manifest.schema != commit.schema {
+        if !matches!(commit.schema, 1..=8) || manifest.schema != commit.schema {
             return Err(Error::AuthorityUnavailable("unsupported schema".into()));
         }
         let header = manifest

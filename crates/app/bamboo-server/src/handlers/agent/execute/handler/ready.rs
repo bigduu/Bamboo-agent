@@ -47,12 +47,16 @@ pub(super) struct ReadyExecution<'a> {
     pub model_source: &'static str,
     pub reasoning_source: &'static str,
     pub is_child_session: bool,
+    /// Durable Schedule profile captured before preparing this execution.
+    pub scheduled_startup_expected: Option<Box<bamboo_agent_core::Session>>,
     /// The `no_human_approver` posture from THIS execute request. #74: re-derived
     /// per user-initiated execute and written over the session's persisted flag.
     pub no_human_approver: bool,
     /// Optional per-run resource guardrail override from THIS execute request
     /// (issue #221). `None` uses the config-level default.
     pub run_budget: Option<bamboo_config::RunBudgetConfig>,
+    pub upstream_retry: bamboo_llm::retry::UpstreamRetry,
+    pub live_bootstrap_resume: bool,
 }
 
 pub(super) struct ExecuteReadyContext<'a> {
@@ -85,7 +89,62 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     // custom instance id. Canonicalize before reserving or saving the run, and
     // require the exact target to be live. An unresolved explicit/session
     // target must never fall through to the process-wide default provider.
-    let provider_override = if let Some(mut model_ref) = session_effective_model_ref(&session) {
+    let scheduled_target =
+        match bamboo_engine::session_app::provider_model::schedule_bound_model_ref(&session) {
+            Ok(target) => target,
+            Err(error) => {
+                super::fail_reserved_pending_startup(
+                    state,
+                    session_id,
+                    ready.startup_turn_id.as_deref(),
+                    &error,
+                    ready.admission_reservation,
+                    &mut *ready.startup_guard,
+                )
+                .await;
+                return bad_request_error_response(error);
+            }
+        };
+    if session.metadata.contains_key("created_by_schedule_id") && scheduled_target.is_none() {
+        let error = "Scheduled session has no provider/model target";
+        super::fail_reserved_pending_startup(
+            state,
+            session_id,
+            ready.startup_turn_id.as_deref(),
+            error,
+            ready.admission_reservation,
+            &mut *ready.startup_guard,
+        )
+        .await;
+        return bad_request_error_response(error.to_string());
+    }
+    let selected_override = if let Some(target) = scheduled_target {
+        // Re-admit a persisted Schedule pair against the current config and
+        // registry generation, even when the primary-chat flag is disabled.
+        match bamboo_engine::model_config_helper::try_resolve_primary_model(
+            config_snapshot,
+            &state.provider_registry,
+            &target,
+        ) {
+            Ok(selected) => {
+                persist_model_ref(&mut session, &selected.target);
+                (Some(selected.provider), selected.managed_origin)
+            }
+            Err(error) => {
+                let detail = format!("provider routing failed: {error}");
+                super::fail_reserved_pending_startup(
+                    state,
+                    session_id,
+                    ready.startup_turn_id.as_deref(),
+                    &detail,
+                    ready.admission_reservation,
+                    &mut *ready.startup_guard,
+                )
+                .await;
+                return bad_request_error_response(detail);
+            }
+        }
+    } else if let Some(mut model_ref) = session_effective_model_ref(&session) {
         let routing_key = match resolve_provider_routing_key(
             config_snapshot,
             &model_ref.provider,
@@ -108,8 +167,8 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         };
         model_ref.provider = routing_key;
         persist_model_ref(&mut session, &model_ref);
-        match state.provider_router.route(&model_ref) {
-            Ok(provider) => Some(provider),
+        match state.provider_router.route_with_origin(&model_ref) {
+            Ok((provider, managed_registry)) => (Some(provider), managed_registry),
             Err(error) => {
                 let detail = format!("provider routing failed: {error}");
                 super::fail_reserved_pending_startup(
@@ -125,8 +184,32 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             }
         }
     } else {
-        None
+        (None, None)
     };
+    let (provider_override, provider_override_managed_registry) = selected_override;
+    let selected_provider_name = session_effective_model_ref(&session)
+        .map(|target| target.provider)
+        .unwrap_or_else(|| config.provider_name.clone());
+    // Capture at selection, before any live config can be observed by runtime.
+    // Failure is retained as absent evidence and rejected only if the legacy
+    // same-account image conversion actually needs the source.
+    let legacy_vision_provider_source = provider_override.as_ref().and_then(|selected| {
+        bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+            config_snapshot,
+            &selected_provider_name,
+            selected.clone(),
+            provider_override_managed_registry.clone(),
+        )
+        .ok()
+        .map(std::sync::Arc::new)
+    });
+
+    #[cfg(test)]
+    super::super::tests::after_legacy_vision_provider_selection(
+        session_id,
+        provider_override_managed_registry.is_some(),
+    )
+    .await;
 
     // Consult the same provider/model that will execute this session. A legacy
     // Error fallback must not reject explicitly supported native image input.
@@ -195,6 +278,11 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     // `apply_no_human_approver`). Done before the `merge_save_runtime` persist
     // below so the corrected posture is what's stored and handed to the spawn.
     apply_no_human_approver(&mut session, ready.no_human_approver);
+
+    #[cfg(test)]
+    if ready.scheduled_startup_expected.is_some() {
+        crate::handlers::agent::execute::scheduled_startup_test_hooks::pause(session_id).await;
+    }
 
     // ---- Reserve runner ----
     let session_tx = state.get_session_event_sender(session_id).await;
@@ -280,10 +368,25 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
     crate::handlers::agent::events::clear_pending_turn(&mut session);
 
     // ---- Save session before spawn (metadata-group merge) ----
-    let saved = if let Some(persistence) = execution_persistence.as_ref() {
-        persistence.save_runtime_session(&mut session).await
-    } else {
-        state.persistence.merge_save_runtime(&mut session).await
+    let saved = match (
+        ready.scheduled_startup_expected.as_deref(),
+        execution_persistence.as_ref(),
+    ) {
+        (Some(expected), Some(persistence)) => {
+            persistence
+                .save_bound_startup_session(&mut session, expected)
+                .await
+        }
+        (Some(expected), None) => {
+            bamboo_domain::RuntimeSessionPersistence::save_bound_startup_session(
+                state.persistence.as_ref(),
+                &mut session,
+                expected,
+            )
+            .await
+        }
+        (None, Some(persistence)) => persistence.save_runtime_session(&mut session).await,
+        (None, None) => state.persistence.merge_save_runtime(&mut session).await,
     };
     if let Err(error) = saved {
         execution_reservation.abandon().await;
@@ -296,6 +399,15 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
             ready.startup_guard,
         )
         .await;
+        if error
+            .get_ref()
+            .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+        {
+            return HttpResponse::Conflict().json(serde_json::json!({
+                "status": "rejected", "session_id": session_id,
+                "error": crate::error::error_value(error.to_string())
+            }));
+        }
         return internal_server_error_response(format!(
             "Failed to persist session config before execute: {}",
             error
@@ -396,6 +508,8 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         is_child_session: ready.is_child_session,
         provider_name: resolved_provider_name,
         provider_override,
+        provider_override_managed_registry,
+        legacy_vision_provider_source,
         model_roster,
         reasoning_effort: ready.effective_reasoning_effort,
         reasoning_effort_source: ready.reasoning_source.to_string(),
@@ -408,7 +522,12 @@ pub(super) async fn handle_execute_ready(context: ExecuteReadyContext<'_>) -> Ht
         app_data_dir: Some(state.app_data_dir.clone()),
         run_budget: ready.run_budget,
     }
-    .spawn_with_native_inputs(ready.untrusted_inputs, native_binding);
+    .spawn_with_native_inputs_and_retry(
+        ready.untrusted_inputs,
+        native_binding,
+        ready.upstream_retry,
+        ready.live_bootstrap_resume,
+    );
 
     started_response(session_id, sync_info, run_id)
 }

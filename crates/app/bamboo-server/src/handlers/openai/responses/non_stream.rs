@@ -92,6 +92,9 @@ pub(super) async fn handle_non_streaming_response(
                 saw_done = true;
                 break;
             }
+            Ok(bamboo_llm::types::LLMChunk::ProviderUsageReplace(usage)) => {
+                provider_usage.replace(usage)
+            }
             Ok(bamboo_llm::types::LLMChunk::ProviderUsage {
                 input_tokens,
                 output_tokens,

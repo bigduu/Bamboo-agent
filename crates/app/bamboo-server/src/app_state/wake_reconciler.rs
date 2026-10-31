@@ -153,6 +153,7 @@ fn spawn_periodic(
     shutdown: CancellationToken,
     mut schedule: WakeSchedule,
     initial_ids: Vec<String>,
+    observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SCAN_TICK);
@@ -167,6 +168,9 @@ fn spawn_periodic(
                 _ = tick.tick() => {}
             }
             let now = Utc::now();
+            if let Some(observers) = &observers {
+                observers.tick(now).await;
+            }
             if cursor >= ids.len() && tokio::time::Instant::now() >= next_refresh {
                 ids = store
                     .list_index_entries()
@@ -212,10 +216,29 @@ fn spawn_periodic(
 /// Inspect at most one tick's worth of indexed Sessions before serving. The
 /// report distinguishes checked from queued targets; the same paced task
 /// finishes the first sweep and keeps recovering later due/missed wakes.
+#[cfg(test)]
 pub(super) async fn reconcile_startup(
     store: Arc<SessionStoreV2>,
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
+) -> WakeReport {
+    reconcile_startup_inner(store, activation, shutdown, None).await
+}
+
+pub(super) async fn reconcile_startup_with_observers(
+    store: Arc<SessionStoreV2>,
+    activation: Arc<SessionActivationRouter>,
+    shutdown: CancellationToken,
+    observers: Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>,
+) -> WakeReport {
+    reconcile_startup_inner(store, activation, shutdown, Some(observers)).await
+}
+
+async fn reconcile_startup_inner(
+    store: Arc<SessionStoreV2>,
+    activation: Arc<SessionActivationRouter>,
+    shutdown: CancellationToken,
+    observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
 ) -> WakeReport {
     let mut report = WakeReport::default();
     let mut schedule = WakeSchedule::default();
@@ -246,7 +269,7 @@ pub(super) async fn reconcile_startup(
         schedule.observe(entry.id, outcome, now);
     }
     report.queued = queued.len();
-    spawn_periodic(store, activation, shutdown, schedule, queued);
+    spawn_periodic(store, activation, shutdown, schedule, queued, observers);
     report
 }
 

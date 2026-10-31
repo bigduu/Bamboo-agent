@@ -135,9 +135,9 @@ impl Tool for ForeignInteractionTool {
 
 #[derive(Clone, Copy, Debug)]
 enum InteractionSequence {
-    SameBatchAsStart,
-    AfterStart,
-    WithoutStart,
+    SameBatch,
+    Later,
+    Unmanaged,
 }
 
 struct InteractionProvider {
@@ -206,15 +206,15 @@ impl LLMProvider for InteractionProvider {
             .unwrap();
         self.durable_seen.lock().unwrap().push(durable);
         let output = match (self.sequence, round) {
-            (InteractionSequence::SameBatchAsStart, 1) => {
+            (InteractionSequence::SameBatch, 1) => {
                 let LLMChunk::ToolCalls(mut calls) = start_call(2, 8) else {
                     unreachable!("existing helper emits the real Start call")
                 };
                 calls.push(foreign_interaction_call());
                 LLMChunk::ToolCalls(calls)
             }
-            (InteractionSequence::AfterStart, 1) => start_call(2, 8),
-            (InteractionSequence::AfterStart, 2) | (InteractionSequence::WithoutStart, 1) => {
+            (InteractionSequence::Later, 1) => start_call(2, 8),
+            (InteractionSequence::Later, 2) | (InteractionSequence::Unmanaged, 1) => {
                 LLMChunk::ToolCalls(vec![foreign_interaction_call()])
             }
             // RED sources may suspend before reaching these rounds. Do not
@@ -238,7 +238,7 @@ async fn run_interaction_fixture(
     provider: Arc<dyn LLMProvider>,
     tools: Arc<dyn ToolExecutor>,
 ) -> (Result<(), AgentError>, Vec<AgentEvent>) {
-    let (tx, mut rx) = mpsc::channel(512);
+    let (tx, rx) = mpsc::channel(512);
     let storage = fixture.storage.clone();
     let config = fixture.config.take().expect("one activation per fixture");
     let run = run_agent_loop_with_config(
@@ -250,24 +250,42 @@ async fn run_interaction_fixture(
         CancellationToken::new(),
         config,
     );
-    tokio::pin!(run);
-    let mut events = Vec::new();
-    let result = loop {
-        tokio::select! {
-            result = &mut run => break result,
-            event = rx.recv() => {
-                if let Some(event) = event {
+    drive_interaction_and_observe(run, storage, rx).await
+}
+
+async fn drive_interaction_and_observe(
+    run: impl std::future::Future<Output = Result<(), AgentError>>,
+    storage: Arc<dyn Storage>,
+    mut rx: mpsc::Receiver<AgentEvent>,
+) -> (Result<(), AgentError>, Vec<AgentEvent>) {
+    let (finished_tx, mut finished_rx) = tokio::sync::oneshot::channel();
+    let run = async move {
+        let result = run.await;
+        let _ = finished_tx.send(());
+        result
+    };
+    // Like Fixture::drive_and_observe, keep polling the runner while a durable
+    // observation waits on a lock retained by its next checkpoint.
+    let observe = async move {
+        let mut events = Vec::new();
+        loop {
+            tokio::select! {
+                _ = &mut finished_rx => break,
+                event = rx.recv() => {
+                    let Some(event) = event else { break };
                     observe_start_receipt(storage.as_ref(), &event).await;
                     events.push(event);
                 }
             }
         }
+        // Completion must not wait for unrelated retained sender clones.
+        while let Ok(event) = rx.try_recv() {
+            observe_start_receipt(storage.as_ref(), &event).await;
+            events.push(event);
+        }
+        events
     };
-    while let Ok(event) = rx.try_recv() {
-        observe_start_receipt(storage.as_ref(), &event).await;
-        events.push(event);
-    }
-    (result, events)
+    tokio::join!(run, observe)
 }
 
 async fn observe_start_receipt(storage: &dyn Storage, event: &AgentEvent) {
@@ -278,6 +296,78 @@ async fn observe_start_receipt(storage: &dyn Storage, event: &AgentEvent) {
         // contract. Ordinary foreign tool events do not share that promise.
         Fixture::observe_event(storage, event).await;
     }
+}
+
+#[tokio::test]
+async fn interaction_start_observer_pending_read_keeps_runner_polled_and_filters_foreign_events() {
+    let dir = tempfile::tempdir().unwrap();
+    let inner: Arc<dyn Storage> = Arc::new(
+        bamboo_storage::SessionStoreV2::new(dir.path().join("sessions"))
+            .await
+            .unwrap(),
+    );
+    // Only seed the observer's immutable durable pair. This scheduling test
+    // grants no managed execution or control authority.
+    let result = ToolResult::text(true, json!({"loop": {"generation": null}}).to_string());
+    let mut session = Session::new(SESSION_ID, "synthetic-only");
+    let LLMChunk::ToolCalls(calls) = start_call(2, 8) else {
+        unreachable!("the existing helper emits the Start call");
+    };
+    session.add_message(Message::assistant("", Some(calls)));
+    session.add_message(Message::tool_result_with_status(
+        "start",
+        result.result.clone(),
+        result.success,
+    ));
+    inner.save_session(&session).await.unwrap();
+    let storage = Arc::new(ObserverReadBarrierStorage {
+        inner,
+        writer: tokio::sync::Mutex::new(()),
+        read_entered: Notify::new(),
+    });
+    let (tx, rx) = mpsc::channel(2);
+    let retained_sender = tx.clone();
+    let runner_storage = storage.clone();
+    let run = async move {
+        let writer = runner_storage.writer.lock().await;
+        tx.send(AgentEvent::ToolComplete {
+            tool_call_id: "start".into(),
+            result,
+        })
+        .await
+        .unwrap();
+        // A legal pending Storage read cannot finish until the runner is
+        // polled again. No sleep or scheduler timing selects this ordering.
+        runner_storage.read_entered.notified().await;
+        drop(writer);
+        tx.send(AgentEvent::ToolComplete {
+            tool_call_id: INTERACTION_CALL.into(),
+            // Foreign completions have no durable-before-publication promise:
+            // this deliberately unpaired, non-JSON result must not be loaded.
+            result: ToolResult::text(true, "ordinary foreign completion"),
+        })
+        .await
+        .unwrap();
+        Err(AgentError::Cancelled)
+    };
+    let (outcome, events) = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        drive_interaction_and_observe(run, storage, rx),
+    )
+    .await
+    .expect("a pending Start observation must not strand the runner");
+    assert!(matches!(outcome, Err(AgentError::Cancelled)));
+    assert_eq!(events.len(), 2, "retain the Start and queued foreign event");
+    assert!(
+        matches!(&events[0], AgentEvent::ToolComplete { tool_call_id, .. }
+        if tool_call_id == "start")
+    );
+    assert!(
+        matches!(&events[1], AgentEvent::ToolComplete { tool_call_id, .. }
+        if tool_call_id == INTERACTION_CALL)
+    );
+    // A retained sender must not turn completion into a wait for channel close.
+    drop(retained_sender);
 }
 
 fn assert_no_interaction_wait(session: &Session) {
@@ -375,9 +465,9 @@ async fn assert_managed_interaction_continues(
         "{shape:?}/{sequence:?}"
     );
     let expected_rounds = match sequence {
-        InteractionSequence::SameBatchAsStart => 3,
-        InteractionSequence::AfterStart => 4,
-        InteractionSequence::WithoutStart => unreachable!(),
+        InteractionSequence::SameBatch => 3,
+        InteractionSequence::Later => 4,
+        InteractionSequence::Unmanaged => unreachable!(),
     };
     assert_eq!(
         provider.calls.load(Ordering::SeqCst),
@@ -443,49 +533,50 @@ async fn assert_managed_interaction_continues(
     for snapshot in provider.durable_seen.lock().unwrap().iter() {
         assert_no_interaction_wait(snapshot);
     }
-    let observations = provider.seen.lock().unwrap();
-    for messages in observations.iter() {
-        assert!(messages
-            .iter()
-            .any(|message| message.content == ORIGINAL_FACT));
-        assert!(!messages.iter().any(|message| message
-            .metadata
-            .as_ref()
-            .and_then(|metadata| metadata.get("runtime_kind"))
-            .and_then(Value::as_str)
-            == Some("max_rounds_summary")));
-    }
-    let answer_round = match sequence {
-        InteractionSequence::SameBatchAsStart => 2,
-        InteractionSequence::AfterStart => 3,
-        InteractionSequence::WithoutStart => unreachable!(),
-    };
-    for round in answer_round..=expected_rounds {
-        let answer = format!("Real bounded objective answer from provider round {round}.");
-        assert!(
-            fixture
-                .session
-                .messages
+    {
+        let observations = provider.seen.lock().unwrap();
+        for messages in observations.iter() {
+            assert!(messages
                 .iter()
-                .any(|message| message.role == Role::Assistant && message.content == answer),
-            "each iteration requires its actual no-tool answer"
-        );
+                .any(|message| message.content == ORIGINAL_FACT));
+            assert!(!messages.iter().any(|message| message
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("runtime_kind"))
+                .and_then(Value::as_str)
+                == Some("max_rounds_summary")));
+        }
+        let answer_round = match sequence {
+            InteractionSequence::SameBatch => 2,
+            InteractionSequence::Later => 3,
+            InteractionSequence::Unmanaged => unreachable!(),
+        };
+        for round in answer_round..=expected_rounds {
+            let answer = format!("Real bounded objective answer from provider round {round}.");
+            assert!(
+                fixture
+                    .session
+                    .messages
+                    .iter()
+                    .any(|message| message.role == Role::Assistant && message.content == answer),
+                "each iteration requires its actual no-tool answer"
+            );
+        }
     }
-    drop(observations);
     fixture.close().await;
 }
 
 #[tokio::test]
 async fn self_control_managed_foreign_interaction_shapes_cannot_suspend_after_start() {
     for shape in INTERACTION_SHAPES {
-        assert_managed_interaction_continues(shape, InteractionSequence::AfterStart).await;
+        assert_managed_interaction_continues(shape, InteractionSequence::Later).await;
     }
 }
 
 #[tokio::test]
 async fn self_control_start_and_foreign_question_same_batch_recheck_active_policy() {
     for shape in INTERACTION_SHAPES {
-        assert_managed_interaction_continues(shape, InteractionSequence::SameBatchAsStart).await;
+        assert_managed_interaction_continues(shape, InteractionSequence::SameBatch).await;
     }
 }
 
@@ -512,7 +603,7 @@ async fn self_control_host_opt_in_without_start_preserves_ordinary_foreign_quest
         })
         .unwrap();
     let provider = Arc::new(InteractionProvider::new(
-        InteractionSequence::WithoutStart,
+        InteractionSequence::Unmanaged,
         fixture.storage.clone(),
     ));
     let persistence = fixture

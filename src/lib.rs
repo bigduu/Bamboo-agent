@@ -81,6 +81,9 @@ pub mod admin_cli;
 /// The `bamboo -p` headless server mode: full AppState, one-shot, resumable.
 pub mod headless;
 
+#[cfg(test)]
+mod model_entrypoint_routing_tests;
+
 /// Shared `-m`/`--model` CLI-flag grammar (`provider:model` / bare model id),
 /// used by `-p -m`, `actor run|serve -m`, and `broker-agent spawn --model`
 /// so all three parse and validate the same string the same way (#246).

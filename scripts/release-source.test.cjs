@@ -1,9 +1,12 @@
 const assert = require('node:assert/strict')
 const { test } = require('node:test')
-const fs = require('node:fs')
 const { spawnSync } = require('node:child_process')
 const { validateDispatch, REQUIRED } = require('./release-source.cjs')
 const { validateSource } = require('./crate-release.cjs')
+// Retained workflow_run compatibility, not the active frozen-Dev publisher.
+// The hash-checked fixture is the complete raw f0eb67c3 publisher. Its loader
+// bytes also match original test source116c1ec4; preserve the v2/v4 cases below.
+const historicalWorkflow = require('./tests/main-authority-bootstrap-fixture.cjs').acceptedDevData().publisher
 const sha = 'a'.repeat(40), tree = 'b'.repeat(40)
 function fixture() {
   const event = { inputs: { complete_release: 'true', expected_source_sha: sha, accepted_ci_run: '123' } }
@@ -69,14 +72,14 @@ test('earlier CI cannot cover runtime, lockfile, Rust manifest or renamed-source
 })
 
 function automaticBootstrap() {
-  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+  const workflow = historicalWorkflow
   const step = workflow.split('      - name: Authorize the exact source before checkout\n')[1].split('\n      - ')[0]
   const match = step.match(/python3 - <<'([A-Z]+)'\n([\s\S]*?)\n          \1/)
   assert.ok(match, 'Select the named authority step, never an unrelated later Python version step')
   return match[2].split('\n').map(line => line.replace(/^ {10}/, '')).join('\n')
 }
 async function runActualPreflight(t, scenario) {
-  return require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, automaticBootstrap(), 'v3', 'publication', {
+  return require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, automaticBootstrap(), 'v4', 'publication', {
     exercise: ({run, base}) => {
       const environment = {}, change = input => {
         const delivered = input.event.workflow_run, server = input.routes['actions/runs/111']
@@ -102,8 +105,8 @@ async function runActualPreflight(t, scenario) {
   })
 }
 
-test('complete automatic publication has one route and never accepts the experimental manual authority', () => {
-  const workflow = fs.readFileSync('.github/workflows/publish-crate.yml', 'utf8')
+test('historical complete automatic publication has one route and never accepts the experimental manual authority', () => {
+  const workflow = historicalWorkflow
   const automatic = workflow.split('  automatic:\n')[1]
   const condition = automatic.match(/^    if: >-\n([\s\S]*?)\n    runs-on:/m)[1]
   assert.match(condition, /github\.event_name == 'workflow_run'/)
@@ -120,15 +123,15 @@ test('complete automatic publication has one route and never accepts the experim
   assert.match(workflow.split('  automatic:\n')[0], /  dry-run:\n/)
 })
 
-test('actual automatic preflight selects the successful main merge, never the separate release head', async (t) => {
+test('historical automatic preflight selects the successful main merge, never the separate release head', async (t) => {
   const source = automaticBootstrap()
   assert.doesNotMatch(source, /GITHUB_ENV/, 'Source authorization must not write environment state')
-  // Use the existing real Git merge/CI transport fixture for the current dev
+  // Use the existing real Git merge/CI transport fixture for the historical dev
   // controller contract, including advanced dev and exact main output checks.
   await require('./tests/main-authority-bootstrap-fixture.cjs').verify(t, source, 'v2')
 })
 
-test('actual manual complete dispatch stops after the pinned loader, before CI proof or authority output', async t => {
+test('historical manual complete dispatch stops after the pinned loader, before CI proof or authority output', async t => {
   for (const scenario of ['manual_release_head', 'manual_changed_base']) {
     const result = await runActualPreflight(t, scenario)
     assert.notEqual(result.status, 0)
@@ -139,7 +142,7 @@ test('actual manual complete dispatch stops after the pinned loader, before CI p
   }
 })
 
-test('actual automatic preflight preserves CI, protected history and workflow-ref rejection boundaries', async t => {
+test('historical automatic preflight preserves CI, protected history and workflow-ref rejection boundaries', async t => {
   for (const scenario of ['failed', 'cancelled', 'release_pr', 'non_main', 'other_workflow',
     'foreign_repository', 'fork', 'unprotected_main', 'unprotected_dev', 'untrusted_ref',
     'unprotected_workflow_ref', 'unrelated_source', 'unrelated_controller']) {

@@ -371,6 +371,7 @@ pub(super) fn build_root_tools(
     root_creator: Arc<
         dyn bamboo_server_tools::session_control::root_creation::SupervisedRootCreatePort,
     >,
+    root_run: Arc<dyn bamboo_server_tools::session_control::root_run::SupervisedRootRunPort>,
     spawn_scheduler: Arc<SpawnScheduler>,
     sessions: bamboo_engine::SessionCache,
     agent_runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
@@ -427,10 +428,10 @@ pub(super) fn build_root_tools(
     // Planning is delegated to one runtime-enforced read-only child. This keeps
     // the root session in its normal orchestrator posture and reuses the same
     // durable child/wait/completion path as `SubAgent`.
-    let plan_tool = Arc::new(crate::tools::PlanTool::new(
-        adapter.clone(),
-        adapter.clone(),
-    ));
+    let plan_tool = Arc::new(
+        crate::tools::PlanTool::new(adapter.clone(), adapter.clone())
+            .with_artifact_home(session_store.bamboo_home_dir().to_path_buf()),
+    );
     let tools_with_plan: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         tools_with_sub_agent,
         plan_tool,
@@ -460,6 +461,7 @@ pub(super) fn build_root_tools(
             Arc::new(
                 bamboo_server_tools::SessionControlTool::new(session_messenger.clone())
                     .with_root_creator(root_creator)
+                    .with_root_run(root_run)
                     .with_directory(Arc::new(
                         crate::app_state::supervisor_directory::SupervisorSessionDirectory::new(
                             storage.clone(),

@@ -554,9 +554,10 @@ async fn prepare_round_inner(
     let model_name = frame.model_name;
     let debug_enabled = frame.debug_enabled;
 
+    let auxiliary = config.resolve_auxiliary_models();
     let runtime_context = PromptMemoryRuntimeContext {
-        llm: config.background_model_provider.clone().unwrap_or(llm),
-        background_model_name: config.background_model_name.clone(),
+        llm: auxiliary.background_model_provider.unwrap_or(llm),
+        background_model_name: auxiliary.background_model_name,
     };
     let (_, observation) = refresh_round_boundary_inner(
         session,
@@ -594,6 +595,10 @@ async fn prepare_round_inner(
         },
     )
 }
+
+#[cfg(test)]
+#[path = "round_prelude/model_routing_tests.rs"]
+mod model_routing_tests;
 
 #[cfg(test)]
 mod project_prompt_tests {

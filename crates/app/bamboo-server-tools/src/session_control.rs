@@ -2,6 +2,7 @@
 
 pub mod directory;
 pub mod root_creation;
+pub mod root_run;
 pub mod versioned {
     //! Fresh Root creation with separately selected retained operation owners.
     //!
@@ -158,7 +159,7 @@ pub mod versioned {
             Some(FRAMEWORK_ROOT_SPAWN_CONTRACT_V1)
         }
         fn description(&self) -> &str {
-            "Create an independent Ordinary Root in an explicit, existing Host-authorized Project/workspace. This fresh call has the same Root meaning in every supported Session version. Use the installed Host scope's exact revision, a stable operation UUID and one first instruction; missing caller scope is a blocker and grants no Project. The default Host adapter exposes scope through session_control(action=scope) to its authorized Supervisor. Use a different Host-bound checkout when isolation is needed; this tool does not create or bind worktrees. Explicit SubAgent creates a bounded Child sharing its parent's workspace. Exact retries reuse every request field and recover the existing creation/link/Inbox admission/activation; receipts do not mean task completion. No history, model, permissions or Project grants are inherited. A missing, disabled, stale or denied Root entry never falls back to Child spawning."
+            "Create an independent Ordinary Root in an explicit existing Project/workspace. This fresh call has the same Root meaning in every supported Session version. The canonical Supervisor uses its current-user domain by default; other callers need their installed finite Host creation scope. Read session_control(action=scope) and use its exact revision, stable operation UUID and one first instruction. Missing or stale authority is a blocker, never a reason to guess a grant. Use a different existing Host-bound checkout when isolation is needed; this tool does not create or bind worktrees. Explicit SubAgent creates a bounded Child sharing its parent's workspace. Exact retries preserve every field and recover the same Root/Inbox admission/activation; receipts do not mean task completion. No history, model or work permissions are inherited, and default Supervisor access creates no Project ACL. A missing, disabled, stale or denied Root entry never falls back to Child spawning."
         }
         fn parameters_schema(&self) -> Value {
             super::root_creation::request_schema()
@@ -507,6 +508,7 @@ pub mod versioned {
 }
 
 use root_creation::{SupervisedRootCreatePort, SupervisedRootCreateRequest};
+use root_run::SupervisedRootRunPort;
 
 use std::sync::Arc;
 
@@ -534,8 +536,19 @@ enum SessionControlArgs {
     },
     Followup {
         target_session_id: String,
+        #[serde(default)]
+        target_ref: Option<bamboo_domain::SupervisorCurrentUserTarget>,
         operation_id: String,
         message: String,
+    },
+    ObserveRun {
+        target_session_id: String,
+        target_ref: bamboo_domain::SupervisorCurrentUserTarget,
+    },
+    Cancel {
+        target_session_id: String,
+        target_ref: bamboo_domain::SupervisorCurrentUserTarget,
+        expected_run_id: String,
     },
     Loop {
         target_session_id: String,
@@ -551,6 +564,15 @@ pub struct SessionControlTool {
     messenger: Arc<SessionMessenger>,
     root_creator: Option<Arc<dyn SupervisedRootCreatePort>>,
     directory: Option<Arc<dyn directory::SupervisorDirectoryPort>>,
+    root_run: Option<Arc<dyn SupervisedRootRunPort>>,
+}
+
+struct CancelPendingRootRun(bamboo_domain::AdmissionGate);
+
+impl Drop for CancelPendingRootRun {
+    fn drop(&mut self) {
+        self.0.cancel_if_pending();
+    }
 }
 
 impl SessionControlTool {
@@ -559,6 +581,7 @@ impl SessionControlTool {
             messenger,
             root_creator: None,
             directory: None,
+            root_run: None,
         }
     }
 
@@ -576,6 +599,11 @@ impl SessionControlTool {
         self.directory = Some(directory);
         self
     }
+
+    pub fn with_root_run(mut self, port: Arc<dyn SupervisedRootRunPort>) -> Self {
+        self.root_run = Some(port);
+        self
+    }
 }
 
 #[async_trait]
@@ -585,10 +613,16 @@ impl Tool for SessionControlTool {
     }
 
     fn description(&self) -> &str {
-        if self.root_creator.is_some() {
-            return "Supervisor-only control of independent Ordinary Roots in explicitly Host-authorized Projects. scope reads current allowed_projects/state_revision. directory (when the Host installs its port) returns a paginated read-only observation of sessions in the authorized scope: supervisor-created roots and user-opened sessions, each with origin, live-link state, persisted progress and the last canonical Human UI engagement mark; it grants no control and is never completion evidence. create requires that revision, an explicit Project and existing Host-bound workspace, a stable operation UUID and first instruction; creates a new Standard Ordinary Root, attaches only that new lifetime and durably submits the instruction. Reuse the complete request on uncertain results; receipts report creation/link/admission/activation, never completion. No Supervisor history, prompt, model, permissions or Project grants are inherited. It does not create a Ticket/Work or isolated worktree. SubAgent creates a bounded Child instead. Existing followup continues an explicitly attached Root using stable operation_id/message. loop retains its separate live-owner Host grant and finite loop opt-in; mutations need exact link/generation/control CAS. No arbitrary attach, permission change, approval answer, successor or cadence. Report actual blocked stage/reason; never substitute shell execution or create another overlapping worker.";
+        if self.root_run.is_some() && self.root_creator.is_some() {
+            return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. directory (when the Host installs its port) returns a paginated read-only observation of sessions in scope: supervisor-created roots and user-opened sessions, each with origin, live-link state, persisted progress and the last canonical Human UI engagement mark; it grants no control and is never completion evidence. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. For an ordinary Root, observe_run uses that same target_ref and returns its current exact run_id and status; pending means execution has not started. cancel requires the unchanged target_ref and observed expected_run_id. cancel_requested only signals that owner: wait for actual finalization before claiming it stopped. A stale target or run must never be redirected to a successor. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
         }
-        "Supervisor-only control of an already attached independent Root, preserving its original context and authority. followup: use a stable operation_id per target and exactly the same message on retry; returns durable admission/activation status, not task completion. loop: requires a separate explicit host grant for the target's current active execution and its existing finite loop opt-in. command is status/start/update/stop; only status may omit expected_link_revision or query receipt_operation_id. Mutations require the exact nonzero link revision and command generation/control CAS. A target-owner receipt distinguishes queued delivery, committed control and any objective still pending its next iteration. No new session, attachment, successor, cadence, approval answer or permission is created. Plan and approval replay cannot issue loop commands. Pending human questions remain unanswered; use session_history.read_messages for bounded history."
+        if self.root_run.is_some() {
+            return "Supervisor followup and exact Root run control preserve the current user's original Session context. Copy current_user_target from session_history. observe_run returns the current Root run_id and status; pending means execution has not started. cancel requires that same target_ref and exact expected_run_id. cancel_requested signals only that owner and does not prove final termination. A stale target or run must never redirect to a successor. Existing work Sessions keep their permissions. loop remains separately Host-granted; do not answer approvals or use direct file/shell tools.";
+        }
+        if self.root_creator.is_some() {
+            return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
+        }
+        "Supervisor followup preserves a current-user Session's original context and work permissions. Copy current_user_target from session_history list/inspect into target_ref; preserve it, operation_id and message on retry. A stale birth/generation/ancestry is denied, not redirected to a replacement Session. Admission/activation receipts do not prove consumption or completion. No per-Project authorization or attachment is needed. loop is a separate capability: it requires an explicit active-owner Host grant and existing finite opt-in; status/start/update/stop keep exact link/generation/control CAS and objective receipts. Default management does not enable loops, answer pending human approvals, grant permissions, create successors or run a shell. Plan and approval replay cannot issue loop commands."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -598,6 +632,7 @@ impl Tool for SessionControlTool {
                 "action": {"type": "string", "enum": ["followup", "loop"],
                     "description": "followup requires target_session_id, operation_id and message. loop requires target_session_id and command; mutations also require expected_link_revision. Only loop status may query receipt_operation_id or omit the link revision."},
                 "target_session_id": {"type": "string", "minLength": 1, "maxLength": 256},
+                "target_ref": {"type":"object", "description":"followup only: copy the unchanged current_user_target returned by session_history list/inspect. This selects the exact birth/generation, never grants access. Refresh on a stale-target error; an uncertain delivery retains every original argument."},
                 "operation_id": {"type": "string", "minLength": 1, "maxLength": 256,
                     "description": "followup only: stable operation id for this target; no whitespace padding, slashes or '..'. Reuse it only with the same message."},
                 "message": {"type": "string", "minLength": 1, "maxLength": 16384,
@@ -617,12 +652,13 @@ impl Tool for SessionControlTool {
                         "expected_link_revision": false,
                         "receipt_operation_id": false
                     },
-                    "required": ["operation_id", "message"]
+                    "required": ["operation_id", "message", "target_ref"]
                 },
                 {
                     "properties": {
                         "action": {"const": "loop"},
                         "operation_id": false,
+                        "target_ref": false,
                         "message": false
                     },
                     "required": ["command"],
@@ -669,11 +705,15 @@ impl Tool for SessionControlTool {
             }
             let forbidden = [
                 "target_session_id",
+                "target_ref",
                 "operation_id",
                 "message",
                 "expected_link_revision",
                 "command",
                 "receipt_operation_id",
+                "query",
+                "limit",
+                "cursor",
             ];
             let mut scope = json!({"properties":{"action":{"const":"scope"},"request":false}});
             let mut create =
@@ -719,11 +759,63 @@ impl Tool for SessionControlTool {
                 }
             }));
         }
+        if self.root_run.is_some() {
+            let actions = schema["properties"]["action"]["enum"]
+                .as_array_mut()
+                .expect("action enumeration");
+            actions.push(json!("observe_run"));
+            actions.push(json!("cancel"));
+            schema["properties"]["expected_run_id"] = json!({
+                "type":"string", "minLength":1, "maxLength":128,
+                "description":"cancel only: copy the exact run_id from observe_run; never infer or refresh it during an uncertain retry."
+            });
+            schema["properties"]["target_ref"]["description"] = json!(
+                "Copy the unchanged current_user_target from session_history. It selects the exact target birth/generation; it is never a grant."
+            );
+            let variants = schema["oneOf"].as_array_mut().expect("action variants");
+            for variant in variants.iter_mut() {
+                variant["properties"]["expected_run_id"] = Value::Bool(false);
+                if variant["properties"].get("query").is_none() {
+                    variant["properties"]["query"] = Value::Bool(false);
+                }
+                if variant["properties"].get("limit").is_none() {
+                    variant["properties"]["limit"] = Value::Bool(false);
+                }
+                if variant["properties"].get("cursor").is_none() {
+                    variant["properties"]["cursor"] = Value::Bool(false);
+                }
+            }
+            let forbidden = [
+                "operation_id",
+                "message",
+                "expected_link_revision",
+                "command",
+                "receipt_operation_id",
+                "request",
+            ];
+            let mut observe = json!({
+                "properties":{"action":{"const":"observe_run"}, "expected_run_id":false},
+                "required":["target_session_id", "target_ref"]
+            });
+            let mut cancel = json!({
+                "properties":{"action":{"const":"cancel"}},
+                "required":["target_session_id", "target_ref", "expected_run_id"]
+            });
+            for field in forbidden {
+                observe["properties"][field] = Value::Bool(false);
+                cancel["properties"][field] = Value::Bool(false);
+            }
+            variants.push(observe);
+            variants.push(cancel);
+        }
         schema
     }
 
     fn classify(&self, args: &Value) -> ToolClass {
-        if args["action"] == "scope" || args["action"] == "directory" {
+        if args["action"] == "scope"
+            || args["action"] == "directory"
+            || args["action"] == "observe_run"
+        {
             ToolClass::READONLY_PARALLEL
         } else {
             ToolClass::MUTATING_SERIAL
@@ -731,7 +823,11 @@ impl Tool for SessionControlTool {
     }
 
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
-        if ctx.plan_read_only && args["action"] != "scope" && args["action"] != "directory" {
+        if ctx.plan_read_only
+            && args["action"] != "scope"
+            && args["action"] != "directory"
+            && args["action"] != "observe_run"
+        {
             return Err(ToolError::Execution(
                 "session_control is unavailable in Plan mode".into(),
             ));
@@ -747,15 +843,23 @@ impl Tool for SessionControlTool {
                 )
             })?
             .supervisor_reference();
-        let (target_session_id, operation_id, message) = match serde_json::from_value(args)
-            .map_err(|error| {
-                ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
-            })? {
+        let original = ctx.executing_caller_for(caller).ok_or_else(|| {
+            ToolError::Execution("session_control requires its original complete caller".into())
+        })?;
+        let (target_session_id, target_ref, operation_id, message) = match serde_json::from_value(
+            args,
+        )
+        .map_err(|error| {
+            ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
+        })? {
             SessionControlArgs::Scope => {
                 let creator = self.root_creator.as_ref().ok_or_else(|| ToolError::Execution(
                     "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
                 ))?;
-                return creator.scope(&supervisor).await.map(ToolOutcome::Completed);
+                return creator
+                    .scope_observed(original)
+                    .await
+                    .map(ToolOutcome::Completed);
             }
             SessionControlArgs::Directory {
                 query,
@@ -771,12 +875,19 @@ impl Tool for SessionControlTool {
                     cursor,
                 };
                 request.validate()?;
-                return port.directory(&ctx, request).await.map(|page| {
-                    ToolOutcome::Completed(ToolResult::text(
-                        true,
-                        serde_json::to_string(&page).unwrap_or_default(),
-                    ))
-                });
+                return port
+                    .directory(&ctx, request)
+                    .await
+                    .and_then(|page| {
+                        serde_json::to_string(&page).map_err(|error| {
+                            ToolError::Execution(format!(
+                                "session_directory_response_failed: {error}"
+                            ))
+                        })
+                    })
+                    .map(|serialized| {
+                        ToolOutcome::Completed(ToolResult::text(true, serialized))
+                    });
             }
             SessionControlArgs::Create { request } => {
                 request.validate()?;
@@ -784,15 +895,52 @@ impl Tool for SessionControlTool {
                     "supervised_root_create_unavailable: this Host has no scoped Root creation port".into(),
                 ))?;
                 return creator
-                    .create(&supervisor, request)
+                    .create_observed(original, request)
+                    .await
+                    .map(ToolOutcome::Completed);
+            }
+            SessionControlArgs::ObserveRun {
+                target_session_id,
+                target_ref,
+            } => {
+                validate_root_run_caller(original, &supervisor)?;
+                validate_root_run_target(&target_session_id, &target_ref)?;
+                let port = self.root_run.as_ref().ok_or_else(|| {
+                    ToolError::Execution("supervised_root_run_unavailable".into())
+                })?;
+                return port
+                    .observe_run(original, &target_ref)
+                    .await
+                    .map(ToolOutcome::Completed);
+            }
+            SessionControlArgs::Cancel {
+                target_session_id,
+                target_ref,
+                expected_run_id,
+            } => {
+                validate_root_run_caller(original, &supervisor)?;
+                validate_root_run_target(&target_session_id, &target_ref)?;
+                if !bamboo_domain::valid_session_run_id(&expected_run_id) {
+                    return Err(ToolError::InvalidArguments(
+                        "invalid expected_run_id".into(),
+                    ));
+                }
+                let port = self.root_run.as_ref().ok_or_else(|| {
+                    ToolError::Execution("supervised_root_run_unavailable".into())
+                })?;
+                let gate = bamboo_domain::AdmissionGate::default();
+                let _pending = CancelPendingRootRun(gate.clone());
+                return port
+                    .cancel_run(original, &target_ref, &expected_run_id, gate)
                     .await
                     .map(ToolOutcome::Completed);
             }
             SessionControlArgs::Followup {
                 target_session_id,
+                target_ref,
                 operation_id,
                 message,
-            } => (target_session_id, operation_id, message),
+            } => (target_session_id, target_ref, operation_id, message),
             SessionControlArgs::Loop {
                 target_session_id,
                 expected_link_revision,
@@ -830,9 +978,19 @@ impl Tool for SessionControlTool {
                 )));
             }
         };
+        let target_ref = target_ref.filter(|target| target.session_id == target_session_id)
+            .ok_or_else(|| ToolError::InvalidArguments(
+                "followup requires the exact current_user_target from session_history list/inspect; no Project grant or attachment is needed".into()
+            ))?;
         let result = self
             .messenger
-            .supervisor_followup(&supervisor, &target_session_id, &operation_id, &message)
+            .supervisor_current_user_followup(
+                original,
+                &supervisor,
+                &target_ref,
+                &operation_id,
+                &message,
+            )
             .await;
         let (delivery, activation, detail) = match result {
             Ok(receipt) => {
@@ -864,6 +1022,37 @@ impl Tool for SessionControlTool {
             "note": "Admission is durable; this is not completion. A waiting target remains waiting. Retry with the same operation_id and message if activation needs recovery; read results with session_history.read_messages."
         }).to_string())))
     }
+}
+
+fn validate_root_run_caller(
+    caller: &bamboo_domain::SessionCallerReference,
+    supervisor: &SupervisorReference,
+) -> Result<(), ToolError> {
+    if caller.session_id != supervisor.session_id
+        || caller.authority_identity
+            != (bamboo_domain::SessionAuthorityIdentity::Supervisor {
+                incarnation_id: supervisor.incarnation_id,
+            })
+    {
+        return Err(ToolError::Execution(
+            "original Supervisor observations disagree".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_root_run_target(
+    target_session_id: &str,
+    target: &bamboo_domain::SupervisorCurrentUserTarget,
+) -> Result<(), ToolError> {
+    bamboo_domain::validate_supervisor_target_id(target_session_id)
+        .map_err(|error| ToolError::InvalidArguments(error.into()))?;
+    if target.session_id != target_session_id || target.kind != bamboo_domain::SessionKind::Root {
+        return Err(ToolError::InvalidArguments(
+            "exact run control requires the observed ordinary Root target".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Project the shared bounded fields into the remote adapter's strict actions.
@@ -982,6 +1171,27 @@ fn validate_loop_arguments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_root_run_requires_matching_original_supervisor_incarnation() {
+        let mut session =
+            bamboo_domain::Session::new(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        let incarnation_id = uuid::Uuid::from_u128(1);
+        session.authority_identity =
+            bamboo_domain::SessionAuthorityIdentity::Supervisor { incarnation_id };
+        let caller = bamboo_domain::SessionCallerReference::from(&session);
+        let supervisor = SupervisorReference {
+            session_id: session.id.clone(),
+            incarnation_id,
+        };
+        assert!(validate_root_run_caller(&caller, &supervisor).is_ok());
+        let mut replaced = supervisor.clone();
+        replaced.incarnation_id = uuid::Uuid::from_u128(2);
+        assert!(validate_root_run_caller(&caller, &replaced).is_err());
+        let mut ordinary = caller;
+        ordinary.authority_identity = bamboo_domain::SessionAuthorityIdentity::Ordinary;
+        assert!(validate_root_run_caller(&ordinary, &supervisor).is_err());
+    }
 
     #[test]
     fn status_bootstrap_and_receipt_lookup_are_valid_structures_not_authority_grants() {

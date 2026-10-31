@@ -26,7 +26,9 @@ static AUXILIARY_BUDGETS: OnceLock<Mutex<HashMap<AuxiliaryBudgetKey, AuxiliaryBu
     OnceLock::new();
 
 fn provider_identity(provider: &Arc<dyn LLMProvider>) -> usize {
-    Arc::as_ptr(provider) as *const () as usize
+    provider
+        .resource_allocation_identity()
+        .unwrap_or(Arc::as_ptr(provider) as *const () as usize)
 }
 
 fn semaphore(
@@ -466,7 +468,10 @@ mod tests {
         concrete.release.add_permits(2);
 
         task_handle.await.expect("Task path joins");
-        gold_handle.await.expect("Gold path joins");
+        gold_handle
+            .await
+            .expect("Gold path joins")
+            .expect("Gold evaluation has no pre-dispatch rejection");
         auto_state_handle
             .await
             .expect("Gold auto-answer state path joins")
@@ -627,7 +632,10 @@ mod tests {
             task.error, None,
             "Task request should retain a fresh timeout"
         );
-        let gold = gold_handle.await.expect("queued Gold joins");
+        let gold = gold_handle
+            .await
+            .expect("queued Gold joins")
+            .expect("queued Gold evaluation has no pre-dispatch rejection");
         assert!(
             !gold.evaluation_result.reasoning.contains("failed"),
             "Gold request should retain a fresh timeout: {}",

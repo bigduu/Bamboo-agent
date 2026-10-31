@@ -110,12 +110,25 @@ mod root_actor_input;
 #[cfg(test)]
 mod root_actor_input_tests;
 mod root_actor_runtime;
+#[cfg(test)]
+mod root_birth_tests;
+#[cfg(test)]
+mod root_live_bootstrap_tests;
 mod scoped_loop_control;
 #[cfg(test)]
 mod scoped_loop_control_tests;
 pub(crate) mod scoped_transport_expiry;
 #[cfg(test)]
 mod session_compatibility_tests;
+mod session_version_migration;
+pub use session_version_migration::{
+    SessionVersionMigrationBlocker, SessionVersionMigrationDecision,
+    SessionVersionMigrationObservation, SessionVersionMigrationReceipt,
+    SessionVersionMigrationRequest,
+};
+
+#[cfg(test)]
+mod session_version_migration_tests;
 mod title_observations;
 pub use host_registry::FileHostRegistry;
 #[cfg(test)]
@@ -145,7 +158,9 @@ mod root_lifetime_tests;
 mod root_mode_actor_context_tests;
 mod supervisor;
 mod supervisor_management;
-pub(crate) use supervisor_management::SupervisorFollowupGuard;
+pub(crate) use supervisor_management::{
+    subscriptions::ObserverNoticeAuthority, CurrentUserTargetGuard, SupervisorFollowupGuard,
+};
 #[cfg(test)]
 mod session_directory_tests;
 #[cfg(test)]
@@ -569,12 +584,17 @@ impl Drop for PeerDeliveryGuard {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct SessionLifecycleWriteGuard {
+    _lease: Arc<SessionLifecycleWriteLease>,
+}
+
+struct SessionLifecycleWriteLease {
     _process: OwnedRwLockWriteGuard<()>,
     file: std::fs::File,
 }
 
-impl Drop for SessionLifecycleWriteGuard {
+impl Drop for SessionLifecycleWriteLease {
     fn drop(&mut self) {
         let _ = FileExt::unlock(&self.file);
     }
@@ -643,6 +663,76 @@ fn reject_session_version_change(incoming: &Session, durable: &Session) -> io::R
         )));
     }
     Ok(())
+}
+
+/// Control-plane decoding retains the exact Session/caller fields and shared
+/// pair validation, but serde skips the two transcript payloads entirely.
+/// Whole-Main framing is still validated; a prefix alone never grants authority.
+struct SessionControlPlane {
+    session: Session,
+}
+
+impl<'de> Deserialize<'de> for SessionControlPlane {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ControlVisitor;
+        impl<'de> serde::de::Visitor<'de> for ControlVisitor {
+            type Value = SessionControlPlane;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a canonical Session control plane")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                // Keep Session's exact required/default/duplicate-field rules.
+                // Replace only the required messages value with an empty array;
+                // the optional native transcript keeps its existing default.
+                Session::deserialize(serde::de::value::MapAccessDeserializer::new(ControlMap {
+                    inner: map,
+                    messages: false,
+                }))
+                .map(|session| SessionControlPlane { session })
+            }
+        }
+        struct ControlMap<A> {
+            inner: A,
+            messages: bool,
+        }
+        impl<'de, A: serde::de::MapAccess<'de>> serde::de::MapAccess<'de> for ControlMap<A> {
+            type Error = A::Error;
+            fn next_key_seed<K: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: K,
+            ) -> Result<Option<K::Value>, Self::Error> {
+                loop {
+                    let Some(key) = self.inner.next_key::<String>()? else {
+                        return Ok(None);
+                    };
+                    if key == "provider_transcript" {
+                        self.inner.next_value::<serde::de::IgnoredAny>()?;
+                        continue;
+                    }
+                    self.messages = key == "messages";
+                    return seed
+                        .deserialize(serde::de::value::StringDeserializer::<A::Error>::new(key))
+                        .map(Some);
+                }
+            }
+            fn next_value_seed<V: serde::de::DeserializeSeed<'de>>(
+                &mut self,
+                seed: V,
+            ) -> Result<V::Value, Self::Error> {
+                if self.messages {
+                    self.inner.next_value::<serde::de::IgnoredAny>()?;
+                    seed.deserialize(&mut serde_json::Deserializer::from_str("[]"))
+                        .map_err(serde::de::Error::custom)
+                } else {
+                    self.inner.next_value_seed(seed)
+                }
+            }
+        }
+        deserializer.deserialize_map(ControlVisitor)
+    }
 }
 
 /// Build the sidecar snapshot: the full session minus its `messages` history.
@@ -1484,6 +1574,9 @@ pub struct SessionStoreV2 {
     #[cfg(test)]
     runtime_task_faults: std::sync::Mutex<Vec<RuntimeTaskTransactionFault>>,
     #[cfg(test)]
+    session_version_migration_fault:
+        std::sync::Mutex<Option<session_version_migration::MigrationFault>>,
+    #[cfg(test)]
     runtime_task_first_write_pause: std::sync::Mutex<Option<RuntimeTaskFirstWritePause>>,
     #[cfg(test)]
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
@@ -1817,6 +1910,8 @@ impl SessionStoreV2 {
             #[cfg(test)]
             runtime_task_faults: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
+            session_version_migration_fault: std::sync::Mutex::new(None),
+            #[cfg(test)]
             runtime_task_first_write_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
@@ -1854,6 +1949,8 @@ impl SessionStoreV2 {
         storage.ensure_runtime_task_transaction_dir().await?;
         storage.ensure_session_copy_transaction_dir().await?;
         storage.ensure_session_write_lock_dir().await?;
+        storage.ensure_session_version_migration_dir().await?;
+        storage.recover_session_version_migrations().await?;
 
         // Constructor recovery takes the same cross-process exclusive gate as
         // a live commit. A second store can therefore recover an orphan, but
@@ -2154,13 +2251,32 @@ impl SessionStoreV2 {
         expected_kind: SessionKind,
         expected_root_id: &str,
     ) -> io::Result<Option<Session>> {
+        self.load_session_from_dir_strict_view(abs_dir, id, expected_kind, expected_root_id, false)
+            .await
+    }
+
+    /// Same canonical pair, revocation and proof validation as the full reader.
+    /// The control view never deserializes private messages/provider history.
+    async fn load_session_from_dir_strict_view(
+        &self,
+        abs_dir: &Path,
+        id: &str,
+        expected_kind: SessionKind,
+        expected_root_id: &str,
+        control_only: bool,
+    ) -> io::Result<Option<Session>> {
         let raw = match fs::read_to_string(abs_dir.join("session.json")).await {
             Ok(raw) => raw,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error),
         };
         compact_main::validate_full_main(raw.as_bytes())?;
-        let mut main: Session = serde_json::from_str(&raw).map_err(|error| {
+        let mut main = if control_only {
+            serde_json::from_str::<SessionControlPlane>(&raw).map(|value| value.session)
+        } else {
+            serde_json::from_str::<Session>(&raw)
+        }
+        .map_err(|error| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("invalid source session.json: {error}"),
@@ -2191,7 +2307,12 @@ impl SessionStoreV2 {
         let runtime_path = abs_dir.join(RUNTIME_SIDECAR_FILE);
         let sidecar = match fs::read_to_string(&runtime_path).await {
             Ok(raw) => {
-                let mut sidecar: Session = serde_json::from_str(&raw).map_err(|error| {
+                let mut sidecar = if control_only {
+                    serde_json::from_str::<SessionControlPlane>(&raw).map(|value| value.session)
+                } else {
+                    serde_json::from_str::<Session>(&raw)
+                }
+                .map_err(|error| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("invalid source runtime.json: {error}"),
@@ -2630,6 +2751,8 @@ impl SessionStoreV2 {
                 .write(true)
                 .open(&path)?;
             if exclusive {
+                #[cfg(test)]
+                session_version_migration_tests::lifecycle_attempted(&path);
                 FileExt::lock_exclusive(&file)?;
             } else {
                 FileExt::lock_shared(&file)?;
@@ -2821,7 +2944,20 @@ impl SessionStoreV2 {
             .map_err(|error| other_io_error(error.to_string()))
     }
 
+    async fn peer_delivery_control_session(&self, id: &str, root_id: &str) -> io::Result<Session> {
+        self.peer_delivery_session_view(id, root_id, true).await
+    }
+
     async fn peer_delivery_session(&self, id: &str, root_id: &str) -> io::Result<Session> {
+        self.peer_delivery_session_view(id, root_id, false).await
+    }
+
+    async fn peer_delivery_session_view(
+        &self,
+        id: &str,
+        root_id: &str,
+        control_only: bool,
+    ) -> io::Result<Session> {
         let kind = if id == root_id {
             SessionKind::Root
         } else {
@@ -2833,7 +2969,13 @@ impl SessionStoreV2 {
             Self::child_rel_path(root_id, id)
         };
         let session = self
-            .load_session_from_dir_strict(&self.abs_path_from_rel(&rel), id, kind, root_id)
+            .load_session_from_dir_strict_view(
+                &self.abs_path_from_rel(&rel),
+                id,
+                kind,
+                root_id,
+                control_only,
+            )
             .await?
             .ok_or_else(|| other_io_error("peer Session no longer exists"))?;
         if session
@@ -2852,8 +2994,10 @@ impl SessionStoreV2 {
         let process = self.session_lifecycle_lock.clone().write_owned().await;
         let file = self.open_session_lifecycle_file(true).await?;
         Ok(SessionLifecycleWriteGuard {
-            _process: process,
-            file,
+            _lease: Arc::new(SessionLifecycleWriteLease {
+                _process: process,
+                file,
+            }),
         })
     }
 
@@ -3209,6 +3353,12 @@ impl SessionStoreV2 {
     }
 
     async fn ensure_no_runtime_task_journal_locked(&self) -> io::Result<()> {
+        if !self.session_version_migration_journals().await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Session version migration recovery is required before control-plane access",
+            ));
+        }
         match self.runtime_task_journal_paths().await {
             Ok(paths) if paths.is_empty() => {
                 self.runtime_task_recovery_required
@@ -3707,6 +3857,7 @@ impl SessionStoreV2 {
         event: RuntimeTaskDurabilityEvent,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        self.ensure_no_session_version_migration_locked().await?;
         validate_session_id(&session.id)?;
         let Some(rel) = self.resolve_rel_path(&session.id).await else {
             return Err(io::Error::new(
@@ -3989,6 +4140,12 @@ impl SessionStoreV2 {
         &self,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        if !self.session_version_migration_journals().await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Session version migration must recover before Task transactions",
+            ));
+        }
         let paths = self.runtime_task_journal_paths().await?;
         for path in paths {
             let journal = match self.read_runtime_task_journal(&path).await {
@@ -4348,6 +4505,12 @@ impl SessionStoreV2 {
     }
 
     async fn recover_all_session_copy_transactions_locked(&self) -> io::Result<()> {
+        if !self.session_version_migration_journals().await?.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "Session version migration must recover before copy transactions",
+            ));
+        }
         let mut families: HashMap<String, Vec<PathBuf>> = HashMap::new();
         for path in self.session_copy_journal_paths().await? {
             let id = path
@@ -4389,6 +4552,7 @@ impl SessionStoreV2 {
         second_session_id: &str,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<()> {
+        self.ensure_no_session_version_migration_locked().await?;
         validate_session_id(first_session_id)?;
         validate_session_id(second_session_id)?;
         if first_session_id >= second_session_id {
@@ -4570,6 +4734,7 @@ impl SessionStoreV2 {
         second_updated: &Session,
         guard: &RuntimeTaskTransactionWriteGuard,
     ) -> io::Result<bool> {
+        self.ensure_no_session_version_migration_locked().await?;
         for session in [
             first_original,
             first_updated,
@@ -6313,6 +6478,19 @@ async fn atomic_rename(from: &Path, to: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     {
+        atomic_rename_blocking(from, to)
+    }
+}
+
+// Owned writer jobs retain their authority while the complete rename and
+// caller-owned directory synchronization run on the same blocking worker.
+fn atomic_rename_blocking(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)
+    }
+    #[cfg(windows)]
+    {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::Storage::FileSystem::{
             MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
@@ -6685,6 +6863,7 @@ impl SessionStoreV2 {
             None => None,
         };
         let session = reconciled.as_ref().unwrap_or(session);
+        self.check_root_birth_guards(session, guards, false).await?;
         self.check_default_or_root_actor_context(
             session,
             &self.abs_path_from_rel(rel),
@@ -6920,6 +7099,7 @@ impl SessionStoreV2 {
             ));
         }
 
+        self.check_root_birth_guards(session, guards, true).await?;
         let intended_rel = Self::default_writer_rel_path(session)?;
         self.check_default_or_root_actor_context(
             session,
@@ -7165,9 +7345,25 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn load_host_scoped_context_target(
+        &self,
+        token: &bamboo_domain::HostSessionScopeToken,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.load_host_scoped_context_target_impl(token, caller, target_id)
+            .await
+    }
+
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
+        if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "manual title target has no canonical Root source",
+            ));
+        }
         let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Full)
@@ -7270,6 +7466,29 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn checkpoint_root_live_bootstrap(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        session: &Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        gate: bamboo_domain::AdmissionGate,
+        publish: bamboo_domain::RootActorRuntimePublisher,
+    ) -> io::Result<bamboo_domain::LiveBootstrapProof> {
+        self.checkpoint_root_live_bootstrap_impl(owner, session, inbox, gate, publish)
+            .await
+    }
+
+    async fn confirm_root_live_bootstrap(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        proof: &bamboo_domain::LiveBootstrapProof,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        publish: bamboo_domain::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        self.confirm_root_live_bootstrap_impl(owner, proof, inbox, publish)
+            .await
+    }
+
     async fn save_root_actor_runtime(
         &self,
         owner: &bamboo_domain::storage::RootActorRuntimeWrite,
@@ -7278,6 +7497,22 @@ impl Storage for SessionStoreV2 {
         publish: bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<()> {
         self.save_root_actor_runtime_impl(owner, session, runtime_only, publish)
+            .await
+    }
+
+    fn supports_root_actor_bound_startup(&self) -> bool {
+        true
+    }
+
+    async fn save_root_actor_bound_startup(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, publish)
             .await
     }
 
@@ -7448,6 +7683,47 @@ impl Storage for SessionStoreV2 {
         self.management_scope(supervisor).await
     }
 
+    async fn inspect_supervisor_current_user_scope(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserScope> {
+        self.current_user_supervisor_scope(supervisor).await
+    }
+
+    async fn list_supervisor_current_user_targets(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        query: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserPage> {
+        self.current_user_supervisor_page(supervisor, query, after, limit)
+            .await
+    }
+
+    async fn inspect_supervisor_current_user_target(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &str,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserTarget> {
+        self.current_user_supervisor_target(supervisor, target)
+            .await
+    }
+
+    async fn load_supervisor_current_user_observed_session(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorCurrentUserTarget)> {
+        let guard = self.lock_current_user_target(supervisor, target).await?;
+        // History is requested explicitly. Retain the same physical guard set
+        // while reading it, so its observation cannot come from another birth.
+        let full = self
+            .peer_delivery_session(target, &guard.target.root_session_id)
+            .await?;
+        Ok((full, guard.reference.clone()))
+    }
+
     async fn mutate_supervisor_management(
         &self,
         request: &bamboo_domain::SupervisorManagementRequest,
@@ -7471,9 +7747,51 @@ impl Storage for SessionStoreV2 {
         self.management_history(supervisor, target_session_id).await
     }
 
+    async fn is_supervisor_observer_child(
+        &self,
+        parent: &Session,
+        child_id: &str,
+    ) -> io::Result<bool> {
+        self.observer_classification(parent, child_id).await
+    }
+
+    async fn supervisor_observer_activation(&self, child: &Session) -> io::Result<bool> {
+        self.observer_activation(child).await
+    }
+
+    async fn load_supervisor_observer_context_target(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorObserverContext)> {
+        self.observer_context_target(caller, target_id).await
+    }
+
+    async fn load_supervisor_context_target(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorLinkObservation)> {
+        self.management_context(supervisor, target_id).await
+    }
+
     async fn save_session(&self, session: &Session) -> io::Result<()> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
+        if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
+            // Release shared lifecycle before requesting exclusive ownership;
+            // no Task, Session or tree guard is retained across this change.
+            drop(lifecycle);
+            let lifecycle = self.lock_session_lifecycle_exclusive().await?;
+            let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+            let session_write = self
+                .acquire_session_write_lock(&session.id, SaveKind::Full)
+                .await?;
+            let guards = DefaultWriterGuards::root_birth(lifecycle, runtime_task, session_write);
+            return self
+                .save_session_after_lock(session, total_started, &guards, None)
+                .await;
+        }
         let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         let session_write = self
             .acquire_session_write_lock(&session.id, SaveKind::Full)
@@ -9289,6 +9607,9 @@ mod tests {
         let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
         let paused = session_with_history("convoy-full-a", 2, "run-a");
         let unrelated = session_with_history("convoy-full-b", 2, "run-b");
+        // Existing Root updates share lifecycle authority; first births do not.
+        storage.save_session(&paused).await?;
+        storage.save_session(&unrelated).await?;
         let (reached, release) =
             storage.pause_full_save_before_filesystem_commit_for_test(&paused.id);
 
@@ -9316,6 +9637,7 @@ mod tests {
         let storage = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
         let paused = session_with_history("convoy-runtime-a", 2, "run-a");
         let mut unrelated = session_with_history("convoy-runtime-b", 2, "run-b");
+        storage.save_session(&paused).await?;
         storage.save_session(&unrelated).await?;
         unrelated.agent_runtime_state = Some(AgentRuntimeState::new("run-b-next"));
         let (reached, release) =
@@ -9474,6 +9796,7 @@ mod tests {
         let second = Arc::new(SessionStoreV2::new(temp.path().to_path_buf()).await?);
 
         let unrelated = session_with_history("cross-store-unrelated", 2, "run-b");
+        second.save_session(&unrelated).await?;
         let mut runtime = shared.clone();
         runtime.agent_runtime_state = Some(AgentRuntimeState::new("run-after-cross-store-full"));
         let (reached, release) =

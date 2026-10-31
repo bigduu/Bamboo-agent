@@ -11,6 +11,7 @@ test-utils = []
 
 [dependencies]
 bamboo-agent-core = { path = "../../core/bamboo-agent-core" }
+bamboo-compression = { path = "../../infra/bamboo-compression" }
 bamboo-engine = { path = "../../engine/bamboo-engine" }
 bamboo-domain = { path = "../../core/bamboo-domain" }
 bamboo-infrastructure = { path = "../../infra/bamboo-infrastructure" }
@@ -30,7 +31,7 @@ serde_json = "1"
 async-trait = "0.1"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-parking_lot = "0.12"
+parking_lot = "0.13"
 dashmap = "6"
 uuid = { version = "1", features = ["v4"] }
 chrono.workspace = true
@@ -38,7 +39,7 @@ sha2 = "0.11"
 hex = "0.4"
 
 [dev-dependencies]
-jsonschema = { version = "0.58.6", default-features = false, features = ["idna"] }
+jsonschema = { version = "0.60.0", default-features = false, features = ["idna"] }
 bamboo-config = { path = "../../infra/bamboo-config", features = ["test-utils"] }
 tempfile = "3"
 futures = "0.3"

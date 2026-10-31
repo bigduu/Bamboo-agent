@@ -1200,6 +1200,13 @@ async fn admit_session_inbox(
         }
         admission.observation_complete = index + 1 == count;
     }
+    // A claimed input must either reach its matching durable transcript and
+    // ACK, or stop this turn before provider dispatch. Several recoverable
+    // proof/checkpoint failures above deliberately keep `cur` intact; none may
+    // turn an incomplete observation into an empty successful prompt.
+    if !admission.observation_complete && admission.admission_error.is_none() {
+        admission.admission_error = Some(INBOX_CLAIM_UNRESOLVED.to_string());
+    }
     admission
 }
 
@@ -1912,9 +1919,10 @@ mod tests {
             "e",
         )
         .await;
-        assert!(
-            refresh.admission_error.is_none(),
-            "preserve original non-error checkpoint branch"
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED),
+            "an uncheckpointed claim must stop before provider dispatch"
         );
         assert_eq!(refresh.merged, 0);
         assert!(refresh.committed_messages.is_empty());
@@ -3153,6 +3161,10 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.merged, 0);
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED)
+        );
         assert!(!running
             .messages
             .iter()
@@ -3215,6 +3227,10 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.merged, 0);
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED)
+        );
         assert!(!running
             .session_inbox_admission()
             .is_some_and(|state| state.contains(&envelope.id)));
@@ -3251,6 +3267,10 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.merged, 0);
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED)
+        );
         let backlog = inbox.inspect(&running.id).await.unwrap();
         assert_eq!(backlog.claimed, 1);
         assert!(!inbox.was_admitted(&running.id, &envelope.id).await.unwrap());
@@ -3288,6 +3308,10 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.merged, 0);
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED)
+        );
         assert_eq!(inbox.inspect(&running.id).await.unwrap().claimed, 1);
         assert!(!inbox.was_admitted(&running.id, &envelope.id).await.unwrap());
         let durable = store.load_session(&running.id).await.unwrap().unwrap();
@@ -3321,6 +3345,10 @@ mod tests {
         )
         .await;
         assert_eq!(refresh.merged, 0);
+        assert_eq!(
+            refresh.admission_error.as_deref(),
+            Some(INBOX_CLAIM_UNRESOLVED)
+        );
         assert_eq!(ack_count.load(Ordering::SeqCst), 0);
         assert_eq!(real_inbox.inspect(&running.id).await.unwrap().claimed, 1);
     }

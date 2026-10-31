@@ -20,7 +20,7 @@ use crate::runtime::guardian_state::{
     write_guardian_state, GuardianPhase, GUARDIAN_REVIEW_RUBRIC,
 };
 use crate::runtime::runner::loop_execution::startup::{
-    resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState,
+    resolve_auxiliary_models, InFlightTaskEvaluation, LoopRunState, QueuedEvaluation,
 };
 use crate::runtime::runner::prompt_context::PromptMemoryRuntimeContext;
 use crate::runtime::runner::session_setup::tool_schemas::{
@@ -50,7 +50,8 @@ use bamboo_metrics::{
 use super::super::to_event_token_usage;
 use super::gold::{
     apply_completed_gold_evaluation, evaluate_gold_terminal, poll_completed_gold_evaluation,
-    spawn_gold_evaluation_if_needed, start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
+    select_gold_evaluation_provider, spawn_gold_evaluation_if_needed,
+    start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
 use crate::runtime::runner::state_bridge;
 
@@ -944,13 +945,18 @@ const PLAN_TOOL_NAME: &str = "Plan";
 
 /// True when `call` creates one new child session.
 ///
-/// Every `Plan` call creates exactly one one-shot planner child. A `SubAgent`
-/// call counts only when its `action` is `"create"`, or when the action is
+/// `Plan` creates one one-shot planner child except for its explicit artifact
+/// `read` action. Missing/unparsable Plan arguments stay conservatively counted.
+/// A `SubAgent` call counts only when its `action` is `"create"`, or when the action is
 /// absent/unparsable (the tool's legacy create default). All other SubAgent
 /// actions manage existing children and do not consume the spawn budget.
 fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
     match call.function.name.as_str() {
-        PLAN_TOOL_NAME => return true,
+        PLAN_TOOL_NAME => {
+            return !serde_json::from_str::<serde_json::Value>(&call.function.arguments).is_ok_and(
+                |value| value.get("action").and_then(|action| action.as_str()) == Some("read"),
+            );
+        }
         SUBAGENT_TOOL_NAME => {}
         _ => return false,
     }
@@ -1243,6 +1249,12 @@ async fn maybe_suspend_for_orphaned_children(
                 &child_id,
             )
             .await
+                && !storage
+                    .is_supervisor_observer_child(session, &child_id)
+                    .await
+                    .map_err(|error| {
+                        AgentError::Tool(format!("Observer classification unavailable: {error}"))
+                    })?
             {
                 ordinary.push(child_id);
             }
@@ -1460,6 +1472,81 @@ async fn maybe_suspend_for_outstanding_bash(
     hook.arrange_bash_self_resume(session.id.clone(), hook_ids);
 
     Some(outcome)
+}
+
+/// Transfer the trusted quiet-poll observation to the host without spending
+/// another model recovery round. Stage the notice and wait together: failed
+/// persistence must neither publish a handoff nor start a detached monitor.
+async fn maybe_background_quiet_exec(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime: &mut AgentRuntimeState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    handle: &str,
+) -> Result<bool, AgentError> {
+    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config)
+        || runtime.waiting_for_bash.is_some()
+    {
+        return Ok(false);
+    }
+    let (Some(persistence), Some(hook)) = (
+        config.persistence.as_ref(),
+        config.bash_resume_hook.as_ref(),
+    ) else {
+        return Ok(false);
+    };
+    if !hook.supports_background_exec() {
+        return Ok(false);
+    }
+    let Some(job) = bamboo_tools::tools::exec_command::reserve_background_job(&session.id, handle)
+    else {
+        return Ok(false);
+    };
+    let mut candidate = session.clone();
+    let mut waiting_runtime = runtime.clone();
+    let now = Utc::now();
+    waiting_runtime.status = AgentStatusState::Suspended;
+    waiting_runtime.suspension = Some(SuspensionState {
+        reason: "waiting_for_bash".into(),
+        suspended_at: now,
+        resumable: true,
+        hook_point: Some("AfterToolExecution".into()),
+    });
+    waiting_runtime.waiting_for_bash =
+        Some(WaitingForBashState::for_bash(vec![handle.to_owned()], now));
+    state_bridge::write_runtime_state(&mut candidate, &waiting_runtime);
+    candidate
+        .metadata
+        .insert("runtime.suspend_reason".into(), "waiting_for_bash".into());
+    candidate
+        .metadata
+        .insert("runtime.background_exec_id".into(), handle.to_owned());
+    candidate.updated_at = now;
+    let mut notice = Message::assistant(
+        format!("Moved command `{handle}` to background monitoring. You can continue this conversation; its result will return automatically."),
+        None,
+    );
+    notice.metadata = Some(serde_json::json!({
+        "runtime_kind": "background_exec_wait",
+        "source": "runtime",
+        "exec_session_id": handle,
+    }));
+    candidate.add_message(notice.clone());
+    persistence
+        .save_runtime_session(&mut candidate)
+        .await
+        .map_err(|error| {
+            AgentError::Tool(format!(
+                "Background command wait could not be saved: {error}"
+            ))
+        })?;
+    *session = candidate;
+    *runtime = waiting_runtime;
+    hook.arrange_exec_self_resume(job, session.created_at);
+    let _ = event_tx
+        .send(AgentEvent::message_appended(&session.id, &notice))
+        .await;
+    Ok(true)
 }
 
 /// Build the guardian reviewer's task brief: the static rubric plus the active
@@ -1993,7 +2080,7 @@ async fn abort_in_flight_evaluations(
 ) {
     let mut task_was_cancelled = false;
     let mut task_generation = None;
-    let mut gold_was_cancelled = false;
+    let mut gold_cancelled_terminal = None;
     if let Some(in_flight) = state.task_evaluation.in_flight.take() {
         task_generation = Some(in_flight.request.based_on_task_context_version);
         let was_finished = in_flight.join_handle.is_finished();
@@ -2061,6 +2148,7 @@ async fn abort_in_flight_evaluations(
         }
     }
     if let Some(in_flight) = state.gold_evaluation.in_flight.take() {
+        let terminal_claimed = in_flight.terminal_claimed.clone();
         let was_finished = in_flight.join_handle.is_finished();
         if !was_finished {
             in_flight.join_handle.abort();
@@ -2070,9 +2158,17 @@ async fn abort_in_flight_evaluations(
         // emitted GoldEvaluationCompleted and must not receive a contradictory
         // cancellation lifecycle event during run cleanup.
         match in_flight.join_handle.await {
-            Ok(Some(_result)) => {}
-            Ok(None) => gold_was_cancelled = true,
-            Err(error) if error.is_cancelled() => gold_was_cancelled = true,
+            Ok(Some(Ok(_result))) => {}
+            Ok(Some(Err(error))) => {
+                tracing::warn!(
+                    "[{}] Async Gold evaluation refused during cleanup for round {}: {}",
+                    state.session_id,
+                    in_flight.request.round_number,
+                    error
+                );
+            }
+            Ok(None) => gold_cancelled_terminal = Some(terminal_claimed),
+            Err(error) if error.is_cancelled() => gold_cancelled_terminal = Some(terminal_claimed),
             Err(error) => {
                 tracing::warn!(
                     "[{}] Async Gold evaluation join failed during cleanup for round {}: {}",
@@ -2103,13 +2199,54 @@ async fn abort_in_flight_evaluations(
             })
             .await;
     }
-    if gold_was_cancelled {
-        let _ = event_tx
-            .send(AgentEvent::GoldEvaluationCancelled {
-                session_id: state.session_id.clone(),
-                reason: reason.to_string(),
-            })
-            .await;
+    if let Some(terminal_claimed) = gold_cancelled_terminal {
+        crate::runtime::gold_evaluation::emit_gold_cancelled_once(
+            event_tx,
+            &terminal_claimed,
+            &state.session_id,
+            reason,
+        )
+        .await;
+    }
+}
+
+fn start_queued_task_evaluation_if_idle(
+    state: &mut LoopRunState,
+    event_tx: &mpsc::Sender<AgentEvent>,
+    main_provider: Arc<dyn LLMProvider>,
+    cancel_token: CancellationToken,
+    configured_limit: usize,
+) {
+    if state.task_evaluation.in_flight.is_some() {
+        return;
+    }
+    let Some(queued) = state.task_evaluation.queued_request.take() else {
+        return;
+    };
+    let eval_provider = state
+        .auxiliary_models
+        .fast_model_provider
+        .clone()
+        .unwrap_or(main_provider);
+    let model_name = state
+        .auxiliary_models
+        .fast_model_name
+        .as_deref()
+        .unwrap_or(state.model_name.as_str());
+    if queued.current_provider(eval_provider, model_name).is_some() {
+        spawn_task_evaluation_request(
+            state,
+            event_tx,
+            queued.request,
+            queued.provider,
+            cancel_token,
+            configured_limit,
+        );
+    } else {
+        tracing::warn!(
+            "[{}] Dropped queued task evaluation after its model or provider changed",
+            state.session_id
+        );
     }
 }
 
@@ -2169,12 +2306,20 @@ fn spawn_task_evaluation_if_needed(
     };
 
     if state.task_evaluation.in_flight.is_some() {
-        state.task_evaluation.queued_request = Some(request);
-        tracing::debug!(
-            "[{}] Queued latest async task evaluation snapshot for round {} while another evaluation is still in flight",
-            state.session_id,
-            turn + 1
-        );
+        let model_name = request.model_name.clone();
+        state.task_evaluation.queued_request = QueuedEvaluation::new(request, llm, model_name);
+        if state.task_evaluation.queued_request.is_some() {
+            tracing::debug!(
+                "[{}] Queued latest async task evaluation for round {}",
+                state.session_id,
+                turn + 1
+            );
+        } else {
+            tracing::warn!(
+                "[{}] Could not bind the queued task evaluation to a stable provider",
+                state.session_id
+            );
+        }
         return Ok(());
     }
 
@@ -2303,7 +2448,8 @@ async fn handle_no_tool_calls_with_native(
     task_context: &Option<TaskLoopContext>,
     eval_model: &str,
     iteration: u32,
-    llm: Arc<dyn LLMProvider>,
+    main_llm: Arc<dyn LLMProvider>,
+    gold_llm: Arc<dyn LLMProvider>,
     provider_transcript_items: Vec<ProviderTranscriptItem>,
     evidence_llm: Arc<dyn LLMProvider>,
     cancel_token: &CancellationToken,
@@ -2396,7 +2542,11 @@ async fn handle_no_tool_calls_with_native(
         config.reasoning_effort,
         session_id,
         iteration,
-        llm,
+        if config.auxiliary_model_resolver.is_some() {
+            main_llm.clone()
+        } else {
+            gold_llm
+        },
         event_tx,
     )
     .await;
@@ -2554,13 +2704,32 @@ async fn handle_no_tool_calls_with_native(
         total_tokens: prompt_tokens.saturating_add(completion_tokens),
     };
     if let Some(mut answer) = buffered_candidate {
+        // A live resolver supplies one fresh Fast pair. If its provider is a
+        // local rejection sentinel, keep it even when the name is absent.
+        // SDK callers without a live resolver retain their supplied pair.
+        let (evidence_llm, evidence_model) = if config.auxiliary_model_resolver.is_some() {
+            let auxiliary = config.resolve_auxiliary_models();
+            (
+                auxiliary
+                    .fast_model_provider
+                    .unwrap_or_else(|| main_llm.clone()),
+                auxiliary.fast_model_name.unwrap_or_else(|| {
+                    config
+                        .model_name
+                        .clone()
+                        .unwrap_or_else(|| session.model.clone())
+                }),
+            )
+        } else {
+            (evidence_llm, eval_model.to_string())
+        };
         let check = super::final_answer::check(
             session,
             runtime_state,
             &mut answer,
             config,
             evidence_llm,
-            eval_model,
+            &evidence_model,
             cancel_token,
             metrics_collector,
             round_id,
@@ -2684,6 +2853,7 @@ async fn handle_no_tool_calls(
         task_context,
         eval_model,
         iteration,
+        llm.clone(),
         llm.clone(),
         Vec::new(),
         llm,
@@ -3007,7 +3177,7 @@ fn boxed_pipeline_inner<'a>(
     cancel_token: &'a CancellationToken,
     config: &'a AgentLoopConfig,
     state: &'a mut LoopRunState,
-) -> std::pin::Pin<Box<impl std::future::Future<Output = super::super::Result<bool>> + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = super::super::Result<bool>> + Send + 'a>> {
     Box::pin(run_pipeline_inner(
         session,
         event_tx,
@@ -3034,6 +3204,12 @@ async fn run_pipeline_inner(
         ));
     }
 
+    // A trusted Supervisor may journal one observation reasoning turn while
+    // its original work/Planner wait remains armed. A newly discovered or
+    // replaced wait must not inherit that intermediate-publication allowance.
+    let supervisor_inherited_wait = session
+        .supervisor_incarnation_id()
+        .and_then(|_| state.runtime_state.waiting_for_children.clone());
     let mut sent_complete = false;
     let mut turn_counter: u32 = 0;
     // One-shot sentinel for the max_rounds summary turn (see the guard at the
@@ -3104,33 +3280,25 @@ async fn run_pipeline_inner(
         refresh_auxiliary_models_for_round(state, config);
         poll_completed_task_evaluation(state).await;
         apply_completed_task_evaluation(session, event_tx, config, state).await;
-        if state.task_evaluation.in_flight.is_none() {
-            if let Some(request) = state.task_evaluation.queued_request.take() {
-                let eval_provider = state
-                    .auxiliary_models
-                    .fast_model_provider
-                    .clone()
-                    .unwrap_or_else(|| llm.clone());
-                spawn_task_evaluation_request(
-                    state,
-                    event_tx,
-                    request,
-                    eval_provider,
-                    cancel_token.clone(),
-                    config.auxiliary_evaluation_max_concurrency,
-                );
-            }
-        }
+        start_queued_task_evaluation_if_idle(
+            state,
+            event_tx,
+            llm.clone(),
+            cancel_token.clone(),
+            config.auxiliary_evaluation_max_concurrency,
+        );
         poll_completed_gold_evaluation(state).await;
         apply_completed_gold_evaluation(session, config, state).await;
+        let gold_provider = select_gold_evaluation_provider(
+            config,
+            &llm,
+            state.auxiliary_models.fast_model_provider.as_ref(),
+        );
         start_queued_gold_evaluation_if_idle(
             state,
             event_tx,
-            state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
+            gold_provider,
+            config,
             cancel_token.clone(),
             config.auxiliary_evaluation_max_concurrency,
         );
@@ -3230,6 +3398,21 @@ async fn run_pipeline_inner(
             &state.runtime_state,
             config,
         );
+        if feedback_active {
+            if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
+                if maybe_background_quiet_exec(
+                    session,
+                    config,
+                    &mut state.runtime_state,
+                    event_tx,
+                    handle,
+                )
+                .await?
+                {
+                    break;
+                }
+            }
+        }
         let observation_progress_hint =
             match tool_policy_guard.feedback_for_next_round(feedback_active) {
                 crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
@@ -3611,6 +3794,11 @@ async fn run_pipeline_inner(
                     }
                 };
 
+            // Only a validated, accepted output can authorize its Gold route.
+            if let Some(attempt) = llm_output.host_gold_attempt.as_ref() {
+                attempt.accept();
+            }
+
             if stream_output.tool_calls.is_empty() {
                 if crate::runtime::runner::round_lifecycle::is_openai_client_tool_search_boundary(
                     &stream_output.provider_transcript_items,
@@ -3655,10 +3843,18 @@ async fn run_pipeline_inner(
                     .await
                 {
                     Ok(Some(suspend)) => {
-                        if inherited_untagged_wait {
+                        let supervisor_reasoning_reply = supervisor_inherited_wait
+                            .as_ref()
+                            .is_some_and(|wait| {
+                                state.runtime_state.waiting_for_children.as_ref() == Some(wait)
+                            });
+                        if inherited_untagged_wait || supervisor_reasoning_reply {
                             // This safety-net wait can also survive a real user
                             // input. Keep its answer as an intermediate message
                             // while the remaining children still prevent Complete.
+                            // The Supervisor's tagged Planner wait has the same
+                            // bounded journal need; ordinary tagged/Guardian
+                            // final-message deferral remains unchanged.
                             let reasoning = (!stream_output.reasoning_content.trim().is_empty())
                                 .then_some(stream_output.reasoning_content);
                             let reasoning_signature = reasoning
@@ -3739,6 +3935,11 @@ async fn run_pipeline_inner(
                     .fast_model_name
                     .clone()
                     .unwrap_or_else(|| state.model_name.clone());
+                let gold_provider = select_gold_evaluation_provider(
+                    config,
+                    &llm,
+                    state.auxiliary_models.fast_model_provider.as_ref(),
+                );
                 match handle_no_tool_calls_with_native(
                     stream_output.content,
                     stream_output.visible_message,
@@ -3758,6 +3959,7 @@ async fn run_pipeline_inner(
                     &eval_model,
                     turn_counter + 1,
                     llm.clone(),
+                    gold_provider,
                     stream_output.provider_transcript_items,
                     state
                         .auxiliary_models
@@ -4202,17 +4404,18 @@ async fn run_pipeline_inner(
                 error
             );
         }
+        let gold_provider = select_gold_evaluation_provider(
+            config,
+            &llm,
+            state.auxiliary_models.fast_model_provider.as_ref(),
+        );
         if let Err(error) = spawn_gold_evaluation_if_needed(
             turn_counter as usize,
             session,
             event_tx,
             config,
             state,
-            state
-                .auxiliary_models
-                .fast_model_provider
-                .clone()
-                .unwrap_or_else(|| llm.clone()),
+            gold_provider,
             cancel_token.clone(),
         ) {
             tracing::warn!(
@@ -4501,7 +4704,7 @@ async fn supervisor_delegation_first_discovery_is_readonly_bounded_and_keeps_ord
                 .iter()
                 .map(|entry| entry.execution_name())
                 .collect::<Vec<_>>(),
-            ["Read", "SubAgent"]
+            ["SubAgent"]
         );
         let request = serde_json::from_value(
             serde_json::json!({"query":"SubAgent","kinds":["tool"],"limit":1}),
@@ -8281,6 +8484,184 @@ mod tests {
         assert_eq!(executor.calls.load(Ordering::SeqCst), 5);
     }
 
+    struct MixedSubAgentLoopProvider {
+        calls: AtomicUsize,
+    }
+
+    struct OversizedSubAgentPageProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for OversizedSubAgentPageProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("Inspection budget reported.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: "oversized-subagent-page".into(),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "SubAgent".into(),
+                            arguments:
+                                r#"{"intent":"inspect","target":"child","message":"result"}"#.into(),
+                        },
+                    },
+                ])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct OversizedSubAgentPageExecutor;
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for OversizedSubAgentPageExecutor {
+        async fn execute(
+            &self,
+            _: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<bamboo_agent_core::tools::ToolResult>
+        {
+            Ok(bamboo_agent_core::tools::ToolResult::text(
+                true,
+                serde_json::json!({"view":"result", "text":"界🦀".repeat(800),
+                    "byte_start":0, "byte_end":5600, "next_cursor":"opaque-next-cursor"})
+                .to_string(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            bamboo_agent_core::tools::ToolExecutor::list_tools(&DelegationLoopExecutor {
+                calls: AtomicUsize::new(0),
+                success_on: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_subagent_page_is_not_persisted_as_success_in_the_real_loop() {
+        let mut session = Session::new("subagent-page-budget-loop", "model");
+        session.token_budget = Some(bamboo_domain::TokenBudget {
+            max_tool_output_tokens: 512,
+            ..Default::default()
+        });
+        session.add_message(Message::user("Inspect the child result"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let mut state = e2e_loop_state(&session.id);
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            Arc::new(OversizedSubAgentPageProvider {
+                calls: AtomicUsize::new(0),
+            }),
+            Arc::new(OversizedSubAgentPageExecutor),
+            &tokio_util::sync::CancellationToken::new(),
+            &delegation_loop_config(),
+            &mut state,
+        )
+        .await
+        .expect("the run should report an oversized page as a tool failure");
+        let message = session
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some("oversized-subagent-page"))
+            .expect("the tool call must have a durable response");
+        assert_eq!(message.tool_success, Some(false));
+        let payload: serde_json::Value = serde_json::from_str(&message.content).unwrap();
+        assert_eq!(payload["error"], "subagent_page_exceeds_tool_output_budget");
+        assert!(payload.get("next_cursor").is_none());
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProvider for MixedSubAgentLoopProvider {
+        async fn chat_stream(
+            &self,
+            _: &[Message],
+            _: &[bamboo_agent_core::tools::ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let round = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if round == 4 {
+                return Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("Delegation corrected.".into())),
+                    Ok(LLMChunk::Done),
+                ])));
+            }
+            let arguments = if round < 2 {
+                r#"{"intent":"inspect","target":"child","message":"result"}"#
+            } else {
+                r#"{"role":"implementer","message":"Complete bounded work"}"#
+            };
+            Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::ToolCalls(vec![
+                    bamboo_agent_core::tools::ToolCall {
+                        id: format!("mixed-subagent-{round}"),
+                        tool_type: "function".into(),
+                        function: bamboo_agent_core::tools::FunctionCall {
+                            name: "SubAgent".into(),
+                            arguments: arguments.into(),
+                        },
+                    },
+                ])),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_inspections_do_not_stop_a_corrected_delegation_in_the_real_loop() {
+        use std::sync::atomic::Ordering;
+        let mut session = Session::new("mixed-subagent-circuit-loop", "model");
+        session.add_message(Message::user("Complete bounded work"));
+        let (tx, _rx) = tokio::sync::mpsc::channel(256);
+        let provider = Arc::new(MixedSubAgentLoopProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let executor = Arc::new(DelegationLoopExecutor {
+            calls: AtomicUsize::new(0),
+            success_on: Some(3),
+        });
+        let mut state = e2e_loop_state(&session.id);
+        let complete = super::run_pipeline(
+            &mut session,
+            &tx,
+            provider.clone(),
+            executor.clone(),
+            &tokio_util::sync::CancellationToken::new(),
+            &delegation_loop_config(),
+            &mut state,
+        )
+        .await
+        .expect("inspection failures must not terminate the corrected delegation");
+        assert!(complete);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
+        assert_eq!(executor.calls.load(Ordering::SeqCst), 4);
+        for round in 0..4 {
+            assert_eq!(
+                session
+                    .messages
+                    .iter()
+                    .filter(|message| message.tool_call_id.as_deref()
+                        == Some(format!("mixed-subagent-{round}").as_str()))
+                    .count(),
+                1,
+                "each call needs one durable response"
+            );
+        }
+    }
+
     struct CancelAfterThirdDelegationRound(tokio_util::sync::CancellationToken);
 
     #[async_trait::async_trait]
@@ -10186,6 +10567,79 @@ mod tests {
     }
 
     #[test]
+    fn planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it() {
+        use crate::runtime::stream::handler::StreamHandlingOutput;
+
+        let call = |arguments: serde_json::Value| bamboo_agent_core::tools::ToolCall {
+            id: "plan-budget".into(),
+            tool_type: "function".into(),
+            function: bamboo_agent_core::tools::FunctionCall {
+                name: "Plan".into(),
+                arguments: arguments.to_string(),
+            },
+        };
+        let mut output = StreamHandlingOutput {
+            response_id: None,
+            visible_message: None,
+            content: String::new(),
+            reasoning_content: String::new(),
+            reasoning_signature: None,
+            token_count: 0,
+            tool_calls: [0, 512, 1024]
+                .into_iter()
+                .map(|offset| {
+                    call(serde_json::json!({
+                        "action":"read", "child_session_id":"existing-planner",
+                        "expected_child_created_at":"2026-10-26T00:00:00Z",
+                        "expected_assignment_sha256":"a".repeat(64),
+                        "revision":"b".repeat(64), "section_id":"s1", "offset":offset
+                    }))
+                })
+                .collect(),
+            output_tokens: 0,
+            thinking_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            provider_usage: None,
+            input_tokens: 0,
+            provider_transcript_items: Vec::new(),
+        };
+        let mut reads = super::RoundActivity::default();
+        let usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 0, 0);
+        reads.absorb_attempt(&output, usage);
+        reads.absorb_attempt(&output, usage);
+        let mut runtime = AgentRuntimeState::default();
+        reads.commit_to_runtime(&mut runtime);
+        assert_eq!(
+            runtime.round.total_tool_calls, 6,
+            "reads still count as tools"
+        );
+        assert_eq!(runtime.round.total_subagents_spawned, 0);
+        let budget = bamboo_config::RunBudgetConfig {
+            max_subagents: Some(2),
+            ..Default::default()
+        };
+        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
+
+        output.tool_calls = vec![call(
+            serde_json::json!({"action":"create","task":"Plan only"}),
+        )];
+        let mut create = super::RoundActivity::default();
+        create.absorb_attempt(&output, usage);
+        create.commit_to_runtime(&mut runtime);
+        assert_eq!(runtime.round.total_subagents_spawned, 1);
+        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
+        create.commit_to_runtime(&mut runtime);
+        let exceeded = check_run_budget_exceeded(&runtime.round, &budget).unwrap();
+        assert_eq!(exceeded.kind, "max_subagents");
+        assert_eq!(exceeded.actual, 2);
+        for arguments in [r#"{"task":"legacy create"}"#, "{"] {
+            output.tool_calls[0].function.arguments = arguments.into();
+            assert!(is_child_spawn_call(&output.tool_calls[0]));
+        }
+    }
+
+    #[test]
     fn is_child_spawn_call_counts_plan_and_subagent_create_only() {
         let call = |name: &str, arguments: &str| bamboo_agent_core::tools::ToolCall {
             id: "id".to_string(),
@@ -10197,7 +10651,7 @@ mod tests {
         };
         assert!(
             is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
-            "every Plan call creates one planner child"
+            "a default Plan call creates one planner child"
         );
         assert!(
             is_child_spawn_call(&call("SubAgent", r#"{"action":"create","prompt":"x"}"#)),
@@ -11226,6 +11680,25 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Storage for ChildIndexStorage {
+        async fn load_root_authority(&self, id: &str) -> std::io::Result<Option<Session>> {
+            // This unit fixture's locked map is its sole canonical store.
+            // Keep the strict authority observation separate from history.
+            let mut observed = self.inner.load_session(id).await?;
+            if let Some(root) = observed.as_mut() {
+                if root.kind != bamboo_domain::SessionKind::Root
+                    || root.parent_session_id.is_some()
+                    || root.root_session_id != root.id
+                    || root.spawn_depth != 0
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "unit authority observation is not a canonical Root",
+                    ));
+                }
+                root.messages.clear();
+            }
+            Ok(observed)
+        }
         async fn save_session(&self, session: &Session) -> std::io::Result<()> {
             self.inner.save_session(session).await
         }
@@ -11567,10 +12040,13 @@ mod tests {
 
     #[tokio::test]
     async fn partial_child_outcome_can_drive_tool_work_before_resuspending_exact_inherited_wait() {
-        for (tagged, buffered) in [true, false].into_iter().flat_map(|tagged| {
-            [false, true]
-                .into_iter()
-                .map(move |buffered| (tagged, buffered))
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for (supervisor, tagged, buffered) in [false, true].into_iter().flat_map(|supervisor| {
+            [true, false].into_iter().flat_map(move |tagged| {
+                [false, true]
+                    .into_iter()
+                    .map(move |buffered| (supervisor, tagged, buffered))
+            })
         }) {
             let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
                 inner: Arc::new(TestStorage::default()),
@@ -11580,7 +12056,19 @@ mod tests {
             config.model_name = Some("model".into());
             config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
             config.features_final_evidence_check = buffered;
-            let mut session = Session::new("partial-parent", "model");
+            let mut session = Session::new(
+                if supervisor {
+                    DEFAULT_SUPERVISOR_SESSION_ID
+                } else {
+                    "partial-parent"
+                },
+                "model",
+            );
+            if supervisor {
+                session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                    incarnation_id: uuid::Uuid::new_v4(),
+                };
+            }
             let mut outcome = Message::user("fast child outcome");
             outcome.metadata = Some(serde_json::json!({
                 "runtime_kind": "child_completion_resume"
@@ -11634,7 +12122,8 @@ mod tests {
                 .iter()
                 .filter(|message| message.content == "continued after child")
                 .collect();
-            assert_eq!(replies.len(), usize::from(!tagged));
+            let journal_reply = !tagged || supervisor;
+            assert_eq!(replies.len(), usize::from(journal_reply));
             let mut events = Vec::new();
             while let Ok(event) = rx.try_recv() {
                 assert!(
@@ -11648,8 +12137,8 @@ mod tests {
                     .iter()
                     .filter(|event| matches!(event, AgentEvent::Token { content } if content == "continued after child"))
                     .count(),
-                usize::from(!buffered || !tagged),
-                "the untagged reply is published once in either streaming mode"
+                usize::from(!buffered || journal_reply),
+                "an eligible intermediate reply is published exactly once"
             );
             if let Some(reply) = replies.first() {
                 assert_eq!(reply.reasoning.as_deref(), Some("remaining child work"));
@@ -11679,6 +12168,71 @@ mod tests {
                 assert_eq!(groups[0].items().len(), 3);
                 assert_eq!(groups[0].items()[2].payload()["id"], "partial-native-reply");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn supervisor_new_orphan_wait_keeps_terminal_reply_deferred() {
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+        for buffered in [false, true] {
+            let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
+                inner: Arc::new(TestStorage::default()),
+                children: vec![("slow-child".into(), Some("running".into()))],
+            });
+            let mut config = config_with_storage(storage.clone());
+            config.model_name = Some("model".into());
+            config.prompt_memory_flags = delegation_loop_config().prompt_memory_flags;
+            config.features_final_evidence_check = buffered;
+            let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+            session.authority_identity = SessionAuthorityIdentity::Supervisor {
+                incarnation_id: uuid::Uuid::new_v4(),
+            };
+            let mut outcome = Message::user("fast child outcome");
+            outcome.metadata = Some(serde_json::json!({"runtime_kind":"child_completion_resume"}));
+            session.add_message(outcome);
+            let mut state = e2e_loop_state(&session.id);
+            assert!(state.runtime_state.waiting_for_children.is_none());
+            session.agent_runtime_state = Some(state.runtime_state.clone());
+            storage.save_session(&session).await.unwrap();
+            let provider = Arc::new(PartialChildWorkProvider {
+                calls: AtomicUsize::new(0),
+                outcome_seen: AtomicBool::new(false),
+            });
+            let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+            let sent_complete = super::run_pipeline(
+                &mut session,
+                &tx,
+                provider.clone(),
+                Arc::new(PartialChildWorkExecutor::default()),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .unwrap();
+            assert!(provider.outcome_seen.load(Ordering::SeqCst));
+            assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+            assert!(!sent_complete);
+            assert_eq!(state.runtime_state.status, AgentStatusState::Suspended);
+            let wait = state.runtime_state.waiting_for_children.as_ref().unwrap();
+            assert_eq!(wait.child_session_ids, vec!["slow-child"]);
+            assert!(wait.registered_by_tool_call_id.is_none());
+            assert!(
+                !session
+                    .messages
+                    .iter()
+                    .any(|message| message.content == "continued after child"),
+                "new orphan discovery is not an inherited Supervisor reasoning turn"
+            );
+            let mut tokens = 0;
+            while let Ok(event) = rx.try_recv() {
+                assert!(!matches!(event, AgentEvent::Complete { .. }));
+                if matches!(event, AgentEvent::Token { content } if content=="continued after child")
+                {
+                    tokens += 1;
+                }
+            }
+            assert_eq!(tokens, usize::from(!buffered));
         }
     }
 
@@ -12007,8 +12561,10 @@ mod tests {
         // background bash, it MUST arrange a self-resume hook so the session
         // is always eventually resumed — no suspend-forever.
         let session_id = "s-bash-liveness";
-        let mut config = AgentLoopConfig::default();
-        config.persistence = Some(Arc::new(StubBashPersistence));
+        let mut config = AgentLoopConfig {
+            persistence: Some(Arc::new(StubBashPersistence)),
+            ..Default::default()
+        };
         let hook = RecordingBashResumeHook {
             calls: Arc::new(std::sync::Mutex::new(Vec::new())),
         };
@@ -12050,9 +12606,11 @@ mod tests {
         // Blocker 1: if all captured shells finish before the gate commits, the
         // gate returns None — no suspend-forever on a lost-wakeup.
         let session_id = "s-bash-toctou";
-        let mut config = AgentLoopConfig::default();
-        config.persistence = Some(Arc::new(StubBashPersistence));
-        config.bash_resume_hook = Some(Arc::new(NoopBashResumeHook));
+        let config = AgentLoopConfig {
+            persistence: Some(Arc::new(StubBashPersistence)),
+            bash_resume_hook: Some(Arc::new(NoopBashResumeHook)),
+            ..Default::default()
+        };
 
         let shell = bamboo_tools::tools::bash_runtime::spawn_background(
             "true",
@@ -12745,7 +13303,11 @@ mod tests {
         )
         .expect("evaluation request")
         .expect("task context");
-        state.task_evaluation.queued_request = Some(request.clone());
+        state.task_evaluation.queued_request = super::QueuedEvaluation::new(
+            request.clone(),
+            Arc::new(StubProvider),
+            request.model_name.clone(),
+        );
 
         let dropped = Arc::new(AtomicBool::new(false));
         let drop_flag = EvalDropFlag(dropped.clone());
@@ -12763,6 +13325,565 @@ mod tests {
             join_handle,
         });
         dropped
+    }
+
+    /// A queued request must not combine its old model with a newly selected
+    /// account. Drive the actual enqueue and pipeline dequeue paths.
+    #[tokio::test]
+    async fn queued_task_and_gold_keep_provider_and_model_paired_across_refresh() {
+        use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::{ProviderModelRef, ReasoningEffort};
+        use bamboo_llm::{LLMRequestOptions, ResolvedModel};
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+
+        type Calls = Arc<Mutex<Vec<(String, String, String)>>>;
+        type Efforts = Arc<Mutex<Vec<(String, Option<ReasoningEffort>)>>>;
+
+        struct CaptureAux {
+            account: &'static str,
+            calls: Calls,
+            efforts: Efforts,
+        }
+
+        #[async_trait::async_trait]
+        impl LLMProvider for CaptureAux {
+            fn queue_requires_current_route(&self) -> bool {
+                true
+            }
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[bamboo_agent_core::tools::ToolSchema],
+                _max: Option<u32>,
+                _model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                panic!("auxiliary calls must carry request options")
+            }
+
+            async fn chat_stream_with_options(
+                &self,
+                _messages: &[Message],
+                _tools: &[bamboo_agent_core::tools::ToolSchema],
+                _max: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                let purpose = options
+                    .and_then(|options| options.request_purpose.as_deref())
+                    .unwrap_or("missing-purpose");
+                self.calls.lock().unwrap().push((
+                    self.account.into(),
+                    model.into(),
+                    purpose.into(),
+                ));
+                self.efforts.lock().unwrap().push((
+                    purpose.to_string(),
+                    options.and_then(|options| options.reasoning_effort),
+                ));
+                Err(LLMError::Auth("synthetic auxiliary refusal".into()))
+            }
+        }
+
+        struct ExplicitlyRejected;
+
+        #[async_trait::async_trait]
+        impl LLMProvider for ExplicitlyRejected {
+            fn known_pre_dispatch_error(&self) -> Option<LLMError> {
+                Some(LLMError::Auth("synthetic explicit refusal".into()))
+            }
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                Err(LLMError::Auth("synthetic explicit refusal".into()))
+            }
+        }
+
+        struct AliasProvider {
+            inner: Arc<dyn LLMProvider>,
+            identity: Arc<dyn LLMProvider>,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for AliasProvider {
+            fn queue_requires_current_route(&self) -> bool {
+                true
+            }
+            fn queued_route_identity(&self) -> bamboo_llm::provider::QueuedRouteIdentity {
+                bamboo_llm::provider::QueuedRouteIdentity::Stable(self.identity.clone())
+            }
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                tools: &[bamboo_agent_core::tools::ToolSchema],
+                max: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.inner.chat_stream(messages, tools, max, model).await
+            }
+            async fn chat_stream_with_options(
+                &self,
+                messages: &[Message],
+                tools: &[bamboo_agent_core::tools::ToolSchema],
+                max: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                self.inner
+                    .chat_stream_with_options(messages, tools, max, model, options)
+                    .await
+            }
+        }
+
+        // Default SDK implementations are deliberately opaque: a new wrapper
+        // per resolution must preserve the pair saved at enqueue.
+        struct SdkOpaque(Arc<dyn LLMProvider>);
+        #[async_trait::async_trait]
+        impl LLMProvider for SdkOpaque {
+            async fn chat_stream(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                self.0.chat_stream(m, t, n, model).await
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                self.0
+                    .chat_stream_with_options(m, t, n, model, options)
+                    .await
+            }
+        }
+
+        struct WaitForQueuedCalls(Calls);
+
+        #[async_trait::async_trait]
+        impl LLMProvider for WaitForQueuedCalls {
+            async fn chat_stream(
+                &self,
+                _messages: &[Message],
+                _tools: &[bamboo_agent_core::tools::ToolSchema],
+                _max: Option<u32>,
+                model: &str,
+            ) -> Result<LLMStream, LLMError> {
+                assert_eq!(model, "main-model");
+                // Correct rejection sends nothing, so use a bounded wait.
+                let _ = tokio::time::timeout(Duration::from_secs(3), async {
+                    loop {
+                        if self.0.lock().unwrap().len() >= 2 {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+
+            async fn chat_stream_with_options(
+                &self,
+                messages: &[Message],
+                tools: &[bamboo_agent_core::tools::ToolSchema],
+                max: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                let purpose = options.and_then(|value| value.request_purpose.as_deref());
+                if let Some(purpose @ ("task_evaluation" | "gold_evaluation")) = purpose {
+                    self.0
+                        .lock()
+                        .unwrap()
+                        .push(("main".into(), model.into(), purpose.into()));
+                    return Err(LLMError::Auth("synthetic auxiliary refusal".into()));
+                }
+                self.chat_stream(messages, tools, max, model).await
+            }
+        }
+
+        let mut observations = Vec::new();
+        for scenario in [
+            "unchanged",
+            "changed",
+            "same_model_new_provider",
+            "same_provider_new_model",
+            "name_only",
+            "provider_only",
+            "unset",
+            "explicit_gold_fast_changed",
+            "rewrapped_same_effort",
+            "rewrapped_new_effort",
+            "explicit_rejected_then_valid",
+            "same_identity_new_provider",
+            "sdk_rewrapped_same_provider",
+            "sdk_rewrapped_other_provider",
+            "sdk_rewrapped_rejected",
+        ] {
+            let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+            let efforts: Efforts = Arc::new(Mutex::new(Vec::new()));
+            let a: Arc<dyn LLMProvider> = Arc::new(CaptureAux {
+                account: "fast-a",
+                calls: calls.clone(),
+                efforts: efforts.clone(),
+            });
+            let b: Arc<dyn LLMProvider> = Arc::new(CaptureAux {
+                account: "fast-b",
+                calls: calls.clone(),
+                efforts: efforts.clone(),
+            });
+            let mut original = AuxiliaryModelConfig {
+                fast_model_name: (!matches!(scenario, "provider_only" | "unset"))
+                    .then(|| "model-a".into()),
+                fast_model_provider: (!matches!(scenario, "name_only" | "unset"))
+                    .then(|| a.clone()),
+                ..Default::default()
+            };
+            if matches!(scenario, "rewrapped_same_effort" | "rewrapped_new_effort") {
+                let reference = ProviderModelRef::new("fast-a", "model-a")
+                    .with_reasoning_effort(ReasoningEffort::Low);
+                original.fast_model_provider =
+                    Some(ResolvedModel::from_ref(a.clone(), &reference).provider);
+            }
+            let alias_identity: Arc<dyn LLMProvider> = Arc::new(ExplicitlyRejected);
+            let alias_b: Arc<dyn LLMProvider> = Arc::new(AliasProvider {
+                inner: b.clone(),
+                identity: alias_identity.clone(),
+            });
+            if scenario == "same_identity_new_provider" {
+                original.fast_model_provider = Some(Arc::new(AliasProvider {
+                    inner: a.clone(),
+                    identity: alias_identity,
+                }));
+            }
+            if scenario == "explicit_rejected_then_valid" {
+                original.fast_model_provider = Some(Arc::new(ExplicitlyRejected));
+            }
+            if matches!(
+                scenario,
+                "sdk_rewrapped_same_provider"
+                    | "sdk_rewrapped_other_provider"
+                    | "sdk_rewrapped_rejected"
+            ) {
+                original.fast_model_provider = Some(Arc::new(SdkOpaque(a.clone())));
+            }
+            let main: Arc<dyn LLMProvider> = Arc::new(WaitForQueuedCalls(calls.clone()));
+            let initial_task_provider = original
+                .fast_model_provider
+                .clone()
+                .unwrap_or_else(|| main.clone());
+            let initial_task_model = original
+                .fast_model_name
+                .as_deref()
+                .unwrap_or("main-model")
+                .to_string();
+            let current = Arc::new(Mutex::new(original.clone()));
+            let current_for_resolver = current.clone();
+            let config = AgentLoopConfig {
+                model_name: Some("main-model".into()),
+                system_prompt: Some("synthetic system".into()),
+                gold_config: Some(GoldConfig {
+                    enabled: true,
+                    model_name: (scenario == "explicit_gold_fast_changed")
+                        .then(|| "explicit-gold".into()),
+                    ..Default::default()
+                }),
+                auxiliary_model_resolver: Some(Arc::new(move || {
+                    current_for_resolver.lock().unwrap().clone()
+                })),
+                prompt_memory_flags: PromptMemoryFlags {
+                    project_prompt_injection: false,
+                    relevant_recall: false,
+                    relevant_recall_rerank: false,
+                    project_first_dream: false,
+                    ledger_agenda: false,
+                },
+                ..Default::default()
+            };
+            let initial_gold_provider = super::select_gold_evaluation_provider(
+                &config,
+                &main,
+                original.fast_model_provider.as_ref(),
+            );
+            let initial_gold_model = config
+                .gold_config
+                .as_ref()
+                .unwrap()
+                .model_name
+                .as_deref()
+                .unwrap_or(&initial_task_model)
+                .to_string();
+            let mut session = Session::new("synthetic-queued-eval", "main-model");
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "main-model".into();
+            state.auxiliary_models = original;
+            let _drop_flag = seed_blocked_task_evaluation(&mut session, &mut state);
+            let existing = state.task_evaluation.in_flight.take().unwrap();
+            existing.join_handle.abort();
+            let _ = existing.join_handle.await;
+            state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
+                request: existing.request,
+                metrics_started: Arc::new(AtomicBool::new(false)),
+                metrics_terminal: Arc::new(AtomicBool::new(false)),
+                join_handle: tokio::spawn(async { None }),
+            });
+            state.task_evaluation.queued_request = None;
+            state.task_context.as_mut().unwrap().task_list_dirty = true;
+
+            let gold_config = config.gold_config.as_ref().unwrap();
+            let previous_gold =
+                crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+                    &state.task_context,
+                    &session,
+                    &session.id,
+                    1,
+                    Some("model-a"),
+                    None,
+                    GoldCheckpoint::PostRound,
+                    gold_config,
+                    crate::runtime::stream::handler::StreamTimeoutContext::default(),
+                )
+                .unwrap()
+                .unwrap();
+            state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+                terminal_claimed: Arc::new(
+                    crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+                ),
+                request: previous_gold,
+                join_handle: tokio::spawn(async { None }),
+            });
+            let (tx, _rx) = mpsc::channel(128);
+            super::spawn_task_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                initial_task_provider,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            super::spawn_gold_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                initial_gold_provider,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(
+                state
+                    .task_evaluation
+                    .queued_request
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .model_name,
+                initial_task_model
+            );
+            assert_eq!(
+                state
+                    .gold_evaluation
+                    .queued_request
+                    .as_ref()
+                    .unwrap()
+                    .request
+                    .model_name,
+                initial_gold_model
+            );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !state
+                    .task_evaluation
+                    .in_flight
+                    .as_ref()
+                    .unwrap()
+                    .join_handle
+                    .is_finished()
+                    || !state
+                        .gold_evaluation
+                        .in_flight
+                        .as_ref()
+                        .unwrap()
+                        .join_handle
+                        .is_finished()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("synthetic earlier evaluations should complete");
+
+            match scenario {
+                "changed" | "explicit_gold_fast_changed" | "explicit_rejected_then_valid" => {
+                    *current.lock().unwrap() = AuxiliaryModelConfig {
+                        fast_model_name: Some("model-b".into()),
+                        fast_model_provider: Some(b.clone()),
+                        ..Default::default()
+                    };
+                }
+                "same_model_new_provider" => {
+                    current.lock().unwrap().fast_model_provider = Some(b.clone());
+                }
+                "sdk_rewrapped_same_provider" | "sdk_rewrapped_other_provider" => {
+                    let inner = if scenario == "sdk_rewrapped_same_provider" {
+                        a.clone()
+                    } else {
+                        b.clone()
+                    };
+                    current.lock().unwrap().fast_model_provider = Some(Arc::new(SdkOpaque(inner)));
+                }
+                "sdk_rewrapped_rejected" => {
+                    current.lock().unwrap().fast_model_provider =
+                        Some(Arc::new(ExplicitlyRejected));
+                }
+                "same_identity_new_provider" => {
+                    current.lock().unwrap().fast_model_provider = Some(alias_b.clone());
+                }
+                "same_provider_new_model" => {
+                    current.lock().unwrap().fast_model_name = Some("model-b".into());
+                }
+                "rewrapped_same_effort" | "rewrapped_new_effort" => {
+                    let effort = if scenario == "rewrapped_new_effort" {
+                        ReasoningEffort::High
+                    } else {
+                        ReasoningEffort::Low
+                    };
+                    let reference =
+                        ProviderModelRef::new("fast-a", "model-a").with_reasoning_effort(effort);
+                    let replacement = ResolvedModel::from_ref(a.clone(), &reference).provider;
+                    let mut current = current.lock().unwrap();
+                    let old = current.fast_model_provider.as_ref().unwrap();
+                    assert!(!Arc::ptr_eq(old, &replacement));
+                    current.fast_model_provider = Some(replacement);
+                }
+                _ => {}
+            }
+            let outcome = super::run_pipeline(
+                &mut session,
+                &tx,
+                main,
+                Arc::new(AlwaysOkExecutor),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "the synthetic main loop should run: {outcome:?}"
+            );
+            let mut actual = calls.lock().unwrap().clone();
+            actual.sort();
+            let pair = |account: &str, model: &str| {
+                vec![
+                    (
+                        account.to_string(),
+                        model.to_string(),
+                        "gold_evaluation".to_string(),
+                    ),
+                    (
+                        account.to_string(),
+                        model.to_string(),
+                        "task_evaluation".to_string(),
+                    ),
+                ]
+            };
+            let expected = match scenario {
+                "unchanged"
+                | "rewrapped_same_effort"
+                | "rewrapped_new_effort"
+                | "same_identity_new_provider"
+                | "sdk_rewrapped_same_provider"
+                | "sdk_rewrapped_other_provider" => pair("fast-a", "model-a"),
+                "name_only" => pair("main", "model-a"),
+                "provider_only" => pair("fast-a", "main-model"),
+                "unset" => pair("main", "main-model"),
+                "explicit_gold_fast_changed" => vec![(
+                    "main".into(),
+                    "explicit-gold".into(),
+                    "gold_evaluation".into(),
+                )],
+                _ => Vec::new(),
+            };
+            if matches!(scenario, "rewrapped_same_effort" | "rewrapped_new_effort") {
+                let effort = ReasoningEffort::Low;
+                let mut observed = efforts.lock().unwrap().clone();
+                observed.sort_by(|a, b| a.0.cmp(&b.0));
+                assert_eq!(
+                    observed,
+                    vec![
+                        ("gold_evaluation".to_string(), Some(effort)),
+                        ("task_evaluation".to_string(), Some(effort)),
+                    ],
+                    "the saved wrapper must retain its original policy for {scenario}"
+                );
+            }
+            if scenario == "changed" {
+                assert!(actual.is_empty(), "a changed route must not dispatch the queued model to any provider: {actual:?}");
+                assert!(state.task_evaluation.in_flight.is_none());
+                assert!(state.gold_evaluation.in_flight.is_none());
+                state.auxiliary_models = current.lock().unwrap().clone();
+                state.task_context.as_mut().unwrap().task_list_dirty = true;
+                super::spawn_task_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    b.clone(),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                super::spawn_gold_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    b.clone(),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while calls.lock().unwrap().len() < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("new requests should use the refreshed provider");
+                let mut later = calls.lock().unwrap().clone();
+                later.sort();
+                assert_eq!(
+                    later,
+                    vec![
+                        ("fast-b".into(), "model-b".into(), "gold_evaluation".into()),
+                        ("fast-b".into(), "model-b".into(), "task_evaluation".into()),
+                    ],
+                    "new work must use the refreshed complete pair"
+                );
+            }
+            observations.push((scenario, actual, expected));
+        }
+        for (scenario, actual, expected) in observations {
+            assert_eq!(actual, expected, "queued target mismatch for {scenario}");
+        }
     }
 
     #[tokio::test]
@@ -13192,6 +14313,159 @@ mod tests {
         }
     }
 
+    // The real evaluator runs under a real LocalTaskResources relay. The test
+    // holds the handoff after the evaluator returns so cleanup deterministically
+    // sees the same pending relay state as a delayed relay on another worker.
+    #[tokio::test]
+    async fn scoped_gold_route_rejection_and_cleanup_emit_one_terminal() {
+        use crate::app_context::model_routing_test_support::CaptureProvider;
+        use crate::runtime::gold_evaluation::{
+            execute_async_gold_evaluation_with_terminal, AsyncGoldEvaluationRequest,
+            GoldEvaluationTerminal,
+        };
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, ProviderRegistry};
+        use tokio::sync::oneshot;
+
+        let session_id = "scoped-gold-relay-race";
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::default();
+        config.provider = "gold-a".into();
+        config.default_provider_instance = Some("gold-a".into());
+        config.http_proxy = "http://127.0.0.1:9".into();
+        config.https_proxy.clear();
+        config.proxy_auth = None;
+        config.provider_instances.insert(
+            "gold-a".into(),
+            serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true,
+                "api_key":"synthetic-only", "base_url":"http://127.0.0.1:1",
+                "model":"main-model", "runtime_models":["main-model", "explicit-gold"]
+            }))
+            .unwrap(),
+        );
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&config, temp.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let target = ProviderModelRef::new("gold-a", "explicit-gold");
+        let (selected, origin) = registry.provider_for_model_with_origin(&target).unwrap();
+        let live = Arc::new(RwLock::new(config));
+        let capture = Arc::new(CaptureProvider::default());
+        let guard = bamboo_llm::gold_admission::guarded_gold_target_with_origin(
+            live.clone(),
+            origin.unwrap(),
+            target,
+            selected,
+            capture.clone(),
+        );
+        let held =
+            crate::runtime::runner::auxiliary_budget::acquire(&guard, "explicit-gold", 1).await;
+        let request = AsyncGoldEvaluationRequest {
+            session_id: session_id.into(),
+            round_number: 1,
+            model_name: "explicit-gold".into(),
+            timeout_context: crate::runtime::stream::handler::StreamTimeoutContext::default(),
+            reasoning_effort: None,
+            checkpoint: GoldCheckpoint::PostRound,
+            session_snapshot: Session::new(session_id, "main-model"),
+            task_context_snapshot: None,
+            gold_config: crate::runtime::config::GoldConfig {
+                enabled: true,
+                ..Default::default()
+            },
+        };
+        let (tx, mut rx) = mpsc::channel(8);
+        let (returned_tx, returned_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel::<()>();
+        let resources = bamboo_tools::LocalTaskResources::new(session_id, "test-run", Utc::now());
+        let eval_request = request.clone();
+        let eval_provider = guard.clone();
+        let eval_tx = tx.clone();
+        let terminal_claimed = Arc::new(GoldEvaluationTerminal::default());
+        let eval_terminal_claimed = terminal_claimed.clone();
+        let join_handle = resources
+            .scope(async move {
+                bamboo_tools::local_task_resources::spawn_cancellable(async move {
+                    let outcome = execute_async_gold_evaluation_with_terminal(
+                        eval_request,
+                        eval_provider,
+                        eval_tx,
+                        1,
+                        eval_terminal_claimed,
+                    )
+                    .await;
+                    let _ = returned_tx.send(outcome.is_err());
+                    // The owner sees a pending scoped relay while this test gate
+                    // holds the completed evaluation result before handoff.
+                    let _ = release_rx.await;
+                    Some(outcome)
+                })
+            })
+            .await;
+        let mut state = e2e_loop_state(session_id);
+        state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+            request,
+            terminal_claimed,
+            join_handle,
+        });
+        let started = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(started, AgentEvent::GoldEvaluationStarted { .. }));
+        live.write()
+            .await
+            .provider_instances
+            .get_mut("gold-a")
+            .unwrap()
+            .extra
+            .insert("runtime_models".into(), serde_json::json!(["main-model"]));
+        drop(held);
+        let refused = tokio::time::timeout(Duration::from_secs(5), returned_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(refused && guard.local_dispatch_refused());
+        assert!(!state
+            .gold_evaluation
+            .in_flight
+            .as_ref()
+            .unwrap()
+            .join_handle
+            .is_finished());
+
+        // Simulate the owning run terminating while its scoped relay has not
+        // finished reporting the already locally refused evaluation.
+        super::abort_in_flight_evaluations(&mut state, &tx, "run_cancelled").await;
+        drop(release_tx);
+        resources.close_and_drain().await.unwrap();
+        assert!(
+            capture.requests.lock().unwrap().is_empty(),
+            "no provider dispatch"
+        );
+        let mut reasons = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::GoldEvaluationCancelled { reason, .. } => reasons.push(reason),
+                AgentEvent::GoldEvaluationCompleted { .. } => panic!("refusal is not a verdict"),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            reasons.len(),
+            1,
+            "one Gold terminal even when relay and cleanup race: {reasons:?}"
+        );
+        assert!(matches!(
+            reasons[0].as_str(),
+            "route_rejected" | "run_cancelled"
+        ));
+    }
+
     #[tokio::test]
     async fn cleanup_harvests_finished_gold_evaluation_without_false_cancellation() {
         let session_id = "gold-eval-finished-before-cleanup";
@@ -13242,8 +14516,11 @@ mod tests {
         .await
         .expect("completed event");
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request,
-            join_handle: tokio::spawn(async move { Some(result) }),
+            join_handle: tokio::spawn(async move { Some(Ok(result)) }),
         });
         tokio::time::timeout(Duration::from_secs(1), async {
             while !state
@@ -13456,10 +14733,17 @@ mod tests {
             gold_config: crate::runtime::config::GoldConfig::default(),
         };
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request: request.clone(),
             join_handle: tokio::spawn(std::future::pending()),
         });
-        state.gold_evaluation.queued_request = Some(request.clone());
+        state.gold_evaluation.queued_request = super::QueuedEvaluation::new(
+            request.clone(),
+            Arc::new(StubProvider),
+            request.model_name.clone(),
+        );
 
         tokio::time::timeout(
             Duration::from_millis(100),
@@ -13486,6 +14770,9 @@ mod tests {
         // same post-loop suspension finalizer (`runtime.suspend_reason` selects
         // this reason). Exercise that seam with another blocked request.
         state.gold_evaluation.in_flight = Some(super::super::startup::InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
             request: request.clone(),
             join_handle: tokio::spawn(std::future::pending()),
         });
@@ -14010,7 +15297,7 @@ mod tests {
             model: &str,
         ) -> Result<LLMStream, LLMError> {
             assert_eq!(model, "configured-vision");
-            assert_eq!(max, Some(1024));
+            assert_eq!(max, None);
             assert!(tools.is_empty());
             assert!(messages[0].content.contains("untrusted"));
             assert!(messages[1]
@@ -14283,11 +15570,566 @@ mod tests {
         assert_eq!(main.calls.load(Ordering::SeqCst), 1);
         assert_eq!(session.model, "actual-model");
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn managed_fast_queue_never_crosses_provider_or_model_after_refresh() {
+        use crate::runtime::config::{AuxiliaryModelConfig, GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_llm::{Config, LLMRequestOptions, ProviderRegistry};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        struct Foreground(Arc<AtomicUsize>);
+        #[async_trait::async_trait]
+        impl LLMProvider for Foreground {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                // Keep the real loop open while queued tasks complete.
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                options: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                if options
+                    .and_then(|o| o.request_purpose.as_deref())
+                    .is_some_and(|p| p == "task_evaluation" || p == "gold_evaluation")
+                {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    return Err(LLMError::Auth("unexpected main fallback".into()));
+                }
+                self.chat_stream(m, t, n, model).await
+            }
+        }
+
+        for scenario in ["unchanged", "switch", "disabled", "revoked", "removed"] {
+            let a = MockServer::start().await;
+            let b = MockServer::start().await;
+            for server in [&a, &b] {
+                Mock::given(method("POST"))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", "text/event-stream")
+                            .set_body_string("data: [DONE]\n\n"),
+                    )
+                    .mount(server)
+                    .await;
+            }
+            let data = tempfile::tempdir().unwrap();
+            let mut cfg = Config::default();
+            cfg.provider = "fast-a".into();
+            cfg.default_provider_instance = Some("fast-a".into());
+            cfg.http_proxy = "http://127.0.0.1:9".into();
+            cfg.https_proxy.clear();
+            cfg.proxy_auth = None;
+            cfg.defaults = Some(
+                serde_json::from_value(json!({
+                    "chat": {"provider": "fast-a", "model": "model-a"},
+                    "fast": {"provider": "fast-a", "model": "model-a"}
+                }))
+                .unwrap(),
+            );
+            for (id, model, endpoint) in [
+                ("fast-a", "model-a", a.uri()),
+                ("fast-b", "model-b", b.uri()),
+            ] {
+                cfg.provider_instances.insert(
+                    id.into(),
+                    serde_json::from_value(json!({
+                        "provider_type": "openai", "enabled": true,
+                        "api_key": "synthetic-only", "base_url": endpoint,
+                        "model": model, "runtime_models": [model]
+                    }))
+                    .unwrap(),
+                );
+            }
+            let registry = Arc::new(
+                ProviderRegistry::from_config(&cfg, data.path().to_path_buf())
+                    .await
+                    .unwrap(),
+            );
+            let current = Arc::new(Mutex::new(cfg));
+            let resolver_config = current.clone();
+            let resolver_registry = registry.clone();
+            let resolver = Arc::new(move || {
+                let config = resolver_config.lock().unwrap();
+                let (fast_model_name, fast_model_provider) =
+                    crate::model_config_helper::resolve_fast_model_for_runner(
+                        Some(&config),
+                        "fast-a",
+                        &resolver_registry,
+                    );
+                AuxiliaryModelConfig {
+                    fast_model_name,
+                    fast_model_provider,
+                    ..Default::default()
+                }
+            });
+            let original = resolver();
+            let fast_a = original.fast_model_provider.as_ref().unwrap().clone();
+            assert!(
+                fast_a.queue_requires_current_route(),
+                "a managed Host route must be marked"
+            );
+            let config = AgentLoopConfig {
+                model_name: Some("main-model".into()),
+                system_prompt: Some("synthetic system".into()),
+                gold_config: Some(GoldConfig {
+                    enabled: true,
+                    ..Default::default()
+                }),
+                auxiliary_model_resolver: Some(resolver),
+                prompt_memory_flags: PromptMemoryFlags {
+                    project_prompt_injection: false,
+                    relevant_recall: false,
+                    relevant_recall_rerank: false,
+                    project_first_dream: false,
+                    ledger_agenda: false,
+                },
+                ..Default::default()
+            };
+            let mut session = Session::new("managed-queue", "main-model");
+            let mut state = e2e_loop_state(&session.id);
+            state.model_name = "main-model".into();
+            state.auxiliary_models = original;
+            let _drop_flag = seed_blocked_task_evaluation(&mut session, &mut state);
+            let existing = state.task_evaluation.in_flight.take().unwrap();
+            existing.join_handle.abort();
+            let _ = existing.join_handle.await;
+            state.task_evaluation.in_flight = Some(InFlightTaskEvaluation {
+                request: existing.request,
+                metrics_started: Arc::new(AtomicBool::new(false)),
+                metrics_terminal: Arc::new(AtomicBool::new(false)),
+                join_handle: tokio::spawn(async { None }),
+            });
+            state.task_evaluation.queued_request = None;
+            state.task_context.as_mut().unwrap().task_list_dirty = true;
+            let previous_gold =
+                crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+                    &state.task_context,
+                    &session,
+                    &session.id,
+                    1,
+                    Some("model-a"),
+                    None,
+                    GoldCheckpoint::PostRound,
+                    config.gold_config.as_ref().unwrap(),
+                    crate::runtime::stream::handler::StreamTimeoutContext::default(),
+                )
+                .unwrap()
+                .unwrap();
+            state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+                terminal_claimed: Arc::new(
+                    crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+                ),
+                request: previous_gold,
+                join_handle: tokio::spawn(async { None }),
+            });
+            let (tx, _rx) = mpsc::channel(128);
+            super::spawn_task_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                fast_a.clone(),
+                CancellationToken::new(),
+            )
+            .unwrap();
+            super::spawn_gold_evaluation_if_needed(
+                1,
+                &session,
+                &tx,
+                &config,
+                &mut state,
+                fast_a,
+                CancellationToken::new(),
+            )
+            .unwrap();
+            assert!(state.task_evaluation.queued_request.is_some());
+            assert!(state.gold_evaluation.queued_request.is_some());
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !state
+                    .task_evaluation
+                    .in_flight
+                    .as_ref()
+                    .unwrap()
+                    .join_handle
+                    .is_finished()
+                    || !state
+                        .gold_evaluation
+                        .in_flight
+                        .as_ref()
+                        .unwrap()
+                        .join_handle
+                        .is_finished()
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            {
+                let mut cfg = current.lock().unwrap();
+                match scenario {
+                    "switch" => {
+                        cfg.defaults.as_mut().unwrap().fast =
+                            Some(bamboo_domain::ProviderModelRef::new("fast-b", "model-b"))
+                    }
+                    "disabled" => cfg.provider_instances.get_mut("fast-a").unwrap().enabled = false,
+                    "revoked" => {
+                        cfg.provider_instances
+                            .get_mut("fast-a")
+                            .unwrap()
+                            .extra
+                            .insert("runtime_models".into(), json!([]));
+                    }
+                    "removed" => {
+                        cfg.provider_instances.remove("fast-a");
+                    }
+                    _ => {}
+                }
+            }
+            let main_calls = Arc::new(AtomicUsize::new(0));
+            let main: Arc<dyn LLMProvider> = Arc::new(Foreground(main_calls.clone()));
+            super::run_pipeline(
+                &mut session,
+                &tx,
+                main,
+                Arc::new(AlwaysOkExecutor),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await
+            .expect("foreground pipeline should complete");
+            let requests_a = a.received_requests().await.unwrap();
+            let requests_b = b.received_requests().await.unwrap();
+            assert_eq!(
+                main_calls.load(Ordering::SeqCst),
+                0,
+                "no fallback to the main account for {scenario}"
+            );
+            assert!(
+                requests_b.is_empty(),
+                "never send A's queued model to B for {scenario}"
+            );
+            let expected_a = if scenario == "unchanged" { 2 } else { 0 };
+            assert_eq!(
+                requests_a.len(),
+                expected_a,
+                "unexpected A dispatch for {scenario}"
+            );
+            for request in &requests_a {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"],
+                    "model-a"
+                );
+            }
+            if scenario == "switch" {
+                assert!(state.task_evaluation.in_flight.is_none());
+                assert!(state.gold_evaluation.in_flight.is_none());
+                let fast_b = state
+                    .auxiliary_models
+                    .fast_model_provider
+                    .as_ref()
+                    .unwrap()
+                    .clone();
+                assert!(fast_b.queue_requires_current_route());
+                state.task_context.as_mut().unwrap().task_list_dirty = true;
+                super::spawn_task_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    fast_b.clone(),
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                super::spawn_gold_evaluation_if_needed(
+                    2,
+                    &session,
+                    &tx,
+                    &config,
+                    &mut state,
+                    fast_b,
+                    CancellationToken::new(),
+                )
+                .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if b.received_requests().await.unwrap().len() >= 2 {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("new work should use the admitted B route");
+                let later = b.received_requests().await.unwrap();
+                assert_eq!(later.len(), 2);
+                for request in &later {
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()
+                            ["model"],
+                        "model-b"
+                    );
+                }
+                assert!(a.received_requests().await.unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn queued_explicit_gold_uses_original_guard_and_independent_refusal_state() {
+        use crate::runtime::config::{GoldConfig, PromptMemoryFlags};
+        use crate::runtime::runner::loop_execution::startup::InFlightGoldEvaluation;
+        use bamboo_agent_core::GoldCheckpoint;
+        use bamboo_domain::ProviderModelRef;
+        use bamboo_llm::{Config, LLMRequestOptions, ProviderRegistry};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        use tokio::sync::RwLock;
+        use tokio_util::sync::CancellationToken;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, Request, ResponseTemplate};
+
+        struct Main {
+            target: Arc<dyn LLMProvider>,
+            requests: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl LLMProvider for Main {
+            async fn chat_stream(
+                &self,
+                _: &[Message],
+                _: &[bamboo_agent_core::tools::ToolSchema],
+                _: Option<u32>,
+                _: &str,
+            ) -> Result<LLMStream, LLMError> {
+                let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                    while self.requests.load(Ordering::SeqCst) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await;
+                Ok(Box::pin(stream::iter([
+                    Ok(LLMChunk::Token("synthetic complete".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+            async fn chat_stream_with_options(
+                &self,
+                m: &[Message],
+                t: &[bamboo_agent_core::tools::ToolSchema],
+                n: Option<u32>,
+                model: &str,
+                o: Option<&LLMRequestOptions>,
+            ) -> Result<LLMStream, LLMError> {
+                if model == "explicit-gold" {
+                    self.target
+                        .chat_stream_with_options(m, t, n, model, o)
+                        .await
+                } else {
+                    self.chat_stream(m, t, n, model).await
+                }
+            }
+        }
+
+        let account = MockServer::start().await;
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        Mock::given(method("POST"))
+            .respond_with(move |_: &Request| {
+                request_count.fetch_add(1, Ordering::SeqCst);
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string("data: [DONE]\n\n")
+            })
+            .mount(&account)
+            .await;
+        let data = tempfile::tempdir().unwrap();
+        let mut cfg = Config::default();
+        cfg.provider = "gold-a".into();
+        cfg.default_provider_instance = Some("gold-a".into());
+        cfg.http_proxy = "http://127.0.0.1:9".into();
+        cfg.https_proxy.clear();
+        cfg.proxy_auth = None;
+        cfg.provider_instances.insert("gold-a".into(), serde_json::from_value(json!({
+            "provider_type":"openai", "enabled":true, "api_key":"synthetic-only",
+            "base_url":account.uri(), "model":"main-model", "runtime_models":["main-model", "explicit-gold"]
+        })).unwrap());
+        let registry = Arc::new(
+            ProviderRegistry::from_config(&cfg, data.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let selected = registry
+            .provider_for_configured_model(&cfg, &ProviderModelRef::new("gold-a", "main-model"))
+            .unwrap();
+        let live = Arc::new(RwLock::new(cfg));
+        let markers: Arc<Mutex<Vec<Arc<dyn LLMProvider>>>> = Arc::new(Mutex::new(Vec::new()));
+        let resolver_markers = markers.clone();
+        let resolver_live = live.clone();
+        let resolver_registry = registry.clone();
+        let resolver_selected = selected.clone();
+        let resolver: crate::runtime::config::GoldTargetResolver =
+            Arc::new(move |model, delegate| {
+                let guard = bamboo_llm::gold_admission::guarded_gold_target(
+                    resolver_live.clone(),
+                    resolver_registry.clone(),
+                    ProviderModelRef::new("gold-a", model),
+                    resolver_selected.clone(),
+                    delegate,
+                );
+                resolver_markers.lock().unwrap().push(guard.clone());
+                guard
+            });
+        let config = AgentLoopConfig {
+            model_name: Some("main-model".into()),
+            system_prompt: Some("synthetic system".into()),
+            gold_config: Some(GoldConfig {
+                enabled: true,
+                model_name: Some("explicit-gold".into()),
+                ..Default::default()
+            }),
+            gold_target_resolver: Some(resolver),
+            prompt_memory_flags: PromptMemoryFlags {
+                project_prompt_injection: false,
+                relevant_recall: false,
+                relevant_recall_rerank: false,
+                project_first_dream: false,
+                ledger_agenda: false,
+            },
+            ..Default::default()
+        };
+        let main: Arc<dyn LLMProvider> = Arc::new(Main {
+            target: selected,
+            requests: requests.clone(),
+        });
+        let mut session = Session::new("guarded-queue", "main-model");
+        let mut state = e2e_loop_state(&session.id);
+        state.model_name = "main-model".into();
+        let previous = crate::runtime::gold_evaluation::build_async_gold_evaluation_request(
+            &None,
+            &session,
+            &session.id,
+            1,
+            Some("main-model"),
+            None,
+            GoldCheckpoint::PostRound,
+            config.gold_config.as_ref().unwrap(),
+            crate::runtime::stream::handler::StreamTimeoutContext::default(),
+        )
+        .unwrap()
+        .unwrap();
+        state.gold_evaluation.in_flight = Some(InFlightGoldEvaluation {
+            terminal_claimed: Arc::new(
+                crate::runtime::gold_evaluation::GoldEvaluationTerminal::default(),
+            ),
+            request: previous,
+            join_handle: tokio::spawn(async { None }),
+        });
+        let (tx, _rx) = mpsc::channel(128);
+        let first = super::select_gold_evaluation_provider(&config, &main, None);
+        super::spawn_gold_evaluation_if_needed(
+            1,
+            &session,
+            &tx,
+            &config,
+            &mut state,
+            first,
+            CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(state.gold_evaluation.queued_request.is_some());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !state
+                .gold_evaluation
+                .in_flight
+                .as_ref()
+                .unwrap()
+                .join_handle
+                .is_finished()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        super::run_pipeline(
+            &mut session,
+            &tx,
+            main,
+            Arc::new(AlwaysOkExecutor),
+            &CancellationToken::new(),
+            &config,
+            &mut state,
+        )
+        .await
+        .expect("foreground pipeline should complete");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "exactly one queued Gold dispatch"
+        );
+        let seen = account.received_requests().await.unwrap();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&seen[0].body).unwrap()["model"],
+            "explicit-gold"
+        );
+        let (old_guard, new_guard) = {
+            let markers = markers.lock().unwrap();
+            assert!(markers.len() >= 2, "a new guard must be created at refresh");
+            (markers[0].clone(), markers[1].clone())
+        };
+        assert!(!old_guard.local_dispatch_refused());
+        assert!(!new_guard.local_dispatch_refused());
+        assert!(old_guard
+            .chat_stream(&[], &[], None, "different-model")
+            .await
+            .is_err());
+        assert!(old_guard.local_dispatch_refused());
+        assert!(
+            !new_guard.local_dispatch_refused(),
+            "refusal belongs to exactly one guard"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "wrong model is locally rejected"
+        );
+    }
 }
 
 #[cfg(test)]
 #[path = "pipeline_final_evidence_tests.rs"]
 mod final_evidence_tests;
+
+#[cfg(test)]
+#[path = "pipeline_model_routing_tests.rs"]
+mod model_routing_tests;
 
 #[cfg(all(test, unix))]
 #[path = "pipeline_exec_sessions_tests.rs"]

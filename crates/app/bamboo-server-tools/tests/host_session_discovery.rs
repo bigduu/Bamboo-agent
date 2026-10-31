@@ -184,18 +184,25 @@ async fn installed_host_scope_serves_root_child_and_supervisor_without_role_impe
                 .await
                 .unwrap(),
         );
-        assert_eq!(page["sessions"].as_array().unwrap().len(), 1);
-        assert_eq!(page["sessions"][0]["session_id"], fixture.targets[1].id);
+        let is_supervisor = caller.supervisor_incarnation_id().is_some();
+        assert_eq!(
+            page["sessions"].as_array().unwrap().len(),
+            if is_supervisor { 6 } else { 1 }
+        );
+        assert_eq!(
+            page["sessions"][0]["session_id"],
+            if is_supervisor {
+                fixture.targets[0].id.as_str()
+            } else {
+                fixture.targets[1].id.as_str()
+            }
+        );
         assert_eq!(page["sessions"][0]["link_revision"], 0);
         assert_eq!(page["sessions"][0]["authorization_revision"], 1);
-        for private in [
-            "private target",
-            "private model",
-            "workspace",
-            "zz-ungranted",
-        ] {
+        for private in ["private target", "private model", "workspace"] {
             assert!(!page.to_string().contains(private));
         }
+        assert_eq!(page.to_string().contains("zz-ungranted"), is_supervisor);
         let view = result(
             fixture
                 .tool()
@@ -482,8 +489,7 @@ async fn no_scope_or_known_id_never_exposes_global_or_peer_history_but_self_read
 }
 
 #[tokio::test]
-async fn only_never_installed_supervisor_can_use_legacy_managed_history_and_revocation_stays_denied(
-) {
+async fn canonical_supervisor_default_history_ignores_legacy_host_acl_and_revocation() {
     let fixture = Fixture::new().await;
     let supervisor = fixture.supervisor().await;
     let legacy = result(
@@ -514,7 +520,8 @@ async fn only_never_installed_supervisor_can_use_legacy_managed_history_and_revo
             .await
             .unwrap(),
     );
-    assert_eq!(page["sessions"][0]["session_id"], fixture.targets[1].id);
+    assert_eq!(page["sessions"][0]["session_id"], fixture.targets[0].id);
+    assert_eq!(page["sessions"].as_array().unwrap().len(), 5);
     for request in [
         json!({"action":"get_meta","session_id":fixture.targets[0].id}),
         json!({"action":"read_messages","session_id":fixture.targets[0].id}),
@@ -525,7 +532,7 @@ async fn only_never_installed_supervisor_can_use_legacy_managed_history_and_revo
             .tool()
             .invoke(request, Fixture::ctx(&supervisor))
             .await
-            .is_err());
+            .is_ok());
     }
     fixture
         .store
@@ -540,8 +547,34 @@ async fn only_never_installed_supervisor_can_use_legacy_managed_history_and_revo
             .tool()
             .invoke(request, Fixture::ctx(&supervisor))
             .await
-            .is_err());
+            .is_ok());
     }
+    let mut current = fixture
+        .store
+        .load_session(&supervisor.id)
+        .await
+        .unwrap()
+        .unwrap();
+    for ultra in [true, false, true] {
+        current.set_root_orchestration_only(ultra).unwrap();
+        fixture.store.save_session(&current).await.unwrap();
+        let page = result(
+            fixture
+                .tool()
+                .invoke(json!({"action":"list"}), Fixture::ctx(&current))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(page["sessions"].as_array().unwrap().len(), 5);
+    }
+    assert!(
+        fixture
+            .tool()
+            .invoke(json!({"action":"list"}), Fixture::ctx(&supervisor))
+            .await
+            .is_err(),
+        "a fresh role observation does not authorize an old executing generation"
+    );
 }
 
 struct UnavailableHost {
@@ -572,6 +605,46 @@ impl Storage for PauseLegacyRead {
     }
     async fn load_execution_admission_snapshot(&self, id: &str) -> io::Result<Option<Session>> {
         self.store.load_execution_admission_snapshot(id).await
+    }
+    async fn inspect_supervisor_current_user_scope(
+        &self,
+        supervisor: &SupervisorReference,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserScope> {
+        self.store
+            .inspect_supervisor_current_user_scope(supervisor)
+            .await
+    }
+    async fn list_supervisor_current_user_targets(
+        &self,
+        supervisor: &SupervisorReference,
+        query: Option<&str>,
+        after: Option<&str>,
+        limit: usize,
+    ) -> io::Result<bamboo_domain::SupervisorCurrentUserPage> {
+        let page = self
+            .store
+            .list_supervisor_current_user_targets(supervisor, query, after, limit)
+            .await?;
+        if !self.inspect {
+            self.paused.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(page)
+    }
+    async fn load_supervisor_current_user_observed_session(
+        &self,
+        supervisor: &SupervisorReference,
+        target: &str,
+    ) -> io::Result<(Session, bamboo_domain::SupervisorCurrentUserTarget)> {
+        let observed = self
+            .store
+            .load_supervisor_current_user_observed_session(supervisor, target)
+            .await?;
+        if self.inspect {
+            self.paused.notify_one();
+            self.resume.notified().await;
+        }
+        Ok(observed)
     }
     async fn find_host_session_scope(
         &self,
@@ -612,9 +685,9 @@ impl Storage for PauseLegacyRead {
 }
 
 #[tokio::test]
-async fn legacy_list_and_inspect_reject_host_installation_or_revocation_while_waiting() {
+async fn current_user_reads_keep_original_caller_fences_without_legacy_host_acl() {
     for inspect in [false, true] {
-        for revoke in [false, true] {
+        for change in ["install", "revoke", "caller"] {
             let fixture = Fixture::new().await;
             let supervisor = fixture.supervisor().await;
             let storage = Arc::new(PauseLegacyRead {
@@ -633,13 +706,26 @@ async fn legacy_list_and_inspect_reject_host_installation_or_revocation_while_wa
             let read = tokio::spawn(async move { tool.invoke(request, ctx).await });
             tokio::time::timeout(std::time::Duration::from_secs(5), storage.paused.notified())
                 .await
-                .expect("legacy reader reaches its synthetic pause");
-            // Only temporary fixture authority changes. The old reader already
-            // observed A, but the newly published grant permits only B's metadata.
-            fixture
-                .install(&supervisor, vec![], &[(1, vec![Right::ListMetadata])], 0)
-                .await;
-            if revoke {
+                .expect("current-user reader reaches its synthetic pause");
+            // Old finite Host ACL publication cannot restrict the canonical
+            // Supervisor role. A changed original execution still must fail.
+            if change == "caller" {
+                let mut changed = supervisor.clone();
+                changed.workspace = Some(
+                    fixture
+                        .home
+                        .path()
+                        .join("new-workspace")
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                fixture.store.save_session(&changed).await.unwrap();
+            } else {
+                fixture
+                    .install(&supervisor, vec![], &[(1, vec![Right::ListMetadata])], 0)
+                    .await;
+            }
+            if change == "revoke" {
                 fixture
                     .store
                     .revoke_host_session_scope(&supervisor.id, 1)
@@ -647,16 +733,23 @@ async fn legacy_list_and_inspect_reject_host_installation_or_revocation_while_wa
                     .unwrap();
             }
             storage.resume.notify_one();
-            let error = tokio::time::timeout(std::time::Duration::from_secs(5), read)
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(5), read)
                 .await
-                .expect("legacy reader completes after release")
-                .unwrap()
-                .unwrap_err();
-            assert!(error.to_string().contains(if revoke {
-                "authority_unavailable"
+                .expect("current-user reader completes after release")
+                .unwrap();
+            if change == "caller" {
+                assert!(
+                    observed.is_err(),
+                    "changed original caller must stay denied"
+                );
             } else {
-                "bounded_scope"
-            }));
+                let observed = result(observed.unwrap());
+                if inspect {
+                    assert_eq!(observed["session_id"], fixture.targets[0].id);
+                } else {
+                    assert_eq!(observed["sessions"].as_array().unwrap().len(), 5);
+                }
+            }
         }
     }
 }

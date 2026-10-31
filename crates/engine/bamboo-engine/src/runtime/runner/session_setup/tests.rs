@@ -1365,6 +1365,8 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
             "default::Read",
             "vendor::session_control",
         ])
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .collect::<Vec<_>>();
     let tools = crate::session_app::approval_replay::framework_fixture::FixtureTools::new(&names);
     let config = crate::runtime::config::AgentLoopConfig::default();
@@ -1380,9 +1382,8 @@ fn supervisor_delegation_first_catalog_matches_provider_and_discovery_in_standar
             .iter()
             .map(|entry| entry.execution_name().to_string())
             .collect::<std::collections::BTreeSet<_>>();
-        let expected = bamboo_domain::ROOT_ORCHESTRATION_TOOLS
+        let expected = bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS
             .into_iter()
-            .chain(bamboo_domain::SUPERVISOR_ORCHESTRATION_TOOLS)
             .map(str::to_owned)
             .collect();
         assert_eq!(names, expected, "Supervisor ultra={ultra}");
@@ -1451,12 +1452,9 @@ fn supervisor_delegation_first_freezes_full_guide_without_user_activation_or_dis
         ..Default::default()
     };
     let schemas = resolve_tool_schemas_for_round(&config, &tools, &mut supervisor);
-    assert_eq!(
-        schemas
-            .iter()
-            .map(|s| s.function.name.as_str())
-            .collect::<Vec<_>>(),
-        ["Read"]
+    assert!(
+        schemas.is_empty(),
+        "disabled delegation must not expose Read"
     );
 }
 
@@ -1493,17 +1491,11 @@ fn supervisor_ultra_catalog_keeps_only_scoped_management_and_live_denials() {
             history.schema().function.parameters["properties"]["action"]["enum"],
             serde_json::json!(["list", "inspect", "get_meta", "read_messages"])
         );
-        if ultra {
-            assert_eq!(
-                names,
-                [
-                    "Read".into(),
-                    "session_control".into(),
-                    "session_history".into()
-                ]
-                .into()
-            );
-        }
+        assert_eq!(
+            names,
+            ["session_control".into(), "session_history".into()].into(),
+            "Supervisor ultra={ultra} must not expose direct Read"
+        );
         let provider =
             resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &supervisor)
                 .into_iter()
@@ -3160,4 +3152,44 @@ async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_
         super::legacy_instruction::validate_execution_selection(&session).unwrap();
         assert_eq!(serde_json::to_value(&session).unwrap(), before);
     }
+}
+
+#[test]
+fn supervisor_existing_session_first_subagent_schema_preserves_ordinary_contract() {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = StaticToolExecutor {
+        schemas: vec![schema("SubAgent")],
+    };
+    let mut supervisor = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    supervisor.authority_identity = SessionAuthorityIdentity::Supervisor {
+        incarnation_id: uuid::Uuid::new_v4(),
+    };
+    for ultra in [false, true] {
+        supervisor.set_root_orchestration_only(ultra).unwrap();
+        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &supervisor);
+        assert!(schemas[0]
+            .function
+            .description
+            .contains("existing managed Sessions"));
+        assert!(schemas[0]
+            .function
+            .description
+            .contains("auxiliary planning"));
+        let guide = super::prompt_setup::build_tool_guide_context(
+            &config,
+            &schemas,
+            "base",
+            &supervisor.id,
+            &super::tool_schemas::effective_guide_activation(&config, &supervisor),
+        );
+        assert!(guide.contains("session_history list"));
+        assert!(guide.contains("auxiliary planning"));
+    }
+    let ordinary = Session::new("ordinary-policy", "model");
+    let ordinary_schemas = resolve_available_tool_schemas_for_session(&config, &tools, &ordinary);
+    assert!(!ordinary_schemas[0]
+        .function
+        .description
+        .contains("existing managed Sessions"));
 }

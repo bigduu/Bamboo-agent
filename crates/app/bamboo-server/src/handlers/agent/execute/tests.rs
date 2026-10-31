@@ -77,6 +77,8 @@ fn execute_request_empty_model_normalizes_to_compat_absent() {
         client_sync: None,
         no_human_approver: false,
         run_budget: None,
+        upstream_retry: None,
+        live_bootstrap_resume: false,
     };
 
     let model = request.model.as_deref().unwrap_or("").trim();
@@ -172,6 +174,36 @@ pub(super) async fn after_root_admission_selection(id: &str, reserved: bool) {
     }
 }
 
+// Test-only gate after the real Ready path selects its concrete provider.
+// The keyed rendezvous leaves ordinary production and unrelated tests untouched.
+type LegacyVisionSelectionGate = (
+    tokio::sync::oneshot::Sender<bool>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+fn legacy_vision_selection_gates(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, LegacyVisionSelectionGate>> {
+    static GATES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, LegacyVisionSelectionGate>>,
+    > = std::sync::OnceLock::new();
+    GATES.get_or_init(std::sync::Mutex::default)
+}
+pub(super) async fn after_legacy_vision_provider_selection(id: &str, managed: bool) {
+    let gate = legacy_vision_selection_gates().lock().unwrap().remove(id);
+    if let Some((selected, resume)) = gate {
+        let _ = selected.send(managed);
+        let _ = resume.await;
+    }
+}
+struct LegacyVisionSelectionProbe(String);
+impl Drop for LegacyVisionSelectionProbe {
+    fn drop(&mut self) {
+        legacy_vision_selection_gates()
+            .lock()
+            .unwrap()
+            .remove(&self.0);
+    }
+}
+
 // Reachable only on the repaired HTTP ownership path. Baseline counterfactual
 // runs target the four early-selection races, never this secondary-only gate.
 impl crate::AppState {
@@ -199,6 +231,413 @@ mod execution_input_http {
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+
+    include!("live_retry_vertical_fixture.rs");
+    include!("gold_host_admission_fixture.rs");
+
+    struct RetryHttpProvider {
+        url: String,
+    }
+    #[async_trait]
+    impl LLMProvider for RetryHttpProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            let config = bamboo_llm::retry::RetryConfig {
+                max_attempts: 1,
+                base_delay: std::time::Duration::from_millis(1),
+                max_delay: std::time::Duration::from_millis(5),
+            };
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let response =
+                bamboo_llm::retry::send_provider_request(&config, "controlled-http", || {
+                    client.post(&self.url).json(messages)
+                })
+                .await?;
+            if !response.status().is_success() {
+                return Err(LLMError::RequestFailed("controlled request failed".into()));
+            }
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token("controlled HTTP complete".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    #[actix_web::test]
+    async fn execute_http_retry_mode_reaches_the_real_provider_and_stop_retires_exact_run() {
+        use std::sync::atomic::AtomicUsize;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        for stop in [false, true] {
+            let server = MockServer::start().await;
+            let count = Arc::new(AtomicUsize::new(0));
+            let hits = count.clone();
+            Mock::given(method("POST"))
+                .respond_with(move |_: &wiremock::Request| {
+                    let n = hits.fetch_add(1, Ordering::SeqCst);
+                    if stop {
+                        ResponseTemplate::new(429).insert_header("Retry-After", "120")
+                    } else {
+                        ResponseTemplate::new(if n < 3 { 503 } else { 200 })
+                    }
+                })
+                .mount(&server)
+                .await;
+            let (_home, state, _fault) =
+                state_with_provider(None, Arc::new(RetryHttpProvider { url: server.uri() })).await;
+            let id = format!("retry-http-{}", uuid::Uuid::new_v4());
+            let session = owned_http_session(&state, &id);
+            state.storage.save_session(&session).await.unwrap();
+            queue_owned_root(&state, &id).await;
+            let mut events = state.get_session_event_sender(&id).await.subscribe();
+            let app = test::init_service(
+                actix_web::App::new()
+                    .app_data(state.clone())
+                    .configure(crate::routes::configure_routes),
+            )
+            .await;
+            let response = test::call_service(&app, test::TestRequest::post().uri(&format!("/api/v1/execute/{id}")).set_json(serde_json::json!({"model":"test-model","upstream_retry":{"mode":"until_cancelled"}})).to_request()).await;
+            assert!(response.status().is_success());
+            let started: serde_json::Value = test::read_body_json(response).await;
+            let run_id = started["run_id"]
+                .as_str()
+                .expect("Execute run id")
+                .to_owned();
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if stop && count.load(Ordering::SeqCst) >= 1 {
+                        break;
+                    }
+                    if !stop
+                        && state
+                            .agent_runners
+                            .read()
+                            .await
+                            .get(&id)
+                            .is_some_and(|r| matches!(r.status, AgentStatus::Completed))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("controlled actual execute consumer");
+            if stop {
+                let duplicate = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&format!("/api/v1/execute/{id}"))
+                        .set_json(serde_json::json!({"upstream_retry":{"mode":"bounded"}}))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(duplicate.status(), StatusCode::OK);
+                let duplicate: serde_json::Value = test::read_body_json(duplicate).await;
+                assert_eq!(duplicate["status"], "already_running");
+                let stale = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&format!("/api/v1/stop/{id}"))
+                        .insert_header(("Bamboo-Run-Id", "an-earlier-run"))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(stale.status(), StatusCode::CONFLICT);
+                let runners = state.agent_runners.read().await;
+                let current = runners.get(&id).unwrap();
+                assert_eq!(current.run_id, run_id);
+                assert!(!current.cancel_token.is_cancelled());
+                drop(runners);
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&format!("/api/v1/stop/{id}"))
+                        .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                let stopped: serde_json::Value = test::read_body_json(response).await;
+                assert_eq!(stopped["run_id"], run_id);
+                assert!(state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(&id)
+                    .unwrap()
+                    .cancel_token
+                    .is_cancelled());
+            }
+            wait_for_owned_terminal_with_cancellation(&state, &id, &run_id, &mut events, stop)
+                .await;
+            assert_eq!(count.load(Ordering::SeqCst), if stop { 1 } else { 4 });
+            let cold = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                cold.last_run_status().as_deref(),
+                Some(if stop { "cancelled" } else { "completed" })
+            );
+            assert_eq!(
+                cold.messages
+                    .iter()
+                    .filter(|m| m.content == "one owned Root input")
+                    .count(),
+                1
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .unwrap();
+        }
+    }
+
+    #[actix_web::test]
+    async fn exact_stop_http_validates_run_identity_and_never_cancels_a_successor_or_legacy_token()
+    {
+        use crate::app_state::AgentRunner;
+        use actix_web::http::header::HeaderValue;
+        use tokio_util::sync::CancellationToken;
+
+        let (_home, state, _fault) = state(None).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for (canonical, child) in [(false, false), (true, false), (false, true), (true, true)] {
+            let id = format!("exact-stop-http-{}", uuid::Uuid::new_v4());
+            let session = if child {
+                let parent = owned_http_session(&state, &format!("parent-{id}"));
+                state.storage.save_session(&parent).await.unwrap();
+                bamboo_agent_core::Session::new_child_of(
+                    &id,
+                    &parent,
+                    "test-model",
+                    "controlled-stop-child",
+                )
+            } else {
+                owned_http_session(&state, &id)
+            };
+            state.storage.save_session(&session).await.unwrap();
+            let uri = if canonical {
+                format!("/api/v1/sessions/{id}/stop")
+            } else {
+                format!("/api/v1/stop/{id}")
+            };
+            let mut owner = AgentRunner::new();
+            owner.status = AgentStatus::Running;
+            let run_id = owner.run_id.clone();
+            let token = owner.cancel_token.clone();
+            state.agent_runners.write().await.insert(id.clone(), owner);
+
+            for header in [
+                HeaderValue::from_static(""),
+                HeaderValue::from_static("invalid run"),
+                HeaderValue::from_str(&"x".repeat(129)).unwrap(),
+                HeaderValue::from_bytes(&[0xff]).unwrap(),
+            ] {
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&uri)
+                        .insert_header(("Bamboo-Run-Id", header))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                assert!(!token.is_cancelled());
+            }
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .append_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .append_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(!token.is_cancelled());
+
+            // An exact stop cannot fall through to the compatibility table.
+            let legacy_guard = state.cancel_tokens.write().await;
+            for _ in 0..2 {
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(3),
+                    test::call_service(
+                        &app,
+                        test::TestRequest::post()
+                            .uri(&uri)
+                            .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                            .to_request(),
+                    ),
+                )
+                .await
+                .expect("exact Stop must not wait for legacy bookkeeping");
+                assert_eq!(response.status(), StatusCode::OK);
+                let stopped: serde_json::Value = test::read_body_json(response).await;
+                assert_eq!(
+                    stopped,
+                    serde_json::json!({"success":true,"session_id":id,"run_id":run_id})
+                );
+                assert!(token.is_cancelled());
+            }
+            drop(legacy_guard);
+
+            let mut successor = AgentRunner::new();
+            successor.status = AgentStatus::Pending;
+            let successor_id = successor.run_id.clone();
+            let successor_token = successor.cancel_token.clone();
+            state
+                .agent_runners
+                .write()
+                .await
+                .insert(id.clone(), successor);
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!successor_token.is_cancelled());
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .insert_header(("Bamboo-Run-Id", successor_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(successor_token.is_cancelled());
+
+            for status in [
+                AgentStatus::Completed,
+                AgentStatus::Error("controlled".into()),
+            ] {
+                let mut terminal = AgentRunner::new();
+                terminal.status = status;
+                let terminal_id = terminal.run_id.clone();
+                let terminal_token = terminal.cancel_token.clone();
+                state
+                    .agent_runners
+                    .write()
+                    .await
+                    .insert(id.clone(), terminal);
+                let response = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri(&uri)
+                        .insert_header(("Bamboo-Run-Id", terminal_id.as_str()))
+                        .to_request(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::CONFLICT);
+                assert!(!terminal_token.is_cancelled());
+            }
+
+            state.agent_runners.write().await.remove(&id);
+            let legacy = CancellationToken::new();
+            state
+                .cancel_tokens
+                .write()
+                .await
+                .insert(id.clone(), legacy.clone());
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .insert_header(("Bamboo-Run-Id", successor_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::CONFLICT);
+            assert!(!legacy.is_cancelled());
+            let response =
+                test::call_service(&app, test::TestRequest::post().uri(&uri).to_request()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(legacy.is_cancelled());
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn stop_http_requires_supervisor_owner_for_exact_and_headerless_requests() {
+        use crate::app_state::AgentRunner;
+        let (_home, state, _fault) = state(None).await;
+        let supervisor = state
+            .storage
+            .get_or_create_default_supervisor("test-model")
+            .await
+            .unwrap();
+        let id = supervisor.session_id;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for canonical in [false, true] {
+            let uri = if canonical {
+                format!("/api/v1/sessions/{id}/stop")
+            } else {
+                format!("/api/v1/stop/{id}")
+            };
+            for exact in [false, true] {
+                let mut runner = AgentRunner::new();
+                runner.status = AgentStatus::Running;
+                let run_id = runner.run_id.clone();
+                let token = runner.cancel_token.clone();
+                state.agent_runners.write().await.insert(id.clone(), runner);
+                for remote in [true, false] {
+                    let mut request = test::TestRequest::post().uri(&uri).peer_addr(
+                        if remote {
+                            "192.0.2.1:12345"
+                        } else {
+                            "127.0.0.1:12345"
+                        }
+                        .parse()
+                        .unwrap(),
+                    );
+                    if exact {
+                        request = request.insert_header(("Bamboo-Run-Id", run_id.as_str()));
+                    }
+                    let response = test::call_service(&app, request.to_request()).await;
+                    assert_eq!(
+                        response.status(),
+                        if remote {
+                            StatusCode::FORBIDDEN
+                        } else {
+                            StatusCode::OK
+                        },
+                        "Supervisor Stop requires its verified owner for either request form",
+                    );
+                    assert_eq!(token.is_cancelled(), !remote);
+                    let runners = state.agent_runners.read().await;
+                    let current = runners.get(&id).unwrap();
+                    assert_eq!(current.run_id, run_id);
+                    assert!(if remote {
+                        matches!(current.status, AgentStatus::Running)
+                    } else {
+                        matches!(current.status, AgentStatus::Cancelled)
+                    });
+                }
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
 
     struct LocalProvider;
     #[async_trait]
@@ -390,6 +829,13 @@ mod execution_input_http {
             model: Some("test-model".into()),
             ..Default::default()
         });
+        // These fixtures count execution calls. The default-on first Dream
+        // tick may otherwise extract a just-persisted fixture through the same
+        // provider before the admission barrier has been released.
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let mut state =
             crate::AppState::new_with_provider(home.path().into(), config, provider.clone())
                 .await
@@ -513,6 +959,2206 @@ mod execution_input_http {
                 "automatic launch unavailable in manual HTTP fixture".into(),
             ))
         }
+    }
+
+    // Full HTTP/Root fixture for the continuous-retry recovery contract. The
+    // completed tool exchange is synthetic; the provider is an in-process stub.
+    #[derive(Default)]
+    struct ResumeBootstrapProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        observed: std::sync::Mutex<Vec<Vec<bamboo_agent_core::Message>>>,
+    }
+    #[async_trait]
+    impl LLMProvider for ResumeBootstrapProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.observed.lock().unwrap().push(messages.to_vec());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Err(LLMError::RequestFailed(
+                    "synthetic initial headers timeout".into(),
+                ))
+            } else {
+                Ok(Box::pin(futures::stream::iter([
+                    Ok(LLMChunk::Token("synthetic recovered reply".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+        }
+    }
+
+    fn completed_synthetic_tool_exchange() -> Vec<bamboo_agent_core::Message> {
+        use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+        vec![
+            bamboo_agent_core::Message::user("one original user message"),
+            bamboo_agent_core::Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "already-completed-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "synthetic_effect".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+            ),
+            bamboo_agent_core::Message::tool_result("already-completed-call", "already completed"),
+        ]
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_failed_bootstrap_after_tool_result() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "continuous-resume-after-bootstrap";
+        let mut session = owned_http_session(&state, id);
+        session.messages = completed_synthetic_tool_exchange();
+        // Prime a real execute from the existing complete tool exchange. Its
+        // provider will fail during bootstrap and consume this old marker.
+        session
+            .metadata
+            .insert("retry_resume_pending".into(), "true".into());
+        state.storage.save_session(&session).await.unwrap();
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let first = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        let first_status = first.status();
+        let first: serde_json::Value = test::read_body_json(first).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED, "first execute: {first}");
+        assert_eq!(first["status"], "started");
+        let first_run = first["run_id"].as_str().unwrap().to_owned();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let terminal = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(id)
+                    .is_some_and(|runner| {
+                        runner.run_id == first_run && matches!(runner.status, AgentStatus::Error(_))
+                    });
+                let persisted = state.storage.load_session(id).await.unwrap();
+                if terminal
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                    && persisted
+                        .as_ref()
+                        .is_some_and(|s| s.last_run_status().as_deref() == Some("error"))
+                {
+                    break persisted.unwrap();
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("actual synthetic bootstrap failure durably retired");
+        let before = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(before.last_run_status().as_deref(), Some("error"));
+        assert_eq!(
+            before
+                .agent_runtime_state
+                .as_ref()
+                .map(|runtime| runtime.status),
+            Some(bamboo_domain::AgentStatusState::Failed)
+        );
+        assert!(!before.metadata.contains_key("retry_resume_pending"));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let cached_before = state.load_session(id).await.expect("cached session");
+        let cached_snapshot =
+            bamboo_engine::session_app::types::ServerExecuteSnapshot::from_session(&cached_before);
+        let durable_snapshot =
+            bamboo_engine::session_app::types::ServerExecuteSnapshot::from_session(&before);
+        let backlog = state
+            .session_inbox
+            .inspect(id)
+            .await
+            .expect("fixture inbox");
+        let runner_observation = {
+            let runners = state.agent_runners.read().await;
+            runners.get(id).map(|runner| {
+                (
+                    format!("{:?}", runner.status),
+                    runner.root_reset_admission_reserved(),
+                )
+            })
+        };
+        let runtime_observation = before.agent_runtime_state.as_ref().map(|runtime| {
+            (
+                format!("{:?}", runtime.status),
+                runtime.waiting_for_children.is_some(),
+                runtime.waiting_for_bash.is_some(),
+            )
+        });
+        eprintln!("synthetic pre-retry: cached={cached_snapshot:?}, durable={durable_snapshot:?}, backlog={backlog:?}, runner={runner_observation:?}, runtime={runtime_observation:?}, queued={}, injected={}, suspended={}",
+            before.metadata.contains_key("chat.queued_ingress.v1"),
+            before.has_pending_injected_messages(),
+            before.metadata.contains_key("runtime.suspend_reason"));
+        {
+            let observed = provider.observed.lock().unwrap();
+            assert_eq!(observed.len(), 1);
+            assert!(
+                observed[0].iter().any(|message| {
+                    message.tool_calls.as_ref().is_some_and(|calls| {
+                        calls.iter().any(|call| call.id == "already-completed-call")
+                    })
+                }),
+                "the first real provider dispatch must include the completed call"
+            );
+            assert!(
+                observed[0].iter().any(|message| {
+                    message.tool_call_id.as_deref() == Some("already-completed-call")
+                }),
+                "the first real provider dispatch must include its recorded result"
+            );
+        }
+        assert_eq!(
+            before.messages.last().unwrap().role,
+            bamboo_agent_core::Role::Tool
+        );
+        assert_eq!(
+            before
+                .messages
+                .iter()
+                .filter(|m| m.content == "one original user message")
+                .count(),
+            1
+        );
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        let after_request_calls = provider.calls.load(Ordering::SeqCst);
+        eprintln!("continuous retry after synthetic bootstrap failure: HTTP {status}, body={body}, provider_calls_after={after_request_calls}");
+        // Count before checking the exact error code so a protocol mismatch
+        // cannot hide an unexpected provider dispatch.
+        assert_eq!(after_request_calls, 1, "a refused retry must not dispatch");
+        // A durable failure and a finished tool result are not by themselves
+        // authorization to restart a turn. Refuse explicitly until a scoped,
+        // non-destructive recovery contract prepares this exact history.
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "ambiguous retry must refuse: {body}"
+        );
+        assert_eq!(body["error"]["code"], "retry_resume_not_prepared");
+        assert!(body.get("run_id").is_none());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(after.last_run_status().as_deref(), Some("error"));
+        assert_eq!(
+            serde_json::to_value(&before.messages).unwrap(),
+            serde_json::to_value(&after.messages).unwrap(),
+            "the previous messages and all their fields must be retained"
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|m| m.content == "one original user message")
+                .count(),
+            1
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|m| m.tool_call_id.as_deref() == Some("already-completed-call"))
+                .count(),
+            1
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[actix_web::test]
+    async fn continuous_resume_contract_failed_bootstrap_user_tail_requires_receipt() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let hook_file = home.path().join("synthetic-session-start-count");
+        state.config.write().await.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+            enabled: true,
+            session_start: vec![bamboo_config::LifecycleHookGroup {
+                enabled: true,
+                matcher: None,
+                hooks: vec![bamboo_config::LifecycleHookHandler::command(
+                    format!("printf s >> '{}'", hook_file.display()),
+                    bamboo_config::DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+                )],
+            }],
+            ..Default::default()
+        };
+        let id = "continuous-resume-after-user-bootstrap";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        let first_status = response.status();
+        let first: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(
+            first_status,
+            StatusCode::ACCEPTED,
+            "first execution: {first}"
+        );
+        let first_run = first["run_id"].as_str().unwrap().to_owned();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let terminal = state.agent_runners.read().await.get(id).is_some_and(|r| {
+                    r.run_id == first_run && matches!(r.status, AgentStatus::Error(_))
+                });
+                let actor_failed = bamboo_domain::ActorDirectoryPort::inspect_actor(
+                    state.session_store.as_ref(),
+                    id,
+                )
+                .await
+                .ok()
+                .and_then(|a| a.activation)
+                .is_some_and(|a| {
+                    a.run_id == first_run
+                        && a.status == bamboo_domain::ActorActivationStatus::Failed
+                });
+                let saved = state.storage.load_session(id).await.unwrap();
+                if terminal
+                    && actor_failed
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                    && saved
+                        .as_ref()
+                        .is_some_and(|s| s.last_run_status().as_deref() == Some("error"))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first synthetic bootstrap error durably retired");
+        let before = state.storage.load_session(id).await.unwrap().unwrap();
+        let user = before.messages.last().unwrap();
+        assert_eq!(user.role, bamboo_agent_core::Role::User);
+        assert_eq!(user.content, "one owned Root input");
+        let user_id = user.id.clone();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let hook_before = std::fs::read_to_string(&hook_file).unwrap();
+        assert_eq!(hook_before, "s", "first SessionStart really ran once");
+
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        if let Some(run) = body.get("run_id").and_then(|v| v.as_str()) {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let terminal = state.agent_runners.read().await.get(id).is_some_and(|r| {
+                        r.run_id == run
+                            && !matches!(r.status, AgentStatus::Pending | AgentStatus::Running)
+                    });
+                    if terminal
+                        && state
+                            .session_activation_router
+                            .current_run_id(id)
+                            .await
+                            .is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("second synthetic execution retired");
+        }
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        let after_calls = provider.calls.load(Ordering::SeqCst);
+        let hook_after = std::fs::read_to_string(&hook_file).unwrap();
+        eprintln!("user-tail retry: HTTP {status}, body={body}, provider_calls_before=1, provider_calls_after={after_calls}, session_start_before={hook_before:?}, session_start_after={hook_after:?}, user_count={}",
+            after.messages.iter().filter(|m| m.id == user_id).count());
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(
+            after_calls, 1,
+            "unprepared recovery must not dispatch provider"
+        );
+        assert_eq!(
+            hook_after, hook_before,
+            "unprepared recovery must not re-run SessionStart"
+        );
+        assert_eq!(status, StatusCode::CONFLICT, "unprepared recovery: {body}");
+        assert_eq!(body["error"]["code"], "retry_resume_not_prepared");
+        assert!(body.get("run_id").is_none());
+        assert_eq!(
+            serde_json::to_value(&before.messages).unwrap(),
+            serde_json::to_value(&after.messages).unwrap()
+        );
+        assert_eq!(after.messages.iter().filter(|m| m.id == user_id).count(), 1);
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_new_user_after_failure_starts_once() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "continuous-fresh-user-after-bootstrap";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        let first_status = response.status();
+        let first: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED, "first run: {first}");
+        let first_run = first["run_id"].as_str().unwrap().to_owned();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let failed = state.agent_runners.read().await.get(id).is_some_and(|r| {
+                    r.run_id == first_run && matches!(r.status, AgentStatus::Error(_))
+                });
+                let actor_failed = bamboo_domain::ActorDirectoryPort::inspect_actor(
+                    state.session_store.as_ref(),
+                    id,
+                )
+                .await
+                .ok()
+                .and_then(|a| a.activation)
+                .is_some_and(|a| {
+                    a.run_id == first_run
+                        && a.status == bamboo_domain::ActorActivationStatus::Failed
+                });
+                if failed
+                    && actor_failed
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("first failed run retires");
+        let before = state.storage.load_session(id).await.unwrap().unwrap();
+        let first_user = before.messages.last().unwrap().id.clone();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(
+            serde_json::json!({"session_id":id,"message":"a genuinely new user input", "model":"test-model"})
+        ).unwrap();
+        let response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        let chat_status = response.status();
+        let chat_body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(
+            chat_status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&chat_body)
+        );
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "new input must start: {body}");
+        let new_run = body["run_id"].as_str().unwrap().to_owned();
+        assert_ne!(new_run, first_run);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let completed = state.agent_runners.read().await.get(id).is_some_and(|r| {
+                    r.run_id == new_run && matches!(r.status, AgentStatus::Completed)
+                });
+                let actor_done = bamboo_domain::ActorDirectoryPort::inspect_actor(
+                    state.session_store.as_ref(),
+                    id,
+                )
+                .await
+                .ok()
+                .and_then(|a| a.activation)
+                .is_some_and(|a| {
+                    a.run_id == new_run
+                        && a.status == bamboo_domain::ActorActivationStatus::Succeeded
+                });
+                if completed
+                    && actor_done
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("new user run completes");
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            after.messages.iter().filter(|m| m.id == first_user).count(),
+            1
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|m| m.content == "a genuinely new user input")
+                .count(),
+            1
+        );
+        assert!(after
+            .messages
+            .iter()
+            .any(|m| m.content == "synthetic recovered reply"));
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    // Consumer regressions for fresh input after a failed run. Each case
+    // observes the actual admission path and retains the original input identity.
+
+    async fn scratch_wait_failed_root(state: &web::Data<crate::AppState>, id: &str, run: &str) {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let runner_failed =
+                    state.agent_runners.read().await.get(id).is_some_and(|r| {
+                        r.run_id == run && matches!(r.status, AgentStatus::Error(_))
+                    });
+                let actor_failed = bamboo_domain::ActorDirectoryPort::inspect_actor(
+                    state.session_store.as_ref(),
+                    id,
+                )
+                .await
+                .ok()
+                .and_then(|a| a.activation)
+                .is_some_and(|a| {
+                    a.run_id == run && a.status == bamboo_domain::ActorActivationStatus::Failed
+                });
+                let failed_session = state
+                    .storage
+                    .load_session(id)
+                    .await
+                    .unwrap()
+                    .is_some_and(|s| s.last_run_status().as_deref() == Some("error"));
+                if runner_failed
+                    && actor_failed
+                    && failed_session
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the actual failed Root must be saved and its exact owner retired");
+    }
+
+    // A Child's new User is durably queued even while runtime.json still
+    // records an older failure. Execute must consume that exact receipt once
+    // without forging a Root owner or replaying the old input.
+    #[actix_web::test]
+    async fn scratch_retry_direct_fresh_user_survives_old_failed_runtime() {
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let parent = "scratch-direct-parent";
+        let id = "scratch-direct-child";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, parent))
+            .await
+            .unwrap();
+        let mut child = bamboo_agent_core::Session::new_child(id, parent, "test-model", "Child");
+        child.title_generated = true;
+        child.add_message(bamboo_agent_core::Message::user("old failed input"));
+        let old_user_id = child.messages.last().unwrap().id.clone();
+        child.set_last_run_status("error");
+        child.set_last_run_error("synthetic previous failure");
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("older-run");
+        runtime.status = bamboo_domain::AgentStatusState::Failed;
+        child.agent_runtime_state = Some(runtime);
+        state.storage.save_session(&child).await.unwrap();
+        assert!(!state
+            .session_store
+            .root_actor_input_required(&child)
+            .await
+            .unwrap());
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(
+            serde_json::json!({"session_id":id,"message":"direct fresh user","model":"test-model"}),
+        )
+        .unwrap();
+        let response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        let chat_status = response.status();
+        let chat_body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        assert_eq!(
+            chat_status,
+            StatusCode::CREATED,
+            "{}",
+            String::from_utf8_lossy(&chat_body)
+        );
+        let chat_body: serde_json::Value = serde_json::from_slice(&chat_body).unwrap();
+        let fresh_id = chat_body["message_id"]
+            .as_str()
+            .expect("Chat returns the durable Inbox message ID")
+            .to_string();
+        let generation = chat_body["ingress_seq"]
+            .as_u64()
+            .expect("Chat returns the matching Inbox generation");
+        let receipt_id = bamboo_domain::SessionMessageId::parse(fresh_id.clone()).unwrap();
+        let prepared = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            prepared.messages.last().unwrap().content,
+            "old failed input"
+        );
+        assert!(!prepared
+            .messages
+            .iter()
+            .any(|message| message.id == fresh_id));
+        assert_eq!(prepared.last_run_status().as_deref(), Some("error"));
+        let previous_runtime = prepared.agent_runtime_state.as_ref().unwrap();
+        assert_eq!(previous_runtime.run_id, "older-run");
+        assert_eq!(
+            previous_runtime.status,
+            bamboo_domain::AgentStatusState::Failed
+        );
+        let queued = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(queued.pending, 1);
+        assert_eq!(queued.claimed, 0);
+        assert_eq!(queued.oldest_generation, Some(generation));
+        assert!(queued.activation_pending());
+        assert!(!state
+            .session_inbox
+            .was_admitted(id, &receipt_id)
+            .await
+            .unwrap());
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model","upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "fresh queued User must start: {body}"
+        );
+        assert_eq!(body["status"], "started");
+        let run_id = body["run_id"]
+            .as_str()
+            .expect("new exact run ID")
+            .to_string();
+        assert_ne!(run_id, "older-run");
+        let after = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let completed = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(id)
+                    .is_some_and(|runner| {
+                        runner.run_id == run_id && matches!(runner.status, AgentStatus::Completed)
+                    });
+                let persisted = state.storage.load_session(id).await.unwrap().unwrap();
+                if completed
+                    && persisted.last_run_status().as_deref() == Some("completed")
+                    && state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break persisted;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("new Child run must finish and retire its exact owner");
+        {
+            let calls = provider.messages.lock().unwrap();
+            assert_eq!(
+                calls.len(),
+                1,
+                "provider must be called once for the fresh run"
+            );
+            assert_eq!(
+                calls[0]
+                    .iter()
+                    .filter(|message| message.id == fresh_id)
+                    .count(),
+                1,
+                "the provider input must not contain a duplicate message ID"
+            );
+            assert_eq!(
+                calls[0]
+                    .iter()
+                    .filter(|message| message.id == fresh_id
+                        && message.role == bamboo_agent_core::Role::User
+                        && message.content == "direct fresh user")
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.id == fresh_id)
+                .count(),
+            1,
+            "the durable transcript must not contain a duplicate message ID"
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.id == fresh_id
+                    && message.role == bamboo_agent_core::Role::User
+                    && message.content == "direct fresh user")
+                .count(),
+            1
+        );
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.id == old_user_id)
+                .count(),
+            1
+        );
+        let drained = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(drained.pending, 0);
+        assert_eq!(drained.claimed, 0);
+        assert_eq!(drained.oldest_generation, None);
+        assert!(!drained.activation_pending());
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &receipt_id)
+            .await
+            .unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    async fn supervisor_pending_run_action(
+        state: &web::Data<crate::AppState>,
+        supervisor: &bamboo_agent_core::Session,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        action: &str,
+        run: Option<&str>,
+    ) -> Result<serde_json::Value, bamboo_agent_core::tools::ToolError> {
+        use bamboo_agent_core::tools::{
+            ExecutingSupervisorObservation, FunctionCall, ToolCall, ToolOutcome,
+        };
+        use bamboo_agent_core::ToolExecutionContext;
+
+        let mut args = serde_json::json!({
+            "action": action,
+            "target_session_id": target.session_id,
+            "target_ref": target,
+        });
+        if let Some(run) = run {
+            args["expected_run_id"] = serde_json::json!(run);
+        }
+        let call = ToolCall {
+            id: "pending-sync-exact-cancel".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments: args.to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&supervisor.id);
+        ctx.root_session_id = Some(&supervisor.id);
+        ctx = ctx.with_executing_supervisor(
+            ExecutingSupervisorObservation::capture_from_executing_session(supervisor),
+        );
+        let outcome = bamboo_agent_core::tools::with_executing_session_caller(
+            Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                supervisor,
+            ))),
+            state
+                .tools_for(crate::tools::ToolSurface::Root)
+                .execute_with_context_outcome(&call, ctx),
+        )
+        .await?;
+        let ToolOutcome::Completed(result) = outcome else {
+            panic!("pending Root control must return its own result");
+        };
+        Ok(serde_json::from_str(&result.result).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn supervisor_observes_and_cancels_the_retained_fresh_sync_owner() {
+        use bamboo_domain::{Storage, SupervisorReference};
+        use bamboo_engine::session_app::supervisor::SupervisorSessionService;
+        use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "supervisor-pending-fresh-sync";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({
+                    "model": "test-model",
+                    "upstream_retry": {"mode": "until_cancelled"},
+                    "client_sync": {"client_message_count": 0, "client_has_pending_question": false}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["sync"]["need_sync"], true, "{body}");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let (run_id, token) = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(id).expect("fresh input owner is retained");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            (runner.run_id.clone(), runner.cancel_token.clone())
+        };
+        assert!(state.fresh_sync.is_current_owner(id, &run_id));
+        let admitted = state.storage.load_session(id).await.unwrap().unwrap();
+        let input_id = admitted.messages.last().unwrap().id.clone();
+
+        let reference: SupervisorReference =
+            (&SupervisorSessionService::new(state.session_store.clone())
+                .get_or_create_default("supervisor-model")
+                .await
+                .unwrap())
+                .into();
+        let supervisor = state
+            .storage
+            .load_execution_admission_snapshot(&reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "pending-sync-exact-cancel".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control cancel {id}"),
+                },
+            )
+            .unwrap();
+        let target = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, id)
+            .await
+            .unwrap();
+        let observed =
+            supervisor_pending_run_action(&state, &supervisor, &target, "observe_run", None)
+                .await
+                .unwrap();
+        assert_eq!(observed["status"], "pending", "{observed}");
+        assert_eq!(observed["run_id"], run_id);
+
+        let wrong_run = uuid::Uuid::new_v4().to_string();
+        let conflict =
+            supervisor_pending_run_action(&state, &supervisor, &target, "cancel", Some(&wrong_run))
+                .await
+                .unwrap();
+        assert_eq!(conflict["status"], "run_conflict");
+        let mut stale = target.clone();
+        stale.created_at += chrono::Duration::seconds(1);
+        assert!(supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &stale,
+            "cancel",
+            Some(&run_id)
+        )
+        .await
+        .is_err());
+        assert!(!token.is_cancelled());
+
+        // Pause the real take after revalidation but before its runner lock.
+        // A winning cancel must make that same take abandon its reservation.
+        let pause = state.fresh_sync.pause_take_for_test(id);
+        let take = state.fresh_sync.take(state.get_ref(), id);
+        let cancel = async {
+            tokio::time::timeout(std::time::Duration::from_secs(15), pause.entered.notified())
+                .await
+                .expect("the real take must reach its handoff boundary");
+            let cancelled = supervisor_pending_run_action(
+                &state,
+                &supervisor,
+                &target,
+                "cancel",
+                Some(&run_id),
+            )
+            .await
+            .unwrap();
+            assert_eq!(cancelled["status"], "cancel_requested");
+            assert_eq!(cancelled["completion_verified"], false);
+            assert!(token.is_cancelled());
+            let stop = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/stop/{id}"))
+                    .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(stop.status(), StatusCode::OK);
+            let stopped =
+                supervisor_pending_run_action(&state, &supervisor, &target, "observe_run", None)
+                    .await
+                    .unwrap();
+            assert_eq!(stopped["status"], "cancel_requested", "{stopped}");
+            assert_eq!(stopped["completion_verified"], false);
+            pause.release.notify_one();
+        };
+        let (handoff, ()) = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            tokio::join!(take, cancel)
+        })
+        .await
+        .expect("cancel and take must not deadlock");
+        assert!(handoff.is_none(), "a cancelled owner cannot be handed off");
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while state.fresh_sync.is_current_owner(id, &run_id) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled retained owner must be released");
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            after.messages.iter().filter(|m| m.id == input_id).count(),
+            1
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+
+        // A newly selected target cannot retarget the original parked owner
+        // after its Workspace changes, even when the Root birth is unchanged.
+        let changed_id = "supervisor-pending-changed-workspace";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, changed_id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, changed_id).await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{changed_id}"))
+                .set_json(serde_json::json!({
+                    "model": "test-model",
+                    "upstream_retry": {"mode": "until_cancelled"},
+                    "client_sync": {"client_message_count": 0, "client_has_pending_question": false}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(body["sync"]["need_sync"], true, "{body}");
+        let (changed_run, changed_token) = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(changed_id).expect("second owner is retained");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            (runner.run_id.clone(), runner.cancel_token.clone())
+        };
+        let original_target = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let originally_observed = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &original_target,
+            "observe_run",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(originally_observed["status"], "pending");
+        let original = state
+            .storage
+            .load_session(changed_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let next_workspace = home.path().join("changed-workspace");
+        std::fs::create_dir_all(&next_workspace).unwrap();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::patch()
+                .uri(&format!("/api/v1/sessions/{changed_id}"))
+                .insert_header((
+                    actix_web::http::header::IF_MATCH,
+                    format!("\"{}\"", original.metadata_version),
+                ))
+                .set_json(serde_json::json!({"workspace_path": next_workspace}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let fresh = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        assert_eq!(fresh.created_at, original.created_at);
+        state
+            .permission_checker
+            .permission_config()
+            .unwrap()
+            .grant_typed_scoped_session_permission(
+                &reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "pending-changed-workspace-cancel".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control cancel {changed_id}"),
+                },
+            )
+            .unwrap();
+        let refused = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["status"], "run_conflict", "{refused}");
+        assert!(!changed_token.is_cancelled());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let stop = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/stop/{changed_id}"))
+                .insert_header(("Bamboo-Run-Id", changed_run.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stop.status(), StatusCode::OK);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let finalized = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(changed_id)
+                    .is_some_and(|runner| runner.exact_execution_finalized());
+                if finalized {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the old retained owner must finalize after HTTP Stop");
+        let fresh_after_stop = state
+            .storage
+            .inspect_supervisor_current_user_target(&reference, changed_id)
+            .await
+            .unwrap();
+        let after_stop = supervisor_pending_run_action(
+            &state,
+            &supervisor,
+            &fresh_after_stop,
+            "cancel",
+            Some(&changed_run),
+        )
+        .await
+        .unwrap();
+        assert_eq!(after_stop["status"], "run_conflict", "{after_stop}");
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    // A fresh owned input admitted before a client-sync mismatch is still pending
+    // execution. A corrected execute must not require posting Chat again.
+    #[actix_web::test]
+    async fn scratch_retry_owned_fresh_user_after_sync_mismatch() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "scratch-owned-sync-retry";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        let first_status = response.status();
+        let first: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED, "first: {first}");
+        let first_run = first["run_id"].as_str().unwrap().to_owned();
+        scratch_wait_failed_root(&state, id, &first_run).await;
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(
+            serde_json::json!({"session_id":id,"message":"fresh after failure","model":"test-model"}),
+        )
+        .unwrap();
+        let response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        let chat_status = response.status();
+        let chat_body: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chat_status, StatusCode::CREATED, "{chat_body}");
+        let fresh_id = chat_body["message_id"].as_str().unwrap().to_owned();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(
+                    serde_json::json!({"model":"test-model","upstream_retry":{"mode":"until_cancelled"},
+                "client_sync":{"client_message_count":0,"client_has_pending_question":false}}),
+                )
+                .to_request(),
+        )
+        .await;
+        let mismatch_status = response.status();
+        let mismatch: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(mismatch_status, StatusCode::OK, "{mismatch}");
+        assert_eq!(mismatch["sync"]["need_sync"], true);
+        assert!(
+            mismatch.get("run_id").is_none(),
+            "resync is not a started generation"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let pending_run = {
+            let runners = state.agent_runners.read().await;
+            let runner = runners.get(id).expect("fresh owner retained for sync");
+            assert!(matches!(runner.status, AgentStatus::Pending));
+            assert_ne!(runner.run_id, first_run);
+            runner.run_id.clone()
+        };
+        let admitted = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            admitted
+                .messages
+                .iter()
+                .filter(|m| m.id == fresh_id)
+                .count(),
+            1
+        );
+        assert!(state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(&fresh_id).unwrap())
+            .await
+            .unwrap());
+        let snapshot =
+            bamboo_engine::session_app::types::ServerExecuteSnapshot::from_session(&admitted);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(
+                    serde_json::json!({"model":"test-model","upstream_retry":{"mode":"until_cancelled"},
+                "client_sync":{"client_message_count":snapshot.message_count,
+                    "client_last_message_id":snapshot.last_message_id,
+                    "client_has_pending_question":snapshot.has_pending_question,
+                    "client_pending_question_tool_call_id":snapshot.pending_question_tool_call_id}}),
+                )
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        if status == StatusCode::ACCEPTED {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                while provider.calls.load(Ordering::SeqCst) < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("corrected execute must reach provider");
+        }
+        let calls = provider.calls.load(Ordering::SeqCst);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        eprintln!(
+            "sync retry: HTTP {status}, body={body}, provider_calls={calls}, fresh_count={}",
+            after.messages.iter().filter(|m| m.id == fresh_id).count()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "corrected sync must start the same admitted User: {body}"
+        );
+        assert_eq!(calls, 2);
+        assert_eq!(
+            body["run_id"], pending_run,
+            "the retained owner starts once"
+        );
+        assert_eq!(
+            after.messages.iter().filter(|m| m.id == fresh_id).count(),
+            1
+        );
+    }
+
+    #[derive(Default)]
+    struct ScratchFailThenChildProvider {
+        calls: std::sync::atomic::AtomicUsize,
+        observed: std::sync::Mutex<Vec<Vec<bamboo_agent_core::Message>>>,
+    }
+
+    #[async_trait]
+    impl LLMProvider for ScratchFailThenChildProvider {
+        async fn chat_stream(
+            &self,
+            messages: &[bamboo_agent_core::Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max: Option<u32>,
+            _model: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.observed.lock().unwrap().push(messages.to_vec());
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                Err(LLMError::RequestFailed(
+                    "synthetic initial headers timeout".into(),
+                ))
+            } else {
+                Ok(Box::pin(futures::stream::iter([
+                    Ok(LLMChunk::Token("owned Root finished".into())),
+                    Ok(LLMChunk::Done),
+                ])))
+            }
+        }
+    }
+
+    // Actual child execution and completion coordinator supply the sole eligible
+    // ChildOutcome. If a 409 is chosen instead of processing it, its ACK and
+    // activation must remain recoverable; an acknowledged-but-unrun outcome fails.
+    #[actix_web::test]
+    async fn scratch_retry_failed_user_and_child_outcome_keep_work() {
+        let provider = Arc::new(ScratchFailThenChildProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "scratch-failed-parent";
+        let child_id = "scratch-failed-parent-child";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        let mut child = bamboo_agent_core::Session::new_child(child_id, id, "test-model", "Child");
+        child.title_generated = true;
+        child.add_message(bamboo_agent_core::Message::user(
+            "real synthetic child work",
+        ));
+        state.storage.save_session(&child).await.unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        let first_status = response.status();
+        let first: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED, "first: {first}");
+        let run = first["run_id"].as_str().unwrap().to_owned();
+        scratch_wait_failed_root(&state, id, &run).await;
+        let failed = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            failed.messages.last().unwrap().role,
+            bamboo_agent_core::Role::User
+        );
+        let original_id = failed.messages.last().unwrap().id.clone();
+        let (outcome, _) = complete_http_race_child(&state, id, child_id).await;
+        let outcome_id = outcome.id.clone();
+        let before = state.session_inbox.inspect(id).await.unwrap();
+        assert_eq!(before.pending, 1);
+        assert!(before.activation_pending());
+        assert!(!state
+            .session_inbox
+            .was_admitted(id, &outcome_id)
+            .await
+            .unwrap());
+        assert_eq!(
+            provider.calls.load(Ordering::SeqCst),
+            2,
+            "one failed parent + one real child"
+        );
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model","upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        if status == StatusCode::ACCEPTED {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    if provider
+                        .observed
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .skip(2)
+                        .any(|messages| messages.iter().any(|m| m.id == outcome_id.as_str()))
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the new owner must present the real outcome");
+        }
+        let admitted = state
+            .session_inbox
+            .was_admitted(id, &outcome_id)
+            .await
+            .unwrap();
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        let calls = provider.calls.load(Ordering::SeqCst);
+        eprintln!("child outcome: HTTP {status}, body={body}, admitted={admitted}, backlog={backlog:?}, provider_calls={calls}");
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .filter(|m| m.id == original_id)
+                .count(),
+            1
+        );
+        if status == StatusCode::ACCEPTED {
+            assert!(admitted);
+            assert_eq!(
+                saved
+                    .messages
+                    .iter()
+                    .filter(|m| m.id == outcome_id.as_str())
+                    .count(),
+                1
+            );
+            assert_eq!(calls, 3);
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "unexpected response: {body}");
+            assert!(
+                !admitted,
+                "a refused retry must not ACK an outcome it never executes"
+            );
+            assert!(
+                backlog.activation_pending(),
+                "a refused retry must preserve the activation"
+            );
+            assert_eq!(calls, 2);
+        }
+    }
+
+    // A real new Root Chat that changes the system prompt is delivered as the
+    // `root_chat_turn_v1` RuntimeInstruction, not a source=user/UserInput envelope.
+    // Its exact fresh input and prompt must reach the actual provider once.
+    #[actix_web::test]
+    async fn scratch_retry_new_root_chat_with_changed_system_prompt_starts_once() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "scratch-root-chat-prompt-after-failure";
+        let user_text = "synthetic fresh prompt-carrying user";
+        let prompt = "SYNTHETIC SYSTEM PROMPT VERSION TWO";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        queue_owned_root(&state, id).await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let first_response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        let first_status = first_response.status();
+        let first: serde_json::Value = test::read_body_json(first_response).await;
+        assert_eq!(first_status, StatusCode::ACCEPTED, "first run: {first}");
+        let first_run = first["run_id"].as_str().unwrap().to_owned();
+        scratch_wait_failed_root(&state, id, &first_run).await;
+        let failed = state.storage.load_session(id).await.unwrap().unwrap();
+        let old_id = failed.messages.last().unwrap().id.clone();
+        assert_eq!(
+            failed.messages.last().unwrap().role,
+            bamboo_agent_core::Role::User
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+
+        let request = serde_json::from_value::<crate::handlers::agent::chat::ChatRequest>(
+            serde_json::json!({"session_id":id,"message":user_text,"model":"test-model", "system_prompt":prompt}),
+        )
+        .unwrap();
+        let chat_response = crate::handlers::agent::chat::handler(
+            state.clone(),
+            test::TestRequest::post().to_http_request(),
+            web::Json(request),
+        )
+        .await;
+        let chat_status = chat_response.status();
+        let chat_body: serde_json::Value = serde_json::from_slice(
+            &actix_web::body::to_bytes(chat_response.into_body())
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(chat_status, StatusCode::CREATED, "new Chat: {chat_body}");
+        let fresh_id = chat_body["message_id"].as_str().unwrap().to_owned();
+        assert_ne!(fresh_id, old_id);
+        assert!(state
+            .session_inbox
+            .inspect(id)
+            .await
+            .unwrap()
+            .activation_pending());
+
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        if status == StatusCode::ACCEPTED {
+            let run = body["run_id"].as_str().expect("started run id");
+            assert_ne!(run, first_run);
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let completed = state.agent_runners.read().await.get(id).is_some_and(|r| {
+                        r.run_id == run && matches!(r.status, AgentStatus::Completed)
+                    });
+                    let actor_done = bamboo_domain::ActorDirectoryPort::inspect_actor(
+                        state.session_store.as_ref(),
+                        id,
+                    )
+                    .await
+                    .ok()
+                    .and_then(|a| a.activation)
+                    .is_some_and(|a| {
+                        a.run_id == run
+                            && a.status == bamboo_domain::ActorActivationStatus::Succeeded
+                    });
+                    if completed
+                        && actor_done
+                        && state
+                            .session_activation_router
+                            .current_run_id(id)
+                            .await
+                            .is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the new prompt-bearing Root run must complete and retire");
+        }
+
+        let saved = state.storage.load_session(id).await.unwrap().unwrap();
+        let matching: Vec<_> = saved.messages.iter().filter(|m| m.id == fresh_id).collect();
+        let envelope = matching
+            .first()
+            .and_then(|message| message.metadata.as_ref())
+            .and_then(|metadata| metadata.get("session_message"))
+            .cloned()
+            .and_then(|value| serde_json::from_value::<SessionMessageEnvelope>(value).ok());
+        let calls = provider.calls.load(Ordering::SeqCst);
+        let (provider_user_count, provider_saw_system) = {
+            let observed = provider.observed.lock().unwrap();
+            let next = observed.get(1);
+            (
+                next.map_or(0, |messages| {
+                    messages
+                        .iter()
+                        .filter(|m| m.id == fresh_id && m.content == user_text)
+                        .count()
+                }),
+                next.is_some_and(|messages| {
+                    messages.iter().any(|m| {
+                        m.role == bamboo_agent_core::Role::System && m.content.contains(prompt)
+                    })
+                }),
+            )
+        };
+        let admitted = state
+            .session_inbox
+            .was_admitted(id, &SessionMessageId::parse(&fresh_id).unwrap())
+            .await
+            .unwrap();
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        eprintln!("new Root prompt: HTTP {status}, body={body}, admitted={admitted}, backlog={backlog:?}, provider_calls={calls}, fresh_in_provider={provider_user_count}, system_seen={provider_saw_system}, fresh_in_session={}", matching.len());
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            status,
+            StatusCode::ACCEPTED,
+            "new prompt-bearing Chat must start: {body}"
+        );
+        assert!(admitted);
+        assert_eq!(matching.len(), 1);
+        let message = matching[0];
+        let envelope = envelope.expect("checkpointed new input retains the typed envelope");
+        assert_eq!(envelope.root_chat_prompt().unwrap(), Some(prompt));
+        assert!(bamboo_domain::is_matching_session_message(
+            message, &envelope
+        ));
+        assert_eq!(saved.messages.iter().filter(|m| m.id == old_id).count(), 1);
+        assert_eq!(calls, 2);
+        assert_eq!(provider_user_count, 1);
+        assert!(provider_saw_system);
+    }
+
+    #[actix_web::test]
+    async fn scratch_retry_unknown_user_tail_requires_proven_handoff() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "scratch-unknown-user-tail";
+        let mut session = owned_http_session(&state, id);
+        session.add_message(bamboo_agent_core::Message::user(
+            "old unproven synthetic input",
+        ));
+        assert!(session.last_run_status().is_none());
+        assert!(session.agent_runtime_state.is_none());
+        state.storage.save_session(&session).await.unwrap();
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let mismatch = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"},
+                "client_sync":{"client_message_count":0,"client_has_pending_question":false}}))
+            .to_request()).await;
+        let mismatch_status = mismatch.status();
+        let mismatch_body: serde_json::Value = test::read_body_json(mismatch).await;
+        assert_eq!(mismatch_status, StatusCode::OK, "{mismatch_body}");
+        assert_eq!(mismatch_body["sync"]["need_sync"], true);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        if let Some(run) = body.get("run_id").and_then(|value| value.as_str()) {
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                loop {
+                    let terminal = state
+                        .agent_runners
+                        .read()
+                        .await
+                        .get(id)
+                        .is_some_and(|runner| {
+                            runner.run_id == run
+                                && !matches!(
+                                    runner.status,
+                                    AgentStatus::Pending | AgentStatus::Running
+                                )
+                        });
+                    if terminal
+                        && state
+                            .session_activation_router
+                            .current_run_id(id)
+                            .await
+                            .is_none()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("unwanted unknown-tail run must retire before counting");
+        }
+        let calls = provider.calls.load(Ordering::SeqCst);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        eprintln!(
+            "unknown user tail: HTTP {status}, body={body}, provider_calls={calls}, user_count={}",
+            after
+                .messages
+                .iter()
+                .filter(|message| message.content == "old unproven synthetic input")
+                .count()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+        assert_eq!(
+            status,
+            StatusCode::CONFLICT,
+            "unknown handoff must refuse: {body}"
+        );
+        assert_eq!(calls, 0, "unproven history cannot dispatch");
+        assert!(body.get("run_id").is_none());
+        assert_eq!(
+            after
+                .messages
+                .iter()
+                .filter(|message| message.content == "old unproven synthetic input")
+                .count(),
+            1
+        );
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_completed_answer_stays_completed() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "continuous-resume-already-completed";
+        let mut session = owned_http_session(&state, id);
+        session
+            .messages
+            .push(bamboo_agent_core::Message::user("already answered"));
+        session
+            .messages
+            .push(bamboo_agent_core::Message::assistant("finished", None));
+        session.set_last_run_status("completed");
+        state.storage.save_session(&session).await.unwrap();
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        eprintln!("continuous retry on already completed answer: HTTP {status}, body={body}");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "completed");
+        assert!(body.get("run_id").is_none());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(after.messages.len(), 2);
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_unresolved_and_interrupted_history_refused() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for kind in ["unresolved-tool", "interrupted-assistant"] {
+            let id = format!("continuous-resume-{kind}");
+            let mut session = owned_http_session(&state, &id);
+            session.messages = completed_synthetic_tool_exchange();
+            session.messages.pop();
+            if kind == "interrupted-assistant" {
+                session.messages.pop();
+                let mut partial = bamboo_agent_core::Message::assistant("partial output", None);
+                partial.metadata = Some(serde_json::json!({
+                    "runtime_kind":"interrupted_assistant_output", "interrupted":true
+                }));
+                session.messages.push(partial);
+            }
+            session.set_last_run_status("error");
+            session.set_last_run_error("synthetic ambiguous error");
+            let original = serde_json::to_value(&session.messages).unwrap();
+            state.storage.save_session(&session).await.unwrap();
+            let response = test::call_service(&app, test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request()).await;
+            let status = response.status();
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
+            assert_eq!(body["error"]["code"], "retry_resume_not_prepared");
+            assert!(body.get("run_id").is_none());
+            let after = state.storage.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::to_value(&after.messages).unwrap(),
+                original,
+                "{kind}"
+            );
+            assert_eq!(after.last_run_status().as_deref(), Some("error"));
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_cache_and_durable_disagreement_refused() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "continuous-resume-stale-cache";
+        let mut cached = owned_http_session(&state, id);
+        cached
+            .messages
+            .push(bamboo_agent_core::Message::user("old question"));
+        cached
+            .messages
+            .push(bamboo_agent_core::Message::assistant("old answer", None));
+        cached.set_last_run_status("completed");
+        state.save_and_cache_session(&mut cached).await;
+        let mut durable = state.storage.load_session(id).await.unwrap().unwrap();
+        durable
+            .messages
+            .push(bamboo_agent_core::Message::user("new durable input"));
+        durable.set_last_run_status("pending");
+        state.storage.save_session(&durable).await.unwrap();
+        let cached_snapshot =
+            bamboo_engine::session_app::types::ServerExecuteSnapshot::from_session(
+                &state.load_session(id).await.unwrap(),
+            );
+        assert_eq!(cached_snapshot.message_count, 2);
+        assert_eq!(
+            state
+                .storage
+                .load_session(id)
+                .await
+                .unwrap()
+                .unwrap()
+                .messages
+                .len(),
+            3
+        );
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({
+                "model":"test-model",
+                "upstream_retry":{"mode":"until_cancelled"},
+                "client_sync":{
+                    "client_message_count":cached_snapshot.message_count,
+                    "client_last_message_id":cached_snapshot.last_message_id,
+                    "client_has_pending_question":cached_snapshot.has_pending_question,
+                    "client_pending_question_tool_call_id":cached_snapshot.pending_question_tool_call_id
+                }
+            }))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["error"]["code"], "retry_state_changed");
+        assert!(body.get("run_id").is_none());
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(&after.messages).unwrap(),
+            serde_json::to_value(&durable.messages).unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_existing_tool_tail_run_returns_its_exact_identity() {
+        let provider = Arc::new(RunningProvider {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            started: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+            messages: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "continuous-resume-running-tool-tail";
+        let mut session = owned_http_session(&state, id);
+        session.messages = completed_synthetic_tool_exchange();
+        session
+            .metadata
+            .insert("retry_resume_pending".into(), "true".into());
+        state.storage.save_session(&session).await.unwrap();
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let first = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first: serde_json::Value = test::read_body_json(first).await;
+        let run_id = first["run_id"].as_str().unwrap().to_owned();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            provider.started.acquire(),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+        assert_eq!(
+            state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .as_deref(),
+            Some(run_id.as_str())
+        );
+        let running = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            running.messages.last().unwrap().role,
+            bamboo_agent_core::Role::Tool
+        );
+        assert!(!running.metadata.contains_key("retry_resume_pending"));
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "already_running");
+        assert_eq!(body["run_id"], run_id);
+        assert_eq!(body["sync"]["has_pending_user_message"], false);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let stopped = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/stop/{id}"))
+                .insert_header(("Bamboo-Run-Id", run_id.as_str()))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stopped.status(), StatusCode::OK);
+        wait_for_owned_terminal_with_cancellation(&state, id, &run_id, &mut events, true).await;
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_missing_session_and_legacy_status_fail_closed() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for missing in [false, true] {
+            let id = if missing {
+                "continuous-resume-deleted"
+            } else {
+                "continuous-resume-legacy-status"
+            };
+            let mut session = owned_http_session(&state, id);
+            session
+                .messages
+                .push(bamboo_agent_core::Message::user("old question"));
+            session
+                .messages
+                .push(bamboo_agent_core::Message::assistant("old answer", None));
+            state.save_and_cache_session(&mut session).await;
+            if missing {
+                assert!(state.storage.delete_session(id).await.unwrap());
+            }
+            let response = test::call_service(&app, test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request()).await;
+            let status = response.status();
+            let body: serde_json::Value = test::read_body_json(response).await;
+            if missing {
+                assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            } else {
+                assert_eq!(status, StatusCode::CONFLICT, "{body}");
+                assert_eq!(body["error"]["code"], "retry_resume_not_prepared");
+            }
+            assert!(body.get("run_id").is_none());
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_staged_inbox_without_activation_keeps_completion() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "continuous-resume-staged-no-activation";
+        let mut session = owned_http_session(&state, id);
+        session
+            .messages
+            .push(bamboo_agent_core::Message::user("old question"));
+        session
+            .messages
+            .push(bamboo_agent_core::Message::assistant("old answer", None));
+        session.set_last_run_status("completed");
+        state.storage.save_session(&session).await.unwrap();
+        state
+            .session_inbox
+            .deliver(&SessionMessageEnvelope::user_input(id, "staged"))
+            .await
+            .unwrap();
+        let backlog = state.session_inbox.inspect(id).await.unwrap();
+        assert!(backlog.pending > 0);
+        assert!(!backlog.activation_pending());
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let response = test::call_service(&app, test::TestRequest::post()
+            .uri(&format!("/api/v1/execute/{id}"))
+            .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+            .to_request()).await;
+        let status = response.status();
+        let body: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_default_and_bounded_responses_unchanged() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "continuous-resume-bounded-control";
+        let mut session = owned_http_session(&state, id);
+        session.messages = completed_synthetic_tool_exchange();
+        session.set_last_run_status("error");
+        session.set_last_run_error("synthetic previous error");
+        let original = serde_json::to_value(&session.messages).unwrap();
+        state.storage.save_session(&session).await.unwrap();
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for body in [
+            serde_json::json!({"model":"test-model"}),
+            serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"bounded"}}),
+        ] {
+            let response = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&format!("/api/v1/execute/{id}"))
+                    .set_json(body)
+                    .to_request(),
+            )
+            .await;
+            let status = response.status();
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["status"], "completed");
+            assert!(body.get("run_id").is_none());
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        let after = state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(serde_json::to_value(&after.messages).unwrap(), original);
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
+    }
+
+    #[actix_web::test]
+    async fn continuous_resume_contract_pending_slot_and_suspended_runtime_refused() {
+        let provider = Arc::new(ResumeBootstrapProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for kind in [
+            "pending-slot",
+            "suspended-runtime",
+            "completed-runtime-failed",
+            "completed-runtime-cancelled",
+            "completed-runner-failed",
+            "completed-runner-cancelled",
+        ] {
+            let id = format!("continuous-resume-{kind}");
+            let mut session = owned_http_session(&state, &id);
+            session
+                .messages
+                .push(bamboo_agent_core::Message::user("old question"));
+            session
+                .messages
+                .push(bamboo_agent_core::Message::assistant("old answer", None));
+            session.set_last_run_status("completed");
+            if kind.starts_with("suspended-") || kind.starts_with("completed-runtime-") {
+                let mut runtime = bamboo_domain::AgentRuntimeState::new(&id);
+                runtime.status = match kind {
+                    "suspended-runtime" => bamboo_domain::AgentStatusState::Suspended,
+                    "completed-runtime-failed" => bamboo_domain::AgentStatusState::Failed,
+                    "completed-runtime-cancelled" => bamboo_domain::AgentStatusState::Cancelled,
+                    _ => unreachable!(),
+                };
+                session.agent_runtime_state = Some(runtime);
+            }
+            state.storage.save_session(&session).await.unwrap();
+            if kind == "pending-slot" || kind.starts_with("completed-runner-") {
+                let mut runner = AgentRunner::new();
+                runner.status = match kind {
+                    "completed-runner-failed" => AgentStatus::Error("synthetic".into()),
+                    "completed-runner-cancelled" => AgentStatus::Cancelled,
+                    _ => AgentStatus::Pending,
+                };
+                state.agent_runners.write().await.insert(id.clone(), runner);
+            }
+            let response = test::call_service(&app, test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(serde_json::json!({"model":"test-model", "upstream_retry":{"mode":"until_cancelled"}}))
+                .to_request()).await;
+            let status = response.status();
+            let body: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(status, StatusCode::CONFLICT, "{kind}: {body}");
+            assert_eq!(body["error"]["code"], "retry_state_changed");
+            assert!(
+                body.get("run_id").is_none(),
+                "{kind} must not invent an executable run"
+            );
+            if kind == "pending-slot" || kind.starts_with("completed-runner-") {
+                state.agent_runners.write().await.remove(&id);
+            }
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+        tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+            .await
+            .unwrap();
     }
 
     #[derive(Default)]
@@ -713,6 +3359,21 @@ mod execution_input_http {
         run: &str,
         events: &mut tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
     ) {
+        wait_for_owned_terminal_with_cancellation(state, id, run, events, false).await;
+    }
+
+    async fn wait_for_owned_terminal_with_cancellation(
+        state: &web::Data<crate::AppState>,
+        id: &str,
+        run: &str,
+        events: &mut tokio::sync::broadcast::Receiver<bamboo_agent_core::AgentEvent>,
+        cancelled: bool,
+    ) {
+        let expected_actor = if cancelled {
+            bamboo_domain::ActorActivationStatus::Cancelled
+        } else {
+            bamboo_domain::ActorActivationStatus::Succeeded
+        };
         tokio::time::timeout(std::time::Duration::from_secs(15), async {
             loop {
                 if matches!(events.recv().await.unwrap(),
@@ -731,14 +3392,18 @@ mod execution_input_http {
                     if matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
                         false
                     } else {
-                        assert!(matches!(runner.status, AgentStatus::Completed), "{:?}", runner.status);
+                        assert!(if cancelled {
+                            matches!(runner.status, AgentStatus::Cancelled)
+                        } else {
+                            matches!(runner.status, AgentStatus::Completed)
+                        }, "{:?}", runner.status);
                         true
                     }
                 };
                 let actor = bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), id)
                     .await.unwrap().activation.unwrap();
                 assert_eq!(actor.run_id, run);
-                if terminal && actor.status == bamboo_domain::ActorActivationStatus::Succeeded
+                if terminal && actor.status == expected_actor
                     && state.session_activation_router.current_run_id(id).await.is_none()
                 {
                     assert!(actor.finished_at.is_some());
@@ -1464,8 +4129,12 @@ mod execution_input_http {
                 .await
                 .unwrap();
             assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-            assert!(String::from_utf8_lossy(&bytes)
-                .contains("Native Root admission changed before ownership; retry execute"));
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["error"]["type"], "api_error");
+            assert_eq!(
+                body["error"]["message"],
+                "Root admission changed before ownership; retry execute"
+            );
             let contender = contender.take().unwrap();
             let writer = contender.root_actor_writer().unwrap();
             contender_run = Some(contender.run_id().to_owned());
@@ -2288,14 +4957,29 @@ mod execution_input_http {
                 input_taps().lock().unwrap().remove(&id).unwrap().is_empty(),
                 "failed startup has no execution handoff"
             );
-            // Early Native admission creates a real reservation. Its existing
-            // abandonment contract retains an exact Cancelled slot.
+            // Both server-generated and explicit input IDs belong to this
+            // current Root and require the same real reservation. Rejection
+            // must retire that exact runner and Actor before a successor.
             let runners = state.agent_runners.read().await;
-            if let Some(runner) = runners.get(&id) {
-                assert!(native);
-                assert!(matches!(runner.status, AgentStatus::Cancelled));
-            }
+            let runner = runners
+                .get(&id)
+                .expect("rejected Root startup retains its exact terminal runner");
+            assert!(matches!(runner.status, AgentStatus::Cancelled));
+            assert!(runner.cancel_token.is_cancelled());
+            let rejected_run = runner.run_id.clone();
             drop(runners);
+            let actor =
+                bamboo_domain::ActorDirectoryPort::inspect_actor(state.session_store.as_ref(), &id)
+                    .await
+                    .unwrap()
+                    .activation
+                    .expect("the rejected reservation had a real bound Root Actor");
+            assert_eq!(actor.run_id, rejected_run);
+            assert_eq!(
+                actor.status,
+                bamboo_domain::ActorActivationStatus::Cancelled
+            );
+            assert!(actor.finished_at.is_some());
             assert!(state
                 .session_activation_router
                 .current_run_id(&id)
@@ -2814,6 +5498,253 @@ mod execution_input_http {
         } else {
             shutdown_rejected_race(&state, &[&id]).await;
         }
+    }
+
+    /// A prepared Host run must never combine the old concrete account with a
+    /// Vision model taken from a newer configuration for the same provider id.
+    #[actix_web::test]
+    async fn vision_legacy_same_provider_reload_keeps_image_destination_bound() {
+        use bamboo_agent_core::Storage;
+        use wiremock::{matchers::method, Mock, MockServer, ResponseTemplate};
+
+        const PIXEL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=";
+        let mut observations = Vec::new();
+        for (changed, replace_registry, is_managed) in [
+            (false, false, true),
+            (true, false, true),
+            (true, true, true),
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+        ] {
+            let a = MockServer::start().await;
+            let b = MockServer::start().await;
+            let sse = "data: {\"id\":\"synthetic\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"synthetic\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Synthetic image description\"},\"finish_reason\":null}]}\n\ndata: [DONE]\n\n";
+            for server in [&a, &b] {
+                Mock::given(method("POST"))
+                    .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
+                    .mount(server)
+                    .await;
+            }
+            let home = tempfile::tempdir().unwrap();
+            let mut old = bamboo_llm::Config::default();
+            *old.memory_mut() = Some(
+                serde_json::from_value(serde_json::json!({
+                    "auto_dream_enabled":false, "project_prompt_injection":false,
+                    "relevant_recall":false, "relevant_recall_rerank":false,
+                    "project_first_dream":false, "ledger_agenda_injection":false
+                }))
+                .unwrap(),
+            );
+            let memory = old.memory().as_ref().unwrap();
+            assert!(
+                !memory.auto_dream_enabled
+                    && !memory.project_prompt_injection
+                    && !memory.relevant_recall
+                    && !memory.relevant_recall_rerank
+                    && !memory.project_first_dream
+                    && !memory.ledger_agenda_injection
+            );
+            old.provider = "openai".into();
+            old.default_provider_instance = Some("openai".into());
+            old.features.provider_model_ref = true;
+            old.http_proxy = "http://127.0.0.1:9".into();
+            old.https_proxy.clear();
+            old.hooks.image_fallback.enabled = true;
+            old.hooks.image_fallback.mode = "vision".into();
+            old.defaults = Some(
+                serde_json::from_value(serde_json::json!({
+                    "chat": {"provider":"openai", "model":"test-model"},
+                    "fast": {"provider":"openai", "model":"test-model"},
+                    "vision": {"provider":"openai", "model":"vision-old"}
+                }))
+                .unwrap(),
+            );
+            old.provider_instances.insert("openai".into(), serde_json::from_value(serde_json::json!({
+                "provider_type":"openai", "enabled":true, "api_key":"synthetic-old",
+                "base_url":a.uri(), "model":"test-model", "vision_model":"vision-old",
+                "runtime_models":["test-model","vision-old","vision-new"],
+                "model_capabilities":{"vision-old":{"supports_vision":true},"vision-new":{"supports_vision":true}}
+            })).unwrap());
+            let mut app = crate::AppState::new_with_provider_and_memory_store(
+                home.path().to_path_buf(),
+                old.clone(),
+                Arc::new(LocalProvider),
+                bamboo_memory::memory_store::MemoryStore::new(home.path().join("jiandu")),
+            )
+            .await
+            .unwrap();
+            app.stop_config_watcher_for_test();
+            let built = ProviderRegistry::from_config(&old, home.path().to_path_buf())
+                .await
+                .unwrap();
+            let selected_registry = if is_managed {
+                built
+            } else {
+                let selected = built.get("openai").unwrap();
+                ProviderRegistry::new(
+                    std::collections::HashMap::from([("openai".into(), selected)]),
+                    "openai".into(),
+                )
+            };
+            app.provider_registry.replace_with(selected_registry);
+            app.provider_router = Arc::new(ProviderModelRouter::new(app.provider_registry.clone()));
+            let state = web::Data::new(app);
+            let id =
+                format!("synthetic-legacy-vision-reload-{changed}-{replace_registry}-{is_managed}");
+            let mut session = owned_http_session(&state, &id);
+            session.model_ref = Some(bamboo_domain::ProviderModelRef::new("openai", "test-model"));
+            let image = bamboo_agent_core::Message::user_with_parts(
+                "Inspect the synthetic pixel",
+                vec![bamboo_domain::MessagePart::ImageUrl {
+                    image_url: bamboo_domain::ImageUrlRef {
+                        url: PIXEL.into(),
+                        detail: None,
+                    },
+                }],
+            );
+            let image_id = image.id.clone();
+            let original_parts = image.content_parts.clone();
+            session.add_message(image);
+            state.storage.save_session(&session).await.unwrap();
+            state.session_store.save_session(&session).await.unwrap();
+
+            let (selected_tx, selected_rx) = tokio::sync::oneshot::channel();
+            let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
+            assert!(legacy_vision_selection_gates()
+                .lock()
+                .unwrap()
+                .insert(id.clone(), (selected_tx, resume_rx))
+                .is_none());
+            let _probe = LegacyVisionSelectionProbe(id.clone());
+            let mut next = old.clone();
+            next.defaults.as_mut().unwrap().vision =
+                Some(bamboo_domain::ProviderModelRef::new("openai", "vision-new"));
+            let instance = next.provider_instances.get_mut("openai").unwrap();
+            instance.base_url = Some(b.uri());
+            instance.api_key = "synthetic-new".into();
+            instance.vision_model = Some("vision-new".into());
+            let replacement = if changed && replace_registry {
+                Some(
+                    ProviderRegistry::from_config(&next, home.path().to_path_buf())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let update = async {
+                let managed = tokio::time::timeout(std::time::Duration::from_secs(10), selected_rx)
+                    .await
+                    .expect("Host selected its original provider")
+                    .expect("selection gate");
+                if let Some(replacement) = replacement {
+                    state.provider_registry.replace_with(replacement);
+                }
+                if changed {
+                    *state.config.write().await = next;
+                }
+                resume_tx.send(()).expect("resume selected Host run");
+                managed
+            };
+            let ((status, body), managed) = tokio::join!(execute(&state, &id, None), update);
+            assert_eq!(
+                managed, is_managed,
+                "the selected A1 client must have the expected provenance"
+            );
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let run = body["run_id"].as_str().expect("accepted run").to_string();
+            let failure = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    let terminal = {
+                        let runners = state.agent_runners.read().await;
+                        runners.get(&id).and_then(|runner| {
+                            if runner.run_id != run {
+                                return None;
+                            }
+                            match &runner.status {
+                                AgentStatus::Completed => Some(None),
+                                AgentStatus::Error(error) => Some(Some(error.clone())),
+                                AgentStatus::Cancelled => {
+                                    Some(Some("unexpected cancellation".into()))
+                                }
+                                AgentStatus::Pending | AgentStatus::Running => None,
+                            }
+                        })
+                    };
+                    if let Some(failure) = terminal {
+                        break failure;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("synthetic Host run must retire");
+            let seen = |requests: &[wiremock::Request], model: &str| {
+                requests.iter().any(|request| {
+                    request
+                        .body_json::<serde_json::Value>()
+                        .ok()
+                        .is_some_and(|body| body["model"] == model)
+                        && String::from_utf8_lossy(&request.body).contains(PIXEL)
+                })
+            };
+            let a_requests = a.received_requests().await.unwrap();
+            let b_requests = b.received_requests().await.unwrap();
+            let mut image_routes = Vec::new();
+            for (endpoint, requests) in [("A1", &a_requests), ("A2", &b_requests)] {
+                for request in requests {
+                    if String::from_utf8_lossy(&request.body).contains(PIXEL) {
+                        let model = request
+                            .body_json::<serde_json::Value>()
+                            .ok()
+                            .and_then(|body| body["model"].as_str().map(str::to_owned))
+                            .unwrap_or_else(|| "<missing>".into());
+                        image_routes.push((endpoint.to_string(), model));
+                    }
+                }
+            }
+            let saved = state.storage.load_session(&id).await.unwrap().unwrap();
+            let preserved = saved
+                .messages
+                .iter()
+                .find(|m| m.id == image_id)
+                .is_some_and(|m| m.content_parts == original_parts);
+            observations.push((
+                changed,
+                replace_registry,
+                seen(&a_requests, "vision-old"),
+                seen(&a_requests, "vision-new"),
+                seen(&b_requests, "vision-new"),
+                failure,
+                preserved,
+                image_routes,
+                is_managed,
+            ));
+            tokio::time::timeout(std::time::Duration::from_secs(15), state.shutdown())
+                .await
+                .expect("shutdown synthetic Host");
+        }
+        for control in [&observations[0], &observations[3]] {
+            assert!(
+                control.2
+                    && !control.3
+                    && !control.4
+                    && control.5.is_none()
+                    && control.6
+                    && !control.7.is_empty()
+                    && control
+                        .7
+                        .iter()
+                        .all(|(endpoint, model)| endpoint == "A1" && model == "vision-old"),
+                "unchanged A1 must receive vision-old and succeed: {observations:?}"
+            );
+        }
+        assert!(observations.iter().filter(|entry| entry.0).all(|(_, _, a_old, a_new, b_new, failure, preserved, routes, _)| {
+            let source_refused = failure.as_ref().is_some_and(|error|
+                error.contains("Legacy Vision provider source changed"));
+            source_refused && !a_old && !a_new && !b_new && routes.is_empty() && *preserved
+        }), "a selected client with a changed source must be refused before any image is sent: {observations:?}");
     }
 
     #[actix_web::test]

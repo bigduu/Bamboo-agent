@@ -54,13 +54,15 @@ def api(route):
 
 def pages(route, field=None):
     result = []
-    page_limit = 20 if re.search(r"/jobs(?:\?|$)", route) else 10
+    # Large job-list responses can fail upstream; retain the 2,000-job bound.
+    jobs = re.search(r"/jobs(?:\?|$)", route)
+    page_size, page_limit = (10, 200) if jobs else (100, 10)
     for page in range(1, page_limit + 1):
-        data = api(f"{route}{'&' if '?' in route else '?'}per_page=100&page={page}")
+        data = api(f"{route}{'&' if '?' in route else '?'}per_page={page_size}&page={page}")
         rows = data[field] if field else data
-        assert isinstance(rows, list) and len(rows) <= 100
+        assert isinstance(rows, list) and len(rows) <= page_size
         result.extend(rows)
-        if len(rows) < 100:
+        if len(rows) < page_size:
             return result
     raise AssertionError("Publication proof exceeds the bounded API page limit")
 
@@ -101,8 +103,38 @@ FULL = (
 )
 
 PLATFORMS = ("Build (ubuntu-latest)", "Build (macos-latest)", "Build (windows-latest)")
-GROUPED_JOBS = {}
+PLATFORM_TESTS = ("Platform Tests (ubuntu-latest)", "Platform Tests (macos-latest)", "Platform Tests (windows-latest)")
+PLATFORM_JOBS = {}
+TEST_JOBS = {}
 GROUPED_PLANS = {}
+CRATE_PACKAGES = {}
+SERVER_BLOCKS = {}
+FEATURE_REVISIONS = set()
+
+def platform_jobs(revision):
+    return PLATFORM_JOBS.get(revision, PLATFORMS)
+
+def crate_jobs(ci, jobs):
+    # The authenticated workflow itself owns the static Cargo package lists.
+    # Native Actions jobs are the result: no inventory, archive or log receipt.
+    packages = CRATE_PACKAGES[ci["head_sha"]]
+    commands = {f"{label} ({package})": step for label, step in (
+        ("Test", "Test crate"), ("E2E", "Run E2E crate tests")) for package in packages[label]}
+    for label, step in (("Test", "Test server block"), ("E2E", "Run E2E server block")):
+        commands.update({f"{label} (bamboo-server/{block})": step
+                         for block in SERVER_BLOCKS.get(ci["head_sha"], {}).get(label, ())})
+    commands["Test SSH"] = "Run SSH fixture"
+    actual = {job["name"] for job in jobs
+              if re.match(r"^(?:Test|E2E) \(", job["name"]) or job["name"] == "Test SSH"}
+    assert actual == set(commands), "Unexpected or missing crate matrix job"
+    for name, command in commands.items():
+        found = [job for job in jobs if job["name"] == name]
+        assert len(found) == 1, f"Missing or ambiguous crate job: {name}"
+        steps = [step for step in found[0]["steps"] if step["name"] == command]
+        assert len(steps) == 1, f"Missing or ambiguous Cargo step: {name}"
+        assert steps[0]["status"] == "completed" and steps[0]["conclusion"] == "success", name
+    TEST_JOBS[ci["id"]] = set(commands)
+    return tuple(sorted(commands))
 
 def grouped_records(job, marker):
     log = subprocess.check_output(
@@ -194,15 +226,23 @@ def grouped_jobs(ci, jobs, before=None):
             assert record["inventory"] == plan["inventory"] and record["doctests"] == plan["doctests"]
             ignored = sum(block["ignored"] for block in plan["blocks"])
             assert record["counts"] == {"passed": plan["inventory"] + plan["doctests"] - ignored, "failed": 0, "ignored": ignored}
-    GROUPED_JOBS[ci["id"]], GROUPED_PLANS[ci["id"]] = names | empty_names, plans
+    TEST_JOBS[ci["id"]], GROUPED_PLANS[ci["id"]] = names | empty_names, plans
     return tuple(sorted(names))
 
 def full_jobs(ci, promotion=False, before=None):
     # latest is intentionally per job: failed-only reruns retain the successful
     # jobs from earlier attempts. Do not invent an all-jobs-same-attempt rule.
     jobs = pages(f"actions/runs/{ci['id']}/jobs?filter=latest", "jobs")
-    grouped = grouped_jobs(ci, jobs, before) if promotion and producer_definition(ci["head_sha"]) == "grouped" else ()
-    for name in FULL + (PLATFORMS + ("Promotion Source",) if promotion else ()) + grouped:
+    contract = producer_definition(ci["head_sha"]) if promotion else "full"
+    if ci["head_sha"] in FEATURE_REVISIONS:
+        feature = [job for job in jobs if job["name"] == "Feature Unit and E2E"]
+        assert len(feature) == 1 and feature[0]["conclusion"] == "skipped", "Feature execution cannot repeat on a legacy release"
+        native_names = ("Native Feature (${{ matrix.os }})", "Native Feature (windows-2025)", "Native Feature (macos-latest)")
+        native = [job for job in jobs if job["name"] in native_names]
+        assert [job["name"] for job in native] == [native_names[0]] or {job["name"] for job in native} == set(native_names[1:]) and len(native) == 2, "Missing or ambiguous feature-native skip representation"
+        assert all(job["status"] == "completed" and job["conclusion"] == "skipped" for job in native), "Native feature tests cannot repeat on a legacy release"
+    tests = grouped_jobs(ci, jobs, before) if contract == "grouped" else crate_jobs(ci, jobs) if contract == "crates" else ()
+    for name in FULL + (platform_jobs(ci["head_sha"]) + ("Promotion Source",) if promotion else ()) + tests:
         found = [job for job in jobs if job["name"] == name]
         assert len(found) == 1, f"Missing or ambiguous full CI job: {name}"
         job = found[0]
@@ -277,7 +317,21 @@ REVIEWED_PRODUCERS = frozenset((PRODUCER_V1, PRODUCER_V2))
 # by a sentinel. Then independently authenticate the actual helper bytes below.
 # This breaks the workflow -> helper -> workflow hash cycle, without excluding
 # a job, global environment, trigger, command or permission from review.
-CURRENT_PRODUCER = "f77f63ee2873eed949e13afef13f6eb948d775654b9d5e7b8fbb654907045619"
+CURRENT_PRODUCER = "64e739dc9583c0bf6969c5a297564c48cfa2b8afbdad66a0355116aab96d0902"
+# Preserve the previously reviewed default/all-feature server partitions.
+LEGACY_SERVER_BLOCK_PRODUCER = "20ca6ba17401c2d9cae9019cbb693eea29386ab77814bfda5d793ee4efb45649"
+LEGACY_SERVER_BLOCK_HELPER = "4ccc047bbaeedab71e93db9b6470f5a3131c1b395260f852baebef19ff9109b7"
+# Published F4 kept one job per crate and the native Platform Tests matrix.
+LEGACY_PLATFORM_PRODUCER = "b8e4760f405745ab787f94373908efe9055c4eb1bfa848bdedbc7e3bd2b6c385"
+LEGACY_PLATFORM_HELPER = "4b26870d8c3a978c9fab601182a8d4074ecfc3f12a3cb2840cde93e548cd0400"
+# The previous native crate producer also required three optimized Build jobs.
+LEGACY_CRATE_PRODUCER = "4fc5b81c53b931118c5c248bbdcffa212fe8dde0fa810c70365bd2cc33c142b7"
+LEGACY_CRATE_HELPER = "c567d1f41fe70acc23bd5f4a64b1d7048c6edbd667a1d2fc12f0f5e4c7ba0529"
+# Actual main 3488eb9b used this verifier before the pagination-only repair.
+LEGACY_MAIN_CRATE_HELPER = "3c34f4125129fbeea199e7a826b29cb523593b513df32cc2479ebe5e8a010e68"
+# Retain the original grouped producer and its exact helper for queued runs.
+LEGACY_GROUPED_PRODUCER = "f77f63ee2873eed949e13afef13f6eb948d775654b9d5e7b8fbb654907045619"
+LEGACY_GROUPED_HELPER = "8b6678f9ea2a28b6d9af6b200d894198f6bb1e754b5d54650cc496197ba78a7e"
 # Preserve the already-reviewed admission producer with its original helper.
 # It has no shard jobs; it cannot satisfy the new grouped producer contract.
 LEGACY_ADMISSION_PRODUCER = "3c3af3e002a8abb341db0bb4020f29491ed32208b0b0953ebb6ed2b289c4390c"
@@ -298,14 +352,49 @@ def producer_definition(revision):
         return "full"
     pins = re.findall(PIN, raw)
     normalized = hashlib.sha256(re.sub(PIN, NORMALIZED_PIN, raw)).hexdigest()
-    assert normalized in {CURRENT_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
-    expected_helper = ADMISSION_SCRIPT_SHA256 if normalized == CURRENT_PRODUCER else LEGACY_ADMISSION_HELPER
-    assert len(pins) == 1 and pins[0].decode() == expected_helper, "Unknown admission helper pin"
+    assert normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER, LEGACY_GROUPED_PRODUCER, LEGACY_ADMISSION_PRODUCER}, "Unknown source-admission producer"
+    expected_helpers = {CURRENT_PRODUCER: {ADMISSION_SCRIPT_SHA256},
+                        LEGACY_SERVER_BLOCK_PRODUCER: {LEGACY_SERVER_BLOCK_HELPER},
+                        LEGACY_PLATFORM_PRODUCER: {LEGACY_PLATFORM_HELPER},
+                        LEGACY_CRATE_PRODUCER: {LEGACY_MAIN_CRATE_HELPER, LEGACY_CRATE_HELPER},
+                        LEGACY_GROUPED_PRODUCER: {LEGACY_GROUPED_HELPER},
+                        LEGACY_ADMISSION_PRODUCER: {LEGACY_ADMISSION_HELPER}}[normalized]
+    assert len(pins) == 1 and pins[0].decode() in expected_helpers, "Unknown admission helper pin"
+    expected_helper = pins[0].decode()
     helper = api(f"contents/scripts/main-release-admission.py?ref={revision}")
     assert helper["encoding"] == "base64" and len(helper["content"]) <= 180000
     body = base64.b64decode(helper["content"], validate=False)
     assert len(body) <= 128000 and hashlib.sha256(body).hexdigest() == expected_helper, "Admission helper bytes changed"
-    return "grouped" if normalized == CURRENT_PRODUCER else "admission"
+    if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER, LEGACY_PLATFORM_PRODUCER, LEGACY_CRATE_PRODUCER}:
+        packages = {}
+        server_blocks = {}
+        for job, label in (("test-crates", "Test"), ("e2e-crates", "E2E")):
+            block = re.search(rb"^  " + job.encode() + rb":\n(.*?)(?=^  [a-z0-9-]+:|\Z)", raw, re.M | re.S)
+            assert block, "Missing native crate matrix"
+            entries = re.search(rb"^        crate:\n((?:          - [a-z0-9-]+\n)+)", block.group(1), re.M)
+            assert entries, "Missing static crate list"
+            packages[label] = tuple(re.findall(rb"^          - ([a-z0-9-]+)$", entries.group(1), re.M))
+            assert len(packages[label]) == len(set(packages[label])), "Duplicate crate matrix entry"
+            packages[label] = tuple(item.decode() for item in packages[label])
+            if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER}:
+                entries = re.search(rb"^        include:\n((?:          - crate: bamboo-server\n            server_block: [a-z-]+\n)+)", block.group(1), re.M)
+                assert entries, "Missing static server blocks"
+                server_blocks[label] = tuple(item.decode() for item in re.findall(
+                    rb"^            server_block: ([a-z-]+)$", entries.group(1), re.M))
+                expected = ("browser", "chat", "execute", "settings", "app-state", "handlers", "other", "integration")
+                assert server_blocks[label] == expected, "Unexpected server blocks"
+                assert "bamboo-server" not in packages[label], "Server also has an unsplit crate job"
+        assert packages["Test"] == packages["E2E"], "Default and E2E crate lists differ"
+        if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER}:
+            if normalized == LEGACY_SERVER_BLOCK_PRODUCER:
+                assert server_blocks["Test"] == server_blocks["E2E"], "Default and E2E server blocks differ"
+            SERVER_BLOCKS[revision] = server_blocks
+        CRATE_PACKAGES[revision] = packages
+        if normalized == CURRENT_PRODUCER:
+            FEATURE_REVISIONS.add(revision)
+        PLATFORM_JOBS[revision] = PLATFORM_TESTS if normalized in {CURRENT_PRODUCER, LEGACY_SERVER_BLOCK_PRODUCER, LEGACY_PLATFORM_PRODUCER} else PLATFORMS
+        return "crates"
+    return "grouped" if normalized == LEGACY_GROUPED_PRODUCER else "admission"
 
 def executed_definition(pre, revision):
     """Bind the real check suite to the immutable executed workflow definition."""
@@ -345,7 +434,7 @@ def snapshot_binding(pre, jobs):
     # jobs retained by a failed-only rerun. One request per distinct attempt.
     attempts = {}
     for gate in jobs:
-        if gate["name"] not in FULL + PLATFORMS + ("Promotion Source",) and gate["name"] not in GROUPED_JOBS.get(pre["id"], set()):
+        if gate["name"] not in FULL + platform_jobs(head) + ("Promotion Source",) and gate["name"] not in TEST_JOBS.get(pre["id"], set()):
             continue
         actual = gate["run_attempt"]
         if actual not in attempts:
@@ -389,7 +478,7 @@ if ci is not None:
     else:
         light_main = True
         contract = executed_definition(ci, source)
-        assert len(admissions) == 1 and contract in {"admission", "grouped"}
+        assert len(admissions) == 1 and contract in {"admission", "grouped", "crates"}
         for name in ("Validation Source", "Main Release Admission", "Test"):
             found = [job for job in main_jobs if job["name"] == name]
             assert len(found) == 1
@@ -406,15 +495,34 @@ if ci is not None:
         # full acceptance: the separate pre-merge proof below requires real jobs.
         skipped = ["Quick Checks", "Promotion Source", "E2E Tests", "Lint", "MSRV (Rust 1.95)",
                    "Security Audit", "cargo-deny (licenses/bans/advisories/sources)", "Documentation"]
+        if source in FEATURE_REVISIONS:
+            skipped.append("Feature Unit and E2E")
         if contract == "grouped":
             skipped.extend(["Test Build", "E2E Build", "Test SSH Build", "Test SSH",
                             "Test Block (${{ matrix.id }})", "E2E Block (${{ matrix.id }})", "Test Doctest (${{ matrix.id }})",
                             "Test Block 2 (${{ matrix.id }})", "E2E Block 2 (${{ matrix.id }})"])
-        for label, platforms in (("TLS Fixture", ("macos-latest", "windows-latest")),
-                                 ("ToolEvent Recorder E2E", ("ubuntu-latest", "macos-latest", "windows-latest")),
-                                 ("Build", ("ubuntu-latest", "macos-latest", "windows-latest"))):
-            literal = label + " (${{ matrix.os }})"
-            expanded = [f"{label} ({platform})" for platform in platforms]
+        matrices = [("TLS Fixture", "os", ("macos-latest", "windows-latest")),
+                    ("ToolEvent Recorder E2E", "os", ("ubuntu-latest", "macos-latest", "windows-latest")),
+                    ("Platform Tests" if platform_jobs(source) == PLATFORM_TESTS else "Build", "os", ("ubuntu-latest", "macos-latest", "windows-latest"))]
+        if source in FEATURE_REVISIONS:
+            matrices.append(("Native Feature", "os", ("windows-2025", "macos-latest")))
+        if contract == "crates":
+            skipped.append("Test SSH")
+            for label, packages in CRATE_PACKAGES[source].items():
+                # One skipped literal covers the ordinary axis and appended
+                # include rows; expanded results must cover both completely.
+                # The jobs API canonicalizes the expression AST even when the
+                # matrix is skipped; bind its observed parenthesized spelling.
+                suffix = "${{ ((matrix.server_block && format('/{0}', matrix.server_block)) || '') }}" if source in SERVER_BLOCKS else ""
+                literal = f"{label} (${{{{ matrix.crate }}}}{suffix})"
+                expanded = [f"{label} ({package})" for package in packages]
+                expanded.extend(f"{label} (bamboo-server/{block})" for block in SERVER_BLOCKS.get(source, {}).get(label, ()))
+                found = [job["name"] for job in main_jobs if job["name"] in [literal] + expanded]
+                assert found == [literal] or (len(found) == len(expanded) and set(found) == set(expanded)), label
+                skipped.extend(found)
+        for label, axis, values in matrices:
+            literal = label + " (${{ matrix." + axis + " }})"
+            expanded = [f"{label} ({value})" for value in values]
             found = [job["name"] for job in main_jobs if job["name"] in [literal] + expanded]
             assert found == [literal] or (len(found) == len(expanded) and set(found) == set(expanded)), label
             skipped.extend(found)
@@ -423,7 +531,7 @@ if ci is not None:
             assert len(found) == 1 and found[0]["status"] == "completed" and found[0]["conclusion"] == "skipped", name
         assert len(main_jobs) == len(skipped) + 3, "Unexpected main CI jobs"
 else:
-    assert producer_definition(source) in {"admission", "grouped"}
+    assert producer_definition(source) in {"admission", "grouped", "crates"}
 
 def latest_premerge():
     runs = pages(f"actions/workflows/ci.yml/runs?event=pull_request&head_sha={head}", "workflow_runs")
@@ -461,7 +569,7 @@ print(f"Accepted normal main merge source={source} tree={commit['tree']['sha']} 
       f"release_CI={pre['id']} release_attempt={pre['run_attempt']} tested_snapshot={tested_snapshot} controller={workflow_source}")
 print("Authenticated full pre-merge job attempts: " + ", ".join(
     f"{job['name']}={job['id']}@{job['run_attempt']}" for job in jobs
-    if job["name"] in FULL + PLATFORMS + ("Promotion Source",) or job["name"] in GROUPED_JOBS.get(pre["id"], set())))
+    if job["name"] in FULL + platform_jobs(head) + ("Promotion Source",) or job["name"] in TEST_JOBS.get(pre["id"], set())))
 print(f"Acceptance covers tested inputs; final executable must be rebuilt for source={source} and its release version")
 with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
     stream.write(f"revision={source}\n")

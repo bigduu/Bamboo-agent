@@ -128,7 +128,7 @@ async fn persistent_connector_failure_has_a_hard_bound_and_secret_free_terminal_
         })
         .mount(&server)
         .await;
-    let cfg = config(99);
+    let cfg = config(7);
     let error = run(&server, &cfg, &InitialRequestBudget::new(&cfg))
         .await
         .unwrap_err();
@@ -137,10 +137,10 @@ async fn persistent_connector_failure_has_a_hard_bound_and_secret_free_terminal_
     assert!(
         message.contains("HTTP 401")
             && message.contains("temporarily recovering")
-            && message.contains("4 request(s)")
+            && message.contains("7 request(s)")
     );
     assert!(!message.contains("Please check your API key") && !message.contains(RECOVERY));
-    assert_eq!(hits.load(Ordering::SeqCst), 4);
+    assert_eq!(hits.load(Ordering::SeqCst), 7);
 }
 
 #[tokio::test]
@@ -613,14 +613,22 @@ async fn default_info_diagnostics_and_export_share_ids_and_exclude_secret_canari
     const SECRET: &str = "PRIVATE_retry_header_url_body_session_canary";
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .respond_with(
+        .respond_with(|_: &wiremock::Request| {
+            // The diagnostic callsite is already registered by attempt_start.
+            // Exercise a cache rebuild from an unrelated, unsubscribed thread.
+            std::thread::spawn(tracing::callsite::rebuild_interest_cache)
+                .join()
+                .unwrap();
             ResponseTemplate::new(503)
                 .insert_header("request-id", SECRET)
-                .set_body_string(SECRET),
-        )
+                .set_body_string(SECRET)
+        })
         .mount(&server)
         .await;
     let capture = InfoCapture::default();
+    // Keep two dispatchers registered: tracing-core's single-dispatch fast path
+    // otherwise uses an unrelated thread's default when rebuilding interest.
+    let _inactive = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
     let _guard = tracing::subscriber::set_default(capture.clone());
     tracing::callsite::rebuild_interest_cache();
     let cfg = config(2);
@@ -635,12 +643,19 @@ async fn default_info_diagnostics_and_export_share_ids_and_exclude_secret_canari
     .to_string();
     let events = diagnostics_for(SECRET);
     let exported = serde_json::to_string(&events).unwrap();
-    for text in [capture.0.text(), exported, error.clone()] {
+    for (source, text) in [
+        ("INFO log", capture.0.text()),
+        ("diagnostic export", exported),
+        ("terminal error", error.clone()),
+    ] {
         assert!(
             !text.contains(SECRET),
-            "secret canary escaped the diagnostic allowlist"
+            "secret canary escaped the diagnostic allowlist in {source}"
         );
-        assert!(text.contains(&budget.diagnostic_id.to_string()));
+        assert!(
+            text.contains(&budget.diagnostic_id.to_string()),
+            "{source} omitted the budget diagnostic ID"
+        );
     }
     assert!(capture.0.text().contains("attempt_start"));
     assert!(capture.0.text().contains("retry_scheduled"));

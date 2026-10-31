@@ -2,7 +2,6 @@ use super::*;
 
 async fn existing(data: &Path) -> anyhow::Result<(TicketService, Authority)> {
     let source = read_source(data, DEFAULT_SUPERVISOR_SESSION_ID).await?;
-    let binding = binding(&source.session)?;
     let root = scope_root(data, &source.session)?;
     ensure!(
         root.join("HEAD").is_file(),
@@ -10,7 +9,8 @@ async fn existing(data: &Path) -> anyhow::Result<(TicketService, Authority)> {
     );
     // The lifetime OS lock rejects a live Host. Run stop proof remains the
     // existing trusted Runtime's durable fact, never a CLI boolean or PID guess.
-    let service = TicketService::open_offline(&root, binding.clone())?;
+    let service = offline_service(data, &source.session)?;
+    let binding = service.published()?.1.binding;
     Ok((service, owner(binding)))
 }
 

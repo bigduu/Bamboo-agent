@@ -241,6 +241,55 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     let state = AppState::new(args.data_dir.clone())
         .await
         .map_err(|e| format!("boot app state: {e}"))?;
+    run_with_state(args, state).await
+}
+
+// Keep one execution implementation; controlled tests inject an isolated Host
+// through this seam instead of booting real credentials or canonical memory.
+async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), String> {
+    // Admit explicit CLI intent before creating/changing a session. A selected
+    // provider without a default model is an error, not parent inheritance.
+    let config_snapshot = state.config.read().await.clone();
+    let model_selection = resolve_model_selection(
+        &args.model,
+        &args.provider,
+        config_snapshot.effective_default_provider(),
+    )?;
+    let mut session_model_ref = match (
+        model_selection.model_ref.clone(),
+        model_selection.provider.as_deref(),
+    ) {
+        (Some(model_ref), _) => Some(model_ref),
+        (None, Some(provider)) => {
+            let provider = bamboo_engine::model_config_helper::resolve_provider_routing_key(
+                &config_snapshot,
+                provider,
+                &state.provider_registry,
+            )
+            .map_err(|error| format!("resolve headless provider: {error}"))?;
+            let model = bamboo_engine::model_config_helper::get_default_model_for_provider(
+                &config_snapshot,
+                &provider,
+            )
+            .map_err(|error| format!("resolve headless model: {error}"))?;
+            Some(bamboo_domain::ProviderModelRef::new(provider, model))
+        }
+        (None, None) => None,
+    };
+    if let Some(target) = session_model_ref.as_mut() {
+        target.provider = bamboo_engine::model_config_helper::resolve_provider_routing_key(
+            &config_snapshot,
+            &target.provider,
+            &state.provider_registry,
+        )
+        .map_err(|error| format!("resolve headless provider: {error}"))?;
+        bamboo_engine::model_config_helper::try_resolve_exact_model(
+            &config_snapshot,
+            &state.provider_registry,
+            target,
+        )
+        .map_err(|error| format!("admit headless model: {error}"))?;
+    }
     let requested_project = match args.project_id.as_deref() {
         Some(raw) => {
             let value = raw.trim();
@@ -312,6 +361,63 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
                     ));
                 }
             }
+            if session_model_ref.is_none() {
+                // A saved target remains authoritative for this resumed run,
+                // even when the legacy model-ref feature is disabled. Re-admit
+                // it before appending the new prompt; never borrow a new default.
+                let mut inherited = existing.model_ref.clone().or_else(|| {
+                    bamboo_engine::session_app::provider_model::session_effective_model_ref(
+                        &existing,
+                    )
+                });
+                if inherited.is_none() {
+                    if let Some(provider) = existing.provider_name() {
+                        let provider =
+                            bamboo_engine::model_config_helper::resolve_provider_routing_key(
+                                &config_snapshot,
+                                &provider,
+                                &state.provider_registry,
+                            )
+                            .map_err(|error| {
+                                format!("resolve headless inherited provider: {error}")
+                            })?;
+                        let model =
+                            bamboo_engine::model_config_helper::get_default_model_for_provider(
+                                &config_snapshot,
+                                &provider,
+                            )
+                            .map_err(|error| {
+                                format!("resolve headless inherited model: {error}")
+                            })?;
+                        inherited = Some(bamboo_domain::ProviderModelRef::new(provider, model));
+                    }
+                }
+                if let Some(mut target) = inherited {
+                    if target.provider.trim().is_empty()
+                        || target.model.trim().is_empty()
+                        || target.model.trim() == "unknown"
+                    {
+                        return Err(
+                            "invalid headless inherited provider/model reference".to_string()
+                        );
+                    }
+                    target.model = target.model.trim().to_string();
+                    target.provider =
+                        bamboo_engine::model_config_helper::resolve_provider_routing_key(
+                            &config_snapshot,
+                            &target.provider,
+                            &state.provider_registry,
+                        )
+                        .map_err(|error| format!("resolve headless inherited provider: {error}"))?;
+                    bamboo_engine::model_config_helper::try_resolve_exact_model(
+                        &config_snapshot,
+                        &state.provider_registry,
+                        &target,
+                    )
+                    .map_err(|error| format!("admit headless inherited model: {error}"))?;
+                    session_model_ref = Some(target);
+                }
+            }
             id.clone()
         }
         None => {
@@ -364,35 +470,6 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     // OVERWRITTEN per execute by the handler, so a session first run headlessly
     // and later reopened interactively correctly resets to the human-present
     // posture instead of staying sticky-true.
-    // Resolve `-m`/`--provider` once, BEFORE the session is persisted below. A
-    // bare `-m <model>` (no colon, no `--provider`) binds to the configured
-    // default provider — the same grammar `actor run` uses. Applies to the
-    // initial execute and to any resume.
-    let default_provider = state.config.read().await.provider.clone();
-    let model_selection = resolve_model_selection(&args.model, &args.provider, &default_provider)?;
-
-    // Resolve the concrete provider+model ref to pin onto the session. For a
-    // bare/colon `-m` this is the parsed ref. For `--provider P` ALONE we resolve
-    // P's configured default model here so the pin is still concrete: the new
-    // cascade's `defaults.chat` fallback is a single GLOBAL ref, so passing only
-    // a provider would otherwise be ignored and the run would keep using the
-    // global default provider/model. If P has no configured model we leave the
-    // ref unset and fall back to the request's `provider` field (the legacy
-    // cascade resolves P's provider-aware default, or execute reports no model).
-    let session_model_ref: Option<bamboo_domain::ProviderModelRef> = match (
-        model_selection.model_ref.clone(),
-        model_selection.provider.as_deref(),
-    ) {
-        (Some(model_ref), _) => Some(model_ref),
-        (None, Some(provider)) => {
-            let config = state.config.read().await;
-            bamboo_engine::model_config_helper::get_default_model_for_provider(&config, provider)
-                .ok()
-                .map(|model| bamboo_domain::ProviderModelRef::new(provider, model))
-        }
-        (None, None) => None,
-    };
-
     {
         let mut session = state
             .storage
@@ -488,8 +565,13 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
         session_id.clone(),
         web::Json(ExecuteRequest {
             model: model_selection.model.clone(),
-            provider: model_selection.provider.clone(),
-            model_ref: model_selection.model_ref.clone(),
+            provider: session_model_ref
+                .as_ref()
+                .map(|target| target.provider.clone())
+                .or_else(|| model_selection.provider.clone()),
+            model_ref: session_model_ref
+                .clone()
+                .or_else(|| model_selection.model_ref.clone()),
             skill_mode: args.skill_mode.clone(),
             reasoning_effort,
             client_sync: None,
@@ -502,6 +584,9 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
             // run gets the config-level `run_budget` default like every other
             // path.
             run_budget: None,
+            upstream_retry: None,
+            // Headless runs cannot offer an interactive same-run continuation.
+            live_bootstrap_resume: false,
         }),
     )
     .await;
@@ -636,8 +721,13 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
                 response,
                 expected_tool_call_id: Some(pending.tool_call_id.clone()),
                 model: model_selection.model.clone(),
-                provider: model_selection.provider.clone(),
-                model_ref: model_selection.model_ref.clone(),
+                provider: session_model_ref
+                    .as_ref()
+                    .map(|target| target.provider.clone())
+                    .or_else(|| model_selection.provider.clone()),
+                model_ref: session_model_ref
+                    .clone()
+                    .or_else(|| model_selection.model_ref.clone()),
                 reasoning_effort,
             }),
         )
@@ -699,6 +789,10 @@ pub async fn run(args: HeadlessArgs) -> Result<(), String> {
     }
     exit
 }
+
+#[cfg(test)]
+#[path = "headless_model_routing_tests.rs"]
+mod model_routing_tests;
 
 /// The tree is done when the root runner is not running, the root is not
 /// suspended waiting for children, and no child runner is still running.

@@ -40,6 +40,55 @@ impl HookRunner {
         self.dispatcher.register(hook);
     }
 
+    /// Best-effort observer. A fixed process-wide concurrency budget and
+    /// deadline isolate model execution from slow or failed plugins. Only the
+    /// small, content-free snapshot and a minimal session reach the observer.
+    pub(crate) fn notify_model_usage(
+        &self,
+        observation: bamboo_domain::ModelCallUsage,
+        session_birth: chrono::DateTime<Utc>,
+        root_session_id: Option<String>,
+    ) {
+        use std::sync::OnceLock;
+        use std::time::Duration;
+        static SLOTS: OnceLock<Arc<tokio::sync::Semaphore>> = OnceLock::new();
+        let point = AgentHookPoint::AfterModelCallUsage;
+        if !self.dispatcher.has_hooks_for(point) && self.plugin_root.is_none() {
+            return;
+        }
+        let Ok(permit) = SLOTS
+            .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(32)))
+            .clone()
+            .try_acquire_owned()
+        else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let runner = self.clone();
+        handle.spawn(async move {
+            let _permit = permit;
+            let mut session = Session::new(
+                &observation.session_id,
+                observation.model.as_deref().unwrap_or("unknown"),
+            );
+            session.created_at = session_birth;
+            session.root_session_id = root_session_id.unwrap_or_default();
+            let payload = HookPayload::ModelCallUsage { observation };
+            let work = async {
+                let _ = runner
+                    .dispatcher
+                    .run_observer_hooks(point, &payload, &session)
+                    .await;
+                if let Some(root) = &runner.plugin_root {
+                    let _ = bamboo_hooks::portable::run(root, point, &payload, &session).await;
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(2), work).await;
+        });
+    }
+
     /// Clone this registry and append configured handlers from one frozen config
     /// snapshot. The original registry remains reusable by future runs.
     pub fn with_lifecycle_config(
@@ -277,6 +326,7 @@ impl HookRunner {
                     AgentHookPoint::BeforeToolExecution,
                     AgentHookPoint::AfterToolExecution,
                     AgentHookPoint::BeforeFinalize,
+                    AgentHookPoint::AfterModelCallUsage,
                 ]
                 .into_iter()
                 .any(|point| bamboo_hooks::portable::has_active_hooks_for(root, point))

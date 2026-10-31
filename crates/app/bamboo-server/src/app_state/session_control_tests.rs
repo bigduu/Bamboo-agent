@@ -137,6 +137,7 @@ struct Probe {
     entered: Notify,
     release: Notify,
     requests: Mutex<Vec<(String, Vec<Message>)>>,
+    control_schemas: Mutex<Vec<Option<Value>>>,
 }
 
 #[async_trait::async_trait]
@@ -144,7 +145,7 @@ impl LLMProvider for Probe {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _tools: &[ToolSchema],
+        tools: &[ToolSchema],
         _max_output_tokens: Option<u32>,
         model: &str,
     ) -> Result<bamboo_llm::LLMStream, bamboo_llm::LLMError> {
@@ -152,6 +153,12 @@ impl LLMProvider for Probe {
             .lock()
             .unwrap()
             .push((model.into(), messages.to_vec()));
+        self.control_schemas.lock().unwrap().push(
+            tools
+                .iter()
+                .find(|schema| schema.function.name == "session_control")
+                .map(|schema| schema.function.parameters.clone()),
+        );
         let output = self.next.lock().unwrap().take();
         if self
             .blocked
@@ -185,14 +192,27 @@ struct Fixture {
     reference: SupervisorReference,
     original: Session,
     followup_tools: Option<Arc<dyn ToolExecutor>>,
+    followup_targets: Mutex<HashMap<String, Value>>,
 }
+
+#[path = "supervisor_exact_cancel_tests.rs"]
+mod exact_cancel_tests;
 
 impl Fixture {
     async fn new() -> Self {
+        Self::new_with_legacy_setup(true).await
+    }
+
+    async fn new_with_legacy_setup(legacy_setup: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
         let probe = Arc::new(Probe::default());
         let mut config = Config::from_data_dir(Some(home.path().to_path_buf()));
         config.provider = "followup-provider".into();
+        // Keep this provider probe dedicated to the native Root turns.
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
         let mut state =
             AppState::new_with_provider(home.path().to_path_buf(), config, probe.clone())
                 .await
@@ -241,27 +261,28 @@ impl Fixture {
             .await
             .unwrap())
             .into();
-        service
-            .configure_project_scope(&reference, 0, [project.id.clone()].into())
-            .await
-            .unwrap();
-        service.attach(&reference, 1, TARGET).await.unwrap();
-        // This fixture's Supervisor has approval only for this one target
-        // operation. Target permissions and every bypass flag remain unchanged.
-        state
-            .permission_checker
-            .permission_config()
-            .unwrap()
-            .grant_typed_scoped_session_permission(
-                &reference.session_id,
-                bamboo_tools::permission::PermissionType::ExecuteCommand,
-                bamboo_tools::permission::PermissionMatcher {
-                    id: "approved-followup-target".into(),
-                    kind: bamboo_tools::permission::PermissionMatcherKind::ExactResource,
-                    value: format!("session_control followup {TARGET}"),
-                },
-            )
-            .unwrap();
+        if legacy_setup {
+            service
+                .configure_project_scope(&reference, 0, [project.id.clone()].into())
+                .await
+                .unwrap();
+            service.attach(&reference, 1, TARGET).await.unwrap();
+            // Older followup fixtures explicitly use their target grant.
+            state
+                .permission_checker
+                .permission_config()
+                .unwrap()
+                .grant_typed_scoped_session_permission(
+                    &reference.session_id,
+                    bamboo_tools::permission::PermissionType::ExecuteCommand,
+                    bamboo_tools::permission::PermissionMatcher {
+                        id: "approved-followup-target".into(),
+                        kind: bamboo_tools::permission::PermissionMatcherKind::ExactResource,
+                        value: format!("session_control followup {TARGET}"),
+                    },
+                )
+                .unwrap();
+        }
         // Prewarm the exact Project/workspace store used by the Root runner.
         // Warming only the workspace store leaves a second watcher registration
         // in the bounded execution path.
@@ -278,6 +299,7 @@ impl Fixture {
             reference,
             original,
             followup_tools: None,
+            followup_targets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -310,6 +332,39 @@ impl Fixture {
             .set_ask_rules(["Bash(echo followup-permission-probe)".into()]);
     }
 
+    async fn followup_arguments(&self, operation: &str, message: &str) -> Value {
+        let cached = self
+            .followup_targets
+            .lock()
+            .unwrap()
+            .get(operation)
+            .cloned();
+        let target_ref = if let Some(cached) = cached {
+            cached
+        } else {
+            let page = self
+                .state
+                .storage
+                .list_supervisor_current_user_targets(&self.reference, None, None, 20)
+                .await
+                .unwrap();
+            let observed = page
+                .targets
+                .into_iter()
+                .find(|target| target.session_id == TARGET)
+                .expect("canonical target observation");
+            let observed = serde_json::to_value(observed).unwrap();
+            self.followup_targets
+                .lock()
+                .unwrap()
+                .entry(operation.to_owned())
+                .or_insert(observed)
+                .clone()
+        };
+        json!({"action":"followup", "target_session_id":TARGET, "target_ref":target_ref,
+            "operation_id":operation, "message":message})
+    }
+
     async fn call(
         &self,
         operation: &str,
@@ -318,24 +373,39 @@ impl Fixture {
         let supervisor = self
             .state
             .storage
-            .load_session(&self.reference.session_id)
+            .load_execution_admission_snapshot(&self.reference.session_id)
             .await
             .unwrap()
             .unwrap();
-        let call = ToolCall { id: format!("call-{operation}"), tool_type: "function".into(), function: FunctionCall {
-            name: "session_control".into(), arguments: json!({"action":"followup", "target_session_id":TARGET, "operation_id":operation, "message":message}).to_string(),
-        }};
+        let arguments = self
+            .followup_arguments(operation, message)
+            .await
+            .to_string();
+        let call = ToolCall {
+            id: format!("call-{operation}"),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments,
+            },
+        };
         let mut ctx = ToolExecutionContext::none(&call.id);
         ctx.session_id = Some(&supervisor.id);
         ctx.root_session_id = Some(&supervisor.id);
         ctx = ctx.with_executing_supervisor(
             ExecutingSupervisorObservation::capture_from_executing_session(&supervisor),
         );
-        self.followup_tools
+        let tools = self
+            .followup_tools
             .clone()
-            .unwrap_or_else(|| self.state.tools_for(ToolSurface::Root))
-            .execute_with_context_outcome(&call, ctx)
-            .await
+            .unwrap_or_else(|| self.state.tools_for(ToolSurface::Root));
+        bamboo_agent_core::tools::with_executing_session_caller(
+            Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+                &supervisor,
+            ))),
+            tools.execute_with_context_outcome(&call, ctx),
+        )
+        .await
     }
 
     async fn model_followup(&self, operation: &str, ultra: bool) -> String {
@@ -351,11 +421,13 @@ impl Fixture {
         std::fs::create_dir_all(&workspace).unwrap();
         supervisor.set_workspace_path_meta(workspace.to_string_lossy());
         self.state.storage.save_session(&supervisor).await.unwrap();
+        let arguments = self.followup_arguments(operation, STEER).await.to_string();
         *self.probe.next.lock().unwrap() = Some(ToolCall {
-            id: operation.into(), tool_type: "function".into(),
+            id: operation.into(),
+            tool_type: "function".into(),
             function: FunctionCall {
                 name: "session_control".into(),
-                arguments: json!({"action":"followup", "target_session_id":TARGET, "operation_id":operation, "message":STEER}).to_string(),
+                arguments,
             },
         });
         let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -535,7 +607,7 @@ impl Fixture {
 }
 
 #[actix_web::test]
-async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_detached_target() {
+async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_stale_target() {
     for ultra in [false, true] {
         let f = Box::pin(Fixture::new()).await;
         let content = Box::pin(f.model_followup("native-attached-followup", ultra)).await;
@@ -582,7 +654,29 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_de
             .detach(&f.reference, scope.state_revision, TARGET)
             .await
             .unwrap();
-        let denied = Box::pin(f.model_followup("native-detached-followup", ultra)).await;
+        assert!(
+            service
+                .inspect_link(&f.reference, TARGET)
+                .await
+                .unwrap()
+                .authorized
+        );
+        let observed = f
+            .followup_targets
+            .lock()
+            .unwrap()
+            .get("native-attached-followup")
+            .unwrap()
+            .clone();
+        let mut changed = f.reload().await;
+        changed.metadata_version += 1;
+        assert_eq!(changed.model, f.original.model);
+        f.state.storage.save_session(&changed).await.unwrap();
+        f.followup_targets
+            .lock()
+            .unwrap()
+            .insert("native-stale-followup".into(), observed.clone());
+        let denied = Box::pin(f.model_followup("native-stale-followup", ultra)).await;
         assert!(serde_json::from_str::<Value>(&denied).is_err(), "{denied}");
         assert_eq!(
             f.state
@@ -606,6 +700,143 @@ async fn supervisor_followup_native_model_dispatch_survives_ultra_and_rejects_de
         assert_eq!(
             serde_json::to_value(&f.reload().await.messages).unwrap(),
             serde_json::to_value(&after.messages).unwrap()
+        );
+
+        // Legacy Project/link changes do not revoke default-domain access or
+        // repair a stale selector. Keep the old target observation through
+        // both metadata mutations and retain the no-provider/no-write checks.
+        let current = service.inspect_scope(&f.reference).await.unwrap();
+        service
+            .attach(&f.reference, current.state_revision, TARGET)
+            .await
+            .unwrap();
+        assert!(
+            service
+                .inspect_link(&f.reference, TARGET)
+                .await
+                .unwrap()
+                .authorized
+        );
+        let target_before = serde_json::to_value(f.reload().await).unwrap();
+        for (operation, allowed_projects) in [
+            ("native-scope-revoked-followup", Default::default()),
+            (
+                "native-scope-regranted-without-attach",
+                scope.allowed_projects.clone(),
+            ),
+        ] {
+            let current = service.inspect_scope(&f.reference).await.unwrap();
+            service
+                .configure_project_scope(&f.reference, current.state_revision, allowed_projects)
+                .await
+                .unwrap();
+            let link = service.inspect_link(&f.reference, TARGET).await.unwrap();
+            assert!(link.authorized);
+            assert!(!link.link.unwrap().enabled);
+            f.followup_targets
+                .lock()
+                .unwrap()
+                .insert(operation.into(), observed.clone());
+            let denied = Box::pin(f.model_followup(operation, ultra)).await;
+            assert!(serde_json::from_str::<Value>(&denied).is_err(), "{denied}");
+            assert_eq!(
+                f.state
+                    .session_inbox
+                    .inspect(TARGET)
+                    .await
+                    .unwrap()
+                    .generation,
+                before.generation
+            );
+            assert_eq!(
+                f.probe
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(model, _)| model == "original-target-model")
+                    .count(),
+                target_calls
+            );
+            assert_eq!(
+                serde_json::to_value(f.reload().await).unwrap(),
+                target_before
+            );
+        }
+
+        // A fresh canonical selector is the positive control, with the legacy
+        // link still disabled. No new attachment or permission is needed.
+        assert!(
+            !service
+                .inspect_link(&f.reference, TARGET)
+                .await
+                .unwrap()
+                .link
+                .unwrap()
+                .enabled
+        );
+        let calls_before = f.probe.requests.lock().unwrap().len();
+        let restored =
+            Box::pin(f.model_followup("native-fresh-selector-without-attach", ultra)).await;
+        let restored: Value = serde_json::from_str(&restored).expect(&restored);
+        assert_eq!(restored["admitted"], true);
+        f.settled(calls_before + 3).await;
+        assert_eq!(
+            f.probe
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(model, _)| model == "original-target-model")
+                .count(),
+            target_calls + 1
+        );
+        assert_eq!(
+            f.state
+                .session_inbox
+                .inspect(TARGET)
+                .await
+                .unwrap()
+                .generation,
+            before.generation + 1
+        );
+        let reactivated = f.reload().await;
+        assert_eq!(reactivated.created_at, after.created_at);
+        assert_eq!(reactivated.kind, f.original.kind);
+        assert_eq!(reactivated.parent_session_id, f.original.parent_session_id);
+        assert_eq!(
+            reactivated.root_thinking_mode(),
+            f.original.root_thinking_mode()
+        );
+        assert!(reactivated.supervisor_incarnation_id().is_none());
+        assert_eq!(reactivated.project_id_meta(), f.original.project_id_meta());
+        assert_eq!(
+            reactivated.workspace_path_meta(),
+            f.original.workspace_path_meta()
+        );
+        assert_eq!(reactivated.model, f.original.model);
+        assert_eq!(
+            reactivated.metadata.get("provider"),
+            f.original.metadata.get("provider")
+        );
+        for message in &after.messages {
+            assert!(reactivated.messages.iter().any(|retained| {
+                retained.id == message.id && retained.content == message.content
+            }));
+        }
+        assert_eq!(
+            reactivated
+                .messages
+                .iter()
+                .filter(|message| message.content == STEER)
+                .count(),
+            2
+        );
+        eprintln!(
+            "native Supervisor scope: mode={:?}; revoke and regrant denied without target mutation; explicit attach admitted; target model requests {} -> {}",
+            bamboo_domain::RootThinkingMode::from_enabled(ultra),
+            target_calls,
+            target_calls + 1
         );
         f.state.shutdown().await;
     }

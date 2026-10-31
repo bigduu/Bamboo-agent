@@ -3071,6 +3071,10 @@ mod hook_tests {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let names = [
             "Read",
+            "Grep",
+            "Glob",
+            "GetFileInfo",
+            "ViewImage",
             "SubAgent",
             "Plan",
             "Task",
@@ -3129,8 +3133,7 @@ mod hook_tests {
                 .unwrap();
                 let allowed = matches!(
                     name,
-                    "Read"
-                        | "SubAgent"
+                    "SubAgent"
                         | "Plan"
                         | "Task"
                         | "session_control"
@@ -3144,7 +3147,6 @@ mod hook_tests {
                 }
             }
             let expected = vec![
-                "Read",
                 "SubAgent",
                 "Plan",
                 "Task",
@@ -3163,7 +3165,7 @@ mod hook_tests {
     }
 
     #[tokio::test]
-    async fn supervisor_ultra_final_gate_uses_original_observation_and_exact_management_tool() {
+    async fn ultra_final_gate_separates_supervisor_management_from_proven_common_history() {
         use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
         let names = [
             "session_control",
@@ -3180,59 +3182,74 @@ mod hook_tests {
         let observed = ExecutingSupervisorObservation::capture_from_executing_session(&supervisor);
         let callable =
             effective_callable_set(&names, CapabilityLoadingMode::LegacyFullCatalog, &[]);
-        for (observation, caller) in [
-            (observed, DEFAULT_SUPERVISOR_SESSION_ID),
-            (None, DEFAULT_SUPERVISOR_SESSION_ID),
-            (observed, "ordinary-root"),
-        ] {
-            let concrete = Arc::new(NameRecordingExecutor::new(&names));
-            let tools: Arc<dyn ToolExecutor> = concrete.clone();
-            let (tx, mut rx) = mpsc::channel(64);
-            for name in names {
-                let call = probe_call(name);
-                let outcome = execute_model_requested_tool_call_only(
-                    &callable,
-                    ToolExecutionOnlyContext {
-                        session_behavior_version: None,
-                        vision_support: true,
-                        output_cap: None,
-                        executing_caller: None,
-                        executing_supervisor: observation,
-                        tool_call: &call,
-                        event_tx: &tx,
-                        metrics_collector: None,
-                        session_id: caller,
-                        root_session_id: caller,
-                        root_orchestration_only: true,
-                        round_id: "round-1",
-                        round: 0,
-                        tools: &tools,
-                        config: &AgentLoopConfig::default(),
-                        hook_session: None,
-                        hook_runtime_state: None,
-                        session_flags: ToolExecutionSessionFlags::from_session(&supervisor),
-                        available_tool_schemas: &[],
-                    },
-                )
-                .await
-                .unwrap();
-                let allowed = observation.is_some()
-                    && caller == DEFAULT_SUPERVISOR_SESSION_ID
-                    && matches!(name, "session_control" | "session_history");
-                assert_eq!(outcome.result.is_ok(), allowed, "{caller}: {name}");
+        // Common history requires Host proof; management requires the original Supervisor.
+        for framework_proof in [false, true] {
+            for (observation, caller) in [
+                (observed, DEFAULT_SUPERVISOR_SESSION_ID),
+                (None, DEFAULT_SUPERVISOR_SESSION_ID),
+                (observed, "ordinary-root"),
+            ] {
+                let mut concrete = NameRecordingExecutor::new(&names);
+                concrete.framework_proof = framework_proof;
+                let concrete = Arc::new(concrete);
+                let tools: Arc<dyn ToolExecutor> = concrete.clone();
+                let (tx, mut rx) = mpsc::channel(64);
+                for name in names {
+                    let call = probe_call(name);
+                    let outcome = execute_model_requested_tool_call_only(
+                        &callable,
+                        ToolExecutionOnlyContext {
+                            session_behavior_version: None,
+                            vision_support: true,
+                            output_cap: None,
+                            executing_caller: None,
+                            executing_supervisor: observation,
+                            tool_call: &call,
+                            event_tx: &tx,
+                            metrics_collector: None,
+                            session_id: caller,
+                            root_session_id: caller,
+                            root_orchestration_only: true,
+                            round_id: "round-1",
+                            round: 0,
+                            tools: &tools,
+                            config: &AgentLoopConfig::default(),
+                            hook_session: None,
+                            hook_runtime_state: None,
+                            session_flags: ToolExecutionSessionFlags::from_session(&supervisor),
+                            available_tool_schemas: &[],
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    let allowed = match name {
+                        "session_history" => framework_proof,
+                        "session_control" => {
+                            observation.is_some() && caller == DEFAULT_SUPERVISOR_SESSION_ID
+                        }
+                        _ => false,
+                    };
+                    assert_eq!(
+                        outcome.result.is_ok(),
+                        allowed,
+                        "proof={framework_proof} {caller}: {name}"
+                    );
+                }
+                let mut expected = vec![];
+                if observation.is_some() && caller == DEFAULT_SUPERVISOR_SESSION_ID {
+                    expected.push("session_control");
+                }
+                if framework_proof {
+                    expected.push("session_history");
+                }
+                assert_eq!(concrete.entered(), expected);
+                assert_eq!(
+                    std::iter::from_fn(|| rx.try_recv().ok())
+                        .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
+                        .count(),
+                    expected.len()
+                );
             }
-            let expected = if observation.is_some() && caller == DEFAULT_SUPERVISOR_SESSION_ID {
-                vec!["session_control", "session_history"]
-            } else {
-                vec![]
-            };
-            assert_eq!(concrete.entered(), expected);
-            assert_eq!(
-                std::iter::from_fn(|| rx.try_recv().ok())
-                    .filter(|event| matches!(event, AgentEvent::ToolStart { .. }))
-                    .count(),
-                expected.len()
-            );
         }
     }
 
@@ -3988,17 +4005,18 @@ mod hook_tests {
         .await
         .expect("denied parent review returns a tool outcome");
         assert!(outcome.result.is_err());
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0].resource, "[redacted]");
-        let request = asks[0]
-            .permission_request
-            .as_ref()
-            .expect("typed review request");
-        assert_eq!(request.resource, "[redacted]");
-        assert!(request.suggested_matchers.is_empty());
-        assert!(!format!("{:?}", asks[0]).contains("private-key"));
-        drop(asks);
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 1);
+            assert_eq!(asks[0].resource, "[redacted]");
+            let request = asks[0]
+                .permission_request
+                .as_ref()
+                .expect("typed review request");
+            assert_eq!(request.resource, "[redacted]");
+            assert!(request.suggested_matchers.is_empty());
+            assert!(!format!("{:?}", asks[0]).contains("private-key"));
+        }
 
         let eval_args = serde_json::json!({
             "code":"document.title = 'private-source'",
@@ -4027,16 +4045,17 @@ mod hook_tests {
         .await
         .expect("denied eval review returns a tool outcome");
         assert!(outcome.result.is_err());
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 2);
-        assert_eq!(asks[1].resource, "[redacted]");
-        let eval_request = asks[1].permission_request.as_ref().unwrap();
-        assert_eq!(eval_request.resource, "[redacted]");
-        assert!(eval_request.suggested_matchers.is_empty());
-        for secret in ["private-source", "private-query", "browser_eval:17:"] {
-            assert!(!format!("{:?}", asks[1]).contains(secret));
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 2);
+            assert_eq!(asks[1].resource, "[redacted]");
+            let eval_request = asks[1].permission_request.as_ref().unwrap();
+            assert_eq!(eval_request.resource, "[redacted]");
+            assert!(eval_request.suggested_matchers.is_empty());
+            for secret in ["private-source", "private-query", "browser_eval:17:"] {
+                assert!(!format!("{:?}", asks[1]).contains(secret));
+            }
         }
-        drop(asks);
 
         let invalid_type_args = serde_json::json!({
             "action":"type",
@@ -4104,7 +4123,7 @@ mod hook_tests {
                 Some(reviewer_proxy.clone()),
                 hook_ask_outcome(
                     &malformed_call,
-                    &execution_name,
+                    execution_name,
                     &config,
                     &session,
                     &runtime_state,
@@ -4144,7 +4163,7 @@ mod hook_tests {
             Some(reviewer_proxy),
             hook_ask_outcome(
                 &read_only_call,
-                &execution_name,
+                execution_name,
                 &config,
                 &session,
                 &runtime_state,
@@ -4249,25 +4268,26 @@ mod hook_tests {
             assert!(outcome.result.is_err());
         }
 
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 3);
-        for ask in asks.iter() {
-            assert_eq!(ask.tool_name, "browser");
-            assert_eq!(ask.resource, "[redacted]");
-            let request = ask.permission_request.as_ref().unwrap();
-            assert_eq!(request.tool_name, "browser");
-            assert_eq!(request.resource, "[redacted]");
-            assert_eq!(
-                request.operation_summary,
-                "Download from selected browser element"
-            );
-            assert!(request.suggested_matchers.is_empty());
-            let display = format!("{ask:?}");
-            assert!(!display.contains(secret));
-            assert!(!display.contains("download:css:"));
-            assert!(!display.contains("private-namespace"));
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 3);
+            for ask in asks.iter() {
+                assert_eq!(ask.tool_name, "browser");
+                assert_eq!(ask.resource, "[redacted]");
+                let request = ask.permission_request.as_ref().unwrap();
+                assert_eq!(request.tool_name, "browser");
+                assert_eq!(request.resource, "[redacted]");
+                assert_eq!(
+                    request.operation_summary,
+                    "Download from selected browser element"
+                );
+                assert!(request.suggested_matchers.is_empty());
+                let display = format!("{ask:?}");
+                assert!(!display.contains(secret));
+                assert!(!display.contains("download:css:"));
+                assert!(!display.contains("private-namespace"));
+            }
         }
-        drop(asks);
 
         let malformed = serde_json::json!({
             "action":"download", "selector":secret, "expected_epoch":17,
@@ -4350,25 +4370,26 @@ mod hook_tests {
         .await
         .expect("parent review returns an outcome");
         assert!(outcome.result.is_err());
-        let asks = reviewer.0.lock().expect("browser approval record lock");
-        assert_eq!(asks.len(), 1);
-        assert_eq!(asks[0].tool_name, "default::browser");
-        assert_eq!(asks[0].resource, "[redacted]");
-        let request = asks[0]
-            .permission_request
-            .as_ref()
-            .expect("typed review request");
-        assert_eq!(
-            request.permission_type,
-            bamboo_tools::permission::PermissionType::BrowserInteraction
-        );
-        assert_eq!(request.resource, "[redacted]");
-        assert_eq!(request.operation_summary, "Select native browser options");
-        assert!(request.suggested_matchers.is_empty());
-        for private in ["private-option-value", "data-private", "options:"] {
-            assert!(!format!("{:?}", asks[0]).contains(private));
+        {
+            let asks = reviewer.0.lock().expect("browser approval record lock");
+            assert_eq!(asks.len(), 1);
+            assert_eq!(asks[0].tool_name, "default::browser");
+            assert_eq!(asks[0].resource, "[redacted]");
+            let request = asks[0]
+                .permission_request
+                .as_ref()
+                .expect("typed review request");
+            assert_eq!(
+                request.permission_type,
+                bamboo_tools::permission::PermissionType::BrowserInteraction
+            );
+            assert_eq!(request.resource, "[redacted]");
+            assert_eq!(request.operation_summary, "Select native browser options");
+            assert!(request.suggested_matchers.is_empty());
+            for private in ["private-option-value", "data-private", "options:"] {
+                assert!(!format!("{:?}", asks[0]).contains(private));
+            }
         }
-        drop(asks);
 
         let invalid_args = serde_json::json!({
             "action":"select_option",

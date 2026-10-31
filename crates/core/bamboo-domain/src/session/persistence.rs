@@ -248,6 +248,27 @@ pub trait RuntimeSessionPersistence: Send + Sync {
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
+    /// Whether this private writer supports the physical profile check.
+    fn supports_bound_startup_session(&self) -> bool {
+        false
+    }
+
+    /// Persist a Root-bound transition only if its original execution profile
+    /// still matches under the backend's physical writer and Root authority.
+    /// Unsupported persisters must never emulate this with a separate read/save.
+    async fn save_bound_startup_session(
+        &self,
+        _session: &mut Session,
+        _expected: &Session,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            crate::SessionAuthorityConflict(
+                "conditional bound startup persistence is unsupported".into(),
+            ),
+        ))
+    }
+
     /// Persist a runner's final snapshot. Implementations with a per-session
     /// lock should reconcile a tool-registered child wait against the latest
     /// durable wait inside that lock: a child may finish after the runner's
@@ -454,6 +475,32 @@ pub trait RuntimeSessionPersistence: Send + Sync {
             merge_session_inbox_admission(session, &durable);
         }
         self.save_runtime_session(session).await
+    }
+
+    /// Bound execution only; unsupported/custom adapters cannot authorize a
+    /// continuation by falling back to generic checkpoint or snapshot reads.
+    async fn checkpoint_live_bootstrap(
+        &self,
+        _session: &Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _gate: crate::AdmissionGate,
+    ) -> io::Result<crate::LiveBootstrapProof> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live bootstrap checkpoint unsupported",
+        ))
+    }
+
+    async fn confirm_live_bootstrap(
+        &self,
+        _proof: &crate::LiveBootstrapProof,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _publish: crate::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "live bootstrap confirmation unsupported",
+        ))
     }
 
     /// Only the existing owner may claim structured Loop inputs. Unsupported
@@ -725,6 +772,18 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
         (**self).save_runtime_session(session).await
     }
 
+    fn supports_bound_startup_session(&self) -> bool {
+        (**self).supports_bound_startup_session()
+    }
+
+    async fn save_bound_startup_session(
+        &self,
+        session: &mut Session,
+        expected: &Session,
+    ) -> io::Result<()> {
+        (**self).save_bound_startup_session(session, expected).await
+    }
+
     async fn save_finalized_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_finalized_runtime_session(session).await
     }
@@ -815,6 +874,26 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
 
     async fn checkpoint_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).checkpoint_runtime_session(session).await
+    }
+
+    async fn checkpoint_live_bootstrap(
+        &self,
+        session: &Session,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        gate: crate::AdmissionGate,
+    ) -> io::Result<crate::LiveBootstrapProof> {
+        (**self)
+            .checkpoint_live_bootstrap(session, inbox, gate)
+            .await
+    }
+
+    async fn confirm_live_bootstrap(
+        &self,
+        proof: &crate::LiveBootstrapProof,
+        inbox: Arc<dyn crate::SessionInboxPort>,
+        publish: crate::RootActorRuntimeEventPublisher,
+    ) -> io::Result<()> {
+        (**self).confirm_live_bootstrap(proof, inbox, publish).await
     }
 
     async fn claim_scoped_loop_controls(

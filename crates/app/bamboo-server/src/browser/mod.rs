@@ -1503,7 +1503,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let read_marker = directory.path().join("first-read");
             let session = fake_host(
-                r#"IFS= read -r first; : > "$READ_MARKER_FILE"; IFS= read -r second; printf '%s\n' '{"id":2,"ok":true,"result":{"page_epoch":7}}'; sleep 60"#,
+                r#"IFS= read -r first; : > "$READ_MARKER_FILE"; IFS= read -r second; printf '%s\n' '{"id":2,"ok":true,"result":{"page_epoch":7}}'; cat >/dev/null"#,
                 &[("READ_MARKER_FILE", &read_marker)],
             );
             let browser = BrowserManager::default();
@@ -1552,7 +1552,7 @@ mod tests {
         let browser = BrowserManager::default();
         let hung = fake_host("IFS= read -r request; sleep 60", &[]);
         let other = fake_host(
-            r#"IFS= read -r request; printf '%s\n' '{"id":1,"ok":true,"result":{"page_epoch":7}}'; sleep 60"#,
+            r#"IFS= read -r request; printf '%s\n' '{"id":1,"ok":true,"result":{"page_epoch":7}}'; cat >/dev/null"#,
             &[],
         );
         {
@@ -1732,7 +1732,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let late_marker = directory.path().join("late-action");
         let session = fake_host(
-            r#"IFS= read -r request; : > "$LATE_MARKER_FILE"; sleep 60"#,
+            r#"IFS= read -r request || exit 0; : > "$LATE_MARKER_FILE"; sleep 60"#,
             &[("LATE_MARKER_FILE", &late_marker)],
         );
         let browser = BrowserManager::default();
@@ -1762,8 +1762,22 @@ mod tests {
         })
         .await
         .expect("command should hold a cloned session before retirement");
-        browser.retire("deleted-chat").await.unwrap();
+        let retiring = {
+            let browser = browser.clone();
+            tokio::spawn(async move { browser.retire("deleted-chat").await })
+        };
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.alive.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("retirement must fence the cloned command before releasing stdin");
+        assert!(session.pending.lock().unwrap().is_empty());
+        // This test owns the write lock, so release it only after the queued
+        // command is fenced. Retirement can then send real EOF and reap.
         drop(stdin_guard);
+        retiring.await.unwrap().unwrap();
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(1), queued)
                 .await
@@ -1773,6 +1787,9 @@ mod tests {
         ));
         assert!(session.pending.lock().unwrap().is_empty());
         assert!(!late_marker.exists());
+        assert!(session.reaped.load(Ordering::Acquire));
+        assert!(session.close_confirmed.load(Ordering::Acquire));
+        assert!(!session.kill_issued.load(Ordering::Acquire));
         assert!(matches!(
             browser.open("deleted-chat").await,
             Err(BrowserError::NotOpen)

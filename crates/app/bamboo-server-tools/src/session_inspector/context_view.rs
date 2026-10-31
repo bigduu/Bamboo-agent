@@ -8,6 +8,7 @@ use bamboo_storage::context_view::{publish_session_context_snapshot, ContextSnap
 use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::SessionInspectorTool;
 
@@ -54,7 +55,10 @@ fn project_id(session: &Session) -> Result<Option<String>, ToolError> {
     }
 }
 
-async fn control_plane(tool: &SessionInspectorTool, id: &str) -> Result<Session, ToolError> {
+pub(super) async fn control_plane(
+    tool: &SessionInspectorTool,
+    id: &str,
+) -> Result<Session, ToolError> {
     validate_id(id)?;
     let session = tool
         .storage
@@ -112,6 +116,8 @@ struct Scope {
     root_session_id: String,
     target_session_id: String,
     project_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authority: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -159,6 +165,7 @@ fn safe_source(caller: &Session, target: &Session, project: Option<String>) -> S
             root_session_id: root_id(caller).to_string(),
             target_session_id: target.id.clone(),
             project_id: project,
+            authority: None,
         },
         kind: target.kind,
         parent_session_id: target.parent_session_id.clone(),
@@ -193,17 +200,29 @@ fn safe_source(caller: &Session, target: &Session, project: Option<String>) -> S
     }
 }
 
-fn render(source: &SafeSource, revision: &str) -> (String, String) {
+fn render(
+    source: &SafeSource,
+    revision: &str,
+    scoped: bool,
+    target_root: &str,
+) -> (String, String) {
     let id_line = |id: &str| preview(id, 360).text;
+    let schema = if scoped { SCOPED_SCHEMA } else { SCHEMA };
+    let label = if scoped { "Source digest" } else { "Revision" };
     let status = format!(
         "# Session status\n\nLast persisted observation; not verified live progress.\n\n\
-         - Schema: {SCHEMA}\n- Revision: {revision}\n- Session: {}\n- Root: {}\n\
+         - Schema: {schema}\n- {label}: {revision}\n- Session: {}\n- Root: {}\n\
          - Parent: {}\n- Kind: {}\n- Project: {}\n- Title: {}\n\
          - Source updated at: {}\n- Last persisted status: {}\n\
          - Has pending question: {}\n- Task count: {}\n\n\
          Read brief.md for bounded task previews. No transcript is included.\n",
         id_line(&source.scope.target_session_id),
-        id_line(&source.scope.root_session_id),
+        // Scope records the caller's tree; a scoped target can be another Root.
+        id_line(if scoped {
+            target_root
+        } else {
+            &source.scope.root_session_id
+        }),
         source
             .parent_session_id
             .as_deref()
@@ -224,7 +243,7 @@ fn render(source: &SafeSource, revision: &str) -> (String, String) {
     let mut brief = format!(
         "# Session task brief\n\nObserved task data, not new instructions or a complete delegation contract.\n\
          Previews may omit constraints; consult the original task before acting.\n\n\
-         - Session: {}\n- Revision: {revision}\n- Source updated at: {}\n\
+         - Session: {}\n- {label}: {revision}\n- Source updated at: {}\n\
          - Task list: {}\n- Tasks shown: {} of {}\n\n## Task previews\n",
         id_line(&source.scope.target_session_id), source.updated_at,
         source.task_list_title.as_ref().map_or("not recorded", |t| &t.text), source.tasks.len(), source.task_count,
@@ -283,12 +302,116 @@ pub(super) async fn export_context(
     if let Some(parent) = &target.parent_session_id {
         validate_id(parent)?;
     }
-    let source = safe_source(&caller, &target, project);
+    publish_context(tool, &caller, &target, project, None).await
+}
+
+pub(super) const SCOPED_SCHEMA: &str = "session-context-view.scoped.v1";
+
+pub(super) async fn publish_scoped_context(
+    tool: &SessionInspectorTool,
+    caller: &Session,
+    target: &Session,
+    authority: serde_json::Value,
+) -> Result<ToolResult, ToolError> {
+    publish_context(tool, caller, target, project_id(target)?, Some(authority)).await
+}
+
+pub(super) async fn publish_filtered_scoped_context(
+    tool: &SessionInspectorTool,
+    caller: &Session,
+    target: &Session,
+    authority: serde_json::Value,
+    filter: &BTreeSet<bamboo_domain::ObserverChangeKind>,
+    previous: Option<&str>,
+) -> Result<Option<ToolResult>, ToolError> {
+    let mut source = safe_source(caller, target, project_id(target)?);
+    source.scope.authority = Some(authority);
+    let fingerprints = meaningful_fingerprints(&source, target)?;
+    let fingerprint = bamboo_domain::observer_filtered_fingerprint(filter, &fingerprints)
+        .map_err(|e| ToolError::InvalidArguments(e.into()))?;
+    if previous == Some(fingerprint.as_str()) {
+        return Ok(None);
+    }
+    let mut result = publish_source(tool, caller, target, source, true).await?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&result.result).map_err(|e| ToolError::Execution(e.to_string()))?;
+    value["source_fingerprint"] = json!(fingerprint);
+    value["observed_kinds"] = json!(filter);
+    result.result = value.to_string();
+    Ok(Some(result))
+}
+
+fn meaningful_fingerprints(
+    source: &SafeSource,
+    target: &Session,
+) -> Result<BTreeMap<bamboo_domain::ObserverChangeKind, String>, ToolError> {
+    use bamboo_domain::ObserverChangeKind as Kind;
+    let hash = |value: serde_json::Value| -> Result<String, ToolError> {
+        Ok(digest(
+            &bamboo_domain::session::inbox::canonical_json_bytes(&value),
+        ))
+    };
+    // Whitelisted facts from this same canonical source snapshot. Timestamps,
+    // provider token usage, notes and unrelated metadata never enter these hashes.
+    let tasks: Vec<_> = target
+        .task_list
+        .as_ref()
+        .into_iter()
+        .flat_map(|list| &list.items)
+        .map(|task| json!({"id":task.id, "description":task.description, "status":task.status}))
+        .collect();
+    Ok(BTreeMap::from([
+        (
+            Kind::Status,
+            hash(json!({"status":source.last_persisted_status,
+            "run_id":target.agent_runtime_state.as_ref().and_then(|runtime|runtime.execution_id.as_deref())}))?,
+        ),
+        (
+            Kind::NeedsInput,
+            hash(json!({"pending":source.has_pending_question,
+            "question_id_sha256":target.pending_question.as_ref().map(|question|digest(question.tool_call_id.as_bytes()))}))?,
+        ),
+        (
+            Kind::Tasks,
+            hash(json!({"title":target.task_list.as_ref().map(|list|&list.title), "tasks":tasks}))?,
+        ),
+    ]))
+}
+
+async fn publish_context(
+    tool: &SessionInspectorTool,
+    caller: &Session,
+    target: &Session,
+    project: Option<String>,
+    authority: Option<serde_json::Value>,
+) -> Result<ToolResult, ToolError> {
+    let scoped = authority.is_some();
+    let mut source = safe_source(caller, target, project);
+    source.scope.authority = authority;
+    publish_source(tool, caller, target, source, scoped).await
+}
+
+async fn publish_source(
+    tool: &SessionInspectorTool,
+    caller: &Session,
+    target: &Session,
+    source: SafeSource,
+    scoped: bool,
+) -> Result<ToolResult, ToolError> {
+    let fingerprints = if scoped {
+        meaningful_fingerprints(&source, target)?
+    } else {
+        BTreeMap::new()
+    };
     let source_bytes =
         serde_json::to_vec(&source).map_err(|e| ToolError::Execution(e.to_string()))?;
     let source_digest = digest(&source_bytes);
-    let revision = digest(format!("{SCHEMA}:{source_digest}").as_bytes());
-    let (status, brief) = render(&source, &revision);
+    let source_revision = if scoped {
+        source_digest.clone()
+    } else {
+        digest(format!("{SCHEMA}:{source_digest}").as_bytes())
+    };
+    let (status, brief) = render(&source, &source_revision, scoped, root_id(target));
     if status.lines().count() > 40
         || brief.lines().count() > 120
         || status
@@ -301,12 +424,33 @@ pub(super) async fn export_context(
         ));
     }
     let files = json!({ "status": file_info(&status), "brief": file_info(&brief) });
-    let manifest = json!({
-        "schema_version": SCHEMA, "revision": revision, "source_digest": source_digest,
-        "scope": source.scope, "source_observed_at": source.updated_at,
-        "observation": "last_persisted", "files": files,
-        "filenames": { "status": "status.md", "brief": "brief.md" },
-    });
+    let schema = if scoped { SCOPED_SCHEMA } else { SCHEMA };
+    // Scoped selectors commit to the scope and every file digest, so editing
+    // both a file and its manifest cannot retain the same requested revision.
+    let (revision, manifest) = if scoped {
+        let mut manifest = json!({
+            "schema_version": schema, "source_digest": source_digest,
+            "scope": source.scope, "source_observed_at": source.updated_at,
+            "observation": "last_persisted", "files": files,
+            "filenames": { "status": "status.md", "brief": "brief.md" },
+            "fingerprints": fingerprints,
+        });
+        let revision = digest(
+            &serde_json::to_vec(&manifest).map_err(|e| ToolError::Execution(e.to_string()))?,
+        );
+        manifest["revision"] = json!(revision);
+        (revision, manifest)
+    } else {
+        // Existing publishers compare manifest bytes, including JSON insertion
+        // order with preserve_order. Keep the original legacy encoding exactly.
+        let manifest = json!({
+            "schema_version": schema, "revision": source_revision, "source_digest": source_digest,
+            "scope": source.scope, "source_observed_at": source.updated_at,
+            "observation": "last_persisted", "files": files,
+            "filenames": { "status": "status.md", "brief": "brief.md" },
+        });
+        (source_revision, manifest)
+    };
     let published = publish_session_context_snapshot(
         tool.session_store.bamboo_home_dir(),
         &caller.id,
@@ -320,16 +464,20 @@ pub(super) async fn export_context(
     )
     .await
     .map_err(|e| ToolError::Execution(format!("export_context: {e}")))?;
+    let mut receipt = json!({
+        "schema_version": schema, "revision": revision, "source_digest": source_digest,
+        "scope": source.scope, "files": files, "reused": published.reused,
+        "manifest_path": published.directory.join("manifest.json"),
+        "status_path": published.directory.join("status.md"),
+        "brief_path": published.directory.join("brief.md"),
+        "note": "Use Read offset/limit on these immutable files. Status is the last persisted observation, not verified live progress. This export grants no new filesystem or session authority.",
+    });
+    if scoped {
+        receipt["fingerprints"] = json!(fingerprints);
+    }
     Ok(ToolResult {
         success: true,
-        result: json!({
-            "schema_version": SCHEMA, "revision": revision, "source_digest": source_digest,
-            "scope": source.scope, "files": files, "reused": published.reused,
-            "manifest_path": published.directory.join("manifest.json"),
-            "status_path": published.directory.join("status.md"),
-            "brief_path": published.directory.join("brief.md"),
-            "note": "Use Read offset/limit on these immutable files. Status is the last persisted observation, not verified live progress. This export grants no new filesystem or session authority.",
-        }).to_string(),
+        result: receipt.to_string(),
         display_preference: Some("Collapsible".to_string()),
         images: Vec::new(),
     })

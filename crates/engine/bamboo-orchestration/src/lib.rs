@@ -116,6 +116,21 @@ impl std::fmt::Debug for ReadyAdmissionFence {
 }
 
 impl ReadyAdmissionFence {
+    /// A staged program notice has no retry admission or model permission.
+    /// Its caller must cancel this gate on drop; the Inbox checks its deadline
+    /// under the actual synchronous publication mutex, including late disk jobs.
+    pub fn patrol_notice_gate(&self) -> Result<bamboo_domain::AdmissionGate> {
+        self.check()?;
+        if self.retry.is_some() {
+            return Err(Error::ResourceBlocked(
+                "Patrol notice cannot use a retry admission fence".into(),
+            ));
+        }
+        Ok(bamboo_domain::AdmissionGate::with_deadline(
+            self.expires.into_std(),
+        ))
+    }
+
     pub fn check(&self) -> Result<()> {
         if self.revoked.is_cancelled() {
             return Err(Error::ResourceBlocked(
@@ -140,6 +155,16 @@ impl ReadyAdmissionFence {
 pub trait ReadyWorkHost: Send + Sync {
     async fn authority(&self) -> Result<(Arc<TicketService>, Authority)>;
     async fn check_budget(&self, max_rounds: u32) -> Result<()>;
+    /// Observe only the Works selected by this already installed Host policy.
+    /// This creates no grant, diagnostic model call or recovery action. The
+    /// Host may stage a bounded decision notice without granting activation.
+    async fn reconcile_program_patrol(
+        &self,
+        _selection: &patrol::program::ProgramSelection<'_>,
+        _fence: &ReadyAdmissionFence,
+    ) -> Result<()> {
+        Ok(())
+    }
     /// Candidate preflight for a fresh Start, never a replacement for the
     /// immutable dispatch checks required when ensuring an existing intent.
     async fn preflight(&self, command: &Command) -> Result<()>;
@@ -412,6 +437,25 @@ impl ReadyWorkScheduler {
         if snapshot.binding != installed.binding || snapshot.authority_epoch != installed.epoch {
             return Ok(ReadyReconcile::Disabled);
         }
+        let patrol_fence = self.admission_fence(installed, None);
+        let work_ids: Vec<_> = policy
+            .grants
+            .iter()
+            .map(|grant| grant.work_id.clone())
+            .collect();
+        let selection = patrol::program::ProgramSelection {
+            project_id: &policy.project_id,
+            work_ids: &work_ids,
+        };
+        if let Err(error) = host
+            .reconcile_program_patrol(&selection, &patrol_fence)
+            .await
+        {
+            // A degraded observer never changes Work facts or blocks otherwise
+            // legal dispatch. Keep the actual error visible for the next pass.
+            tracing::warn!(%error, "Ready Work program patrol remains unavailable");
+        }
+        patrol_fence.check()?;
         let mut candidates = Vec::new();
         let mut retry_permits = BTreeMap::new();
         let mut blocked = None;

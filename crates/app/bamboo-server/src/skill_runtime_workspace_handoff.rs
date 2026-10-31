@@ -491,6 +491,13 @@ impl SourceBinding {
     pub(super) async fn check_session(&self, session: Session) -> Result<(), ToolError> {
         check_session(self.policy.clone(), session).await
     }
+
+    pub(super) async fn check_ordinary_session(&self, session: Session) -> Result<bool, ToolError> {
+        let policy = self.policy.clone();
+        tokio::task::spawn_blocking(move || policy.check_ordinary_session(&session))
+            .await
+            .map_err(|_| denied("Native canonical Source check is unavailable"))?
+    }
 }
 
 // Canonical filesystem probes may block. The existing Policy guard remains
@@ -1492,7 +1499,7 @@ impl NativeRun {
         execution_id: &str,
     ) -> Result<(), ToolError> {
         let _source = self.source.read().await;
-        self.policy.check_execution_session(session)?;
+        self.policy.check_execution_identity(session)?;
         {
             let current = self
                 .current
@@ -1518,9 +1525,14 @@ impl NativeRun {
             (state.receipt.clone(), state.adopted.clone())
         };
         let Some(receipt) = receipt else {
+            self.check_ordinary_runtime_session(session.clone()).await?;
             self.check_owner().await?;
             return self.bind_refresh_execution(execution_id);
         };
+        // A committed Workspace remains a strict finite-Source transaction.
+        // Permission drift is never permission to renew a Reader.
+        self.check_skills_active()?;
+        self.policy.check_execution_session(session)?;
         if !adopted.matches(session)
             && !receipt.before.matches(session)
             && !receipt.after.matches_or_title_successor(session)

@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 
@@ -9,13 +9,166 @@ use bamboo_agent_core::tools::{
 };
 use bamboo_domain::{
     Message, Session, SessionActivationDisposition, SessionActivationError, SessionActivationPort,
-    SessionInboxLimits, SessionInboxPort, SessionMessageBody, SessionMessageContent,
-    SessionMessageKind, SessionMessageSource, Storage, SupervisorReference,
+    SessionCallerReference, SessionInboxLimits, SessionInboxPort, SessionMessageBody,
+    SessionMessageContent, SessionMessageKind, SessionMessageSource, Storage, SupervisorReference,
 };
 use bamboo_engine::{session_app::supervisor::SupervisorSessionService, SessionMessenger};
 use bamboo_server_tools::{SessionControlTool, SessionInspectorTool};
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
+
+#[derive(Default)]
+struct RecordingRootRunPort {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort
+    for RecordingRootRunPort
+{
+    async fn observe_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(bamboo_agent_core::tools::ToolResult::text(
+            true,
+            json!({"run_id":"run-1", "status":"running"}).to_string(),
+        ))
+    }
+
+    async fn cancel_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+        expected_run_id: &str,
+        _gate: bamboo_domain::AdmissionGate,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(bamboo_agent_core::tools::ToolResult::text(
+            true,
+            json!({"run_id":expected_run_id, "status":"cancel_requested"}).to_string(),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn exact_root_run_schema_requires_observed_target_and_run_without_granting_authority() {
+    let fixture = Fixture::new().await;
+    let port = Arc::new(RecordingRootRunPort::default());
+    let tool = SessionControlTool::new(fixture.messenger.clone()).with_root_run(port.clone());
+    let schema = tool.parameters_schema();
+    let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+    assert!(actions.contains(&json!("observe_run")));
+    assert!(actions.contains(&json!("cancel")));
+    let cancel = schema["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["action"]["const"] == "cancel")
+        .unwrap();
+    let required = cancel["required"].as_array().unwrap();
+    for field in ["target_session_id", "target_ref", "expected_run_id"] {
+        assert!(required.contains(&json!(field)));
+    }
+    let target = fixture
+        .targets
+        .iter()
+        .find(|target| target.session_id == "a")
+        .unwrap();
+    let observe = json!({"action":"observe_run", "target_session_id":"a", "target_ref":target});
+    assert_eq!(tool.classify(&observe), ToolClass::READONLY_PARALLEL);
+    let observed = completed(tool.invoke(observe, fixture.ctx.clone()).await.unwrap());
+    assert_eq!(observed["run_id"], "run-1");
+    let cancel = json!({"action":"cancel", "target_session_id":"a", "target_ref":target, "expected_run_id":"run-1"});
+    assert_eq!(tool.classify(&cancel), ToolClass::MUTATING_SERIAL);
+    assert_eq!(
+        completed(tool.invoke(cancel, fixture.ctx.clone()).await.unwrap())["status"],
+        "cancel_requested"
+    );
+    for invalid in [
+        json!({"action":"cancel", "target_session_id":"b", "target_ref":target, "expected_run_id":"run-1"}),
+        json!({"action":"cancel", "target_session_id":"a", "target_ref":target, "expected_run_id":"bad run"}),
+        json!({"action":"cancel", "target_session_id":"a", "expected_run_id":"run-1"}),
+    ] {
+        assert!(tool.invoke(invalid, fixture.ctx.clone()).await.is_err());
+    }
+    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+}
+
+#[derive(Default)]
+struct DetachedCancelPort {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    completed: Arc<tokio::sync::Notify>,
+    signalled: Arc<AtomicBool>,
+}
+
+#[async_trait]
+impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort for DetachedCancelPort {
+    async fn observe_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        unreachable!("this fixture exercises only the cancel admission")
+    }
+
+    async fn cancel_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+        _expected_run_id: &str,
+        gate: bamboo_domain::AdmissionGate,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        let completed = self.completed.clone();
+        let signalled = self.signalled.clone();
+        tokio::spawn(async move {
+            entered.notify_one();
+            release.notified().await;
+            gate.commit(|| {
+                signalled.store(true, Ordering::SeqCst);
+                Ok::<(), ()>(())
+            })
+            .unwrap();
+            completed.notify_one();
+        });
+        // The owned job outlives this awaiter, like a started blocking signal.
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn dropping_cancel_awaiter_closes_gate_before_detached_signal() {
+    let fixture = Fixture::new().await;
+    let port = Arc::new(DetachedCancelPort::default());
+    let tool =
+        Arc::new(SessionControlTool::new(fixture.messenger.clone()).with_root_run(port.clone()));
+    let target = fixture
+        .targets
+        .iter()
+        .find(|target| target.session_id == "a")
+        .unwrap();
+    let args = json!({"action":"cancel", "target_session_id":"a", "target_ref":target,
+        "expected_run_id":"run-1"});
+    let context = fixture.ctx.clone();
+    let entered = port.entered.notified();
+    let completed = port.completed.notified();
+    let call = tokio::spawn(async move { tool.invoke(args, context).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered)
+        .await
+        .unwrap();
+    call.abort();
+    assert!(call.await.unwrap_err().is_cancelled());
+    port.release.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(5), completed)
+        .await
+        .unwrap();
+    assert!(!port.signalled.load(Ordering::SeqCst));
+}
 
 #[derive(Default)]
 struct Activation {
@@ -50,6 +203,7 @@ struct Fixture {
     tool: SessionControlTool,
     service: SupervisorSessionService,
     supervisor: SupervisorReference,
+    targets: Vec<bamboo_domain::SupervisorCurrentUserTarget>,
     ctx: ToolCtx,
 }
 
@@ -89,14 +243,20 @@ impl Fixture {
         service.attach(&supervisor, 1, "a").await.unwrap();
         service.attach(&supervisor, 2, "b").await.unwrap();
         let executing = store
-            .load_session(&supervisor.session_id)
+            .load_execution_admission_snapshot(&supervisor.session_id)
             .await
             .unwrap()
             .unwrap();
         let mut ctx = ToolCtx::none("followup-call");
         ctx.session_id = Some(Arc::from(executing.id.as_str()));
+        ctx.executing_caller = Some(Arc::new(SessionCallerReference::from(&executing)));
         ctx.executing_supervisor =
             ExecutingSupervisorObservation::capture_from_executing_session(&executing);
+        let targets = store
+            .list_supervisor_current_user_targets(&supervisor, None, None, 20)
+            .await
+            .unwrap()
+            .targets;
         let inbox = Arc::new(FileSessionInbox::new(
             store.clone(),
             SessionInboxLimits::default(),
@@ -117,22 +277,25 @@ impl Fixture {
             tool,
             service,
             supervisor,
+            targets,
             ctx,
         }
+    }
+
+    fn args(&self, target: &str, operation: &str, message: &str) -> Value {
+        let target_ref = self.targets.iter().find(|item| item.session_id == target);
+        json!({"action":"followup", "target_session_id":target, "target_ref":target_ref,
+            "operation_id":operation, "message":message})
     }
 
     async fn invoke(&self, target: &str, operation: &str, message: &str) -> Value {
         completed(
             self.tool
-                .invoke(args(target, operation, message), self.ctx.clone())
+                .invoke(self.args(target, operation, message), self.ctx.clone())
                 .await
                 .unwrap(),
         )
     }
-}
-
-fn args(target: &str, operation: &str, message: &str) -> Value {
-    json!({"action":"followup", "target_session_id":target, "operation_id":operation, "message":message})
 }
 
 fn completed(outcome: ToolOutcome) -> Value {
@@ -144,15 +307,15 @@ fn completed(outcome: ToolOutcome) -> Value {
 }
 
 #[tokio::test]
-async fn supervisor_followup_preserves_two_roots_and_rejects_unattached_c() {
+async fn supervisor_followup_preserves_roots_and_rejects_mismatched_target_reference() {
     let f = Fixture::new().await;
     assert_eq!(
-        f.tool.classify(&args("a", "op", "continue")),
+        f.tool.classify(&f.args("a", "op", "continue")),
         ToolClass::MUTATING_SERIAL
     );
     let schema = f.tool.parameters_schema();
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["properties"].as_object().unwrap().len(), 7);
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 8);
     assert!(bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_control").is_some());
     for id in ["a", "b"] {
         let before =
@@ -182,13 +345,22 @@ async fn supervisor_followup_preserves_two_roots_and_rejects_unattached_c() {
         );
         assert_eq!(f.inbox.inspect(id).await.unwrap().interrupt_generation, 0);
     }
-    assert!(f
-        .tool
-        .invoke(args("c", "operation-1", "not authorized"), f.ctx.clone())
-        .await
-        .is_err());
+    let mut mismatched = f.args("c", "operation-1", "Continue the original target");
+    mismatched["target_ref"] = f.args("a", "operation-1", "Continue")["target_ref"].clone();
+    assert!(f.tool.invoke(mismatched, f.ctx.clone()).await.is_err());
     assert_eq!(f.inbox.inspect("c").await.unwrap().generation, 0);
     assert_eq!(f.activation.calls.lock().await.len(), 2);
+    let before = serde_json::to_value(f.store.load_session("c").await.unwrap()).unwrap();
+    let admitted = f
+        .invoke("c", "operation-1", "Continue the original target")
+        .await;
+    assert_eq!(admitted["admitted"], true);
+    assert_eq!(f.inbox.inspect("c").await.unwrap().generation, 1);
+    assert_eq!(f.activation.calls.lock().await.len(), 3);
+    assert_eq!(
+        serde_json::to_value(f.store.load_session("c").await.unwrap()).unwrap(),
+        before
+    );
 }
 
 #[tokio::test]
@@ -215,7 +387,7 @@ async fn supervisor_followup_exact_retry_survives_activation_failure_reopen_and_
         f.activation.clone(),
     )));
     let retry = completed(
-        tool.invoke(args("a", "operation-1", "Continue"), f.ctx.clone())
+        tool.invoke(f.args("a", "operation-1", "Continue"), f.ctx.clone())
             .await
             .unwrap(),
     );
@@ -227,14 +399,17 @@ async fn supervisor_followup_exact_retry_survives_activation_failure_reopen_and_
     store.save_session(&target).await.unwrap();
     inbox.ack("a", &claim).await.unwrap();
     let after_ack = completed(
-        tool.invoke(args("a", "operation-1", "Continue"), f.ctx.clone())
+        tool.invoke(f.args("a", "operation-1", "Continue"), f.ctx.clone())
             .await
             .unwrap(),
     );
     assert_eq!(after_ack["receipt_id"], pending["receipt_id"]);
     assert_eq!(inbox.inspect("a").await.unwrap().pending, 0);
     assert!(tool
-        .invoke(args("a", "operation-1", "Different payload"), f.ctx.clone())
+        .invoke(
+            f.args("a", "operation-1", "Different payload"),
+            f.ctx.clone()
+        )
         .await
         .is_err());
     let history = SessionInspectorTool::new(store.clone(), store.clone());
@@ -265,7 +440,7 @@ async fn supervisor_followup_exact_retry_survives_activation_failure_reopen_and_
 #[tokio::test]
 async fn supervisor_followup_duplicate_calls_admit_one_semantic_message() {
     let f = Fixture::new().await;
-    let call = args("a", "same-operation", "Continue");
+    let call = f.args("a", "same-operation", "Continue");
     let (first, second) = tokio::join!(
         f.tool.invoke(call.clone(), f.ctx.clone()),
         f.tool.invoke(call, f.ctx.clone())
@@ -281,7 +456,7 @@ async fn supervisor_followup_duplicate_calls_admit_one_semantic_message() {
 #[tokio::test]
 async fn supervisor_followup_rejects_forged_missing_ordinary_child_plan_and_stale_callers() {
     let f = Fixture::new().await;
-    let valid = args("a", "op", "Continue");
+    let valid = f.args("a", "op", "Continue");
     for field in [
         "source_session_id",
         "supervisor",
@@ -329,21 +504,21 @@ async fn supervisor_followup_validates_target_operation_and_utf8_bounds() {
     for operation in ["", " padded", "path/key", "..", &"x".repeat(257)] {
         assert!(f
             .tool
-            .invoke(args("a", operation, "Continue"), f.ctx.clone())
+            .invoke(f.args("a", operation, "Continue"), f.ctx.clone())
             .await
             .is_err());
     }
     for message in [" ".to_string(), "界".repeat(6000)] {
         assert!(f
             .tool
-            .invoke(args("a", "op", &message), f.ctx.clone())
+            .invoke(f.args("a", "op", &message), f.ctx.clone())
             .await
             .is_err());
     }
     for target in ["", "../a", &f.supervisor.session_id] {
         assert!(f
             .tool
-            .invoke(args(target, "op", "Continue"), f.ctx.clone())
+            .invoke(f.args(target, "op", "Continue"), f.ctx.clone())
             .await
             .is_err());
     }
@@ -404,7 +579,7 @@ mod loop_adapter_tests {
             schema["properties"]["action"]["enum"],
             json!(["followup", "loop"])
         );
-        assert_eq!(schema["properties"].as_object().unwrap().len(), 7);
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 8);
         let command = &schema["properties"]["command"];
         assert_eq!(command["additionalProperties"], false);
         assert_eq!(command["required"], json!(["action"]));
@@ -421,7 +596,7 @@ mod loop_adapter_tests {
             update(),
             stop(),
             json!({"action":"loop"}),
-            args("a", "legacy-op", "Continue"),
+            f.args("a", "legacy-op", "Continue"),
         ] {
             assert_eq!(f.tool.classify(&arguments), ToolClass::MUTATING_SERIAL);
         }
@@ -448,7 +623,7 @@ mod loop_adapter_tests {
     async fn advertised_followup_schema_requires_its_fields_and_rejects_loop_fields() {
         let f = Fixture::new().await;
         let validator = advertised_validator(&f);
-        let valid = args("a", "schema-followup", "Continue your original task");
+        let valid = f.args("a", "schema-followup", "Continue your original task");
         assert!(validator.validate(&valid).is_ok());
         assert_eq!(f.tool.classify(&valid), ToolClass::MUTATING_SERIAL);
 
@@ -1116,7 +1291,7 @@ mod loop_adapter_tests {
         let mut malformed_receipt = status();
         malformed_receipt["receipt_operation_id"] = json!("not-a-uuid");
         invalid.push(malformed_receipt);
-        let mut followup_with_loop_field = args("a", "legacy-op", "Continue");
+        let mut followup_with_loop_field = f.args("a", "legacy-op", "Continue");
         followup_with_loop_field["command"] = json!({"action":"status"});
         invalid.push(followup_with_loop_field);
         for arguments in invalid {
@@ -1192,7 +1367,7 @@ mod loop_adapter_tests {
                 call_id,
                 generation,
                 f.tool.invoke(
-                    args("a", &operation, "Continue your original task"),
+                    f.args("a", &operation, "Continue your original task"),
                     f.ctx.clone(),
                 ),
             )
