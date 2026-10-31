@@ -1,5 +1,6 @@
 //! Narrow model control over explicitly scoped independent Roots.
 
+pub mod directory;
 pub mod root_creation;
 pub mod root_run;
 pub mod versioned {
@@ -522,6 +523,14 @@ use serde_json::{json, Value};
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 enum SessionControlArgs {
     Scope,
+    Directory {
+        #[serde(default)]
+        query: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        cursor: Option<String>,
+    },
     Create {
         request: SupervisedRootCreateRequest,
     },
@@ -554,6 +563,7 @@ enum SessionControlArgs {
 pub struct SessionControlTool {
     messenger: Arc<SessionMessenger>,
     root_creator: Option<Arc<dyn SupervisedRootCreatePort>>,
+    directory: Option<Arc<dyn directory::SupervisorDirectoryPort>>,
     root_run: Option<Arc<dyn SupervisedRootRunPort>>,
 }
 
@@ -570,12 +580,23 @@ impl SessionControlTool {
         Self {
             messenger,
             root_creator: None,
+            directory: None,
             root_run: None,
         }
     }
 
     pub fn with_root_creator(mut self, creator: Arc<dyn SupervisedRootCreatePort>) -> Self {
         self.root_creator = Some(creator);
+        self
+    }
+
+    /// Install the Host's authoritative read-only session directory. Only an
+    /// installed port exposes the `directory` action; the model cannot opt in.
+    pub fn with_directory(
+        mut self,
+        directory: Arc<dyn directory::SupervisorDirectoryPort>,
+    ) -> Self {
+        self.directory = Some(directory);
         self
     }
 
@@ -593,7 +614,7 @@ impl Tool for SessionControlTool {
 
     fn description(&self) -> &str {
         if self.root_run.is_some() && self.root_creator.is_some() {
-            return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. For an ordinary Root, observe_run uses that same target_ref and returns its current exact run_id and status; pending means execution has not started. cancel requires the unchanged target_ref and observed expected_run_id. cancel_requested only signals that owner: wait for actual finalization before claiming it stopped. A stale target or run must never be redirected to a successor. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
+            return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. directory (when the Host installs its port) returns a paginated read-only observation of sessions in scope: supervisor-created roots and user-opened sessions, each with origin, live-link state, persisted progress and the last canonical Human UI engagement mark; it grants no control and is never completion evidence. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. For an ordinary Root, observe_run uses that same target_ref and returns its current exact run_id and status; pending means execution has not started. cancel requires the unchanged target_ref and observed expected_run_id. cancel_requested only signals that owner: wait for actual finalization before claiming it stopped. A stale target or run must never be redirected to a successor. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
         }
         if self.root_run.is_some() {
             return "Supervisor followup and exact Root run control preserve the current user's original Session context. Copy current_user_target from session_history. observe_run returns the current Root run_id and status; pending means execution has not started. cancel requires that same target_ref and exact expected_run_id. cancel_requested signals only that owner and does not prove final termination. A stale target or run must never redirect to a successor. Existing work Sessions keep their permissions. loop remains separately Host-granted; do not answer approvals or use direct file/shell tools.";
@@ -660,13 +681,23 @@ impl Tool for SessionControlTool {
             ]
         });
         if self.root_creator.is_some() {
-            schema["properties"]["action"]["enum"] = json!(["followup", "loop", "scope", "create"]);
-            schema["properties"]["action"]["description"] = json!("scope needs only action; create needs request; followup/loop need the existing target_session_id and action-specific fields.");
+            schema["properties"]["action"]["enum"] =
+                json!(["followup", "loop", "scope", "directory", "create"]);
+            schema["properties"]["action"]["description"] = json!("scope needs only action; directory needs only optional query/limit/cursor; create needs request; followup/loop need the existing target_session_id and action-specific fields.");
             schema["properties"]["request"] = root_creation::request_schema();
+            schema["properties"]["query"] = json!({"type": ["string", "null"], "maxLength": 128,
+                "description": "directory only: optional lexical filter over session_id/project_id/title."});
+            schema["properties"]["limit"] = json!({"type": ["integer", "null"], "minimum": 1, "maximum": 20,
+                "description": "directory only: page size, default 20."});
+            schema["properties"]["cursor"] = json!({"type": ["string", "null"], "maxLength": 4096,
+                "description": "directory only: opaque continuation cursor from the previous page."});
             schema["required"] = json!(["action"]);
             let variants = schema["oneOf"].as_array_mut().unwrap();
             for variant in variants.iter_mut() {
                 variant["properties"]["request"] = Value::Bool(false);
+                variant["properties"]["query"] = Value::Bool(false);
+                variant["properties"]["limit"] = Value::Bool(false);
+                variant["properties"]["cursor"] = Value::Bool(false);
                 variant["required"]
                     .as_array_mut()
                     .unwrap()
@@ -680,6 +711,9 @@ impl Tool for SessionControlTool {
                 "expected_link_revision",
                 "command",
                 "receipt_operation_id",
+                "query",
+                "limit",
+                "cursor",
             ];
             let mut scope = json!({"properties":{"action":{"const":"scope"},"request":false}});
             let mut create =
@@ -690,6 +724,57 @@ impl Tool for SessionControlTool {
             }
             variants.push(scope);
             variants.push(create);
+        }
+        if self.directory.is_some() {
+            let action = &mut schema["properties"]["action"];
+            let mut actions = action["enum"].as_array().cloned().unwrap_or_default();
+            if !actions.iter().any(|value| value == "directory") {
+                actions.push(json!("directory"));
+            }
+            action["enum"] = Value::Array(actions);
+            // Installing directory alone must stay independently usable: the
+            // top-level requirement narrows to `action` (the followup/loop
+            // variants keep their own target requirements). Without this, the
+            // directory variant's target_session_id:false makes every
+            // directory request invalid against the advertised schema.
+            let required = schema["required"].as_array_mut().unwrap();
+            required.retain(|field| field == "action");
+            schema["properties"]["query"] = json!({"type": ["string", "null"], "maxLength": 128,
+                "description": "directory only: optional lexical filter over session_id/project_id/title."});
+            schema["properties"]["limit"] = json!({"type": ["integer", "null"], "minimum": 1, "maximum": 20,
+                "description": "directory only: page size, default 20."});
+            schema["properties"]["cursor"] = json!({"type": ["string", "null"], "maxLength": 4096,
+                "description": "directory only: opaque continuation cursor from the previous page."});
+            let variants = schema["oneOf"].as_array_mut().unwrap();
+            for variant in variants.iter_mut() {
+                if variant["properties"].get("query").is_none() {
+                    variant["properties"]["query"] = Value::Bool(false);
+                }
+                if variant["properties"].get("limit").is_none() {
+                    variant["properties"]["limit"] = Value::Bool(false);
+                }
+                if variant["properties"].get("cursor").is_none() {
+                    variant["properties"]["cursor"] = Value::Bool(false);
+                }
+            }
+            variants.push(json!({
+                "properties": {
+                    "action": {"const": "directory"},
+                    "target_session_id": false, "operation_id": false, "message": false,
+                    "expected_link_revision": false, "command": false,
+                    "receipt_operation_id": false, "request": false,
+                    "expected_run_id": false,
+                    // Declare ownership explicitly (same shape as the
+                    // top-level definitions) so later install-time loops that
+                    // forbid these keys elsewhere never strip them here.
+                    "query": {"type": ["string", "null"], "maxLength": 128,
+                        "description": "directory only: optional lexical filter over session_id/project_id/title."},
+                    "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 20,
+                        "description": "directory only: page size, default 20."},
+                    "cursor": {"type": ["string", "null"], "maxLength": 4096,
+                        "description": "directory only: opaque continuation cursor from the previous page."}
+                }
+            }));
         }
         if self.root_run.is_some() {
             let actions = schema["properties"]["action"]["enum"]
@@ -707,6 +792,20 @@ impl Tool for SessionControlTool {
             let variants = schema["oneOf"].as_array_mut().expect("action variants");
             for variant in variants.iter_mut() {
                 variant["properties"]["expected_run_id"] = Value::Bool(false);
+                // The directory variant OWNS query/limit/cursor (declared when
+                // its port was installed); only forbid them where they were
+                // not already declared. Forbidding them here would break
+                // filtered/continued directory requests for schema-following
+                // clients (e.g. the Anthropic adapter, which preserves oneOf).
+                if variant["properties"].get("query").is_none() {
+                    variant["properties"]["query"] = Value::Bool(false);
+                }
+                if variant["properties"].get("limit").is_none() {
+                    variant["properties"]["limit"] = Value::Bool(false);
+                }
+                if variant["properties"].get("cursor").is_none() {
+                    variant["properties"]["cursor"] = Value::Bool(false);
+                }
             }
             let forbidden = [
                 "operation_id",
@@ -735,7 +834,10 @@ impl Tool for SessionControlTool {
     }
 
     fn classify(&self, args: &Value) -> ToolClass {
-        if args["action"] == "scope" || args["action"] == "observe_run" {
+        if args["action"] == "scope"
+            || args["action"] == "directory"
+            || args["action"] == "observe_run"
+        {
             ToolClass::READONLY_PARALLEL
         } else {
             ToolClass::MUTATING_SERIAL
@@ -743,7 +845,11 @@ impl Tool for SessionControlTool {
     }
 
     async fn invoke(&self, args: Value, ctx: ToolCtx) -> Result<ToolOutcome, ToolError> {
-        if ctx.plan_read_only && args["action"] != "scope" {
+        if ctx.plan_read_only
+            && args["action"] != "scope"
+            && args["action"] != "directory"
+            && args["action"] != "observe_run"
+        {
             return Err(ToolError::Execution(
                 "session_control is unavailable in Plan mode".into(),
             ));
@@ -776,6 +882,32 @@ impl Tool for SessionControlTool {
                     .scope_observed(original)
                     .await
                     .map(ToolOutcome::Completed);
+            }
+            SessionControlArgs::Directory {
+                query,
+                limit,
+                cursor,
+            } => {
+                let port = self.directory.as_ref().ok_or_else(|| ToolError::Execution(
+                    "session_directory_unavailable: this Host has no authorized session directory port".into(),
+                ))?;
+                let request = directory::SupervisorDirectoryRequest {
+                    query,
+                    limit,
+                    cursor,
+                };
+                request.validate()?;
+                return port
+                    .directory(&ctx, request)
+                    .await
+                    .and_then(|page| {
+                        serde_json::to_string(&page).map_err(|error| {
+                            ToolError::Execution(format!(
+                                "session_directory_response_failed: {error}"
+                            ))
+                        })
+                    })
+                    .map(|serialized| ToolOutcome::Completed(ToolResult::text(true, serialized)));
             }
             SessionControlArgs::Create { request } => {
                 request.validate()?;

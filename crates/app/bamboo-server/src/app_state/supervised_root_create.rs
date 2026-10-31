@@ -463,6 +463,14 @@ impl SupervisedRootCreator {
         // as the UUID. A recreated or unrelated lifetime can never match it.
         candidate.created_at = operation.created_at;
         candidate.updated_at = operation.created_at;
+        // Canonical creation provenance for the session directory: this root
+        // was created through the Supervisor creation route. Independent of
+        // management links (which this route deliberately does not mint) and
+        // durable across restarts. Metadata is an observation label, never a
+        // grant.
+        candidate
+            .metadata
+            .insert("session.origin.v1".into(), "supervisor_created".into());
         candidate
     }
 
