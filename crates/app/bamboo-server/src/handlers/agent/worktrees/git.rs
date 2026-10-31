@@ -5,8 +5,8 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// Upper bound on Git children running at once during one inventory scan.
 /// Each child is a fork/exec (~10-30ms of pure startup), so inspection is
@@ -251,6 +251,9 @@ fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output
     bounded_output(command, deadline_at).map_err(|e| format!("Git at {}: {e}", repo.display()))
 }
 
+/// Test-only convenience wrapper: production paths always pass a deadline
+/// through `git_bytes_by` so one child cannot outlive its share of the budget.
+#[cfg(test)]
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     git_bytes_by(repo, args, Instant::now() + git_command_timeout())
 }
