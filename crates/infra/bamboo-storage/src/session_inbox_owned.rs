@@ -475,6 +475,9 @@ impl OwnedFilesystem {
 
     /// Same cancelled tombstone, while preserving any existing evidence.
     /// Caller and this job retain the original exclusive Inbox operation lock.
+    /// A tombstone that already exists is an idempotent success: the repeated
+    /// cancellation reached the same benign terminal state, so the original
+    /// evidence is preserved and the source transport is left in place.
     pub(super) async fn cancel_if_absent(
         &self,
         dir: &Path,
@@ -487,12 +490,10 @@ impl OwnedFilesystem {
             let anchor = filesystem.anchor();
             anchor.create_dir_all(&cancelled)?;
             // `symlink_metadata` relative to the retained Inbox: an existing
-            // tombstone still wins over a fresh move.
+            // tombstone still wins over a fresh move, and preserves its
+            // original evidence instead of surfacing a hard conflict.
             if anchor.entry_exists(&to)? {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "scoped Loop cancellation tombstone already exists",
-                ));
+                return Ok(());
             }
             anchor.rename(path, &to)
         })

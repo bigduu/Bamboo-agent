@@ -1056,6 +1056,41 @@ async fn interrupted_upgrade_ignores_old_interrupt_write_and_rejects_missing_sna
     }
 }
 
+#[tokio::test]
+async fn cancel_if_absent_treats_existing_tombstone_as_idempotent_success() {
+    let (temp, _, inbox) = fixture().await;
+    immediate(&inbox, "scoped cancellation").await;
+    let (dir, filesystem) = inbox.owned_filesystem("target").await.unwrap();
+    let queue = dir.join("new");
+    let mut entries = tokio::fs::read_dir(&queue).await.unwrap();
+    let entry = entries.next_entry().await.unwrap().unwrap();
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let path = queue.join(&name);
+    // First cancellation moves the transport into its tombstone.
+    filesystem
+        .cancel_if_absent(&dir, &path, &name)
+        .await
+        .unwrap();
+    let tombstone = dir.join("cancelled").join(&name);
+    let evidence = tokio::fs::read(&tombstone).await.unwrap();
+    assert!(!path.exists());
+    // A retried cancellation replays a transport at the same name: the
+    // existing tombstone is the same benign terminal state, so it must
+    // succeed without moving the replayed source or rewriting the evidence.
+    tokio::fs::write(&path, br#"{"replayed":true}"#)
+        .await
+        .unwrap();
+    filesystem
+        .cancel_if_absent(&dir, &path, &name)
+        .await
+        .unwrap();
+    assert!(
+        path.exists(),
+        "existing tombstone must not move the replayed source"
+    );
+    assert_eq!(tokio::fs::read(&tombstone).await.unwrap(), evidence);
+}
+
 // Frozen v2 ACK body from 20e6276b. It reads InboxMessage.kind at the held
 // physical path, never either version header, then validates envelope/generation
 // before receipt+remove. Helper semantic/receipt parsing remains v2-compatible.
