@@ -90,21 +90,17 @@ mod tests {
     }
 
     #[test]
-    fn view_image_schema_preserves_existing_parameter_contract() {
-        assert_unchanged(
-            &ViewImageTool::new(),
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "Absolute local image path or exact image reference supplied by this conversation"
-                    }
-                },
-                "required": ["path"],
-                "additionalProperties": false
-            }),
-        );
+    fn view_image_schema_exposes_an_optional_focus_prompt() {
+        let tool = ViewImageTool::new();
+        let schema = tool.parameters_schema();
+        assert_eq!(schema["required"], json!(["path"]));
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"]["path"]["type"], "string");
+        assert!(schema["properties"]["prompt"].is_object());
+        let openai = sanitize_openai_function_parameters_schema(&schema);
+        let anthropic = anthropic_input_schema(&tool, &schema);
+        assert!(openai["properties"]["prompt"].is_object());
+        assert!(anthropic["properties"]["prompt"].is_object());
     }
 
     #[test]
