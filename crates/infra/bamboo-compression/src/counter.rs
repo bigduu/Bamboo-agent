@@ -9,7 +9,7 @@
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
-use std::hash::{BuildHasher, Hash, Hasher};
+use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -490,9 +490,7 @@ static CACHE_HASH_KEYS: OnceLock<RandomState> = OnceLock::new();
 /// different texts cannot alias purely on a hash collision of equal length.
 fn token_cache_key(text: &str) -> (u64, u32) {
     let state = CACHE_HASH_KEYS.get_or_init(RandomState::new);
-    let mut hasher = state.build_hasher();
-    text.hash(&mut hasher);
-    (hasher.finish(), text.len() as u32)
+    (state.hash_one(text), text.len() as u32)
 }
 
 impl Default for TiktokenTokenCounter {
