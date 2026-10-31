@@ -1675,6 +1675,10 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
     copy.conversation_reset = None;
+    // Creation provenance is birth-specific: the copy is a fresh independent
+    // user-created session and must not inherit the source's
+    // supervisor_created origin mark (same reset discipline as id/created_at).
+    copy.metadata.remove("session.origin.v1");
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;

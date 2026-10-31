@@ -755,7 +755,17 @@ impl Tool for SessionControlTool {
                     "action": {"const": "directory"},
                     "target_session_id": false, "operation_id": false, "message": false,
                     "expected_link_revision": false, "command": false,
-                    "receipt_operation_id": false, "request": false
+                    "receipt_operation_id": false, "request": false,
+                    "expected_run_id": false,
+                    // Declare ownership explicitly (same shape as the
+                    // top-level definitions) so later install-time loops that
+                    // forbid these keys elsewhere never strip them here.
+                    "query": {"type": ["string", "null"], "maxLength": 128,
+                        "description": "directory only: optional lexical filter over session_id/project_id/title."},
+                    "limit": {"type": ["integer", "null"], "minimum": 1, "maximum": 20,
+                        "description": "directory only: page size, default 20."},
+                    "cursor": {"type": ["string", "null"], "maxLength": 4096,
+                        "description": "directory only: opaque continuation cursor from the previous page."}
                 }
             }));
         }
@@ -775,6 +785,11 @@ impl Tool for SessionControlTool {
             let variants = schema["oneOf"].as_array_mut().expect("action variants");
             for variant in variants.iter_mut() {
                 variant["properties"]["expected_run_id"] = Value::Bool(false);
+                // The directory variant OWNS query/limit/cursor (declared when
+                // its port was installed); only forbid them where they were
+                // not already declared. Forbidding them here would break
+                // filtered/continued directory requests for schema-following
+                // clients (e.g. the Anthropic adapter, which preserves oneOf).
                 if variant["properties"].get("query").is_none() {
                     variant["properties"]["query"] = Value::Bool(false);
                 }

@@ -17,6 +17,57 @@ use bamboo_server_tools::session_control::directory::{
 use crate::app_state::supervisor_directory::SupervisorSessionDirectory;
 use bamboo_storage::SessionStoreV2;
 
+/// Codex P2: with directory AND root_run both installed (production wiring),
+/// the directory oneOf variant must keep query/limit/cursor usable — the
+/// root_run install loop must not strip them from the directory variant.
+#[tokio::test]
+async fn session_control_schema_keeps_directory_params_with_root_run_installed() {
+    use bamboo_agent_core::tools::Tool as _;
+    use bamboo_domain::SessionActivationDisposition;
+
+    struct NoopActivation;
+    #[async_trait::async_trait]
+    impl bamboo_domain::SessionActivationPort for NoopActivation {
+        async fn request_activation(
+            &self,
+            _target_session_id: &str,
+            _inbox_generation: u64,
+        ) -> Result<SessionActivationDisposition, bamboo_domain::SessionActivationError> {
+            Ok(SessionActivationDisposition::ActivationReserved)
+        }
+    }
+    let (home, store, _reference) = fixture().await;
+    let inbox: Arc<dyn bamboo_domain::SessionInboxPort> = Arc::new(
+        bamboo_storage::FileSessionInbox::new(store.clone(), Default::default()),
+    );
+    let activation: Arc<dyn bamboo_domain::SessionActivationPort> = Arc::new(NoopActivation);
+    let messenger = Arc::new(bamboo_engine::SessionMessenger::new(
+        store.clone(),
+        inbox,
+        activation,
+    ));
+    let directory: Arc<dyn SupervisorDirectoryPort> = Arc::new(SupervisorSessionDirectory::new(
+        store.clone(),
+        store.clone(),
+    ));
+    let tool = bamboo_server_tools::SessionControlTool::new(messenger).with_directory(directory);
+    let schema = tool.parameters_schema();
+    let variant = schema["oneOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|variant| variant["properties"]["action"]["const"] == "directory")
+        .expect("directory variant present");
+    for field in ["query", "limit", "cursor"] {
+        assert!(
+            variant["properties"][field].is_object(),
+            "directory variant must keep {field} usable, got {}",
+            variant["properties"][field]
+        );
+    }
+    assert!(home.path().exists());
+}
+
 async fn fixture() -> (tempfile::TempDir, Arc<SessionStoreV2>, SupervisorReference) {
     let home = tempfile::tempdir().unwrap();
     let store = Arc::new(
