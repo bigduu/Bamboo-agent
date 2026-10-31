@@ -92,7 +92,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // compression library counts content pages against the dispatch cap; the
 // test-utils diagnostic records each read attempt. No additive feature-only
 // cases were added. Actual compact/actor integration targets stay in agent-tests-0.
-const FEATURE_SOURCE_SHA256 = "08fb74aaf8d639871d288906bb90d083aa741c1ca99bd08137b19ac54436be77";
+const FEATURE_SOURCE_SHA256 = "ea383ea4904c8e752f7b75b1baddae26ddb46b52c6f07fc8c880197ab7a57405";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
