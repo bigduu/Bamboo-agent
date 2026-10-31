@@ -316,7 +316,16 @@ fn adopt_root_publication(
         ));
     }
     ensure_conversation_generation_is_current(session, &committed)?;
-    *session = committed;
+    // These three fields are #[serde(skip)] runtime-only state: the committed
+    // snapshot is the persisted copy and therefore always carries None. Adopting
+    // it must not erase the live round's values, or downstream dispatch loses the
+    // resolved tool-output cap (native skill calls then fail with "requires a
+    // known current tool-output cap") and the manual-compression request.
+    let mut adopted = committed;
+    adopted.resolved_token_budget = session.resolved_token_budget.clone();
+    adopted.observed_runtime_session_version = session.observed_runtime_session_version;
+    adopted.force_manual_compression = session.force_manual_compression.clone();
+    *session = adopted;
     Ok(())
 }
 

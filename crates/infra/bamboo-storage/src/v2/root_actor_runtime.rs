@@ -408,7 +408,13 @@ impl SessionStoreV2 {
             .await?;
         let committed = Self::default_writer_job(&guards, move || proof.validate()).await?;
         self.publish_root_actor_runtime(&guards, publish).await?;
-        *session = committed;
+        // Same #1053 constraint as session_merge::adopt_root_publication: the
+        // persisted proof copy never carries #[serde(skip)] runtime-only state.
+        let mut adopted = committed;
+        adopted.resolved_token_budget = session.resolved_token_budget.clone();
+        adopted.observed_runtime_session_version = session.observed_runtime_session_version;
+        adopted.force_manual_compression = session.force_manual_compression.clone();
+        *session = adopted;
         Ok(())
     }
 }
