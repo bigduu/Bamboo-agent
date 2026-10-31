@@ -319,10 +319,14 @@ impl LLMProvider for GeminiProvider {
         let model_for_log = model.to_string();
         let requested_reasoning_for_log = reasoning_effort;
         let mut logged_summary = false;
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
 
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
             move |event, data| {
+                if let Some(diagnostics) = &completion_diagnostics {
+                    diagnostics.observe_sse(event, data);
+                }
                 let chunks = stream::parse_with_provider_usage(&mut state, event, data)?;
 
                 if !logged_summary

@@ -285,6 +285,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             "/projects/{project_id}/worktrees",
             web::post().to(agent::worktrees::create),
         )
+        .route(
+            "/projects/{project_id}/worktrees/merge-state",
+            web::get().to(agent::worktrees::merge_state),
+        )
         .route("/projects", web::get().to(agent::projects::list_projects))
         .route("/projects", web::post().to(agent::projects::create_project))
         .route(

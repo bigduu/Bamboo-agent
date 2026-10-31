@@ -118,6 +118,7 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     max_tokens: u32,
+    max_tokens_configured: bool,
     default_reasoning_effort: Option<ReasoningEffort>,
     request_overrides: Option<RequestOverridesConfig>,
     masking_config: KeywordMaskingConfig,
@@ -148,6 +149,7 @@ impl AnthropicProvider {
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,
+            max_tokens_configured: false,
             default_reasoning_effort: None,
             request_overrides: None,
             masking_config: KeywordMaskingConfig::default(),
@@ -175,6 +177,7 @@ impl AnthropicProvider {
 
     pub fn with_max_tokens(mut self, max_tokens: u32) -> Self {
         self.max_tokens = max_tokens;
+        self.max_tokens_configured = true;
         self
     }
 
@@ -390,7 +393,17 @@ impl AnthropicProvider {
         capability_loading_mode: CapabilityLoadingMode,
     ) -> Result<LLMStream> {
         crate::image_budget::validate_tool_image_budget(messages).map_err(LLMError::Api)?;
-        let max_tokens = max_output_tokens.unwrap_or(self.max_tokens);
+        // Anthropic's wire protocol requires max_tokens even when the caller
+        // does not set a limit. Use the existing Bodhi proxy default for an
+        // unconfigured Vision request; preserve explicit provider settings.
+        let vision_request =
+            options.and_then(|o| o.request_purpose.as_deref()) == Some("vision_description");
+        let max_tokens =
+            max_output_tokens.unwrap_or(if vision_request && !self.max_tokens_configured {
+                16_384
+            } else {
+                self.max_tokens
+            });
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = required_tool_from_options(options, tools)?;
         let reasoning_effort = options
@@ -552,6 +565,7 @@ impl AnthropicProvider {
             requested_reasoning_effort: applied_reasoning_effort,
             request_thinking_enabled: thinking_enabled,
             request_thinking_budget_tokens: thinking_budget_tokens,
+            completion_diagnostics: crate::provider::current_completion_diagnostics(),
             ..Default::default()
         }));
         Ok(anthropic_stream_with_usage_on_error(
@@ -1650,6 +1664,7 @@ fn validated_anthropic_reference_definitions_in_order<'a>(
 /// Tracks tool_use blocks by index so we can emit partial ToolCall chunks with correct id/name.
 #[derive(Default)]
 pub struct AnthropicStreamState {
+    pub(crate) completion_diagnostics: Option<crate::provider::CompletionDiagnostics>,
     tool_uses_by_index: HashMap<usize, (String, String)>, // (id, name)
     thinking_blocks_by_index: HashSet<usize>,
     thinking_blocks_started: usize,
@@ -2344,6 +2359,9 @@ pub fn parse_anthropic_sse_event(
         }
         "message_delta" => {
             if !data.is_empty() {
+                if let Some(diagnostics) = &state.completion_diagnostics {
+                    diagnostics.observe_sse(event_type, data);
+                }
                 match serde_json::from_str::<Value>(data) {
                     Ok(v) => {
                         if let Some(stop_reason) = v

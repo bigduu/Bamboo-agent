@@ -283,7 +283,11 @@ impl BodhiProvider {
             )));
         }
 
-        let stream = openai_compat_chat_stream_from_sse(response, |_event, data| {
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let stream = openai_compat_chat_stream_from_sse(response, move |event, data| {
+            if let Some(diagnostics) = &completion_diagnostics {
+                diagnostics.observe_sse(event, data);
+            }
             if data.trim().is_empty() {
                 return Ok(Vec::new());
             }
@@ -341,6 +345,7 @@ impl BodhiProvider {
         }
 
         let mut state = AnthropicStreamState::default();
+        state.completion_diagnostics = crate::provider::current_completion_diagnostics();
         let stream = llm_stream_from_sse(response, move |event, data| {
             parse_anthropic_sse_event(&mut state, event, data)
         });
@@ -409,9 +414,15 @@ impl BodhiProvider {
         // Multi-chunk adapter: a final Gemini `usageMetadata` carries both a
         // cache hit and output/thinking usage in one event, and the stream sends
         // no [DONE], so both must be emitted from that single event (issue #27).
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let stream = crate::providers::common::sse::llm_stream_from_sse_multi(
             response,
-            move |event, data| parse_gemini_sse_event(&mut state, event, data),
+            move |event, data| {
+                if let Some(diagnostics) = &completion_diagnostics {
+                    diagnostics.observe_sse(event, data);
+                }
+                parse_gemini_sse_event(&mut state, event, data)
+            },
         );
 
         Ok(stream)
@@ -570,6 +581,31 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_targets_capture_request_scoped_finish_reasons() {
+        for (target, body, expected) in [
+            ("openai", "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n", "length"),
+            ("anthropic", "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"max_tokens\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n", "max_tokens"),
+            ("gemini", "data: {\"candidates\":[{\"finishReason\":\"MAX_TOKENS\"}]}\n\n", "MAX_TOKENS"),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(body))
+                .expect(1).mount(&server).await;
+            let provider = BodhiProvider::new("test-key").with_base_url(server.uri())
+                .with_target_provider(target);
+            let diagnostics = crate::provider::CompletionDiagnostics::default();
+            let messages = [Message::user("describe")];
+            let mut stream = crate::provider::scope_completion_diagnostics(
+                diagnostics.clone(), provider.chat_stream(&messages, &[], None, "model"),
+            ).await.unwrap();
+            while let Some(chunk) = stream.next().await { chunk.unwrap(); }
+            assert_eq!(diagnostics.finish_reason(), expected, "{target}");
+        }
     }
 
     #[tokio::test]

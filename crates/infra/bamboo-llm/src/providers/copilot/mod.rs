@@ -607,6 +607,7 @@ impl CopilotProvider {
         session_log_id: &str,
         request_purpose: &str,
     ) -> Result<LLMStream> {
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let url = self.model_endpoint("responses");
         let mut effective_responses_options = responses_options.cloned().unwrap_or_default();
         if effective_responses_options.store == Some(true) {
@@ -796,6 +797,9 @@ impl CopilotProvider {
         let stream = llm_stream_from_sse_multi_requiring_done(
             response,
             move |event, data| {
+                if let Some(diagnostics) = &completion_diagnostics {
+                    diagnostics.observe_sse(event, data);
+                }
                 let parsed = parser.handle_event_multi(event, data);
                 append_responses_sse_record("Copilot", &model_for_debug, event, data, &parsed);
                 parsed
@@ -1314,7 +1318,11 @@ impl LLMProvider for CopilotProvider {
         let mut observed_reasoning_signal = false;
         let mut reasoning_chars = 0usize;
         let mut logged_summary = false;
-        let stream = openai_compat_chat_stream_from_sse(response, move |_event, data| {
+        let completion_diagnostics = crate::provider::current_completion_diagnostics();
+        let stream = openai_compat_chat_stream_from_sse(response, move |event, data| {
+            if let Some(diagnostics) = &completion_diagnostics {
+                diagnostics.observe_sse(event, data);
+            }
             let mut reasoning_chunk_to_emit: Option<String> = None;
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(data) {
                 if let Some(delta) = v
