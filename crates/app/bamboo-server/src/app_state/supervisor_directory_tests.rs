@@ -168,6 +168,45 @@ async fn directory_merges_link_origin_and_user_opened_with_engagement() {
     let _ = &mut created;
 }
 
+/// Codex P1: a linked target that was PATCH-moved to an unauthorized Project
+/// (stale link keeps the old Project) must not expose its current metadata.
+#[tokio::test]
+async fn directory_hides_linked_target_moved_out_of_authorized_project() {
+    let (_home, store, reference) = fixture().await;
+    let supervisor = authorized_supervisor(&store, &reference).await;
+    let mut target = root(&store, "linked-moved", "project-a").await;
+    store
+        .mutate_supervisor_management(&SupervisorManagementRequest {
+            supervisor: reference.clone(),
+            expected_state_revision: 1,
+            mutation: SupervisorManagementMutation::Attach {
+                target_session_id: "linked-moved".into(),
+            },
+        })
+        .await
+        .unwrap();
+
+    // User moves the session to an unauthorized Project via PATCH: the index
+    // now reports project-b while the historical link still says project-a.
+    // The PATCH path bumps metadata_version; mirror that here.
+    target.set_project_id_meta("project-b");
+    target.metadata_version += 1;
+    store.save_session(&target).await.unwrap();
+
+    let directory = SupervisorSessionDirectory::new(store.clone(), store.clone());
+    let page = directory
+        .directory(
+            &supervisor_ctx(&supervisor),
+            SupervisorDirectoryRequest::default(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !page.entries.iter().any(|e| e.session_id == "linked-moved"),
+        "a link whose current target binding changed must expose nothing"
+    );
+}
+
 #[tokio::test]
 async fn directory_paginates_with_stable_cursor() {
     let (_home, store, reference) = fixture().await;

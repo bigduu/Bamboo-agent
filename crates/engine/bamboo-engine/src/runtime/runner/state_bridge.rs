@@ -561,8 +561,30 @@ pub fn read_runtime_state(session: &Session) -> Option<AgentRuntimeState> {
 ///
 /// Only writes to `session.agent_runtime_state`. The legacy metadata mirror
 /// was removed after the migration completed.
+///
+/// The canonical Human UI engagement mark is a session-level observation that
+/// may have advanced through SessionInbox admission after the runner captured
+/// its state copy. Never let the runner's older snapshot erase it: keep the
+/// session's newer mark unless the runner itself carries one at least as new.
 pub fn write_runtime_state(session: &mut Session, state: &AgentRuntimeState) {
-    session.agent_runtime_state = Some(state.clone());
+    let mut state = state.clone();
+    if let (Some(session_mark), Some(runner_mark)) = (
+        session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|s| s.last_human_input.clone()),
+        state.last_human_input.clone(),
+    ) {
+        if session_mark.at > runner_mark.at {
+            state.last_human_input = Some(session_mark);
+        }
+    } else if state.last_human_input.is_none() {
+        state.last_human_input = session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|s| s.last_human_input.clone());
+    }
+    session.agent_runtime_state = Some(state);
 }
 
 /// Sync runtime state fields from existing metadata keys.
@@ -1523,6 +1545,53 @@ async fn refresh_turn_boundary_inner(
 
 #[cfg(test)]
 mod tests {
+    /// Codex P2: the runner's older runtime-state snapshot must never erase a
+    /// Human engagement mark that SessionInbox admission recorded on the
+    /// session after the runner captured its copy.
+    #[test]
+    fn write_runtime_state_preserves_newer_session_human_engagement_mark() {
+        let mut session = Session::new("engagement-retain", "model");
+        let newer = bamboo_domain::HumanInputMark::user(chrono::Utc::now());
+        let mut admitted = AgentRuntimeState::new("admission-run");
+        admitted.set_last_human_input(newer.clone());
+        session.agent_runtime_state = Some(admitted);
+
+        // Runner state was captured before admission: no mark of its own.
+        let mut runner_state = AgentRuntimeState::new("runner-run");
+        write_runtime_state(&mut session, &runner_state);
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|s| s.last_human_input.clone()),
+            Some(newer.clone()),
+            "a runner snapshot without the mark must not erase the session's mark"
+        );
+
+        // Runner state carries an older mark: the session's newer one wins.
+        let older =
+            bamboo_domain::HumanInputMark::user(chrono::Utc::now() - chrono::Duration::seconds(60));
+        runner_state.set_last_human_input(older);
+        write_runtime_state(&mut session, &runner_state);
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|s| s.last_human_input.clone()),
+            Some(newer),
+            "an older runner mark must not overwrite a newer session mark"
+        );
+
+        // The runner's own state (run id etc.) still replaces everything else.
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .map(|s| s.run_id.as_str()),
+            Some("runner-run")
+        );
+    }
+
     #[tokio::test]
     async fn ql_overflow_old_wrapper_and_rich_prelude_preserve_actual_outputs_and_ack() {
         let mut snapshots = Vec::new();

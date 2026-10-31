@@ -191,6 +191,24 @@ impl SessionRepository {
             .session_inbox_admission_mut()
             .record(envelope.id.clone(), claim.claim.generation);
         session.updated_at = chrono::Utc::now();
+        // Same canonical Human UI engagement mark as the fallback admission
+        // path in state_bridge: only interactive `user`-source user_input
+        // envelopes stamp it, peer/host dispatch never does. It joins the
+        // message in this same atomic root-input checkpoint.
+        if !matching
+            && envelope.source == bamboo_domain::SessionMessageSource::User
+            && envelope.kind == bamboo_domain::SessionMessageKind::UserInput
+        {
+            let mark = bamboo_domain::HumanInputMark::user(envelope.created_at);
+            match session.agent_runtime_state.as_mut() {
+                Some(state) => state.set_last_human_input(mark),
+                None => {
+                    let mut state = bamboo_domain::AgentRuntimeState::new("");
+                    state.set_last_human_input(mark);
+                    session.agent_runtime_state = Some(state);
+                }
+            }
+        }
         if let Err(error) = self
             .persistence
             .checkpoint_root_input(session, inbox.clone(), &claim)

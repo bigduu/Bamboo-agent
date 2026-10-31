@@ -274,6 +274,13 @@ pub(super) async fn initialize_loop_state(
         .agent_runtime_state
         .as_ref()
         .is_some_and(|prev| prev.no_human_approver);
+    // The canonical Human UI engagement mark is a session-level observation, not
+    // per-run execution state. Carry it forward so the runner's fresh state and
+    // later runtime-state writes never erase a recorded human takeover signal.
+    runtime_state.last_human_input = session
+        .agent_runtime_state
+        .as_ref()
+        .and_then(|prev| prev.last_human_input.clone());
     // Preserve the incoming typed Child posture when rebuilding this run.
     // Legacy metadata is not authority for granting read-only mode.
     runtime_state.read_only = session

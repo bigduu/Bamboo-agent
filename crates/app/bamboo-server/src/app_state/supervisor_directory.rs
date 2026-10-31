@@ -49,7 +49,7 @@ struct DirectoryCursor {
 /// SupervisorSessionDiscovery, kept local because that helper is private.
 struct CallerAuthority {
     session_id: String,
-    incarnation: uuid::Uuid,
+    reference: bamboo_domain::SupervisorReference,
     scope_revision: u64,
     state: Option<SupervisorManagementState>,
 }
@@ -98,8 +98,8 @@ impl SupervisorSessionDirectory {
             })?;
         }
         Ok(CallerAuthority {
-            session_id: reference.session_id,
-            incarnation: reference.incarnation_id,
+            session_id: reference.session_id.clone(),
+            reference,
             scope_revision: state.as_ref().map_or(0, |state| state.revision),
             state,
         })
@@ -116,7 +116,10 @@ impl SupervisorSessionDirectory {
             s.allowed_projects.clone()
         });
 
-        // 1) Supervisor-created roots: authoritative management links.
+        // 1) Supervisor-created roots: authoritative management links. Each
+        // link is revalidated against the current target: a moved Project, a
+        // changed metadata version or a different lifetime means the stale
+        // link no longer authorizes exposing the target's current metadata.
         if let Some(state) = state {
             if state.links.len() > MAX_SUPERVISOR_LINKS {
                 return Err(ToolError::Execution(
@@ -145,6 +148,17 @@ impl SupervisorSessionDirectory {
                     });
                     continue;
                 };
+                // The link's Project must still match the target's CURRENT
+                // Project. A target PATCH-moved to another Project keeps its
+                // historical link; that stale link no longer authorizes
+                // exposing the moved target's current metadata. The created_at
+                // lifetime check fences rebirth under the same id.
+                let current_project_matches = index.project_id.as_deref()
+                    == Some(link.target_project_id.as_str())
+                    && index.created_at == link.target_created_at;
+                if !current_project_matches {
+                    continue;
+                }
                 if let Some(query) = query {
                     let id_match = id.to_lowercase().contains(query);
                     let project_match = link
@@ -248,7 +262,7 @@ impl SupervisorDirectoryPort for SupervisorSessionDirectory {
                     )
                 })?;
                 if cursor.version != 1
-                    || cursor.incarnation != caller.incarnation
+                    || cursor.incarnation != caller.reference.incarnation_id
                     || cursor.scope_revision != caller.scope_revision
                     || cursor.query != query
                     || cursor.limit != limit
@@ -287,7 +301,7 @@ impl SupervisorDirectoryPort for SupervisorSessionDirectory {
         let next_cursor = if has_more {
             let value = serde_json::to_string(&DirectoryCursor {
                 version: 1,
-                incarnation: caller.incarnation,
+                incarnation: caller.reference.incarnation_id,
                 scope_revision: caller.scope_revision,
                 query,
                 limit,

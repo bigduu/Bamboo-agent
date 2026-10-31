@@ -885,9 +885,7 @@ impl Tool for SessionControlTool {
                             ))
                         })
                     })
-                    .map(|serialized| {
-                        ToolOutcome::Completed(ToolResult::text(true, serialized))
-                    });
+                    .map(|serialized| ToolOutcome::Completed(ToolResult::text(true, serialized)));
             }
             SessionControlArgs::Create { request } => {
                 request.validate()?;
