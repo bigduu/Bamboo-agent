@@ -152,6 +152,9 @@ pub struct ChildActorRuntimeSave<'a> {
 
 /// Synchronous cache publication at the storage commit boundary. Implementors
 /// retain the same physical guards and revalidate the owner before invoking it.
+/// Full Root writers must invoke this exactly once with the committed snapshot
+/// before returning success. A caller that cannot confirm this publication
+/// treats the result as unknown; it cannot use its candidate as committed data.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
 
 /// The final sink receives a fresh owner check while the physical authority
@@ -368,6 +371,33 @@ pub trait Storage: Send + Sync {
             std::io::ErrorKind::Unsupported,
             "storage backend does not support fenced Root runtime writes",
         ))
+    }
+
+    /// Persist the final snapshot of this exact owned Root execution. The
+    /// backend must commit any tracked outcome with the reconciled Main, under
+    /// the same live Actor and Session guards. This is not a completion event.
+    /// Legacy backends retain their original final save; they do not claim
+    /// support for the V2 Root-outcome receipt contract.
+    async fn save_finalized_root_actor_runtime(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        inherited: Option<&crate::InheritedChildWait>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        if let Some(inherited) = inherited {
+            self.save_runtime_with_inherited_child_wait(
+                session,
+                inherited,
+                false,
+                Some((owner.clone(), publish)),
+                None,
+            )
+            .await
+        } else {
+            self.save_root_actor_runtime(owner, session, false, publish)
+                .await
+        }
     }
 
     /// Probe before consuming a response that needs a bound profile check.

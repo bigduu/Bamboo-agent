@@ -29,6 +29,8 @@ pub struct ObserverSubscriptionStart {
 #[derive(serde::Deserialize)]
 struct PublishedViewSelector {
     revision: String,
+    #[serde(default)]
+    root_outcome: Option<bamboo_domain::ObserverRootOutcomeCursor>,
 }
 
 pub(super) struct ObserverSubscriptionCoordinator {
@@ -50,7 +52,8 @@ impl ObserverSubscriptionCoordinator {
         native: bool,
     ) -> Self {
         Self {
-            inspector: SessionInspectorTool::host_routed(store.clone(), storage),
+            inspector: SessionInspectorTool::host_routed(store.clone(), storage)
+                .with_observer_outcome_inbox(inbox.clone()),
             store,
             inbox,
             activation,
@@ -169,6 +172,10 @@ impl ObserverSubscriptionCoordinator {
                     .map_err(|error| (Failure::InboxUnavailable, error.to_string()))?;
                 return Ok(());
             }
+            self.store
+                .initialize_observer_root_outcome_lane(reference, id)
+                .await
+                .map_err(authority)?;
             let parent = self
                 .store
                 .load_root_authority(&reference.session_id)
@@ -203,7 +210,7 @@ impl ObserverSubscriptionCoordinator {
                     .map(String::as_str);
                 let Some(view) = self
                     .inspector
-                    .observe_context(&ctx, target, &subscription.filter, previous)
+                    .observe_next_root_outcome(&ctx, target, &subscription.filter, previous)
                     .await
                     .map_err(|error| (Failure::PublicationUnavailable, error.to_string()))?
                 else {
@@ -214,7 +221,14 @@ impl ObserverSubscriptionCoordinator {
                 let receipt: PublishedViewSelector = serde_json::from_str(&view.result)
                     .map_err(|error| (Failure::PublicationUnavailable, error.to_string()))?;
                 self.store
-                    .stage_supervisor_observation(reference, id, target, &receipt.revision, now)
+                    .stage_supervisor_observation_with_root_outcome(
+                        reference,
+                        id,
+                        target,
+                        &receipt.revision,
+                        receipt.root_outcome.as_ref(),
+                        now,
+                    )
                     .await
                     .map_err(|error| (Failure::PublicationUnavailable, error.to_string()))?;
                 break;
@@ -234,6 +248,45 @@ impl ObserverSubscriptionCoordinator {
             {
                 return Ok(());
             }
+        }
+        let parent = self
+            .store
+            .load_root_authority(&reference.session_id)
+            .await
+            .map_err(authority)?
+            .ok_or_else(|| authority("Observer parent disappeared"))?;
+        let pending = parent
+            .supervisor_management
+            .as_ref()
+            .and_then(|state| state.subscriptions.get(id))
+            .and_then(|subscription| subscription.window.pending.as_ref());
+        if let Some(change) = pending.filter(|change| change.root_outcome.is_some()) {
+            let child = self
+                .store
+                .load_child_wait_session(&parent, id, true)
+                .await
+                .map_err(authority)?
+                .ok_or_else(|| authority("Observer Child disappeared"))?;
+            let caller = SessionCallerReference::from(&child);
+            let position = change.root_outcome.as_ref().expect("checked outcome");
+            let delivered = self
+                .inbox
+                .deliver_observer_root_outcome_to_supervisor(
+                    &caller,
+                    reference,
+                    &change.target_session_id,
+                    position.sequence,
+                    now,
+                )
+                .await
+                .map_err(|error| (Failure::InboxUnavailable, error.to_string()))?;
+            if delivered.is_none() {
+                return Ok(());
+            }
+            self.activation
+                .reconcile_wake(&reference.session_id, now)
+                .await
+                .map_err(|error| (Failure::InboxUnavailable, error.to_string()))?;
         }
         self.inbox
             .deliver_supervisor_observation(reference, id, now)
@@ -299,4 +352,4 @@ impl AppState {
 
 #[cfg(test)]
 #[path = "observer_subscription_tests.rs"]
-mod tests;
+pub(super) mod tests;

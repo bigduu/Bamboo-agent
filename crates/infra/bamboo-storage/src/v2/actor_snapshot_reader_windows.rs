@@ -31,7 +31,7 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
-pub(super) struct ReadBudget {
+pub(crate) struct ReadBudget {
     pub limits: ActorSnapshotLimits,
     entries: usize,
     reads: usize,
@@ -49,7 +49,7 @@ impl ReadBudget {
     }
 }
 
-pub(super) struct Directory(File);
+pub(crate) struct Directory(File);
 
 impl Directory {
     pub fn open_absolute(path: &Path) -> Result<Self, Error> {

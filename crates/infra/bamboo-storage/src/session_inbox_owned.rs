@@ -64,6 +64,11 @@ pub(super) struct StoredLease {
 }
 
 impl StoredLease {
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(super) fn effective_policy_for_testing(&self) -> SessionActivationPolicy {
+        self.policy
+    }
+
     /// Structural evidence only. Retirement does not mint or renew a lease.
     pub(super) fn matches_transport_name(&self, generation: u64, name: &str) -> bool {
         FileSessionInbox::owned_name(generation, &self.token) == name
@@ -80,17 +85,31 @@ impl StoredLease {
         };
         let lease: Self =
             serde_json::from_value(raw.clone()).map_err(|_| invalid("invalid Inbox lease"))?;
-        if lease.version != 1
-            || lease.token.epoch == 0
-            || lease.token.consumer.as_str().is_empty()
-            || lease.token.consumer.as_str().len() > 128
-            || uuid::Uuid::parse_str(&lease.token.incarnation).is_err()
-            || lease.failure_count > MAX_EXPLICIT_FAILURES
-            || lease
+        lease.validate()?;
+        Ok(Some(lease))
+    }
+
+    /// Parse directly from the physical JSON so duplicate nested keys cannot
+    /// be folded into a `Value` before the lease is checked.
+    pub(super) fn from_raw(raw: &serde_json::value::RawValue) -> Result<Self, SessionInboxError> {
+        let lease: Self =
+            serde_json::from_str(raw.get()).map_err(|_| invalid("invalid Inbox lease"))?;
+        lease.validate()?;
+        Ok(lease)
+    }
+
+    fn validate(&self) -> Result<(), SessionInboxError> {
+        if self.version != 1
+            || self.token.epoch == 0
+            || self.token.consumer.as_str().is_empty()
+            || self.token.consumer.as_str().len() > 128
+            || uuid::Uuid::parse_str(&self.token.incarnation).is_err()
+            || self.failure_count > MAX_EXPLICIT_FAILURES
+            || self
                 .reclaim_count
-                .is_some_and(|count| count >= lease.token.epoch)
-            || lease.manual_retry_count >= lease.token.epoch
-            || lease.last_error_code.as_ref().is_some_and(|code| {
+                .is_some_and(|count| count >= self.token.epoch)
+            || self.manual_retry_count >= self.token.epoch
+            || self.last_error_code.as_ref().is_some_and(|code| {
                 code.is_empty()
                     || code.len() > 64
                     || !code.bytes().all(|byte| {
@@ -99,13 +118,13 @@ impl StoredLease {
                             || matches!(byte, b'_' | b'-' | b'.')
                     })
             })
-            || (lease.failure_count > 0 && lease.last_error_code.is_none())
-            || (lease.retry_after.is_some() && lease.dead_lettered_at.is_some())
-            || (lease.retry_requested_at.is_some() && lease.dead_lettered_at.is_none())
+            || (self.failure_count > 0 && self.last_error_code.is_none())
+            || (self.retry_after.is_some() && self.dead_lettered_at.is_some())
+            || (self.retry_requested_at.is_some() && self.dead_lettered_at.is_none())
         {
             return Err(invalid("invalid Inbox lease"));
         }
-        Ok(Some(lease))
+        Ok(())
     }
 
     fn same_identity(&self, token: &SessionInboxLeaseToken) -> bool {
@@ -148,17 +167,31 @@ pub(crate) enum InboxAuthority {
     CurrentSupervisor {
         _guard: Box<crate::v2::CurrentUserTargetGuard>,
     },
+    SupervisedRootOutcome {
+        _guard: Arc<crate::v2::CurrentUserTargetGuard>,
+        inbox_dir: PathBuf,
+    },
     Peer {
         _guard: crate::v2::PeerDeliveryGuard,
     },
     Observer {
         _guard: Arc<crate::v2::ObserverNoticeAuthority>,
     },
+    ObserverRootOutcomeRead {
+        _guard: Arc<crate::v2::ObserverRootOutcomeAuthority>,
+        inbox_dir: PathBuf,
+    },
+    ObserverSupervisorReceipt {
+        _guard: Arc<crate::v2::ObserverNoticeAuthority>,
+        inbox_dir: PathBuf,
+    },
     HostScoped {
-        _guard: crate::v2::host_session_scope::HostScopedDeliveryGuards,
+        // Boxed like `CurrentSupervisor` above: these guard sets are far larger
+        // than the other variants and would otherwise size every enum value.
+        _guard: Box<crate::v2::host_session_scope::HostScopedDeliveryGuards>,
     },
     HostCreation {
-        _guard: crate::v2::host_root_create::HostCreatedRootDeliveryGuards,
+        _guard: Box<crate::v2::host_root_create::HostCreatedRootDeliveryGuards>,
     },
     Unscoped {
         _guard: crate::v2::host_session_scope::LegacySessionDeliveryGuards,
@@ -170,6 +203,9 @@ struct OwnedScope {
 }
 struct OwnedGuards {
     _file: FileOperationLock,
+    // Retained handle to the canonical Inbox directory. Field order releases the
+    // lock, then the Inbox FD, then the process and original authority.
+    dir: super::anchor::InboxAnchor,
     _scope: Arc<OwnedScope>,
 }
 
@@ -263,40 +299,55 @@ impl OwnedFilesystem {
         Ok(())
     }
 
+    /// The retained canonical Inbox handle. Every mutation below is relative to
+    /// it, so a replaced name can never redirect a write outside the Inbox.
+    fn anchor(&self) -> &super::anchor::InboxAnchor {
+        &self.guards.dir
+    }
+
     pub(super) async fn create_dir(&self, path: &Path) -> std::io::Result<()> {
-        self.job("mkdir", path, |_, path| std::fs::create_dir_all(path))
-            .await
+        self.job("mkdir", path, |filesystem, path| {
+            filesystem.anchor().create_dir_all(path)
+        })
+        .await
     }
 
     pub(super) async fn write(&self, path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let bytes = bytes.to_vec();
         self.job("write", path, move |filesystem, path| {
             use std::io::Write;
+            let anchor = filesystem.anchor();
             let temp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            // Every step through the anchored rename shares the cleanup below: a
+            // failed observation, validation, or rename must not leave the
+            // exclusive temp behind. `after_replace` runs post-commit, so a late
+            // observation error reports without touching published bytes.
             let result = (|| {
-                let mut file = File::create(&temp)?;
+                let mut file = anchor.create_exclusive(&temp)?;
                 filesystem.observe("write_temp", path)?;
                 file.write_all(&bytes)?;
-                file.sync_all()
+                file.sync_all()?;
+                filesystem.observe("replace", path)?;
+                filesystem.validate()?;
+                anchor.rename(&temp, path)
             })();
             if let Err(error) = result {
                 // Keep the primary error and the existing best-effort cleanup contract.
                 #[cfg(test)]
                 let _ = filesystem.observe("write_cleanup", path);
-                let _ = std::fs::remove_file(&temp);
+                let _ = anchor.remove_file(&temp);
                 return Err(error);
             }
-            filesystem.observe("replace", path)?;
-            filesystem.validate()?;
-            replace(&temp, path)?;
             filesystem.observe("after_replace", path)
         })
         .await
     }
 
     pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
-        self.job("remove", path, |_, path| std::fs::remove_file(path))
-            .await
+        self.job("remove", path, |filesystem, path| {
+            filesystem.anchor().remove_file(path)
+        })
+        .await
     }
 
     pub(super) async fn deliver(
@@ -315,44 +366,87 @@ impl OwnedFilesystem {
             let retained =
                 std::cell::RefCell::new(None::<Arc<dyn bamboo_domain::SessionRunDeliveryGuard>>);
             let conflict = std::cell::RefCell::new(None::<SessionInboxError>);
-            let result =
-                Mailbox::at(dir).deliver_blocking(&wrapper, gate.as_ref(), |phase, path| {
-                    filesystem.observe(phase, path)?;
-                    if phase == "maildir_replace" {
-                        if let Some(expected) = &expected {
-                            match expected.retain() {
-                                Ok(guard) => *retained.borrow_mut() = Some(guard),
-                                Err(error) => {
-                                    *conflict.borrow_mut() = Some(error);
-                                    return Err(std::io::Error::other(
-                                        "expected run admission rejected",
-                                    ));
-                                }
-                            }
-                            filesystem.observe("expected_run_matched", path)?;
-                            if retained.borrow().as_ref().is_none_or(|guard| {
-                                !guard.matches(
-                                    &expected.target_session_id,
-                                    expected.target_created_at,
-                                    &expected.expected_run_id,
-                                )
-                            }) {
-                                *conflict.borrow_mut() = Some(SessionInboxError::InvalidClaim(
-                                    "Loop owner stopped before delivery publication".into(),
-                                ));
+            // Same observer contract as the Maildir writer, but publication
+            // below stays relative to the retained Inbox handle.
+            let observe = |phase: &str, path: &Path| -> std::io::Result<()> {
+                filesystem.observe(phase, path)?;
+                if phase == "maildir_replace" {
+                    if let Some(expected) = &expected {
+                        match expected.retain() {
+                            Ok(guard) => *retained.borrow_mut() = Some(guard),
+                            Err(error) => {
+                                *conflict.borrow_mut() = Some(error);
                                 return Err(std::io::Error::other(
-                                    "expected run publication stopped",
+                                    "expected run admission rejected",
                                 ));
                             }
                         }
+                        filesystem.observe("expected_run_matched", path)?;
+                        if retained.borrow().as_ref().is_none_or(|guard| {
+                            !guard.matches(
+                                &expected.target_session_id,
+                                expected.target_created_at,
+                                &expected.expected_run_id,
+                            )
+                        }) {
+                            *conflict.borrow_mut() = Some(SessionInboxError::InvalidClaim(
+                                "Loop owner stopped before delivery publication".into(),
+                            ));
+                            return Err(std::io::Error::other("expected run publication stopped"));
+                        }
                     }
-                    Ok(())
-                });
+                }
+                Ok(())
+            };
+            let bytes = match serde_json::to_vec_pretty(&wrapper) {
+                Ok(bytes) => bytes,
+                Err(error) => return Ok(Err(SessionInboxError::Storage(error.to_string()))),
+            };
+            // The same 20-digit time prefix, hidden temp name and implicit
+            // queue creation as the Maildir writer.
+            let nanos = wrapper.created_at.timestamp_nanos_opt().unwrap_or(0).max(0);
+            let name = format!("{nanos:020}-{}.json", wrapper.id.0);
+            let queue = dir.join("new");
+            let path = queue.join(&name);
+            let temp = queue.join(format!(".{name}.tmp.{}", uuid::Uuid::new_v4()));
+            let anchor = filesystem.anchor();
+            let result = (|| {
+                anchor.create_dir_all(&queue)?;
+                if gate
+                    .as_ref()
+                    .is_some_and(bamboo_domain::AdmissionGate::is_cancelled)
+                {
+                    return Ok(bamboo_domain::AdmissionCommit::Cancelled);
+                }
+                {
+                    use std::io::Write;
+                    let mut file = anchor.create_exclusive(&temp)?;
+                    file.write_all(&bytes)?;
+                    file.sync_all()?;
+                }
+                observe("maildir_replace", &path)?;
+                let rename = || anchor.rename(&temp, &path);
+                match gate.as_ref() {
+                    Some(gate) => gate.commit(rename),
+                    None => rename().map(bamboo_domain::AdmissionCommit::Committed),
+                }
+            })();
+            // Observation and residue removal cannot replace a primary error.
+            let _ = observe("maildir_cleanup", &path);
+            let _ = anchor.remove_file(&temp);
             if let Some(error) = conflict.into_inner() {
                 return Ok(Err(error));
             }
             let committed = match result {
-                Ok(committed) => committed,
+                Ok(bamboo_domain::AdmissionCommit::Committed(())) => {
+                    bamboo_domain::AdmissionCommit::Committed(wrapper.id.clone())
+                }
+                Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => {
+                    bamboo_domain::AdmissionCommit::AlreadyCommitted
+                }
+                Ok(bamboo_domain::AdmissionCommit::Cancelled) => {
+                    bamboo_domain::AdmissionCommit::Cancelled
+                }
                 Err(error) => return Ok(Err(SessionInboxError::Storage(error.to_string()))),
             };
             let notified = matches!(&committed, bamboo_domain::AdmissionCommit::Committed(_))
@@ -371,9 +465,10 @@ impl OwnedFilesystem {
     pub(super) async fn cancel(&self, dir: &Path, path: &Path, name: &str) -> std::io::Result<()> {
         let cancelled = dir.join("cancelled");
         let to = cancelled.join(name);
-        self.job("cancel", path, move |_, path| {
-            std::fs::create_dir_all(cancelled)?;
-            std::fs::rename(path, to)
+        self.job("cancel", path, move |filesystem, path| {
+            let anchor = filesystem.anchor();
+            anchor.create_dir_all(&cancelled)?;
+            anchor.rename(path, &to)
         })
         .await
     }
@@ -388,27 +483,28 @@ impl OwnedFilesystem {
     ) -> std::io::Result<()> {
         let cancelled = dir.join("cancelled");
         let to = cancelled.join(name);
-        self.job("cancel", path, move |_, path| {
-            std::fs::create_dir_all(cancelled)?;
-            match std::fs::symlink_metadata(&to) {
-                Ok(_) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        "scoped Loop cancellation tombstone already exists",
-                    ));
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error),
+        self.job("cancel", path, move |filesystem, path| {
+            let anchor = filesystem.anchor();
+            anchor.create_dir_all(&cancelled)?;
+            // `symlink_metadata` relative to the retained Inbox: an existing
+            // tombstone still wins over a fresh move.
+            if anchor.entry_exists(&to)? {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "scoped Loop cancellation tombstone already exists",
+                ));
             }
-            std::fs::rename(path, to)
+            anchor.rename(path, &to)
         })
         .await
     }
 
     async fn rotate(&self, from: &Path, to: &Path) -> std::io::Result<()> {
         let to = to.to_owned();
-        self.job("rotate", from, move |_, from| std::fs::rename(from, to))
-            .await
+        self.job("rotate", from, move |filesystem, from| {
+            filesystem.anchor().rename(from, &to)
+        })
+        .await
     }
 
     pub(super) async fn quarantine(
@@ -423,9 +519,10 @@ impl OwnedFilesystem {
         let corrupt = dir.join("corrupt");
         let to = corrupt.join(name);
         let reason = reason.to_owned();
-        self.job("quarantine", path, move |_, from| {
-            std::fs::create_dir_all(&corrupt)?;
-            match std::fs::rename(from, &to) {
+        self.job("quarantine", path, move |filesystem, from| {
+            let anchor = filesystem.anchor();
+            anchor.create_dir_all(&corrupt)?;
+            match anchor.rename(from, &to) {
                 Ok(()) => {
                     tracing::warn!(path = %to.display(), reason, "quarantined malformed typed session inbox envelope");
                     Ok(())
@@ -434,35 +531,6 @@ impl OwnedFilesystem {
                 Err(error) => Err(error),
             }
         }).await.map_err(|error| SessionInboxError::Storage(error.to_string()))
-    }
-}
-
-// Same replacement and residue contract as v2::atomic_write; no parent-dir fsync.
-fn replace(from: &Path, to: &Path) -> std::io::Result<()> {
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(from, to)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-        };
-        let from: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
-        let to: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
-        let result = unsafe {
-            MoveFileExW(
-                from.as_ptr(),
-                to.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if result == 0 {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -627,10 +695,13 @@ impl FileSessionInbox {
         match authority {
             InboxAuthority::Peer { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Observer { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::ObserverRootOutcomeRead { inbox_dir, .. } => Ok(inbox_dir.clone()),
+            InboxAuthority::ObserverSupervisorReceipt { inbox_dir, .. } => Ok(inbox_dir.clone()),
             InboxAuthority::HostScoped { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::HostCreation { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::Unscoped { _guard } => Ok(_guard.inbox_dir.clone()),
             InboxAuthority::CurrentSupervisor { _guard } => Ok(_guard.inbox_dir.clone()),
+            InboxAuthority::SupervisedRootOutcome { inbox_dir, .. } => Ok(inbox_dir.clone()),
             _ => self.inbox_dir(target).await,
         }
     }
@@ -656,16 +727,15 @@ impl FileSessionInbox {
             if let Some(hook) = &hook {
                 hook("acquire", &path)?;
             }
-            std::fs::create_dir_all(&path)?;
-            let file = OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(path.join(OPERATION_LOCK_FILE))?;
+            // Retain the canonical Inbox directory and open its advisory lock
+            // relative to that handle. A link at either name now fails closed
+            // instead of creating or locking an object outside the Inbox.
+            let anchor = super::anchor::InboxAnchor::acquire(&path)?;
+            let file = anchor.open_lock(OPERATION_LOCK_FILE)?;
             file.lock_exclusive()?;
             Ok::<_, std::io::Error>(Arc::new(OwnedGuards {
                 _file: FileOperationLock(file),
+                dir: anchor,
                 _scope: scope,
             }))
         })

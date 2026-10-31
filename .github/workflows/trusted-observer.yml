@@ -196,7 +196,7 @@ jobs:
           }
           assert results['engine'] == {f'runtime::runner::state_bridge::tests::{name}' for name in boundary}, results['engine']
           window = {n for n in results['domain'] if n.startswith('observer_subscription::tests::')}
-          assert len(window) == 6
+          assert len(window) == 7
           assert results['domain'] == window, 'Shared serde case already passed in the first joint recipe'
           fixtures = {
               'subscription_real_inbox_crash_retry_reopens_and_preserves_frozen_pending',
@@ -206,6 +206,7 @@ jobs:
               'subscription_owned_and_active_backpressure_coalesces_until_real_consumption',
               'subscription_status_filter_ignores_question_and_task_noise_but_tracks_run_identity',
               'subscription_unavailable_observer_retries_are_bounded_without_borrowing_authority',
+              'historical_pending_requires_supervisor_receipt_before_observer_cursor',
           }
           expected = {f'app_state::observer_subscriptions::tests::{name}' for name in fixtures}
           faults = {
@@ -217,7 +218,7 @@ jobs:
           }
           expected |= {f'app_state::observer_subscriptions::tests::fault::{name}' for name in faults}
           assert results['server'] == expected, results['server'] ^ expected
-          print('Six canonical windows, shared serde already covered, five fail-closed Inbox regressions, seven subscription and five fault Host fixtures passed')
+          print('Seven canonical windows, shared serde already covered, five fail-closed Inbox regressions, eight subscription and five fault Host fixtures passed')
           PY
 
       - name: Verify exact source stayed clean after subscriptions

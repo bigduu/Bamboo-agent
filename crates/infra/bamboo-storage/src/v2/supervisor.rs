@@ -106,6 +106,7 @@ pub(super) fn validate_overlay(main: &Session, side: Option<&Session>) -> io::Re
     validate_identity(main)?;
     if let Some(side) = side {
         validate_identity(side)?;
+        reject_main_only_outcomes_in_sidecar(side)?;
     }
     let has_authority = !matches!(main.authority_identity, SessionAuthorityIdentity::Ordinary)
         || side.is_some_and(|side| {
@@ -123,6 +124,20 @@ pub(super) fn validate_overlay(main: &Session, side: Option<&Session>) -> io::Re
             main.supervisor_management.as_ref(),
             side.supervisor_management.as_ref(),
         )?;
+    }
+    Ok(())
+}
+
+/// Outcome facts are committed only with Main. A sidecar can lead Main after a
+/// crash, so even a well-formed sidecar value is not a completion receipt.
+pub(super) fn reject_main_only_outcomes_in_sidecar(side: &Session) -> io::Result<()> {
+    if side
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        .is_some()
+    {
+        return Err(invalid("runtime sidecar contains Main-only Root outcomes"));
     }
     Ok(())
 }
@@ -184,7 +199,7 @@ struct MainIdentity {
 impl SessionStoreV2 {
     /// Caller holds lifecycle/task/session read guards. Admission needs the
     /// strict canonical Root proof and full history; never repair its index.
-    pub(super) async fn load_execution_admission_unchecked(
+    pub(crate) async fn load_execution_admission_unchecked(
         &self,
         id: &str,
     ) -> io::Result<Option<Session>> {
@@ -261,6 +276,7 @@ impl SessionStoreV2 {
             serde_json::from_slice(&read_regular(&directory.join(RUNTIME_SIDECAR_FILE)).await?)
                 .map_err(|_| invalid("invalid canonical runtime.json"))?;
         validate_identity(&side)?;
+        reject_main_only_outcomes_in_sidecar(&side)?;
         side.validate_conversation_state()
             .map_err(|error| invalid(&error.to_string()))?;
         let side_root = if matches!(side.authority_identity, SessionAuthorityIdentity::Ordinary)

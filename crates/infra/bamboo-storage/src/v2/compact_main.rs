@@ -7,12 +7,14 @@ use std::io::{self, Write};
 
 use bamboo_domain::{
     ConversationResetState, RootModeOperationReceipt, Session, SessionAuthorityIdentity,
-    SessionKind, SupervisorManagementState, ROOT_MODE_OPERATION_HISTORY_LIMIT,
+    SessionKind, SupervisedRootOutcomes, SupervisorManagementState,
+    ROOT_MODE_OPERATION_HISTORY_LIMIT,
 };
 use chrono::{DateTime, Utc};
 use serde::de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{value::RawValue, Value};
+use sha2::{Digest, Sha256};
 
 pub(super) const MEMBER: &str = "_bamboo_main_authority";
 pub(super) const SECTION_CAP: usize = 512 * 1024;
@@ -51,6 +53,8 @@ pub(super) struct CompactMainAuthority {
     supervisor_management: Option<SupervisorManagementState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_reset: Option<ConversationResetState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_root_outcomes_sha256: Option<String>,
     title_label: String,
 }
 
@@ -65,8 +69,8 @@ pub(super) fn public_title(title: &str) -> String {
 }
 
 impl CompactMainAuthority {
-    fn from_session(session: &Session) -> Self {
-        Self {
+    fn from_session(session: &Session) -> io::Result<Self> {
+        let mut authority = Self {
             id: session.id.clone(),
             created_at: session.created_at,
             kind: session.kind,
@@ -83,8 +87,17 @@ impl CompactMainAuthority {
             root_mode_operations: session.root_mode_operations.clone(),
             supervisor_management: session.supervisor_management.clone(),
             conversation_reset: session.conversation_reset.clone(),
+            supervised_root_outcomes_sha256: None,
             title_label: public_title(&session.title),
+        };
+        if let Some(outcomes) = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        {
+            authority.supervised_root_outcomes_sha256 = Some(authority.commitment(outcomes)?);
         }
+        Ok(authority)
     }
 
     /// Only the observed public-graph identity; no skipped flat-body grant.
@@ -125,11 +138,39 @@ impl CompactMainAuthority {
             };
             management.validate(incarnation_id).map_err(|_| invalid())?;
         }
+        if let Some(digest) = &self.supervised_root_outcomes_sha256 {
+            if self.kind != SessionKind::Root
+                || !self.authority_identity.is_ordinary()
+                || self.parent_session_id.is_some()
+                || self.spawn_depth != 0
+                || (!self.root_session_id.is_empty() && self.root_session_id != self.id)
+                || digest.len() != 64
+                || !digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(invalid());
+            }
+        }
         self.clone()
             .into_snapshot_session()
             .validate_conversation_state()
             .map_err(|_| invalid())?;
         Ok(())
+    }
+
+    // The graph header carries only a fixed-size commitment. It never supplies
+    // outcome contents or authorizes them. Full-Main readers verify the body.
+    fn commitment(&self, outcomes: &SupervisedRootOutcomes) -> io::Result<String> {
+        if outcomes.root_session_id != self.id || outcomes.root_created_at != self.created_at {
+            return Err(invalid());
+        }
+        outcomes.validate().map_err(|_| invalid())?;
+        let bytes = serde_json::to_vec(outcomes).map_err(|_| invalid())?;
+        let mut digest = Sha256::new();
+        digest.update(b"bamboo.supervised-root-outcomes.v1\0");
+        digest.update(bytes);
+        Ok(format!("{:x}", digest.finalize()))
     }
 }
 
@@ -154,7 +195,7 @@ impl Write for BoundedPayload {
 /// Prepare before the named publisher starts its new state mutations. Runtime
 /// encoders remain separate, and no caller-provided header is trusted.
 pub(super) fn serialize_main(session: &Session) -> io::Result<Vec<u8>> {
-    let authority = CompactMainAuthority::from_session(session);
+    let authority = CompactMainAuthority::from_session(session)?;
     authority.validate()?;
     let mut payload = BoundedPayload(Vec::new());
     serde_json::to_writer(&mut payload, &authority).map_err(io::Error::other)?;
@@ -244,6 +285,23 @@ pub(super) fn decode_v1_section(bytes: &[u8], cap: usize) -> io::Result<CompactM
 pub(super) fn validate_full_main(bytes: &[u8]) -> io::Result<Option<CompactMainAuthority>> {
     let fields: MainFields<'_> = serde_json::from_slice(bytes).map_err(|_| invalid())?;
     if !fields.values.contains_key(MEMBER) {
+        // Legacy bodies are allowed without a header, but a repeated typed
+        // runtime field cannot hide an earlier Main-only outcome value.
+        if fields.duplicate_runtime_metadata {
+            return Err(invalid());
+        }
+        let runtime: Option<OutcomePresence> = fields
+            .values
+            .get("runtime_metadata")
+            .map(|value| serde_json::from_str(value.get()).map_err(|_| invalid()))
+            .transpose()?
+            .flatten();
+        if runtime
+            .and_then(|metadata| metadata.supervised_root_outcomes)
+            .is_some()
+        {
+            return Err(invalid());
+        }
         return Ok(None);
     }
     if fields.duplicate {
@@ -261,6 +319,7 @@ pub(super) fn validate_full_main(bytes: &[u8]) -> io::Result<Option<CompactMainA
 struct MainFields<'a> {
     values: BTreeMap<String, &'a RawValue>,
     duplicate: bool,
+    duplicate_runtime_metadata: bool,
 }
 impl<'de> Deserialize<'de> for MainFields<'de> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -274,6 +333,7 @@ impl<'de> Deserialize<'de> for MainFields<'de> {
                 let mut fields = MainFields {
                     values: BTreeMap::new(),
                     duplicate: false,
+                    duplicate_runtime_metadata: false,
                 };
                 while let Some(key) = map.next_key::<String>()? {
                     if matches!(
@@ -298,7 +358,10 @@ impl<'de> Deserialize<'de> for MainFields<'de> {
                             | "metadata"
                             | "runtime_metadata"
                     ) {
-                        fields.duplicate |= fields.values.insert(key, map.next_value()?).is_some();
+                        let is_runtime_metadata = key == "runtime_metadata";
+                        let repeated = fields.values.insert(key, map.next_value()?).is_some();
+                        fields.duplicate |= repeated;
+                        fields.duplicate_runtime_metadata |= is_runtime_metadata && repeated;
                     } else {
                         map.next_value::<IgnoredAny>()?;
                     }
@@ -314,6 +377,20 @@ impl<'de> Deserialize<'de> for MainFields<'de> {
 struct ProjectMetadata {
     #[serde(default)]
     project_id: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct OutcomePresence {
+    #[serde(default)]
+    supervised_root_outcomes: Option<IgnoredAny>,
+}
+
+#[derive(Default, Deserialize)]
+struct OutcomeRuntimeMetadata {
+    #[serde(default)]
+    project_id: Option<String>,
+    #[serde(default)]
+    supervised_root_outcomes: Option<SupervisedRootOutcomes>,
 }
 
 /// Census-only ordinary identity and raw Project, without compatibility trimming.
@@ -373,8 +450,8 @@ impl FlatAuthority {
                 .unwrap_or_else(|| Ok(T::default()))
         }
         let metadata: ProjectMetadata = default(fields, "metadata")?;
-        let runtime: Option<ProjectMetadata> = default(fields, "runtime_metadata")?;
-        Ok(CompactMainAuthority {
+        let runtime: Option<OutcomeRuntimeMetadata> = default(fields, "runtime_metadata")?;
+        let mut authority = CompactMainAuthority {
             id: get(fields, "id")?,
             created_at: get(fields, "created_at")?,
             kind: default(fields, "kind")?,
@@ -385,7 +462,8 @@ impl FlatAuthority {
             authority_identity: get_or_unique_default(fields, "authority_identity")?,
             metadata_version: default(fields, "metadata_version")?,
             project_id: runtime
-                .and_then(|meta| meta.project_id)
+                .as_ref()
+                .and_then(|meta| meta.project_id.clone())
                 .or(metadata.project_id),
             root_orchestration_only: default(fields, "root_orchestration_only")?,
             root_tool_authority_revision: default(fields, "root_tool_authority_revision")?,
@@ -393,8 +471,13 @@ impl FlatAuthority {
             root_mode_operations: get_or_unique_default(fields, "root_mode_operations")?,
             supervisor_management: get_or_unique_default(fields, "supervisor_management")?,
             conversation_reset: get_or_unique_default(fields, "conversation_reset")?,
+            supervised_root_outcomes_sha256: None,
             title_label: public_title(&default::<String>(fields, "title")?),
-        })
+        };
+        if let Some(outcomes) = runtime.and_then(|meta| meta.supervised_root_outcomes) {
+            authority.supervised_root_outcomes_sha256 = Some(authority.commitment(&outcomes)?);
+        }
+        Ok(authority)
     }
 }
 
