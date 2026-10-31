@@ -644,6 +644,31 @@ async fn publish_dependent_config<T>(
     })
 }
 
+/// Publish the operator's retry policy to the provider layer.
+///
+/// Called at startup and after every applied configuration change, so a
+/// settings-page edit takes effect on the next request instead of requiring a
+/// process restart. A rejected value is reported and the previous policy stays
+/// in place rather than silently widening the retry loop.
+pub(crate) fn apply_llm_retry_policy(config: &bamboo_config::Config) {
+    let policy = config.llm_retry;
+    if let Err(error) = policy.validate() {
+        tracing::warn!("llm_retry rejected: {error}; keeping the previous initial-request policy");
+        return;
+    }
+    bamboo_llm::retry::configure(
+        bamboo_llm::retry::InitialRequestLimits {
+            total_budget: std::time::Duration::from_millis(policy.total_budget_ms),
+            attempt_timeout: std::time::Duration::from_millis(policy.attempt_timeout_ms),
+        },
+        bamboo_llm::retry::RetryConfig {
+            max_attempts: policy.max_attempts,
+            base_delay: std::time::Duration::from_millis(policy.base_delay_ms),
+            max_delay: std::time::Duration::from_millis(policy.max_delay_ms),
+        },
+    );
+}
+
 fn project_dependent_section_candidate(
     id: SectionId,
     data: &Value,
@@ -664,6 +689,7 @@ fn project_dependent_section_candidate(
             candidate.worktrees = section.worktrees;
             candidate.run_budget = section.run_budget;
             candidate.stream_timeout = section.stream_timeout;
+            candidate.llm_retry = section.llm_retry;
             candidate.context_management = section.context_management;
             candidate.extra = section.extra;
         }
@@ -1912,6 +1938,7 @@ async fn reload_and_apply_ordinary_sections(
     let publishes_env = applied.iter().any(|(id, _)| *id == SectionId::Env);
     let enforcement_newly_off = !enforcement_was_off && current.plugin_trust.enforcement_is_off();
     *config.write().await = current.clone();
+    apply_llm_retry_policy(&current);
     if publishes_env {
         current.publish_env_vars();
     }
@@ -2258,6 +2285,7 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.worktrees = source.worktrees.clone();
             target.run_budget = source.run_budget;
             target.stream_timeout = source.stream_timeout;
+            target.llm_retry = source.llm_retry;
             target.context_management = source.context_management.clone();
             target.extra = source.extra.clone();
         }

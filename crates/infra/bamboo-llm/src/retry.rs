@@ -199,7 +199,7 @@ where
     F: Fn() -> RequestBuilder,
 {
     claim_work_physical_request()?;
-    send_managed_request(config, provider, *initial_request_limits(), build).await
+    send_managed_request(config, provider, initial_request_limits(), build).await
 }
 
 // The timeout owns only the headers future, never the successful SSE body.
@@ -348,14 +348,52 @@ impl RetryConfig {
     }
 }
 
-/// Process-wide retry config, resolved from the environment on first use.
+/// One immutable snapshot of the operator-tunable initial-request policy.
+///
+/// Both halves travel together: a retry loop is only meaningful together with
+/// the deadline and budget it may spend, so they are replaced atomically rather
+/// than as two independent globals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LiveRequestPolicy {
+    limits: InitialRequestLimits,
+    retry: RetryConfig,
+}
+
+/// Process-wide retry config.
 ///
 /// Providers don't carry a `RetryConfig` field (keeps their structs and the
 /// many constructors untouched); they call [`global`] at the send site instead.
-/// The env vars are read exactly once.
-pub fn global() -> &'static RetryConfig {
-    static CONFIG: OnceLock<RetryConfig> = OnceLock::new();
-    CONFIG.get_or_init(RetryConfig::from_env)
+/// The environment is the initial source, and the owner of the live
+/// configuration may replace it later with [`configure`] so a settings-page
+/// change takes effect without a process restart.
+pub fn global() -> RetryConfig {
+    live_policy()
+        .map(|policy| policy.retry)
+        .unwrap_or_else(RetryConfig::from_env)
+}
+
+/// Replace the process-wide initial-request policy from a validated
+/// configuration value. Called by the configuration owner on startup and on
+/// every applied change; providers read it at the next send.
+pub fn configure(policy: InitialRequestLimits, retry: RetryConfig) {
+    let mut stored = policy_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *stored = Some(LiveRequestPolicy {
+        limits: policy,
+        retry,
+    });
+}
+
+fn policy_slot() -> &'static Mutex<Option<LiveRequestPolicy>> {
+    static POLICY: OnceLock<Mutex<Option<LiveRequestPolicy>>> = OnceLock::new();
+    POLICY.get_or_init(|| Mutex::new(None))
+}
+
+fn live_policy() -> Option<LiveRequestPolicy> {
+    *policy_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Whether an HTTP status code represents a *transient* upstream failure that is

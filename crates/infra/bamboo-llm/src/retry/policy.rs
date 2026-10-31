@@ -40,9 +40,17 @@ pub struct InitialRequestLimits {
 
 impl Default for InitialRequestLimits {
     fn default() -> Self {
+        // A headers deadline is a *discard* decision: the whole request body is
+        // dropped and re-sent. Observed real latency makes a short one harmful
+        // rather than protective — p95 first-byte latency is ~40s and the tail
+        // runs into minutes when a shared gateway queues a request behind
+        // others or prefill covers a few hundred thousand prompt tokens.
+        // A deadline sitting at the median (20s) therefore discards requests
+        // that were about to succeed, and repeating the attempt resends the
+        // body instead of letting one in-flight request finish.
         Self {
-            total_budget: Duration::from_secs(120),
-            attempt_timeout: Duration::from_secs(20),
+            total_budget: Duration::from_secs(600),
+            attempt_timeout: Duration::from_secs(180),
         }
     }
 }
@@ -66,7 +74,7 @@ impl InitialRequestLimits {
             attempt_timeout: duration(
                 "BAMBOO_LLM_RETRY_ATTEMPT_TIMEOUT_MS",
                 defaults.attempt_timeout,
-                60_000,
+                600_000,
             ),
         }
     }
@@ -74,9 +82,10 @@ impl InitialRequestLimits {
 
 /// Operator settings are read once, like the existing retry count/backoff env.
 /// Invalid or overflowing values retain finite defaults. No live config writes.
-pub fn initial_request_limits() -> &'static InitialRequestLimits {
-    static LIMITS: OnceLock<InitialRequestLimits> = OnceLock::new();
-    LIMITS.get_or_init(|| InitialRequestLimits::from_lookup(|key| std::env::var(key).ok()))
+pub fn initial_request_limits() -> InitialRequestLimits {
+    super::live_policy()
+        .map(|policy| policy.limits)
+        .unwrap_or_else(|| InitialRequestLimits::from_lookup(|key| std::env::var(key).ok()))
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -122,6 +131,45 @@ mod tests {
                 InitialRequestLimits::default()
             );
         }
+    }
+
+    /// The default headers deadline must stay well clear of ordinary
+    /// first-byte latency, and the operator ceiling must not be tighter than
+    /// the deadline it is supposed to bound.
+    #[test]
+    fn defaults_tolerate_slow_first_byte_and_the_ceiling_admits_them() {
+        let defaults = InitialRequestLimits::default();
+        assert_eq!(defaults.attempt_timeout, Duration::from_secs(180));
+        assert_eq!(defaults.total_budget, Duration::from_secs(600));
+        assert!(defaults.attempt_timeout < defaults.total_budget);
+
+        let ceiling = InitialRequestLimits::from_lookup(|key| {
+            Some(
+                match key {
+                    "BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS" => "3600000",
+                    _ => "600000",
+                }
+                .into(),
+            )
+        });
+        assert_eq!(ceiling.attempt_timeout, Duration::from_secs(600));
+        assert_eq!(ceiling.total_budget, Duration::from_secs(3_600));
+
+        // One millisecond past the ceiling is not silently clamped; it falls
+        // back to the finite default instead of widening the policy.
+        assert_eq!(
+            InitialRequestLimits::from_lookup(|key| Some(
+                match key {
+                    "BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS" => "3600000",
+                    _ => "600001",
+                }
+                .into(),
+            )),
+            InitialRequestLimits {
+                total_budget: Duration::from_secs(3_600),
+                attempt_timeout: defaults.attempt_timeout,
+            }
+        );
     }
 
     #[test]
