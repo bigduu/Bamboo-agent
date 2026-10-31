@@ -195,85 +195,56 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
     command_by(repo, args, Instant::now() + git_command_timeout())
 }
 
-/// Discovers the `filter.<driver>.<kind>` overrides that disable external
-/// content filters for one repository.
-///
-/// Reading configuration names does not execute filters. Include every scope
-/// and include file, but never read or log their potentially secret values.
-/// Bounded too: an include file can live on stalled storage. The answer is a
-/// repository-level fact, so one scan computes it once for every checkout.
-fn filter_overrides(repo: &Path, deadline_at: Instant) -> Result<Vec<String>, String> {
-    let mut probe = git_command(repo);
-    probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
-    let configured = bounded_output(probe, deadline_at)
-        .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
-    if !configured.status.success() {
-        return Err(format!(
-            "Cannot inspect Git filter configuration: {}",
-            String::from_utf8_lossy(&configured.stderr).trim()
-        ));
-    }
-    let names =
-        std::str::from_utf8(&configured.stdout).map_err(|_| "Git filter names must be UTF-8")?;
-    let mut drivers = std::collections::BTreeSet::new();
-    for name in names.split('\0') {
-        if let Some((driver, kind)) = name
-            .strip_prefix("filter.")
-            .and_then(|s| s.rsplit_once('.'))
-        {
-            if matches!(kind, "clean" | "smudge" | "process") {
-                // -c splits at the first '='. Never let a subsection name
-                // change which key is overridden.
-                if driver.contains('=') {
-                    return Err("Git filter names containing '=' are unsupported".into());
-                }
-                drivers.insert(driver);
-            }
-        }
-    }
-    let mut overrides = Vec::new();
-    for driver in drivers {
-        for kind in ["clean", "smudge", "process"] {
-            overrides.push("-c".to_string());
-            overrides.push(format!("filter.{driver}.{kind}="));
-        }
-        // A checkout needing conversion must fail explicitly, rather than
-        // silently materialize raw pointers or report an inaccurate status.
-        overrides.push("-c".to_string());
-        overrides.push(format!("filter.{driver}.required=true"));
-    }
-    Ok(overrides)
-}
-
 /// Runs one Git command, bounded by `deadline_at`. The effective ceiling is
 /// also capped by the per-command ceiling, so one slow entry can never spend
 /// a whole inventory budget on a single child.
 fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output, String> {
-    command_with_overrides(repo, args, deadline_at, None)
-}
-
-/// Runs one Git command with optional precomputed filter overrides. A scan
-/// resolves them once per repository and reuses them for every checkout, which
-/// removes one Git spawn per inspected entry.
-fn command_with_overrides(
-    repo: &Path,
-    args: &[&str],
-    deadline_at: Instant,
-    overrides: Option<&[String]>,
-) -> Result<Output, String> {
     let ceiling = Instant::now() + git_command_timeout();
     let deadline_at = deadline_at.min(ceiling);
     let mut command = git_command(repo);
     if matches!(args.first(), Some(&"status" | &"read-tree"))
         || args.starts_with(&["worktree", "add"])
     {
-        match overrides {
-            Some(precomputed) => {
-                command.args(precomputed);
+        // Reading configuration names does not execute filters. Include every
+        // scope and include file, but never read/log their potentially secret
+        // values. Bounded too: an include file can live on stalled storage.
+        // Resolved in this checkout's own context: `extensions.worktreeConfig`
+        // can give a linked checkout a filter the parent repository lacks.
+        let mut probe = git_command(repo);
+        probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
+        let configured = bounded_output(probe, deadline_at)
+            .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
+        if !configured.status.success() {
+            return Err(format!(
+                "Cannot inspect Git filter configuration: {}",
+                String::from_utf8_lossy(&configured.stderr).trim()
+            ));
+        }
+        let names = std::str::from_utf8(&configured.stdout)
+            .map_err(|_| "Git filter names must be UTF-8")?;
+        let mut drivers = std::collections::BTreeSet::new();
+        for name in names.split('\0') {
+            if let Some((driver, kind)) = name
+                .strip_prefix("filter.")
+                .and_then(|s| s.rsplit_once('.'))
+            {
+                if matches!(kind, "clean" | "smudge" | "process") {
+                    // -c splits at the first '='. Never let a subsection name
+                    // change which key is overridden.
+                    if driver.contains('=') {
+                        return Err("Git filter names containing '=' are unsupported".into());
+                    }
+                    drivers.insert(driver);
+                }
             }
-            None => {
-                command.args(filter_overrides(repo, deadline_at)?);
+        }
+        for driver in drivers {
+            for kind in ["clean", "smudge", "process"] {
+                command.args(["-c", &format!("filter.{driver}.{kind}=")]);
             }
+            // A checkout needing conversion must fail explicitly, rather than
+            // silently materialize raw pointers or report an inaccurate status.
+            command.args(["-c", &format!("filter.{driver}.required=true")]);
         }
     }
     command.args(args);
@@ -285,17 +256,7 @@ fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 fn git_bytes_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Vec<u8>, String> {
-    git_bytes_with(repo, args, deadline_at, None)
-}
-
-/// Byte-returning variant that reuses precomputed filter overrides.
-fn git_bytes_with(
-    repo: &Path,
-    args: &[&str],
-    deadline_at: Instant,
-    overrides: Option<&[String]>,
-) -> Result<Vec<u8>, String> {
-    let output = command_with_overrides(repo, args, deadline_at, overrides)?;
+    let output = command_by(repo, args, deadline_at)?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         let guidance = if diagnostic.contains(": smudge filter ")
@@ -951,12 +912,12 @@ struct Inspection {
 /// attacker-influenced (`gitdir: /repo/.git/../../other/.git` passes any prefix
 /// test while resolving to a foreign repository) and reading it is unbounded
 /// I/O, which a stalled checkout turns into a hang the deadline cannot stop.
-fn inspect_checkout(
-    checkout: &Path,
-    common: &Path,
-    filters: &[String],
-    deadline: Instant,
-) -> Inspection {
+///
+/// Filter overrides are discovered per checkout, not once per repository:
+/// `extensions.worktreeConfig` lets a linked checkout carry its own filter
+/// configuration, so a repository-level answer would miss a driver that this
+/// checkout's `status` would still load and execute.
+fn inspect_checkout(checkout: &Path, common: &Path, deadline: Instant) -> Inspection {
     let mut outcome = Inspection::default();
     if Instant::now() >= deadline {
         outcome.error =
@@ -1005,7 +966,7 @@ fn inspect_checkout(
     let has_submodules = index
         .split(|byte| *byte == 0)
         .any(|entry| entry.starts_with(b"160000 "));
-    let status = match git_bytes_with(
+    let status = match git_bytes_by(
         &canonical,
         &[
             "status",
@@ -1015,7 +976,6 @@ fn inspect_checkout(
             "--ignore-submodules=dirty",
         ],
         deadline,
-        Some(filters),
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1103,16 +1063,16 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
     // shared `deadline` still bounds the whole phase and every child keeps its
     // per-command ceiling, so one stalled checkout cannot block the scan.
     //
-    // Filter overrides are a repository-level fact, resolved once here instead
-    // of once per checkout. A probe failure degrades every entry the same way
-    // the per-entry probe used to, but costs a single child rather than N.
+    // Filter overrides stay per checkout: `git status` applies this checkout's
+    // effective filter configuration, so suppressing a driver must be decided
+    // in that same context. Discovering it once per repository would miss a
+    // `extensions.worktreeConfig` driver defined only on a linked checkout.
     let mut outcomes: Vec<(usize, Inspection)> = Vec::new();
     if !pending.is_empty() {
-        let filters = filter_overrides(repo, deadline).unwrap_or_default();
         let workers = inspect_concurrency().min(pending.len());
         let cursor = std::sync::atomic::AtomicUsize::new(0);
         let collected: Mutex<Vec<(usize, Inspection)>> = Mutex::new(Vec::new());
-        let (pending_ref, common_ref, filters_ref) = (&pending, &common, &filters);
+        let (pending_ref, common_ref) = (&pending, &common);
         let (cursor_ref, collected_ref) = (&cursor, &collected);
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -1121,7 +1081,7 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
                     let Some((index, path)) = pending_ref.get(next) else {
                         break;
                     };
-                    let outcome = inspect_checkout(path, common_ref, filters_ref, deadline);
+                    let outcome = inspect_checkout(path, common_ref, deadline);
                     if let Ok(mut rows) = collected_ref.lock() {
                         rows.push((*index, outcome));
                     }
@@ -2726,10 +2686,9 @@ mod tests {
         // Serial reference: inspect each entry on its own.
         let common = repository(&f.repo()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
-        let filters = filter_overrides(&f.repo(), deadline).unwrap();
         let mut serial = Vec::new();
         for path in &expected {
-            serial.push(inspect_checkout(path, &common, &filters, deadline).dirty);
+            serial.push(inspect_checkout(path, &common, deadline).dirty);
         }
         // Concurrent path: the same work through the production scan.
         let entries = list_until(&f.repo(), Instant::now() + Duration::from_secs(30)).unwrap();
