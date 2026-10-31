@@ -316,11 +316,15 @@ fn adopt_root_publication(
         ));
     }
     ensure_conversation_generation_is_current(session, &committed)?;
-    // These three fields are #[serde(skip)] runtime-only state: the committed
-    // snapshot is the persisted copy and therefore always carries None. Adopting
-    // it must not erase the live round's values, or downstream dispatch loses the
-    // resolved tool-output cap (native skill calls then fail with "requires a
-    // known current tool-output cap") and the manual-compression request.
+    // These three fields are #[serde(skip)] runtime-only state. The persisted
+    // copy never carries `resolved_token_budget` or `force_manual_compression`,
+    // so adopting it would erase the live round's values: downstream dispatch
+    // then loses the resolved tool-output cap (native skill calls fail with
+    // "requires a known current tool-output cap") and the manual-compression
+    // request. `observed_runtime_session_version` may be re-stamped by the
+    // sidecar overlay; keeping the caller's observation is still correct
+    // because the reachable callers already passed the generation and
+    // session-version compatibility checks below/upstream.
     let mut adopted = committed;
     adopted.resolved_token_budget = session.resolved_token_budget.clone();
     adopted.observed_runtime_session_version = session.observed_runtime_session_version;

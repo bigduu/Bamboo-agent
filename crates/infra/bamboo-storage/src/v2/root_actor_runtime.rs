@@ -409,7 +409,11 @@ impl SessionStoreV2 {
         let committed = Self::default_writer_job(&guards, move || proof.validate()).await?;
         self.publish_root_actor_runtime(&guards, publish).await?;
         // Same #1053 constraint as session_merge::adopt_root_publication: the
-        // persisted proof copy never carries #[serde(skip)] runtime-only state.
+        // persisted proof copy never carries `resolved_token_budget` or
+        // `force_manual_compression`, so adopting it would erase the live
+        // round's values. `observed_runtime_session_version` may be re-stamped
+        // by the sidecar overlay; keeping the caller's observation is still
+        // correct because this path already verified the finalized source.
         let mut adopted = committed;
         adopted.resolved_token_budget = session.resolved_token_budget.clone();
         adopted.observed_runtime_session_version = session.observed_runtime_session_version;
