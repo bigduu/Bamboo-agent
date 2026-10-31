@@ -1147,14 +1147,11 @@ async fn admit_session_inbox(
             .session_inbox_admission_mut()
             .record(claim.envelope.id.clone(), claim.generation);
         session.updated_at = chrono::Utc::now();
-        // Canonical Human UI engagement mark: only interactive `user`-source
-        // user_input envelopes record the takeover signal. Peer/host dispatch
-        // (Supervisor followup/create first input) uses `Session`/`PeerMessage`
-        // and must never pollute it.
-        if !transcript_has_id
-            && claim.envelope.source == bamboo_domain::SessionMessageSource::User
-            && claim.envelope.kind == bamboo_domain::SessionMessageKind::UserInput
-        {
+        // Canonical Human UI engagement mark: only interactive human input
+        // (plain user/UserInput or the prompt-wrapped chat turn) stamps the
+        // takeover signal. Peer/host dispatch (Supervisor followup/create
+        // first input) uses Session/PeerMessage and never pollutes it.
+        if !transcript_has_id && claim.envelope.is_human_interactive_input() {
             let mark = bamboo_domain::HumanInputMark::user(claim.envelope.created_at);
             match session.agent_runtime_state.as_mut() {
                 Some(state) => state.set_last_human_input(mark),
@@ -3022,6 +3019,38 @@ mod tests {
                 .and_then(|state| state.last_human_input.clone())
                 .is_none(),
             "peer/host dispatch never pollutes the human engagement signal"
+        );
+    }
+
+    /// Codex P2 round-3: a prompt-wrapped chat turn (Runtime/chat +
+    /// root_chat_turn_v1, produced by `with_root_chat_prompt` when a user
+    /// turn also changes the system prompt) is still canonical human input
+    /// and must stamp the engagement mark.
+    #[tokio::test]
+    async fn prompt_wrapped_chat_turn_records_human_engagement() {
+        let (_home, store, locked, inbox, mut session) =
+            durable_inbox_fixture("engagement-wrapped").await;
+        let wrapped = SessionMessageEnvelope::user_input(&session.id, "human turn with prompt")
+            .with_root_chat_prompt("fixed provider system".into())
+            .expect("validated chat wrapper");
+        assert!(wrapped.is_human_interactive_input());
+        deliver_interrupt_eligible(&inbox, &wrapped).await;
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+        refresh_turn_boundary_with_inbox(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+        )
+        .await;
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.last_human_input.clone()),
+            Some(bamboo_domain::HumanInputMark::user(wrapped.created_at)),
+            "the prompt-wrapped canonical chat turn records the engagement mark"
         );
     }
 

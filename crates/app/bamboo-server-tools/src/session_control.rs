@@ -732,6 +732,13 @@ impl Tool for SessionControlTool {
                 actions.push(json!("directory"));
             }
             action["enum"] = Value::Array(actions);
+            // Installing directory alone must stay independently usable: the
+            // top-level requirement narrows to `action` (the followup/loop
+            // variants keep their own target requirements). Without this, the
+            // directory variant's target_session_id:false makes every
+            // directory request invalid against the advertised schema.
+            let required = schema["required"].as_array_mut().unwrap();
+            required.retain(|field| field == "action");
             schema["properties"]["query"] = json!({"type": ["string", "null"], "maxLength": 128,
                 "description": "directory only: optional lexical filter over session_id/project_id/title."});
             schema["properties"]["limit"] = json!({"type": ["integer", "null"], "minimum": 1, "maximum": 20,

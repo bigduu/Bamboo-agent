@@ -52,6 +52,13 @@ async fn session_control_schema_keeps_directory_params_with_root_run_installed()
     ));
     let tool = bamboo_server_tools::SessionControlTool::new(messenger).with_directory(directory);
     let schema = tool.parameters_schema();
+    // Codex P2: directory-only installation must narrow the top-level
+    // requirement to `action` so directory requests are schema-valid.
+    assert_eq!(
+        schema["required"],
+        serde_json::json!(["action"]),
+        "directory-only install must require only action at top level"
+    );
     let variant = schema["oneOf"]
         .as_array()
         .unwrap()

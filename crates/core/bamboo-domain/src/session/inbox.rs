@@ -493,6 +493,29 @@ impl SessionMessageEnvelope {
             })
     }
 
+    /// Canonical human interactive input, in either wire shape: the plain
+    /// `user`/`UserInput` envelope, or the prompt-wrapped chat turn that
+    /// `with_root_chat_prompt` rebased onto `Runtime{subsystem:"chat"}` /
+    /// `RuntimeInstruction{instruction:"root_chat_turn_v1"}` while retaining
+    /// its validated User content. Other runtime instructions and all
+    /// peer/host dispatch stay excluded. Used for the session-level Human
+    /// engagement mark; observational only, never authority.
+    pub fn is_human_interactive_input(&self) -> bool {
+        if self.source == SessionMessageSource::User && self.kind == SessionMessageKind::UserInput {
+            return true;
+        }
+        self.source
+            == (SessionMessageSource::Runtime {
+                subsystem: "chat".into(),
+            })
+            && self.kind == SessionMessageKind::RuntimeInstruction
+            && matches!(
+                &self.body,
+                SessionMessageBody::RuntimeInstruction(instruction)
+                    if instruction.instruction == "root_chat_turn_v1"
+            )
+    }
+
     pub fn guidance_waits_for_run(&self, run_id: &str) -> bool {
         self.is_guidance()
             && self
