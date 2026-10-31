@@ -600,6 +600,10 @@ async fn publish_dependent_config<T>(
         #[cfg(test)]
         run_generic_before_provider_publish_test_hook(&context.app_data_dir);
         *live_config = candidate.clone();
+        // The registry suppresses self-write echoes, so the watcher will not
+        // repair this omission: an accepted Core write must publish the policy
+        // here or the API edit would not govern the next request.
+        apply_llm_retry_policy(&candidate);
         if let Some(staged) = staged {
             context.provider_registry.replace_with(staged.registry);
             if let Some(provider) = staged.provider {

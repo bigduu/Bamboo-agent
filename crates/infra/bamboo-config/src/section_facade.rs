@@ -1904,6 +1904,7 @@ fn validate_json_serializable<T: Serialize>(value: &T) -> Result<(), String> {
 
 fn validate_core(value: &CoreSection) -> Result<(), String> {
     value.stream_timeout.validate()?;
+    value.llm_retry.validate()?;
     value.context_management.validate()?;
     validate_secret_free_http_url("HTTP proxy", &value.http_proxy, true)?;
     validate_secret_free_http_url("HTTPS proxy", &value.https_proxy, true)?;

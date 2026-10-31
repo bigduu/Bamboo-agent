@@ -20,6 +20,22 @@ async fn request_sink() -> MockServer {
 }
 
 async fn configured_state(proxy: &str) -> (tempfile::TempDir, AppState) {
+    // Building an AppState publishes the default retry policy process-wide (the
+    // builder does that for real startup too). Every builder in this module
+    // therefore holds this guard, so a test that must observe the published
+    // policy is not raced by a sibling test's AppState construction.
+    let _guard = policy_lock().lock().await;
+    configured_state_inner(proxy).await
+}
+
+/// Serializes AppState construction against tests that read the process-global
+/// retry policy.
+fn policy_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn configured_state_inner(proxy: &str) -> (tempfile::TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(
         dir.path().join("config.json"),
@@ -410,4 +426,76 @@ async fn dependent_cancelled_commit_finishes_before_later_configuration_generati
     let requests = second.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     assert!(!String::from_utf8_lossy(&requests[0].body).contains("project-code"));
+}
+
+/// An accepted Core API write must reach the provider layer immediately. The
+/// registry suppresses self-write echoes, so if publication only happened on
+/// watcher reloads the settings page would appear to save while requests kept
+/// using the previous policy until a restart or an unrelated edit.
+#[tokio::test]
+async fn accepted_core_write_publishes_the_llm_retry_policy_to_the_provider_layer() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x63; 32]);
+    // Hold the builder guard across build + write + read: a sibling test's
+    // AppState construction would otherwise republish the defaults mid-flight.
+    let _guard = policy_lock().lock().await;
+    let sink = request_sink().await;
+    let (_dir, state) = configured_state_inner(&sink.uri()).await;
+
+    // Restore afterwards: the policy is process-global.
+    let previous_retry = bamboo_llm::retry::global();
+    let previous_limits = bamboo_llm::retry::initial_request_limits();
+
+    let mut core = section(&state, SectionId::Core);
+    core.data["llm_retry"] = serde_json::json!({
+        "max_attempts": 11,
+        "attempt_timeout_ms": 240_000,
+        "total_budget_ms": 1_800_000,
+        "base_delay_ms": 900,
+        "max_delay_ms": 45_000,
+    });
+    let committed = state
+        .put_ordinary_section(SectionId::Core, core.revision, core.data)
+        .await
+        .unwrap();
+    assert_eq!(committed.data["llm_retry"]["max_attempts"], 11);
+
+    let published = bamboo_llm::retry::global();
+    let limits = bamboo_llm::retry::initial_request_limits();
+    bamboo_llm::retry::configure(previous_limits, previous_retry);
+
+    assert_eq!(published.max_attempts, 11);
+    assert_eq!(published.base_delay, Duration::from_millis(900));
+    assert_eq!(published.max_delay, Duration::from_millis(45_000));
+    assert_eq!(limits.attempt_timeout, Duration::from_millis(240_000));
+    assert_eq!(limits.total_budget, Duration::from_millis(1_800_000));
+}
+
+/// An out-of-range policy must be rejected before it is committed, so the API
+/// cannot report success for settings that requests would refuse to use.
+#[tokio::test]
+async fn core_write_rejects_an_invalid_llm_retry_policy_before_committing() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x64; 32]);
+    let sink = request_sink().await;
+    let (_dir, state) = configured_state(&sink.uri()).await;
+
+    let mut core = section(&state, SectionId::Core);
+    core.data["llm_retry"] = serde_json::json!({
+        "max_attempts": 0,
+        "attempt_timeout_ms": 180_000,
+        "total_budget_ms": 900_000,
+        "base_delay_ms": 500,
+        "max_delay_ms": 30_000,
+    });
+    assert!(
+        state
+            .put_ordinary_section(SectionId::Core, core.revision, core.data)
+            .await
+            .is_err(),
+        "max_attempts: 0 must not be accepted"
+    );
+    assert_ne!(
+        state.config.read().await.llm_retry.max_attempts,
+        0,
+        "the rejected policy must not reach the live configuration"
+    );
 }
