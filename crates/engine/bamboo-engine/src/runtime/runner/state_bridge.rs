@@ -1125,6 +1125,24 @@ async fn admit_session_inbox(
             .session_inbox_admission_mut()
             .record(claim.envelope.id.clone(), claim.generation);
         session.updated_at = chrono::Utc::now();
+        // Canonical Human UI engagement mark: only interactive `user`-source
+        // user_input envelopes record the takeover signal. Peer/host dispatch
+        // (Supervisor followup/create first input) uses `Session`/`PeerMessage`
+        // and must never pollute it.
+        if !transcript_has_id
+            && claim.envelope.source == bamboo_domain::SessionMessageSource::User
+            && claim.envelope.kind == bamboo_domain::SessionMessageKind::UserInput
+        {
+            let mark = bamboo_domain::HumanInputMark::user(claim.envelope.created_at);
+            match session.agent_runtime_state.as_mut() {
+                Some(state) => state.set_last_human_input(mark),
+                None => {
+                    let mut state = bamboo_domain::AgentRuntimeState::new("");
+                    state.set_last_human_input(mark);
+                    session.agent_runtime_state = Some(state);
+                }
+            }
+        }
 
         // The provider-valid Message and bounded cursor live in the same
         // session.json atomic checkpoint. Only after that succeeds may ack
@@ -2856,6 +2874,78 @@ mod tests {
             .await
             .unwrap();
         receipt
+    }
+
+    #[tokio::test]
+    async fn user_input_admission_records_human_engagement_and_peer_dispatch_does_not() {
+        // Interactive UI route (source=User, kind=UserInput) stamps the mark.
+        let (_home, store, locked, inbox, mut session) =
+            durable_inbox_fixture("engagement-user").await;
+        let envelope = SessionMessageEnvelope::user_input(&session.id, "human takeover");
+        deliver_interrupt_eligible(&inbox, &envelope).await;
+        let storage: Arc<dyn Storage> = store.clone();
+        let persistence: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked;
+        refresh_turn_boundary_with_inbox(
+            &mut session,
+            Some(&storage),
+            Some(&persistence),
+            Some(&inbox),
+        )
+        .await;
+        let mark = session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.last_human_input.clone())
+            .expect("user-source user_input records the engagement mark");
+        assert_eq!(mark.at, envelope.created_at);
+        assert_eq!(mark.source, bamboo_domain::HumanInputSource::User);
+        let persisted = store.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            persisted
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.last_human_input.clone()),
+            Some(mark),
+            "the mark lives in the same atomic checkpoint as the message"
+        );
+
+        // Supervisor/host dispatch (source=Session, kind=PeerMessage) must not.
+        let (_home2, store2, locked2, inbox2, mut peer_session) =
+            durable_inbox_fixture("engagement-peer").await;
+        let peer = SessionMessageEnvelope {
+            id: bamboo_domain::SessionMessageId::new(),
+            source: bamboo_domain::SessionMessageSource::Session {
+                session_id: "dispatching-supervisor".into(),
+            },
+            target_session_id: peer_session.id.clone(),
+            kind: bamboo_domain::SessionMessageKind::PeerMessage,
+            body: bamboo_domain::SessionMessageBody::Content(
+                bamboo_domain::SessionMessageContent::text("supervisor followup"),
+            ),
+            created_at: chrono::Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        deliver_interrupt_eligible(&inbox2, &peer).await;
+        let storage2: Arc<dyn Storage> = store2.clone();
+        let persistence2: Arc<dyn bamboo_domain::RuntimeSessionPersistence> = locked2;
+        refresh_turn_boundary_with_inbox(
+            &mut peer_session,
+            Some(&storage2),
+            Some(&persistence2),
+            Some(&inbox2),
+        )
+        .await;
+        assert!(
+            peer_session
+                .agent_runtime_state
+                .as_ref()
+                .and_then(|state| state.last_human_input.clone())
+                .is_none(),
+            "peer/host dispatch never pollutes the human engagement signal"
+        );
     }
 
     #[tokio::test]

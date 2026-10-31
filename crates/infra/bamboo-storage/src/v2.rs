@@ -147,6 +147,8 @@ mod supervisor;
 mod supervisor_management;
 pub(crate) use supervisor_management::SupervisorFollowupGuard;
 #[cfg(test)]
+mod session_directory_tests;
+#[cfg(test)]
 mod supervisor_management_lifetime_tests;
 #[cfg(test)]
 mod supervisor_management_tests;
@@ -847,6 +849,12 @@ pub struct SessionIndexEntry {
     /// can display the question dialog badge without loading session.json.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// Latest canonical Human UI engagement mark, mirrored from
+    /// `session.agent_runtime_state.last_human_input`. Absent means no human
+    /// input was admitted through the interactive route since creation. This is
+    /// an observation fact for directory-style views; it grants no authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_human_input: Option<bamboo_domain::HumanInputMark>,
     /// Active plan mode runtime state mirrored into the index from
     /// `session.agent_runtime_state.plan_mode`, so lightweight session-list/detail
     /// APIs can surface plan mode without loading every session.json.
@@ -5210,6 +5218,10 @@ impl SessionStoreV2 {
             .as_ref()
             .map(|state| state.effective_permission_mode())
             .unwrap_or_default();
+        let last_human_input = session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.last_human_input.clone());
         let bypass_permissions = permission_mode != bamboo_domain::SessionPermissionMode::Default;
         // Placement (which machine the agent runs on) is stamped by the spawn
         // path into `metadata["placement"]` as a JSON `{kind,host}` object for
@@ -5250,6 +5262,7 @@ impl SessionStoreV2 {
             message_count: session.messages.len(),
             has_attachments,
             has_pending_question: session.has_pending_question(),
+            last_human_input,
             plan_mode,
             bypass_permissions,
             permission_mode,

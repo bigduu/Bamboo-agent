@@ -459,7 +459,13 @@ pub(super) fn build_root_tools(
             tools_with_schedule,
             Arc::new(
                 bamboo_server_tools::SessionControlTool::new(session_messenger.clone())
-                    .with_root_creator(root_creator),
+                    .with_root_creator(root_creator)
+                    .with_directory(Arc::new(
+                        crate::app_state::supervisor_directory::SupervisorSessionDirectory::new(
+                            storage.clone(),
+                            session_store.clone(),
+                        ),
+                    )),
             ),
         ));
 

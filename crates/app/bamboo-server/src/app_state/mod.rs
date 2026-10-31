@@ -653,3 +653,6 @@ mod local_task_conversation_tests;
 mod supervised_root_create_tests;
 
 pub(super) mod supervised_root_create;
+pub(super) mod supervisor_directory;
+#[cfg(test)]
+mod supervisor_directory_tests;
