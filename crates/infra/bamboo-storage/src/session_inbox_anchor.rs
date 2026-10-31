@@ -380,7 +380,8 @@ mod platform {
     };
     use windows_sys::Win32::Foundation::{
         HANDLE, INVALID_HANDLE_VALUE, OBJ_DONT_REPARSE, STATUS_NO_SUCH_FILE,
-        STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND, UNICODE_STRING,
+        STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+        UNICODE_STRING,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FileAttributeTagInfo, GetFileInformationByHandleEx, GetFileType, DELETE,
@@ -494,6 +495,12 @@ mod platform {
                     ErrorKind::NotFound,
                     "Inbox anchor name is absent",
                 )),
+                // A racing creator won this name; mapped so the lock retry loop
+                // reopens the name instead of aborting.
+                STATUS_OBJECT_NAME_COLLISION => Err(std::io::Error::new(
+                    ErrorKind::AlreadyExists,
+                    "Inbox anchor name already exists",
+                )),
                 _ => Err(rejected("Inbox anchor name was rejected")),
             };
         }
@@ -604,9 +611,16 @@ mod platform {
         to_dir: &File,
         to: &OsStr,
     ) -> std::io::Result<()> {
-        // The rename target is the file itself, opened only for its DELETE
-        // access so the directory entry can be replaced.
-        let file = open_relative(from_dir, from, false, FILE_OPEN, DELETE | SYNCHRONIZE)?;
+        // The rename target is the file itself, opened for its DELETE access so
+        // the directory entry can be replaced; FILE_READ_ATTRIBUTES backs the
+        // validation query every relative open performs.
+        let file = open_relative(
+            from_dir,
+            from,
+            false,
+            FILE_OPEN,
+            DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        )?;
         let units = name_units(to)?;
         let header = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
         let byte_len = units.len() * 2;
@@ -638,7 +652,13 @@ mod platform {
     }
 
     pub(super) fn remove(parent: &File, name: &OsStr) -> std::io::Result<()> {
-        let file = open_relative(parent, name, false, FILE_OPEN, DELETE | SYNCHRONIZE)?;
+        let file = open_relative(
+            parent,
+            name,
+            false,
+            FILE_OPEN,
+            DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES,
+        )?;
         // Deletion is bound to the retained handle and completes when it closes.
         let info = FILE_DISPOSITION_INFO { DeleteFile: true };
         set_information(
