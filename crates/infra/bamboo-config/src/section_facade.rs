@@ -24,10 +24,10 @@ use crate::{
     ConfigValues, ConnectConfig, ContextManagementConfig, CredentialRef, CredentialSource,
     CredentialStatus, CredentialStore, CredentialStoreHealth, DefaultWorkAreaConfig,
     DefaultsConfig, EnvVarEntry, FeatureFlags, GeminiModelMapping, HooksConfig,
-    KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, MemoryConfig, NotificationsConfig,
-    PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope,
-    SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig, StreamTimeoutConfig,
-    SubagentsConfig, ToolsConfig, WorktreeSettings,
+    KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, LlmRetryConfig, MemoryConfig,
+    NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
+    RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig,
+    StreamTimeoutConfig, SubagentsConfig, ToolsConfig, WorktreeSettings,
 };
 
 pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
@@ -342,6 +342,8 @@ pub struct CoreSection {
     pub run_budget: RunBudgetConfig,
     #[serde(default)]
     pub stream_timeout: StreamTimeoutConfig,
+    #[serde(default)]
+    pub llm_retry: LlmRetryConfig,
     #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
     pub context_management: ContextManagementConfig,
     /// Only genuinely unclassified root keys live here.
@@ -598,6 +600,7 @@ impl SectionProjection {
             features,
             run_budget,
             stream_timeout,
+            llm_retry,
             context_management,
             cluster_fabric,
             mcp,
@@ -620,6 +623,7 @@ impl SectionProjection {
                 worktrees,
                 run_budget,
                 stream_timeout,
+                llm_retry,
                 context_management,
                 extra,
             },
@@ -687,6 +691,7 @@ impl SectionProjection {
             worktrees,
             run_budget,
             stream_timeout,
+            llm_retry,
             context_management,
             extra,
         } = core;
@@ -742,6 +747,7 @@ impl SectionProjection {
                 features,
                 run_budget,
                 stream_timeout,
+                llm_retry,
                 context_management,
                 cluster_fabric: cluster_fabric.0,
                 mcp: mcp.0,
@@ -1898,6 +1904,7 @@ fn validate_json_serializable<T: Serialize>(value: &T) -> Result<(), String> {
 
 fn validate_core(value: &CoreSection) -> Result<(), String> {
     value.stream_timeout.validate()?;
+    value.llm_retry.validate()?;
     value.context_management.validate()?;
     validate_secret_free_http_url("HTTP proxy", &value.http_proxy, true)?;
     validate_secret_free_http_url("HTTPS proxy", &value.https_proxy, true)?;

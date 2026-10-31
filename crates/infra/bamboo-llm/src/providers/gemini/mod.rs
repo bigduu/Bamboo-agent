@@ -281,7 +281,7 @@ impl LLMProvider for GeminiProvider {
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
         let response =
-            crate::retry::send_provider_request(crate::retry::global(), "Gemini", || {
+            crate::retry::send_provider_request(&crate::retry::global(), "Gemini", || {
                 self.client
                     .post(&url)
                     .headers(headers.clone())

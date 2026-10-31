@@ -533,20 +533,20 @@ impl AnthropicProvider {
         // (429/5xx, connect/timeout). The closure rebuilds a fresh request each
         // attempt; the returned response body is unread, so streaming below is
         // unaffected (issue #18).
-        let request_budget = crate::retry::InitialRequestBudget::new(crate::retry::global())
+        // One request keeps one policy snapshot across its budget and its send,
+        // so a concurrent settings change cannot split them.
+        let retry_config = crate::retry::global();
+        let request_budget = crate::retry::InitialRequestBudget::new(&retry_config)
             .with_session_id(options.and_then(|o| o.session_id.as_deref()));
         let messages_url = format!("{}/messages", self.base_url);
-        let response = crate::retry::send_anthropic_with_retry(
-            crate::retry::global(),
-            &request_budget,
-            || {
+        let response =
+            crate::retry::send_anthropic_with_retry(&retry_config, &request_budget, || {
                 self.client
                     .post(&messages_url)
                     .headers(headers.clone())
                     .json(&body)
-            },
-        )
-        .await?;
+            })
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();

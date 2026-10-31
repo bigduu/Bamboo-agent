@@ -176,6 +176,132 @@ impl StreamTimeoutConfig {
     }
 }
 
+/// Bounds for the initial-request retry policy. The attempt ceiling keeps a
+/// configuration write from widening the HTTP retry loop beyond what the
+/// request budget can pay for.
+pub const MIN_LLM_RETRY_ATTEMPTS: u32 = 1;
+pub const MAX_LLM_RETRY_ATTEMPTS: u32 = 12;
+pub const MIN_LLM_RETRY_DELAY_MS: u64 = 1;
+pub const MAX_LLM_RETRY_DELAY_MS: u64 = 300_000;
+pub const MIN_LLM_RETRY_ATTEMPT_TIMEOUT_MS: u64 = 1_000;
+pub const MAX_LLM_RETRY_ATTEMPT_TIMEOUT_MS: u64 = 600_000;
+pub const MIN_LLM_RETRY_TOTAL_BUDGET_MS: u64 = 1_000;
+pub const MAX_LLM_RETRY_TOTAL_BUDGET_MS: u64 = 3_600_000;
+
+fn default_llm_retry_attempts() -> u32 {
+    // Eight attempts absorb a relay blip or a queue spike instead of losing the
+    // turn. An attempt is only re-sent after the previous one failed, so this
+    // raises tolerance without raising the successful-path cost.
+    8
+}
+
+fn default_llm_retry_attempt_timeout_ms() -> u64 {
+    180_000
+}
+
+fn default_llm_retry_total_budget_ms() -> u64 {
+    900_000
+}
+
+fn default_llm_retry_base_delay_ms() -> u64 {
+    500
+}
+
+fn default_llm_retry_max_delay_ms() -> u64 {
+    30_000
+}
+
+/// Initial-request retry policy, operator-tunable from the settings page.
+///
+/// Only establishment of the initial HTTP response is retried; a successful
+/// stream is never replayed. `attempt_timeout_ms` is a *discard* deadline: on
+/// expiry the whole request body is dropped and sent again, so it must clear
+/// real first-byte latency rather than the median.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LlmRetryConfig {
+    /// Total attempts including the first. `1` disables retrying.
+    #[serde(default = "default_llm_retry_attempts")]
+    pub max_attempts: u32,
+    /// Deadline for response headers on one attempt.
+    #[serde(default = "default_llm_retry_attempt_timeout_ms")]
+    pub attempt_timeout_ms: u64,
+    /// Absolute budget shared by every attempt of one initial request.
+    #[serde(default = "default_llm_retry_total_budget_ms")]
+    pub total_budget_ms: u64,
+    /// Base exponential backoff step.
+    #[serde(default = "default_llm_retry_base_delay_ms")]
+    pub base_delay_ms: u64,
+    /// Upper bound on any single computed backoff sleep.
+    #[serde(default = "default_llm_retry_max_delay_ms")]
+    pub max_delay_ms: u64,
+}
+
+impl Default for LlmRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_attempts: default_llm_retry_attempts(),
+            attempt_timeout_ms: default_llm_retry_attempt_timeout_ms(),
+            total_budget_ms: default_llm_retry_total_budget_ms(),
+            base_delay_ms: default_llm_retry_base_delay_ms(),
+            max_delay_ms: default_llm_retry_max_delay_ms(),
+        }
+    }
+}
+
+impl LlmRetryConfig {
+    /// Reject an out-of-range policy at the API boundary instead of letting it
+    /// widen the retry loop silently.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let checks = [
+            (
+                "max_attempts",
+                u64::from(self.max_attempts),
+                u64::from(MIN_LLM_RETRY_ATTEMPTS),
+                u64::from(MAX_LLM_RETRY_ATTEMPTS),
+            ),
+            (
+                "attempt_timeout_ms",
+                self.attempt_timeout_ms,
+                MIN_LLM_RETRY_ATTEMPT_TIMEOUT_MS,
+                MAX_LLM_RETRY_ATTEMPT_TIMEOUT_MS,
+            ),
+            (
+                "total_budget_ms",
+                self.total_budget_ms,
+                MIN_LLM_RETRY_TOTAL_BUDGET_MS,
+                MAX_LLM_RETRY_TOTAL_BUDGET_MS,
+            ),
+            (
+                "base_delay_ms",
+                self.base_delay_ms,
+                MIN_LLM_RETRY_DELAY_MS,
+                MAX_LLM_RETRY_DELAY_MS,
+            ),
+            (
+                "max_delay_ms",
+                self.max_delay_ms,
+                MIN_LLM_RETRY_DELAY_MS,
+                MAX_LLM_RETRY_DELAY_MS,
+            ),
+        ];
+        for (name, value, min, max) in checks {
+            if !(min..=max).contains(&value) {
+                return Err(format!(
+                    "{name} must be between {min} and {max}, got {value}"
+                ));
+            }
+        }
+        if self.base_delay_ms > self.max_delay_ms {
+            return Err(format!(
+                "base_delay_ms ({}) must not exceed max_delay_ms ({})",
+                self.base_delay_ms, self.max_delay_ms
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// A user-managed environment variable that is injected into Bash tool processes.
 ///
 /// Secret entries are stored by reference in the isolated credential store:
@@ -1852,6 +1978,13 @@ pub struct ConfigValues {
     #[serde(default)]
     pub stream_timeout: StreamTimeoutConfig,
 
+    /// Initial-request retry policy for transient transport failures and
+    /// retryable upstream statuses. Operator-tunable so a flaky or
+    /// heavily-queued relay can be tolerated without an environment variable
+    /// and a process restart.
+    #[serde(default)]
+    pub llm_retry: LlmRetryConfig,
+
     /// Host-owned strategy for bounding provider-visible conversation context.
     #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
     pub context_management: ContextManagementConfig,
@@ -1912,6 +2045,7 @@ impl Default for ConfigValues {
             headless_auth: false,
             run_budget: RunBudgetConfig::default(),
             stream_timeout: StreamTimeoutConfig::default(),
+            llm_retry: LlmRetryConfig::default(),
             context_management: ContextManagementConfig::default(),
             cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
@@ -2027,6 +2161,8 @@ struct ExecutionConfigSection {
     run_budget: RunBudgetConfig,
     #[serde(default)]
     stream_timeout: StreamTimeoutConfig,
+    #[serde(default)]
+    llm_retry: LlmRetryConfig,
     #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
     context_management: ContextManagementConfig,
     #[serde(
@@ -2142,6 +2278,7 @@ impl From<ConfigValues> for ConfigRoot {
             features,
             run_budget,
             stream_timeout,
+            llm_retry,
             context_management,
             cluster_fabric,
             mcp,
@@ -2185,6 +2322,7 @@ impl From<ConfigValues> for ConfigRoot {
                 features,
                 run_budget,
                 stream_timeout,
+                llm_retry,
                 context_management,
                 cluster_fabric,
             },
@@ -2246,6 +2384,7 @@ impl From<ConfigRoot> for ConfigValues {
             features,
             run_budget,
             stream_timeout,
+            llm_retry,
             context_management,
             cluster_fabric,
         } = execution;
@@ -2281,6 +2420,7 @@ impl From<ConfigRoot> for ConfigValues {
             features,
             run_budget,
             stream_timeout,
+            llm_retry,
             context_management,
             cluster_fabric,
             mcp,
@@ -4807,6 +4947,7 @@ impl Config {
                 headless_auth: false,
                 run_budget: RunBudgetConfig::default(),
                 stream_timeout: StreamTimeoutConfig::default(),
+                llm_retry: LlmRetryConfig::default(),
                 context_management: ContextManagementConfig::default(),
                 cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
                 provider: default_provider(),
@@ -5877,6 +6018,77 @@ mod tests {
             .stream_timeout
             .validate()
             .expect("defaults are valid");
+    }
+
+    #[test]
+    fn llm_retry_defaults_load_from_a_config_without_the_key_and_tolerate_slow_routes() {
+        let root: ConfigRoot = serde_json::from_value(serde_json::json!({}))
+            .expect("legacy config without llm_retry should load");
+        let values = ConfigValues::from(root);
+        assert_eq!(values.llm_retry, LlmRetryConfig::default());
+        assert_eq!(values.llm_retry.max_attempts, 8);
+        assert_eq!(values.llm_retry.attempt_timeout_ms, 180_000);
+        assert_eq!(values.llm_retry.total_budget_ms, 900_000);
+        values.llm_retry.validate().expect("defaults are valid");
+    }
+
+    #[test]
+    fn llm_retry_rejects_out_of_range_or_inconsistent_policies() {
+        let valid = LlmRetryConfig::default();
+        assert!(valid.validate().is_ok());
+        for broken in [
+            LlmRetryConfig {
+                max_attempts: 0,
+                ..valid
+            },
+            LlmRetryConfig {
+                max_attempts: MAX_LLM_RETRY_ATTEMPTS + 1,
+                ..valid
+            },
+            LlmRetryConfig {
+                attempt_timeout_ms: 999,
+                ..valid
+            },
+            LlmRetryConfig {
+                attempt_timeout_ms: MAX_LLM_RETRY_ATTEMPT_TIMEOUT_MS + 1,
+                ..valid
+            },
+            LlmRetryConfig {
+                total_budget_ms: 0,
+                ..valid
+            },
+            LlmRetryConfig {
+                total_budget_ms: MAX_LLM_RETRY_TOTAL_BUDGET_MS + 1,
+                ..valid
+            },
+            // A base delay above the cap would never be honoured.
+            LlmRetryConfig {
+                base_delay_ms: 2_000,
+                max_delay_ms: 1_000,
+                ..valid
+            },
+        ] {
+            assert!(broken.validate().is_err(), "{broken:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn llm_retry_round_trips_through_its_section() {
+        let policy = LlmRetryConfig {
+            max_attempts: 12,
+            attempt_timeout_ms: 300_000,
+            total_budget_ms: 3_600_000,
+            base_delay_ms: 250,
+            max_delay_ms: 60_000,
+        };
+        let values = ConfigValues {
+            llm_retry: policy,
+            ..ConfigValues::default()
+        };
+        let json = serde_json::to_value(&values).expect("serialize");
+        assert_eq!(json["llm_retry"]["max_attempts"], 12);
+        let round_tripped: ConfigValues = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped.llm_retry, policy);
     }
 
     #[test]

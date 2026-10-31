@@ -261,7 +261,10 @@ impl InitialRequestDiagnosticFields {
             && self
                 .status
                 .is_none_or(|status| (100..=599).contains(&status))
-            && self.attempt_timeout_ms <= 60_000
+            // Ceiling, not a default: the provider policy may legitimately
+            // configure a long headers deadline for slow first-byte routes, and
+            // rejecting that receipt would silently drop the only evidence.
+            && self.attempt_timeout_ms <= 600_000
             && ["send_headers", "error_body", "response_status", "backoff"]
                 .contains(&self.phase.as_str())
             && ["unknown", "response_received"].contains(&self.upstream_outcome.as_str())
@@ -509,6 +512,25 @@ mod tests {
         let mut cleared = cold;
         cleared.clear_last_run_error();
         assert!(!cleared.metadata.contains_key(LAST_RUN_LLM_DIAGNOSTIC_KEY));
+    }
+
+    /// A slow-route policy is a supported configuration: its receipt must stay
+    /// readable instead of being dropped by a ceiling that only matched the
+    /// old short default.
+    #[test]
+    fn receipt_accepts_a_long_configured_headers_deadline_up_to_its_ceiling() {
+        let session = Session::new("slow-route", "model");
+        let mut bounded = serde_json::to_value(sample(&session)).unwrap();
+        bounded["attempt_timeout_ms"] = 180_000.into();
+        bounded["total_budget_ms"] = 600_000.into();
+        bounded["attempt_elapsed_ms"] = 180_000.into();
+        bounded["total_elapsed_ms"] = 600_000.into();
+        bounded["remaining_budget_ms"] = 0.into();
+        assert!(LlmRequestDiagnostic::from_json(&bounded.to_string()).is_some());
+        bounded["attempt_timeout_ms"] = 600_000.into();
+        assert!(LlmRequestDiagnostic::from_json(&bounded.to_string()).is_some());
+        bounded["attempt_timeout_ms"] = 600_001.into();
+        assert!(LlmRequestDiagnostic::from_json(&bounded.to_string()).is_none());
     }
 
     #[test]
