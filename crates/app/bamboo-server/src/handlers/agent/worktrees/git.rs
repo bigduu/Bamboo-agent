@@ -5,7 +5,21 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+/// Upper bound on Git children running at once during one inventory scan.
+/// Each child is a fork/exec (~10-30ms of pure startup), so inspection is
+/// dominated by process latency rather than by Git's own work; overlapping a
+/// bounded number of them removes most of the wall clock without letting a
+/// large Project flood the host with processes.
+fn inspect_concurrency() -> usize {
+    if cfg!(test) {
+        4
+    } else {
+        8
+    }
+}
 
 /// Hard ceiling for one Git child process. A checkout on slow or offline
 /// storage (for example macOS-evicted dataless files) can block `git status`
@@ -194,6 +208,8 @@ fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output
         // Reading configuration names does not execute filters. Include every
         // scope and include file, but never read/log their potentially secret
         // values. Bounded too: an include file can live on stalled storage.
+        // Resolved in this checkout's own context: `extensions.worktreeConfig`
+        // can give a linked checkout a filter the parent repository lacks.
         let mut probe = git_command(repo);
         probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
         let configured = bounded_output(probe, deadline_at)
@@ -235,6 +251,9 @@ fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output
     bounded_output(command, deadline_at).map_err(|e| format!("Git at {}: {e}", repo.display()))
 }
 
+/// Test-only convenience wrapper: production paths always pass a deadline
+/// through `git_bytes_by` so one child cannot outlive its share of the budget.
+#[cfg(test)]
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     git_bytes_by(repo, args, Instant::now() + git_command_timeout())
 }
@@ -876,10 +895,107 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
     list_until(repo, Instant::now() + list_inspect_budget())
 }
 
-/// Lists one repository's worktrees, inspecting entries only until
-/// `overall_deadline`. An inventory scans several repositories, so the caller
-/// shares one deadline across them: the per-repository budget alone would make
-/// the response unbounded in the number of repositories.
+/// Outcome of inspecting one checkout.
+///
+/// The caller must distinguish "identity did not verify" from "identity
+/// verified but the dirty state is unknown": a checkout becomes openable as
+/// soon as its identity verifies, even if the dirty answer never arrives.
+#[derive(Default)]
+struct Inspection {
+    canonical: PathBuf,
+    openable: bool,
+    dirty: Option<bool>,
+    error: Option<String>,
+}
+
+/// Inspects one checkout: identity, submodule presence, and dirty state.
+///
+/// Both identity facts come from Git itself, inside the bounded wrapper. They
+/// are deliberately not derived from the `.git` file: that path is
+/// attacker-influenced (`gitdir: /repo/.git/../../other/.git` passes any prefix
+/// test while resolving to a foreign repository) and reading it is unbounded
+/// I/O, which a stalled checkout turns into a hang the deadline cannot stop.
+///
+/// Filter overrides are discovered per checkout, not once per repository:
+/// `extensions.worktreeConfig` lets a linked checkout carry its own filter
+/// configuration, so a repository-level answer would miss a driver that this
+/// checkout's `status` would still load and execute.
+fn inspect_checkout(checkout: &Path, common: &Path, deadline: Instant) -> Inspection {
+    let mut outcome = Inspection::default();
+    if Instant::now() >= deadline {
+        outcome.error =
+            Some("Inspection budget exhausted; dirty state is unknown for this checkout".into());
+        return outcome;
+    }
+    let canonical = match fs::canonicalize(checkout) {
+        Ok(path) => path,
+        Err(error) => {
+            outcome.error = Some(format!("{} is unavailable: {error}", checkout.display()));
+            return outcome;
+        }
+    };
+    let reported_common = match repository_by(&canonical, deadline) {
+        Ok(path) => path,
+        Err(error) => {
+            outcome.error = Some(error);
+            return outcome;
+        }
+    };
+    if reported_common != common {
+        outcome.error = Some("Worktree path now belongs to a different repository".into());
+        return outcome;
+    }
+    match workspace_root_by(&canonical, deadline) {
+        Ok(root) if root == canonical => {}
+        Ok(_) => {
+            outcome.error = Some("Worktree path now belongs to a different repository".into());
+            return outcome;
+        }
+        Err(error) => {
+            outcome.error = Some(error);
+            return outcome;
+        }
+    }
+    // Identity verified: the checkout is usable whatever the dirty answer is.
+    outcome.openable = true;
+    outcome.canonical = canonical.clone();
+    let index = match git_bytes_by(&canonical, &["ls-files", "--stage", "-z"], deadline) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            outcome.error = Some(error);
+            return outcome;
+        }
+    };
+    let has_submodules = index
+        .split(|byte| *byte == 0)
+        .any(|entry| entry.starts_with(b"160000 "));
+    let status = match git_bytes_by(
+        &canonical,
+        &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=normal",
+            "--ignore-submodules=dirty",
+        ],
+        deadline,
+    ) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            outcome.error = Some(error);
+            return outcome;
+        }
+    };
+    if status.is_empty() && has_submodules {
+        outcome.error = Some(
+            "Submodule working-copy changes were not inspected; dirty state is unknown".into(),
+        );
+        return outcome;
+    }
+    outcome.dirty = Some(!status.is_empty());
+    outcome
+}
+
 pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree>, String> {
     let deadline = overall_deadline.min(Instant::now() + list_inspect_budget());
     let common = repository_by(repo, deadline)?;
@@ -916,7 +1032,11 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
     if let Some(previous) = entry {
         result.push(previous);
     }
-    for entry in &mut result {
+    // Phase 1 (serial, no per-entry Git): drop entries that cannot be inspected,
+    // resolve a separate-metadata main checkout to its real path, and collect
+    // the checkouts that still need Git.
+    let mut pending: Vec<(usize, PathBuf)> = Vec::new();
+    for (index, entry) in result.iter_mut().enumerate() {
         if entry.bare {
             entry.error = Some("Bare repository metadata has no working checkout".into());
             continue;
@@ -937,52 +1057,57 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
             entry.error = Some("Worktree path contains non-UTF-8 bytes and is displayed as an escaped label. This UI cannot open it; use a Git client. No files were changed.".into());
             continue;
         }
-        let mut inspect = || -> Result<(PathBuf, bool), String> {
-            if Instant::now() >= deadline {
-                return Err(
-                    "Inspection budget exhausted; dirty state is unknown for this checkout".into(),
-                );
+        pending.push((index, entry.path.clone()));
+    }
+
+    // Phase 2 (concurrent): inspection is a handful of fork/exec calls per
+    // checkout and the cost is process startup rather than Git's own work.
+    // Overlapping a bounded number of them removes most of the wall clock. The
+    // shared `deadline` still bounds the whole phase and every child keeps its
+    // per-command ceiling, so one stalled checkout cannot block the scan.
+    //
+    // Filter overrides stay per checkout: `git status` applies this checkout's
+    // effective filter configuration, so suppressing a driver must be decided
+    // in that same context. Discovering it once per repository would miss a
+    // `extensions.worktreeConfig` driver defined only on a linked checkout.
+    let mut outcomes: Vec<(usize, Inspection)> = Vec::new();
+    if !pending.is_empty() {
+        let workers = inspect_concurrency().min(pending.len());
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let collected: Mutex<Vec<(usize, Inspection)>> = Mutex::new(Vec::new());
+        let (pending_ref, common_ref) = (&pending, &common);
+        let (cursor_ref, collected_ref) = (&cursor, &collected);
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                scope.spawn(move || loop {
+                    let next = cursor_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some((index, path)) = pending_ref.get(next) else {
+                        break;
+                    };
+                    let outcome = inspect_checkout(path, common_ref, deadline);
+                    if let Ok(mut rows) = collected_ref.lock() {
+                        rows.push((*index, outcome));
+                    }
+                });
             }
-            let canonical = fs::canonicalize(&entry.path)
-                .map_err(|e| format!("{} is unavailable: {e}", entry.path.display()))?;
-            if repository_by(&canonical, deadline)? != common
-                || workspace_root_by(&canonical, deadline)? != canonical
-            {
-                return Err("Worktree path now belongs to a different repository".into());
-            }
-            // Opening depends on checkout identity, not whether Git can report
-            // its complete dirty state (for example, a disabled content filter).
-            entry.openable = true;
-            let index = git_bytes_by(&canonical, &["ls-files", "--stage", "-z"], deadline)?;
-            let has_submodules = index
-                .split(|byte| *byte == 0)
-                .any(|entry| entry.starts_with(b"160000 "));
-            let status = git_bytes_by(
-                &canonical,
-                &[
-                    "status",
-                    "--porcelain",
-                    "-z",
-                    "--untracked-files=normal",
-                    "--ignore-submodules=dirty",
-                ],
-                deadline,
-            )?;
-            if status.is_empty() && has_submodules {
-                return Err(
-                    "Submodule working-copy changes were not inspected; dirty state is unknown"
-                        .into(),
-                );
-            }
-            Ok((canonical, !status.is_empty()))
+        });
+        outcomes = collected.into_inner().unwrap_or_default();
+    }
+
+    // Phase 3: apply in entry order so the response stays deterministic.
+    for (index, outcome) in outcomes {
+        let Some(entry) = result.get_mut(index) else {
+            continue;
         };
-        match inspect() {
-            Ok((path, dirty)) => {
-                entry.path = path;
-                entry.dirty = Some(dirty);
-            }
-            Err(error) => entry.error = Some(error),
+        if outcome.openable {
+            entry.openable = true;
         }
+        if outcome.dirty.is_some() {
+            entry.path = outcome.canonical;
+            entry.dirty = outcome.dirty;
+            continue;
+        }
+        entry.error = outcome.error;
     }
     Ok(result)
 }
@@ -1173,6 +1298,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
+
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {
@@ -2548,5 +2674,78 @@ mod tests {
         for name in ["a", "b", "c", "d"] {
             let _ = fs::remove_file(container.join(name).join(".git/config"));
         }
+    }
+
+    #[test]
+    fn concurrent_inspection_matches_serial_verdicts() {
+        let f = Fixture::new();
+        let mut expected = Vec::new();
+        for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
+            let path = create(&f.repo(), &f.roots(), name, name).unwrap();
+            expected.push(path);
+        }
+        // Dirty exactly one checkout so the comparison covers both verdicts.
+        fs::write(f.roots().join("beta").join("untracked.txt"), "x\n").unwrap();
+        // Serial reference: inspect each entry on its own.
+        let common = repository(&f.repo()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut serial = Vec::new();
+        for path in &expected {
+            serial.push(inspect_checkout(path, &common, deadline).dirty);
+        }
+        // Concurrent path: the same work through the production scan.
+        let entries = list_until(&f.repo(), Instant::now() + Duration::from_secs(30)).unwrap();
+        for (offset, path) in expected.iter().enumerate() {
+            let entry = entries
+                .iter()
+                .find(|entry| &entry.path == path)
+                .unwrap_or_else(|| panic!("missing entry for {}", path.display()));
+            assert_eq!(
+                entry.dirty,
+                serial[offset],
+                "concurrent verdict differs from serial for {}",
+                path.display()
+            );
+            assert!(entry.openable, "{} must stay openable", path.display());
+        }
+        let dirty_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.dirty == Some(true))
+            .collect();
+        assert_eq!(
+            dirty_entries.len(),
+            1,
+            "exactly one planted checkout is dirty: {dirty_entries:?}"
+        );
+        assert!(
+            dirty_entries[0].path.ends_with("beta"),
+            "the dirty checkout is the planted one: {:?}",
+            dirty_entries[0].path
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn concurrent_scan_still_returns_when_a_checkout_stalls() {
+        let f = Fixture::new();
+        let healthy = create(&f.repo(), &f.roots(), "healthy", "healthy").unwrap();
+        let stalled = create(&f.repo(), &f.roots(), "stalled", "stalled").unwrap();
+        let admin = f.repo().join(".git").join("worktrees").join("stalled");
+        fs::remove_file(admin.join("index")).unwrap();
+        let _guard = FifoSentinel::create(admin.join("index"));
+        let started = Instant::now();
+        let entries = list_until(&f.repo(), Instant::now() + Duration::from_millis(1500))
+            .expect("a stalled checkout must not fail the inventory");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "concurrent scan took {elapsed:?}; the shared deadline must bound it"
+        );
+        let hung = entries.iter().find(|entry| entry.path == stalled).unwrap();
+        assert_eq!(hung.dirty, None, "a stalled checkout reports unknown state");
+        assert!(hung.error.is_some(), "and explains why: {hung:?}");
+        let fine = entries.iter().find(|entry| entry.path == healthy).unwrap();
+        assert_eq!(fine.dirty, Some(false), "healthy entries stay accurate");
+        assert!(fine.error.is_none(), "{:?}", fine.error);
     }
 }
