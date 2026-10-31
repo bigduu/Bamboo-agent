@@ -678,3 +678,6 @@ mod supervised_root_create_tests;
 
 pub(super) mod supervised_root_create;
 mod supervised_root_run;
+pub(super) mod supervisor_directory;
+#[cfg(test)]
+mod supervisor_directory_tests;
