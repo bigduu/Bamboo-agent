@@ -3124,6 +3124,92 @@ async fn handle_tool_calls_path(
 
 // ---- Core pipeline ----
 
+/// How many consecutive rounds may finish without a single tool call and still
+/// request continuation before the run is ended (#2425).
+///
+/// A round with no tool calls cannot have gathered new evidence, so a short
+/// streak is legitimate (goal/task evaluation nudging the model onward) but a
+/// long one means the continuation gates disagree and the loop would spin.
+/// Exceeding this bound ends the run as completed instead of issuing more
+/// provider requests.
+pub(super) const MAX_NO_TOOL_CALL_CONTINUATIONS: u32 = 3;
+
+/// Advance the consecutive no-tool-call continuation streak and report whether
+/// the run has exhausted its continuation budget (#2425).
+///
+/// A round that produced tool calls is progress and resets the streak. A round
+/// that produced none cannot have gathered evidence, so each one moves the run
+/// closer to stopping; once the budget is spent the caller ends the run instead
+/// of dispatching another provider request.
+fn advance_no_tool_call_streak(streak: &mut u32, round_had_tool_calls: bool) -> bool {
+    if round_had_tool_calls {
+        *streak = 0;
+        return false;
+    }
+    *streak = streak.saturating_add(1);
+    *streak >= MAX_NO_TOOL_CALL_CONTINUATIONS
+}
+
+/// Regression coverage for the bounded progress guard (#2425).
+#[cfg(test)]
+mod no_tool_call_guard_tests {
+    use super::{advance_no_tool_call_streak, MAX_NO_TOOL_CALL_CONTINUATIONS};
+
+    #[test]
+    fn rounds_with_tool_calls_never_stop_the_run() {
+        let mut streak = 0;
+        for _ in 0..50 {
+            assert!(
+                !advance_no_tool_call_streak(&mut streak, true),
+                "a round that used tools is progress and must not end the run"
+            );
+            assert_eq!(streak, 0, "progress must reset the streak");
+        }
+    }
+
+    #[test]
+    fn empty_rounds_stop_the_run_at_the_budget() {
+        let mut streak = 0;
+        for round in 1..MAX_NO_TOOL_CALL_CONTINUATIONS {
+            assert!(
+                !advance_no_tool_call_streak(&mut streak, false),
+                "round {round} is within the continuation budget"
+            );
+        }
+        assert!(
+            advance_no_tool_call_streak(&mut streak, false),
+            "the run must stop once the budget is spent"
+        );
+    }
+
+    #[test]
+    fn a_single_productive_round_clears_an_accumulated_streak() {
+        // Nearly out of budget, then one real round: the run must continue and
+        // the following empty rounds must again need the full budget.
+        let mut streak = 0;
+        for _ in 0..(MAX_NO_TOOL_CALL_CONTINUATIONS - 1) {
+            advance_no_tool_call_streak(&mut streak, false);
+        }
+        assert!(!advance_no_tool_call_streak(&mut streak, true));
+        assert_eq!(streak, 0, "productive work clears the streak");
+
+        for _ in 0..(MAX_NO_TOOL_CALL_CONTINUATIONS - 1) {
+            assert!(!advance_no_tool_call_streak(&mut streak, false));
+        }
+        assert!(
+            advance_no_tool_call_streak(&mut streak, false),
+            "the budget applies again after it was reset"
+        );
+    }
+
+    #[test]
+    fn streak_saturates_instead_of_overflowing() {
+        let mut streak = u32::MAX - 1;
+        assert!(advance_no_tool_call_streak(&mut streak, false));
+        assert_eq!(streak, u32::MAX, "streak must saturate, never wrap");
+    }
+}
+
 use crate::runtime::runner::session_setup::legacy_instruction::{
     apply_successful_attempt as apply_successful_explicit_activation,
     validate_first_step as validate_explicit_activation_first_step,
@@ -3234,6 +3320,12 @@ async fn run_pipeline_inner(
         config.max_tool_calls_per_round,
         config.max_consecutive_failures_per_tool,
     );
+
+    // Consecutive rounds that finished with no tool calls yet asked to keep
+    // going. Declared OUTSIDE the round loop: the whole point is to accumulate
+    // across rounds, so resetting it per iteration would make the guard unable
+    // to ever fire (#2425).
+    let mut no_tool_call_continuation_streak: u32 = 0;
 
     loop {
         if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
@@ -3471,6 +3563,12 @@ async fn run_pipeline_inner(
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
         let mut turn_outcome: Option<TurnOutcome> = None;
+        // Whether this round produced any tool call. Per-round, so it belongs
+        // inside the loop; captured from the provider output rather than
+        // inferred from the last session message, because a committed tool
+        // *result* carries no `tool_calls` and would otherwise be
+        // indistinguishable from a round that did nothing at all.
+        let mut round_had_tool_calls = false;
         let mut terminal_error: Option<AgentError> = None;
         let mut hook_suspension: Option<AgentError> = None;
 
@@ -3778,6 +3876,8 @@ async fn run_pipeline_inner(
 
             // --- Handle LLM output ---
             let stream_output = llm_output.stream_output;
+            // Capture before any field is moved out of `stream_output` below.
+            round_had_tool_calls = !stream_output.tool_calls.is_empty();
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
@@ -4381,6 +4481,49 @@ async fn run_pipeline_inner(
 
         sent_complete = sent_complete || outcome.sent_complete;
         if outcome.should_break {
+            break;
+        }
+
+        // Bounded progress guard (#2425). When a round produced no tool calls,
+        // nothing new can have been learned, yet the goal/task continuation gates
+        // may still decide to continue. Without a bound, a disagreement between
+        // those gates turns one execute into an unbounded stream of provider
+        // requests (observed: 85 rounds, 19.8M prompt tokens for 27k output).
+        // Count the streak and end the run instead of spinning.
+        //
+        // Only an UNBUDGETED loop is guarded. A counted loop has an explicit,
+        // user-configured round budget and is expected to run its rounds even
+        // when some use no tools, so it keeps its existing semantics — and its
+        // own completion bookkeeping — untouched.
+        if config.effective_counted_loop().is_none()
+            && advance_no_tool_call_streak(
+                &mut no_tool_call_continuation_streak,
+                round_had_tool_calls,
+            )
+        {
+            tracing::warn!(
+                session_id = %state.session_id,
+                consecutive_rounds = no_tool_call_continuation_streak,
+                round = turn_counter + 1,
+                "stopping run: consecutive no-tool-call rounds requested continuation \
+                 without producing work"
+            );
+            state.runtime_state.status = AgentStatusState::Completed;
+            state_bridge::write_runtime_state(session, &state.runtime_state);
+            // Publish the terminal event the ordinary completion path would
+            // have published. Breaking out of the loop skips that path, and the
+            // caller has nothing to publish on this branch — without this the
+            // run ends with an open SSE stream and a client that never sees it
+            // finish.
+            if !super::defers_terminal_complete(config) {
+                let usage = round_activity.token_usage();
+                let _ = event_tx
+                    .send(AgentEvent::Complete {
+                        usage: to_event_token_usage(usage.prompt_tokens, usage.completion_tokens),
+                    })
+                    .await;
+            }
+            sent_complete = true;
             break;
         }
 

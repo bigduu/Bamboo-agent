@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use tokio::sync::Notify;
 
+mod no_tool_call_guard_tests;
 mod recovery_tests;
 mod terminal_result_tests;
 
