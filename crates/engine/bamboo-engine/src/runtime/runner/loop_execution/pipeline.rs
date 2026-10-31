@@ -3132,7 +3132,7 @@ async fn handle_tool_calls_path(
 /// long one means the continuation gates disagree and the loop would spin.
 /// Exceeding this bound ends the run as completed instead of issuing more
 /// provider requests.
-const MAX_NO_TOOL_CALL_CONTINUATIONS: u32 = 3;
+pub(super) const MAX_NO_TOOL_CALL_CONTINUATIONS: u32 = 3;
 
 /// Advance the consecutive no-tool-call continuation streak and report whether
 /// the run has exhausted its continuation budget (#2425).
@@ -3320,6 +3320,12 @@ async fn run_pipeline_inner(
         config.max_tool_calls_per_round,
         config.max_consecutive_failures_per_tool,
     );
+
+    // Consecutive rounds that finished with no tool calls yet asked to keep
+    // going. Declared OUTSIDE the round loop: the whole point is to accumulate
+    // across rounds, so resetting it per iteration would make the guard unable
+    // to ever fire (#2425).
+    let mut no_tool_call_continuation_streak: u32 = 0;
 
     loop {
         if config.effective_counted_loop().is_some() && cancel_token.is_cancelled() {
@@ -3557,14 +3563,10 @@ async fn run_pipeline_inner(
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
         let mut turn_outcome: Option<TurnOutcome> = None;
-        // Consecutive rounds that finished with no tool calls yet asked to keep
-        // going. A healthy loop alternates work and tool use; a long streak here
-        // means the continuation gates disagree and the run would spin forever
-        // issuing provider requests with nothing to show for them (#2425).
-        let mut no_tool_call_continuation_streak: u32 = 0;
-        // Whether this round produced any tool call. Captured from the provider
-        // output rather than inferred from the last session message, because a
-        // committed tool *result* carries no `tool_calls` and would otherwise be
+        // Whether this round produced any tool call. Per-round, so it belongs
+        // inside the loop; captured from the provider output rather than
+        // inferred from the last session message, because a committed tool
+        // *result* carries no `tool_calls` and would otherwise be
         // indistinguishable from a round that did nothing at all.
         let mut round_had_tool_calls = false;
         let mut terminal_error: Option<AgentError> = None;
@@ -4488,7 +4490,16 @@ async fn run_pipeline_inner(
         // those gates turns one execute into an unbounded stream of provider
         // requests (observed: 85 rounds, 19.8M prompt tokens for 27k output).
         // Count the streak and end the run instead of spinning.
-        if advance_no_tool_call_streak(&mut no_tool_call_continuation_streak, round_had_tool_calls)
+        //
+        // Only an UNBUDGETED loop is guarded. A counted loop has an explicit,
+        // user-configured round budget and is expected to run its rounds even
+        // when some use no tools, so it keeps its existing semantics — and its
+        // own completion bookkeeping — untouched.
+        if config.effective_counted_loop().is_none()
+            && advance_no_tool_call_streak(
+                &mut no_tool_call_continuation_streak,
+                round_had_tool_calls,
+            )
         {
             tracing::warn!(
                 session_id = %state.session_id,
@@ -4499,6 +4510,19 @@ async fn run_pipeline_inner(
             );
             state.runtime_state.status = AgentStatusState::Completed;
             state_bridge::write_runtime_state(session, &state.runtime_state);
+            // Publish the terminal event the ordinary completion path would
+            // have published. Breaking out of the loop skips that path, and the
+            // caller has nothing to publish on this branch — without this the
+            // run ends with an open SSE stream and a client that never sees it
+            // finish.
+            if !super::defers_terminal_complete(config) {
+                let usage = round_activity.token_usage();
+                let _ = event_tx
+                    .send(AgentEvent::Complete {
+                        usage: to_event_token_usage(usage.prompt_tokens, usage.completion_tokens),
+                    })
+                    .await;
+            }
             sent_complete = true;
             break;
         }
