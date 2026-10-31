@@ -23,6 +23,10 @@ impl RootActorWriteProof {
         Self { directory, owner }
     }
 
+    pub(super) fn owner(&self) -> &RootActorRuntimeWrite {
+        &self.owner
+    }
+
     // Pure reads at the final boundary; never ensure/repair/claim authority.
     pub(super) fn validate(&self) -> io::Result<Session> {
         let id = &self.owner.fence.actor_id;
@@ -339,5 +343,82 @@ impl SessionStoreV2 {
         self.save_session_after_lock(session, total_started, &guards, None)
             .await?;
         self.publish_root_actor_runtime(&guards, publish).await
+    }
+
+    pub(super) async fn save_finalized_root_actor_runtime_impl(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        publish: RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        let started = Instant::now();
+        validate_session_id(&session.id)?;
+        if let Some(inherited) = inherited {
+            inherited.validate_session(session)?;
+        }
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session_write = self
+            .acquire_session_write_lock(&session.id, SaveKind::Full)
+            .await?;
+        let proof = RootActorWriteProof::new(self.sessions_dir.join(&session.id), owner.clone());
+        let mut guards = DefaultWriterGuards::shared_with_root_actor(
+            lifecycle,
+            task,
+            session_write,
+            Some(proof.clone()),
+        );
+        Arc::get_mut(&mut guards)
+            .expect("new Root final writer has no borrowers")
+            .root_outcome_finalized = true;
+        let mut reconciled = match inherited {
+            Some(inherited) => {
+                self.reconcile_inherited_runtime_snapshot(session, inherited, false)
+                    .await?
+            }
+            None => session.clone(),
+        };
+        // Another Store may complete a tagged Child after the outer merge's
+        // read. Reconcile again while this physical Root lock is retained.
+        let latest = self
+            .load_session_unlocked(&session.id)
+            .await?
+            .filter(|latest| latest.created_at == session.created_at)
+            .ok_or_else(|| conflict("Root finalization source changed"))?;
+        if let Some(registered_at) =
+            crate::session_merge::adopt_finalized_child_wait(&mut reconciled, &latest, false)
+        {
+            crate::session_merge::preserve_finalized_hidden_child_resumes(
+                &mut reconciled,
+                &latest,
+                registered_at,
+            );
+        }
+        if let Some(registered_at) =
+            crate::session_merge::adopt_durable_tagged_child_wait(&mut reconciled, &latest)
+        {
+            crate::session_merge::preserve_finalized_hidden_child_resumes(
+                &mut reconciled,
+                &latest,
+                registered_at,
+            );
+        }
+        self.save_session_after_lock(&reconciled, started, &guards, None)
+            .await?;
+        let committed = Self::default_writer_job(&guards, move || proof.validate()).await?;
+        self.publish_root_actor_runtime(&guards, publish).await?;
+        // Same #1053 constraint as session_merge::adopt_root_publication: the
+        // persisted proof copy never carries `resolved_token_budget` or
+        // `force_manual_compression`, so adopting it would erase the live
+        // round's values. `observed_runtime_session_version` may be re-stamped
+        // by the sidecar overlay; keeping the caller's observation is still
+        // correct because this path already verified the finalized source.
+        let mut adopted = committed;
+        adopted.resolved_token_budget = session.resolved_token_budget.clone();
+        adopted.observed_runtime_session_version = session.observed_runtime_session_version;
+        adopted.force_manual_compression = session.force_manual_compression.clone();
+        *session = adopted;
+        Ok(())
     }
 }

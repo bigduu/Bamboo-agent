@@ -119,6 +119,10 @@ pub struct SessionRuntimeMetadata {
     /// acknowledged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_inbox_admission: Option<super::SessionInboxAdmissionState>,
+    /// Main-owned source facts. Only a fenced storage transition may change
+    /// them; the field itself is not an authority or a delivery receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervised_root_outcomes: Option<super::SupervisedRootOutcomes>,
 }
 
 impl SessionRuntimeMetadata {

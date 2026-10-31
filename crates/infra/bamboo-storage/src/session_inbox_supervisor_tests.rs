@@ -89,6 +89,112 @@ fn bound_envelope(
 }
 
 #[tokio::test]
+async fn supervisor_first_intent_survives_pending_ack_reopen_and_legacy_retry() {
+    for legacy_first in [true, false] {
+        let (_home, store, inbox, reference) = fixture().await;
+        let supervisor = store
+            .load_session(&reference.session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let caller = bamboo_domain::SessionCallerReference::from(&supervisor);
+        let target = store
+            .inspect_supervisor_current_user_target(&reference, "target")
+            .await
+            .unwrap();
+        let message = bound_envelope(&reference, &target);
+        let first = if legacy_first {
+            // An old v1 transport may have been written before provenance was
+            // available. A new protected retry must not invent its origin.
+            inbox
+                .deliver_with_activation_intent(
+                    &message,
+                    SessionActivationPolicy::RespectSpecificWait,
+                    None,
+                )
+                .await
+                .unwrap()
+        } else {
+            inbox
+                .deliver_supervisor_current_user_followup(&caller, &reference, &target, &message)
+                .await
+                .unwrap()
+        };
+        assert_eq!(
+            inbox
+                .deliver_supervisor_current_user_followup(&caller, &reference, &target, &message)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            inbox
+                .deliver_supervisor_followup(&reference, target.created_at, &message)
+                .await
+                .unwrap(),
+            first
+        );
+        let mut changed = message.clone();
+        changed.body = bamboo_domain::SessionMessageBody::Content(
+            bamboo_domain::SessionMessageContent::text("different instruction"),
+        );
+        assert!(inbox
+            .deliver_supervisor_current_user_followup(&caller, &reference, &target, &changed)
+            .await
+            .is_err());
+        let claim = inbox.claim("target", 1).await.unwrap().remove(0);
+        assert_eq!(
+            inbox
+                .deliver_supervisor_followup(&reference, target.created_at, &message)
+                .await
+                .unwrap(),
+            first
+        );
+        let mut persisted = store.load_session("target").await.unwrap().unwrap();
+        persisted.add_message(message.to_provider_message().unwrap());
+        persisted
+            .session_inbox_admission_mut()
+            .record(message.id.clone(), claim.generation);
+        store.save_session(&persisted).await.unwrap();
+        inbox.ack("target", &claim).await.unwrap();
+
+        let reopened = FileSessionInbox::new(store.clone(), SessionInboxLimits::default());
+        assert_eq!(
+            reopened
+                .deliver_supervisor_current_user_followup(&caller, &reference, &target, &message)
+                .await
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            reopened
+                .deliver_supervisor_followup(&reference, target.created_at, &message)
+                .await
+                .unwrap(),
+            first
+        );
+        let receipt = FileSessionInbox::admitted_receipt(
+            &store.sessions_root_dir().join("target/inbox"),
+            &message,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(receipt.delivery, first);
+        assert_eq!(
+            receipt
+                .intent
+                .as_ref()
+                .and_then(|intent| intent.supervised_root_origin())
+                .is_some(),
+            !legacy_first
+        );
+        let state = reopened.inspect("target").await.unwrap();
+        assert_eq!((state.generation, state.pending + state.claimed), (1, 0));
+    }
+}
+
+#[tokio::test]
 async fn supervisor_current_user_followup_rejects_changed_target_but_not_legacy_acl() {
     for change in [
         "detach",

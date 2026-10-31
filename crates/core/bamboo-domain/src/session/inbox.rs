@@ -1179,6 +1179,10 @@ pub struct SessionInboxActivationIntent {
     delivery: Option<SessionMessageDeliveryIntent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expected_run_id: Option<String>,
+    /// Historical observation captured by a protected Supervisor writer. It
+    /// is never a grant; storage validates the original guards before publish.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supervised_root_origin: Option<super::SupervisedRootOutcomeInputOrigin>,
 }
 
 impl SessionInboxActivationIntent {
@@ -1188,6 +1192,7 @@ impl SessionInboxActivationIntent {
             policy,
             delivery: None,
             expected_run_id: None,
+            supervised_root_origin: None,
         }
     }
 
@@ -1199,6 +1204,7 @@ impl SessionInboxActivationIntent {
             policy: SessionActivationPolicy::RespectSpecificWait,
             delivery: Some(delivery),
             expected_run_id: None,
+            supervised_root_origin: None,
         }
     }
 
@@ -1214,7 +1220,32 @@ impl SessionInboxActivationIntent {
             policy: SessionActivationPolicy::RespectSpecificWait,
             delivery: Some(SessionMessageDeliveryIntent::QueueOnly),
             expected_run_id: Some(expected_run_id.into()),
+            supervised_root_origin: None,
         })
+    }
+
+    /// Preserve the existing scheduling choice while retaining historical
+    /// Supervisor input provenance. Only the physical storage writer may
+    /// publish this observation after validating its original authority.
+    pub fn with_supervised_root_origin(
+        mut self,
+        origin: super::SupervisedRootOutcomeInputOrigin,
+    ) -> Result<Self, SessionInboxError> {
+        self.policy()?;
+        if !matches!(self.version, 1 | 2)
+            || self.policy != SessionActivationPolicy::RespectSpecificWait
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "Supervisor origin requires an existing wait-respecting intent".into(),
+            ));
+        }
+        self.version = 4;
+        self.supervised_root_origin = Some(origin);
+        Ok(self)
+    }
+
+    pub fn supervised_root_origin(&self) -> Option<&super::SupervisedRootOutcomeInputOrigin> {
+        self.supervised_root_origin.as_ref()
     }
 
     pub fn expected_run_id(&self) -> Option<&str> {
@@ -1242,15 +1273,18 @@ impl SessionInboxActivationIntent {
             self.delivery,
             self.policy,
             self.expected_run_id.as_deref(),
+            self.supervised_root_origin.as_ref(),
         ) {
-            (1, None, _, None)
-            | (2, Some(_), SessionActivationPolicy::RespectSpecificWait, None) => true,
+            (1, None, _, None, None)
+            | (2, Some(_), SessionActivationPolicy::RespectSpecificWait, None, None) => true,
             (
                 3,
                 Some(SessionMessageDeliveryIntent::QueueOnly),
                 SessionActivationPolicy::RespectSpecificWait,
                 Some(run_id),
+                None,
             ) => valid_session_run_id(run_id),
+            (4, _, SessionActivationPolicy::RespectSpecificWait, None, Some(_)) => true,
             _ => false,
         };
         if !supported {
@@ -3199,6 +3233,86 @@ mod tests {
                 .policy()
                 .is_err());
         }
+    }
+
+    #[test]
+    fn supervised_root_origin_keeps_original_delivery_and_cannot_modify_old_versions() {
+        let target_session = Session::new("origin-target", "synthetic-model");
+        let origin = super::super::SupervisedRootOutcomeInputOrigin::CurrentUser {
+            supervisor: crate::SupervisorReference {
+                session_id: crate::DEFAULT_SUPERVISOR_SESSION_ID.into(),
+                incarnation_id: uuid::Uuid::new_v4(),
+            },
+            supervisor_created_at: Utc::now(),
+            caller: None,
+            requires_host_scope: None,
+            target: crate::SupervisorCurrentUserTarget::capture(&target_session).unwrap(),
+            operation_id: SessionMessageId::parse("origin-operation").unwrap(),
+        };
+        let legacy =
+            SessionInboxActivationIntent::new(SessionActivationPolicy::RespectSpecificWait);
+        assert_eq!(
+            serde_json::to_value(&legacy).unwrap(),
+            serde_json::json!({"version":1,"policy":"respect_specific_wait"})
+        );
+        for base in [
+            legacy,
+            SessionInboxActivationIntent::with_delivery(SessionMessageDeliveryIntent::QueueOnly),
+            SessionInboxActivationIntent::with_delivery(SessionMessageDeliveryIntent::TriggerTurn),
+        ] {
+            let expected_delivery = base.delivery();
+            let intent = base.with_supervised_root_origin(origin.clone()).unwrap();
+            assert_eq!(
+                intent.policy().unwrap(),
+                SessionActivationPolicy::RespectSpecificWait
+            );
+            assert_eq!(intent.delivery(), expected_delivery);
+            assert_eq!(intent.supervised_root_origin(), Some(&origin));
+            let raw = serde_json::to_value(&intent).unwrap();
+            assert_eq!(raw["version"], 4);
+            assert_eq!(
+                serde_json::from_value::<SessionInboxActivationIntent>(raw.clone()).unwrap(),
+                intent
+            );
+            for version in [1, 2, 3] {
+                let mut forged = raw.clone();
+                forged["version"] = serde_json::json!(version);
+                assert!(
+                    serde_json::from_value::<SessionInboxActivationIntent>(forged)
+                        .unwrap()
+                        .policy()
+                        .is_err()
+                );
+            }
+            let mut no_origin = raw.clone();
+            no_origin
+                .as_object_mut()
+                .unwrap()
+                .remove("supervised_root_origin");
+            assert!(
+                serde_json::from_value::<SessionInboxActivationIntent>(no_origin)
+                    .unwrap()
+                    .policy()
+                    .is_err()
+            );
+            let mut escalated = raw;
+            escalated["policy"] = serde_json::json!("interrupt_specific_wait");
+            assert!(
+                serde_json::from_value::<SessionInboxActivationIntent>(escalated)
+                    .unwrap()
+                    .policy()
+                    .is_err()
+            );
+        }
+        assert!(
+            SessionInboxActivationIntent::new(SessionActivationPolicy::InterruptSpecificWait)
+                .with_supervised_root_origin(origin.clone())
+                .is_err()
+        );
+        assert!(SessionInboxActivationIntent::for_expected_run("run-a")
+            .unwrap()
+            .with_supervised_root_origin(origin)
+            .is_err());
     }
 
     #[test]

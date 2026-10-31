@@ -52,6 +52,8 @@ impl Drop for HostScopedSessionGuards {
 pub(crate) struct HostScopedDeliveryGuards {
     pub(crate) inbox_dir: PathBuf,
     pub(crate) identity: bamboo_domain::HostSessionPeerIdentity,
+    pub(crate) caller: SessionCallerReference,
+    pub(crate) target: HostScopeSessionObservation,
     _authority: HostScopedSessionGuards,
 }
 
@@ -70,6 +72,25 @@ pub(crate) struct LegacySessionDeliveryGuards {
     pub(crate) inbox_dir: PathBuf,
     _authority: LegacySessionDeliveryAuthority,
     _absence: Option<HostSessionScopeAbsence>,
+}
+
+impl LegacySessionDeliveryGuards {
+    pub(crate) fn is_supervisor_root_target(&self) -> bool {
+        matches!(
+            &self._authority,
+            LegacySessionDeliveryAuthority::Supervisor { _guard }
+                if _guard.target.kind == SessionKind::Root
+        )
+    }
+
+    pub(crate) fn supervisor_sessions(&self) -> Option<(&Session, &Session)> {
+        match &self._authority {
+            LegacySessionDeliveryAuthority::Supervisor { _guard } => {
+                Some((&_guard.source, &_guard.target))
+            }
+            LegacySessionDeliveryAuthority::Peer { .. } => None,
+        }
+    }
 }
 
 /// The namespace publication fence is retained through physical Inbox work.
@@ -554,6 +575,8 @@ impl SessionStoreV2 {
         Ok(HostScopedDeliveryGuards {
             inbox_dir: self.abs_path_from_rel(&rel).join("inbox"),
             identity,
+            caller: caller.clone(),
+            target,
             _authority: guards,
         })
     }
