@@ -173,6 +173,117 @@ async fn fixture(
     )
 }
 
+fn receipt(version: &str, bundle: &str, manifest: &str) -> ConnectorRelease {
+    ConnectorRelease {
+        version: version.into(),
+        bundle_url: format!(
+            "https://github.com/bigduu/Nova/releases/download/v{version}/nova-plugin-v{version}.tar.gz"
+        ),
+        bundle_sha256: bundle.into(),
+        manifest_sha256: manifest.into(),
+        executable_sha256: BTreeMap::from([("macos".into(), digest(b"cli"))]),
+        legacy_cli: false,
+    }
+}
+
+fn installed_with(version: &str, bundle: &str) -> InstalledPlugin {
+    InstalledPlugin {
+        id: "nova".into(),
+        version: version.into(),
+        source: PluginSource::Url {
+            url: format!(
+                "https://github.com/bigduu/Nova/releases/download/v{version}/nova-plugin-v{version}.tar.gz"
+            ),
+            sha256: Some(bundle.into()),
+            signed_by: Some("nova (bigduu official)".into()),
+            allow_unverified: false,
+            allow_unsigned: false,
+            allow_untrusted_host: false,
+            insecure: false,
+        },
+        plugin_dir: PathBuf::from("/var/bamboo/plugins/nova"),
+        installed_at: Utc::now(),
+        status: PluginInstallStatus::Installed,
+        registered: RegisteredCapabilities::default(),
+    }
+}
+
+/// Nova v0.3.1 was republished under the same version, so the catalog holds two
+/// accepted receipts for one version. The installed record's own digest decides
+/// which one describes the bytes on disk; version alone must never be used, or
+/// accepting the new receipt silently invalidates every existing installation.
+#[test]
+fn receipt_selection_follows_the_installed_bytes_not_the_version() {
+    let newer = receipt("0.3.1", &"1".repeat(64), &"2".repeat(64));
+    let older = receipt("0.3.1", &"3".repeat(64), &"4".repeat(64));
+    let catalog = Catalog {
+        connectors: vec![newer.clone(), older.clone()],
+        app: None,
+    };
+
+    let old_install = installed_with("0.3.1", &older.bundle_sha256);
+    assert_eq!(
+        receipt_for(&catalog, &old_install).map(|r| &r.bundle_sha256),
+        Some(&older.bundle_sha256),
+        "an older installation must select its own accepted receipt"
+    );
+
+    let new_install = installed_with("0.3.1", &newer.bundle_sha256);
+    assert_eq!(
+        receipt_for(&catalog, &new_install).map(|r| &r.bundle_sha256),
+        Some(&newer.bundle_sha256),
+        "a newer installation must select the receipt it was verified against"
+    );
+
+    // Digests are compared case-insensitively, matching the rest of the
+    // verification path rather than accepting only one hex spelling.
+    let upper = installed_with("0.3.1", &older.bundle_sha256.to_uppercase());
+    assert_eq!(
+        receipt_for(&catalog, &upper).map(|r| &r.bundle_sha256),
+        Some(&older.bundle_sha256)
+    );
+}
+
+/// An install whose bytes no receipt describes stays unverified: falling back to
+/// an arbitrary same-version receipt would claim provenance that was never proven.
+#[test]
+fn receipt_selection_rejects_unknown_and_ambiguous_installs() {
+    let catalog = Catalog {
+        connectors: vec![
+            receipt("0.3.1", &"1".repeat(64), &"2".repeat(64)),
+            receipt("0.3.1", &"3".repeat(64), &"4".repeat(64)),
+        ],
+        app: None,
+    };
+    let foreign = installed_with("0.3.1", &"f".repeat(64));
+    assert!(
+        receipt_for(&catalog, &foreign).is_none(),
+        "an unknown digest must not borrow an unrelated receipt"
+    );
+
+    // A single receipt may still be returned so the existing validation reports
+    // the digest mismatch itself instead of the connector silently vanishing.
+    let single = Catalog {
+        connectors: vec![receipt("0.3.1", &"1".repeat(64), &"2".repeat(64))],
+        app: None,
+    };
+    assert_eq!(
+        receipt_for(&single, &foreign).map(|r| &r.bundle_sha256),
+        Some(&"1".repeat(64))
+    );
+
+    // Version alone is never enough: a different version selects nothing.
+    let other_version = installed_with("0.3.0", &"3".repeat(64));
+    assert!(receipt_for(&catalog, &other_version).is_none());
+
+    // Non-URL sources carry no pinned digest and cannot be matched.
+    let mut local = installed_with("0.3.1", &"3".repeat(64));
+    local.source = PluginSource::LocalDir {
+        path: PathBuf::from("/tmp/nova"),
+    };
+    assert!(receipt_for(&catalog, &local).is_none());
+}
+
 #[test]
 fn host_matrix_does_not_call_windows_missing_app_a_failure() {
     for (os, arch, supported, reason) in [
@@ -192,13 +303,22 @@ fn host_matrix_does_not_call_windows_missing_app_a_failure() {
 fn reviewed_catalog_uses_immutable_release_urls_and_valid_digests() {
     let catalog = accepted_catalog();
     assert!(!catalog.connectors.is_empty());
-    for release in catalog.connectors {
+    // The catalog is a receipt list, so one version may legitimately repeat after
+    // a re-cut release — but each receipt must stay distinct or `receipt_for`
+    // could not tell the installed bytes apart.
+    let mut seen = std::collections::BTreeSet::new();
+    for release in &catalog.connectors {
         assert_eq!(
             release.bundle_url,
             format!(
                 "https://github.com/bigduu/Nova/releases/download/v{0}/nova-plugin-v{0}.tar.gz",
                 release.version
             )
+        );
+        assert!(
+            seen.insert((&release.version, &release.bundle_sha256)),
+            "duplicate receipt for {} with the same bundle digest",
+            release.version
         );
         for hash in std::iter::once(&release.bundle_sha256)
             .chain(std::iter::once(&release.manifest_sha256))
@@ -338,6 +458,32 @@ async fn missing_success_is_capability_and_install_eligibility_not_desktop_readi
         serde_json::to_value(&state.config.read().await.mcp).unwrap(),
         before
     );
+}
+
+/// Accepting a re-cut release must not invalidate an installation that was
+/// verified against the previous bytes. Published first, a version-only lookup
+/// would select the newer receipt and then reject the installed manifest and
+/// binary — turning a working install into `unverified_install`.
+#[cfg(unix)]
+#[actix_web::test]
+async fn accepting_a_newer_receipt_keeps_an_existing_install_verified() {
+    let (_dir, state, mut catalog, _entry) =
+        fixture(&format!("printf '%s\\n' '{}'", missing())).await;
+    let mut newer = catalog.connectors[0].clone();
+    newer.bundle_sha256 = "1".repeat(64);
+    newer.manifest_sha256 = "2".repeat(64);
+    newer
+        .executable_sha256
+        .insert("macos".into(), "3".repeat(64));
+    catalog.connectors.insert(0, newer);
+
+    let report = inspect_locked(&state, mac(), &catalog)
+        .await
+        .unwrap()
+        .report;
+    assert_eq!(report.connector.state, "verified");
+    assert!(report.capability.supported);
+    assert_eq!(report.desktop_server_id.as_deref(), Some("nova"));
 }
 
 #[actix_web::test]
