@@ -1,8 +1,132 @@
 //! Git is the only worktree registry. This module deliberately has no runtime
 //! dependencies, so its real filesystem/Git regressions can run without Cargo.
 use std::fs::{self, OpenOptions};
+use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// Hard ceiling for one Git child process. A checkout on slow or offline
+/// storage (for example macOS-evicted dataless files) can block `git status`
+/// inside the kernel for minutes; the inventory must never inherit that.
+/// Tests run with a short ceiling so timeout regressions stay fast.
+fn git_command_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(1500)
+    } else {
+        Duration::from_secs(10)
+    }
+}
+
+/// Wall-clock budget for inspecting all entries of one repository during a
+/// `list` call. The listing itself (`git worktree list`) is metadata-only;
+/// per-entry inspection shells out repeatedly and is what can stall. Once
+/// the budget is spent, remaining entries keep metadata with unknown dirty
+/// state instead of blocking the inventory response.
+fn list_inspect_budget() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(4000)
+    } else {
+        Duration::from_secs(60)
+    }
+}
+
+/// Wall-clock budget for one complete inventory request, covering every
+/// repository it scans. The HTTP response must always return, so this is the
+/// bound the caller shares across repositories.
+pub fn inventory_budget() -> Duration {
+    list_inspect_budget()
+}
+
+/// Runs one Git child process to completion, or kills it at the deadline.
+///
+/// `Command::output()` waits forever: its failure model has no exit for a
+/// child that never exits. Storage that stalls the kernel (dataless files,
+/// dead network mounts) produces exactly that child, so every Git
+/// invocation in this module funnels through this bounded wrapper instead.
+/// Std-only: stdin is null so commands that read it (`mktree`) see the same
+/// immediate EOF `output()` gave them instead of inheriting a long-lived
+/// server stdin; one reader thread per pipe drains output (so a full pipe
+/// can never deadlock the child); the parent polls `try_wait`; a missed
+/// deadline escalates to `kill()` plus a reaping `wait()`, which guarantees
+/// the pipe writers are gone before `recv()` runs. A killed child surfaces
+/// as a normal `Err` string so callers degrade that one entry instead of
+/// hanging the whole inventory.
+fn bounded_output(mut command: Command, deadline_at: Instant) -> Result<Output, String> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Cannot run git: {e}"))?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = stdout_tx.send(buf);
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        let _ = stderr_tx.send(buf);
+    });
+    let mut status = None;
+    while Instant::now() < deadline_at {
+        match child.try_wait() {
+            Ok(exited) => {
+                if exited.is_some() {
+                    status = exited;
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if status.is_none() {
+        // SIGKILL terminates the child, closing its pipe write ends, so the
+        // reader threads return and recv() below can never block on a pipe
+        // whose writer is gone. wait() also reaps the corpse.
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    // A descendant that inherited the pipes (a content filter, a pager) can
+    // outlive the direct child and keep them open. Collect output with a
+    // bounded grace period so an orphaned writer cannot reintroduce the hang
+    // this wrapper exists to prevent. `join()` cannot time out, so a reader
+    // that did not report within the grace period is detached instead: it owns
+    // no shared state and exits on its own once the last writer closes.
+    let grace = Duration::from_secs(1);
+    let stdout = stdout_rx.recv_timeout(grace);
+    let stderr = stderr_rx.recv_timeout(grace);
+    if stdout.is_ok() {
+        let _ = stdout_reader.join();
+    }
+    if stderr.is_ok() {
+        let _ = stderr_reader.join();
+    }
+    let stdout = stdout.unwrap_or_default();
+    let stderr = stderr.unwrap_or_default();
+    match status {
+        Some(status) => Ok(Output {
+            status,
+            stdout,
+            stderr,
+        }),
+        None => Err(
+            "git did not finish within its command timeout; the checkout may be on slow or offline storage"
+                .to_string(),
+        ),
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct Worktree {
@@ -54,15 +178,25 @@ pub(super) fn git_command(repo: &Path) -> Command {
 }
 
 fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
+    command_by(repo, args, Instant::now() + git_command_timeout())
+}
+
+/// Runs one Git command, bounded by `deadline_at`. The effective ceiling is
+/// also capped by the per-command ceiling, so one slow entry can never spend
+/// a whole inventory budget on a single child.
+fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output, String> {
+    let ceiling = Instant::now() + git_command_timeout();
+    let deadline_at = deadline_at.min(ceiling);
     let mut command = git_command(repo);
     if matches!(args.first(), Some(&"status" | &"read-tree"))
         || args.starts_with(&["worktree", "add"])
     {
         // Reading configuration names does not execute filters. Include every
-        // scope and include file, but never read/log their potentially secret values.
-        let configured = git_command(repo)
-            .args(["config", "--includes", "--null", "--name-only", "--list"])
-            .output()
+        // scope and include file, but never read/log their potentially secret
+        // values. Bounded too: an include file can live on stalled storage.
+        let mut probe = git_command(repo);
+        probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
+        let configured = bounded_output(probe, deadline_at)
             .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
         if !configured.status.success() {
             return Err(format!(
@@ -97,14 +231,16 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
             command.args(["-c", &format!("filter.{driver}.required=true")]);
         }
     }
-    command
-        .args(args)
-        .output()
-        .map_err(|e| format!("Git at {}: {e}", repo.display()))
+    command.args(args);
+    bounded_output(command, deadline_at).map_err(|e| format!("Git at {}: {e}", repo.display()))
 }
 
 fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = command(repo, args)?;
+    git_bytes_by(repo, args, Instant::now() + git_command_timeout())
+}
+
+fn git_bytes_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Vec<u8>, String> {
+    let output = command_by(repo, args, deadline_at)?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         let guidance = if diagnostic.contains(": smudge filter ")
@@ -124,11 +260,25 @@ fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    String::from_utf8(git_bytes(repo, args)?).map_err(|_| "Git returned non-UTF-8 text".into())
+    git_by(repo, args, Instant::now() + git_command_timeout())
 }
 
+/// Deadline-aware variant: discovery scans many candidates under one shared
+/// inventory budget, so its probes must not each restart the clock.
+fn git_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<String, String> {
+    String::from_utf8(git_bytes_by(repo, args, deadline_at)?)
+        .map_err(|_| "Git returned non-UTF-8 text".into())
+}
+
+/// Test-only convenience wrapper; production callers share the inventory
+/// deadline through `git_path_by`.
+#[cfg(test)]
 fn git_path(repo: &Path, args: &[&str]) -> Result<PathBuf, String> {
-    let mut bytes = git_bytes(repo, args)?;
+    git_path_by(repo, args, Instant::now() + git_command_timeout())
+}
+
+fn git_path_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<PathBuf, String> {
+    let mut bytes = git_bytes_by(repo, args, deadline_at)?;
     if bytes.last() == Some(&b'\n') {
         bytes.pop();
     }
@@ -158,9 +308,20 @@ pub fn path_label(path: &Path) -> String {
 }
 
 pub fn repository(repo: &Path) -> Result<PathBuf, String> {
-    let value = git_path(
+    repository_by(repo, Instant::now() + git_command_timeout())
+}
+
+/// Deadline-aware repository identity lookup for the inventory handler: the
+/// handler's deduplication probes share the request's scan deadline.
+pub fn repository_until(repo: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+    repository_by(repo, deadline_at)
+}
+
+fn repository_by(repo: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+    let value = git_path_by(
         repo,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+        deadline_at,
     )?;
     fs::canonicalize(value).map_err(|e| format!("Repository metadata is unavailable: {e}"))
 }
@@ -181,12 +342,22 @@ pub(super) fn workspace_root_queries_for_test(path: &Path) -> usize {
 }
 
 pub fn workspace_root(path: &Path) -> Result<PathBuf, String> {
+    workspace_root_by(path, Instant::now() + git_command_timeout())
+}
+
+/// Deadline-aware checkout-root lookup for the inventory handler's session
+/// association probes.
+pub fn workspace_root_until(path: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
+    workspace_root_by(path, deadline_at)
+}
+
+fn workspace_root_by(path: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
     #[cfg(test)]
     WORKSPACE_ROOT_QUERIES
         .lock()
         .unwrap()
         .push(path.to_path_buf());
-    let value = git_path(path, &["rev-parse", "--show-toplevel"])?;
+    let value = git_path_by(path, &["rev-parse", "--show-toplevel"], deadline_at)?;
     fs::canonicalize(value).map_err(|e| e.to_string())
 }
 
@@ -208,16 +379,24 @@ struct DiscoveryLimits {
 /// Each root is bounded to 12 levels and 20,000 directory entries, including
 /// ignored entries. Truncation is reported rather than presented as complete.
 pub fn discover_repositories(root: &Path) -> Discovery {
+    discover_until(root, Instant::now() + inventory_budget())
+}
+
+/// Discovery under the caller's inventory deadline. Every Git probe inside the
+/// walk inherits this deadline, so a root whose metadata is on stalled storage
+/// cannot spend more than the request budget before `list_until` even runs.
+pub fn discover_until(root: &Path, deadline_at: Instant) -> Discovery {
     discover_with_limits(
         root,
         DiscoveryLimits {
             max_depth: 12,
             max_entries: 20_000,
         },
+        deadline_at,
     )
 }
 
-fn discover_with_limits(root: &Path, limits: DiscoveryLimits) -> Discovery {
+fn discover_with_limits(root: &Path, limits: DiscoveryLimits, deadline_at: Instant) -> Discovery {
     let mut result = Discovery::default();
     let canonical = match fs::canonicalize(root) {
         Ok(path) if path.is_dir() => path,
@@ -241,6 +420,7 @@ fn discover_with_limits(root: &Path, limits: DiscoveryLimits) -> Discovery {
         limits,
         remaining_entries: limits.max_entries,
         exhausted: false,
+        deadline_at,
         result: &mut result,
     };
     scan.visit(&canonical, 0);
@@ -256,6 +436,8 @@ struct RepositoryScan<'a> {
     limits: DiscoveryLimits,
     remaining_entries: usize,
     exhausted: bool,
+    /// Shared inventory deadline; every Git probe in the walk is bounded by it.
+    deadline_at: Instant,
     result: &'a mut Discovery,
 }
 
@@ -266,7 +448,21 @@ impl RepositoryScan<'_> {
             .push((path.to_path_buf(), message.into()));
     }
 
+    /// True once the shared budget is spent. The walk then stops probing and
+    /// reports the remainder as uninspected instead of overrunning the
+    /// request budget one command timeout per candidate.
+    fn expired(&self) -> bool {
+        Instant::now() >= self.deadline_at
+    }
+
     fn visit(&mut self, path: &Path, depth: usize) {
+        if self.expired() {
+            self.diagnostic(
+                path,
+                "Discovery budget exhausted; the remaining tree was not inspected",
+            );
+            return;
+        }
         // Recheck each path at use time. Directory symlinks are never followed,
         // including aliases that lead back inside the same Project.
         let metadata = match fs::symlink_metadata(path) {
@@ -307,7 +503,11 @@ impl RepositoryScan<'_> {
             && path.join("objects").is_dir()
             && path.join("refs").is_dir();
         if metadata_shape {
-            match git(path, &["rev-parse", "--is-bare-repository"]) {
+            match git_by(
+                path,
+                &["rev-parse", "--is-bare-repository"],
+                self.deadline_at,
+            ) {
                 Ok(value) if value.trim() == "true" => {
                     // Explicit bare source bindings already support worktree
                     // creation. Preserve that path without scanning metadata.
@@ -323,8 +523,12 @@ impl RepositoryScan<'_> {
                     return;
                 }
                 Ok(_) => {
-                    if git(path, &["rev-parse", "--is-inside-git-dir"])
-                        .is_ok_and(|value| value.trim() == "true")
+                    if git_by(
+                        path,
+                        &["rev-parse", "--is-inside-git-dir"],
+                        self.deadline_at,
+                    )
+                    .is_ok_and(|value| value.trim() == "true")
                     {
                         self.diagnostic(
                             path,
@@ -336,13 +540,13 @@ impl RepositoryScan<'_> {
             }
         }
         if depth == 0 || marker {
-            match workspace_root(path) {
+            match workspace_root_by(path, self.deadline_at) {
                 Ok(checkout) if (depth == 0 && path.starts_with(&checkout)) || checkout == path => {
                     if depth > 0 {
                         // A .git file alone can point at an unrelated repository.
                         // Git's native registry must also identify this checkout
                         // before a discovered path can authorize branch creation.
-                        match registered_worktree(path) {
+                        match registered_worktree_by(path, self.deadline_at) {
                             Ok(true) => {}
                             Ok(false) => {
                                 self.diagnostic(
@@ -386,8 +590,12 @@ impl RepositoryScan<'_> {
                     if !ordinary_directory {
                         self.diagnostic(path, error);
                         if depth == 0
-                            && git(path, &["rev-parse", "--is-inside-git-dir"])
-                                .is_ok_and(|value| value.trim() == "true")
+                            && git_by(
+                                path,
+                                &["rev-parse", "--is-inside-git-dir"],
+                                self.deadline_at,
+                            )
+                            .is_ok_and(|value| value.trim() == "true")
                         {
                             return;
                         }
@@ -455,8 +663,19 @@ impl RepositoryScan<'_> {
     }
 }
 
+/// Test-only convenience wrapper; production callers must share the inventory
+/// deadline through `registered_worktree_by`.
+#[cfg(test)]
 fn registered_worktree(path: &Path) -> Result<bool, String> {
-    let listing = git_bytes(path, &["worktree", "list", "--porcelain", "-z"])?;
+    registered_worktree_by(path, Instant::now() + git_command_timeout())
+}
+
+fn registered_worktree_by(path: &Path, deadline_at: Instant) -> Result<bool, String> {
+    let listing = git_bytes_by(
+        path,
+        &["worktree", "list", "--porcelain", "-z"],
+        deadline_at,
+    )?;
     for field in listing.split(|byte| *byte == 0) {
         if let Some(registered) = field.strip_prefix(b"worktree ") {
             let registered = path_from_bytes(registered)?;
@@ -468,16 +687,28 @@ fn registered_worktree(path: &Path) -> Result<bool, String> {
     // Git lists a submodule's separate metadata directory as its main entry.
     // Accept its reverse checkout binding only from the shared metadata's own
     // config, never a candidate-controlled config.worktree, include or global.
-    let common = repository(path)?;
-    Ok(configured_main_worktree(path, &common)?.is_some_and(|configured| configured == path))
+    let common = repository_by(path, deadline_at)?;
+    Ok(configured_main_worktree_by(path, &common, deadline_at)?
+        .is_some_and(|configured| configured == path))
 }
 
+/// Test-only convenience wrapper; the list path threads its deadline through
+/// `configured_main_worktree_by`.
+#[cfg(test)]
 fn configured_main_worktree(repo: &Path, common: &Path) -> Result<Option<PathBuf>, String> {
+    configured_main_worktree_by(repo, common, Instant::now() + git_command_timeout())
+}
+
+fn configured_main_worktree_by(
+    repo: &Path,
+    common: &Path,
+    deadline_at: Instant,
+) -> Result<Option<PathBuf>, String> {
     let config = common.join("config");
     let config = config
         .to_str()
         .ok_or("Git metadata configuration path contains non-UTF-8 bytes")?;
-    let output = command(
+    let output = command_by(
         repo,
         &[
             "config",
@@ -489,6 +720,7 @@ fn configured_main_worktree(repo: &Path, common: &Path) -> Result<Option<PathBuf
             "--get",
             "core.worktree",
         ],
+        deadline_at,
     )?;
     if output.status.code() == Some(1) {
         return Ok(None);
@@ -506,15 +738,26 @@ fn configured_main_worktree(repo: &Path, common: &Path) -> Result<Option<PathBuf
         .map_err(|error| format!("Configured Git checkout is unavailable: {error}"))
 }
 
+/// Test-only convenience wrapper; `list_until` calls `main_worktree_by` with
+/// the inventory deadline.
+#[cfg(test)]
 fn main_worktree_for_list(repo: &Path, common: &Path) -> Result<PathBuf, String> {
+    main_worktree_by(repo, common, Instant::now() + git_command_timeout())
+}
+
+/// Deadline-aware variant: called from `list_until`, so its probes must stay
+/// inside the inventory budget instead of restarting the clock per call.
+fn main_worktree_by(repo: &Path, common: &Path, deadline_at: Instant) -> Result<PathBuf, String> {
     let verify = |checkout: PathBuf| {
-        if repository(&checkout)? == common && workspace_root(&checkout)? == checkout {
+        if repository_by(&checkout, deadline_at)? == common
+            && workspace_root_by(&checkout, deadline_at)? == checkout
+        {
             Ok(checkout)
         } else {
             Err("Configured Git main checkout belongs to a different repository".to_string())
         }
     };
-    let configured = configured_main_worktree(repo, common)
+    let configured = configured_main_worktree_by(repo, common, deadline_at)
         .and_then(|checkout| {
             checkout.ok_or_else(|| {
                 "Native Git main entry points to metadata without a verified checkout binding"
@@ -528,11 +771,11 @@ fn main_worktree_for_list(repo: &Path, common: &Path) -> Result<PathBuf, String>
             // An explicitly bound main checkout may use separate metadata with
             // no reverse config. Its own Git directory proves it is the main
             // caller; a linked worktree must never impersonate that record.
-            let main_caller = git_path(repo, &["rev-parse", "--absolute-git-dir"])
+            let main_caller = git_path_by(repo, &["rev-parse", "--absolute-git-dir"], deadline_at)
                 .and_then(|path| fs::canonicalize(path).map_err(|error| error.to_string()))
                 .is_ok_and(|path| path == common);
             if main_caller {
-                workspace_root(repo).and_then(verify)
+                workspace_root_by(repo, deadline_at).and_then(verify)
             } else {
                 Err(error)
             }
@@ -626,9 +869,21 @@ pub fn root(path: &Path) -> Result<PathBuf, String> {
     Ok(canonical)
 }
 
+/// Single-repository convenience wrapper used by tests; the inventory handler
+/// shares one deadline across repositories through `list_until`.
+#[cfg(test)]
 pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
-    let common = repository(repo)?;
-    let listing = git_bytes(repo, &["worktree", "list", "--porcelain", "-z"])?;
+    list_until(repo, Instant::now() + list_inspect_budget())
+}
+
+/// Lists one repository's worktrees, inspecting entries only until
+/// `overall_deadline`. An inventory scans several repositories, so the caller
+/// shares one deadline across them: the per-repository budget alone would make
+/// the response unbounded in the number of repositories.
+pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree>, String> {
+    let deadline = overall_deadline.min(Instant::now() + list_inspect_budget());
+    let common = repository_by(repo, deadline)?;
+    let listing = git_bytes_by(repo, &["worktree", "list", "--porcelain", "-z"], deadline)?;
     let mut result = Vec::new();
     let mut entry: Option<Worktree> = None;
     for field in listing.split(|byte| *byte == 0) {
@@ -670,7 +925,7 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
         // its metadata path. Never expose that path as an openable workspace.
         // Linked entries have their own registry paths and are left unchanged.
         if fs::canonicalize(&entry.path).is_ok_and(|path| path == common) {
-            match main_worktree_for_list(repo, &common) {
+            match main_worktree_by(repo, &common, deadline) {
                 Ok(path) => entry.path = path,
                 Err(error) => {
                     entry.error = Some(error);
@@ -683,19 +938,26 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
             continue;
         }
         let mut inspect = || -> Result<(PathBuf, bool), String> {
+            if Instant::now() >= deadline {
+                return Err(
+                    "Inspection budget exhausted; dirty state is unknown for this checkout".into(),
+                );
+            }
             let canonical = fs::canonicalize(&entry.path)
                 .map_err(|e| format!("{} is unavailable: {e}", entry.path.display()))?;
-            if repository(&canonical)? != common || workspace_root(&canonical)? != canonical {
+            if repository_by(&canonical, deadline)? != common
+                || workspace_root_by(&canonical, deadline)? != canonical
+            {
                 return Err("Worktree path now belongs to a different repository".into());
             }
             // Opening depends on checkout identity, not whether Git can report
             // its complete dirty state (for example, a disabled content filter).
             entry.openable = true;
-            let index = git_bytes(&canonical, &["ls-files", "--stage", "-z"])?;
+            let index = git_bytes_by(&canonical, &["ls-files", "--stage", "-z"], deadline)?;
             let has_submodules = index
                 .split(|byte| *byte == 0)
                 .any(|entry| entry.starts_with(b"160000 "));
-            let status = git_bytes(
+            let status = git_bytes_by(
                 &canonical,
                 &[
                     "status",
@@ -704,6 +966,7 @@ pub fn list(repo: &Path) -> Result<Vec<Worktree>, String> {
                     "--untracked-files=normal",
                     "--ignore-submodules=dirty",
                 ],
+                deadline,
             )?;
             if status.is_empty() && has_submodules {
                 return Err(
@@ -1236,6 +1499,7 @@ mod tests {
                 max_depth: 1,
                 max_entries: 100,
             },
+            std::time::Instant::now() + inventory_budget(),
         );
         assert_eq!(discovery.repositories, vec![shallow]);
         assert!(discovery
@@ -1248,6 +1512,7 @@ mod tests {
                 max_depth: 12,
                 max_entries: 1,
             },
+            std::time::Instant::now() + inventory_budget(),
         );
         assert!(discovery.repositories.is_empty());
         assert_eq!(discovery.diagnostics.len(), 1);
@@ -1855,6 +2120,35 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn git_children_see_eof_stdin_even_when_the_parent_keeps_stdin_open() {
+        // bamboo serve runs with an open stdin forever. Children that read
+        // stdin (`mktree` inside create()) must see EOF immediately, not the
+        // inherited server stdin, or they block until the command timeout.
+        let f = Fixture::new();
+        let read_end = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(f.0.join("held-open-stdin"))
+            .unwrap();
+        let _held = StdioHolder(read_end);
+        let started = std::time::Instant::now();
+        let created = create(&f.repo(), &f.roots(), "stdin-eof", "stdin-eof").unwrap();
+        assert!(
+            started.elapsed() < git_command_timeout(),
+            "create must not wait for the command ceiling"
+        );
+        assert!(created.join(".git").is_file());
+    }
+
+    /// Keeps the held file descriptor open for the test body; a plain File
+    /// would be dropped (and closed) before the assertion runs.
+    #[cfg(unix)]
+    struct StdioHolder(std::fs::File);
+
+    #[cfg(unix)]
+    #[test]
     fn initial_checkout_preserves_collisions_and_staged_and_unstaged_content() {
         let f = Fixture::new();
         fs::write(f.repo().join("tracked.txt"), "tracked\n").unwrap();
@@ -2029,5 +2323,230 @@ mod tests {
         let after = command(&f.repo(), &["ls-files", "--stage", "-z"]).unwrap();
         assert!(after.status.success());
         assert!(after.stdout.contains(&0xff));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stalled_checkout_times_out_and_keeps_other_inventory_entries() {
+        let f = Fixture::new();
+        let healthy = create(&f.repo(), &f.roots(), "healthy", "healthy").unwrap();
+        let stalled = create(&f.repo(), &f.roots(), "stalled", "stalled").unwrap();
+        // An unopening FIFO as the linked worktree's index reproduces the
+        // production hang exactly: any Git that reads the index blocks in
+        // the kernel, while metadata listing (`worktree list`) stays fast.
+        // Dataless (macOS-evicted) working trees stall the same way.
+        let admin = f.repo().join(".git").join("worktrees").join("stalled");
+        fs::remove_file(admin.join("index")).unwrap();
+        let _guard = FifoSentinel::create(admin.join("index"));
+        let started = std::time::Instant::now();
+        let entries = list(&f.repo()).expect("inventory must return despite the stalled entry");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < list_inspect_budget() + git_command_timeout(),
+            "list took {elapsed:?}, beyond budget {:?} + ceiling {:?}",
+            list_inspect_budget(),
+            git_command_timeout()
+        );
+        assert_eq!(entries.len(), 3, "main + healthy + stalled all present");
+        let hung = entries
+            .iter()
+            .find(|entry| entry.path == stalled)
+            .expect("stalled entry kept");
+        assert_eq!(
+            hung.dirty, None,
+            "a stalled checkout reports unknown dirty state"
+        );
+        assert!(
+            hung.error.as_deref().unwrap().contains("timeout")
+                || hung
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("slow or offline storage"),
+            "error explains the timeout: {:?}",
+            hung.error
+        );
+        let fine = entries
+            .iter()
+            .find(|entry| entry.path == healthy)
+            .expect("healthy entry present");
+        assert_eq!(fine.dirty, Some(false));
+        assert!(fine.error.is_none(), "{:?}", fine.error);
+        let main = entries
+            .iter()
+            .find(|entry| entry.path == f.repo())
+            .expect("main entry present");
+        assert_eq!(main.dirty, Some(false));
+        assert!(main.error.is_none(), "{:?}", main.error);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_budget_degrades_remaining_entries_without_git_calls() {
+        let f = Fixture::new();
+        let healthy = create(&f.repo(), &f.roots(), "healthy", "healthy").unwrap();
+        let stalled = create(&f.repo(), &f.roots(), "stalled", "stalled").unwrap();
+        let admin = f.repo().join(".git").join("worktrees").join("stalled");
+        fs::remove_file(admin.join("index")).unwrap();
+        let _guard = FifoSentinel::create(admin.join("index"));
+        // Burn the whole budget on the first stalled entry (list order is
+        // main first), then verify the remaining entries still degrade with
+        // metadata instead of spawning further Git children.
+        let entries = list(&f.repo()).unwrap();
+        assert!(entries.iter().any(|entry| entry.path == healthy));
+        assert!(entries.iter().any(|entry| entry.path == stalled));
+        assert!(
+            entries.iter().filter(|entry| entry.dirty.is_none()).count() >= 1,
+            "at least the stalled entry has unknown dirty state: {entries:?}"
+        );
+    }
+
+    /// Keeps a FIFO path present for the test body and removes it on drop so
+    /// Fixture cleanup (remove_dir_all) does not block opening the pipe.
+    #[cfg(unix)]
+    struct FifoSentinel(PathBuf);
+    #[cfg(unix)]
+    impl FifoSentinel {
+        #[allow(clippy::unnecessary_wraps)]
+        fn create(path: PathBuf) -> Self {
+            nix_mknod_fifo(&path);
+            Self(path)
+        }
+    }
+    #[cfg(unix)]
+    impl Drop for FifoSentinel {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn nix_mknod_fifo(path: &Path) {
+        // mkfifo(3) via libc would add a dependency; a binding-free fallback
+        // is not available, so use the nix-free Command route.
+        let status = Command::new("mkfifo")
+            .arg(path)
+            .status()
+            .expect("mkfifo is available on unix hosts");
+        assert!(status.success(), "mkfifo {path:?} failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_listing_probes_respect_the_shared_deadline() {
+        let f = Fixture::new();
+        // Each bound repository gets a linked worktree whose administrative
+        // HEAD is a FIFO: `worktree list` itself stalls reading it, which is
+        // the probe that previously restarted the clock inside list_until.
+        for name in ["one", "two", "three", "four"] {
+            let repo = f.roots().join(name);
+            init_discovery_repo(&repo);
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                    "commit",
+                    "--allow-empty",
+                    "-m",
+                    "init",
+                ],
+            )
+            .unwrap();
+            let linked = f.roots().join(format!("{name}-linked"));
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "--detach",
+                    "--",
+                    linked.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )
+            .unwrap();
+            let admin_head = repo
+                .join(".git")
+                .join("worktrees")
+                .join(format!("{name}-linked"))
+                .join("HEAD");
+            fs::remove_file(&admin_head).unwrap();
+            let guard = FifoSentinel::create(admin_head);
+            std::mem::forget(guard);
+        }
+        // One shared inventory deadline for every repository, exactly as the
+        // handler passes it: the total must stay bounded, not per call.
+        let budget = Duration::from_millis(1500);
+        let scan_deadline = std::time::Instant::now() + budget;
+        let started = std::time::Instant::now();
+        let mut failures = 0;
+        for name in ["one", "two", "three", "four"] {
+            let repo = f.roots().join(name);
+            if list_until(&repo, scan_deadline).is_err() {
+                failures += 1;
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(4000),
+            "listing probes took {elapsed:?}; the shared deadline must bound all repositories"
+        );
+        assert!(
+            failures > 0,
+            "a stalled listing must fail with a timeout rather than hang"
+        );
+        for name in ["one", "two", "three", "four"] {
+            let _ = fs::remove_file(
+                f.roots()
+                    .join(name)
+                    .join(".git")
+                    .join("worktrees")
+                    .join(format!("{name}-linked"))
+                    .join("HEAD"),
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_discovery_budget_stops_probing_and_reports_partial_results() {
+        let f = Fixture::new();
+        let container = f.roots();
+        for name in ["a", "b", "c", "d"] {
+            let repo = container.join(name);
+            init_discovery_repo(&repo);
+            // A FIFO as .git/config stalls every probe that needs config
+            // (workspace_root/repository/bare detection), the shape Codex
+            // reproduced against stalled metadata storage.
+            fs::remove_file(repo.join(".git/config")).unwrap();
+            let _guard = FifoSentinel::create(repo.join(".git/config"));
+            std::mem::forget(_guard);
+        }
+        let started = std::time::Instant::now();
+        let discovery = discover_until(
+            &container,
+            std::time::Instant::now() + Duration::from_millis(1500),
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(6000),
+            "discovery took {elapsed:?}; the shared deadline must apply to every probe"
+        );
+        assert!(
+            discovery
+                .diagnostics
+                .iter()
+                .any(|(_, message)| message.contains("budget exhausted")),
+            "expiry must be reported as a diagnostic: {:?}",
+            discovery.diagnostics
+        );
+        // Unblock teardown: the Fixture drop removes the tree, and an open FIFO
+        // reader would otherwise hold the walk.
+        for name in ["a", "b", "c", "d"] {
+            let _ = fs::remove_file(container.join(name).join(".git/config"));
+        }
     }
 }

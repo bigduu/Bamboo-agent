@@ -150,6 +150,10 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         .cloned()
         .or(preferences.default_root);
     let repositories = blocking(move || {
+        // One wall-clock budget for the whole inventory, shared by every
+        // repository: a per-repository budget alone would leave the response
+        // unbounded in the number of repositories a Project folder contains.
+        let scan_deadline = std::time::Instant::now() + git::inventory_budget();
         // Discover repositories within registered Project roots without adding
         // overlapping workspace bindings or another repository registry.
         let bound_sources: Vec<_> = project.workspace_roots().map(PathBuf::from).collect();
@@ -157,7 +161,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         let mut sources = Vec::new();
         let mut diagnostics = Vec::new();
         for source in &bound_sources {
-            let discovered = git::discover_repositories(source);
+            let discovered = git::discover_until(source, scan_deadline);
             sources.extend(discovered.repositories);
             diagnostics.extend(discovered.diagnostics);
         }
@@ -166,7 +170,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
         let mut seen = HashSet::new();
         for path in sources {
             let source = git::path_label(&path);
-            let common = match git::repository(&path) {
+            let common = match git::repository_until(&path, scan_deadline) {
                 Ok(common) => common,
                 Err(error) => {
                     repositories.push(RepositoryInventory {
@@ -177,7 +181,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                 }
             };
             if !seen.insert(common.clone()) { continue; }
-            match git::list(&path) {
+            match git::list_until(&path, scan_deadline) {
                 Ok(entries) => {
                     for session in &sessions {
                         let Some(workspace) = session.workspace_path.as_deref().map(Path::new) else { continue; };
@@ -196,7 +200,7 @@ pub async fn list(state: web::Data<AppState>, id: web::Path<String>) -> Response
                             if entries.iter().any(|entry| entry.path == workspace) {
                                 Some(workspace.to_path_buf())
                             } else {
-                                git::workspace_root(workspace).ok()
+                                git::workspace_root_until(workspace, scan_deadline).ok()
                             }
                         });
                     }
