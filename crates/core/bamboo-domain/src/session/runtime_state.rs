@@ -403,6 +403,38 @@ pub struct AgentRuntimeState {
     /// sessions leave it `false` so approvals reach the human as usual.
     #[serde(default)]
     pub no_human_approver: bool,
+    /// Declarative mark of the most recent canonical Human input admitted through
+    /// the interactive UI route. Host/tool-routed dispatch (e.g. `session_control`
+    /// create/followup) never sets it, so its presence strictly means a human
+    /// engaged the session from the user surface. It is an observation fact, not
+    /// a takeover verdict or control authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_human_input: Option<HumanInputMark>,
+}
+
+/// Observed engagement mark for the latest canonical Human UI input.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HumanInputMark {
+    pub at: chrono::DateTime<chrono::Utc>,
+    /// Input route. `user` = interactive UI ingress; Host-dispatched first
+    /// instructions and tool followups do not record a mark.
+    pub source: HumanInputSource,
+}
+
+impl HumanInputMark {
+    pub fn user(at: chrono::DateTime<chrono::Utc>) -> Self {
+        Self {
+            at,
+            source: HumanInputSource::User,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanInputSource {
+    #[default]
+    User,
 }
 
 impl AgentRuntimeState {
@@ -429,7 +461,13 @@ impl AgentRuntimeState {
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             no_human_approver: false,
+            last_human_input: None,
         }
+    }
+
+    /// Record the latest canonical Human UI input as the engagement mark.
+    pub fn set_last_human_input(&mut self, mark: HumanInputMark) {
+        self.last_human_input = Some(mark);
     }
 
     /// Resolve the new typed mode with the legacy boolean as a bounded fallback.
@@ -473,6 +511,7 @@ impl Default for AgentRuntimeState {
             permission_mode: SessionPermissionMode::Default,
             bypass_permissions: false,
             no_human_approver: false,
+            last_human_input: None,
         }
     }
 }
