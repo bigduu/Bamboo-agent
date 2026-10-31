@@ -7,7 +7,11 @@
 //! vocabulary ever fails to load, so a failed load degrades gracefully rather
 //! than panicking.
 
-use std::sync::OnceLock;
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
+use std::hash::{BuildHasher, Hash, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use bamboo_domain::Message;
 use tiktoken_rs::o200k_base;
@@ -331,6 +335,166 @@ fn valid_utf8_suffix(bytes: Vec<u8>) -> String {
     String::new()
 }
 
+/// Content-addressed memo for BPE token counts.
+///
+/// A single agent round counts the same immutable transcript many times:
+/// `context_preparation` projects request usage for each retrieval-window stage,
+/// and every projection re-flattens and re-counts the whole message list. BPE
+/// encoding dominates that work, so identical text is counted once instead of
+/// once per pass.
+///
+/// Entries are keyed on a content fingerprint (byte length plus a 64-bit hash),
+/// never on `message.id`. A prepared message can carry different content under
+/// the same id, and keying on the id alone would return a stale count.
+struct TokenCountCache {
+    shards: Vec<Mutex<HashMap<(u64, u32), u32>>>,
+    shard_entries: usize,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl TokenCountCache {
+    fn new(shard_entries: usize) -> Self {
+        Self {
+            shards: (0..CACHE_SHARDS)
+                .map(|_| Mutex::new(HashMap::new()))
+                .collect(),
+            shard_entries,
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
+
+    fn shard_for(&self, hash: u64) -> &Mutex<HashMap<(u64, u32), u32>> {
+        // `shards` is non-empty, so the remainder is always in range.
+        &self.shards[(hash as usize) % self.shards.len()]
+    }
+
+    fn get(&self, key: (u64, u32)) -> Option<u32> {
+        let found = self
+            .shard_for(key.0)
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&key).copied());
+        match found {
+            Some(tokens) => {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                Some(tokens)
+            }
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    fn insert(&self, key: (u64, u32), tokens: u32) {
+        let Ok(mut map) = self.shard_for(key.0).lock() else {
+            // A poisoned mutex only means another thread panicked mid-lookup;
+            // skipping the insert keeps counting correct, just uncached.
+            return;
+        };
+        if map.len() >= self.shard_entries {
+            map.clear();
+        }
+        map.insert(key, tokens);
+    }
+
+    fn clear(&self) {
+        for shard in &self.shards {
+            if let Ok(mut map) = shard.lock() {
+                map.clear();
+            }
+        }
+    }
+
+    fn stats(&self) -> TokenCountCacheStats {
+        let entries = self
+            .shards
+            .iter()
+            .filter_map(|shard| shard.lock().ok().map(|map| map.len()))
+            .sum();
+        TokenCountCacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            entries,
+        }
+    }
+}
+
+/// Number of shards in the process-wide token count memo.
+///
+/// Sharding keeps concurrent agent workers from serializing on one mutex: an
+/// agent round re-counts its transcript from several tasks at once, and a single
+/// lock would turn that concurrency into contention.
+const CACHE_SHARDS: usize = 16;
+
+/// Per-shard entry cap. A full shard is cleared rather than evicted entry by
+/// entry, because the working set is a handful of transcripts: exceeding the cap
+/// means the process moved on to a different corpus and the old entries are no
+/// longer hot. This keeps the memo bounded without an LRU clock in the hot path.
+const CACHE_SHARD_ENTRIES: usize = 4096;
+
+/// Texts below this size are cheaper to encode again than to hash and look up
+/// (tool-call ids, function names). Only real payloads are memoized.
+const CACHE_MIN_TEXT_BYTES: usize = 128;
+
+/// Observability snapshot for the token count memo.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenCountCacheStats {
+    /// Lookups served without encoding.
+    pub hits: u64,
+    /// Lookups that had to encode.
+    pub misses: u64,
+    /// Entries currently retained across all shards.
+    pub entries: usize,
+}
+
+impl TokenCountCacheStats {
+    /// Total memo lookups (hits + misses).
+    pub fn lookups(&self) -> u64 {
+        self.hits.saturating_add(self.misses)
+    }
+}
+
+static TOKEN_COUNT_CACHE: OnceLock<TokenCountCache> = OnceLock::new();
+
+fn token_count_cache() -> &'static TokenCountCache {
+    TOKEN_COUNT_CACHE.get_or_init(|| TokenCountCache::new(CACHE_SHARD_ENTRIES))
+}
+
+/// Snapshot the process-wide token count memo counters.
+///
+/// Used by tests and diagnostics to prove repeated counting is served from the
+/// memo instead of re-encoding the same transcript.
+pub fn token_count_cache_stats() -> TokenCountCacheStats {
+    token_count_cache().stats()
+}
+
+/// Drop every memoized token count.
+///
+/// The memo is content-addressed and therefore always safe to keep, but tests
+/// and long-lived diagnostics use this to establish a clean baseline.
+pub fn clear_token_count_cache() {
+    token_count_cache().clear();
+}
+
+/// Per-process randomized hash keys for the memo fingerprint.
+///
+/// Fixed-key hashing would let crafted text (tool output, model content) collide
+/// on purpose and silently receive another text's count. `RandomState` derives
+/// fresh keys per process, so collisions stay unpredictable.
+static CACHE_HASH_KEYS: OnceLock<RandomState> = OnceLock::new();
+
+/// Fingerprint used as the memo key: full-content hash plus byte length, so two
+/// different texts cannot alias purely on a hash collision of equal length.
+fn token_cache_key(text: &str) -> (u64, u32) {
+    let state = CACHE_HASH_KEYS.get_or_init(RandomState::new);
+    let mut hasher = state.build_hasher();
+    text.hash(&mut hasher);
+    (hasher.finish(), text.len() as u32)
+}
+
 impl Default for TiktokenTokenCounter {
     fn default() -> Self {
         Self {
@@ -377,6 +541,28 @@ impl TokenCounter for TiktokenTokenCounter {
         if text.is_empty() {
             return 0;
         }
+        // Short payloads (tool-call ids, function names) cost less to encode than
+        // to fingerprint, so they bypass the memo.
+        if text.len() < CACHE_MIN_TEXT_BYTES {
+            return self.encode_text(text);
+        }
+        let cache = token_count_cache();
+        let key = token_cache_key(text);
+        if let Some(tokens) = cache.get(key) {
+            return tokens;
+        }
+        let tokens = self.encode_text(text);
+        cache.insert(key, tokens);
+        tokens
+    }
+}
+
+impl TiktokenTokenCounter {
+    /// Encode without consulting the memo.
+    ///
+    /// This is the single place that turns text into tokens, so the memo in
+    /// `count_text` can never change the value that is stored or returned.
+    fn encode_text(&self, text: &str) -> u32 {
         match o200k_encoder() {
             // Accurate BPE count.
             Some(encoder) => encoder.encode_with_special_tokens(text).len() as u32,
@@ -739,6 +925,214 @@ mod tests {
         assert!(
             scount <= max_tokens,
             "suffix token count {scount} exceeds budget {max_tokens}"
+        );
+    }
+
+    /// Serializes the memo-statistics tests. The memo is process-wide, so tests
+    /// that assert on hit/miss deltas must not overlap with each other.
+    static CACHE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// A payload long enough to be memoized (`>= CACHE_MIN_TEXT_BYTES`).
+    fn memoized_payload(seed: &str) -> String {
+        let mut text = String::from(seed);
+        while text.len() < CACHE_MIN_TEXT_BYTES * 2 {
+            text.push_str(" lorem ipsum dolor sit amet consectetur adipiscing elit");
+        }
+        text
+    }
+
+    #[test]
+    fn memoized_count_text_returns_the_uncached_count() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_token_count_cache();
+        let counter = TiktokenTokenCounter::default();
+        let text = memoized_payload("baseline");
+
+        // The memo must be transparent: a memoized answer is byte-identical to
+        // the encoder's own answer.
+        let expected = counter.encode_text(&text);
+        let first = counter.count_text(&text);
+        let second = counter.count_text(&text);
+
+        assert_eq!(first, expected, "memoized count must equal the BPE count");
+        assert_eq!(second, expected, "repeat call must equal the BPE count");
+    }
+
+    #[test]
+    fn repeated_counting_is_served_from_the_memo() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_token_count_cache();
+        let counter = TiktokenTokenCounter::default();
+        let messages = vec![
+            Message::user(memoized_payload("first turn")),
+            Message::user(memoized_payload("second turn")),
+        ];
+
+        let first_pass = counter.count_messages(&messages);
+        let misses_after_first = token_count_cache_stats().misses;
+        assert!(
+            misses_after_first >= messages.len() as u64,
+            "cold pass must encode every memoizable message"
+        );
+
+        // Re-counting the same immutable transcript — what an agent round does
+        // for each projection — must not encode anything again.
+        let second_pass = counter.count_messages(&messages);
+        let after = token_count_cache_stats();
+
+        assert_eq!(first_pass, second_pass, "counts must not drift");
+        assert_eq!(
+            after.misses, misses_after_first,
+            "second pass must be served entirely from the memo"
+        );
+        assert!(
+            after.hits >= messages.len() as u64,
+            "second pass must register hits, got {}",
+            after.hits
+        );
+    }
+
+    #[test]
+    fn memo_is_keyed_on_content_not_message_id() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_token_count_cache();
+        let counter = TiktokenTokenCounter::default();
+
+        // Same id and same length, different content: a key derived from the id
+        // would hand the second body the first body's count.
+        let mut a = Message::user(memoized_payload("alpha"));
+        let mut b = Message::user(memoized_payload("bravo"));
+        b.id = a.id.clone();
+        assert_eq!(a.content.len(), b.content.len());
+        assert_ne!(a.content, b.content);
+
+        let count_b = counter.count_message(&b);
+
+        // Rewriting `a`'s body to b's while keeping the id must now report b's
+        // count, not the stale one cached under that id.
+        a.content = b.content.clone();
+        assert_eq!(
+            counter.count_message(&a),
+            count_b,
+            "identical content under one id must return that content's count"
+        );
+
+        // And the cached answer must equal a cold recomputation.
+        let cached = counter.count_message(&a);
+        clear_token_count_cache();
+        assert_eq!(
+            cached,
+            counter.count_message(&a),
+            "memoized count must equal a cold recomputation"
+        );
+    }
+
+    #[test]
+    fn short_payloads_bypass_the_memo() {
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        clear_token_count_cache();
+        let counter = TiktokenTokenCounter::default();
+        let short = "short";
+        assert!(short.len() < CACHE_MIN_TEXT_BYTES);
+
+        let before = token_count_cache_stats().lookups();
+        counter.count_text(short);
+        counter.count_text(short);
+        let after = token_count_cache_stats().lookups();
+
+        assert_eq!(
+            after, before,
+            "texts below the memo threshold must not touch the cache"
+        );
+    }
+
+    #[test]
+    fn cache_stays_bounded_by_the_shard_cap() {
+        // Exercise the cache directly so the bound is asserted without encoding
+        // thousands of payloads.
+        let cap = 4;
+        let cache = TokenCountCache::new(cap);
+
+        for i in 0..(cap * CACHE_SHARDS * 3) as u64 {
+            cache.insert((i, 8), i as u32);
+        }
+
+        let stats = cache.stats();
+        assert!(
+            stats.entries <= cap * CACHE_SHARDS,
+            "memo must stay bounded: entries={} cap={}",
+            stats.entries,
+            cap * CACHE_SHARDS
+        );
+    }
+
+    /// Measures the real cost of re-counting one agent-round transcript six
+    /// times (the number of `project_request_usage` call sites per round), with
+    /// and without the memo.
+    ///
+    /// Ignored by default because it reports timings rather than asserting them.
+    /// Run with: `cargo test -p bamboo-compression --lib -- --ignored --nocapture
+    /// memo_speedup_on_round_transcript`
+    #[test]
+    #[ignore = "timing measurement, not an assertion"]
+    fn memo_speedup_on_round_transcript() {
+        use std::time::Instant;
+
+        let _guard = CACHE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let counter = TiktokenTokenCounter::default();
+
+        // ~64 messages of ~2.5 KB reproduces the observed working set
+        // (176k-token session) without needing a real session fixture.
+        let body: String = "The quick brown fox jumps over the lazy dog. \
+             Agents reconcile prompt context every round, re-reading the same \
+             transcript segments repeatedly.\n"
+            .repeat(25);
+        let messages: Vec<Message> = (0..64).map(|_| Message::user(body.clone())).collect();
+
+        // Cold path: encode everything, as the uncached code does on every pass.
+        // Mirrors `count_message` exactly (these messages carry no tool calls),
+        // so the two totals are directly comparable.
+        clear_token_count_cache();
+        let uncached_start = Instant::now();
+        let mut uncached_total = 0u64;
+        for _ in 0..6 {
+            for message in &messages {
+                uncached_total +=
+                    (counter.encode_text(&message.content) + counter.metadata_overhead) as u64;
+            }
+        }
+        let uncached_elapsed = uncached_start.elapsed();
+
+        // Memoized path: exactly what a round now does.
+        clear_token_count_cache();
+        let cached_start = Instant::now();
+        let mut cached_total = 0u64;
+        for _ in 0..6 {
+            cached_total += counter.count_messages(&messages) as u64;
+        }
+        let cached_elapsed = cached_start.elapsed();
+
+        let stats = token_count_cache_stats();
+        assert_eq!(
+            uncached_total, cached_total,
+            "memoization must not change the total token count"
+        );
+
+        let speedup = uncached_elapsed.as_secs_f64() / cached_elapsed.as_secs_f64().max(1e-9);
+        println!(
+            "\n--- token memo speedup (6 projections of 64 messages) ---\n\
+             uncached: {:?}\n\
+             memoized: {:?}\n\
+             speedup:  {:.1}x\n\
+             tokens:   {} (identical both ways)\n\
+             cache:    hits={} misses={} entries={}",
+            uncached_elapsed,
+            cached_elapsed,
+            speedup,
+            cached_total,
+            stats.hits,
+            stats.misses,
+            stats.entries
         );
     }
 }
