@@ -317,7 +317,21 @@ impl OwnedFilesystem {
         self.job("write", path, move |filesystem, path| {
             use std::io::Write;
             let anchor = filesystem.anchor();
-            let temp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4()));
+            // Hidden temp sibling, matching `deliver()`'s `.{name}.tmp.{uuid}`
+            // style so naive directory scanners skip it. Assembling the name
+            // from `file_name` (rather than `with_extension`) keeps the temp in
+            // the target's directory even for `subdir/name.json` paths.
+            let parent = path
+                .parent()
+                .ok_or_else(|| std::io::Error::other("write path has no parent directory"))?;
+            let file_name = path
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("write path has no file name"))?;
+            let temp = parent.join(format!(
+                ".{}.tmp.{}",
+                file_name.to_string_lossy(),
+                uuid::Uuid::new_v4()
+            ));
             // Every step through the anchored rename shares the cleanup below: a
             // failed observation, validation, or rename must not leave the
             // exclusive temp behind. `after_replace` runs post-commit, so a late
