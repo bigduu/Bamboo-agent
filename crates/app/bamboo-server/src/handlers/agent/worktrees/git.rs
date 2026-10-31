@@ -21,106 +21,6 @@ fn inspect_concurrency() -> usize {
     }
 }
 
-/// How long a cached dirty-state verdict stays usable. `git status` also
-/// reports untracked files, which do not move the index; the TTL bounds how
-/// stale an untracked-only change can be before the next scan re-inspects.
-fn inspect_cache_ttl() -> Duration {
-    if cfg!(test) {
-        Duration::from_millis(300)
-    } else {
-        Duration::from_secs(10)
-    }
-}
-
-/// Cap on retained cache rows so a Project with many historical worktrees
-/// cannot grow the map without bound.
-const INSPECT_CACHE_LIMIT: usize = 512;
-
-/// A dirty-state verdict plus the checkout state it was derived from. A row is
-/// reusable only while the index mtime and HEAD bytes are unchanged and the TTL
-/// has not expired.
-#[derive(Clone)]
-struct CachedInspection {
-    index_mtime: Option<SystemTime>,
-    head: Vec<u8>,
-    dirty: bool,
-    inspected_at: Instant,
-}
-
-fn inspect_cache() -> &'static Mutex<std::collections::HashMap<PathBuf, CachedInspection>> {
-    static CACHE: OnceLock<Mutex<std::collections::HashMap<PathBuf, CachedInspection>>> =
-        OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
-}
-
-/// Resolves a checkout's Git directory without spawning Git: a linked worktree
-/// carries a `.git` file pointing at the shared metadata, a primary checkout
-/// carries a `.git` directory.
-fn git_dir_of(checkout: &Path) -> PathBuf {
-    let marker = checkout.join(".git");
-    if marker.is_dir() {
-        return marker;
-    }
-    if let Ok(text) = fs::read_to_string(&marker) {
-        if let Some(rest) = text.strip_prefix("gitdir: ") {
-            let raw = PathBuf::from(rest.trim());
-            return if raw.is_absolute() {
-                raw
-            } else {
-                checkout.join(raw)
-            };
-        }
-    }
-    marker
-}
-
-/// The two file facts a dirty-state verdict depends on. Reading them costs no
-/// child process, so a cache lookup is strictly cheaper than any inspection.
-fn checkout_stamp(checkout: &Path) -> (Option<SystemTime>, Vec<u8>) {
-    let dir = git_dir_of(checkout);
-    let index = fs::metadata(dir.join("index"))
-        .and_then(|m| m.modified())
-        .ok();
-    let head = fs::read(dir.join("HEAD")).unwrap_or_default();
-    (index, head)
-}
-
-fn cached_inspection(checkout: &Path, stamp: &(Option<SystemTime>, Vec<u8>)) -> Option<bool> {
-    let cache = inspect_cache().lock().ok()?;
-    let row = cache.get(checkout)?;
-    if row.index_mtime != stamp.0 || row.head != stamp.1 {
-        return None;
-    }
-    if row.inspected_at.elapsed() > inspect_cache_ttl() {
-        return None;
-    }
-    Some(row.dirty)
-}
-
-fn remember_inspection(checkout: &Path, stamp: (Option<SystemTime>, Vec<u8>), dirty: bool) {
-    let Ok(mut cache) = inspect_cache().lock() else {
-        return;
-    };
-    if cache.len() >= INSPECT_CACHE_LIMIT && !cache.contains_key(checkout) {
-        // Bounded retention: drop stale rows first, then anything, rather than
-        // growing without limit on a machine with many historical checkouts.
-        let ttl = inspect_cache_ttl();
-        cache.retain(|_, row| row.inspected_at.elapsed() <= ttl);
-        if cache.len() >= INSPECT_CACHE_LIMIT {
-            cache.clear();
-        }
-    }
-    cache.insert(
-        checkout.to_path_buf(),
-        CachedInspection {
-            index_mtime: stamp.0,
-            head: stamp.1,
-            dirty,
-            inspected_at: Instant::now(),
-        },
-    );
-}
-
 /// Hard ceiling for one Git child process. A checkout on slow or offline
 /// storage (for example macOS-evicted dataless files) can block `git status`
 /// inside the kernel for minutes; the inventory must never inherit that.
@@ -295,54 +195,85 @@ fn command(repo: &Path, args: &[&str]) -> Result<Output, String> {
     command_by(repo, args, Instant::now() + git_command_timeout())
 }
 
+/// Discovers the `filter.<driver>.<kind>` overrides that disable external
+/// content filters for one repository.
+///
+/// Reading configuration names does not execute filters. Include every scope
+/// and include file, but never read or log their potentially secret values.
+/// Bounded too: an include file can live on stalled storage. The answer is a
+/// repository-level fact, so one scan computes it once for every checkout.
+fn filter_overrides(repo: &Path, deadline_at: Instant) -> Result<Vec<String>, String> {
+    let mut probe = git_command(repo);
+    probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
+    let configured = bounded_output(probe, deadline_at)
+        .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
+    if !configured.status.success() {
+        return Err(format!(
+            "Cannot inspect Git filter configuration: {}",
+            String::from_utf8_lossy(&configured.stderr).trim()
+        ));
+    }
+    let names =
+        std::str::from_utf8(&configured.stdout).map_err(|_| "Git filter names must be UTF-8")?;
+    let mut drivers = std::collections::BTreeSet::new();
+    for name in names.split('\0') {
+        if let Some((driver, kind)) = name
+            .strip_prefix("filter.")
+            .and_then(|s| s.rsplit_once('.'))
+        {
+            if matches!(kind, "clean" | "smudge" | "process") {
+                // -c splits at the first '='. Never let a subsection name
+                // change which key is overridden.
+                if driver.contains('=') {
+                    return Err("Git filter names containing '=' are unsupported".into());
+                }
+                drivers.insert(driver);
+            }
+        }
+    }
+    let mut overrides = Vec::new();
+    for driver in drivers {
+        for kind in ["clean", "smudge", "process"] {
+            overrides.push("-c".to_string());
+            overrides.push(format!("filter.{driver}.{kind}="));
+        }
+        // A checkout needing conversion must fail explicitly, rather than
+        // silently materialize raw pointers or report an inaccurate status.
+        overrides.push("-c".to_string());
+        overrides.push(format!("filter.{driver}.required=true"));
+    }
+    Ok(overrides)
+}
+
 /// Runs one Git command, bounded by `deadline_at`. The effective ceiling is
 /// also capped by the per-command ceiling, so one slow entry can never spend
 /// a whole inventory budget on a single child.
 fn command_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Output, String> {
+    command_with_overrides(repo, args, deadline_at, None)
+}
+
+/// Runs one Git command with optional precomputed filter overrides. A scan
+/// resolves them once per repository and reuses them for every checkout, which
+/// removes one Git spawn per inspected entry.
+fn command_with_overrides(
+    repo: &Path,
+    args: &[&str],
+    deadline_at: Instant,
+    overrides: Option<&[String]>,
+) -> Result<Output, String> {
     let ceiling = Instant::now() + git_command_timeout();
     let deadline_at = deadline_at.min(ceiling);
     let mut command = git_command(repo);
     if matches!(args.first(), Some(&"status" | &"read-tree"))
         || args.starts_with(&["worktree", "add"])
     {
-        // Reading configuration names does not execute filters. Include every
-        // scope and include file, but never read/log their potentially secret
-        // values. Bounded too: an include file can live on stalled storage.
-        let mut probe = git_command(repo);
-        probe.args(["config", "--includes", "--null", "--name-only", "--list"]);
-        let configured = bounded_output(probe, deadline_at)
-            .map_err(|e| format!("Cannot inspect Git filter configuration: {e}"))?;
-        if !configured.status.success() {
-            return Err(format!(
-                "Cannot inspect Git filter configuration: {}",
-                String::from_utf8_lossy(&configured.stderr).trim()
-            ));
-        }
-        let names = std::str::from_utf8(&configured.stdout)
-            .map_err(|_| "Git filter names must be UTF-8")?;
-        let mut drivers = std::collections::BTreeSet::new();
-        for name in names.split('\0') {
-            if let Some((driver, kind)) = name
-                .strip_prefix("filter.")
-                .and_then(|s| s.rsplit_once('.'))
-            {
-                if matches!(kind, "clean" | "smudge" | "process") {
-                    // -c splits at the first '='. Never let a subsection name
-                    // change which key is overridden.
-                    if driver.contains('=') {
-                        return Err("Git filter names containing '=' are unsupported".into());
-                    }
-                    drivers.insert(driver);
-                }
+        match overrides {
+            Some(precomputed) => {
+                command.args(precomputed);
             }
-        }
-        for driver in drivers {
-            for kind in ["clean", "smudge", "process"] {
-                command.args(["-c", &format!("filter.{driver}.{kind}=")]);
+            None => {
+                command.args(filter_overrides(repo, deadline_at)?);
             }
-            // A checkout needing conversion must fail explicitly, rather than
-            // silently materialize raw pointers or report an inaccurate status.
-            command.args(["-c", &format!("filter.{driver}.required=true")]);
         }
     }
     command.args(args);
@@ -354,7 +285,17 @@ fn git_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 fn git_bytes_by(repo: &Path, args: &[&str], deadline_at: Instant) -> Result<Vec<u8>, String> {
-    let output = command_by(repo, args, deadline_at)?;
+    git_bytes_with(repo, args, deadline_at, None)
+}
+
+/// Byte-returning variant that reuses precomputed filter overrides.
+fn git_bytes_with(
+    repo: &Path,
+    args: &[&str],
+    deadline_at: Instant,
+    overrides: Option<&[String]>,
+) -> Result<Vec<u8>, String> {
+    let output = command_with_overrides(repo, args, deadline_at, overrides)?;
     if !output.status.success() {
         let diagnostic = String::from_utf8_lossy(&output.stderr);
         let guidance = if diagnostic.contains(": smudge filter ")
@@ -1005,11 +946,17 @@ struct Inspection {
 
 /// Inspects one checkout: identity, submodule presence, and dirty state.
 ///
-/// Spawns three Git children instead of five. The checkout root and the shared
-/// metadata directory are resolved from the filesystem first (`git_dir_of`
-/// reads the `.git` file or directory); only a checkout whose layout does not
-/// resolve falls back to querying Git for both facts.
-fn inspect_checkout(checkout: &Path, common: &Path, deadline: Instant) -> Inspection {
+/// Both identity facts come from Git itself, inside the bounded wrapper. They
+/// are deliberately not derived from the `.git` file: that path is
+/// attacker-influenced (`gitdir: /repo/.git/../../other/.git` passes any prefix
+/// test while resolving to a foreign repository) and reading it is unbounded
+/// I/O, which a stalled checkout turns into a hang the deadline cannot stop.
+fn inspect_checkout(
+    checkout: &Path,
+    common: &Path,
+    filters: &[String],
+    deadline: Instant,
+) -> Inspection {
     let mut outcome = Inspection::default();
     if Instant::now() >= deadline {
         outcome.error =
@@ -1023,24 +970,22 @@ fn inspect_checkout(checkout: &Path, common: &Path, deadline: Instant) -> Inspec
             return outcome;
         }
     };
-    // A linked worktree's `.git` file and a primary checkout's `.git` directory
-    // both point at metadata this repository owns. Paths may contain newlines,
-    // so identity is verified from filesystem facts and single-value Git
-    // queries rather than a multi-line combined reply.
-    let metadata = git_dir_of(&canonical);
-    let common_matches = fs::canonicalize(&metadata).is_ok_and(|path| path == common)
-        || metadata.starts_with(common);
-    if !common_matches {
+    let reported_common = match repository_by(&canonical, deadline) {
+        Ok(path) => path,
+        Err(error) => {
+            outcome.error = Some(error);
+            return outcome;
+        }
+    };
+    if reported_common != common {
         outcome.error = Some("Worktree path now belongs to a different repository".into());
         return outcome;
     }
-    match git_path_by(&canonical, &["rev-parse", "--show-toplevel"], deadline) {
-        Ok(root) => {
-            let root_matches = fs::canonicalize(&root).is_ok_and(|path| path == canonical);
-            if !root_matches {
-                outcome.error = Some("Worktree path now belongs to a different repository".into());
-                return outcome;
-            }
+    match workspace_root_by(&canonical, deadline) {
+        Ok(root) if root == canonical => {}
+        Ok(_) => {
+            outcome.error = Some("Worktree path now belongs to a different repository".into());
+            return outcome;
         }
         Err(error) => {
             outcome.error = Some(error);
@@ -1060,7 +1005,7 @@ fn inspect_checkout(checkout: &Path, common: &Path, deadline: Instant) -> Inspec
     let has_submodules = index
         .split(|byte| *byte == 0)
         .any(|entry| entry.starts_with(b"160000 "));
-    let status = match git_bytes_by(
+    let status = match git_bytes_with(
         &canonical,
         &[
             "status",
@@ -1070,6 +1015,7 @@ fn inspect_checkout(checkout: &Path, common: &Path, deadline: Instant) -> Inspec
             "--ignore-submodules=dirty",
         ],
         deadline,
+        Some(filters),
     ) {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -1156,12 +1102,17 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
     // Overlapping a bounded number of them removes most of the wall clock. The
     // shared `deadline` still bounds the whole phase and every child keeps its
     // per-command ceiling, so one stalled checkout cannot block the scan.
+    //
+    // Filter overrides are a repository-level fact, resolved once here instead
+    // of once per checkout. A probe failure degrades every entry the same way
+    // the per-entry probe used to, but costs a single child rather than N.
     let mut outcomes: Vec<(usize, Inspection)> = Vec::new();
     if !pending.is_empty() {
+        let filters = filter_overrides(repo, deadline).unwrap_or_default();
         let workers = inspect_concurrency().min(pending.len());
         let cursor = std::sync::atomic::AtomicUsize::new(0);
         let collected: Mutex<Vec<(usize, Inspection)>> = Mutex::new(Vec::new());
-        let (pending_ref, common_ref) = (&pending, &common);
+        let (pending_ref, common_ref, filters_ref) = (&pending, &common, &filters);
         let (cursor_ref, collected_ref) = (&cursor, &collected);
         std::thread::scope(|scope| {
             for _ in 0..workers {
@@ -1170,22 +1121,7 @@ pub fn list_until(repo: &Path, overall_deadline: Instant) -> Result<Vec<Worktree
                     let Some((index, path)) = pending_ref.get(next) else {
                         break;
                     };
-                    let stamp = checkout_stamp(path);
-                    let outcome = match cached_inspection(path, &stamp) {
-                        Some(dirty) => Inspection {
-                            canonical: path.clone(),
-                            openable: true,
-                            dirty: Some(dirty),
-                            error: None,
-                        },
-                        None => {
-                            let inspected = inspect_checkout(path, common_ref, deadline);
-                            if let Some(dirty) = inspected.dirty {
-                                remember_inspection(&inspected.canonical, stamp, dirty);
-                            }
-                            inspected
-                        }
-                    };
+                    let outcome = inspect_checkout(path, common_ref, filters_ref, deadline);
                     if let Ok(mut rows) = collected_ref.lock() {
                         rows.push((*index, outcome));
                     }
@@ -1399,14 +1335,6 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
-
-    /// The inspection cache is process-global, so every test that exercises it
-    /// starts from an empty map rather than inheriting another test's fixtures.
-    fn clear_inspection_cache() {
-        if let Ok(mut cache) = inspect_cache().lock() {
-            cache.clear();
-        }
-    }
 
     struct Fixture(PathBuf);
     impl Fixture {
@@ -2787,7 +2715,6 @@ mod tests {
 
     #[test]
     fn concurrent_inspection_matches_serial_verdicts() {
-        clear_inspection_cache();
         let f = Fixture::new();
         let mut expected = Vec::new();
         for name in ["alpha", "beta", "gamma", "delta", "epsilon"] {
@@ -2799,11 +2726,11 @@ mod tests {
         // Serial reference: inspect each entry on its own.
         let common = repository(&f.repo()).unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
+        let filters = filter_overrides(&f.repo(), deadline).unwrap();
         let mut serial = Vec::new();
         for path in &expected {
-            serial.push(inspect_checkout(path, &common, deadline).dirty);
+            serial.push(inspect_checkout(path, &common, &filters, deadline).dirty);
         }
-        clear_inspection_cache();
         // Concurrent path: the same work through the production scan.
         let entries = list_until(&f.repo(), Instant::now() + Duration::from_secs(30)).unwrap();
         for (offset, path) in expected.iter().enumerate() {
@@ -2833,54 +2760,11 @@ mod tests {
             "the dirty checkout is the planted one: {:?}",
             dirty_entries[0].path
         );
-        clear_inspection_cache();
-    }
-
-    #[test]
-    fn inspection_cache_is_reused_then_invalidated_by_index_change() {
-        clear_inspection_cache();
-        let f = Fixture::new();
-        let checkout = create(&f.repo(), &f.roots(), "cached", "cached").unwrap();
-        let stamp = checkout_stamp(&checkout);
-        assert!(
-            cached_inspection(&checkout, &stamp).is_none(),
-            "an unseen checkout must not report a cached verdict"
-        );
-        remember_inspection(&checkout, stamp.clone(), false);
-        assert_eq!(
-            cached_inspection(&checkout, &stamp),
-            Some(false),
-            "an unchanged checkout must serve the cached verdict"
-        );
-        // A different index timestamp must invalidate the row.
-        let mut moved = stamp.clone();
-        moved.0 = Some(SystemTime::now() + Duration::from_secs(60));
-        assert!(
-            cached_inspection(&checkout, &moved).is_none(),
-            "an index change must invalidate the cached verdict"
-        );
-        // A different HEAD must invalidate the row too.
-        let mut head_changed = stamp.clone();
-        head_changed.1 = b"ref: refs/heads/other\n".to_vec();
-        assert!(
-            cached_inspection(&checkout, &head_changed).is_none(),
-            "a HEAD change must invalidate the cached verdict"
-        );
-        // The TTL bounds staleness even when the files did not move.
-        remember_inspection(&checkout, stamp.clone(), true);
-        assert_eq!(cached_inspection(&checkout, &stamp), Some(true));
-        std::thread::sleep(inspect_cache_ttl() + Duration::from_millis(50));
-        assert!(
-            cached_inspection(&checkout, &stamp).is_none(),
-            "an expired row must be re-inspected"
-        );
-        clear_inspection_cache();
     }
 
     #[cfg(unix)]
     #[test]
     fn concurrent_scan_still_returns_when_a_checkout_stalls() {
-        clear_inspection_cache();
         let f = Fixture::new();
         let healthy = create(&f.repo(), &f.roots(), "healthy", "healthy").unwrap();
         let stalled = create(&f.repo(), &f.roots(), "stalled", "stalled").unwrap();
@@ -2901,6 +2785,5 @@ mod tests {
         let fine = entries.iter().find(|entry| entry.path == healthy).unwrap();
         assert_eq!(fine.dirty, Some(false), "healthy entries stay accurate");
         assert!(fine.error.is_none(), "{:?}", fine.error);
-        clear_inspection_cache();
     }
 }
