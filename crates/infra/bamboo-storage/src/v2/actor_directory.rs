@@ -2053,4 +2053,59 @@ mod tests {
             .is_file());
         Ok(())
     }
+
+    /// Reproduction for bigduu/Bamboo-agent#2424: a pre-schema Child was
+    /// created before actor-authority existed, so its Session carries no
+    /// `parent_created_at` and no recorded Actor sidecar exists for it.
+    /// The strict lineage rule is intentionally UNCHANGED: such a Child is
+    /// still rejected here with `InvalidIdentity`, because it can never
+    /// present a valid ancestor birth proof. Exclusion from the managed
+    /// directory happens one layer up in `current_user_supervisor_target`
+    /// (see supervisor_current_user.rs), which skips these sessions rather
+    /// than failing the whole listing page. This test documents that
+    /// boundary: lineage still rejects, the directory layer excludes.
+    #[tokio::test]
+    async fn legacy_child_without_parent_created_at_is_still_rejected_by_lineage() {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let root = Session::new("legacy-birth-root", "model");
+        store.save_session(&root).await.unwrap();
+        // `new_child` leaves parent_created_at None: exactly the shape of a
+        // Child created before this column existed.
+        let child = Session::new_child("legacy-birth-child", &root.id, "model", "legacy child");
+        assert_eq!(child.parent_created_at, None);
+        store.save_session(&child).await.unwrap();
+        let actor = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        assert_eq!(actor.current_attempt, 0);
+        assert!(actor.ancestor_observations.is_empty());
+        let rejection = store
+            .validate_actor_control_lineage(&actor)
+            .await
+            .unwrap_err();
+        assert_eq!(rejection, ActorDirectoryError::InvalidIdentity);
+    }
+
+    /// The fix must not weaken validation: a Child whose recorded parentage
+    /// is genuinely inconsistent (wrong spawn depth) is still rejected.
+    #[tokio::test]
+    async fn inconsistent_legacy_child_depth_is_still_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let root = Session::new("legacy-reject-root", "model");
+        store.save_session(&root).await.unwrap();
+        let mut child =
+            Session::new_child("legacy-reject-child", &root.id, "model", "legacy child");
+        child.spawn_depth = 7; // inconsistent with parent depth 0 + 1
+        store.save_session(&child).await.unwrap();
+        let actor = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        let rejection = store
+            .validate_actor_control_lineage(&actor)
+            .await
+            .unwrap_err();
+        assert_eq!(rejection, ActorDirectoryError::InvalidIdentity);
+    }
 }

@@ -8031,7 +8031,10 @@ impl Storage for SessionStoreV2 {
         target: &str,
     ) -> io::Result<bamboo_domain::SupervisorCurrentUserTarget> {
         self.current_user_supervisor_target(supervisor, target)
-            .await
+            .await?
+            // Excluded targets (pre-schema children, #2424) are absent from the
+            // directory; a direct inspection of them is "not found".
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "current-user target not found"))
     }
 
     async fn load_supervisor_current_user_observed_session(
@@ -12005,5 +12008,56 @@ mod tests {
     fn test_extension_to_mime_with_whitespace() {
         assert_eq!(extension_to_mime("  png  "), Some("image/png"));
         assert_eq!(extension_to_mime("\tjpg\t"), Some("image/jpeg"));
+    }
+
+    // Regression for bigduu/Bamboo-agent#2424: a pre-schema child must not
+    // 503 the whole directory.
+    #[tokio::test]
+    async fn legacy_child_without_birth_proof_is_excluded_from_current_user_page() {
+        use bamboo_domain::Storage;
+
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let reference: bamboo_domain::SupervisorReference = (&store
+            .get_or_create_default_supervisor("model")
+            .await
+            .unwrap())
+            .into();
+        let root = Session::new("legacy-page-root", "model");
+        store.save_session(&root).await.unwrap();
+        // `new_child` leaves `parent_created_at` as `None`: exactly the shape
+        // of a Child created before actor birth proofs existed (#2424).
+        let child = Session::new_child("legacy-page-child", &root.id, "model", "legacy child");
+        assert_eq!(child.kind, bamboo_domain::SessionKind::Child);
+        assert!(child.parent_created_at.is_none());
+        store.save_session(&child).await.unwrap();
+
+        let page = store
+            .current_user_supervisor_page(&reference, None, None, 20)
+            .await
+            .expect("directory page must not fail on a pre-schema child");
+        let ids: Vec<&str> = page
+            .targets
+            .iter()
+            .map(|target| target.session_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&root.id.as_str()),
+            "ordinary Root must stay listed, got {ids:?}"
+        );
+        assert!(
+            !ids.contains(&child.id.as_str()),
+            "pre-schema Child must be excluded from the page, got {ids:?}"
+        );
+
+        // The excluded child is absent, not a page error: a direct
+        // inspection reports "not found" instead of failing the call.
+        assert!(store
+            .current_user_supervisor_target(&reference, &child.id)
+            .await
+            .unwrap()
+            .is_none());
     }
 }

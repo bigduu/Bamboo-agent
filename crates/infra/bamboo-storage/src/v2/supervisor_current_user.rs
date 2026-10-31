@@ -88,7 +88,7 @@ impl SessionStoreV2 {
     async fn current_user_target_source(
         &self,
         target_id: &str,
-    ) -> io::Result<(Session, HostScopeSessionObservation)> {
+    ) -> io::Result<Option<(Session, HostScopeSessionObservation)>> {
         target_id_is_valid(target_id)?;
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _task = self.lock_runtime_task_sidecar_shared().await?;
@@ -109,13 +109,20 @@ impl SessionStoreV2 {
         if !target.authority_identity.is_ordinary() {
             return Err(denied("current-user target must be an ordinary Session"));
         }
+        // Pre-schema children predate ancestor birth proofs: no `parent_created_at`
+        // and no actor-authority record, so strict lineage validation can never
+        // succeed. They carry no usable managed-target authority, so exclude them
+        // from the directory rather than failing the whole page (#2424).
+        if target.kind == bamboo_domain::SessionKind::Child && target.parent_created_at.is_none() {
+            return Ok(None);
+        }
         let ancestors = self
             .validate_actor_control_lineage(&actor)
             .await
             .map_err(|error| other_io_error(error.to_string()))?;
         let observation = HostScopeSessionObservation::capture(&target, ancestors)
             .map_err(|error| denied(&error.to_string()))?;
-        Ok((target, observation))
+        Ok(Some((target, observation)))
     }
 
     pub(crate) async fn lock_current_user_target(
@@ -146,7 +153,15 @@ impl SessionStoreV2 {
         }
         let caller = HostScopeSessionObservation::capture(&source, vec![])
             .map_err(|error| denied(&error.to_string()))?;
-        let (_, target) = self.current_user_target_source(target_id).await?;
+        let (_, target) = self
+            .current_user_target_source(target_id)
+            .await?
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "current-user target has no usable actor authority",
+                )
+            })?;
         let authority = self
             .lock_host_scope_control_observations(&[caller, target.clone()])
             .await?;
@@ -192,9 +207,15 @@ impl SessionStoreV2 {
         &self,
         reference: &SupervisorReference,
         target_id: &str,
-    ) -> io::Result<SupervisorCurrentUserTarget> {
-        let guard = self.lock_current_user_target(reference, target_id).await?;
-        Ok(guard.reference.clone())
+    ) -> io::Result<Option<SupervisorCurrentUserTarget>> {
+        let guard = match self.lock_current_user_target(reference, target_id).await {
+            Ok(guard) => guard,
+            // Excluded targets (pre-schema children with no actor authority)
+            // are absent from the directory listing, not a page error (#2424).
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        Ok(Some(guard.reference.clone()))
     }
 
     pub(crate) async fn current_user_supervisor_link(
@@ -353,7 +374,9 @@ impl SessionStoreV2 {
                     continue;
                 }
             }
-            let target = self.current_user_supervisor_target(reference, &id).await?;
+            let Some(target) = self.current_user_supervisor_target(reference, &id).await? else {
+                continue;
+            };
             if query.as_ref().is_some_and(|query| {
                 !id.to_lowercase().contains(query)
                     && !target
