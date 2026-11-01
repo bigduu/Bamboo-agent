@@ -13,6 +13,9 @@ pub(super) const LEASE_KEY: &str = "session_inbox_lease";
 const OWNED_KIND: &str = "session_envelope_owned_v3";
 const DEAD_LETTER_DIR: &str = "dead";
 const MAX_EXPLICIT_FAILURES: u32 = 3;
+/// Tombstone comparisons are bounded by the same order of magnitude as
+/// transports themselves, so a replay check can never read unbounded evidence.
+const MAX_CANCEL_BYTES: usize = 8 * 1024 * 1024;
 const RETRY_BASE_MILLIS: u64 = 30_000;
 const RETRY_MAX_MILLIS: u64 = 300_000;
 
@@ -475,9 +478,11 @@ impl OwnedFilesystem {
 
     /// Same cancelled tombstone, while preserving any existing evidence.
     /// Caller and this job retain the original exclusive Inbox operation lock.
-    /// A tombstone that already exists is an idempotent success: the repeated
-    /// cancellation reached the same benign terminal state, so the original
-    /// evidence is preserved and the source transport is left in place.
+    /// A tombstone that already holds exactly the bytes we are about to move is
+    /// the same cancellation replaying: keep the original evidence and treat it
+    /// as an idempotent success. Any other existing tombstone is a foreign
+    /// forensic collision and must still fail closed, or the caller would ACK a
+    /// Stop whose tail was never retired.
     pub(super) async fn cancel_if_absent(
         &self,
         dir: &Path,
@@ -489,11 +494,19 @@ impl OwnedFilesystem {
         self.job("cancel", path, move |filesystem, path| {
             let anchor = filesystem.anchor();
             anchor.create_dir_all(&cancelled)?;
-            // `symlink_metadata` relative to the retained Inbox: an existing
-            // tombstone still wins over a fresh move, and preserves its
-            // original evidence instead of surfacing a hard conflict.
+            // An existing tombstone still wins over a fresh move, preserving
+            // its original evidence. It is only an idempotent success when it
+            // already holds the exact bytes of the transport being cancelled.
             if anchor.entry_exists(&to)? {
-                return Ok(());
+                let existing = anchor.read_existing(&to, MAX_CANCEL_BYTES)?;
+                let source = anchor.read_existing(path, MAX_CANCEL_BYTES)?;
+                if existing.is_some() && existing == source {
+                    return Ok(());
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "scoped Loop cancellation tombstone already exists",
+                ));
             }
             anchor.rename(path, &to)
         })
