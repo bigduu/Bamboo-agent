@@ -480,19 +480,15 @@ async fn unset_llm_retry_leaves_the_environment_derived_policy_in_force() {
     let sink = request_sink().await;
     let (_dir, state) = configured_state_inner(&sink.uri()).await;
 
+    // Simulate a deployment tuned only through the environment: no published
+    // override exists, so `global()`/`initial_request_limits()` fall back to
+    // these variables.
     let previous_retry = bamboo_llm::retry::global();
     let previous_limits = bamboo_llm::retry::initial_request_limits();
-    bamboo_llm::retry::configure(
-        bamboo_llm::retry::InitialRequestLimits {
-            total_budget: Duration::from_millis(1_234_000),
-            attempt_timeout: Duration::from_millis(111_000),
-        },
-        bamboo_llm::retry::RetryConfig {
-            max_attempts: 3,
-            base_delay: Duration::from_millis(11),
-            max_delay: Duration::from_millis(22),
-        },
-    );
+    bamboo_llm::retry::clear_published_policy();
+    std::env::set_var("BAMBOO_LLM_MAX_RETRIES", "2");
+    std::env::set_var("BAMBOO_LLM_RETRY_ATTEMPT_TIMEOUT_MS", "111000");
+    std::env::set_var("BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS", "1234000");
 
     // The freshly built state has no persisted policy.
     assert!(state.config.read().await.llm_retry.is_none());
@@ -500,14 +496,62 @@ async fn unset_llm_retry_leaves_the_environment_derived_policy_in_force() {
 
     let kept = bamboo_llm::retry::global();
     let kept_limits = bamboo_llm::retry::initial_request_limits();
+
+    std::env::remove_var("BAMBOO_LLM_MAX_RETRIES");
+    std::env::remove_var("BAMBOO_LLM_RETRY_ATTEMPT_TIMEOUT_MS");
+    std::env::remove_var("BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS");
     bamboo_llm::retry::configure(previous_limits, previous_retry);
 
+    // BAMBOO_LLM_MAX_RETRIES=2 means two retries after the first attempt.
     assert_eq!(
         kept.max_attempts, 3,
         "an unset policy must not publish defaults"
     );
     assert_eq!(kept_limits.attempt_timeout, Duration::from_millis(111_000));
     assert_eq!(kept_limits.total_budget, Duration::from_millis(1_234_000));
+}
+
+/// Removing a previously saved policy must drop the live override, otherwise
+/// requests keep using settings the configuration no longer contains.
+#[tokio::test]
+async fn removing_the_persisted_policy_clears_the_published_override() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x66; 32]);
+    let _guard = policy_lock().lock().await;
+    let sink = request_sink().await;
+    let (_dir, state) = configured_state_inner(&sink.uri()).await;
+
+    let previous_retry = bamboo_llm::retry::global();
+    let previous_limits = bamboo_llm::retry::initial_request_limits();
+
+    let mut core = section(&state, SectionId::Core);
+    core.data["llm_retry"] = serde_json::json!({
+        "max_attempts": 9,
+        "attempt_timeout_ms": 200_000,
+        "total_budget_ms": 900_000,
+        "base_delay_ms": 500,
+        "max_delay_ms": 30_000,
+    });
+    state
+        .put_ordinary_section(SectionId::Core, core.revision, core.data)
+        .await
+        .unwrap();
+    assert_eq!(bamboo_llm::retry::global().max_attempts, 9);
+
+    let mut core = section(&state, SectionId::Core);
+    core.data["llm_retry"] = serde_json::Value::Null;
+    state
+        .put_ordinary_section(SectionId::Core, core.revision, core.data)
+        .await
+        .unwrap();
+
+    let after_removal = bamboo_llm::retry::global();
+    bamboo_llm::retry::configure(previous_limits, previous_retry);
+
+    assert_ne!(
+        after_removal.max_attempts, 9,
+        "a removed policy must not stay in force"
+    );
+    assert_eq!(after_removal.max_attempts, previous_retry.max_attempts);
 }
 
 /// An out-of-range policy must be rejected before it is committed, so the API

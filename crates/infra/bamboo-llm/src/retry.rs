@@ -395,6 +395,19 @@ pub fn configure(policy: InitialRequestLimits, retry: RetryConfig) {
     });
 }
 
+/// Drop the published override so the environment-derived policy applies again.
+///
+/// Needed when the operator *removes* a previously saved policy: leaving the old
+/// override installed would keep requests on settings the configuration no
+/// longer contains. Calling this when nothing was ever published is a no-op, so
+/// a deployment that only tunes `BAMBOO_LLM_RETRY_*` is unaffected.
+pub fn clear_published_policy() {
+    let mut stored = policy_slot()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    *stored = None;
+}
+
 fn policy_slot() -> &'static Mutex<Option<LiveRequestPolicy>> {
     static POLICY: OnceLock<Mutex<Option<LiveRequestPolicy>>> = OnceLock::new();
     POLICY.get_or_init(|| Mutex::new(None))
