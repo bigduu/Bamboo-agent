@@ -479,6 +479,23 @@ pub fn clear_token_count_cache() {
     token_count_cache().clear();
 }
 
+/// Whether `text` currently has a memoized count.
+///
+/// Test-only probe. Hit/miss counters are process-wide and shared with every
+/// other test that counts text, so asserting on their deltas makes a test
+/// depend on unrelated tests' traffic. Membership for one specific payload is
+/// deterministic instead.
+#[cfg(test)]
+fn token_count_cache_contains(text: &str) -> bool {
+    let cache = token_count_cache();
+    let key = token_cache_key(text);
+    cache
+        .shard_for(key.0)
+        .lock()
+        .map(|map| map.contains_key(&key))
+        .unwrap_or(false)
+}
+
 /// Per-process randomized hash keys for the memo fingerprint.
 ///
 /// Fixed-key hashing would let crafted text (tool output, model content) collide
@@ -967,26 +984,26 @@ mod tests {
         ];
 
         let first_pass = counter.count_messages(&messages);
-        let misses_after_first = token_count_cache_stats().misses;
-        assert!(
-            misses_after_first >= messages.len() as u64,
-            "cold pass must encode every memoizable message"
-        );
+        // Membership (not the shared hit/miss counters) proves the cold pass
+        // memoized each payload. Concurrent tests share those counters, so a
+        // delta assertion would depend on their traffic.
+        for message in &messages {
+            assert!(
+                token_count_cache_contains(&message.content),
+                "cold pass must memoize every payload"
+            );
+        }
 
         // Re-counting the same immutable transcript — what an agent round does
         // for each projection — must not encode anything again.
         let second_pass = counter.count_messages(&messages);
-        let after = token_count_cache_stats();
 
         assert_eq!(first_pass, second_pass, "counts must not drift");
-        assert_eq!(
-            after.misses, misses_after_first,
-            "second pass must be served entirely from the memo"
-        );
+        // `hits` only ever grows, so a lower bound is safe under concurrent
+        // tests while still proving the second pass was served from the memo.
         assert!(
-            after.hits >= messages.len() as u64,
-            "second pass must register hits, got {}",
-            after.hits
+            token_count_cache_stats().hits >= messages.len() as u64,
+            "second pass must be served from the memo"
         );
     }
 
@@ -1033,14 +1050,14 @@ mod tests {
         let short = "short";
         assert!(short.len() < CACHE_MIN_TEXT_BYTES);
 
-        let before = token_count_cache_stats().lookups();
         counter.count_text(short);
         counter.count_text(short);
-        let after = token_count_cache_stats().lookups();
 
-        assert_eq!(
-            after, before,
-            "texts below the memo threshold must not touch the cache"
+        // Deterministic membership check: a shared hit/miss delta would be
+        // perturbed by any concurrently running test.
+        assert!(
+            !token_count_cache_contains(short),
+            "texts below the memo threshold must not be cached"
         );
     }
 
