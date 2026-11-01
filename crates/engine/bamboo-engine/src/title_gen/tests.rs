@@ -519,6 +519,113 @@ fn test_heuristic_title_trims_punctuation_tail() {
 }
 
 #[test]
+fn test_heuristic_title_caps_without_splitting_a_word() {
+    // 60 characters lands inside "detai|ls"; the title must not keep the fragment.
+    let input =
+        "Wrangle the deployment pipeline for every microservice before the release window closes";
+    let title = heuristic_title(input);
+    assert!(title.chars().count() <= 60, "{title:?}");
+    assert!(
+        input.starts_with(&title),
+        "title must be a prefix of the input: {title:?}"
+    );
+    // The cut falls on a word boundary, so the title ends a whole word.
+    let next = input[title.len()..].chars().next();
+    assert!(
+        next.is_none_or(|c| c.is_whitespace()),
+        "title ends mid-word: {title:?} then {next:?}"
+    );
+}
+
+#[test]
+fn test_heuristic_title_keeps_cjk_text_that_has_no_word_spaces() {
+    // A CJK sentence has no whitespace to retreat to; it must keep the hard cut
+    // instead of collapsing to an empty title.
+    let input = "帮我把这个部署流水线在发布窗口关闭之前全部分析清楚并且给出改进建议";
+    let title = heuristic_title(input);
+    assert!(!title.is_empty());
+    assert!(title.chars().count() <= 60, "{title:?}");
+    assert!(input.starts_with(&title), "{title:?}");
+}
+
+#[test]
+fn test_heuristic_title_drops_a_pasted_banner_joined_on_one_line() {
+    // Reproduces the reported title: a selection over the banner joined its title
+    // and <summary> label into one line, followed by the error body.
+    let input = concat!(
+        "Message sent, but generation was interrupted Technical details\n",
+        "LLM error: initial response headers timed out\n",
+        "\n",
+        "\n",
+        "Why does this keep happening? And here is my diagnostics bundle.\n"
+    );
+    let title = heuristic_title(input);
+    assert_eq!(title, "Why does this keep happening");
+}
+
+#[test]
+fn test_heuristic_title_drops_a_pasted_banner_on_separate_lines() {
+    let input = concat!(
+        "Message sent, but generation was interrupted\n",
+        "Technical details\n",
+        "LLM error: initial response headers timed out\n",
+        "\n",
+        "The retry policy never recovers on its own.\n"
+    );
+    let title = heuristic_title(input);
+    assert_eq!(title, "The retry policy never recovers on its own");
+}
+
+#[test]
+fn test_heuristic_title_drops_a_pasted_banner_without_details() {
+    let input = "Message sent, but generation was interrupted\n\nHow do I stop this?\n";
+    assert_eq!(heuristic_title(input), "How do I stop this");
+}
+
+#[test]
+fn test_heuristic_title_drops_a_pasted_banner_in_chinese() {
+    let input = concat!(
+        "消息已发送，但生成中断 技术详情\n",
+        "LLM error: initial response headers timed out\n",
+        "\n",
+        "老是有这个问题 是为什么?\n"
+    );
+    assert_eq!(heuristic_title(input), "老是有这个问题 是为什么");
+}
+
+#[test]
+fn test_heuristic_title_falls_back_to_banner_copy_when_nothing_else_remains() {
+    // Stripping everything would lose the title entirely, so the banner copy is
+    // kept rather than emitting an empty session title.
+    let input = "Message sent, but generation was interrupted\n";
+    assert_eq!(
+        heuristic_title(input),
+        "Message sent, but generation was interrupted"
+    );
+}
+
+#[test]
+fn test_heuristic_title_leaves_ordinary_messages_untouched() {
+    // Only a banner at the very start is stripped. A message that merely quotes
+    // the banner copy keeps its own words, and the long line still caps normally.
+    let input = "Why does the banner say \"Message sent, but generation was interrupted\"?";
+    let title = heuristic_title(input);
+    assert!(title.starts_with("Why does the banner say"), "{title:?}");
+
+    // A banner phrase that is not the first line is not stripped. Only the strip
+    // is asserted here: whitespace collapsing predates this fix and joins the
+    // lines, so the exact title text is not this fix's contract.
+    assert!(
+        heuristic_title("Explain this\nMessage sent, but generation was interrupted")
+            .starts_with("Explain this")
+    );
+    assert_eq!(
+        heuristic_title("Refactor the auth module"),
+        "Refactor the auth module"
+    );
+}
+
+#[test]
 fn test_sanitize_strips_quotes_and_caps() {
     assert_eq!(sanitize("\"Hello world.\""), "Hello world");
     assert_eq!(sanitize("  'A quoted title'  "), "A quoted title");
