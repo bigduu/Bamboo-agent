@@ -1808,9 +1808,18 @@ impl RootActorExecution {
                         let now = chrono::Utc::now();
                         let expires = now + chrono::Duration::from_std(duration).expect("bounded Root lease");
                         if let Err(error) = directory.renew_activation(&fence, now, expires).await {
-                            // An in-flight provider response may still arrive.
-                            // Its next load/write/effect boundary rejects this
-                            // fence; never retry a side effect or cancel a new owner.
+                            // A transient storage failure (lock contention, IO
+                            // hiccup) only delays this renewal; the next tick
+                            // retries. An authority rejection (fence taken over
+                            // or activation finished) is final: an in-flight
+                            // provider response may still arrive, but its next
+                            // load/write/effect boundary rejects this fence;
+                            // never retry a side effect or cancel a new owner.
+                            if matches!(error, bamboo_domain::ActorDirectoryError::Storage(_)) {
+                                tracing::warn!(actor_id = %fence.actor_id, run_id = %fence.run_id,
+                                    %error, "Root Actor renewal hit transient storage failure; retrying next tick");
+                                continue;
+                            }
                             tracing::warn!(actor_id = %fence.actor_id, run_id = %fence.run_id,
                                 %error, "Root Actor renewal lost its execution authority");
                             break;
