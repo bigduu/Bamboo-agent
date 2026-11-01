@@ -45,10 +45,15 @@ pub fn heuristic_title(first_user_text: &str) -> String {
 /// Text with no whitespace before the cut (a URL, a CJK sentence) keeps the hard
 /// cut: retreating to a "word" boundary there would discard the whole title.
 fn truncate_at_word_boundary(text: &str, max_chars: usize) -> &str {
-    let Some((hard_cut, _)) = text.char_indices().nth(max_chars) else {
+    let Some((hard_cut, next_char)) = text.char_indices().nth(max_chars) else {
         return text;
     };
     let head = &text[..hard_cut];
+    // A separator at the cut means `head` already ends a whole word. Retreating
+    // again would drop a word that fits inside the limit exactly.
+    if next_char.is_whitespace() {
+        return head;
+    }
     match head.rfind(char::is_whitespace) {
         Some(word_cut) if word_cut > 0 => &head[..word_cut],
         _ => head,

@@ -538,6 +538,22 @@ fn test_heuristic_title_caps_without_splitting_a_word() {
 }
 
 #[test]
+fn test_heuristic_title_keeps_a_word_that_ends_exactly_at_the_limit() {
+    // This sentence's 60th character is the space after "logs", so the whole word
+    // fits inside the limit and must not be dropped by a second retreat.
+    let input = "Investigate failed authentication request in production logs before deploying";
+    assert_eq!(
+        &input[..60],
+        "Investigate failed authentication request in production logs"
+    );
+    assert!(input[60..].starts_with(' '));
+    assert_eq!(
+        heuristic_title(input),
+        "Investigate failed authentication request in production logs"
+    );
+}
+
+#[test]
 fn test_heuristic_title_keeps_cjk_text_that_has_no_word_spaces() {
     // A CJK sentence has no whitespace to retreat to; it must keep the hard cut
     // instead of collapsing to an empty title.
