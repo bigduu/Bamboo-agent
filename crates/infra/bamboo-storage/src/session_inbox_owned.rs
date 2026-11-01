@@ -493,8 +493,9 @@ impl OwnedFilesystem {
     /// Same cancelled tombstone, while preserving any existing evidence.
     /// Caller and this job retain the original exclusive Inbox operation lock.
     /// A tombstone that already holds exactly the bytes we are about to move is
-    /// the same cancellation replaying: keep the original evidence and treat it
-    /// as an idempotent success. Any other existing tombstone is a foreign
+    /// the same cancellation replaying: keep the original evidence, drop the
+    /// duplicate source from the active queue, and treat it as an idempotent
+    /// success. Any other existing tombstone is a foreign
     /// forensic collision and must still fail closed, or the caller would ACK a
     /// Stop whose tail was never retired.
     pub(super) async fn cancel_if_absent(
@@ -515,6 +516,17 @@ impl OwnedFilesystem {
                 let existing = anchor.read_existing(&to, MAX_CANCEL_BYTES)?;
                 let source = anchor.read_existing(path, MAX_CANCEL_BYTES)?;
                 if existing.is_some() && existing == source {
+                    // The tombstone already holds exactly these bytes, so this
+                    // cancellation is replaying. Drop the duplicate transport
+                    // from the active queue before reporting success: callers
+                    // stop accounting for it once retirement succeeds, so
+                    // leaving it behind would let the queue fill with entries
+                    // no later retirement could ever clear.
+                    match anchor.remove_file(path) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e),
+                    }
                     return Ok(());
                 }
                 return Err(std::io::Error::new(

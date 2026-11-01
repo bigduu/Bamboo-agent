@@ -1076,15 +1076,16 @@ async fn cancel_if_absent_treats_existing_tombstone_as_idempotent_success() {
     assert!(!path.exists());
     // A retried cancellation replays a transport with the same bytes at the
     // same name: the existing tombstone is the same benign terminal state, so
-    // it must succeed without moving the replayed source or rewriting evidence.
+    // it must succeed, drop the duplicate source from the active queue, and
+    // leave the preserved tombstone bytes untouched.
     tokio::fs::write(&path, &evidence).await.unwrap();
     filesystem
         .cancel_if_absent(&dir, &path, &name)
         .await
         .unwrap();
     assert!(
-        path.exists(),
-        "existing tombstone must not move the replayed source"
+        !path.exists(),
+        "replayed cancellation must drop the duplicate source"
     );
     assert_eq!(tokio::fs::read(&tombstone).await.unwrap(), evidence);
 }
