@@ -8031,7 +8031,10 @@ impl Storage for SessionStoreV2 {
         target: &str,
     ) -> io::Result<bamboo_domain::SupervisorCurrentUserTarget> {
         self.current_user_supervisor_target(supervisor, target)
-            .await
+            .await?
+            // Excluded targets (pre-schema children, #2424) are absent from the
+            // directory; a direct inspection of them is "not found".
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "current-user target not found"))
     }
 
     async fn load_supervisor_current_user_observed_session(
