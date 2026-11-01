@@ -23,7 +23,10 @@ struct Fixture {
 impl Fixture {
     async fn new(exact_authorizer: bool) -> Self {
         let home = tempfile::tempdir().unwrap();
-        let mut state = Box::pin(AppState::new(home.path().into())).await.unwrap();
+        let memory = bamboo_memory::memory_store::MemoryStore::new(home.path().join("jiandu"));
+        let mut state = Box::pin(AppState::new_with_memory_store(home.path().into(), memory))
+            .await
+            .unwrap();
         if exact_authorizer {
             state = state.with_supervisor_project_scope_authorizer(Arc::new(ApprovedHostIntent));
         }
@@ -483,4 +486,977 @@ async fn managed_sessions_corrupt_canonical_target_and_source_fail_closed_withou
     assert!(error.get("sessions").is_none());
     assert_eq!(f.target_bytes("target-a").await, before);
     f.state.shutdown().await;
+}
+
+/// These requests use a temporary AppState and synthetic Sessions only.  The
+/// stale selector is data, not authorization, and must never select a new birth.
+#[actix_web::test]
+async fn managed_history_binds_snapshot_to_observed_target_and_keeps_legacy_history() {
+    let f = Fixture::new(false).await;
+    let (status, directory) = f.call(Method::GET, None, None).await;
+    assert_eq!(status, StatusCode::OK, "{directory}");
+    assert_eq!(
+        directory["capabilities"]["current_user_bound_history_v1"],
+        true
+    );
+    let old_target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let binding = json!({"supervisor": f.supervisor, "target": old_target});
+    let (status, initial) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "bound history must exist: {initial}"
+    );
+    assert_eq!(initial["current_user_target"], old_target);
+    assert_eq!(
+        initial["messages"][0]["content"],
+        "PRIVATE target-a original history"
+    );
+    let cursor = initial["messages"][0]["id"].as_str().unwrap().to_string();
+
+    // A normal append in the same birth is still the same target, including
+    // when a client requests the existing cursor/projection semantics.
+    let mut original = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    // The pre-existing quiet cache has the same birth, but misses the newly
+    // persisted history. Identity equality is not a freshness proof.
+    f.state.sessions.insert(
+        "target-a".into(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(original.clone())),
+    );
+    original.add_message(Message::user("synthetic same-birth append"));
+    f.state.storage.save_session(&original).await.unwrap();
+    let mut delta_request = binding.clone();
+    delta_request["query"] = json!({"since_message_id": cursor, "projection": "messages"});
+    let (status, delta) = f
+        .call(Method::POST, Some("target-a/history"), Some(delta_request))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{delta}");
+    assert_eq!(delta["is_delta"], true);
+    assert_eq!(delta["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        delta["messages"][0]["content"],
+        "synthetic same-birth append"
+    );
+
+    assert_eq!(delta["history_snapshot_source"], "durable");
+    assert!(delta.get("bound_token_usage").is_some());
+
+    // Same-identity edits and truncations must also beat the old cached copy.
+    original.messages[1].content = "synthetic edited".into();
+    f.state.storage.save_session(&original).await.unwrap();
+    let (status, edited) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(edited["messages"][1]["content"], "synthetic edited");
+    original.messages.truncate(1);
+    original.token_usage = Some(bamboo_domain::TokenBudgetUsage {
+        system_tokens: 2,
+        summary_tokens: 0,
+        window_tokens: 3,
+        total_tokens: 5,
+        max_context_tokens: 100,
+        budget_limit: 100,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
+    });
+    f.state.storage.save_session(&original).await.unwrap();
+    let (status, shortened) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{shortened}");
+    assert_eq!(shortened["messages"].as_array().unwrap().len(), 1);
+    assert_eq!(shortened["bound_token_usage"]["total_tokens"], 5);
+
+    // Actual supported replacement in the isolated temporary store: the old
+    // selector cannot retrieve the new birth's transcript.
+    assert!(f.state.storage.delete_session("target-a").await.unwrap());
+    let mut replacement = f
+        .state
+        .storage
+        .recreate_root_session("target-a", "model")
+        .await
+        .unwrap();
+    replacement.set_project_id_meta(f.project.to_string());
+    // Recreated Roots use the same next-revision CAS for Project changes.
+    replacement.metadata_version = replacement.metadata_version.checked_add(1).unwrap();
+    replacement.add_message(Message::user("PRIVATE replacement history"));
+    f.state.storage.save_session(&replacement).await.unwrap();
+    let (status, stale) = f
+        .call(Method::POST, Some("target-a/history"), Some(binding))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert_eq!(stale["code"], "target_observation_stale");
+    assert!(!stale.to_string().contains("PRIVATE replacement history"));
+    assert!(stale.get("messages").is_none());
+
+    // Legacy cache publication is independent of this bound endpoint.
+    let _ = f.state.sessions.remove("target-a");
+    // Legacy GET remains available with its existing, weaker ID-only contract.
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let request = test::TestRequest::get()
+        .uri("/api/v1/history/target-a")
+        .peer_addr("127.0.0.1:12345".parse().unwrap())
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let legacy: Value = test::read_body_json(response).await;
+    assert_eq!(
+        legacy["messages"][0]["content"],
+        "PRIVATE replacement history"
+    );
+    assert!(legacy.get("current_user_target").is_none());
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn managed_history_requires_owner_and_matching_supervisor_and_path() {
+    let f = Fixture::new(false).await;
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let binding = json!({"supervisor": f.supervisor, "target": target});
+    for (remote, worker) in [(true, false), (false, true)] {
+        let (status, denied) = call(
+            f.state.clone(),
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+            remote,
+            worker,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+        assert!(denied.get("messages").is_none());
+    }
+    let (status, mismatch) = f
+        .call(
+            Method::POST,
+            Some("target-b/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{mismatch}");
+    let mut stale_supervisor = binding;
+    stale_supervisor["supervisor"]["incarnation_id"] = json!(uuid::Uuid::new_v4());
+    let (status, stale) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(stale_supervisor),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{stale}");
+    assert!(stale.get("messages").is_none());
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn managed_history_uses_durable_snapshot_even_with_a_same_birth_cache() {
+    let f = Fixture::new(false).await;
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let binding = json!({"supervisor": f.supervisor, "target": target});
+    let mut cached = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    cached.add_message(Message::user("synthetic cache-only same-birth message"));
+    f.state.sessions.insert(
+        "target-a".into(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(cached)),
+    );
+    let (status, matching) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{matching}");
+    assert_eq!(matching["history_snapshot_source"], "durable");
+    assert!(matching.get("bound_token_usage").is_some());
+    assert!(!matching
+        .to_string()
+        .contains("synthetic cache-only same-birth message"));
+
+    // The live runner owns its local mutable Session; like the legacy handler,
+    // bound history chooses the persisted snapshot rather than a lagging cache.
+    f.state
+        .agent_runners
+        .write()
+        .await
+        .insert("target-a".into(), bamboo_engine::AgentRunner::new());
+    let (status, active) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(binding.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{active}");
+    assert_eq!(active["history_snapshot_source"], "durable");
+    assert!(!active
+        .to_string()
+        .contains("synthetic cache-only same-birth message"));
+    f.state.agent_runners.write().await.remove("target-a");
+
+    let mut other = Session::new("target-a", "model");
+    other.set_project_id_meta(f.project.to_string());
+    other.add_message(Message::user("PRIVATE wrong-birth cache"));
+    f.state.sessions.insert(
+        "target-a".into(),
+        Arc::new(bamboo_engine::SessionSnapshot::new(other)),
+    );
+    let (status, safe) = f
+        .call(Method::POST, Some("target-a/history"), Some(binding))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{safe}");
+    assert_eq!(safe["history_snapshot_source"], "durable");
+    assert!(!safe.to_string().contains("PRIVATE wrong-birth cache"));
+    assert!(safe
+        .to_string()
+        .contains("PRIVATE target-a original history"));
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn managed_history_binds_ordinary_child_and_its_ancestry() {
+    let f = Fixture::new(false).await;
+    let parent = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    let mut child = Session::new_child_of("child-a", &parent, "model", "Synthetic child");
+    child.set_project_id_meta(f.project.to_string());
+    child.add_message(Message::user("synthetic child history"));
+    f.state.storage.save_session(&child).await.unwrap();
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "child-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    assert_eq!(target["kind"], "child");
+    assert_eq!(target["parent_session_id"], "target-a");
+    let binding = json!({"supervisor": f.supervisor, "target": target});
+    let (status, history) = f
+        .call(Method::POST, Some("child-a/history"), Some(binding))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(history["current_user_target"], target);
+    assert_eq!(history["messages"][0]["content"], "synthetic child history");
+    f.state.shutdown().await;
+}
+
+// Synthetic state only: verify the readback evidence comes from the selected
+// durable Session and that the Host activity probe does not wait under storage.
+#[actix_web::test]
+async fn managed_clear_readback_binds_full_count_pending_and_local_activity() {
+    let f = Fixture::new(false).await;
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let ordinary = json!({"supervisor": f.supervisor, "target": target});
+    let mut request = ordinary.clone();
+    request["clear_readback"] = json!(true);
+    let (_, default_history) = f
+        .call(Method::POST, Some("target-a/history"), Some(ordinary))
+        .await;
+    assert!(default_history.get("bound_clear_evidence").is_none());
+
+    let mut session = f
+        .state
+        .storage
+        .load_session("target-a")
+        .await
+        .unwrap()
+        .unwrap();
+    session.messages.clear();
+    f.state.storage.save_session(&session).await.unwrap();
+    let (status, empty) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{empty}");
+    assert_eq!(
+        empty["bound_clear_evidence"],
+        json!({
+            "full_message_count": 0, "execution_active": false,
+            "has_pending_question": false, "has_pending_approval": false
+        })
+    );
+    assert_eq!(empty["bound_token_usage"], Value::Null);
+
+    let mut hidden = Message::user("synthetic hidden runtime record");
+    hidden.metadata = Some(json!({"hidden_from_ui": true}));
+    session.add_message(hidden);
+    f.state.storage.save_session(&session).await.unwrap();
+    let (_, hidden_history) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(hidden_history["messages"].as_array().unwrap().len(), 0);
+    assert_eq!(
+        hidden_history["bound_clear_evidence"]["full_message_count"],
+        1
+    );
+
+    session.messages.clear();
+    session.set_pending_question(
+        "q".into(),
+        "synthetic".into(),
+        "synthetic".into(),
+        vec![],
+        false,
+    );
+    f.state.storage.save_session(&session).await.unwrap();
+    let (_, pending) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(
+        pending["bound_clear_evidence"]["has_pending_question"],
+        true
+    );
+    session.clear_pending_question();
+    let mut runtime = bamboo_domain::AgentRuntimeState::default();
+    runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+        entered_at: chrono::Utc::now(),
+        pre_permission_mode: "default".into(),
+        plan_file_path: None,
+        status: bamboo_domain::PlanModeStatus::AwaitingApproval,
+    });
+    session.agent_runtime_state = Some(runtime);
+    f.state.storage.save_session(&session).await.unwrap();
+    let (_, approval) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(
+        approval["bound_clear_evidence"]["has_pending_approval"],
+        true
+    );
+
+    f.state
+        .agent_runners
+        .write()
+        .await
+        .insert("target-a".into(), bamboo_engine::AgentRunner::new());
+    let (_, active) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(active["bound_clear_evidence"]["execution_active"], true);
+    f.state.agent_runners.write().await.remove("target-a");
+    let startup =
+        crate::handlers::agent::events::begin_execute_startup(f.state.get_ref(), "target-a");
+    let (_, starting) = f
+        .call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        )
+        .await;
+    assert_eq!(starting["bound_clear_evidence"]["execution_active"], true);
+    drop(startup);
+
+    let held = f.state.agent_runners.write().await;
+    let (status, busy) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        f.call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        ),
+    )
+    .await
+    .expect("no registry wait under storage guard");
+    drop(held);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{busy}");
+
+    let startups = f.state.execute_startups.clone();
+    let (locked_tx, locked_rx) = std::sync::mpsc::sync_channel(0);
+    let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+    let holder = std::thread::spawn(move || {
+        let _guard = startups.lock().unwrap();
+        locked_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    locked_rx.recv().unwrap();
+    let (status, busy) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        f.call(
+            Method::POST,
+            Some("target-a/history"),
+            Some(request.clone()),
+        ),
+    )
+    .await
+    .expect("no startup registry wait under storage guard");
+    release_tx.send(()).unwrap();
+    holder.join().unwrap();
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{busy}");
+
+    let mut stale = request.clone();
+    stale["target"]["authority_sha256"] = json!("f".repeat(64));
+    let (status, _) = f
+        .call(Method::POST, Some("target-a/history"), Some(stale))
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    request["query"] = json!({"projection":"messages"});
+    let (status, _) = f
+        .call(Method::POST, Some("target-a/history"), Some(request))
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    f.state.shutdown().await;
+}
+
+// Exercise the real C1 write and the opt-in same-identity readback through
+// production routes, using only a temporary store and synthetic Session.
+#[actix_web::test]
+async fn managed_clear_readback_follows_acknowledged_c1() {
+    let f = Fixture::new(false).await;
+    // Retain the selector actually held by the UI when it issued C1.
+    let (_, directory) = f.call(Method::GET, None, None).await;
+    let target = directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"]
+        .clone();
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(configure_routes),
+    )
+    .await;
+    let request = test::TestRequest::post()
+        .uri("/api/v1/sessions/target-a/clear")
+        .peer_addr("127.0.0.1:12345".parse().unwrap())
+        .to_request();
+    let response = test::call_service(&app, request).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let receipt: Value = test::read_body_json(response).await;
+    assert_eq!(receipt["success"], true);
+    assert_eq!(receipt["session_id"], "target-a");
+    let (_, after_directory) = f.call(Method::GET, None, None).await;
+    let after_target = &after_directory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["session_id"] == "target-a")
+        .unwrap()["current_user_target"];
+    assert_eq!(
+        after_target, &target,
+        "ordinary C1 must retain its observed selector"
+    );
+    let request = json!({"supervisor": f.supervisor, "target": target, "clear_readback": true});
+    let (status, history) = f
+        .call(Method::POST, Some("target-a/history"), Some(request))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{history}");
+    assert_eq!(
+        history["bound_clear_evidence"],
+        json!({
+            "full_message_count": 0, "execution_active": false,
+            "has_pending_question": false, "has_pending_approval": false
+        })
+    );
+    assert_eq!(history["bound_token_usage"], Value::Null);
+    assert_eq!(history["is_delta"], false);
+    assert_eq!(history["truncated"], false);
+    f.state.shutdown().await;
+}
+
+// C1 retains these permission replay markers. An empty visible transcript and
+// an idle local runner are therefore insufficient clear-confirmation evidence.
+#[actix_web::test]
+async fn managed_clear_readback_refuses_permission_replay_or_uncertain_save() {
+    for marker in [
+        "permission.reexecute_tool_call_id",
+        "permission.reexecute_request_generation",
+        "permission.replay_save_recovery_required",
+    ] {
+        let f = Fixture::new(false).await;
+        let mut session = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        session.metadata.insert(marker.into(), "synthetic".into());
+        f.state.storage.save_session(&session).await.unwrap();
+        let (_, directory) = f.call(Method::GET, None, None).await;
+        let target = directory["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "target-a")
+            .unwrap()["current_user_target"]
+            .clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(f.state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let clear = test::TestRequest::post()
+            .uri("/api/v1/sessions/target-a/clear")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let response = test::call_service(&app, clear).await;
+        assert_eq!(response.status(), StatusCode::OK, "{marker}");
+        let receipt: Value = test::read_body_json(response).await;
+        assert_eq!(receipt["success"], true, "{marker}");
+        let stored = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.messages.is_empty(), "{marker}");
+        assert!(stored.pending_question.is_none(), "{marker}");
+        assert!(stored.token_usage.is_none(), "{marker}");
+        assert!(stored.metadata.contains_key(marker), "{marker}");
+        assert!(
+            !f.state.agent_runners.read().await.contains_key("target-a"),
+            "{marker}"
+        );
+        let body = json!({"supervisor": f.supervisor, "target": target, "clear_readback": true});
+        let (status, history) = f
+            .call(Method::POST, Some("target-a/history"), Some(body.clone()))
+            .await;
+        if marker == "permission.replay_save_recovery_required" {
+            assert_eq!(status, StatusCode::LOCKED, "{marker}: {history}");
+            assert_eq!(history["code"], "clear_readback_unsettled");
+            assert!(history.get("bound_clear_evidence").is_none());
+        } else {
+            assert_eq!(status, StatusCode::OK, "{marker}: {history}");
+            assert_eq!(
+                history["bound_clear_evidence"]["has_pending_approval"], true,
+                "{marker}"
+            );
+        }
+        let mut ordinary = body;
+        ordinary.as_object_mut().unwrap().remove("clear_readback");
+        let (status, ordinary_history) = f
+            .call(Method::POST, Some("target-a/history"), Some(ordinary))
+            .await;
+        assert_eq!(status, StatusCode::OK, "ordinary history: {marker}");
+        assert!(ordinary_history.get("bound_clear_evidence").is_none());
+        f.state.shutdown().await;
+    }
+}
+
+// Both routes see only temporary synthetic Sessions and the loopback owner.
+#[actix_web::test]
+async fn managed_clear_readback_allows_idle_plan_after_c1_preflight() {
+    for phase in [
+        bamboo_domain::PlanModeStatus::Exploring,
+        bamboo_domain::PlanModeStatus::Designing,
+        bamboo_domain::PlanModeStatus::Reviewing,
+        bamboo_domain::PlanModeStatus::Finalizing,
+    ] {
+        let f = Fixture::new(false).await;
+        let mut session = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("synthetic-c1-plan");
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: phase,
+        });
+        session.agent_runtime_state = Some(runtime);
+        f.state.storage.save_session(&session).await.unwrap();
+        let (_, directory) = f.call(Method::GET, None, None).await;
+        let target = directory["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "target-a")
+            .unwrap()["current_user_target"]
+            .clone();
+        let app = test::init_service(
+            App::new()
+                .app_data(f.state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let detail = test::TestRequest::get()
+            .uri("/api/v1/sessions/target-a")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let detail = test::call_service(&app, detail).await;
+        assert_eq!(detail.status(), StatusCode::OK, "{phase:?}");
+        let detail: Value = test::read_body_json(detail).await;
+        assert_eq!(detail["session"]["is_running"], false, "{phase:?}");
+        assert_eq!(
+            detail["session"]["plan_mode"]["status"],
+            serde_json::to_value(phase).unwrap()
+        );
+        let pending = test::TestRequest::get()
+            .uri("/api/v1/respond/target-a/pending")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let pending = test::call_service(&app, pending).await;
+        assert_eq!(pending.status(), StatusCode::OK, "{phase:?}");
+        let pending: Value = test::read_body_json(pending).await;
+        assert_eq!(pending["has_pending_question"], false, "{phase:?}");
+        let clear = test::TestRequest::post()
+            .uri("/api/v1/sessions/target-a/clear")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let response = test::call_service(&app, clear).await;
+        assert_eq!(response.status(), StatusCode::OK, "{phase:?}");
+        let receipt: Value = test::read_body_json(response).await;
+        assert_eq!(receipt["success"], true);
+        let body = json!({"supervisor": f.supervisor, "target": target, "clear_readback": true});
+        let (status, history) = f
+            .call(Method::POST, Some("target-a/history"), Some(body))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{phase:?}: {history}");
+        assert_eq!(
+            history["bound_clear_evidence"],
+            json!({"full_message_count":0,"execution_active":false,
+            "has_pending_question":false,"has_pending_approval":false})
+        );
+        assert_eq!(history["bound_token_usage"], Value::Null);
+        let after = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .plan_mode
+                .as_ref()
+                .unwrap()
+                .status,
+            phase
+        );
+        f.state.shutdown().await;
+    }
+}
+
+#[actix_web::test]
+async fn managed_clear_readback_blocks_real_waits_even_with_idle_plan() {
+    for case in [
+        "approval",
+        "replay",
+        "recovery",
+        "pending_question",
+        "pending_input",
+        "runtime_running",
+        "active_tool",
+        "suspended_status",
+        "suspension",
+        "child",
+        "bash",
+        "local_runner",
+        "running_runner",
+    ] {
+        let f = Fixture::new(false).await;
+        let mut session = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        session.messages.clear();
+        let mut runtime = bamboo_domain::AgentRuntimeState::new("synthetic-c1-plan");
+        runtime.plan_mode = Some(bamboo_domain::PlanModeState {
+            entered_at: chrono::Utc::now(),
+            pre_permission_mode: "default".into(),
+            plan_file_path: None,
+            status: if case == "approval" {
+                bamboo_domain::PlanModeStatus::AwaitingApproval
+            } else {
+                bamboo_domain::PlanModeStatus::Exploring
+            },
+        });
+        match case {
+            "replay" => {
+                session.metadata.insert(
+                    "permission.reexecute_tool_call_id".into(),
+                    "synthetic".into(),
+                );
+            }
+            "recovery" => {
+                session.metadata.insert(
+                    "permission.replay_save_recovery_required".into(),
+                    "synthetic".into(),
+                );
+            }
+            "pending_question" => session.set_pending_question(
+                "q".into(),
+                "synthetic".into(),
+                "synthetic".into(),
+                vec![],
+                false,
+            ),
+            "pending_input" => {
+                session.set_pending_injected_messages(vec![json!({"id":"synthetic"})])
+            }
+            "runtime_running" => runtime.status = bamboo_domain::AgentStatusState::Running,
+            "active_tool" => runtime.tools.active_tool_calls = 1,
+            "suspended_status" => runtime.status = bamboo_domain::AgentStatusState::Suspended,
+            "suspension" => {
+                runtime.suspension = Some(bamboo_domain::SuspensionState {
+                    reason: "synthetic".into(),
+                    suspended_at: chrono::Utc::now(),
+                    resumable: true,
+                    hook_point: None,
+                })
+            }
+            "child" => {
+                runtime.waiting_for_children =
+                    Some(bamboo_domain::WaitingForChildrenState::for_children(
+                        vec!["synthetic-child".into()],
+                        bamboo_domain::ChildWaitPolicy::All,
+                        chrono::Utc::now(),
+                    ))
+            }
+            "bash" => {
+                runtime.waiting_for_bash = Some(bamboo_domain::WaitingForBashState::for_bash(
+                    vec!["synthetic-shell".into()],
+                    chrono::Utc::now(),
+                ))
+            }
+            "approval" | "local_runner" | "running_runner" => {}
+            _ => unreachable!(),
+        }
+        session.agent_runtime_state = Some(runtime);
+        if case == "child" {
+            let mut child =
+                Session::new_child_of("synthetic-child", &session, "model", "Synthetic child");
+            child.set_project_id_meta(f.project.to_string());
+            f.state.storage.save_session(&child).await.unwrap();
+        }
+        f.state.storage.save_session(&session).await.unwrap();
+        let durable = f
+            .state
+            .storage
+            .load_session("target-a")
+            .await
+            .unwrap()
+            .unwrap();
+        let durable_runtime = durable.agent_runtime_state.as_ref().unwrap();
+        match case {
+            "approval" => assert_eq!(
+                durable_runtime.plan_mode.as_ref().unwrap().status,
+                bamboo_domain::PlanModeStatus::AwaitingApproval
+            ),
+            "replay" => assert!(durable
+                .metadata
+                .contains_key("permission.reexecute_tool_call_id")),
+            "recovery" => assert!(durable
+                .metadata
+                .contains_key("permission.replay_save_recovery_required")),
+            "pending_question" => assert!(durable.has_pending_question()),
+            "pending_input" => assert!(durable.has_pending_injected_messages()),
+            "runtime_running" => assert_eq!(
+                durable_runtime.status,
+                bamboo_domain::AgentStatusState::Running
+            ),
+            "active_tool" => assert_eq!(durable_runtime.tools.active_tool_calls, 1),
+            "suspended_status" => assert_eq!(
+                durable_runtime.status,
+                bamboo_domain::AgentStatusState::Suspended
+            ),
+            "suspension" => assert!(durable_runtime.suspension.is_some()),
+            "child" => assert!(durable_runtime.waiting_for_children.is_some()),
+            "bash" => assert!(durable_runtime.waiting_for_bash.is_some()),
+            "local_runner" | "running_runner" => {}
+            _ => unreachable!(),
+        }
+        if matches!(case, "local_runner" | "running_runner") {
+            let mut runner = bamboo_engine::AgentRunner::new();
+            if case == "running_runner" {
+                runner.status = bamboo_engine::AgentStatus::Running;
+            }
+            f.state
+                .agent_runners
+                .write()
+                .await
+                .insert("target-a".into(), runner);
+        }
+        // Observe exactly the fields used by the existing Lotus C1 preflight.
+        let app = test::init_service(
+            App::new()
+                .app_data(f.state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let detail = test::TestRequest::get()
+            .uri("/api/v1/sessions/target-a")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let detail = test::call_service(&app, detail).await;
+        assert_eq!(detail.status(), StatusCode::OK, "{case}");
+        let detail: Value = test::read_body_json(detail).await;
+        assert_eq!(
+            detail["session"]["is_running"],
+            case == "running_runner",
+            "{case}"
+        );
+        let pending = test::TestRequest::get()
+            .uri("/api/v1/respond/target-a/pending")
+            .peer_addr("127.0.0.1:12345".parse().unwrap())
+            .to_request();
+        let pending = test::call_service(&app, pending).await;
+        assert_eq!(pending.status(), StatusCode::OK, "{case}");
+        let pending: Value = test::read_body_json(pending).await;
+        assert_eq!(
+            pending["has_pending_question"],
+            case == "pending_question",
+            "{case}"
+        );
+        let approval = detail["session"]["plan_mode"]["status"] == "awaiting_approval";
+        assert_eq!(approval, case == "approval", "{case}");
+        let preflight_allows = detail["session"]["is_running"] == false
+            && pending["has_pending_question"] == false
+            && !approval;
+        assert_eq!(
+            preflight_allows,
+            !matches!(case, "approval" | "pending_question" | "running_runner"),
+            "{case}"
+        );
+        let (_, directory) = f.call(Method::GET, None, None).await;
+        let target = directory["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["session_id"] == "target-a")
+            .unwrap()["current_user_target"]
+            .clone();
+        let body = json!({"supervisor":f.supervisor,"target":target,"clear_readback":true});
+        let (status, history) = f
+            .call(Method::POST, Some("target-a/history"), Some(body))
+            .await;
+        match case {
+            "approval" | "replay" => {
+                assert_eq!(status, StatusCode::OK, "{case}: {history}");
+                assert_eq!(
+                    history["bound_clear_evidence"]["has_pending_approval"], true,
+                    "{case}"
+                );
+            }
+            "pending_question" => {
+                assert_eq!(status, StatusCode::OK, "{case}: {history}");
+                assert_eq!(
+                    history["bound_clear_evidence"]["has_pending_question"], true,
+                    "{case}"
+                );
+            }
+            "local_runner" | "running_runner" => {
+                assert_eq!(status, StatusCode::OK, "{case}: {history}");
+                assert_eq!(
+                    history["bound_clear_evidence"]["execution_active"], true,
+                    "{case}"
+                );
+            }
+            _ => {
+                assert_eq!(status, StatusCode::LOCKED, "{case}: {history}");
+                assert_eq!(history["code"], "clear_readback_unsettled", "{case}");
+                assert!(history.get("bound_clear_evidence").is_none(), "{case}");
+            }
+        }
+        if matches!(case, "local_runner" | "running_runner") {
+            f.state.agent_runners.write().await.remove("target-a");
+        }
+        f.state.shutdown().await;
+    }
 }

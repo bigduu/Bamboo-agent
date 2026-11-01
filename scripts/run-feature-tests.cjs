@@ -9,7 +9,8 @@ const { createHash } = require("node:crypto");
 const { spawnSync } = require("node:child_process");
 const { parseCounts } = require("./test-groups.cjs");
 const SERIAL_STORAGE_FAMILIES = ["root_birth_tests", "host_root_create::tests", "supervisor_management_tests",
-  "supervisor_management_lifetime_tests", "supervisor_proof_tests", "supervisor_management::observer_lock_order_tests"].map((name) => "v2::" + name + "::");
+  "supervisor_management_lifetime_tests", "supervisor_proof_tests", "supervisor_management::observer_lock_order_tests",
+  "supervisor_management::current_user::observed_history_guard_tests"].map((name) => "v2::" + name + "::");
 const SERIAL_STORAGE_FILTERS = ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"];
 const SERIAL_STORAGE_SELECTORS = [...SERIAL_STORAGE_FAMILIES,
   "session_merge::tests::supervisor_management_race_rejects_staged_task_callbacks_and_fresh_invocation_succeeds"];
@@ -92,11 +93,14 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // compression library counts content pages against the dispatch cap; the
 // test-utils diagnostic records each read attempt. No additive feature-only
 // cases were added. Actual compact/actor integration targets stay in agent-tests-0.
-// The llm_retry policy work (PR #2429) touches bamboo-config/src/config.rs with
-// unconditional validation tests only: no feature cfg, new owner, or additive
-// feature-only case changed; the 20 explicit additive cases and four contexts
-// remain unchanged.
-const FEATURE_SOURCE_SHA256 = "ac3c34883c429b8258d74bd35920bddb07cf5b0b42258cf24d9c25f6202d63ac";
+// Bound Supervisor history adds four ordinary Actix cases to server-handlers.
+// Its two storage guard cases belong to the existing serial storage owner;
+// they are excluded from the ordinary storage run and executed once serially.
+// Two identity-bound clear-readback Actix cases also belong to server-handlers;
+// They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
+// The C1 pending predicates add two ordinary domain packages-2 cases and three
+// server-handlers Actix cases; none is an additive feature-only case.
+const FEATURE_SOURCE_SHA256 = "1237ba6c2a17d52eb69204322f082e5fc843ddca6dbc636e77e5d0f832cdc831";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
