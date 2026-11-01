@@ -1,7 +1,6 @@
 //! Per-execution opt-in. No persistent Session or provider mutation.
 
 use std::future::Future;
-use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Retry only establishment of the initial HTTP response. Successful streams
