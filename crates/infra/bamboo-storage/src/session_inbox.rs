@@ -3108,6 +3108,28 @@ impl FileSessionInbox {
             if claims.len() >= limit {
                 break;
             }
+            // Legacy claim rename (`new/` -> `cur/`), documented for #2420:
+            //
+            // This performs a bare `tokio::fs::rename(new_path, cur_path)` that
+            // resolves both entries by path at call time; it does not go through
+            // an anchored filesystem handle. Converting it to the anchored
+            // `OwnedFilesystem`/`InboxAnchor` API would change this function's
+            // signature and ripple through every legacy claim call site, which
+            // is out of scope for this issue.
+            //
+            // Existing mitigations (verified in this file): the caller holds the
+            // Inbox operation lock (`.session-inbox.lock`, acquired via
+            // `lock_operation` before the scan), and that lock file itself is
+            // opened through `InboxAnchor::acquire`, so a link planted at either
+            // the Inbox directory or lock name fails closed. Additionally, when
+            // the owned Inbox mode is enabled this whole legacy path is rejected
+            // (`owned_enabled` -> `InvalidClaim("owned Inbox claim API required")`).
+            //
+            // Residual risk: a concurrent actor that ignores the advisory lock
+            // can still swap the `new/` or `cur/` path components between lock
+            // acquisition and this rename, redirecting the move outside the
+            // canonical Inbox. Cooperating Bamboo processes are serialized by
+            // the lock; only lock-skipping external writers keep this window.
             let cur_path = dir.join("cur").join(&claim_id);
             if !already_claimed {
                 let new_path = dir.join("new").join(&claim_id);
