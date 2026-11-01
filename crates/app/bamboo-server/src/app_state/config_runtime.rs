@@ -655,7 +655,13 @@ async fn publish_dependent_config<T>(
 /// process restart. A rejected value is reported and the previous policy stays
 /// in place rather than silently widening the retry loop.
 pub(crate) fn apply_llm_retry_policy(config: &bamboo_config::Config) {
-    let policy = config.llm_retry;
+    // `None` means the operator never configured a policy. Publishing defaults
+    // here would replace an environment-tuned deployment (`BAMBOO_LLM_RETRY_*`)
+    // on upgrade, silently re-enabling retries or changing time limits that
+    // nobody edited.
+    let Some(policy) = config.llm_retry else {
+        return;
+    };
     if let Err(error) = policy.validate() {
         tracing::warn!("llm_retry rejected: {error}; keeping the previous initial-request policy");
         return;

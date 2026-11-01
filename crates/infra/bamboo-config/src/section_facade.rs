@@ -342,8 +342,8 @@ pub struct CoreSection {
     pub run_budget: RunBudgetConfig,
     #[serde(default)]
     pub stream_timeout: StreamTimeoutConfig,
-    #[serde(default)]
-    pub llm_retry: LlmRetryConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_retry: Option<LlmRetryConfig>,
     #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
     pub context_management: ContextManagementConfig,
     /// Only genuinely unclassified root keys live here.
@@ -1904,7 +1904,9 @@ fn validate_json_serializable<T: Serialize>(value: &T) -> Result<(), String> {
 
 fn validate_core(value: &CoreSection) -> Result<(), String> {
     value.stream_timeout.validate()?;
-    value.llm_retry.validate()?;
+    if let Some(policy) = &value.llm_retry {
+        policy.validate()?;
+    }
     value.context_management.validate()?;
     validate_secret_free_http_url("HTTP proxy", &value.http_proxy, true)?;
     validate_secret_free_http_url("HTTPS proxy", &value.https_proxy, true)?;

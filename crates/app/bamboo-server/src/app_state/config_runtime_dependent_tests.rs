@@ -470,6 +470,46 @@ async fn accepted_core_write_publishes_the_llm_retry_policy_to_the_provider_laye
     assert_eq!(limits.total_budget, Duration::from_millis(1_800_000));
 }
 
+/// An unset policy must not be published. Otherwise upgrading a deployment that
+/// tunes `BAMBOO_LLM_RETRY_*` silently replaces those settings with the built-in
+/// defaults, because publication stops the environment from being consulted.
+#[tokio::test]
+async fn unset_llm_retry_leaves_the_environment_derived_policy_in_force() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
+    let _guard = policy_lock().lock().await;
+    let sink = request_sink().await;
+    let (_dir, state) = configured_state_inner(&sink.uri()).await;
+
+    let previous_retry = bamboo_llm::retry::global();
+    let previous_limits = bamboo_llm::retry::initial_request_limits();
+    bamboo_llm::retry::configure(
+        bamboo_llm::retry::InitialRequestLimits {
+            total_budget: Duration::from_millis(1_234_000),
+            attempt_timeout: Duration::from_millis(111_000),
+        },
+        bamboo_llm::retry::RetryConfig {
+            max_attempts: 3,
+            base_delay: Duration::from_millis(11),
+            max_delay: Duration::from_millis(22),
+        },
+    );
+
+    // The freshly built state has no persisted policy.
+    assert!(state.config.read().await.llm_retry.is_none());
+    apply_llm_retry_policy(&state.config.read().await.clone());
+
+    let kept = bamboo_llm::retry::global();
+    let kept_limits = bamboo_llm::retry::initial_request_limits();
+    bamboo_llm::retry::configure(previous_limits, previous_retry);
+
+    assert_eq!(
+        kept.max_attempts, 3,
+        "an unset policy must not publish defaults"
+    );
+    assert_eq!(kept_limits.attempt_timeout, Duration::from_millis(111_000));
+    assert_eq!(kept_limits.total_budget, Duration::from_millis(1_234_000));
+}
+
 /// An out-of-range policy must be rejected before it is committed, so the API
 /// cannot report success for settings that requests would refuse to use.
 #[tokio::test]
@@ -493,9 +533,10 @@ async fn core_write_rejects_an_invalid_llm_retry_policy_before_committing() {
             .is_err(),
         "max_attempts: 0 must not be accepted"
     );
+    let live = state.config.read().await.llm_retry;
     assert_ne!(
-        state.config.read().await.llm_retry.max_attempts,
-        0,
+        live.map(|policy| policy.max_attempts),
+        Some(0),
         "the rejected policy must not reach the live configuration"
     );
 }

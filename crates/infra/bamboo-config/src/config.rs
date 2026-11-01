@@ -1982,8 +1982,12 @@ pub struct ConfigValues {
     /// retryable upstream statuses. Operator-tunable so a flaky or
     /// heavily-queued relay can be tolerated without an environment variable
     /// and a process restart.
-    #[serde(default)]
-    pub llm_retry: LlmRetryConfig,
+    ///
+    /// `None` means "not configured": the environment-derived policy stays in
+    /// force, so upgrading a deployment that tunes `BAMBOO_LLM_RETRY_*` does
+    /// not silently replace those settings with the built-in defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm_retry: Option<LlmRetryConfig>,
 
     /// Host-owned strategy for bounding provider-visible conversation context.
     #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
@@ -2045,7 +2049,7 @@ impl Default for ConfigValues {
             headless_auth: false,
             run_budget: RunBudgetConfig::default(),
             stream_timeout: StreamTimeoutConfig::default(),
-            llm_retry: LlmRetryConfig::default(),
+            llm_retry: None,
             context_management: ContextManagementConfig::default(),
             cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
             provider: default_provider(),
@@ -2161,8 +2165,8 @@ struct ExecutionConfigSection {
     run_budget: RunBudgetConfig,
     #[serde(default)]
     stream_timeout: StreamTimeoutConfig,
-    #[serde(default)]
-    llm_retry: LlmRetryConfig,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    llm_retry: Option<LlmRetryConfig>,
     #[serde(default, skip_serializing_if = "ContextManagementConfig::is_default")]
     context_management: ContextManagementConfig,
     #[serde(
@@ -4947,7 +4951,7 @@ impl Config {
                 headless_auth: false,
                 run_budget: RunBudgetConfig::default(),
                 stream_timeout: StreamTimeoutConfig::default(),
-                llm_retry: LlmRetryConfig::default(),
+                llm_retry: None,
                 context_management: ContextManagementConfig::default(),
                 cluster_fabric: crate::cluster_fabric::ClusterFabricConfig::default(),
                 provider: default_provider(),
@@ -6025,11 +6029,15 @@ mod tests {
         let root: ConfigRoot = serde_json::from_value(serde_json::json!({}))
             .expect("legacy config without llm_retry should load");
         let values = ConfigValues::from(root);
-        assert_eq!(values.llm_retry, LlmRetryConfig::default());
-        assert_eq!(values.llm_retry.max_attempts, 8);
-        assert_eq!(values.llm_retry.attempt_timeout_ms, 180_000);
-        assert_eq!(values.llm_retry.total_budget_ms, 900_000);
-        values.llm_retry.validate().expect("defaults are valid");
+        // Unset means "never configured": the environment-derived policy keeps
+        // applying, which is what an existing deployment expects on upgrade.
+        assert_eq!(values.llm_retry, None);
+
+        let defaults = LlmRetryConfig::default();
+        assert_eq!(defaults.max_attempts, 8);
+        assert_eq!(defaults.attempt_timeout_ms, 180_000);
+        assert_eq!(defaults.total_budget_ms, 900_000);
+        defaults.validate().expect("defaults are valid");
     }
 
     #[test]
@@ -6082,13 +6090,13 @@ mod tests {
             max_delay_ms: 60_000,
         };
         let values = ConfigValues {
-            llm_retry: policy,
+            llm_retry: Some(policy),
             ..ConfigValues::default()
         };
         let json = serde_json::to_value(&values).expect("serialize");
         assert_eq!(json["llm_retry"]["max_attempts"], 12);
         let round_tripped: ConfigValues = serde_json::from_value(json).expect("deserialize");
-        assert_eq!(round_tripped.llm_retry, policy);
+        assert_eq!(round_tripped.llm_retry, Some(policy));
     }
 
     #[test]

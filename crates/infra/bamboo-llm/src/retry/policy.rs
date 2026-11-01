@@ -88,6 +88,22 @@ pub fn initial_request_limits() -> InitialRequestLimits {
         .unwrap_or_else(|| InitialRequestLimits::from_lookup(|key| std::env::var(key).ok()))
 }
 
+/// Both halves of the policy, read under one lock.
+///
+/// A request must not combine the attempt count from one policy with the
+/// deadlines of another: a configuration change landing between two separate
+/// reads would produce a combination the operator never configured. Callers
+/// that build a request should take this snapshot once and thread it through.
+pub fn policy_snapshot() -> (InitialRequestLimits, super::RetryConfig) {
+    match super::live_policy() {
+        Some(policy) => (policy.limits, policy.retry),
+        None => (
+            InitialRequestLimits::from_lookup(|key| std::env::var(key).ok()),
+            super::RetryConfig::from_env(),
+        ),
+    }
+}
+
 #[derive(Debug, serde::Serialize)]
 pub struct UpstreamRetryDefaults {
     pub supported_modes: [&'static str; 2],
