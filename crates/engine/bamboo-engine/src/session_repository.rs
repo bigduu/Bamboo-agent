@@ -50,7 +50,8 @@ pub struct SessionRepository {
     root_inbox_receipt: Option<bamboo_domain::SessionInboxReceipt>,
     root_actor_writers:
         Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
-    #[cfg(test)]
+    // Always present in production builds too; only focused tests set it via
+    // the #[cfg(test)] builder below.
     root_lease_override: Option<std::time::Duration>,
     #[cfg(test)]
     post_durable_hook: Option<PostDurableHook>,
@@ -70,7 +71,6 @@ impl SessionRepository {
             root_actor_owner: None,
             root_inbox_receipt: None,
             root_actor_writers: Arc::new(Default::default()),
-            #[cfg(test)]
             root_lease_override: None,
             #[cfg(test)]
             post_durable_hook: None,
