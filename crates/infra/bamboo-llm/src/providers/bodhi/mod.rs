@@ -269,10 +269,11 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
-            self.client.post(&url).headers(headers.clone()).json(&body)
-        })
-        .await?;
+        let response =
+            crate::retry::send_provider_request(&crate::retry::global(), "Bodhi", || {
+                self.client.post(&url).headers(headers.clone()).json(&body)
+            })
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -330,10 +331,11 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
-            self.client.post(&url).headers(headers.clone()).json(&body)
-        })
-        .await?;
+        let response =
+            crate::retry::send_provider_request(&crate::retry::global(), "Bodhi", || {
+                self.client.post(&url).headers(headers.clone()).json(&body)
+            })
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -393,13 +395,14 @@ impl BodhiProvider {
 
         // Retry the initial request on transient failures (issue #18); the
         // returned body is unread, so SSE streaming below is unaffected.
-        let response = crate::retry::send_provider_request(crate::retry::global(), "Bodhi", || {
-            self.client
-                .post(&url)
-                .headers(headers.clone())
-                .json(&request_json)
-        })
-        .await?;
+        let response =
+            crate::retry::send_provider_request(&crate::retry::global(), "Bodhi", || {
+                self.client
+                    .post(&url)
+                    .headers(headers.clone())
+                    .json(&request_json)
+            })
+            .await?;
 
         if !response.status().is_success() {
             let status = response.status();

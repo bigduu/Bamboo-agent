@@ -549,7 +549,7 @@ impl CopilotProvider {
     where
         F: Fn() -> reqwest::RequestBuilder,
     {
-        crate::retry::send_provider_request(crate::retry::global(), "Copilot", build_request).await
+        crate::retry::send_provider_request(&crate::retry::global(), "Copilot", build_request).await
     }
 
     async fn send_with_transport_retry<F>(
