@@ -583,7 +583,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                 actor_id: session.id.clone(),
                 run_id: run_id.into(),
                 lease_owner: format!("host-task-{}", uuid::Uuid::new_v4()),
-                lease_expires_at: now + chrono::Duration::seconds(30),
+                lease_expires_at: now + chrono::Duration::seconds(60),
                 inbox_generation: session
                     .session_inbox_admission()
                     .map_or(0, |state| state.last_admitted_sequence),
@@ -647,13 +647,21 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                 loop {
                     tokio::select! { _ = done.cancelled() => break, _ = interval.tick() => {} }
                     let now = chrono::Utc::now();
-                    if store
-                        .renew_activation(&fence, now, now + chrono::Duration::seconds(30))
+                    match store
+                        .renew_activation(&fence, now, now + chrono::Duration::seconds(60))
                         .await
-                        .is_err()
                     {
-                        cancel.cancel();
-                        break;
+                        Ok(_) => {}
+                        // Transient storage failures only delay one heartbeat;
+                        // the next tick retries before the lease can expire.
+                        Err(error @ bamboo_domain::ActorDirectoryError::Storage(_)) => {
+                            tracing::warn!(actor_id = %fence.actor_id, run_id = %fence.run_id,
+                                %error, "local task heartbeat hit transient storage failure; retrying next tick");
+                        }
+                        Err(_) => {
+                            cancel.cancel();
+                            break;
+                        }
                     }
                 }
             })

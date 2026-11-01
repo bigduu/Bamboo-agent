@@ -825,8 +825,16 @@ async fn surviving_root_writer_rejects_old_output_after_real_host_lease_reclaim(
         eprintln!("fixture rejected {rejected} pauses inside physical writer boundaries");
     }
     // Actual wall time and the persisted lease decide expiry. No future `now`,
-    // shortened sidecar, A finish, or external A claim substitutes for it.
-    tokio::time::timeout(WAIT, async {
+    // shortened sidecar, A finish, or external A claim substitutes for it. The
+    // window follows the claim A actually made, so a lease-length change widens
+    // this proof instead of truncating it.
+    let claimed = fixture.authority().activation.unwrap();
+    assert_eq!(claimed.fence(), a.activation.as_ref().unwrap().fence());
+    let expiry_window = (claimed.lease_expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        + WAIT;
+    tokio::time::timeout(expiry_window, async {
         loop {
             fixture.a.alive();
             let live = fixture.authority().activation.unwrap();
