@@ -1485,6 +1485,11 @@ impl AppState {
             })
         };
 
+        // Publish the persisted retry policy before the watcher starts, so the
+        // first request already uses the operator's values rather than the
+        // provider's built-in defaults.
+        super::config_runtime::apply_llm_retry_policy(&config.read().await.clone());
+
         let (config_watcher, config_live_health, mcp_config_live_health) =
             super::config_runtime::ConfigWatcherRuntime::start(
                 bamboo_home_dir.clone(),
