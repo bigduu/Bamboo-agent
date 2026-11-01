@@ -561,16 +561,26 @@ pub(super) enum AckAuthority<'a> {
     /// or [`AckAuthority::Owned`] instead.
     ///
     /// Residual risk (#2423): these operations resolve the `admitted/` receipt
-    /// path by name, so a symlink planted inside the Inbox directory can
-    /// redirect the receipt write outside the Inbox. Existing mitigations: the
-    /// sole caller must already hold the Inbox operation lock
-    /// `.session-inbox.lock`, which is itself acquired through an anchored
-    /// directory handle and fails closed on a swapped link, so redirecting
-    /// these writes requires replacing the Inbox directory and bypassing that
-    /// anchored lock; the legacy ACK path is also rejected outright once the
-    /// owned Inbox mode is enabled. The remaining window — a live directory
-    /// swap racing a legacy ACK between the anchored lock acquisition and this
-    /// path-based write — is a known residual risk tracked by #2423.
+    /// path by name, so a symlink on that path can redirect the receipt write
+    /// outside the Inbox. Two scenarios differ, and only the first is
+    /// mitigated:
+    ///
+    /// * Mitigated — a live replacement of the Inbox directory or of the
+    ///   `.session-inbox.lock` name: the sole caller must already hold the
+    ///   Inbox operation lock, which is acquired through an anchored directory
+    ///   handle and fails closed when that path is swapped, so a live swap
+    ///   cannot steer this path-based write. The legacy ACK path is also
+    ///   rejected outright once the owned Inbox mode is enabled.
+    ///
+    /// * Not mitigated — a pre-planted `inbox/admitted` child symlink that
+    ///   already points at an external directory: `create_dir_all` and
+    ///   `atomic_write` follow that link and write into the external
+    ///   directory, and the anchored lock does not stop them. Because the
+    ///   external directory usually holds no matching receipt, the write
+    ///   completes silently instead of failing closed.
+    ///
+    /// This second scenario is the residual risk #2423 records but does not
+    /// fix.
     Legacy,
     ScopedLegacy(&'a OwnedFilesystem),
     Owned {
