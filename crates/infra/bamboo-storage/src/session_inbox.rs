@@ -3056,6 +3056,20 @@ impl FileSessionInbox {
                 "owned Inbox claim API required".into(),
             ));
         }
+        // Legacy Mailbox bootstrapping: `Mailbox::ensure_dirs()` creates
+        // `new/`, `cur/` and `corrupt/` with path-based `create_dir_all`.
+        // It stays path-based on purpose: `Mailbox` is the generic type in
+        // `bamboo-subagent` and is unaware of Inbox anchor handles, so
+        // anchoring it here would change the public Mailbox API for every
+        // non-Inbox consumer. The surrounding claim path already mitigates
+        // this surface: the operation lock above was acquired through
+        // `InboxAnchor::acquire`, which creates the Inbox directory itself
+        // with a no-follow open (a link at the Inbox name fails closed) and
+        // resolves the lock name relative to that retained handle. Residual
+        // risk: the queue subdirectories under the anchored Inbox are not
+        // re-verified here; if `new/`, `cur/` or `corrupt/` is replaced by
+        // a symlink after the anchor is established, `create_dir_all`
+        // follows it and later queue reads trust the link target.
         let mailbox = Mailbox::at(&dir);
         mailbox
             .ensure_dirs()
