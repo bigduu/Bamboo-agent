@@ -163,6 +163,8 @@ pub(crate) use supervisor_management::{
     CurrentUserTargetGuard, SupervisorFollowupGuard,
 };
 #[cfg(test)]
+mod session_directory_tests;
+#[cfg(test)]
 mod supervisor_management_lifetime_tests;
 #[cfg(test)]
 mod supervisor_management_tests;
@@ -1091,6 +1093,12 @@ pub struct SessionIndexEntry {
     /// If the session was created by a schedule, store the schedule id here for fast filtering.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by_schedule_id: Option<String>,
+    /// Creation provenance mirrored from `session.metadata["session.origin.v1"]`
+    /// for the supervisor session directory. Currently only
+    /// `Some("supervisor_created")` is minted, by the Host Root creation route.
+    /// An observation label only; it never grants authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_origin: Option<String>,
     /// If the session was created by a specific schedule run, keep the run id here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule_run_id: Option<String>,
@@ -1104,6 +1112,12 @@ pub struct SessionIndexEntry {
     /// can display the question dialog badge without loading session.json.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// Latest canonical Human UI engagement mark, mirrored from
+    /// `session.agent_runtime_state.last_human_input`. Absent means no human
+    /// input was admitted through the interactive route since creation. This is
+    /// an observation fact for directory-style views; it grants no authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_human_input: Option<bamboo_domain::HumanInputMark>,
     /// Active plan mode runtime state mirrored into the index from
     /// `session.agent_runtime_state.plan_mode`, so lightweight session-list/detail
     /// APIs can surface plan mode without loading every session.json.
@@ -1828,6 +1842,10 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
     copy.authority_identity = SessionAuthorityIdentity::Ordinary;
     copy.supervisor_management = None;
     copy.conversation_reset = None;
+    // Creation provenance is birth-specific: the copy is a fresh independent
+    // user-created session and must not inherit the source's
+    // supervisor_created origin mark (same reset discipline as id/created_at).
+    copy.metadata.remove("session.origin.v1");
     copy.id = new_id.to_string();
     copy.kind = SessionKind::Root;
     copy.parent_session_id = None;
@@ -5517,6 +5535,11 @@ impl SessionStoreV2 {
             .get("created_by_schedule_id")
             .cloned()
             .filter(|v| !v.trim().is_empty());
+        let session_origin = session
+            .metadata
+            .get("session.origin.v1")
+            .cloned()
+            .filter(|v| !v.trim().is_empty());
         let schedule_run_id = session
             .metadata
             .get("schedule_run_id")
@@ -5547,6 +5570,10 @@ impl SessionStoreV2 {
             .as_ref()
             .map(|state| state.effective_permission_mode())
             .unwrap_or_default();
+        let last_human_input = session
+            .agent_runtime_state
+            .as_ref()
+            .and_then(|state| state.last_human_input.clone());
         let bypass_permissions = permission_mode != bamboo_domain::SessionPermissionMode::Default;
         // Placement (which machine the agent runs on) is stamped by the spawn
         // path into `metadata["placement"]` as a JSON `{kind,host}` object for
@@ -5580,6 +5607,7 @@ impl SessionStoreV2 {
             project_id,
             gold_config_json,
             created_by_schedule_id,
+            session_origin,
             schedule_run_id,
             created_at: session.created_at,
             updated_at: session.updated_at,
@@ -5587,6 +5615,7 @@ impl SessionStoreV2 {
             message_count: session.messages.len(),
             has_attachments,
             has_pending_question: session.has_pending_question(),
+            last_human_input,
             plan_mode,
             bypass_permissions,
             permission_mode,
