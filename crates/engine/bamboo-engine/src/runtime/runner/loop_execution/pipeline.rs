@@ -3134,6 +3134,23 @@ async fn handle_tool_calls_path(
 /// provider requests.
 pub(super) const MAX_NO_TOOL_CALL_CONTINUATIONS: u32 = 3;
 
+/// Whether a round counts as progress for the no-tool-call guard (#2425).
+///
+/// A round is progress when it either executed tools, or performed a native
+/// OpenAI client-side tool search. The latter carries its search call in the
+/// provider transcript rather than `tool_calls`, and it commits discovered
+/// tools and requests another round — so treating it as idle would let three
+/// consecutive discovery rounds end a run that is actively working.
+fn round_counts_as_progress(
+    tool_calls: &[bamboo_agent_core::tools::ToolCall],
+    provider_transcript_items: &[ProviderTranscriptItem],
+) -> bool {
+    !tool_calls.is_empty()
+        || crate::runtime::runner::round_lifecycle::is_openai_client_tool_search_boundary(
+            provider_transcript_items,
+        )
+}
+
 /// Advance the consecutive no-tool-call continuation streak and report whether
 /// the run has exhausted its continuation budget (#2425).
 ///
@@ -3207,6 +3224,42 @@ mod no_tool_call_guard_tests {
         let mut streak = u32::MAX - 1;
         assert!(advance_no_tool_call_streak(&mut streak, false));
         assert_eq!(streak, u32::MAX, "streak must saturate, never wrap");
+    }
+
+    /// A native OpenAI client tool-search round is productive even though its
+    /// `tool_calls` is empty: the search call rides in the provider transcript.
+    /// Counting it as idle would end a run that is actively discovering tools.
+    #[test]
+    fn client_tool_search_counts_as_progress() {
+        use bamboo_domain::{
+            ProviderFamily, ProviderProtocol, ProviderTranscriptAuthor, ProviderTranscriptItem,
+            ProviderTranscriptOrigin,
+        };
+
+        let discovery = ProviderTranscriptItem::try_from_payload(
+            ProviderFamily::OpenAi,
+            ProviderProtocol::OpenAiResponsesV1,
+            ProviderTranscriptOrigin::Provider,
+            ProviderTranscriptAuthor::Model,
+            serde_json::json!({
+                "type": "tool_search_call",
+                "id": "tsc_1",
+                "execution": "client",
+                "call_id": "search_1",
+                "status": "completed",
+                "arguments": {"query": "git status"}
+            }),
+        )
+        .expect("client tool-search item must be constructible");
+
+        assert!(
+            super::round_counts_as_progress(&[], &[discovery]),
+            "a client tool-search round must count as progress"
+        );
+        assert!(
+            !super::round_counts_as_progress(&[], &[]),
+            "a round with neither tool calls nor discovery items is idle"
+        );
     }
 }
 
@@ -3877,7 +3930,10 @@ async fn run_pipeline_inner(
             // --- Handle LLM output ---
             let stream_output = llm_output.stream_output;
             // Capture before any field is moved out of `stream_output` below.
-            round_had_tool_calls = !stream_output.tool_calls.is_empty();
+            round_had_tool_calls = round_counts_as_progress(
+                &stream_output.tool_calls,
+                &stream_output.provider_transcript_items,
+            );
             // Every successful provider call is billed, including an explicit
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
