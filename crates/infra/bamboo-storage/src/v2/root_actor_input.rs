@@ -105,6 +105,96 @@ impl RootActorInputProof {
         }
         Ok(())
     }
+
+    /// Derive the Main-owned facts only from this live Actor and the exact
+    /// retained Inbox lease. An ordinary Root message has no Child-style
+    /// checkpoint marker; its original intent comes from the locked transport.
+    pub(super) fn outcomes_after_input(
+        &self,
+        durable: &Session,
+    ) -> io::Result<Option<bamboo_domain::SupervisedRootOutcomes>> {
+        self.root.validate_deadline(self.claim.lease.expires_at)?;
+        let (envelope, intent) = self
+            .inbox
+            .locked_owned_claim(
+                &self.directory,
+                &self.claim.claim.envelope.target_session_id,
+                &self.claim,
+                Utc::now(),
+                false,
+            )
+            .map_err(conflict)?;
+        let origin = intent
+            .as_ref()
+            .and_then(bamboo_domain::SessionInboxActivationIntent::supervised_root_origin)
+            .cloned();
+        if origin
+            .as_ref()
+            .is_some_and(|origin| !origin.matches_input_envelope(&envelope))
+        {
+            return Err(conflict("Root input origin differs from its owned claim"));
+        }
+        let previous = durable
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.clone());
+        if previous.is_none() && origin.is_none() {
+            return Ok(None);
+        }
+        let owner = self.root.owner();
+        let mut outcomes = match previous {
+            Some(outcomes) => outcomes,
+            None => bamboo_domain::SupervisedRootOutcomes::new(&durable.id, durable.created_at)
+                .map_err(conflict)?,
+        };
+        let reset = durable.conversation_reset_sha256().map_err(conflict)?;
+        // Unrelated later Human/peer runs must not allocate a supervised fact.
+        // Inputs admitted during an already tracked run remain associated with
+        // that run, even when their own Supervisor origin is unknown.
+        if origin.is_none()
+            && outcomes
+                .facts
+                .last()
+                .is_none_or(|fact| fact.run_id != owner.fence.run_id || fact.result.is_some())
+        {
+            if outcomes
+                .facts
+                .last()
+                .is_some_and(|fact| fact.result.is_none() && fact.run_id != owner.fence.run_id)
+            {
+                outcomes
+                    .mark_predecessor_interrupted(&owner.fence, reset.as_deref())
+                    .map_err(conflict)?;
+            }
+            return Ok(Some(outcomes));
+        }
+        if outcomes
+            .facts
+            .last()
+            .is_some_and(|fact| fact.result.is_none() && fact.run_id != owner.fence.run_id)
+        {
+            // The current Root proof establishes this newer live Actor fence;
+            // unresolved predecessor evidence is marked unknown, never success.
+            outcomes
+                .recover_predecessor_and_reserve(&owner.fence, reset.as_deref())
+                .map_err(conflict)?;
+        } else {
+            outcomes
+                .reserve(&owner.fence, reset.as_deref())
+                .map_err(conflict)?;
+        }
+        outcomes
+            .record_input(
+                &owner.fence,
+                bamboo_domain::SupervisedRootOutcomeInput {
+                    receipt_id: envelope.id,
+                    generation: self.claim.claim.generation,
+                    supervisor_origin: origin,
+                },
+            )
+            .map_err(conflict)?;
+        Ok(Some(outcomes))
+    }
 }
 
 impl SessionStoreV2 {

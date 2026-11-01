@@ -333,7 +333,8 @@ test("serial Root birth selectors reuse canonical storage compilation and preser
   const { SERIAL_STORAGE_FAMILIES, SERIAL_STORAGE_FILTERS, SERIAL_STORAGE_SELECTORS, ROOT_BIRTH_CASES, cargoArguments } = require("./run-feature-tests.cjs")
   assert.deepEqual(SERIAL_STORAGE_FAMILIES, ["v2::root_birth_tests::", "v2::host_root_create::tests::",
     "v2::supervisor_management_tests::", "v2::supervisor_management_lifetime_tests::", "v2::supervisor_proof_tests::",
-    "v2::supervisor_management::observer_lock_order_tests::"])
+    "v2::supervisor_management::observer_lock_order_tests::",
+    "v2::supervisor_management::current_user::observed_history_guard_tests::"])
   assert.deepEqual(SERIAL_STORAGE_FILTERS, ["root_birth_tests", "host_root_create::tests", "supervisor_management", "supervisor_proof"])
   const source = readFileSync("crates/infra/bamboo-storage/src/v2/root_birth_tests.rs", "utf8")
   assert.deepEqual([...source.matchAll(/async fn (root_birth_[a-z_]+)\(/gu)].map(match => match[1]).sort(), [...ROOT_BIRTH_CASES].sort())
@@ -405,7 +406,11 @@ function assertObserverRuntimeOwner(definitions) {
     .replace(`name: ${secondName}\n`, `name: ${secondName}\n        if: success()\n        timeout-minutes: 90\n`)
     .replace('            --test-threads=1 --color=never \\\n', `            --skip ${OBSERVER_SHARED_SERDE_CASE} \\\n            --test-threads=1 --color=never \\\n`)
     .replace(`assert results['domain'] - window == {'${OBSERVER_SHARED_SERDE_CASE}'}`, "assert results['domain'] == window, 'Shared serde case already passed in the first joint recipe'")
-    .replace("Six canonical windows, exact legacy serde,", "Six canonical windows, shared serde already covered,")
+    .replace("assert len(window) == 6", "assert len(window) == 7")
+    .replace("'subscription_unavailable_observer_retries_are_bounded_without_borrowing_authority',\n          }",
+      "'subscription_unavailable_observer_retries_are_bounded_without_borrowing_authority',\n              'historical_pending_requires_supervisor_receipt_before_observer_cursor',\n          }")
+    .replace("Six canonical windows, exact legacy serde,", "Seven canonical windows, shared serde already covered,")
+    .replace("regressions, seven subscription", "regressions, eight subscription")
   assert.equal(second, expected, "Preserve the complete original joint recipe, skipping only the already-passed serde case")
   assert.equal((combined.match(/--skip /gu) ?? []).length, 1)
   assert.match(second, /cargo test --locked -p bamboo-domain -p bamboo-engine -p bamboo-server --lib --/u)
@@ -421,7 +426,7 @@ test("one automatic Observer job preserves both joint graphs and executes shared
     [`--skip ${OBSERVER_SHARED_SERDE_CASE}`, ""], ["        if: success()", "        if: always()"],
     ["-p bamboo-domain -p bamboo-engine -p bamboo-server --lib", "-p bamboo-engine -p bamboo-server --lib"],
     ["Shared serde case already passed in the first joint recipe", "ignored duplicate"],
-    ["assert len(window) == 6", "assert len(window) >= 0"]]) {
+    ["assert len(window) == 7", "assert len(window) >= 0"]]) {
     assert.ok(source.includes(before), before)
     assert.throws(() => assertObserverRuntimeOwner({ ...definitions, [name]: source.replace(before, after) }))
   }
@@ -540,7 +545,7 @@ function assertLinuxTestOwnership(definitions) {
       }
       if (file === "trusted-observer.yml") {
         // Preserve this separately accepted F/config exactly; never relabel it as M.
-        assert.equal(createHash("sha256").update(source).digest("hex"), "ce58547220ee0620820911b4354af9d446acd65bb036cbfb1ce5411360acebaa")
+        assert.equal(createHash("sha256").update(source).digest("hex"), "aa6c09cd846756df8908d26b555a9131ccf05f0fe3c984fe9ca4771fa3c76de2")
         assert.match(block, /BAMBOO_FRONTEND_BUILD_MODE: api-only/u)
         assert.match(block, /EXPECTED_SOURCE_SHA: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)
         assert.match(block, /ref: \$\{\{ github\.event\.pull_request\.head\.sha \}\}/u)

@@ -141,7 +141,10 @@ impl SupervisorFollowupGuard {
 
 /// Management publication owns the existing locks, not a new authority grant.
 /// Fields release Sessions → Task → lifecycle; pop reverses sorted acquisition.
-pub(super) struct SupervisorManagementGuards {
+/// Field visibility stays private; only the type name is reachable wherever a
+/// retained guard set is publicly held (for example
+/// `ObserverRootOutcomeAuthority::_guards`), so `private_interfaces` holds.
+pub(crate) struct SupervisorManagementGuards {
     sessions: Vec<SessionWriteGuard>,
     _task: RuntimeTaskTransactionReadGuard,
     _lifecycle: LifecycleGuard,

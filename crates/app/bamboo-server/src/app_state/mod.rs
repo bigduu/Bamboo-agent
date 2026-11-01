@@ -649,6 +649,9 @@ mod model_limit_snapshot_tests;
 #[cfg(test)]
 mod supervisor_epic_acceptance_tests;
 
+#[cfg(test)]
+mod supervised_root_outcome_tests;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ConfigUpdateEffects {
     pub reload_provider: bamboo_config::patch::ReloadMode,
@@ -675,3 +678,6 @@ mod supervised_root_create_tests;
 
 pub(super) mod supervised_root_create;
 mod supervised_root_run;
+pub(super) mod supervisor_directory;
+#[cfg(test)]
+mod supervisor_directory_tests;

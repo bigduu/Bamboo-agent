@@ -50,6 +50,9 @@ pub struct SessionRepository {
     root_inbox_receipt: Option<bamboo_domain::SessionInboxReceipt>,
     root_actor_writers:
         Arc<dashmap::DashMap<String, std::sync::Weak<bamboo_domain::RootActorRuntimeWrite>>>,
+    // Always present in production builds too; only focused tests set it via
+    // the #[cfg(test)] builder below.
+    root_lease_override: Option<std::time::Duration>,
     #[cfg(test)]
     post_durable_hook: Option<PostDurableHook>,
 }
@@ -68,6 +71,7 @@ impl SessionRepository {
             root_actor_owner: None,
             root_inbox_receipt: None,
             root_actor_writers: Arc::new(Default::default()),
+            root_lease_override: None,
             #[cfg(test)]
             post_durable_hook: None,
         }
@@ -109,14 +113,22 @@ impl SessionRepository {
         session
             .check_conversation_generation(&durable)
             .map_err(root_actor_binding_error)?;
-        let lease_duration = std::time::Duration::from_secs(15);
+        // A longer Root lease absorbs slow durable writes (multi-MB session
+        // transcripts serialized under the actor transaction lock) so a busy
+        // host cannot expire a live turn between renewal ticks. Renewal still
+        // runs every lease/3, and a genuine takeover keeps rejecting the old
+        // fence. Focused tests may shorten this through the test-only override.
+        let lease_duration = self
+            .root_lease_override
+            .unwrap_or_else(|| std::time::Duration::from_secs(60));
+        let lease_seconds = chrono::Duration::from_std(lease_duration).expect("bounded Root lease");
         let now = chrono::Utc::now();
         let claimed = directory
             .claim_activation(&bamboo_domain::ActorActivationClaim {
                 actor_id: session.id.clone(),
                 run_id: run_id.to_string(),
                 lease_owner: format!("root-execution-{}", uuid::Uuid::new_v4()),
-                lease_expires_at: now + chrono::Duration::seconds(15),
+                lease_expires_at: now + lease_seconds,
                 inbox_generation: session
                     .session_inbox_admission()
                     .map_or(0, |a| a.last_admitted_sequence),
@@ -226,6 +238,14 @@ impl SessionRepository {
     #[cfg(test)]
     fn with_post_durable_hook(mut self, hook: PostDurableHook) -> Self {
         self.post_durable_hook = Some(hook);
+        self
+    }
+
+    /// Test-only shortening of the Root activation lease. Focused port tests
+    /// observe expiry-driven fencing without waiting out the production lease.
+    #[cfg(test)]
+    pub(crate) fn with_root_lease_override(mut self, duration: std::time::Duration) -> Self {
+        self.root_lease_override = Some(duration);
         self
     }
 
@@ -761,26 +781,7 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
                 // persistence and is therefore preserved alongside the cached
                 // messages, matching the V2 sidecar overlay contract.
                 if let Some(cached) = self.cache.get(&saved.id) {
-                    cached.update(|cached| {
-                        let messages = cached.messages.clone();
-                        let provider_transcript = cached.provider_transcript.clone();
-                        let admission = cached
-                            .runtime_metadata
-                            .as_ref()
-                            .and_then(|metadata| metadata.session_inbox_admission.clone());
-                        let mut refreshed = saved.clone();
-                        refreshed.messages = messages;
-                        refreshed.provider_transcript = provider_transcript;
-                        if let Some(admission) = admission {
-                            refreshed
-                                .runtime_metadata
-                                .get_or_insert_with(Default::default)
-                                .session_inbox_admission = Some(admission);
-                        } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
-                            metadata.session_inbox_admission = None;
-                        }
-                        *cached = refreshed;
-                    });
+                    cached.update(|cached| merge_runtime_control_plane_cache(cached, saved));
                 }
             })
             .await
@@ -1187,6 +1188,51 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
     }
 }
 
+/// Runtime-only callbacks do not observe Main-owned facts. Preserve the
+/// existing cache projection only within the same Session lifetime and reset
+/// generation; consumers requiring durable outcome truth must read Main.
+fn merge_runtime_control_plane_cache(cached: &mut Session, saved: &Session) {
+    let messages = cached.messages.clone();
+    let provider_transcript = cached.provider_transcript.clone();
+    let admission = cached
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.session_inbox_admission.clone());
+    let same_lifetime = cached.id == saved.id
+        && cached.created_at == saved.created_at
+        && cached.kind == saved.kind
+        && cached.authority_identity == saved.authority_identity
+        && cached.check_conversation_generation(saved).is_ok();
+    let outcomes = if same_lifetime {
+        cached
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.clone())
+    } else {
+        None
+    };
+    let mut refreshed = saved.clone();
+    refreshed.messages = messages;
+    refreshed.provider_transcript = provider_transcript;
+    if let Some(admission) = admission {
+        refreshed
+            .runtime_metadata
+            .get_or_insert_with(Default::default)
+            .session_inbox_admission = Some(admission);
+    } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
+        metadata.session_inbox_admission = None;
+    }
+    if let Some(outcomes) = outcomes {
+        refreshed
+            .runtime_metadata
+            .get_or_insert_with(Default::default)
+            .supervised_root_outcomes = Some(outcomes);
+    } else if let Some(metadata) = refreshed.runtime_metadata.as_mut() {
+        metadata.supervised_root_outcomes = None;
+    }
+    *cached = refreshed;
+}
+
 fn validate_bound_root_snapshot(
     owner: &bamboo_domain::RootActorRuntimeWrite,
     snapshot: &Session,
@@ -1220,6 +1266,64 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn runtime_cache_preserves_only_same_lifetime_main_outcome_projection() {
+        let mut cached = Session::new("outcome-cache", "synthetic-model");
+        let owner = bamboo_domain::ActorActivationFence {
+            schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
+            actor_id: cached.id.clone(),
+            activation_id: "synthetic-activation".into(),
+            attempt: 1,
+            run_id: "synthetic-run".into(),
+            lease_owner: "synthetic-owner".into(),
+            lease_epoch: 1,
+        };
+        let mut outcomes =
+            bamboo_domain::SupervisedRootOutcomes::new(&cached.id, cached.created_at).unwrap();
+        outcomes.reserve(&owner, None).unwrap();
+        outcomes
+            .finalize(
+                &owner,
+                bamboo_domain::SupervisedRootOutcomeResult::Completed,
+            )
+            .unwrap();
+        cached
+            .runtime_metadata
+            .get_or_insert_with(Default::default)
+            .supervised_root_outcomes = Some(outcomes.clone());
+
+        // The runtime callback carries a conflicting value, which is not Main.
+        let mut saved = cached.clone();
+        saved
+            .runtime_metadata
+            .as_mut()
+            .unwrap()
+            .supervised_root_outcomes
+            .as_mut()
+            .unwrap()
+            .facts[0]
+            .result = Some(bamboo_domain::SupervisedRootOutcomeResult::Failed);
+        merge_runtime_control_plane_cache(&mut cached, &saved);
+        assert_eq!(
+            cached
+                .runtime_metadata
+                .as_ref()
+                .unwrap()
+                .supervised_root_outcomes,
+            Some(outcomes)
+        );
+
+        // A reused ID is not the old Session's birth and cannot inherit facts.
+        saved.created_at += chrono::Duration::seconds(1);
+        merge_runtime_control_plane_cache(&mut cached, &saved);
+        assert!(cached
+            .runtime_metadata
+            .as_ref()
+            .unwrap()
+            .supervised_root_outcomes
+            .is_none());
+    }
 
     #[derive(Default)]
     struct MapStorage {

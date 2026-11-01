@@ -53,6 +53,13 @@ pub fn observer_filtered_fingerprint(
 /// The view is already published. These selectors confer no file/read right.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ObserverRootOutcomeCursor {
+    pub root_created_at: DateTime<Utc>,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObserverViewChange {
     pub scope_epoch: u64,
     pub sequence: u64,
@@ -62,6 +69,9 @@ pub struct ObserverViewChange {
     pub observed_kinds: BTreeSet<ObserverChangeKind>,
     pub observed_at: DateTime<Utc>,
     pub event_id: SessionMessageId,
+    /// Optional historical Root result, not a new grant or consumer ACK.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_outcome: Option<ObserverRootOutcomeCursor>,
 }
 
 /// Transient values from the locked canonical registration, never another
@@ -81,6 +91,9 @@ pub struct ObserverSubscriptionWindow {
     pub scope_epoch: u64,
     pub enqueued_sequence: u64,
     pub enqueued_fingerprints: BTreeMap<String, String>,
+    /// Source position advances only with this pending view's Inbox receipt.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub root_outcome_cursors: BTreeMap<String, ObserverRootOutcomeCursor>,
     pub pending: Option<ObserverViewChange>,
     /// Bounded enqueue references, never a consumer/model watermark. Canonical
     /// Inbox remains consumer ACK truth.
@@ -127,6 +140,10 @@ impl ObserverViewChange {
         if self.scope_epoch == 0
             || self.sequence == 0
             || self.observed_kinds.is_empty()
+            || self
+                .root_outcome
+                .as_ref()
+                .is_some_and(|position| position.sequence == 0)
             || !digest_shape(&self.view_revision)
             || !digest_shape(&self.source_fingerprint)
             || canonical_json_bytes(&serde_json::to_value(self).map_err(|_| "change encoding")?)
@@ -139,20 +156,21 @@ impl ObserverViewChange {
     }
 
     pub fn expected_event_id(&self, owner: &ObserverSubscriptionOwner<'_>) -> SessionMessageId {
-        SessionMessageId::stable(
-            "supervisor_observation_v1",
-            &serde_json::json!({
-                "supervisor_incarnation":owner.supervisor_incarnation,
-                "supervisor_created_at":owner.supervisor_created_at,
-                "observer_session_id":owner.observer_session_id,
-                "observer_created_at":owner.observer_created_at,
-                "scope_epoch":self.scope_epoch, "sequence":self.sequence,
-                "target_session_id":self.target_session_id,
-                "view_revision":self.view_revision,
-                "source_fingerprint":self.source_fingerprint,
-                "observed_kinds":self.observed_kinds, "observed_at":self.observed_at,
-            }),
-        )
+        let mut identity = serde_json::json!({
+            "supervisor_incarnation":owner.supervisor_incarnation,
+            "supervisor_created_at":owner.supervisor_created_at,
+            "observer_session_id":owner.observer_session_id,
+            "observer_created_at":owner.observer_created_at,
+            "scope_epoch":self.scope_epoch, "sequence":self.sequence,
+            "target_session_id":self.target_session_id,
+            "view_revision":self.view_revision,
+            "source_fingerprint":self.source_fingerprint,
+            "observed_kinds":self.observed_kinds, "observed_at":self.observed_at,
+        });
+        if let Some(outcome) = &self.root_outcome {
+            identity["root_outcome"] = serde_json::json!(outcome);
+        }
+        SessionMessageId::stable("supervisor_observation_v1", &identity)
     }
 }
 
@@ -163,6 +181,7 @@ impl ObserverSubscriptionWindow {
             scope_epoch,
             enqueued_sequence: 0,
             enqueued_fingerprints: BTreeMap::new(),
+            root_outcome_cursors: BTreeMap::new(),
             pending: None,
             history: Vec::new(),
         };
@@ -174,6 +193,7 @@ impl ObserverSubscriptionWindow {
         if self.version != OBSERVER_SUBSCRIPTION_VERSION
             || self.scope_epoch == 0
             || self.enqueued_fingerprints.len() > MAX_OBSERVER_WINDOW_TARGETS
+            || self.root_outcome_cursors.len() > MAX_OBSERVER_WINDOW_TARGETS
             || self.history.len() > MAX_OBSERVER_CHANGE_HISTORY
             || serde_json::to_vec(self)
                 .map_err(|_| "window encoding")?
@@ -187,6 +207,9 @@ impl ObserverSubscriptionWindow {
             if !digest_shape(fingerprint) {
                 return Err("invalid Observer source fingerprint");
             }
+        }
+        for target in self.root_outcome_cursors.keys() {
+            crate::validate_supervisor_target_id(target)?;
         }
         let first = self
             .enqueued_sequence
@@ -204,6 +227,19 @@ impl ObserverSubscriptionWindow {
         }
         if let Some(pending) = &self.pending {
             pending.validate()?;
+            if let Some(outcome) = &pending.root_outcome {
+                if outcome.sequence == 0
+                    || self
+                        .root_outcome_cursors
+                        .get(&pending.target_session_id)
+                        .is_some_and(|current| {
+                            current.root_created_at != outcome.root_created_at
+                                || current.sequence >= outcome.sequence
+                        })
+                {
+                    return Err("invalid pending Observer Root outcome position");
+                }
+            }
             if pending.scope_epoch != self.scope_epoch
                 || Some(pending.sequence) != self.enqueued_sequence.checked_add(1)
                 || (!self
@@ -245,11 +281,37 @@ impl ObserverSubscriptionWindow {
         observed_kinds: BTreeSet<ObserverChangeKind>,
         observed_at: DateTime<Utc>,
     ) -> Result<ObserverStageOutcome, &'static str> {
+        self.stage_with_root_outcome(
+            owner,
+            target,
+            view_revision,
+            source_fingerprint,
+            observed_kinds,
+            observed_at,
+            None,
+        )
+    }
+
+    /// A historical Root selector is frozen with the existing pending view.
+    /// Its position is not advanced until the matching Inbox receipt commits.
+    pub fn stage_with_root_outcome(
+        &mut self,
+        owner: &ObserverSubscriptionOwner<'_>,
+        target: &str,
+        view_revision: &str,
+        source_fingerprint: &str,
+        observed_kinds: BTreeSet<ObserverChangeKind>,
+        observed_at: DateTime<Utc>,
+        root_outcome: Option<ObserverRootOutcomeCursor>,
+    ) -> Result<ObserverStageOutcome, &'static str> {
         self.validate_for_owner(owner)?;
         if let Some(pending) = &self.pending {
             return Ok(ObserverStageOutcome::ExistingPending(pending.clone()));
         }
-        if self.enqueued_fingerprints.get(target).map(String::as_str) == Some(source_fingerprint) {
+        if root_outcome.is_none()
+            && self.enqueued_fingerprints.get(target).map(String::as_str)
+                == Some(source_fingerprint)
+        {
             return Ok(ObserverStageOutcome::Unchanged);
         }
         if !self.enqueued_fingerprints.contains_key(target)
@@ -269,6 +331,7 @@ impl ObserverSubscriptionWindow {
             observed_kinds,
             observed_at,
             event_id: SessionMessageId::new(),
+            root_outcome,
         };
         change.event_id = change.expected_event_id(owner);
         change.validate()?;
@@ -308,6 +371,11 @@ impl ObserverSubscriptionWindow {
         let mut candidate = self.clone();
         let pending = candidate.pending.take().expect("matching pending checked");
         candidate.enqueued_sequence = pending.sequence;
+        if let Some(position) = pending.root_outcome.clone() {
+            candidate
+                .root_outcome_cursors
+                .insert(pending.target_session_id.clone(), position);
+        }
         candidate.enqueued_fingerprints.insert(
             pending.target_session_id.clone(),
             pending.source_fingerprint.clone(),
@@ -622,6 +690,62 @@ mod tests {
         other.generation = 0;
         assert!(window.commit_enqueued(&owner(), &other).is_err());
         assert_eq!(window, before);
+    }
+
+    #[test]
+    fn root_outcome_position_advances_only_with_its_exact_inbox_receipt() {
+        let mut window = ObserverSubscriptionWindow::new(7).unwrap();
+        let position = ObserverRootOutcomeCursor {
+            root_created_at: Utc.timestamp_opt(1_700_000_003, 0).unwrap(),
+            sequence: 1,
+        };
+        let ObserverStageOutcome::Staged(pending) = window
+            .stage_with_root_outcome(
+                &owner(),
+                "root-a",
+                &"a".repeat(64),
+                &"b".repeat(64),
+                BTreeSet::from([ObserverChangeKind::Status]),
+                Utc.timestamp_opt(1_700_000_004, 0).unwrap(),
+                Some(position.clone()),
+            )
+            .unwrap()
+        else {
+            panic!("expected historical pending outcome");
+        };
+        assert!(window.root_outcome_cursors.is_empty());
+        let bytes = serde_json::to_vec(&window).unwrap();
+        let mut reopened: ObserverSubscriptionWindow = serde_json::from_slice(&bytes).unwrap();
+        let mut wrong = receipt(&pending);
+        wrong.id = SessionMessageId::new();
+        assert!(reopened.commit_enqueued(&owner(), &wrong).is_err());
+        assert_eq!(serde_json::to_vec(&reopened).unwrap(), bytes);
+        assert!(reopened
+            .commit_enqueued(&owner(), &receipt(&pending))
+            .unwrap());
+        assert_eq!(reopened.root_outcome_cursors["root-a"], position);
+        assert!(!reopened
+            .commit_enqueued(&owner(), &receipt(&pending))
+            .unwrap());
+
+        // An ordinary snapshot fingerprint must not short-circuit a distinct
+        // historical position, even when the filtered status bytes match.
+        let next = ObserverRootOutcomeCursor {
+            sequence: 2,
+            ..position
+        };
+        assert!(matches!(
+            reopened.stage_with_root_outcome(
+                &owner(),
+                "root-a",
+                &"c".repeat(64),
+                &"b".repeat(64),
+                BTreeSet::from([ObserverChangeKind::Status]),
+                Utc.timestamp_opt(1_700_000_005, 0).unwrap(),
+                Some(next),
+            ),
+            Ok(ObserverStageOutcome::Staged(_))
+        ));
     }
 
     #[test]

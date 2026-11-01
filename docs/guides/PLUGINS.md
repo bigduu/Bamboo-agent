@@ -138,6 +138,29 @@ Malformed output, process failure and timeout report `invalid_report`,
 Neither an installed app nor an MCP connection proves privacy permissions;
 `desktop_readiness` remains `not_tested`.
 
+### Accepted release receipts
+
+`official-nova.json` is a list of accepted **receipts**, not one row per version.
+A producer can re-cut a release under the same version (Nova `v0.3.1` was
+republished on 2026-10-25 with different bytes), and every already-verified
+installation keeps the digests of the bytes it originally fetched. The receipt is
+therefore selected from the install record's own pinned bundle digest, never from
+the version alone: accepting a newer receipt must not invalidate an existing
+install, and an older install must not be validated against newer manifest and
+executable digests.
+
+An installation whose pinned digest no receipt describes stays unverified rather
+than borrowing an unrelated same-version receipt. When the catalog holds exactly
+one receipt for that version it is still used, so the normal digest check reports
+the mismatch itself instead of the connector silently disappearing.
+
+A receipt must describe immutable bytes. If the published archive no longer
+matches the accepted `sha256`, installation fails closed with
+`archive_checksum_mismatch` and installs nothing; the app `artifact.sha256` lives
+in the same catalog and needs the same treatment. Re-pin the receipt to the
+reviewed bytes, or publish a new version instead of replacing a released asset —
+replacing one silently breaks every client that pinned the earlier bytes.
+
 `POST /api/v1/plugins/nova/app/install` is an explicit user action. Send `{}` or
 the exact `artifact_id` returned by the current status response. The server
 selects the immutable reviewed release archive, downloads it into a private

@@ -508,7 +508,15 @@ async fn assert_owned_input_restart(canonical_workspace: bool) {
         "Host shutdown preserves the uncheckpointed typed transport"
     );
     let mut b = Host::start(&home, false).await;
-    tokio::time::timeout(WAIT, async {
+    // B can only recover the stopped Host's Root once that Root's real
+    // activation lease has lapsed. Derive the window from the lease A actually
+    // claimed so a lease-length change widens the proof instead of truncating
+    // it, without weakening the "actual expiry" assertion below.
+    let recovery_window = (a_activation.lease_expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        + WAIT;
+    tokio::time::timeout(recovery_window, async {
         loop {
             let store = SessionStoreV2::new(home.clone()).await.unwrap();
             let session = store.load_session(ROOT).await.unwrap().unwrap();

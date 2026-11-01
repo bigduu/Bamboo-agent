@@ -28,11 +28,59 @@ pub(super) async fn observe(
     target_id: &str,
     filter: &std::collections::BTreeSet<bamboo_domain::ObserverChangeKind>,
     previous: Option<&str>,
+    use_subscription_cursor: bool,
 ) -> Result<Option<ToolResult>, ToolError> {
     if !cfg!(any(target_os = "linux", target_os = "macos")) {
         return Err(error("retained context reading is unsupported"));
     }
     let source = authorize(tool, ctx, target_id).await?;
+    if filter == &std::collections::BTreeSet::from([bamboo_domain::ObserverChangeKind::Status])
+        && source.authority["route"]["route"] == "observer"
+    {
+        if let Some(inbox) = &tool.observer_outcome_inbox {
+            if !inbox.belongs_to_store(&tool.session_store) {
+                return Err(error("Observer Inbox belongs to another store"));
+            }
+            let supervisor: bamboo_domain::SupervisorReference = serde_json::from_value(
+                source.authority["route"]["registration"]["supervisor"].clone(),
+            )
+            .map_err(error)?;
+            let caller = bamboo_domain::SessionCallerReference::from(&source.caller);
+            match inbox
+                .read_observer_root_outcome(
+                    &caller,
+                    &supervisor,
+                    target_id,
+                    use_subscription_cursor,
+                    previous,
+                )
+                .await
+                .map_err(error)?
+            {
+                bamboo_domain::ObserverRootOutcomeRead::LegacySnapshot => {}
+                // Historical delivery does not suppress later ordinary live
+                // status changes on the existing snapshot lane.
+                bamboo_domain::ObserverRootOutcomeRead::CaughtUp => {}
+                bamboo_domain::ObserverRootOutcomeRead::PendingSource => return Ok(None),
+                bamboo_domain::ObserverRootOutcomeRead::Next(outcome) => {
+                    let result = context_view::publish_filtered_scoped_root_outcome(
+                        tool,
+                        &source.caller,
+                        &source.target,
+                        source.authority.clone(),
+                        filter,
+                        outcome,
+                    )
+                    .await?;
+                    let after = authorize(tool, ctx, target_id).await?;
+                    if after.authority != source.authority {
+                        return Err(error("scope changed during outcome observation"));
+                    }
+                    return Ok(Some(result));
+                }
+            }
+        }
+    }
     let result = context_view::publish_filtered_scoped_context(
         tool,
         &source.caller,

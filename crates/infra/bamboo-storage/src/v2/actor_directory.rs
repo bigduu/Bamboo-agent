@@ -942,8 +942,26 @@ impl ActorDirectoryPort for SessionStoreV2 {
         lease_expires_at: DateTime<Utc>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         self.actor_transaction(&fence.actor_id, |entry| {
-            let old_expiry = current_live(entry, fence, now)?.lease_expires_at;
-            if lease_expires_at <= old_expiry {
+            // Renewal is the one operation that may repair an expired lease:
+            // while the fence still matches the persisted activation exactly
+            // and the activation stays live, no other owner could have claimed
+            // (a replacement claim replaces the activation and the fence), so
+            // extending the lease here cannot cancel a new owner. Any other
+            // mismatch keeps the existing StaleFence rejection. This holds the
+            // same actor transaction lock a replacement claim needs, so the
+            // exact-fence proof and the extension are serialized against
+            // takeover the same way live renewals already are.
+            let activation = entry
+                .activation
+                .as_ref()
+                .ok_or(ActorDirectoryError::StaleFence)?;
+            if entry.actor.state != ActorLogicalState::Active
+                || !activation.status.is_live()
+                || !activation.matches_fence(fence)
+            {
+                return Err(ActorDirectoryError::StaleFence);
+            }
+            if lease_expires_at <= activation.lease_expires_at || lease_expires_at <= now {
                 return Err(ActorDirectoryError::InvalidTransition);
             }
             let activation = entry
@@ -1467,6 +1485,108 @@ mod tests {
         assert_eq!(
             store
                 .validate_fence(&old.fence(), after_expiry)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::StaleFence
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn renewal_repairs_expired_lease_without_takeover(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        store
+            .save_session(&Session::new("lapsed-renewal", "model"))
+            .await?;
+        let now = Utc::now();
+        let claimed = store
+            .claim_activation(&claim("lapsed-renewal", "run-lapsed", "host-lapsed", now))
+            .await?;
+        store.start_activation(&claimed.fence(), now).await?;
+        // The lease has lapsed (busy host, slow durable write) but no other
+        // owner claimed the activation: the persisted activation still matches
+        // the fence exactly and stays live, so renewal must repair it instead
+        // of killing the in-flight turn.
+        let after_expiry = claimed.lease_expires_at + Duration::minutes(6);
+        let repaired = store
+            .renew_activation(
+                &claimed.fence(),
+                after_expiry,
+                after_expiry + Duration::minutes(5),
+            )
+            .await?;
+        assert_eq!(repaired.fence(), claimed.fence());
+        assert!(repaired.lease_expires_at > claimed.lease_expires_at);
+        // With the lease repaired the owner can checkpoint and finish again.
+        let checkpoint = store
+            .checkpoint_activation(&claimed.fence(), after_expiry, 0)
+            .await?;
+        assert_eq!(checkpoint.checkpoint_revision, 1);
+        store
+            .finish_activation(
+                &claimed.fence(),
+                after_expiry + Duration::seconds(1),
+                ActorActivationFinish::Succeeded,
+            )
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn renewal_after_takeover_or_finish_still_rejects_old_fence(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let home = tempfile::tempdir()?;
+        let store = SessionStoreV2::new(home.path().to_path_buf()).await?;
+        store
+            .save_session(&Session::new("takeover-renewal", "model"))
+            .await?;
+        let now = Utc::now();
+        let old = store
+            .claim_activation(&claim("takeover-renewal", "run-old", "host-old", now))
+            .await?;
+        store.start_activation(&old.fence(), now).await?;
+        // A replacement claim after expiry replaces the activation entirely;
+        // the old fence must never extend the new owner's lease.
+        let after_expiry = old.lease_expires_at + Duration::minutes(6);
+        let replacement = store
+            .claim_activation(&claim(
+                "takeover-renewal",
+                "run-new",
+                "host-new",
+                after_expiry,
+            ))
+            .await?;
+        assert_eq!(
+            store
+                .renew_activation(
+                    &old.fence(),
+                    after_expiry,
+                    after_expiry + Duration::minutes(5),
+                )
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::StaleFence
+        );
+        // A finished activation is equally closed to renewal by its old fence.
+        store
+            .start_activation(&replacement.fence(), after_expiry)
+            .await?;
+        store
+            .finish_activation(
+                &replacement.fence(),
+                after_expiry + Duration::seconds(1),
+                ActorActivationFinish::Succeeded,
+            )
+            .await?;
+        assert_eq!(
+            store
+                .renew_activation(
+                    &replacement.fence(),
+                    after_expiry + Duration::seconds(2),
+                    after_expiry + Duration::minutes(5),
+                )
                 .await
                 .unwrap_err(),
             ActorDirectoryError::StaleFence
@@ -2052,5 +2172,60 @@ mod tests {
             .join("sessions/direct-claim/actor-authority.initialized.json")
             .is_file());
         Ok(())
+    }
+
+    /// Reproduction for bigduu/Bamboo-agent#2424: a pre-schema Child was
+    /// created before actor-authority existed, so its Session carries no
+    /// `parent_created_at` and no recorded Actor sidecar exists for it.
+    /// The strict lineage rule is intentionally UNCHANGED: such a Child is
+    /// still rejected here with `InvalidIdentity`, because it can never
+    /// present a valid ancestor birth proof. Exclusion from the managed
+    /// directory happens one layer up in `current_user_supervisor_target`
+    /// (see supervisor_current_user.rs), which skips these sessions rather
+    /// than failing the whole listing page. This test documents that
+    /// boundary: lineage still rejects, the directory layer excludes.
+    #[tokio::test]
+    async fn legacy_child_without_parent_created_at_is_still_rejected_by_lineage() {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let root = Session::new("legacy-birth-root", "model");
+        store.save_session(&root).await.unwrap();
+        // `new_child` leaves parent_created_at None: exactly the shape of a
+        // Child created before this column existed.
+        let child = Session::new_child("legacy-birth-child", &root.id, "model", "legacy child");
+        assert_eq!(child.parent_created_at, None);
+        store.save_session(&child).await.unwrap();
+        let actor = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        assert_eq!(actor.current_attempt, 0);
+        assert!(actor.ancestor_observations.is_empty());
+        let rejection = store
+            .validate_actor_control_lineage(&actor)
+            .await
+            .unwrap_err();
+        assert_eq!(rejection, ActorDirectoryError::InvalidIdentity);
+    }
+
+    /// The fix must not weaken validation: a Child whose recorded parentage
+    /// is genuinely inconsistent (wrong spawn depth) is still rejected.
+    #[tokio::test]
+    async fn inconsistent_legacy_child_depth_is_still_rejected() {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().to_path_buf())
+            .await
+            .unwrap();
+        let root = Session::new("legacy-reject-root", "model");
+        store.save_session(&root).await.unwrap();
+        let mut child =
+            Session::new_child("legacy-reject-child", &root.id, "model", "legacy child");
+        child.spawn_depth = 7; // inconsistent with parent depth 0 + 1
+        store.save_session(&child).await.unwrap();
+        let actor = bamboo_domain::ActorSession::from_session(&child).unwrap();
+        let rejection = store
+            .validate_actor_control_lineage(&actor)
+            .await
+            .unwrap_err();
+        assert_eq!(rejection, ActorDirectoryError::InvalidIdentity);
     }
 }

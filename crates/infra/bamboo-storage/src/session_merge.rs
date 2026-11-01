@@ -213,6 +213,7 @@ fn reconcile_runtime_checkpoint(
     latest: &Session,
 ) -> std::io::Result<(usize, bool)> {
     ensure_model_context_checkpoint_is_current(session, latest)?;
+    adopt_durable_supervised_outcomes(session, latest)?;
     let appended = bamboo_domain::append_missing_runtime_messages(session, latest);
     bamboo_domain::merge_session_inbox_admission(session, latest);
     let adopted_response = adopt_durable_consumed_clarification(session, latest);
@@ -220,6 +221,116 @@ fn reconcile_runtime_checkpoint(
     adopt_fresher_disk_permission_posture(session, latest);
     let _ = adopt_durable_tagged_child_wait(session, latest);
     Ok((appended, adopted_response))
+}
+
+/// Runtime snapshots do not own this Main lane. Adopt only a same-lifetime,
+/// same-generation durable value before a later checkpoint or final save.
+fn adopt_durable_supervised_outcomes(
+    session: &mut Session,
+    latest: &Session,
+) -> std::io::Result<()> {
+    let durable = latest
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.clone());
+    let incoming = session
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.as_ref());
+    if durable.is_none() && incoming.is_none() {
+        return Ok(());
+    }
+    if session.id != latest.id
+        || session.created_at != latest.created_at
+        || session.kind != latest.kind
+        || session.authority_identity != latest.authority_identity
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict("Root outcome lifetime changed".into()),
+        ));
+    }
+    ensure_conversation_generation_is_current(session, latest)?;
+    if let Some(durable) = durable {
+        session
+            .runtime_metadata
+            .get_or_insert_with(Default::default)
+            .supervised_root_outcomes = Some(durable);
+    } else if let Some(metadata) = session.runtime_metadata.as_mut() {
+        metadata.supervised_root_outcomes = None;
+    }
+    Ok(())
+}
+
+/// Capture the same owner-checked snapshot that the storage writer publishes
+/// while it still owns the physical guard. The slot is owned by the callback
+/// as well as the awaiting task, including when that task is cancelled.
+fn capture_root_publication(
+    publish: bamboo_domain::RootActorRuntimePublisher,
+) -> (
+    bamboo_domain::RootActorRuntimePublisher,
+    Arc<std::sync::Mutex<(bool, Option<Session>)>>,
+) {
+    let slot = Arc::new(std::sync::Mutex::new((false, None)));
+    let callback_slot = Arc::clone(&slot);
+    let callback = Arc::new(move |committed: &Session| {
+        publish(committed);
+        if let Ok(mut state) = callback_slot.lock() {
+            if state.0 {
+                state.1 = None;
+            } else {
+                state.0 = true;
+                state.1 = Some(committed.clone());
+            }
+        }
+    });
+    (callback, slot)
+}
+
+fn adopt_root_publication(
+    session: &mut Session,
+    slot: &std::sync::Mutex<(bool, Option<Session>)>,
+) -> std::io::Result<()> {
+    let unknown = || {
+        std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "Root committed snapshot unavailable; write outcome is unknown".into(),
+            ),
+        )
+    };
+    let committed = slot
+        .lock()
+        .map_err(|_| unknown())?
+        .1
+        .take()
+        .ok_or_else(unknown)?;
+    if session.id != committed.id
+        || session.created_at != committed.created_at
+        || session.kind != committed.kind
+        || session.authority_identity != committed.authority_identity
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict("Root publication lifetime changed".into()),
+        ));
+    }
+    ensure_conversation_generation_is_current(session, &committed)?;
+    // These three fields are #[serde(skip)] runtime-only state. The persisted
+    // copy never carries `resolved_token_budget` or `force_manual_compression`,
+    // so adopting it would erase the live round's values: downstream dispatch
+    // then loses the resolved tool-output cap (native skill calls fail with
+    // "requires a known current tool-output cap") and the manual-compression
+    // request. `observed_runtime_session_version` may be re-stamped by the
+    // sidecar overlay; keeping the caller's observation is still correct
+    // because the reachable callers already passed the generation and
+    // session-version compatibility checks below/upstream.
+    let mut adopted = committed;
+    adopted.resolved_token_budget = session.resolved_token_budget.clone();
+    adopted.observed_runtime_session_version = session.observed_runtime_session_version;
+    adopted.force_manual_compression = session.force_manual_compression.clone();
+    *session = adopted;
+    Ok(())
 }
 
 // This limit applies only to the optional recovery proof, never ordinary saves.
@@ -411,6 +522,35 @@ fn may_publish_runtime_result(result: &std::io::Result<()>) -> bool {
     })
 }
 
+/// A runtime-only callback cannot attest Main-owned outcomes. Temporarily
+/// hide them without cloning the potentially large transcript, and restore the
+/// caller's projection even if the callback unwinds.
+struct RuntimeOutcomePublication<'a> {
+    session: &'a mut Session,
+    outcomes: Option<bamboo_domain::SupervisedRootOutcomes>,
+}
+
+impl<'a> RuntimeOutcomePublication<'a> {
+    fn new(session: &'a mut Session) -> Self {
+        let outcomes = session
+            .runtime_metadata
+            .as_mut()
+            .and_then(|metadata| metadata.supervised_root_outcomes.take());
+        Self { session, outcomes }
+    }
+}
+
+impl Drop for RuntimeOutcomePublication<'_> {
+    fn drop(&mut self) {
+        if let Some(outcomes) = self.outcomes.take() {
+            self.session
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .supervised_root_outcomes = Some(outcomes);
+        }
+    }
+}
+
 fn is_direct_parent_terminal_conflict(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::WouldBlock
         && error
@@ -422,7 +562,7 @@ fn is_direct_parent_terminal_conflict(error: &std::io::Error) -> bool {
 /// a runtime-only control-plane write; untagged safety-net waits remain owned
 /// by the runner. Adopt the latest wait under the same lock as this save,
 /// without reverting the new run's Initializing/Running status to Suspended.
-fn adopt_durable_tagged_child_wait(
+pub(crate) fn adopt_durable_tagged_child_wait(
     session: &mut Session,
     latest: &Session,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -596,7 +736,7 @@ pub(crate) fn reconcile_inherited_child_wait(
     Ok(())
 }
 
-fn preserve_finalized_hidden_child_resumes(
+pub(crate) fn preserve_finalized_hidden_child_resumes(
     session: &mut Session,
     latest: &Session,
     registered_at: chrono::DateTime<chrono::Utc>,
@@ -908,6 +1048,22 @@ impl LockedSessionStore {
                 .await;
         }
         if let Some(inherited) = self.inherited_for_session(session) {
+            if !runtime_only {
+                if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
+                    let (publish, slot) = capture_root_publication(publish.clone());
+                    let mut candidate = session.clone();
+                    self.storage
+                        .save_runtime_with_inherited_child_wait(
+                            &mut candidate,
+                            inherited,
+                            false,
+                            Some((owner.clone(), publish)),
+                            None,
+                        )
+                        .await?;
+                    return adopt_root_publication(session, &slot);
+                }
+            }
             self.storage
                 .save_runtime_with_inherited_child_wait(
                     session,
@@ -918,9 +1074,17 @@ impl LockedSessionStore {
                 )
                 .await
         } else if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
-            self.storage
-                .save_root_actor_runtime(owner, session, runtime_only, publish.clone())
-                .await
+            if runtime_only {
+                self.storage
+                    .save_root_actor_runtime(owner, session, true, publish.clone())
+                    .await
+            } else {
+                let (publish, slot) = capture_root_publication(publish.clone());
+                self.storage
+                    .save_root_actor_runtime(owner, session, false, publish)
+                    .await?;
+                adopt_root_publication(session, &slot)
+            }
         } else if runtime_only {
             self.storage.save_runtime_state(session).await
         } else {
@@ -990,7 +1154,7 @@ impl LockedSessionStore {
         &self,
         session: &mut Session,
     ) -> std::io::Result<()> {
-        self.save_session_rebasing_task_conflicts_with_input(session, None, None, None)
+        self.save_session_rebasing_task_conflicts_with_input(session, None, None, None, false)
             .await
     }
 
@@ -1003,6 +1167,7 @@ impl LockedSessionStore {
         )>,
         inherited: Option<&bamboo_domain::session::runtime_state::WaitingForChildrenState>,
         startup_expected: Option<&Session>,
+        finalized_root: bool,
     ) -> std::io::Result<()> {
         for attempt in 0..=MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if let Some(provenance) = self.inherited_for_session(session) {
@@ -1026,44 +1191,93 @@ impl LockedSessionStore {
                     )
                 })?;
                 let carried_wait = self.inherited_for_session(session).cloned();
+                let (publish, slot) = capture_root_publication(publish.clone());
+                let mut candidate = session.clone();
                 self.storage
                     .save_root_actor_bound_startup(
                         owner,
-                        session,
+                        &mut candidate,
                         expected,
                         carried_wait.as_ref(),
-                        publish.clone(),
+                        publish,
                     )
                     .await
+                    .and_then(|()| adopt_root_publication(session, &slot))
             } else if self.child_actor_writer.is_some() {
                 self.save_child_snapshot(session, false, input.cloned(), inherited)
                     .await
-            } else if inherited.is_none() && self.inherited_for_session(session).is_some() {
+            } else if finalized_root
+                && inherited.is_none()
+                && input.is_none()
+                && self.root_actor_writer.is_some()
+            {
+                let (owner, publish) = self.root_actor_writer.as_ref().expect("checked Root owner");
+                let carried_wait = self.inherited_for_session(session).cloned();
+                let (publish, slot) = capture_root_publication(publish.clone());
+                let mut candidate = session.clone();
                 self.storage
-                    .save_runtime_with_inherited_child_wait(
-                        session,
-                        self.inherited_for_session(session)
-                            .expect("bound provenance"),
-                        false,
-                        self.root_actor_writer.clone(),
-                        input.cloned(),
+                    .save_finalized_root_actor_runtime(
+                        owner,
+                        &mut candidate,
+                        carried_wait.as_ref(),
+                        publish,
                     )
                     .await
+                    .and_then(|()| adopt_root_publication(session, &slot))
+            } else if inherited.is_none() && self.inherited_for_session(session).is_some() {
+                let inherited = self
+                    .inherited_for_session(session)
+                    .expect("bound provenance");
+                if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
+                    let (publish, slot) = capture_root_publication(publish.clone());
+                    let mut candidate = session.clone();
+                    self.storage
+                        .save_runtime_with_inherited_child_wait(
+                            &mut candidate,
+                            inherited,
+                            false,
+                            Some((owner.clone(), publish)),
+                            input.cloned(),
+                        )
+                        .await
+                        .and_then(|()| adopt_root_publication(session, &slot))
+                } else {
+                    self.storage
+                        .save_runtime_with_inherited_child_wait(
+                            session,
+                            inherited,
+                            false,
+                            None,
+                            input.cloned(),
+                        )
+                        .await
+                }
             } else if let Some((inbox, claim)) = input {
                 let (owner, publish) = self.root_actor_writer.as_ref().ok_or_else(|| {
                     std::io::Error::other("Root input checkpoint requires a bound writer")
                 })?;
+                let (publish, slot) = capture_root_publication(publish.clone());
                 self.storage
-                    .save_root_actor_input(owner, session, inbox.clone(), claim, publish.clone())
+                    .save_root_actor_input(owner, session, inbox.clone(), claim, publish)
                     .await
+                    .and_then(|()| adopt_root_publication(session, &slot))
             } else if let Some(inherited) = inherited {
-                self.storage
-                    .save_inherited_child_wait_finalized(
-                        session,
-                        inherited,
-                        self.root_actor_writer.clone(),
-                    )
-                    .await
+                if let Some((owner, publish)) = self.root_actor_writer.as_ref() {
+                    let (publish, slot) = capture_root_publication(publish.clone());
+                    let mut candidate = session.clone();
+                    self.storage
+                        .save_inherited_child_wait_finalized(
+                            &mut candidate,
+                            inherited,
+                            Some((owner.clone(), publish)),
+                        )
+                        .await
+                        .and_then(|()| adopt_root_publication(session, &slot))
+                } else {
+                    self.storage
+                        .save_inherited_child_wait_finalized(session, inherited, None)
+                        .await
+                }
             } else {
                 self.save_runtime_snapshot(session, false).await
             };
@@ -1279,7 +1493,11 @@ impl LockedSessionStore {
         if may_publish_runtime_result(&result) {
             *original = candidate;
             if result.is_ok() || publish_on_failure {
-                publish(original);
+                // Some backends implement runtime-only save as a full save;
+                // preserve their candidate and the caller's Session. Only the
+                // synchronous publication view omits Main-only outcome facts.
+                let publication = RuntimeOutcomePublication::new(original);
+                publish(&*publication.session);
             }
         }
         result
@@ -1863,7 +2081,13 @@ impl LockedSessionStore {
                 .insert(0, bamboo_domain::Message::system(prompt));
         }
         let mut result = self
-            .save_session_rebasing_task_conflicts_with_input(session, input.as_ref(), None, None)
+            .save_session_rebasing_task_conflicts_with_input(
+                session,
+                input.as_ref(),
+                None,
+                None,
+                false,
+            )
             .await;
         for _ in 0..MAX_TASK_CONTROL_PLANE_REBASE_RETRIES {
             if !result
@@ -1895,6 +2119,7 @@ impl LockedSessionStore {
                     input.as_ref(),
                     None,
                     None,
+                    false,
                 )
                 .await;
         }
@@ -2140,6 +2365,7 @@ impl LockedSessionStore {
 
         if let Some(latest) = latest.as_ref() {
             adopt_durable_actor_parent_question_handoff(session, latest)?;
+            adopt_durable_supervised_outcomes(session, latest)?;
             if finalize_child_wait {
                 if let Some(registered_at) = adopt_finalized_child_wait(session, latest, false) {
                     preserve_finalized_hidden_child_resumes(session, latest, registered_at);
@@ -2174,6 +2400,7 @@ impl LockedSessionStore {
                 None,
                 inherited,
                 startup_expected,
+                finalize_child_wait,
             )
             .await;
         if may_publish_runtime_result(&result) {
@@ -2538,6 +2765,7 @@ impl LockedSessionStore {
                 None,
                 None,
                 Some(expected),
+                false,
             )
             .await?;
         } else {
@@ -3861,6 +4089,61 @@ mod tests {
     use crate::v2::{RuntimeTaskTransactionFault, SessionStoreV2};
     use bamboo_domain::{session::types::Session, PermissionMode};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    #[test]
+    fn root_publication_requires_one_owner_checked_committed_snapshot() {
+        let mut runner = Session::new("capture-root", "synthetic-model");
+        let mut committed = runner.clone();
+        committed.add_message(bamboo_domain::Message::user("durable input"));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let publisher: bamboo_domain::RootActorRuntimePublisher = Arc::new(move |_| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        let (callback, slot) = capture_root_publication(publisher.clone());
+        callback(&committed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        adopt_root_publication(&mut runner, &slot).unwrap();
+        assert_eq!(runner.messages.len(), 1);
+        assert_eq!(runner.messages[0].id, committed.messages[0].id);
+
+        let (_, empty) = capture_root_publication(publisher.clone());
+        let error = adopt_root_publication(&mut runner, &empty).unwrap_err();
+        assert!(!may_publish_runtime_result(&Err(error)));
+
+        let (callback, duplicate) = capture_root_publication(publisher);
+        callback(&committed);
+        callback(&committed);
+        let error = adopt_root_publication(&mut runner, &duplicate).unwrap_err();
+        assert!(!may_publish_runtime_result(&Err(error)));
+    }
+
+    #[test]
+    fn runtime_only_publication_restores_main_outcomes_after_callback_panics() {
+        let mut session = Session::new("outcome-publication", "synthetic-model");
+        let outcomes =
+            bamboo_domain::SupervisedRootOutcomes::new(&session.id, session.created_at).unwrap();
+        session
+            .runtime_metadata
+            .get_or_insert_with(Default::default)
+            .supervised_root_outcomes = Some(outcomes.clone());
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let publication = RuntimeOutcomePublication::new(&mut session);
+            assert!(publication
+                .session
+                .runtime_metadata
+                .as_ref()
+                .unwrap()
+                .supervised_root_outcomes
+                .is_none());
+            panic!("synthetic callback failure");
+        }));
+        assert!(result.is_err());
+        assert_eq!(
+            session.runtime_metadata.unwrap().supervised_root_outcomes,
+            Some(outcomes)
+        );
+    }
 
     #[tokio::test]
     async fn scoped_unknown_checkpoint_cannot_enter_generic_merge_or_publish_callbacks() {

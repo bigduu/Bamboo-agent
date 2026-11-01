@@ -279,6 +279,43 @@ async fn verified_bytes(
     Ok(bytes)
 }
 
+/// Select the accepted receipt that describes the bytes actually installed.
+///
+/// `connectors` is a list of accepted *receipts*, not one row per version: a
+/// release can be re-cut under the same version (Nova v0.3.1 was republished on
+/// 2026-10-25), and an existing install keeps the digests of the bytes it
+/// originally fetched. Matching on version alone therefore breaks installs
+/// whenever an additional receipt is accepted, and picking the newest receipt
+/// for an old install would verify the wrong manifest/executable.
+///
+/// The install record's own pinned digest is authoritative, so prefer the
+/// receipt whose `bundle_sha256` it records. When no receipt matches, fall back
+/// to a lone same-version receipt so the existing validation can still report
+/// the mismatch itself (it re-checks the installed digest).
+fn receipt_for<'a>(catalog: &'a Catalog, entry: &InstalledPlugin) -> Option<&'a ConnectorRelease> {
+    let installed = match &entry.source {
+        PluginSource::Url {
+            sha256: Some(hash), ..
+        } => hash,
+        _ => return None,
+    };
+    catalog
+        .connectors
+        .iter()
+        .find(|release| {
+            release.version == entry.version
+                && release.bundle_sha256.eq_ignore_ascii_case(installed)
+        })
+        .or_else(|| {
+            let mut same_version = catalog
+                .connectors
+                .iter()
+                .filter(|release| release.version == entry.version);
+            let only = same_version.next()?;
+            same_version.next().is_none().then_some(only)
+        })
+}
+
 async fn validated_cli(
     state: &AppState,
     entry: &InstalledPlugin,
@@ -745,11 +782,7 @@ async fn inspect_locked(
         } else {
             "unverified_install"
         });
-        if let Some(release) = catalog
-            .connectors
-            .iter()
-            .find(|release| release.version == entry.version)
-        {
+        if let Some(release) = receipt_for(catalog, entry) {
             connector.reason =
                 trust_reason(&config.plugin_trust, &release.bundle_url).or(connector.reason);
             let eligible_abi = matches!(
@@ -772,11 +805,7 @@ async fn inspect_locked(
     if host.supported {
         capability.reason = connector.reason;
         if let (Some(binary), Some(entry)) = (&command, entry) {
-            let legacy = catalog
-                .connectors
-                .iter()
-                .find(|r| r.version == entry.version)
-                .is_some_and(|r| r.legacy_cli);
+            let legacy = receipt_for(catalog, entry).is_some_and(|r| r.legacy_cli);
             match run_cli(
                 binary,
                 &["app".into(), "status".into()],

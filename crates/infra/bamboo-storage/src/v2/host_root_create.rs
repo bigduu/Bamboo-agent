@@ -10,6 +10,9 @@ use bamboo_domain::{
 /// observations have been checked under the complete physical authority set.
 pub(crate) struct HostCreatedRootDeliveryGuards {
     pub(crate) inbox_dir: PathBuf,
+    pub(crate) caller: SessionCallerReference,
+    pub(crate) target_id: String,
+    pub(crate) target_created_at: chrono::DateTime<Utc>,
     _authority: super::host_session_scope::HostScopedSessionGuards,
 }
 
@@ -130,6 +133,9 @@ impl SessionStoreV2 {
             inbox_dir: self
                 .abs_path_from_rel(&Self::root_rel_path(&candidate.id))
                 .join("inbox"),
+            caller: caller.clone(),
+            target_id: candidate.id.clone(),
+            target_created_at: candidate.created_at,
             _authority: authority,
         })
     }

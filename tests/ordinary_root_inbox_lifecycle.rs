@@ -54,9 +54,15 @@ struct Probe {
     release_root: tokio::sync::watch::Sender<bool>,
 }
 
+/// The held provider boundary is released explicitly by the test, so this is
+/// only a safety net. It must outlast a full Root/Child lease lapse (60s) plus
+/// the bounded recovery that follows, otherwise the fixture aborts the held
+/// response while the test is still waiting out the real lease.
+const HOLD_BUDGET: Duration = Duration::from_secs(180);
+
 async fn released(sender: &tokio::sync::watch::Sender<bool>) {
     let mut receiver = sender.subscribe();
-    tokio::time::timeout(Duration::from_secs(60), async {
+    tokio::time::timeout(HOLD_BUDGET, async {
         while !*receiver.borrow_and_update() {
             receiver.changed().await.unwrap();
         }
@@ -584,8 +590,32 @@ impl Fixture {
             .unwrap()
     }
 
+    /// Recovery can only proceed once the stopped Host's real Root lease lapses.
+    /// Derive the budget from the lease that Host actually claimed so a
+    /// lease-length change widens the wait instead of truncating the proof.
+    fn recovery_budget(&self) -> Duration {
+        let authority = self
+            .data
+            .join("sessions")
+            .join(ROOT_ID)
+            .join("actor-authority.json");
+        let remaining = std::fs::read(&authority)
+            .ok()
+            .and_then(|bytes| {
+                serde_json::from_slice::<bamboo_domain::ActorDirectoryEntry>(&bytes).ok()
+            })
+            .and_then(|entry| entry.activation)
+            .and_then(|activation| {
+                (activation.lease_expires_at - chrono::Utc::now())
+                    .to_std()
+                    .ok()
+            })
+            .unwrap_or_default();
+        remaining + Duration::from_secs(30)
+    }
+
     async fn wait(&mut self, reason: &str, predicate: impl Fn(&Session) -> bool) -> Session {
-        let result = tokio::time::timeout(Duration::from_secs(30), async {
+        let result = tokio::time::timeout(self.recovery_budget(), async {
             loop {
                 assert!(
                     self.host.as_mut().unwrap().0.try_wait().unwrap().is_none(),

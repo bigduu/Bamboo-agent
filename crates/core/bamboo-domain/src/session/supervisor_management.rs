@@ -13,6 +13,8 @@ pub const SUPERVISOR_OBSERVER_SCHEMA_VERSION: u32 = 2;
 pub const SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION: u32 = 3;
 pub const SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION: u32 = 4;
 pub const SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION: u32 = 4;
+/// Observer outcome positions are committed with the existing receipt cursor.
+pub const SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION: u32 = 5;
 pub const MAX_SUPERVISOR_OBSERVERS: usize = 8;
 pub const MAX_SUPERVISOR_OBSERVER_TARGETS: usize = 8;
 pub const MAX_SUPERVISOR_PROJECTS: usize = 64;
@@ -117,6 +119,7 @@ impl SupervisorManagementState {
                 | SUPERVISOR_OBSERVER_SCHEMA_VERSION
                 | SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION
                 | SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION
+                | SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION
         ) || (self.schema_version == SUPERVISOR_MANAGEMENT_SCHEMA_VERSION
             && !self.observers.is_empty())
             || (self.schema_version < SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION
@@ -186,6 +189,45 @@ impl SupervisorManagementState {
                 .get(id)
                 .ok_or("subscription has no Observer registration")?;
             subscription.validate()?;
+            if subscription
+                .window
+                .root_outcome_cursors
+                .iter()
+                .any(|(target, cursor)| {
+                    registration
+                        .target_links
+                        .get(target)
+                        .is_none_or(|link| link.target_created_at != cursor.root_created_at)
+                })
+                || subscription
+                    .window
+                    .history
+                    .iter()
+                    .chain(subscription.window.pending.iter())
+                    .any(|change| {
+                        change.root_outcome.as_ref().is_some_and(|position| {
+                            registration
+                                .target_links
+                                .get(&change.target_session_id)
+                                .is_none_or(|link| {
+                                    link.target_created_at != position.root_created_at
+                                })
+                        })
+                    })
+            {
+                return Err("Observer Root outcome lifetime differs from registration");
+            }
+            if self.schema_version < SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION
+                && (!subscription.window.root_outcome_cursors.is_empty()
+                    || subscription
+                        .window
+                        .history
+                        .iter()
+                        .chain(subscription.window.pending.iter())
+                        .any(|change| change.root_outcome.is_some()))
+            {
+                return Err("Observer Root outcomes require schema 5");
+            }
             if let Some(fault) = &subscription.terminal_fault {
                 if self.schema_version < SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION {
                     return Err("terminal Observer diagnostic requires schema 4");
@@ -204,6 +246,7 @@ impl SupervisorManagementState {
                 .window
                 .enqueued_fingerprints
                 .keys()
+                .chain(subscription.window.root_outcome_cursors.keys())
                 .chain(
                     subscription
                         .window
