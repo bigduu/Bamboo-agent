@@ -92,7 +92,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // compression library counts content pages against the dispatch cap; the
 // test-utils diagnostic records each read attempt. No additive feature-only
 // cases were added. Actual compact/actor integration targets stay in agent-tests-0.
-const FEATURE_SOURCE_SHA256 = "e93089775d4918e340a36e8be4ffa3ca11bfe490bbbe7e86e161044289d6a0dc";
+// The llm_retry policy work (PR #2429) touches bamboo-config/src/config.rs with
+// unconditional validation tests only: no feature cfg, new owner, or additive
+// feature-only case changed; the 20 explicit additive cases and four contexts
+// remain unchanged.
+const FEATURE_SOURCE_SHA256 = "ac3c34883c429b8258d74bd35920bddb07cf5b0b42258cf24d9c25f6202d63ac";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

@@ -9,20 +9,29 @@ was unreceived.
 ## Finite automatic default
 
 The default is six total HTTP attempts (one initial request and five retries).
-Anthropic shares a 120-second total budget across its compatibility fallbacks;
-each headers attempt has a 20-second deadline. This doubles the previous
-60-second allowance while keeping ordinary interactive execution finite. The
-count remains a ceiling: elapsed time or a long server hint may stop it sooner.
+Anthropic shares a 600-second total budget across its compatibility fallbacks;
+each headers attempt has a 180-second deadline. The count remains a ceiling:
+elapsed time or a long server hint may stop it sooner, so a 600-second budget
+carries roughly three full-length attempts rather than six.
+
+A headers deadline is a discard decision, not a wait limit: on expiry the whole
+request body is dropped and sent again. Deadlines therefore have to clear real
+first-byte latency, not the median. Prompts carrying several hundred thousand
+tokens, and gateways that queue one request behind another, routinely take tens
+of seconds to return headers and can take minutes. A short deadline turns those
+requests into repeated resends of the same large body and then a terminal
+failure that a manual retry would have completed.
 Other built-in providers using the shared HTTP driver apply finite headers and per-send time limits. Copilot model POSTs use the same policy while model discovery retains its existing transport contract. Successful streams retain their independent stream watchdog.
 
-Operator environment settings are read once at first use, so changing them
-requires a later normal process start. This feature does not edit live settings.
+Operator environment settings seed the policy at first use. The persisted
+configuration below is authoritative once published, so the environment only
+matters for deployments that never write it.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `BAMBOO_LLM_MAX_RETRIES` | `5` | Retries after the initial attempt; `0` means one attempt. Anthropic no longer silently clamps this setting to four total attempts. |
-| `BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS` | `120000` | Managed initial-request budget, shared across Anthropic fallbacks and per send for other providers; positive values up to 3600000 ms. |
-| `BAMBOO_LLM_RETRY_ATTEMPT_TIMEOUT_MS` | `20000` | Initial headers deadline; positive values up to 60000 ms. |
+| `BAMBOO_LLM_RETRY_TOTAL_BUDGET_MS` | `600000` | Managed initial-request budget, shared across Anthropic fallbacks and per send for other providers; positive values up to 3600000 ms. |
+| `BAMBOO_LLM_RETRY_ATTEMPT_TIMEOUT_MS` | `180000` | Initial headers deadline; positive values up to 600000 ms. A value below the real first-byte latency converts one slow response into repeated resends. |
 | `BAMBOO_LLM_RETRY_BASE_DELAY_MS` | `500` | Exponential backoff base. |
 | `BAMBOO_LLM_RETRY_MAX_DELAY_MS` | `30000` | Cap on computed backoff, with jitter. |
 
@@ -30,6 +39,38 @@ Invalid new duration settings retain finite defaults. Retry-After supports
 seconds and HTTP dates. It is a minimum wait and is never shortened to the
 computed backoff cap or to fit a remaining total budget. Finite mode stops when
 the required delay cannot fit; explicit continuous mode waits cancellably.
+
+## Persisted policy (`core.json` → `llm_retry`)
+
+The same policy is a first-class configuration section, so operators change it
+from the settings page instead of an environment variable plus a restart:
+
+```json
+{
+  "llm_retry": {
+    "max_attempts": 8,
+    "attempt_timeout_ms": 180000,
+    "total_budget_ms": 900000,
+    "base_delay_ms": 500,
+    "max_delay_ms": 30000
+  }
+}
+```
+
+It is written through the ordinary section endpoint
+(`PUT /api/v1/bamboo/config/sections/core` with `expected_revision`), which keeps
+every other `core` field intact. Accepted ranges are `max_attempts` 1–12,
+`attempt_timeout_ms` 1000–600000, `total_budget_ms` 1000–3600000, and
+`base_delay_ms`/`max_delay_ms` 1–300000 with `base_delay_ms <= max_delay_ms`. An
+out-of-range value is rejected at the API boundary; a value that fails to load is
+reported and the previous policy stays active rather than silently widening the
+loop.
+
+The policy is published to the provider layer at startup and again after every
+applied configuration change, so an accepted edit governs the next request —
+including for sessions already running. Providers read one immutable snapshot per
+request, so a concurrent change cannot split one attempt's budget from its
+deadline.
 
 ## Explicit per-execution continuous mode
 

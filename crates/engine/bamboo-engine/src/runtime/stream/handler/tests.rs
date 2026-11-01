@@ -1064,6 +1064,57 @@ async fn stalled_stream_bootstrap_times_out_before_response_headers() {
     assert!(timeout.last_http_retry().is_none());
 }
 
+/// A managed headers attempt owns its own deadline. Configuring that deadline
+/// above `transport_idle_timeout_secs` must not let the outer bootstrap
+/// watchdog fabricate a timeout for a request that is still legitimately in
+/// flight: the deadline being raised is what makes slow first-byte routes
+/// survivable in the first place.
+#[tokio::test]
+async fn managed_headers_attempt_may_outlive_the_transport_idle_deadline() {
+    use std::sync::Arc;
+
+    use bamboo_llm::retry::{
+        observe_initial_http_retries, send_provider_request, InitialHttpRetryObserver, RetryConfig,
+    };
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::await_stream_bootstrap_observed;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(2_500)))
+        .mount(&server)
+        .await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/chat/completions", server.uri());
+    let retry_config = RetryConfig {
+        max_attempts: 1,
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(5),
+    };
+    // A one-second transport idle deadline, far below the 2.5s managed send.
+    let context = timeout_context(1, 20, 20).begin_request();
+    let observer = Arc::new(InitialHttpRetryObserver::default());
+
+    let result = await_stream_bootstrap_observed(
+        observe_initial_http_retries(observer.clone(), async {
+            send_provider_request(&retry_config, "test", || client.post(&url)).await
+        }),
+        &CancellationToken::new(),
+        "session-managed-bootstrap-outlives-idle",
+        &context,
+        observer,
+    )
+    .await;
+
+    match result {
+        Ok(Ok(response)) => assert!(response.status().is_success()),
+        Ok(Err(error)) => panic!("managed send failed: {error:?}"),
+        Err(error) => panic!("the outer watchdog must defer to the managed policy: {error:?}"),
+    }
+}
+
 #[tokio::test]
 async fn rate_limited_bootstrap_timeout_keeps_the_observed_http_status() {
     use wiremock::matchers::method;

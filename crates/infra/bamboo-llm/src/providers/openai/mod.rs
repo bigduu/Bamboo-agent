@@ -342,7 +342,7 @@ impl OpenAIProvider {
         // returned body is unread, so SSE streaming below is unaffected.
         let responses_url = format!("{}/responses", self.base_url);
         let response =
-            crate::retry::send_provider_request(crate::retry::global(), "OpenAI", || {
+            crate::retry::send_provider_request(&crate::retry::global(), "OpenAI", || {
                 self.client
                     .post(&responses_url)
                     .headers(headers.clone())
@@ -411,7 +411,7 @@ impl OpenAIProvider {
                 let fallback_headers =
                     self.build_headers(request_overrides::ENDPOINT_RESPONSES, Some(model))?;
                 let fallback =
-                    crate::retry::send_provider_request(crate::retry::global(), "OpenAI", || {
+                    crate::retry::send_provider_request(&crate::retry::global(), "OpenAI", || {
                         self.client
                             .post(&responses_url)
                             .headers(fallback_headers.clone())
@@ -727,7 +727,7 @@ impl LLMProvider for OpenAIProvider {
         // returned body is unread, so SSE streaming below is unaffected.
         let chat_url = format!("{}/chat/completions", self.base_url);
         let response =
-            crate::retry::send_provider_request(crate::retry::global(), "OpenAI", || {
+            crate::retry::send_provider_request(&crate::retry::global(), "OpenAI", || {
                 self.client
                     .post(&chat_url)
                     .headers(headers.clone())
