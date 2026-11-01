@@ -550,6 +550,47 @@ impl OwnedFilesystem {
 
 /// The exact owned lease cannot be dispatched without its actual mutation scope.
 pub(super) enum AckAuthority<'a> {
+    /// Pre-owned ACK surface: deliberately path-based, without an anchor.
+    ///
+    /// The legacy `ack` entry point (`SessionInbox::ack`) never constructs an
+    /// [`OwnedFilesystem`], so this variant has no anchored directory handle to
+    /// dispatch `create_dir`/`write`/`remove` through. Threading one in would
+    /// change the authority signature and ripple through every legacy call
+    /// site, so the enum keeps the raw-path behavior here by design; callers
+    /// that do hold an `OwnedFilesystem` must use [`AckAuthority::ScopedLegacy`]
+    /// or [`AckAuthority::Owned`] instead.
+    ///
+    /// Residual risk (#2423): these operations resolve the `admitted/` receipt
+    /// path by name, so a symlink on that path can redirect the receipt write
+    /// outside the Inbox. The no-follow guarantee below covers the lock
+    /// acquisition moment only; both swap scenarios around it stay residual:
+    ///
+    /// * Mitigated at acquisition time only — the sole caller must already
+    ///   hold the Inbox operation lock, and `lock_operation` resolves it via
+    ///   `InboxAnchor::acquire`, which opens the Inbox directory and the
+    ///   `.session-inbox.lock` name with no-follow semantics: if either name
+    ///   is a link at the moment it is opened, acquisition fails closed. That
+    ///   is the full extent of the guarantee — `lock_file` retains only the
+    ///   lock descriptor and never re-validates the Inbox pathname afterwards.
+    ///   The legacy ACK path is also rejected outright once the owned Inbox
+    ///   mode is enabled.
+    ///
+    /// * Residual — a pre-planted `inbox/admitted` child symlink that already
+    ///   points at an external directory: `create_dir_all` and
+    ///   `atomic_write` follow that link and write into the external
+    ///   directory, and the anchored lock does not stop them. Because the
+    ///   external directory usually holds no matching receipt, the write
+    ///   completes silently instead of failing closed.
+    ///
+    /// * Residual — a post-acquisition replacement of the Inbox directory
+    ///   itself: because `lock_file` holds only the lock descriptor, an
+    ///   external writer that ignores the advisory lock can, after lock
+    ///   acquisition (between the claim validation and this receipt publish),
+    ///   rename the Inbox directory away and swap a symlink in at the same
+    ///   name; the path-based `create_dir_all`/`atomic_write` here then
+    ///   resolve through that link and write outside the Inbox.
+    ///
+    /// #2423 records but does not fix these residual risks.
     Legacy,
     ScopedLegacy(&'a OwnedFilesystem),
     Owned {

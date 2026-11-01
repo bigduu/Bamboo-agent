@@ -2093,6 +2093,26 @@ impl FileSessionInbox {
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(canonical)))
     }
 
+    /// Legacy, path-resolved quarantine for malformed claims (#2421).
+    ///
+    /// Both the `create_dir_all(dir/corrupt)` and the `rename` below resolve
+    /// purely by path; this helper holds neither an `OwnedFilesystem` nor an
+    /// `InboxAnchor`, unlike the owned writer's `quarantine` used for the
+    /// same purpose in `queue_entries`.
+    ///
+    /// It stays path-based because both call sites — `valid_queue_entries`
+    /// and the malformed-claim arm of `claim_for_turn_selected` — serve the
+    /// legacy unowned Inbox path, where no `OwnedFilesystem` exists; anchoring
+    /// the move would change this signature and ripple through every caller.
+    ///
+    /// Existing mitigation: callers operate under `lock_operation`, whose
+    /// file lock is itself acquired via `anchor::InboxAnchor::acquire` and
+    /// opened relative to that handle, so only a holder of the anchored Inbox
+    /// lock can reach this code.
+    ///
+    /// Residual risk: `corrupt/` is re-resolved by path at quarantine time.
+    /// If it is replaced by a symlink, the corrupted claim is renamed outside
+    /// the expected quarantine directory.
     async fn quarantine_claim(
         dir: &Path,
         claim_path: &Path,
@@ -3036,6 +3056,20 @@ impl FileSessionInbox {
                 "owned Inbox claim API required".into(),
             ));
         }
+        // Legacy Mailbox bootstrapping: `Mailbox::ensure_dirs()` creates
+        // `new/`, `cur/` and `corrupt/` with path-based `create_dir_all`.
+        // It stays path-based on purpose: `Mailbox` is the generic type in
+        // `bamboo-subagent` and is unaware of Inbox anchor handles, so
+        // anchoring it here would change the public Mailbox API for every
+        // non-Inbox consumer. The surrounding claim path already mitigates
+        // this surface: the operation lock above was acquired through
+        // `InboxAnchor::acquire`, which creates the Inbox directory itself
+        // with a no-follow open (a link at the Inbox name fails closed) and
+        // resolves the lock name relative to that retained handle. Residual
+        // risk: the queue subdirectories under the anchored Inbox are not
+        // re-verified here; if `new/`, `cur/` or `corrupt/` is replaced by
+        // a symlink after the anchor is established, `create_dir_all`
+        // follows it and later queue reads trust the link target.
         let mailbox = Mailbox::at(&dir);
         mailbox
             .ensure_dirs()
@@ -3108,6 +3142,28 @@ impl FileSessionInbox {
             if claims.len() >= limit {
                 break;
             }
+            // Legacy claim rename (`new/` -> `cur/`), documented for #2420:
+            //
+            // This performs a bare `tokio::fs::rename(new_path, cur_path)` that
+            // resolves both entries by path at call time; it does not go through
+            // an anchored filesystem handle. Converting it to the anchored
+            // `OwnedFilesystem`/`InboxAnchor` API would change this function's
+            // signature and ripple through every legacy claim call site, which
+            // is out of scope for this issue.
+            //
+            // Existing mitigations (verified in this file): the caller holds the
+            // Inbox operation lock (`.session-inbox.lock`, acquired via
+            // `lock_operation` before the scan), and that lock file itself is
+            // opened through `InboxAnchor::acquire`, so a link planted at either
+            // the Inbox directory or lock name fails closed. Additionally, when
+            // the owned Inbox mode is enabled this whole legacy path is rejected
+            // (`owned_enabled` -> `InvalidClaim("owned Inbox claim API required")`).
+            //
+            // Residual risk: a concurrent actor that ignores the advisory lock
+            // can still swap the `new/` or `cur/` path components between lock
+            // acquisition and this rename, redirecting the move outside the
+            // canonical Inbox. Cooperating Bamboo processes are serialized by
+            // the lock; only lock-skipping external writers keep this window.
             let cur_path = dir.join("cur").join(&claim_id);
             if !already_claimed {
                 let new_path = dir.join("new").join(&claim_id);
