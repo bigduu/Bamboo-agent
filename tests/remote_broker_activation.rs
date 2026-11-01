@@ -4,8 +4,8 @@ use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_agent_core::storage::Storage;
 use bamboo_broker::{client_config_trusting_cert, BrokerClient};
 use bamboo_domain::{
-    ActorActivation, ActorActivationStatus, ActorDirectoryError, ActorDirectoryPort,
-    HostRegistryError, Session, WorkerSlotLease,
+    ActorActivation, ActorActivationStatus, ActorDirectoryEntry, ActorDirectoryError,
+    ActorDirectoryPort, HostRegistryError, Session, WorkerSlotLease,
 };
 use bamboo_storage::v2::{BrokerTerminalReceipt, FileHostRegistry};
 use bamboo_storage::SessionStoreV2;
@@ -234,6 +234,19 @@ async fn cold(data: &Path, id: &str) -> Session {
         .unwrap()
         .unwrap()
 }
+/// A killed Host's Root can only be replaced after its real activation lease
+/// lapses. Derive the wait budget from the lease that Host actually claimed so a
+/// lease-length change widens the proof instead of truncating it.
+fn lease_headroom(data: &Path, id: &str) -> Duration {
+    let authority = data.join("sessions").join(id).join("actor-authority.json");
+    let remaining = std::fs::read(&authority)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ActorDirectoryEntry>(&bytes).ok())
+        .and_then(|entry| entry.activation)
+        .and_then(|activation| (activation.lease_expires_at - Utc::now()).to_std().ok())
+        .unwrap_or_default();
+    remaining + Duration::from_secs(15)
+}
 async fn wait_child(data: &Path, id: &str, status: &str) -> Session {
     wait_child_after(data, id, status, SystemTime::UNIX_EPOCH).await
 }
@@ -307,7 +320,7 @@ async fn turn(client: &reqwest::Client, base: &str, p: &Probe, op: usize, target
             .status()
             .is_success());
     }
-    tokio::time::timeout(Duration::from_secs(45), async {
+    tokio::time::timeout(lease_headroom(&p.data, "remote-root"), async {
         loop {
             let root = cold(&p.data, "remote-root").await;
             let call_id = format!("remote-op-{number}");
