@@ -554,6 +554,48 @@ async fn removing_the_persisted_policy_clears_the_published_override() {
     assert_eq!(after_removal.max_attempts, previous_retry.max_attempts);
 }
 
+/// Resetting Core removes the saved policy, so it must clear the live override
+/// too. The reset transaction adopts its own revision, so the watcher does not
+/// repair this afterwards.
+#[tokio::test]
+async fn resetting_core_clears_the_published_retry_policy() {
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x67; 32]);
+    let _guard = policy_lock().lock().await;
+    let sink = request_sink().await;
+    let (_dir, state) = configured_state_inner(&sink.uri()).await;
+
+    let previous_retry = bamboo_llm::retry::global();
+    let previous_limits = bamboo_llm::retry::initial_request_limits();
+
+    let mut core = section(&state, SectionId::Core);
+    core.data["llm_retry"] = serde_json::json!({
+        "max_attempts": 7,
+        "attempt_timeout_ms": 200_000,
+        "total_budget_ms": 900_000,
+        "base_delay_ms": 500,
+        "max_delay_ms": 30_000,
+    });
+    state
+        .put_ordinary_section(SectionId::Core, core.revision, core.data)
+        .await
+        .unwrap();
+    assert_eq!(bamboo_llm::retry::global().max_attempts, 7);
+
+    let revision = section(&state, SectionId::Core).revision;
+    state
+        .reset_credential_backed_section(SectionId::Core, revision)
+        .await
+        .unwrap();
+
+    let after_reset = bamboo_llm::retry::global();
+    bamboo_llm::retry::configure(previous_limits, previous_retry);
+
+    assert_ne!(
+        after_reset.max_attempts, 7,
+        "resetting Core must not leave the saved policy active"
+    );
+}
+
 /// An out-of-range policy must be rejected before it is committed, so the API
 /// cannot report success for settings that requests would refuse to use.
 #[tokio::test]

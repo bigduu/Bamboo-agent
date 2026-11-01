@@ -4447,6 +4447,11 @@ impl AppState {
                 candidate.publish_env_vars();
             }
             *config.write().await = candidate.clone();
+            // A reset replaces Core with defaults, so it also removes any saved
+            // `llm_retry`. The reset transaction adopts its own revision, so the
+            // watcher will not clear the override afterwards: publish here or a
+            // removed policy would stay in force.
+            apply_llm_retry_policy(&candidate);
             if id != SectionId::ClusterFabric {
                 publish_exact_facade_events(&account_sink, &section_events)
                     .await
