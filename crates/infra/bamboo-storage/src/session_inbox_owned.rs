@@ -562,25 +562,35 @@ pub(super) enum AckAuthority<'a> {
     ///
     /// Residual risk (#2423): these operations resolve the `admitted/` receipt
     /// path by name, so a symlink on that path can redirect the receipt write
-    /// outside the Inbox. Two scenarios differ, and only the first is
-    /// mitigated:
+    /// outside the Inbox. The no-follow guarantee below covers the lock
+    /// acquisition moment only; both swap scenarios around it stay residual:
     ///
-    /// * Mitigated — a live replacement of the Inbox directory or of the
-    ///   `.session-inbox.lock` name: the sole caller must already hold the
-    ///   Inbox operation lock, which is acquired through an anchored directory
-    ///   handle and fails closed when that path is swapped, so a live swap
-    ///   cannot steer this path-based write. The legacy ACK path is also
-    ///   rejected outright once the owned Inbox mode is enabled.
+    /// * Mitigated at acquisition time only — the sole caller must already
+    ///   hold the Inbox operation lock, and `lock_operation` resolves it via
+    ///   `InboxAnchor::acquire`, which opens the Inbox directory and the
+    ///   `.session-inbox.lock` name with no-follow semantics: if either name
+    ///   is a link at the moment it is opened, acquisition fails closed. That
+    ///   is the full extent of the guarantee — `lock_file` retains only the
+    ///   lock descriptor and never re-validates the Inbox pathname afterwards.
+    ///   The legacy ACK path is also rejected outright once the owned Inbox
+    ///   mode is enabled.
     ///
-    /// * Not mitigated — a pre-planted `inbox/admitted` child symlink that
-    ///   already points at an external directory: `create_dir_all` and
+    /// * Residual — a pre-planted `inbox/admitted` child symlink that already
+    ///   points at an external directory: `create_dir_all` and
     ///   `atomic_write` follow that link and write into the external
     ///   directory, and the anchored lock does not stop them. Because the
     ///   external directory usually holds no matching receipt, the write
     ///   completes silently instead of failing closed.
     ///
-    /// This second scenario is the residual risk #2423 records but does not
-    /// fix.
+    /// * Residual — a post-acquisition replacement of the Inbox directory
+    ///   itself: because `lock_file` holds only the lock descriptor, an
+    ///   external writer that ignores the advisory lock can, after lock
+    ///   acquisition (between the claim validation and this receipt publish),
+    ///   rename the Inbox directory away and swap a symlink in at the same
+    ///   name; the path-based `create_dir_all`/`atomic_write` here then
+    ///   resolve through that link and write outside the Inbox.
+    ///
+    /// #2423 records but does not fix these residual risks.
     Legacy,
     ScopedLegacy(&'a OwnedFilesystem),
     Owned {
