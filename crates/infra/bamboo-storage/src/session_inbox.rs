@@ -2093,6 +2093,26 @@ impl FileSessionInbox {
         Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(canonical)))
     }
 
+    /// Legacy, path-resolved quarantine for malformed claims (#2421).
+    ///
+    /// Both the `create_dir_all(dir/corrupt)` and the `rename` below resolve
+    /// purely by path; this helper holds neither an `OwnedFilesystem` nor an
+    /// `InboxAnchor`, unlike the owned writer's `quarantine` used for the
+    /// same purpose in `queue_entries`.
+    ///
+    /// It stays path-based because both call sites — `valid_queue_entries`
+    /// and the malformed-claim arm of `claim_for_turn_selected` — serve the
+    /// legacy unowned Inbox path, where no `OwnedFilesystem` exists; anchoring
+    /// the move would change this signature and ripple through every caller.
+    ///
+    /// Existing mitigation: callers operate under `lock_operation`, whose
+    /// file lock is itself acquired via `anchor::InboxAnchor::acquire` and
+    /// opened relative to that handle, so only a holder of the anchored Inbox
+    /// lock can reach this code.
+    ///
+    /// Residual risk: `corrupt/` is re-resolved by path at quarantine time.
+    /// If it is replaced by a symlink, the corrupted claim is renamed outside
+    /// the expected quarantine directory.
     async fn quarantine_claim(
         dir: &Path,
         claim_path: &Path,
