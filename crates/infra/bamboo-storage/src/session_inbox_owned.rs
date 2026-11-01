@@ -550,6 +550,27 @@ impl OwnedFilesystem {
 
 /// The exact owned lease cannot be dispatched without its actual mutation scope.
 pub(super) enum AckAuthority<'a> {
+    /// Pre-owned ACK surface: deliberately path-based, without an anchor.
+    ///
+    /// The legacy `ack` entry point (`SessionInbox::ack`) never constructs an
+    /// [`OwnedFilesystem`], so this variant has no anchored directory handle to
+    /// dispatch `create_dir`/`write`/`remove` through. Threading one in would
+    /// change the authority signature and ripple through every legacy call
+    /// site, so the enum keeps the raw-path behavior here by design; callers
+    /// that do hold an `OwnedFilesystem` must use [`AckAuthority::ScopedLegacy`]
+    /// or [`AckAuthority::Owned`] instead.
+    ///
+    /// Residual risk (#2423): these operations resolve the `admitted/` receipt
+    /// path by name, so a symlink planted inside the Inbox directory can
+    /// redirect the receipt write outside the Inbox. Existing mitigations: the
+    /// sole caller must already hold the Inbox operation lock
+    /// `.session-inbox.lock`, which is itself acquired through an anchored
+    /// directory handle and fails closed on a swapped link, so redirecting
+    /// these writes requires replacing the Inbox directory and bypassing that
+    /// anchored lock; the legacy ACK path is also rejected outright once the
+    /// owned Inbox mode is enabled. The remaining window — a live directory
+    /// swap racing a legacy ACK between the anchored lock acquisition and this
+    /// path-based write — is a known residual risk tracked by #2423.
     Legacy,
     ScopedLegacy(&'a OwnedFilesystem),
     Owned {
