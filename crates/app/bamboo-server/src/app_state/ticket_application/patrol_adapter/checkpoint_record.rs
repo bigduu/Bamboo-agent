@@ -205,7 +205,7 @@ mod tests {
                         constraints: vec![],
                         acceptance: vec!["Review".into()],
                         user_acceptance_required: true,
-                        allowed_tools: BTreeSet::new(),
+                        allowed_tools: BTreeSet::from(["Task".into()]),
                     },
                     depends_on: BTreeSet::new(),
                 }],

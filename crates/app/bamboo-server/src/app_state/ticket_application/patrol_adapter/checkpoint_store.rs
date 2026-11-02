@@ -1,7 +1,7 @@
 //! Single-writer, CAS Host policy metadata. All actual file I/O lives here,
 //! outside orchestration/Ticket locks. Never stores Task/lease/stop/budget facts.
 
-use super::checkpoint_record::{self, NoticeSource};
+use super::checkpoint_record::NoticeSource;
 #[cfg(unix)]
 use bamboo_orchestration::patrol::checkpoint::{self, MAX_CHECKPOINT_BYTES};
 use bamboo_orchestration::patrol::{
