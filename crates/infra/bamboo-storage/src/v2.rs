@@ -7285,6 +7285,7 @@ impl SessionStoreV2 {
             false,
         )
         .await
+        .map(|_| ())
     }
 
     async fn save_session_after_lock_with_title_intent(
@@ -7294,7 +7295,7 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
         manual_title: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Session>> {
         reject_incompatible_session_write(session)?;
         if session
             .metadata
@@ -7652,7 +7653,7 @@ impl SessionStoreV2 {
             total_ms = total.as_millis() as u64,
             "session durable commit completed; search indexing deferred"
         );
-        Ok(())
+        Ok(manual_title.then(|| session.clone()))
     }
 }
 
@@ -7735,6 +7736,10 @@ impl Storage for SessionStoreV2 {
     }
 
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
+        self.save_manual_title_committed(session).await.map(|_| ())
+    }
+
+    async fn save_manual_title_committed(&self, session: &Session) -> io::Result<Session> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
@@ -7748,8 +7753,10 @@ impl Storage for SessionStoreV2 {
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
         let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
-        self.save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
-            .await
+        let committed = self
+            .save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
+            .await?;
+        Ok(committed.expect("manual-title transaction returns its committed candidate"))
     }
 
     async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {

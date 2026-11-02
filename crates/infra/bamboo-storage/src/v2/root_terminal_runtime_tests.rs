@@ -497,7 +497,15 @@ async fn root_terminal_scope_observation_survives_actor_refresh_without_project_
                 current.title_version += 1;
                 current.title_generated = false;
                 current.updated_at = Utc::now();
-                f.store.save_manual_title(&current).await.unwrap();
+                let committed = f.store.save_manual_title_committed(&current).await.unwrap();
+                f.store
+                    .validate_title_observations(&committed)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&committed).unwrap(),
+                    serde_json::to_value(f.current().await).unwrap()
+                );
             } else {
                 f.store.save_runtime_state(&current).await.unwrap();
             }

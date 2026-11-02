@@ -179,6 +179,13 @@ pub trait Storage: Send + Sync {
         self.save_session(session).await
     }
 
+    /// Return the exact candidate committed by the title transaction, including
+    /// backend-owned bookkeeping. Confirmation must still validate this value.
+    async fn save_manual_title_committed(&self, session: &Session) -> std::io::Result<Session> {
+        self.save_manual_title(session).await?;
+        Ok(session.clone())
+    }
+
     /// Validate a manual title before reporting success, including a no-op.
     /// Backends with Actor metadata observations must reread canonical state
     /// under their writer guards and reject stale or incomplete observations.
