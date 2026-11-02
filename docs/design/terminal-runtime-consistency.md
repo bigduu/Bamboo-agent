@@ -133,11 +133,13 @@ same attempt's diagnostic (#2470). Retired state and finish time remain. Root
 execution does not use the Child Host UUID admission protocol.
 
 A marked Child Host can still be persisting a question or suspension after its
-Worker finishes. A terminal Actor with a nonterminal Host phase remains unknown
+Worker finishes. A successful Actor with a nonterminal Host phase remains unknown
 without an exact committed Main Host terminal fact. For an unactivated Child,
 only matching bound Host UUID, birth, launch, input and runtime identity in Main
 can confirm its Host outcome. Readable Runtime after a failed Main write is not
-that proof. No Actor plus nonterminal state remains unknown. Conflicting live
+that proof. Failed/Cancelled are exact negative Actor facts; durable waits and
+pending input still take precedence. No Actor plus nonterminal state remains
+unknown. Conflicting live
 Actor/Host outcomes remain unknown; expiry cannot turn committed success or
 cancellation into failure.
 

@@ -443,13 +443,30 @@ async fn terminal_runtime_host_final_save_io_fault_reopens_to_trusted_outcome() 
                 .unwrap();
             drop(host);
             drop(store);
-            let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+            let reopened = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
             let current = reopened.load_session(&child.id).await.unwrap().unwrap();
-            reopened
+            let repaired = reopened
                 .reconcile_child_runtime(&current, Utc::now(), Some("restart"))
                 .await
-                .unwrap()
                 .unwrap();
+            if repaired.is_none() {
+                assert_eq!(outcome, ActorActivationFinish::Succeeded);
+                assert_eq!(file, "runtime.json");
+                assert_eq!(current.last_run_status().as_deref(), Some("running"));
+                // Actor success can also mean a suspension handoff. A failed
+                // first Host checkpoint is unknown until its real retry; it
+                // cannot be inferred into completed before that boundary.
+                let retry = crate::LockedSessionStore::new(reopened.clone());
+                final_snapshot.set_last_run_status(status);
+                final_snapshot.synchronize_terminal_runtime_status();
+                retry.merge_save_runtime(&mut final_snapshot).await.unwrap();
+                let current = reopened.load_session(&child.id).await.unwrap().unwrap();
+                reopened
+                    .reconcile_child_runtime(&current, Utc::now(), None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
             assert_terminal(&reopened, typed, status).await;
         }
     }

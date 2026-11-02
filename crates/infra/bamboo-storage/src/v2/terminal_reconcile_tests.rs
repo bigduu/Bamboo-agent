@@ -314,51 +314,69 @@ async fn terminal_repair_cannot_close_marked_host_before_its_real_wait_handoff()
 }
 
 #[tokio::test]
-async fn terminal_repair_runtime_after_replace_error_does_not_publish_before_real_retry() {
-    let (home, store, _, activation) = fixture(AgentStatusState::Initializing).await;
-    let authority = ActorWriteHook::install(
-        &store,
-        ACTOR_AUTHORITY_FILE,
+async fn terminal_repair_runtime_faults_do_not_publish_before_real_retry() {
+    for phase in [
+        DurableWritePhase::BeforeReplace,
         DurableWritePhase::AfterReplace,
-        true,
-    );
-    authority.release();
-    assert!(store
-        .finish_activation_observed(
-            &activation.fence(),
-            Utc::now(),
-            ActorActivationFinish::Failed
-        )
-        .await
-        .is_err());
-    let runtime = ActorWriteHook::install(
-        &store,
-        "runtime.json",
-        DurableWritePhase::AfterReplace,
-        true,
-    );
-    runtime.release();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let count = calls.clone();
-    let publish: bamboo_domain::storage::RootActorRuntimePublisher = Arc::new(move |_| {
-        count.fetch_add(1, Ordering::SeqCst);
-    });
-    let expected = store.load_session("terminal-child").await.unwrap().unwrap();
-    assert!(store
-        .reconcile_session_runtime(&expected, Utc::now(), None, publish.clone())
-        .await
-        .is_err());
-    assert_eq!(calls.load(Ordering::SeqCst), 0);
-    let bytes = fs::read(runtime_path(home.path())).await.unwrap();
-    let expected = store.load_session("terminal-child").await.unwrap().unwrap();
-    store
-        .reconcile_session_runtime(&expected, Utc::now(), None, publish)
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(calls.load(Ordering::SeqCst), 1);
-    assert!(runtime.reconfirmed() > 0);
-    assert_eq!(fs::read(runtime_path(home.path())).await.unwrap(), bytes);
-    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
-    assert_terminal(&reopened, AgentStatusState::Failed, "error").await;
+    ] {
+        let (home, store, _, activation) = fixture(AgentStatusState::Initializing).await;
+        let authority = ActorWriteHook::install(
+            &store,
+            ACTOR_AUTHORITY_FILE,
+            DurableWritePhase::AfterReplace,
+            true,
+        );
+        authority.release();
+        assert!(store
+            .finish_activation_observed(
+                &activation.fence(),
+                Utc::now(),
+                ActorActivationFinish::Failed
+            )
+            .await
+            .is_err());
+        let runtime = ActorWriteHook::install(&store, "runtime.json", phase, true);
+        runtime.release();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let publish: bamboo_domain::storage::RootActorRuntimePublisher = Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+        });
+        let expected = store.load_session("terminal-child").await.unwrap().unwrap();
+        assert!(store
+            .reconcile_session_runtime(&expected, Utc::now(), None, publish.clone())
+            .await
+            .is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let bytes = fs::read(runtime_path(home.path())).await.unwrap();
+        let expected = store.load_session("terminal-child").await.unwrap().unwrap();
+        let repaired = store
+            .reconcile_session_runtime(&expected, Utc::now(), None, publish.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let confirmed = fs::read(runtime_path(home.path())).await.unwrap();
+        if phase == DurableWritePhase::AfterReplace {
+            assert_eq!(confirmed, bytes);
+        } else {
+            assert_ne!(
+                confirmed, bytes,
+                "retry really commits the missing terminal state"
+            );
+        }
+        store
+            .reconcile_session_runtime(&repaired, Utc::now(), None, publish)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(runtime.reconfirmed() > 0);
+        assert_eq!(
+            fs::read(runtime_path(home.path())).await.unwrap(),
+            confirmed
+        );
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        assert_terminal(&reopened, AgentStatusState::Failed, "error").await;
+    }
 }

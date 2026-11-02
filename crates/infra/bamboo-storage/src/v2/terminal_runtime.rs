@@ -618,12 +618,16 @@ impl SessionStoreV2 {
         let activation = observed
             .as_ref()
             .and_then(|entry| entry.activation.as_ref());
-        if let Some(activation) = activation.filter(|a| !a.status.is_live()) {
+        if let Some(activation) =
+            activation.filter(|a| a.status == ActorActivationStatus::Succeeded)
+        {
             if latest.host_run_id().is_some() && chosen_status.is_none() {
-                // A Worker can finish before the Host persists a suspension or
-                // question handoff. The exact Host marker identifies this
+                // A successful Worker can hand off to a Host suspension or
+                // question. The exact Host marker identifies this
                 // in-flight phase; only its already committed Main terminal
-                // fact may close it. Actor completion alone cannot close it.
+                // fact may close it. Actor success alone cannot close it.
+                // Failed/Cancelled remain exact negative terminal facts, with
+                // durable waits excluded above, including after a failed repair.
                 let Some(outcome) = terminal_status(activation.status) else {
                     return Ok(None);
                 };
