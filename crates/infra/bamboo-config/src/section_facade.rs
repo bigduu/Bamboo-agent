@@ -5184,9 +5184,20 @@ impl SectionRegistry {
         &self,
         id: SectionId,
         expected_revision: u64,
-        candidate: Value,
+        mut candidate: Value,
     ) -> ConfigStoreResult<(ConfigSectionEvent, SectionEnvelope<Value>)> {
         validate_ordinary_section_json(&candidate)?;
+        if id == SectionId::ToolsSkills {
+            let current = self.tools_skills.snapshot();
+            if let Some(policy) = candidate.get_mut("plugin_trust") {
+                current.data.plugin_trust.prepare_update(policy)?;
+            } else if let Some(object) = candidate.as_object_mut() {
+                object.insert(
+                    "plugin_trust".into(),
+                    serde_json::to_value(&current.data.plugin_trust)?,
+                );
+            }
+        }
         macro_rules! commit {
             ($field:ident, $ty:ty) => {{
                 let typed: $ty = serde_json::from_value(candidate)?;

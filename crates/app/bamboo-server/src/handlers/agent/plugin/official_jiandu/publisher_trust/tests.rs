@@ -4,6 +4,244 @@ use actix_web::{test, App};
 use bamboo_config::{ConfigFacade, PluginTrustEnforcement};
 use serde_json::{json, Value};
 
+fn policy_change(state: &AppState, change: Value) -> Value {
+    json!({"expected_revision": snapshot(state).revision,
+        "expected_publishers": catalog_identity(), "change": change})
+}
+
+#[actix_web::test]
+async fn policy_mode_revoke_legacy_save_and_reviewed_restore_keep_one_cas_authority() {
+    let custom = json!({"label":"private", "algorithm":"ed25519", "public_key":"11".repeat(32)});
+    let (_dir, state) = legacy_state(
+        Some(json!([custom])),
+        json!(["github.com/bigduu/", "example.invalid/"]),
+    )
+    .await;
+    let before = snapshot(&state);
+    let memory_before = tree_bytes(&state.memory_store.data_dir());
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .service(web::scope("/api/v1").service(crate::routes::plugin_scope()))
+            .route(
+                "/sections/{section}/reset",
+                web::post().to(crate::handlers::settings::reset_typed_section),
+            ),
+    )
+    .await;
+    let report: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/plugins/publishers")
+            .to_request(),
+    )
+    .await;
+    assert_eq!(report["publisher_mode"], "explicit");
+    assert_eq!(snapshot(&state).revision, before.revision);
+    for (change, mode, trusted, revoked) in [
+        (
+            json!({"type":"set_mode", "publisher_mode":"follow_defaults"}),
+            "follow_defaults",
+            true,
+            false,
+        ),
+        (
+            json!({"type":"revoke", "publisher_id":"jiandu"}),
+            "follow_defaults",
+            false,
+            true,
+        ),
+        (
+            json!({"type":"set_mode", "publisher_mode":"explicit"}),
+            "explicit",
+            false,
+            true,
+        ),
+        (
+            json!({"type":"set_mode", "publisher_mode":"follow_defaults"}),
+            "follow_defaults",
+            false,
+            true,
+        ),
+        (
+            json!({"type":"trust", "publisher_id":"jiandu"}),
+            "follow_defaults",
+            true,
+            false,
+        ),
+    ] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/plugins/publishers")
+                .set_json(policy_change(&state, change))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), 204);
+        let report: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/plugins/publishers")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(report["publisher_mode"], mode);
+        let jiandu = report["publishers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == "jiandu")
+            .unwrap();
+        assert_eq!(jiandu["trusted"], trusted);
+        assert_eq!(jiandu["revoked"], revoked);
+        assert_eq!(report["enforcement"], "strict");
+        assert_eq!(report["custom_key_count"], 1);
+        assert_eq!(
+            snapshot(&state).data.plugin_trust.trusted_hosts,
+            before.data.plugin_trust.trusted_hosts
+        );
+        assert!(!state.app_data_dir.join("plugins").exists());
+    }
+    // Legacy list-only save must select explicit, without erasing the deny record.
+    let mut candidate = snapshot(&state).data.clone();
+    candidate.plugin_trust.revoke_official_publisher("jiandu");
+    state
+        .put_ordinary_section(
+            SectionId::ToolsSkills,
+            snapshot(&state).revision,
+            serde_json::to_value(candidate).unwrap(),
+        )
+        .await
+        .unwrap();
+    state
+        .put_ordinary_section(
+            SectionId::ToolsSkills,
+            snapshot(&state).revision,
+            json!({"plugin_trust":{"trusted_keys":[]}}),
+        )
+        .await
+        .unwrap();
+    assert!(snapshot(&state)
+        .data
+        .plugin_trust
+        .effective_trusted_keys()
+        .is_empty());
+    assert!(snapshot(&state)
+        .data
+        .plugin_trust
+        .revoked_publishers
+        .contains_key("jiandu"));
+    let saved_policy = snapshot(&state).data.plugin_trust.clone();
+    let reset = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/sections/tools-skills/reset")
+            .set_json(json!({"expected_revision":snapshot(&state).revision}))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(reset.status(), 200);
+    assert_eq!(snapshot(&state).data.plugin_trust, saved_policy);
+    let reopened = ConfigFacade::open(&state.app_data_dir).unwrap();
+    assert_eq!(
+        reopened
+            .registry()
+            .tools_skills
+            .snapshot()
+            .data
+            .plugin_trust,
+        snapshot(&state).data.plugin_trust
+    );
+    assert_eq!(tree_bytes(&state.memory_store.data_dir()), memory_before);
+}
+
+#[actix_web::test]
+async fn policy_rejects_stale_revision_catalog_replacement_and_unknown_actions_without_writes() {
+    let (_dir, state) = legacy_state(Some(json!([])), json!(["github.com/bigduu/"])).await;
+    let before = snapshot(&state);
+    let bytes = tokio::fs::read(state.app_data_dir.join("tools-skills.json"))
+        .await
+        .unwrap();
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .service(web::scope("/api/v1").service(crate::routes::plugin_scope())),
+    )
+    .await;
+    let valid = policy_change(&state, json!({"type":"trust", "publisher_id":"jiandu"}));
+    let mut stale = valid.clone();
+    stale["expected_revision"] = json!(0);
+    let mut replaced = valid.clone();
+    replaced["expected_publishers"]["jiandu"] = json!("ed25519:00");
+    let mut unknown = valid.clone();
+    unknown["change"]["publisher_id"] = json!("arbitrary");
+    let mut extra = valid.clone();
+    extra["enforcement"] = json!("off");
+    let mut invalid = valid.clone();
+    invalid["change"] = json!({"type":"set_mode", "publisher_mode":null});
+    for (body, status) in [
+        (stale, 409),
+        (replaced, 400),
+        (unknown, 400),
+        (extra, 400),
+        (invalid, 400),
+    ] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/plugins/publishers")
+                .set_json(body)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(snapshot(&state).revision, before.revision);
+        assert_eq!(
+            tokio::fs::read(state.app_data_dir.join("tools-skills.json"))
+                .await
+                .unwrap(),
+            bytes
+        );
+    }
+}
+
+#[actix_web::test]
+async fn fixed_jiandu_adoption_can_restore_a_revoked_publisher_without_relaxing_enforcement() {
+    for mode in [PublisherMode::Explicit, PublisherMode::FollowDefaults] {
+        let (_dir, state) = legacy_state(Some(json!([])), json!(["github.com/bigduu/"])).await;
+        let mut candidate = snapshot(&state).data.clone();
+        candidate.plugin_trust.set_publisher_mode(mode);
+        candidate.plugin_trust.revoke_official_publisher("jiandu");
+        state
+            .put_ordinary_section(
+                SectionId::ToolsSkills,
+                snapshot(&state).revision,
+                serde_json::to_value(candidate).unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = trust_official_jiandu(
+            state.clone(),
+            web::Json(PublisherTrustRequest {
+                expected_revision: snapshot(&state).revision,
+                expected_public_key: JIANDU_PLUGIN_PUBLIC_KEY.into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 204);
+        let policy = snapshot(&state).data.plugin_trust.clone();
+        assert!(policy
+            .effective_trusted_keys()
+            .iter()
+            .any(|key| key.public_key == JIANDU_PLUGIN_PUBLIC_KEY));
+        assert!(!policy.revoked_publishers.contains_key("jiandu"));
+        assert_eq!(policy.enforcement, PluginTrustEnforcement::Strict);
+        assert_eq!(policy.publisher_mode, mode);
+    }
+}
+
 async fn legacy_state(
     keys: Option<Value>,
     hosts: Value,
@@ -68,7 +306,7 @@ fn tree_bytes(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 #[actix_web::test]
 async fn explicit_adoption_preserves_legacy_custom_and_empty_lists_and_survives_reload() {
     let old_keys: Vec<_> = PluginTrustConfig::default()
-        .trusted_keys
+        .effective_trusted_keys()
         .into_iter()
         .filter(|key| key.public_key != JIANDU_PLUGIN_PUBLIC_KEY)
         .collect();
@@ -128,7 +366,7 @@ async fn explicit_adoption_preserves_legacy_custom_and_empty_lists_and_survives_
         .await;
         assert_eq!(response.status(), 204);
         let mut expected = before.data.clone();
-        expected.plugin_trust.trusted_keys.push(publisher());
+        expected.plugin_trust.trust_official_publisher("jiandu");
         let after = snapshot(&state);
         assert_eq!(
             serde_json::to_value(&after.data).unwrap(),
@@ -178,7 +416,7 @@ async fn absent_key_field_keeps_reviewed_defaults_without_adoption() {
     assert!(before
         .data
         .plugin_trust
-        .trusted_keys
+        .effective_trusted_keys()
         .iter()
         .any(|key| key.public_key == JIANDU_PLUGIN_PUBLIC_KEY));
     assert_eq!(snapshot(&state).revision, before.revision);

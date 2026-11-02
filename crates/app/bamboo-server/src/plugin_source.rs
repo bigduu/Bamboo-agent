@@ -1878,7 +1878,8 @@ async fn fetch_manifest_bundle(
 
     // Layer 2: signature — a valid signature is a STRONGER integrity +
     // authenticity guarantee than a pasted checksum (see layer 3 below).
-    let signed_by = fetch_and_verify_signature(&client, url, &bytes, &trust.trusted_keys).await;
+    let signed_by =
+        fetch_and_verify_signature(&client, url, &bytes, &trust.effective_trusted_keys()).await;
     if signed_by.is_none() {
         if !allow_unsigned {
             return Err(PluginError::UnsignedOrUntrustedSignature(format!(

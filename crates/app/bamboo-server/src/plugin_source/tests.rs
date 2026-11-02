@@ -1874,6 +1874,8 @@ async fn valid_signature_from_a_trusted_key_verifies_and_supersedes_the_checksum
         .await;
 
     let trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
         enforcement: PluginTrustEnforcement::Strict,
@@ -1891,6 +1893,33 @@ async fn valid_signature_from_a_trusted_key_verifies_and_supersedes_the_checksum
     )
     .await
     .expect("a valid signature from a trusted key must satisfy the checksum requirement too");
+
+    // A captured revoked identity overrides a duplicate key, including a
+    // publisher no longer present in this application's current catalog.
+    let mut revoked = trust.clone();
+    revoked.revoked_publishers.insert(
+        "retired-fixture".into(),
+        [bamboo_config::publisher_key_id(&trust.trusted_keys[0])]
+            .into_iter()
+            .collect(),
+    );
+    for mode in [
+        bamboo_config::PublisherMode::Explicit,
+        bamboo_config::PublisherMode::FollowDefaults,
+    ] {
+        revoked.publisher_mode = mode;
+        let error = stage_plugin_source(
+            url_input_full(&url, None, false, true, false),
+            &plugins_root,
+            &revoked,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PluginError::UnsignedOrUntrustedSignature(_)
+        ));
+    }
 
     assert_eq!(staged.manifest.id, "hello-plugin");
     assert_eq!(
@@ -1925,6 +1954,8 @@ fn assert_signed_staging_survives_another_runtime_shutdown(allow_unsigned: bool)
     let signing_key = test_signing_key(7);
     let signature = hex::encode(signing_key.sign(manifest_body.as_bytes()).to_bytes());
     let trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
         enforcement: PluginTrustEnforcement::Strict,
@@ -2095,6 +2126,8 @@ async fn malformed_tampered_and_oversized_signatures_are_refused() {
         ),
     ];
     let trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
         enforcement: PluginTrustEnforcement::Strict,
@@ -2147,6 +2180,8 @@ async fn absent_signature_is_refused_with_unsigned_or_untrusted_signature() {
 
     let signing_key = test_signing_key(9);
     let trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
         enforcement: PluginTrustEnforcement::Strict,
@@ -2196,6 +2231,8 @@ async fn signature_from_a_non_trusted_key_is_refused() {
     // `trusted_keys` only has `other_key`'s pubkey — the bundle was signed by
     // `signing_key`, a DIFFERENT (non-trusted) key.
     let trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("other-key", &other_key)],
         enforcement: PluginTrustEnforcement::Strict,
@@ -2380,6 +2417,8 @@ async fn services_manifest_with_a_valid_trusted_signature_is_accepted() {
         .await;
 
     let trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: Vec::new(),
         trusted_keys: vec![trusted_key_for("test-key", &signing_key)],
         enforcement: PluginTrustEnforcement::Strict,
@@ -2515,6 +2554,8 @@ async fn signed_install_still_follows_a_redirect() {
     let signing_key = test_signing_key(11);
     let signature = signing_key.sign(manifest_body.as_bytes());
     let trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: PluginTrustConfig::default().trusted_hosts,
         trusted_keys: vec![trusted_key_for("test key", &signing_key)],
         enforcement: PluginTrustEnforcement::Strict,
@@ -2801,6 +2842,8 @@ async fn local_dir_install_ignores_a_hostile_trust_config() {
     // `PluginTrustConfig`) must have ZERO effect on a local install — proves
     // `stage_into`'s LocalDir arm never consults `trust` at all.
     let hostile_trust = PluginTrustConfig {
+        publisher_mode: bamboo_config::PublisherMode::Explicit,
+        revoked_publishers: Default::default(),
         trusted_hosts: Vec::new(),
         trusted_keys: Vec::new(),
         enforcement: PluginTrustEnforcement::Strict,
