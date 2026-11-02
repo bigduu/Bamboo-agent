@@ -43,6 +43,10 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
         .route("/jiandu/setup", web::get().to(agent::plugin::jiandu_setup))
+        .route(
+            "/official/jiandu/trust",
+            web::post().to(agent::plugin::trust_official_jiandu),
+        )
         .route("/nova/app", web::get().to(agent::plugin::nova_app))
         .route(
             "/nova/app/install",
