@@ -262,6 +262,58 @@ async fn terminal_repair_callback_holds_actual_guards_and_stale_a_cannot_replace
 }
 
 #[tokio::test]
+async fn terminal_repair_cannot_close_marked_host_before_its_real_wait_handoff() {
+    let (_home, store, child, activation) = fixture(AgentStatusState::Running).await;
+    store.begin_host_run(&child, "host-A").await.unwrap();
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    let mut in_flight = store.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(in_flight.last_run_status().as_deref(), Some("running"));
+    assert!(store
+        .reconcile_session_runtime(
+            &in_flight,
+            Utc::now() - chrono::Duration::hours(1),
+            None,
+            Arc::new(|_| panic!("unconfirmed Host terminal published"))
+        )
+        .await
+        .unwrap()
+        .is_none());
+    let state = in_flight.agent_runtime_state.as_mut().unwrap();
+    state.status = AgentStatusState::Suspended;
+    state.suspension = Some(SuspensionState {
+        reason: "awaiting_clarification".into(),
+        suspended_at: Utc::now(),
+        resumable: true,
+        hook_point: None,
+    });
+    in_flight.set_last_run_status("suspended");
+    store.save_session(&in_flight).await.unwrap();
+    let waiting = store.load_session(&child.id).await.unwrap().unwrap();
+    assert!(waiting.has_runtime_wait());
+    assert_eq!(
+        waiting.agent_runtime_state.as_ref().unwrap().status,
+        AgentStatusState::Suspended
+    );
+    assert!(store
+        .reconcile_session_runtime(
+            &waiting,
+            Utc::now(),
+            None,
+            Arc::new(|_| panic!("wait terminalized"))
+        )
+        .await
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test]
 async fn terminal_repair_runtime_after_replace_error_does_not_publish_before_real_retry() {
     let (home, store, _, activation) = fixture(AgentStatusState::Initializing).await;
     let authority = ActorWriteHook::install(

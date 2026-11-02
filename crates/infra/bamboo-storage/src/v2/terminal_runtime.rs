@@ -80,6 +80,23 @@ fn runtime_status(session: &Session) -> Option<AgentStatusState> {
         .map(|state| state.status)
 }
 
+pub(super) fn runtime_identity(session: &Session) -> io::Result<Option<String>> {
+    let legacy = session
+        .metadata
+        .get("agent.runtime.state")
+        .map(|raw| serde_json::from_str::<AgentRuntimeState>(raw))
+        .transpose()
+        .map_err(|_| conflict("runtime identity mirror is invalid"))?;
+    let typed = session.agent_runtime_state.as_ref();
+    if typed
+        .zip(legacy.as_ref())
+        .is_some_and(|(a, b)| a.run_id != b.run_id)
+    {
+        return Err(conflict("runtime identity mirror differs"));
+    }
+    Ok(typed.or(legacy.as_ref()).map(|state| state.run_id.clone()))
+}
+
 pub(super) fn idle_control_state(session: &Session) -> bool {
     runtime_status(session) == Some(AgentStatusState::Idle)
 }
@@ -525,6 +542,7 @@ impl SessionStoreV2 {
         super::super::reject_incompatible_session_write(&main)?;
         if main.id != latest.id
             || main.kind != SessionKind::Child
+            || latest.host_run_id().is_none()
             || main.created_at != latest.created_at
             || main.parent_session_id != latest.parent_session_id
             || main.parent_created_at != latest.parent_created_at
@@ -533,8 +551,7 @@ impl SessionStoreV2 {
             || !main.host_run_matches_launch()
             || main.child_launch_generation() != latest.child_launch_generation()
             || main.session_inbox_admission() != latest.session_inbox_admission()
-            || main.agent_runtime_state.as_ref().map(|s| &s.run_id)
-                != latest.agent_runtime_state.as_ref().map(|s| &s.run_id)
+            || runtime_identity(&main)? != runtime_identity(latest)?
             || main.check_conversation_generation(latest).is_err()
             || !main
                 .last_run_status()
@@ -601,6 +618,23 @@ impl SessionStoreV2 {
         let activation = observed
             .as_ref()
             .and_then(|entry| entry.activation.as_ref());
+        if let Some(activation) = activation.filter(|a| !a.status.is_live()) {
+            if latest.host_run_id().is_some() && chosen_status.is_none() {
+                // A Worker can finish before the Host persists a suspension or
+                // question handoff. The exact Host marker identifies this
+                // in-flight phase; only its already committed Main terminal
+                // fact may close it. Actor completion alone cannot close it.
+                let Some(outcome) = terminal_status(activation.status) else {
+                    return Ok(None);
+                };
+                if !self
+                    .confirm_child_host_terminal(&latest, outcome, &rel, &guards)
+                    .await?
+                {
+                    return Ok(None);
+                }
+            }
+        }
         if let Some(host) = chosen_status.as_deref().filter(|_| {
             activation.is_none()
                 || (source_run.is_some() && activation.is_some_and(|a| a.status.is_live()))

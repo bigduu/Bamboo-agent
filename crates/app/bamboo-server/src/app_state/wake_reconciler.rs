@@ -45,6 +45,7 @@ impl TerminalRecovery {
                 return Ok(());
             };
             let cache = self.cache.clone();
+            let selected = expected.clone();
             self.store
                 .reconcile_session_runtime(
                     &expected,
@@ -54,7 +55,7 @@ impl TerminalRecovery {
                         if let Some(cache) = &cache {
                             if saved.kind == SessionKind::Child {
                                 bamboo_engine::SessionRepository::publish_reconciled_child(
-                                    cache, saved,
+                                    cache, &selected, saved,
                                 );
                             } else {
                                 cache.insert(

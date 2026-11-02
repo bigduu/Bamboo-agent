@@ -4056,6 +4056,7 @@ impl ChildCompletionCoordinator {
             return;
         }
         let cache = self.sessions.clone();
+        let selected = child.clone();
         if let Err(repair_error) = self
             .storage
             .reconcile_session_runtime(
@@ -4063,7 +4064,7 @@ impl ChildCompletionCoordinator {
                 before,
                 Some("Child activation lease expired without confirmed Host completion"),
                 Arc::new(move |saved| {
-                    crate::SessionRepository::publish_reconciled_child(&cache, saved)
+                    crate::SessionRepository::publish_reconciled_child(&cache, &selected, saved)
                 }),
             )
             .await
