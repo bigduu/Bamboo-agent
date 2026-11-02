@@ -1307,7 +1307,9 @@ pub fn check_permissions(
         }
         "session_control" => {
             let action = required_string_arg(args, "action")?;
-            if action == "scope" {
+            // Read-only observations grant no execution authority. The Host
+            // still validates the original Supervisor and its observation scope.
+            if matches!(action, "scope" | "directory") {
                 return Ok(None);
             }
             if action == "observe_run" {
