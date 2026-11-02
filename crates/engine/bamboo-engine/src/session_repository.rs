@@ -96,7 +96,11 @@ impl SessionRepository {
             // Leave a vacant cache vacant: loading canonical Storage remains
             // correct, while a check-then-insert could replace a new birth.
             entry.update(|current| {
-                if current.created_at != saved.created_at
+                if current.id != saved.id
+                    || current.kind != saved.kind
+                    || current.root_session_id != saved.root_session_id
+                    || current.authority_identity != saved.authority_identity
+                    || current.created_at != saved.created_at
                     || current.parent_created_at != saved.parent_created_at
                     || current.parent_session_id != saved.parent_session_id
                     || current.project_id_meta() != saved.project_id_meta()
