@@ -74,7 +74,8 @@ impl Fixture {
             store.clone(),
             Arc::new(LockedSessionStore::new(store.clone())),
         )
-        .with_root_actor_directory(store);
+        .with_root_actor_directory(store)
+        .with_root_lease_override(Duration::from_secs(1));
         tokio::time::timeout(
             WAIT,
             repository.bind_root_actor_execution(&self.root, run_id),
@@ -105,7 +106,7 @@ impl Fixture {
             }
         })
         .await
-        .expect("the repository's actual 15 second Root lease expires");
+        .expect("the repository's short test Root lease expires");
     }
 }
 
