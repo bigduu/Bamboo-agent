@@ -477,6 +477,37 @@ fn root_id() -> String {
 }
 
 #[tokio::test]
+async fn terminal_runtime_native_preparation_refusal_does_not_create_ownerless_host_run() {
+    let home = tempfile::tempdir().unwrap();
+    let mut control = ProviderControl::new();
+    let harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    let child = harness.child("refused", "must not enter a provider").await;
+    let before = serde_json::to_value(
+        harness
+            .store
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    harness.runner.shutdown().await.unwrap();
+    let error = harness.launch(&child).await.unwrap_err();
+    assert!(error.contains("shutting down"), "{error}");
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let current = reopened.load_session(&child.id).await.unwrap().unwrap();
+    assert!(current.host_run_id().is_none());
+    assert_eq!(serde_json::to_value(&current).unwrap(), before);
+    assert!(matches!(
+        control.calls.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(lock(&harness.runner.executions).is_empty());
+    assert!(crate::execution::ChildCompletionSource::from_committed_session(&current).is_none());
+    harness.assert_no_worker_artifacts();
+}
+
+#[tokio::test]
 async fn production_local_task_completes_in_host_and_commits_history_before_parent_end() {
     let home = tempfile::tempdir().unwrap();
     let mut control = ProviderControl::new();
@@ -1168,8 +1199,7 @@ async fn production_local_restart_rejects_unknown_stop_without_relaunch_or_false
     let reopened = Harness::open(home.path(), &parent_id, control.provider.clone(), 1).await;
     let error = reopened.launch(&child).await.unwrap_err();
     assert!(
-        (error.contains("confirmed stop") && error.contains("blocked"))
-            || error.contains("another Actor attempt owns Host startup"),
+        error.contains("confirmed stop") && error.contains("blocked"),
         "{error}"
     );
     assert!(matches!(

@@ -494,13 +494,6 @@ async fn run_child_spawn_inner(
         .await;
         return Err(setup_error);
     }
-    if let Err(error) = ctx.agent.storage().begin_host_run(&session, &run_id).await {
-        let failure = Err(bamboo_agent_core::AgentError::LLM(error.to_string()));
-        finalize_runner_exact(&ctx.agent_runners, &session.id, &run_id, &failure).await;
-        execution_reservation.abandon().await;
-        return Err(error.to_string());
-    }
-    session.set_host_run_id(&run_id);
     // The native backend acquires its dedicated Actor writer before any
     // execution checkpoint. The legacy backend returns None and keeps its own
     // Worker-owned admission. Never silently retry a failed local bind remotely.
@@ -542,6 +535,13 @@ async fn run_child_spawn_inner(
     }
 
     let publish_running = async {
+        // Backend refusal has not started this Run. Bind only after successful
+        // preparation; a binding failure uses the existing exact pre-launch
+        // cleanup path below instead of leaving an ownerless running marker.
+        if let Err(error) = ctx.agent.storage().begin_host_run(&session, &run_id).await {
+            return (false, Err(error));
+        }
+        session.set_host_run_id(&run_id);
         // Publish the child's process-global workspace only after this task owns
         // both the exact runner slot and logical-session router. A rejected
         // cross-entry caller must not overwrite a live owner's tool root or
