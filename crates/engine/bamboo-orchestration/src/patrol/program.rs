@@ -106,7 +106,6 @@ impl ProgramPatrol {
             if service.published().map_err(|_| PortError::Unavailable)?.0 != commit {
                 return Err(PortError::Conflict.into());
             }
-            let work = snapshot.tickets.get(work_id).ok_or(PortError::Denied)?;
             if snapshot.project.links.get(work_id) != Some(selection.project_id) {
                 return Err(PortError::Denied.into());
             }

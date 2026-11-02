@@ -76,6 +76,8 @@ fixture runs the real native worker once, writes only a test receipt after
 canonical evidence exists, and exits before reopening that same disposable
 root. It verifies stable allowance identity, retained earlier incident, zero
 observer/provider calls, exact fencing and byte-identical Actor authority.
+The byte baseline follows exact runner/router finalization and a pure-read
+terminal Actor check; a canonical owned stop alone precedes that writer tail.
 The existing orchestration `patrol` target owns policy transition regressions;
 the server default library owns compact identity-helper negatives.
 

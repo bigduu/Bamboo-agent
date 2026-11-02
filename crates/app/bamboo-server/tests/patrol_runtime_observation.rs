@@ -2,7 +2,8 @@
 //! The same test is its own bounded child-process fixture; only the parent
 //! owns/removes the disposable root. No receipt/stop/Actor record is seeded.
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
-use bamboo_domain::{Storage, WorkspaceBinding};
+use bamboo_domain::WorkspaceBinding;
+use bamboo_engine::execution::AgentStatus;
 use bamboo_llm::LLMChunk;
 use bamboo_orchestration::patrol::{
     host as projection, program::ProgramPatrol, CheckpointPort, Clock, ObservationPort, Policy,
@@ -24,9 +25,10 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+#[macro_use]
 #[path = "common/native_work.rs"]
 mod native_work;
-use native_work::{execution_workspace, host, LocalProvider, MODEL, WAIT};
+use native_work::{execution_workspace, host, LocalProvider, CALL, RESULT, WAIT};
 
 const SEED: &str = "BAMBOO_PATROL_2469_SEED_ROOT";
 const CASE: &str = "native_question_wait_retains_incident_and_reopens_without_mutation";
@@ -42,7 +44,7 @@ fn now() -> u64 {
 }
 fn user() -> Principal {
     Principal::User {
-        user_id: "patrol-fixture-owner".into(),
+        user_id: "host-owner".into(),
     }
 }
 
@@ -98,7 +100,13 @@ async fn seed(root: &Path) {
         calls: AtomicUsize::new(0),
         max_requests: 1,
     });
-    let state = host(root, provider.clone()).await;
+    let state = actix_web::web::Data::new(host(root, provider.clone()).await);
+    let app = actix_web::test::init_service(
+        actix_web::App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::routes::configure_routes),
+    )
+    .await;
     let project = state
         .project_store
         .create("Patrol Question Project", None)
@@ -118,7 +126,7 @@ async fn seed(root: &Path) {
     let (service, authority) = state.tickets.authority(user()).await.unwrap();
     let contract = Contract {
         title: "Exact native patrol Question".into(),
-        objective: "Ask one precise owner question and yield without delivering the Work".into(),
+        objective: format!("Ask one precise owner question before producing '{RESULT}'"),
         constraints: vec!["No model or observer may accept or restart this Work".into()],
         acceptance: vec!["Owner separately reviews an eventual submission".into()],
         user_acceptance_required: true,
@@ -143,7 +151,13 @@ async fn seed(root: &Path) {
             ],
         )
         .unwrap();
-    let work = state.tickets.update(user(), &create).await.unwrap().ids["work"].clone();
+    let created = owner_post!(
+        app,
+        "/api/v1/tickets/update",
+        &create,
+        actix_web::http::StatusCode::OK
+    );
+    let work = created["ids"]["work"].as_str().unwrap().to_owned();
     let ready = service
         .prepare_command(
             &authority,
@@ -187,6 +201,10 @@ async fn seed(root: &Path) {
         .unwrap()
         .unwrap();
     assert!(request
+        .messages
+        .iter()
+        .any(|message| message.content.contains(RESULT)));
+    assert!(request
         .tools
         .iter()
         .any(|tool| tool.function.name == "Task"));
@@ -225,7 +243,7 @@ async fn seed(root: &Path) {
     assert_eq!(original.reason, Reason::EvidenceUnknown);
     assert!(original.escalation.is_some());
     request.reply.send(LLMChunk::ToolCalls(vec![ToolCall {
-        id: "patrol-native-question".into(), tool_type: "function".into(),
+        id: CALL.into(), tool_type: "function".into(),
         function: FunctionCall { name: "Task".into(), arguments: json!({
             "tasks":[{"id":"own-question-step","content":"Await the precise owner answer","status":"blocked"}],
             "question":{"prompt":"Which exact bounded acceptance should this Work use?"}
@@ -254,7 +272,43 @@ async fn seed(root: &Path) {
     assert_eq!(snapshot.tickets[&work].state, WorkState::Blocked);
     assert!(snapshot.tickets[&work].active_assignment.is_none());
     assert!(snapshot.submissions.is_empty());
-    let wait = sample.expected_wait.unwrap();
+    let receipt = snapshot.assignments[&assignment].runtime.as_ref().unwrap();
+    // Owned stop precedes the SDK history barrier and final Actor projection.
+    // Require the actual exact runner/router finalization before establishing
+    // the byte baseline; this is not a delay or an inferred physical-stop proof.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let runner_done = state
+                .agent_runners
+                .read()
+                .await
+                .get(&receipt.session_id)
+                .is_some_and(|runner| {
+                    runner.run_id == receipt.run_id
+                        && matches!(runner.status, AgentStatus::Completed)
+                        && runner.completed_at.is_some()
+                });
+            if runner_done
+                && state
+                    .session_activation_router
+                    .current_run_id(&receipt.session_id)
+                    .await
+                    .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("exact native coordinator must complete its history/Actor finalization tail");
+    let first_wait = sample.expected_wait.unwrap();
+    let wait = observation(&state, &scope).await.expected_wait.unwrap();
+    assert_eq!(
+        (wait.issued_at_ms, wait.until_ms),
+        (first_wait.issued_at_ms, first_wait.until_ms),
+        "finalization must not extend the diagnostic allowance"
+    );
     assert_eq!(wait.kind, WaitKind::User);
     assert_eq!(wait.progress_sequence, 0);
     assert_eq!(
@@ -263,6 +317,24 @@ async fn seed(root: &Path) {
     );
     let actor_before = actor_files(root);
     assert!(!actor_before.is_empty());
+    let actor = actor_before
+        .values()
+        .filter_map(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .find(|entry| entry["actor"]["actor_id"] == receipt.session_id)
+        .unwrap();
+    assert_eq!(actor["activation"]["run_id"], receipt.run_id);
+    assert_eq!(actor["activation"]["status"], "succeeded");
+    assert!(actor["activation"]["finished_at"].is_string());
+    let child = state
+        .storage
+        .load_runtime_control_plane(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        actor["actor"]["session_created_at"],
+        serde_json::to_value(child.created_at).unwrap()
+    );
     let head_before = service.published().unwrap().0;
     for _ in 0..3 {
         assert_eq!(
