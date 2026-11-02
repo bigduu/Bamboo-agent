@@ -81,9 +81,16 @@ pipeline runtimes use the same Session ID and omit `execution_id`.
 Strict broker delivery keeps its existing pending source/receipt boundary.
 Pending publication is not repaired into an exposed completion. Committed
 receipt publication synchronizes typed status in its existing exact-snapshot CAS.
-The separate #2468 slice must reject replay of an older pending checkpoint
-after a terminal source was already published, including after receipt ACK.
-Host integration alone does not establish that same-run replay guarantee.
+For the same Run, a published terminal source cannot return to the older
+pending checkpoint, including after receipt ACK and Store reopen. The normal
+full/runtime writer rejects that replay under its existing physical locks;
+the first pending stage remains nonterminal. A new Run still requires its own
+identity transition and receipt rather than borrowing its predecessor's proof.
+Duplicate source publication repeats the guarded full commit. Runtime or Main
+bytes readable after an uncertain rename are not a durable acknowledgement:
+the retry must complete the actual file and parent-directory syncs and repair
+a Main left behind the leading sidecar. Receipt/anchor checks and the complete
+expected Session CAS remain in force, including on an identical retry.
 
 ## Recovery boundary
 

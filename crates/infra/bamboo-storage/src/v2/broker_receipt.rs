@@ -281,6 +281,51 @@ fn staged_terminal_matches(receipt: &BrokerTerminalReceipt, session: &Session) -
         && pending_completion_matches(receipt, session)
 }
 
+pub(super) fn reject_replaying_published_source(
+    latest: &Session,
+    incoming: &Session,
+) -> io::Result<()> {
+    if !super::child_wait_control_plane::terminal(latest.last_run_status().as_deref().unwrap_or(""))
+    {
+        return Ok(());
+    }
+    let Some(raw) = incoming.metadata.get(COMPLETION_SOURCE_KEY) else {
+        return Ok(());
+    };
+    if raw.len() > 8192 {
+        return Err(invalid("pending terminal source exceeds bound"));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| invalid("invalid terminal source phase"))?;
+    if value.get("pending_confirmation").is_none() {
+        return Ok(());
+    }
+    let pending: PendingCompletionEnvelope = serde_json::from_value(value)
+        .map_err(|_| invalid("invalid pending terminal source phase"))?;
+    let Some(raw) = latest.metadata.get(COMPLETION_SOURCE_KEY) else {
+        return Ok(());
+    };
+    if raw.len() > 8192 {
+        return Err(invalid("canonical terminal source exceeds bound"));
+    }
+    let current: serde_json::Value = serde_json::from_str(raw)
+        .map_err(|_| invalid("invalid canonical terminal source phase"))?;
+    if current.get("pending_confirmation").is_some() {
+        return Ok(());
+    }
+    let published: PendingCompletionIdentity = serde_json::from_value(current)
+        .map_err(|_| invalid("invalid published terminal source phase"))?;
+    if published.activation_run_id == pending.pending_confirmation.activation_run_id {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "published terminal source cannot return to pending confirmation".into(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn completeness_matches_receipt(receipt: &BrokerTerminalReceipt) -> bool {
     match (
         receipt.required_execution_epoch,
@@ -1035,18 +1080,19 @@ impl SessionStoreV2 {
             .map_err(|_| invalid("invalid expected broker terminal snapshot"))?;
         // A duplicate reconciler may observe exactly the first reconciler's
         // publication. Any other intervening runtime/input/source change fails.
-        if canonical_value == published_value {
-            return Ok(current);
-        }
-        if canonical_value
-            != serde_json::to_value(expected)
-                .map_err(|_| invalid("invalid expected pending broker terminal snapshot"))?
-            || !staged_terminal_matches(receipt, &current)
+        if canonical_value != published_value
+            && (canonical_value
+                != serde_json::to_value(expected)
+                    .map_err(|_| invalid("invalid expected pending broker terminal snapshot"))?
+                || !staged_terminal_matches(receipt, &current))
         {
             return Err(invalid(
                 "broker terminal source snapshot changed before publication",
             ));
         }
+        // An earlier AfterReplace failure may expose these exact values before
+        // its directory sync, or leave Main behind the leading runtime sidecar.
+        // Replay the actual guarded full commit even for byte-identical output.
         self.save_session_after_lock(&published_expected, started, &guards, None)
             .await?;
         let confirmed = self
@@ -1380,7 +1426,6 @@ mod tests {
         use bamboo_domain::{
             ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, AgentRuntimeState,
             AgentStatusState, ChildActorRuntimeSave, ChildActorRuntimeWrite,
-            RuntimeSessionPersistence,
         };
         for (status, typed, finish) in [
             (
@@ -1508,6 +1553,118 @@ mod tests {
                 assert_eq!(mirror.status, typed);
                 assert_eq!(current.metadata[COMPLETION_SOURCE_KEY], published);
                 assert_eq!(fs::read(directory.join("session.json")).await?, before);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn duplicate_source_publication_recommits_real_files_after_uncertain_replace(
+    ) -> io::Result<()> {
+        use crate::v2::{default_actor_context_tests::DefaultWriteHook, DurableWritePhase};
+        use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+
+        for file in ["runtime.json", "session.json"] {
+            for phase in [
+                DurableWritePhase::BeforeReplace,
+                DurableWritePhase::AfterReplace,
+            ] {
+                let (home, store, child) = fixture().await?;
+                let (mut completed, _) = strict_completed(&child, 2)?;
+                completed.agent_runtime_state = Some(AgentRuntimeState::default());
+                completed.synchronize_terminal_runtime_status();
+                let proof =
+                    HostTerminalCompleteness::from_verified_host(&completed, "strict-run", 7, 2)?;
+                prepare_strict(&store, &completed, &proof).await?;
+                let (mut staged, intended, published) = pending_terminal(&completed);
+                staged.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+                staged.metadata.insert(
+                    "agent.runtime.state".into(),
+                    serde_json::to_string(staged.agent_runtime_state.as_ref().unwrap()).unwrap(),
+                );
+                store.save_session(&staged).await?;
+                let expected = store.load_session(&staged.id).await?.unwrap();
+                let receipt = store
+                    .commit_broker_terminal_receipt_with_completeness(
+                        &intended,
+                        "strict-run",
+                        &proof,
+                    )
+                    .await?;
+                let hook = DefaultWriteHook::install(&store, file, phase, true);
+                hook.release();
+                assert!(
+                    store
+                        .publish_broker_terminal_source(&receipt, &expected, &published)
+                        .await
+                        .is_err(),
+                    "first publication must encounter {file} {phase:?}"
+                );
+                drop(store);
+
+                let store = SessionStoreV2::new(home.path().into()).await?;
+                // Readable runtime/Main bytes after rename cannot acknowledge
+                // the failed operation. An exact retry must reach Main's actual
+                // durable writer again, even when its values already match.
+                let retry_fault = DefaultWriteHook::install(
+                    &store,
+                    "session.json",
+                    DurableWritePhase::BeforeReplace,
+                    true,
+                );
+                retry_fault.release();
+                assert!(
+                    store
+                        .publish_broker_terminal_source(&receipt, &expected, &published)
+                        .await
+                        .is_err(),
+                    "retry must perform the actual full commit after {file} {phase:?}"
+                );
+                let confirmed = store
+                    .publish_broker_terminal_source(&receipt, &expected, &published)
+                    .await?;
+                assert_eq!(confirmed.last_run_status().as_deref(), Some("completed"));
+                assert_eq!(
+                    confirmed.agent_runtime_state.as_ref().unwrap().status,
+                    AgentStatusState::Completed
+                );
+                let dir = home
+                    .path()
+                    .join("sessions/broker-receipt-root/children/broker-receipt-child");
+                let main: Session =
+                    serde_json::from_slice(&fs::read(dir.join("session.json")).await?).unwrap();
+                assert_eq!(main.metadata[COMPLETION_SOURCE_KEY], published);
+                assert_eq!(
+                    serde_json::to_value(&main.messages)?,
+                    serde_json::to_value(&expected.messages)?
+                );
+                assert_eq!(
+                    main.agent_runtime_state.as_ref().unwrap().status,
+                    AgentStatusState::Completed
+                );
+                let mirror: AgentRuntimeState =
+                    serde_json::from_str(&main.metadata["agent.runtime.state"]).unwrap();
+                assert_eq!(mirror.status, AgentStatusState::Completed);
+                let before = fs::read(dir.join("session.json")).await?;
+                store
+                    .clear_acknowledged_broker_terminal_receipt(
+                        &child.id,
+                        child.created_at,
+                        "strict-run",
+                        TEST_PARENT_MAILBOX,
+                    )
+                    .await?;
+                store
+                    .publish_broker_terminal_source(&receipt, &expected, &published)
+                    .await?;
+                assert_eq!(fs::read(dir.join("session.json")).await?, before);
+                drop(store);
+                let reopened = SessionStoreV2::new(home.path().into()).await?;
+                let current = reopened.load_session(&child.id).await?.unwrap();
+                assert_eq!(
+                    serde_json::to_value(current)?,
+                    serde_json::to_value(confirmed)?
+                );
             }
         }
         Ok(())

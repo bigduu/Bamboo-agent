@@ -495,6 +495,7 @@ impl SessionStoreV2 {
             {
                 return Err(conflict("Host runtime writer belongs to a different run"));
             }
+            super::super::broker_receipt::reject_replaying_published_source(latest, incoming)?;
             if latest.host_run_id().is_some()
                 && super::super::child_wait_control_plane::terminal(
                     latest.last_run_status().as_deref().unwrap_or(""),
