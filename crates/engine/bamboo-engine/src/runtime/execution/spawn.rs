@@ -1086,9 +1086,7 @@ async fn queued_launch_state(
     }
     match child.last_run_status().as_deref() {
         Some("pending") => Ok(QueuedLaunchState::Eligible),
-        Some("running" | "completed" | "error" | "timeout" | "skipped" | "suspended") => {
-            Ok(QueuedLaunchState::AlreadyStarted)
-        }
+        Some("running" | "suspended") => Ok(QueuedLaunchState::AlreadyStarted),
         _ => Ok(QueuedLaunchState::Stale),
     }
 }

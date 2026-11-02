@@ -33,6 +33,7 @@ pub(super) fn stamp_owned_observation(session: &mut Session, owner: &RootActorRu
     if owner.created_at != session.created_at { return Err(invalid()); }
     let marker = serde_json::to_string(&observation(session, &owner.fence)?)?;
     session.metadata.insert(ROOT_OBSERVATION.into(), marker);
+    session.metadata.remove("runtime.reconciled_activation_fence");
     Ok(())
 }
 pub(super) fn preserve_observation(incoming: &mut Session, canonical: Option<&Session>) {
