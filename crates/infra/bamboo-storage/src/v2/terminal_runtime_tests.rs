@@ -909,7 +909,7 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
         "agent.runtime.state".into(),
         serde_json::to_string(ready.agent_runtime_state.as_ref().unwrap()).unwrap(),
     );
-    store.save_session_runtime_state(&ready).await.unwrap();
+    store.save_runtime_state(&ready).await.unwrap();
     let before = std::fs::read(runtime_path(home.path())).unwrap();
     store
         .finish_activation(
