@@ -1298,3 +1298,124 @@ async fn copy_rollback_unmarked_partial_canonical_refuses_without_mutation() {
         home.close().unwrap();
     }
 }
+
+#[tokio::test]
+async fn observed_root_claim_rejects_pre_reset_and_same_revision_callers_before_authority() {
+    use bamboo_domain::{ActorActivationClaim, ActorDirectoryError, ActorDirectoryPort};
+    let fixture = Fixture::new().await;
+    // The original caller was read before the fixture's canonical reset won.
+    // Selector-only claim has no such observation; observed admission must not
+    // initialize even an otherwise valid Actor for that old caller.
+    let before = fixture.files().await;
+    let directory = fixture.store.sessions_root_dir().join(&fixture.original.id);
+    let now = Utc::now();
+    let claim = ActorActivationClaim {
+        actor_id: fixture.original.id.clone(),
+        run_id: "observed-root".into(),
+        lease_owner: "original-caller".into(),
+        lease_expires_at: now + chrono::Duration::minutes(5),
+        inbox_generation: 0,
+        placement_ref: None,
+        now,
+    };
+    let mut changed_receipt = fixture.canonical.clone();
+    changed_receipt
+        .conversation_reset
+        .as_mut()
+        .unwrap()
+        .receipts[0]
+        .expected_snapshot_sha256 = "b".repeat(64);
+    let mut changed_birth = fixture.canonical.clone();
+    changed_birth.created_at -= chrono::Duration::seconds(1);
+    let mut changed_project = fixture.canonical.clone();
+    changed_project.set_project_id_meta("other-project");
+    let mut changed_metadata = fixture.canonical.clone();
+    changed_metadata.metadata_version += 1;
+    for expected in [
+        &fixture.original,
+        &changed_receipt,
+        &changed_birth,
+        &changed_project,
+        &changed_metadata,
+    ] {
+        assert_eq!(
+            fixture
+                .store
+                .claim_root_activation_observed(&claim, expected)
+                .await
+                .unwrap_err(),
+            ActorDirectoryError::InvalidIdentity
+        );
+        assert_eq!(fixture.files().await, before);
+        assert!(!directory.join("actor-authority.json").exists());
+        assert!(!directory.join("actor-authority.initialized.json").exists());
+    }
+    let claimed = fixture
+        .store
+        .claim_root_activation_observed(&claim, &fixture.canonical)
+        .await
+        .unwrap();
+    let repeated = fixture
+        .store
+        .claim_root_activation_observed(&claim, &fixture.canonical)
+        .await
+        .unwrap();
+    assert_eq!(claimed, repeated);
+    assert_eq!(
+        fixture.files().await,
+        before,
+        "claim changed the transcript, reset ledger or index"
+    );
+    let reopened = SessionStoreV2::new(fixture.home.path().to_path_buf())
+        .await
+        .unwrap();
+    assert_eq!(
+        reopened
+            .claim_root_activation_observed(&claim, &fixture.canonical)
+            .await
+            .unwrap(),
+        claimed
+    );
+    reopened.flush_search_index().await;
+    drop(reopened);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+async fn selector_only_claim_is_a_negative_control_for_original_root_generation() {
+    use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort, RootActorRuntimeWrite};
+    let fixture = Fixture::new().await;
+    // This is the old Root bind order: its separate initial load passed in the
+    // old generation, a reset won, then selector-only claim admitted a fence.
+    let now = Utc::now();
+    let claimed = fixture
+        .store
+        .claim_activation(&ActorActivationClaim {
+            actor_id: fixture.original.id.clone(),
+            run_id: "old-selector-path".into(),
+            lease_owner: "old-generation".into(),
+            lease_expires_at: now + chrono::Duration::minutes(5),
+            inbox_generation: 0,
+            placement_ref: None,
+            now,
+        })
+        .await
+        .unwrap();
+    fixture
+        .store
+        .start_activation(&claimed.fence(), now)
+        .await
+        .unwrap();
+    let owner = RootActorRuntimeWrite {
+        fence: claimed.fence(),
+        created_at: fixture.original.created_at,
+        conversation_generation: fixture.original.conversation_generation_observation(),
+    };
+    let directory = fixture.store.sessions_root_dir().join(&fixture.original.id);
+    assert_conflict(
+        root_actor_runtime::RootActorWriteProof::new(directory, owner)
+            .validate()
+            .unwrap_err(),
+    );
+    fixture.finish().await;
+}

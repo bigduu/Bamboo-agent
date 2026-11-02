@@ -467,6 +467,16 @@ pub trait ActorDirectoryPort: Send + Sync {
         &self,
         claim: &ActorActivationClaim,
     ) -> Result<ActorActivation, ActorDirectoryError>;
+    /// Ordinary Root admission checks the original caller's complete lifetime
+    /// in the same physical transaction as claim. Unsupported adapters must not
+    /// fall back to the selector-only claim or refresh the caller observation.
+    async fn claim_root_activation_observed(
+        &self,
+        _claim: &ActorActivationClaim,
+        _expected: &super::Session,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        Err(ActorDirectoryError::InvalidTransition)
+    }
     async fn start_activation(
         &self,
         fence: &ActorActivationFence,

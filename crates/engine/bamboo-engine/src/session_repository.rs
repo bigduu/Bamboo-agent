@@ -124,17 +124,20 @@ impl SessionRepository {
         let lease_seconds = chrono::Duration::from_std(lease_duration).expect("bounded Root lease");
         let now = chrono::Utc::now();
         let claimed = directory
-            .claim_activation(&bamboo_domain::ActorActivationClaim {
-                actor_id: session.id.clone(),
-                run_id: run_id.to_string(),
-                lease_owner: format!("root-execution-{}", uuid::Uuid::new_v4()),
-                lease_expires_at: now + lease_seconds,
-                inbox_generation: session
-                    .session_inbox_admission()
-                    .map_or(0, |a| a.last_admitted_sequence),
-                placement_ref: None,
-                now,
-            })
+            .claim_root_activation_observed(
+                &bamboo_domain::ActorActivationClaim {
+                    actor_id: session.id.clone(),
+                    run_id: run_id.to_string(),
+                    lease_owner: format!("root-execution-{}", uuid::Uuid::new_v4()),
+                    lease_expires_at: now + lease_seconds,
+                    inbox_generation: session
+                        .session_inbox_admission()
+                        .map_or(0, |a| a.last_admitted_sequence),
+                    placement_ref: None,
+                    now,
+                },
+                session,
+            )
             .await
             .map_err(root_actor_binding_error)?;
         let owner = bamboo_domain::RootActorRuntimeWrite {
