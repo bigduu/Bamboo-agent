@@ -7,7 +7,7 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-async fn isolated_state(data_dir: PathBuf, memory_root: PathBuf) -> web::Data<AppState> {
+pub(super) async fn isolated_state(data_dir: PathBuf, memory_root: PathBuf) -> web::Data<AppState> {
     let mut state = AppState::new_with_memory_store(
         data_dir,
         bamboo_memory::memory_store::MemoryStore::new(memory_root),
@@ -88,7 +88,7 @@ async fn save(state: &AppState, entry: InstalledPlugin) {
     .await
     .unwrap();
 }
-fn mac() -> Host {
+pub(super) fn mac() -> Host {
     Host::for_platform("macos", "aarch64", None)
 }
 
