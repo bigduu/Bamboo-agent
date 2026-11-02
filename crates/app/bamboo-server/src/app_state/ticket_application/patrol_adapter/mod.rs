@@ -1,7 +1,9 @@
 //! Host-only patrol adapters. No worker action or provider call.
 
+mod checkpoint_record;
 mod checkpoint_store;
 mod delivery;
+mod notice_evidence;
 mod program;
 mod runtime_observation;
 pub use checkpoint_store::PatrolCheckpointStore;
