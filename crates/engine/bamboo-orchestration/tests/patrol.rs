@@ -458,12 +458,42 @@ fn heartbeat_does_not_reset_progress_or_duplicate_incident_or_diagnostic() {
 }
 
 #[test]
-fn initial_missing_heartbeat_has_a_finite_startup_grace_period() {
+fn unavailable_heartbeat_is_not_a_measured_startup_timeout() {
     let patrol = configured();
     let mut host = FakeHost::new();
     let mut provider = ControlledProvider::new(&host);
     host.observation.heartbeat_at_ms = None;
     host.observation.progress = None;
+    assert_eq!(
+        tick(&patrol, &mut host, &mut provider, 29).status,
+        Status::Incident
+    );
+    assert_eq!(
+        tick(&patrol, &mut host, &mut provider, 30).status,
+        Status::NeedsSupervisor
+    );
+    assert_eq!(host.incident().reason, Reason::EvidenceUnknown);
+    assert_eq!(
+        tick(&patrol, &mut host, &mut provider, 30).status,
+        Status::NeedsSupervisor
+    );
+    assert_eq!(
+        host.durable.borrow().queue.values().next().unwrap().reason,
+        SupervisorReason::DeterministicAnomaly
+    );
+    assert!(provider.submits.is_empty());
+}
+
+#[test]
+fn measured_heartbeat_expiry_retains_the_original_exact_timeout() {
+    let patrol = configured();
+    let mut host = FakeHost::new();
+    let mut provider = ControlledProvider::new(&host);
+    host.observation.heartbeat_at_ms = Some(0);
+    host.observation.progress = Some(Progress {
+        sequence: 1,
+        at_ms: 0,
+    });
     assert_eq!(
         tick(&patrol, &mut host, &mut provider, 29).status,
         Status::Healthy
@@ -473,14 +503,6 @@ fn initial_missing_heartbeat_has_a_finite_startup_grace_period() {
         Status::Incident
     );
     assert_eq!(host.incident().reason, Reason::MissingHeartbeat);
-    assert_eq!(
-        tick(&patrol, &mut host, &mut provider, 30).status,
-        Status::NeedsSupervisor
-    );
-    assert_eq!(
-        host.durable.borrow().queue.values().next().unwrap().reason,
-        SupervisorReason::ReconcileReceipt
-    );
     assert!(provider.submits.is_empty());
 }
 

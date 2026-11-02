@@ -89,6 +89,8 @@ pub enum WaitKind {
 pub struct ExpectedWait {
     pub kind: WaitKind,
     pub issued_at_ms: u64,
+    /// End of this bounded patrol diagnostic allowance. A Host may tighten an
+    /// existing wait deadline; this never creates a business timeout or stop proof.
     pub until_ms: u64,
     pub progress_sequence: u64,
     pub evidence_ref: String,
@@ -768,17 +770,24 @@ impl Patrol {
         if o.repeated_errors {
             return Some(Reason::RepeatedErrors);
         }
-        let Some(started_at_ms) = o.started_at_ms else {
+        if o.started_at_ms.is_none() {
             return Some(Reason::EvidenceUnknown);
-        };
-        if now.saturating_sub(o.heartbeat_at_ms.unwrap_or(started_at_ms))
-            >= self.policy.heartbeat_timeout_ms
+        }
+        if o.heartbeat_at_ms
+            .is_some_and(|at| now.saturating_sub(at) >= self.policy.heartbeat_timeout_ms)
         {
             return Some(Reason::MissingHeartbeat);
         }
-        let progress_at = o.progress.map_or(started_at_ms, |p| p.at_ms);
-        if now.saturating_sub(progress_at) >= self.policy.progress_timeout_ms {
+        if o.progress.is_some_and(|progress| {
+            now.saturating_sub(progress.at_ms) >= self.policy.progress_timeout_ms
+        }) {
             return Some(Reason::NoProgress);
+        }
+        // A start is not a heartbeat or a meaningful-progress measurement.
+        // Producers that cannot persist either measurement remain unknown even
+        // after a long execution; never diagnose its absence as measured loss.
+        if o.heartbeat_at_ms.is_none() || o.progress.is_none() {
+            return Some(Reason::EvidenceUnknown);
         }
         None
     }

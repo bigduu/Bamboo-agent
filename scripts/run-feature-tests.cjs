@@ -114,7 +114,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // four native HTTP cases join native_work_token_budget/server-tests-0; the
 // Worker-auth case belongs to server-handlers. No feature cfg, package graph,
 // additive context or its 20 explicit cases changed.
-const FEATURE_SOURCE_SHA256 = "d75bcf77f7e35f514df756bbebc00bf2d8d88a177e79d47212227ea846f0aa91";
+// Admitted #2469 runtime observation and #2460 terminal-save integration keep
+// their existing default owners; no additive context or case selection changes.
+const FEATURE_SOURCE_SHA256 = "30880f5af87083293c595844c9ed8f5eb778952cb66b10756e4cc8b15ce8d7a6";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
