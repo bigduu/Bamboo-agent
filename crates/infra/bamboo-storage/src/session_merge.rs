@@ -3929,6 +3929,17 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    if session.host_run_id().is_some() && session.host_run_id() == latest.host_run_id() {
+        let key = "runtime.host_prior_activation_fence";
+        match latest.metadata.get(key) {
+            Some(fence) => {
+                session.metadata.insert(key.into(), fence.clone());
+            }
+            None => {
+                session.metadata.remove(key);
+            }
+        }
+    }
     if session.kind == bamboo_domain::SessionKind::Child
         && latest.kind == bamboo_domain::SessionKind::Child
         && session.created_at == latest.created_at

@@ -6,6 +6,8 @@ use super::*;
 use crate::v2::DefaultWriterGuards;
 use bamboo_domain::{AgentRuntimeState, AgentStatusState, SessionKind};
 
+const HOST_PRIOR_ACTIVATION: &str = "runtime.host_prior_activation_fence";
+
 fn conflict(message: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
@@ -280,11 +282,13 @@ impl SessionStoreV2 {
         {
             return Err(conflict("queued Host launch was closed before startup"));
         }
-        if self
+        let observed = self
             .observed_runtime_actor(&path, &latest)
             .await
             .map_err(io::Error::other)?
-            .and_then(|entry| entry.activation)
+            .and_then(|entry| entry.activation);
+        if observed
+            .as_ref()
             .is_some_and(|activation| activation.status.is_live() && activation.run_id != run_id)
         {
             return Err(conflict("another Actor attempt owns Host startup"));
@@ -303,6 +307,15 @@ impl SessionStoreV2 {
         }
         let mut after = latest.clone();
         after.set_host_run_id(run_id);
+        after.metadata.remove(HOST_PRIOR_ACTIVATION);
+        if let Some(prior) = observed
+            .filter(|activation| !activation.status.is_live() && activation.run_id != run_id)
+        {
+            after.metadata.insert(
+                HOST_PRIOR_ACTIVATION.into(),
+                serde_json::to_string(&prior.fence())?,
+            );
+        }
         after.metadata.remove("runtime.reconciled_activation_fence");
         after.set_last_run_status("running");
         after.clear_last_run_error();
@@ -497,7 +510,21 @@ impl SessionStoreV2 {
                 return Err(conflict("Host runtime writer would reopen a terminal run"));
             }
         }
-        let candidate = incoming.clone();
+        let mut candidate = incoming.clone();
+        if let Some(latest) = latest.as_ref().filter(|latest| {
+            latest.host_run_id().is_some() && latest.host_run_id() == candidate.host_run_id()
+        }) {
+            match latest.metadata.get(HOST_PRIOR_ACTIVATION) {
+                Some(fence) => {
+                    candidate
+                        .metadata
+                        .insert(HOST_PRIOR_ACTIVATION.into(), fence.clone());
+                }
+                None => {
+                    candidate.metadata.remove(HOST_PRIOR_ACTIVATION);
+                }
+            }
+        }
         if !candidate.host_run_matches_launch()
             && candidate.last_run_status().as_deref() != Some("pending")
         {
@@ -539,6 +566,25 @@ impl SessionStoreV2 {
                 // The ordinary predecessor receives no such grant, including
                 // when it retains a wait or pending completion source.
                 if bound_fence == Some(&activation.fence()) {
+                    return Ok(candidate);
+                }
+                // A legacy backend claims its Actor inside execute. The exact
+                // new Host binding observed this terminal predecessor under the
+                // same lock; permit its startup before that claim. Any new
+                // Actor fence, including a finished successor, invalidates it.
+                if !activation.status.is_live()
+                    && latest.as_ref().is_some_and(|latest| {
+                        latest.host_run_id() == candidate.host_run_id()
+                            && latest
+                                .metadata
+                                .get(HOST_PRIOR_ACTIVATION)
+                                .and_then(|raw| {
+                                    serde_json::from_str::<ActorActivationFence>(raw).ok()
+                                })
+                                .as_ref()
+                                == Some(&activation.fence())
+                    })
+                {
                     return Ok(candidate);
                 }
                 if candidate.host_run_id().is_some() {

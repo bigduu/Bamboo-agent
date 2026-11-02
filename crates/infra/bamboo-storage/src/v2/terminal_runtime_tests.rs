@@ -982,6 +982,42 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
 }
 
 #[tokio::test]
+async fn terminal_runtime_host_startup_accepts_only_its_observed_terminal_predecessor() {
+    let (home, store, child, activation) = fixture(AgentStatusState::Initializing).await;
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    let current = store.load_session(&child.id).await.unwrap().unwrap();
+    store.begin_host_run(&current, "host-B").await.unwrap();
+    let mut startup = store.load_session(&child.id).await.unwrap().unwrap();
+    store.save_runtime_state(&startup).await.unwrap();
+    let mut forged = startup.clone();
+    forged
+        .metadata
+        .remove("runtime.host_prior_activation_fence");
+    store.save_runtime_state(&forged).await.unwrap();
+    let canonical = store.load_session(&child.id).await.unwrap().unwrap();
+    assert!(canonical
+        .metadata
+        .contains_key("runtime.host_prior_activation_fence"));
+    let now = Utc::now();
+    store
+        .claim_activation(&claim(&child.id, "host-C", now))
+        .await
+        .unwrap();
+    let before = std::fs::read(runtime_path(home.path())).unwrap();
+    startup.set_last_run_status("error");
+    startup.synchronize_terminal_runtime_status();
+    assert!(store.save_runtime_state(&startup).await.is_err());
+    assert_eq!(std::fs::read(runtime_path(home.path())).unwrap(), before);
+}
+
+#[tokio::test]
 async fn terminal_runtime_queued_closure_after_prior_host_cannot_restart_or_reuse_old_finish() {
     for (status, typed) in [
         ("cancelled", AgentStatusState::Cancelled),
@@ -1006,6 +1042,22 @@ async fn terminal_runtime_queued_closure_after_prior_host_cannot_restart_or_reus
         queued.mark_child_auto_run_launch_intent();
         queued.set_last_run_status("pending");
         store.save_session(&queued).await.unwrap();
+        let mut old_failure = completed.clone();
+        old_failure.cancel_child_launch_generation();
+        old_failure.set_last_run_status("error");
+        old_failure.synchronize_terminal_runtime_status();
+        let locked = crate::LockedSessionStore::new(store.clone());
+        assert!(locked.merge_save_runtime(&mut old_failure).await.is_err());
+        assert_eq!(
+            store
+                .load_session(&child.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_run_status()
+                .as_deref(),
+            Some("pending")
+        );
         let expected_launch = queued.clone();
         queued.cancel_child_launch_generation();
         queued.set_last_run_status(status);

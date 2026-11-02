@@ -400,8 +400,40 @@ async fn run_child_spawn_inner(
     // observe suspend state stamped by THIS run, otherwise a genuinely
     // completed re-run is published as non-terminal "suspended" and the
     // parent stalls until the wait lease expires.
-    session.metadata.remove("runtime.suspend_reason");
+    let prior_suspend_reason = session.metadata.remove("runtime.suspend_reason");
     session.clear_pending_question();
+    // The explicit queued rerun consumes the prior question/approval handoff,
+    // just as the legacy metadata path above does. A child/Bash wait and plan
+    // approval remain independently owned, and any wait created by this run is
+    // still honored by final-save below.
+    if session.last_run_status().as_deref() == Some("pending")
+        && matches!(
+            prior_suspend_reason.as_deref(),
+            Some("awaiting_clarification" | "awaiting_parent_approval")
+        )
+    {
+        if let Some(mut state) = crate::runtime::runner::state_bridge::read_runtime_state(&session)
+        {
+            if state
+                .suspension
+                .as_ref()
+                .is_none_or(|s| Some(s.reason.as_str()) == prior_suspend_reason.as_deref())
+            {
+                state.suspension = None;
+                if state.status == AgentStatusState::Suspended
+                    && state.waiting_for_children.is_none()
+                    && state.waiting_for_bash.is_none()
+                {
+                    state.status = AgentStatusState::Idle;
+                }
+                crate::runtime::runner::state_bridge::write_runtime_state(&mut session, &state);
+                session.metadata.insert(
+                    "agent.runtime.state".into(),
+                    serde_json::to_string(&state).map_err(|e| e.to_string())?,
+                );
+            }
+        }
+    }
 
     // Ensure last message is user (otherwise nothing to do).
     let last_is_user = session
@@ -534,6 +566,7 @@ async fn run_child_spawn_inner(
         ctx.agent = Arc::new(ctx.agent.with_execution_persistence(persistence));
     }
 
+    let mut host_bound = false;
     let publish_running = async {
         // Backend refusal has not started this Run. Bind only after successful
         // preparation; a binding failure uses the existing exact pre-launch
@@ -542,6 +575,7 @@ async fn run_child_spawn_inner(
             return (false, Err(error));
         }
         session.set_host_run_id(&run_id);
+        host_bound = true;
         // Publish the child's process-global workspace only after this task owns
         // both the exact runner slot and logical-session router. A rejected
         // cross-entry caller must not overwrite a live owner's tool root or
@@ -629,6 +663,16 @@ async fn run_child_spawn_inner(
             return Err(format!(
                 "Local Child running checkpoint failed before launch: {error}"
             ));
+        }
+        if !host_bound
+            || error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+        {
+            let failure = Err(bamboo_agent_core::AgentError::LLM(error.to_string()));
+            finalize_runner_exact(&ctx.agent_runners, &session.id, &run_id, &failure).await;
+            execution_reservation.abandon().await;
+            return Err(format!("Child Host startup was not admitted: {error}"));
         }
         if retired_pending {
             return Err(format!(

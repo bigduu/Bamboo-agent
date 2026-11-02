@@ -1788,6 +1788,7 @@ pub struct SessionStoreV2 {
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "runtime.host_run_id",
     "runtime.host_launch_generation",
+    "runtime.host_prior_activation_fence",
     "runtime.reconciled_activation_fence",
     "agent.runtime.state",
     "assignment_prompt",
