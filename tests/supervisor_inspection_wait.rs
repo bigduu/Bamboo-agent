@@ -527,13 +527,17 @@ async fn fixture(case: Case, ultra: bool) {
         "three unchanged complete inspection batches before waiting"
     );
     let calls = probe.root_calls.load(Ordering::SeqCst);
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Outlast the audited 3–5 second polling interval while the real verifier
+    // command is still held and no completion/input event has been sent.
+    let quiet_started = std::time::Instant::now();
+    tokio::time::sleep(Duration::from_secs(6)).await;
     assert_eq!(
         probe.root_calls.load(Ordering::SeqCst),
         calls,
         "waiting dispatches zero providers"
     );
     assert_eq!(probe.inspections.load(Ordering::SeqCst), inspect_count);
+    let quiet_ms = quiet_started.elapsed().as_millis();
     assert!(!workspace.join("verifier-release").exists());
     for child in &original_wait.child_session_ids {
         let child = canonical(&data, child).await;
@@ -682,7 +686,7 @@ async fn fixture(case: Case, ultra: bool) {
         "duplicate outcomes never dispatch another turn"
     );
     assert_eq!(outcomes(&canonical(&data, SUPERVISOR).await).len(), wanted);
-    eprintln!("2451 controlled-provider/native-Host case={case:?} ultra={ultra}: before_wait provider={calls}, inspect={inspect_count}; quiet_delta=0; outcomes={wanted}; final_provider={}; independent_root_calls=1",probe.root_calls.load(Ordering::SeqCst));
+    eprintln!("2451 controlled-provider/native-Host case={case:?} ultra={ultra}: before_wait provider={calls}, inspect={inspect_count}; quiet_ms={quiet_ms}, quiet_delta=0; outcomes={wanted}; final_provider={}; independent_root_calls=1",probe.root_calls.load(Ordering::SeqCst));
     drop(host);
     provider_handle.stop(true).await;
 }
