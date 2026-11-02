@@ -63,6 +63,10 @@ publication fail before rename. The process exits naturally and a fresh Host
 reconciles the original receipt from the same root after a canonical source
 change. No checkpoint rollback, receipt fabrication or production fault switch
 is used. Assertions retain provider/activation/interrupt/Ticket/Actor boundaries.
+Cold reopen explicitly installs a fresh policy through the existing trusted Host
+Rust API; no cached grant is restored. It does not claim owner HTTP reinstallation
+for attempted/submitted Work: that separate owner route admits generation-0 Ready
+Work only.
 Private codec/store cases cover legacy bytes, no retrofit, source immutability,
 future/tampered records, uncertain publication and legitimate incident replacement.
 Written cases are not execution evidence; exact commands/results belong to the PR.
