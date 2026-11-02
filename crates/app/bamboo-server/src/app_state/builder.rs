@@ -1357,7 +1357,6 @@ impl AppState {
                 session_activation_router.clone(),
                 mcp_proxy_shutdown.clone(),
                 observer_subscriptions.clone(),
-                sessions.clone(),
             )
             .await;
             if wake_report.attempted > 0

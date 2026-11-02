@@ -108,7 +108,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // signature and compatibility-merge cases remain server-other. Moving the
 // ungated policy definitions out of config.rs changes this source fingerprint,
 // but no feature cfg expression, default target or 20 additive cases changes.
-const FEATURE_SOURCE_SHA256 = "17e40ad314e5fe24b5207e4d042c1aa7cbe80a2a075fbc673b52bb7366fc6b2c";
+// Root terminal tests use the existing default Storage/Engine/Server owners;
+// the nested test module adds no feature context or duplicate producer.
+const FEATURE_SOURCE_SHA256 = "ff958cf5299f28cbb4989a264e0bc726a2f22d93864c454c4f987d98d56d0432";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

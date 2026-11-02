@@ -10,7 +10,6 @@ use std::{
     time::Duration,
 };
 
-use bamboo_domain::{SessionKind, Storage};
 use bamboo_engine::{session_activation::SessionWakeReconcileResult, SessionActivationRouter};
 use bamboo_storage::SessionStoreV2;
 use chrono::{DateTime, Utc};
@@ -24,56 +23,6 @@ const SCAN_TICK: Duration = Duration::from_secs(1);
 const MAX_INSPECTIONS_PER_TICK: usize = 32;
 const RESERVED_INDEX_INSPECTIONS: usize = MAX_INSPECTIONS_PER_TICK / 2;
 const STARTUP_INLINE_BUDGET: usize = MAX_INSPECTIONS_PER_TICK;
-
-/// One immutable cutoff covers the initial and later paced passes. Revisit old
-/// terminal records regardless of age/index label. Live recovery uses this
-/// fixed pre-startup cutoff; a trusted terminal fact needs no death inference.
-/// Neither lane depends on Session version migration.
-struct TerminalRecovery {
-    store: Arc<SessionStoreV2>,
-    cutoff: DateTime<Utc>,
-    cache: Option<bamboo_engine::SessionCache>,
-}
-
-impl TerminalRecovery {
-    async fn inspect(&self, target: &str) {
-        let Some(entry) = self.store.get_index_entry(target).await else {
-            return;
-        };
-        if entry.kind != SessionKind::Root {
-            return;
-        }
-        let result = async {
-            let Some(expected) = self.store.load_session(target).await? else {
-                return Ok(());
-            };
-            let cache = self.cache.clone();
-            self.store
-                .reconcile_session_runtime(
-                    &expected,
-                    self.cutoff,
-                    None,
-                    Arc::new(move |saved| {
-                        if let Some(cache) = &cache {
-                            cache.insert(
-                                saved.id.clone(),
-                                Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
-                            );
-                        }
-                    }),
-                )
-                .await?;
-            Ok::<_, std::io::Error>(())
-        }
-        .await;
-        if let Err(error) = result {
-            // The bounded index sweep retries with the same cutoff. Neither a
-            // failed/uncertain write nor an absent local runner publishes a
-            // completion, changes Inbox eligibility or grants a Worker proof.
-            tracing::warn!(session_id = %target, %error, "Root terminal reconciliation unconfirmed; retained for paced retry");
-        }
-    }
-}
 
 #[derive(Default)]
 pub(super) struct WakeReport {
@@ -205,7 +154,6 @@ fn spawn_periodic(
     mut schedule: WakeSchedule,
     initial_ids: Vec<String>,
     observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
-    terminal: TerminalRecovery,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(SCAN_TICK);
@@ -239,7 +187,6 @@ fn spawn_periodic(
                     break;
                 };
                 budget -= 1;
-                terminal.inspect(&target).await;
                 let outcome = wake_once(&target, activation.as_ref(), now).await;
                 schedule.observe(target, outcome, now);
             }
@@ -252,7 +199,6 @@ fn spawn_periodic(
                     continue;
                 }
                 budget -= 1;
-                terminal.inspect(target).await;
                 let outcome = wake_once(target, activation.as_ref(), now).await;
                 schedule.observe(target.clone(), outcome, now);
             }
@@ -276,7 +222,7 @@ pub(super) async fn reconcile_startup(
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
 ) -> WakeReport {
-    reconcile_startup_inner(store, activation, shutdown, None, None).await
+    reconcile_startup_inner(store, activation, shutdown, None).await
 }
 
 pub(super) async fn reconcile_startup_with_observers(
@@ -284,9 +230,8 @@ pub(super) async fn reconcile_startup_with_observers(
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
     observers: Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>,
-    cache: bamboo_engine::SessionCache,
 ) -> WakeReport {
-    reconcile_startup_inner(store, activation, shutdown, Some(observers), Some(cache)).await
+    reconcile_startup_inner(store, activation, shutdown, Some(observers)).await
 }
 
 async fn reconcile_startup_inner(
@@ -294,13 +239,7 @@ async fn reconcile_startup_inner(
     activation: Arc<SessionActivationRouter>,
     shutdown: CancellationToken,
     observers: Option<Arc<super::observer_subscriptions::ObserverSubscriptionCoordinator>>,
-    cache: Option<bamboo_engine::SessionCache>,
 ) -> WakeReport {
-    let terminal = TerminalRecovery {
-        store: store.clone(),
-        cutoff: Utc::now(),
-        cache,
-    };
     let mut report = WakeReport::default();
     let mut schedule = WakeSchedule::default();
     let entries = store.list_index_entries().await;
@@ -311,7 +250,6 @@ async fn reconcile_startup_inner(
             continue;
         }
         report.checked += 1;
-        terminal.inspect(&entry.id).await;
         let now = Utc::now();
         let outcome = wake_once(&entry.id, activation.as_ref(), now).await;
         match &outcome {
@@ -331,9 +269,7 @@ async fn reconcile_startup_inner(
         schedule.observe(entry.id, outcome, now);
     }
     report.queued = queued.len();
-    spawn_periodic(
-        store, activation, shutdown, schedule, queued, observers, terminal,
-    );
+    spawn_periodic(store, activation, shutdown, schedule, queued, observers);
     report
 }
 
@@ -421,157 +357,6 @@ mod tests {
         });
         router.set_spawner(spawner.clone()).await;
         (router, spawner)
-    }
-
-    #[tokio::test]
-    async fn restart_reconciles_terminal_roots_and_cache_without_migration_or_new_execution() {
-        use bamboo_domain::{
-            ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, AgentRuntimeState,
-            AgentStatusState, Session,
-        };
-        let home = tempfile::tempdir().unwrap();
-        let original = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
-        let mut evidence = Vec::new();
-        for (index, outcome, typed) in [
-            (
-                0,
-                ActorActivationFinish::Succeeded,
-                AgentStatusState::Completed,
-            ),
-            (
-                1,
-                ActorActivationFinish::Cancelled,
-                AgentStatusState::Cancelled,
-            ),
-            (2, ActorActivationFinish::Failed, AgentStatusState::Failed),
-        ] {
-            let mut session = Session::new(format!("terminal-root-{index}"), "model");
-            session.session_version = None;
-            session.agent_runtime_state = Some(AgentRuntimeState::new(&session.id));
-            session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
-            session.set_last_run_status("running");
-            original.save_session(&session).await.unwrap();
-            let now = Utc::now();
-            let activation = original
-                .claim_activation(&ActorActivationClaim {
-                    actor_id: session.id.clone(),
-                    run_id: format!("run-{index}"),
-                    lease_owner: format!("synthetic-owner-{index}"),
-                    lease_expires_at: now + chrono::Duration::minutes(5),
-                    inbox_generation: 0,
-                    placement_ref: None,
-                    now,
-                })
-                .await
-                .unwrap();
-            original
-                .start_activation(&activation.fence(), now)
-                .await
-                .unwrap();
-            original
-                .finish_activation(&activation.fence(), now, outcome)
-                .await
-                .unwrap();
-            let mut zombie = original.load_session(&session.id).await.unwrap().unwrap();
-            zombie.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Initializing;
-            zombie.metadata.insert(
-                "agent.runtime.state".into(),
-                serde_json::to_string(zombie.agent_runtime_state.as_ref().unwrap()).unwrap(),
-            );
-            zombie.messages.clear();
-            // Seed only this TempDir with the audited legacy split. The trusted
-            // Actor/Main files are the actual commits, not enumeration stubs.
-            let directory = home.path().join("sessions").join(&session.id);
-            tokio::fs::write(
-                directory.join("runtime.json"),
-                serde_json::to_vec_pretty(&zombie).unwrap(),
-            )
-            .await
-            .unwrap();
-            let main = tokio::fs::read(directory.join("session.json"))
-                .await
-                .unwrap();
-            evidence.push((session.id, typed, main));
-        }
-        let mut unknown = Session::new("unknown-live-root", "model");
-        unknown.agent_runtime_state = Some(AgentRuntimeState::new(&unknown.id));
-        unknown.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
-        unknown.set_last_run_status("running");
-        original.save_session(&unknown).await.unwrap();
-        original.flush_search_index().await;
-        drop(original);
-
-        let reopened = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
-        let inbox = Arc::new(FileSessionInbox::new(
-            reopened.clone(),
-            SessionInboxLimits::default(),
-        ));
-        let (router, spawner) = router(inbox, false).await;
-        let cache: bamboo_engine::SessionCache = Arc::default();
-        let shutdown = CancellationToken::new();
-        let report = reconcile_startup_inner(
-            reopened.clone(),
-            router,
-            shutdown.clone(),
-            None,
-            Some(cache.clone()),
-        )
-        .await;
-        assert_eq!(report.checked, 4);
-        assert_eq!(report.attempted, 0);
-        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
-        shutdown.cancel();
-        let replay = TerminalRecovery {
-            store: reopened.clone(),
-            cutoff: Utc::now() - chrono::Duration::hours(1),
-            cache: Some(cache.clone()),
-        };
-        for (id, typed, main) in evidence {
-            let repaired = reopened.load_session(&id).await.unwrap().unwrap();
-            assert_eq!(repaired.session_version, None);
-            assert_eq!(repaired.agent_runtime_state.as_ref().unwrap().status, typed);
-            assert_eq!(
-                cache
-                    .get(&id)
-                    .unwrap()
-                    .read()
-                    .agent_runtime_state
-                    .as_ref()
-                    .unwrap()
-                    .status,
-                typed
-            );
-            let directory = home.path().join("sessions").join(&id);
-            let runtime = tokio::fs::read(directory.join("runtime.json"))
-                .await
-                .unwrap();
-            replay.inspect(&id).await;
-            assert_eq!(
-                tokio::fs::read(directory.join("runtime.json"))
-                    .await
-                    .unwrap(),
-                runtime
-            );
-            assert_eq!(
-                tokio::fs::read(directory.join("session.json"))
-                    .await
-                    .unwrap(),
-                main
-            );
-        }
-        assert_eq!(
-            reopened
-                .load_session(&unknown.id)
-                .await
-                .unwrap()
-                .unwrap()
-                .agent_runtime_state
-                .unwrap()
-                .status,
-            AgentStatusState::Running
-        );
-        assert!(!cache.contains_key(&unknown.id));
-        reopened.flush_search_index().await;
     }
 
     #[tokio::test]
