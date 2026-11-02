@@ -17,6 +17,7 @@ async fn fixture(
     let parent = Session::new("terminal-parent", "model");
     store.save_session(&parent).await.unwrap();
     let mut child = Session::new_child_of("terminal-child", &parent, "model", "Child");
+    child.add_message(bamboo_domain::Message::user("retained retry input"));
     let mut state = AgentRuntimeState::new(&child.id);
     state.status = initial;
     state.round.current_round = 8;
@@ -505,7 +506,6 @@ async fn terminal_runtime_pending_retry_generation_survives_old_finish_and_recon
     let mut queued = old.clone();
     queued.advance_child_launch_generation().unwrap();
     queued.set_last_run_status("pending");
-    queued.add_message(bamboo_domain::Message::user("retained retry input"));
     store.save_session(&queued).await.unwrap();
     let queued = store.load_session(&child.id).await.unwrap().unwrap();
     assert!(store
@@ -612,6 +612,119 @@ async fn terminal_runtime_inflight_host_does_not_publish_terminal_before_broker_
         .unwrap()
         .is_none());
     assert_eq!(current.last_run_status().as_deref(), Some("running"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_runtime_authority_after_replace_error_requires_durable_exact_retry() {
+    let (home, store, _, activation) = fixture(AgentStatusState::Initializing).await;
+    let hook = ActorWriteHook::install(
+        &store,
+        ACTOR_AUTHORITY_FILE,
+        DurableWritePhase::AfterReplace,
+        true,
+    );
+    hook.release();
+    assert!(
+        matches!(
+            store
+                .finish_activation_observed(
+                    &activation.fence(),
+                    Utc::now(),
+                    ActorActivationFinish::Succeeded
+                )
+                .await,
+            Err(ActorDirectoryError::Storage(_))
+        ),
+        "readable rename is not a directory fsync proof"
+    );
+    let authority =
+        std::fs::read(runtime_path(home.path()).with_file_name(ACTOR_AUTHORITY_FILE)).unwrap();
+    let first: ActorDirectoryEntry = serde_json::from_slice(&authority).unwrap();
+    let retry = store
+        .finish_activation_observed(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    assert_eq!(Some(retry), first.activation);
+    assert_eq!(
+        authority,
+        std::fs::read(runtime_path(home.path()).with_file_name(ACTOR_AUTHORITY_FILE)).unwrap()
+    );
+    assert_terminal(&store, AgentStatusState::Completed, "completed").await;
+}
+
+#[tokio::test]
+async fn terminal_runtime_finish_preserves_confirmed_timeout_status_error_and_source() {
+    let (_home, store, child, activation) = fixture(AgentStatusState::Running).await;
+    store.begin_host_run(&child, "host-A").await.unwrap();
+    let mut final_save = store.load_session(&child.id).await.unwrap().unwrap();
+    final_save.set_last_run_status("timeout");
+    final_save.set_last_run_error("owned child watchdog expired");
+    let source = "{\"status\":\"timeout\",\"activation_run_id\":\"host-A\"}";
+    final_save
+        .metadata
+        .insert("runtime.child_completion_source_v1".into(), source.into());
+    let host = crate::LockedSessionStore::new(store.clone());
+    host.merge_save_runtime(&mut final_save).await.unwrap();
+    for _ in 0..2 {
+        store
+            .finish_activation(
+                &activation.fence(),
+                Utc::now(),
+                ActorActivationFinish::Failed,
+            )
+            .await
+            .unwrap();
+        let saved = assert_terminal(&store, AgentStatusState::Failed, "timeout").await;
+        assert_eq!(
+            saved.last_run_error().as_deref(),
+            Some("owned child watchdog expired")
+        );
+        assert_eq!(saved.metadata["runtime.child_completion_source_v1"], source);
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_lost_activated_sidecar_is_not_reconstructed_from_stale_main() {
+    let (home, store, child, activation) = fixture(AgentStatusState::Running).await;
+    let old_main = std::fs::read(main_path(home.path())).unwrap();
+    std::fs::remove_file(runtime_path(home.path())).unwrap();
+    assert!(store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Cancelled
+        )
+        .await
+        .is_err());
+    assert!(!runtime_path(home.path()).exists());
+    assert!(store.begin_host_run(&child, "new-run").await.is_err());
+    assert!(store
+        .reconcile_child_runtime(&child, Utc::now(), "error", None)
+        .await
+        .is_err());
+    assert!(!runtime_path(home.path()).exists());
+    assert_eq!(old_main, std::fs::read(main_path(home.path())).unwrap());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn terminal_runtime_symlink_authority_witness_cannot_authorize_begin_or_repair() {
+    let (home, store, child, _) = fixture(AgentStatusState::Running).await;
+    let marker = runtime_path(home.path()).with_file_name(ACTOR_INITIALIZED_FILE);
+    let real = marker.with_extension("saved");
+    std::fs::rename(&marker, &real).unwrap();
+    std::os::unix::fs::symlink(&real, &marker).unwrap();
+    let runtime = std::fs::read(runtime_path(home.path())).unwrap();
+    assert!(store.begin_host_run(&child, "host-A").await.is_err());
+    assert!(store
+        .reconcile_child_runtime(&child, Utc::now(), "error", None)
+        .await
+        .is_err());
+    assert_eq!(runtime, std::fs::read(runtime_path(home.path())).unwrap());
 }
 
 #[tokio::test]

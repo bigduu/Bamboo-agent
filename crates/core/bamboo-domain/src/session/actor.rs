@@ -438,6 +438,8 @@ pub enum ActorDirectoryError {
     CounterOverflow,
     #[error("actor authority storage failed: {0}")]
     Storage(String),
+    #[error("activation committed; runtime projection failed: {0}")]
+    RuntimeProjection(String),
 }
 
 /// Narrow storage/runtime port. Implementations must serialize each mutation
@@ -497,7 +499,7 @@ pub trait ActorDirectoryPort: Send + Sync {
         outcome: ActorActivationFinish,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         let result = self.finish_activation(fence, now, outcome).await;
-        if !matches!(result, Err(ActorDirectoryError::Storage(_))) {
+        if !matches!(result, Err(ActorDirectoryError::RuntimeProjection(_))) {
             return result;
         }
         let expected = match outcome {

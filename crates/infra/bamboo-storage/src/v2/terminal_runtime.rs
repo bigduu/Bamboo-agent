@@ -29,6 +29,16 @@ fn pending_delivery(session: &Session) -> bool {
         .is_some_and(|source| source.get("pending_confirmation").is_some())
 }
 
+fn same_terminal_class(left: &str, right: &str) -> bool {
+    let class = |status| match status {
+        "completed" | "skipped" => Some(0),
+        "cancelled" => Some(1),
+        "error" | "failed" | "timeout" => Some(2),
+        _ => None,
+    };
+    class(left).is_some() && class(left) == class(right)
+}
+
 impl SessionStoreV2 {
     async fn projection_target(&self, id: &str, rel: &str) -> io::Result<Option<Session>> {
         let (kind, root) = Self::copy_source_identity_from_rel(id, rel)?;
@@ -55,6 +65,9 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         let record = fs::read(path).await.map_err(storage)?;
+        if !Self::regular_actor_file(&path.with_file_name(ACTOR_INITIALIZED_FILE)).await? {
+            return Err(ActorDirectoryError::Corrupt);
+        }
         if !Self::regular_actor_file(&path.with_file_name(super::super::RUNTIME_SIDECAR_FILE))
             .await?
         {
@@ -96,11 +109,11 @@ impl SessionStoreV2 {
         }
         // Replay an interrupted index publication without rewriting settled
         // records on every watchdog sweep.
-        if self
-            .get_index_entry(&after.id)
-            .await
-            .is_none_or(|entry| entry.last_run_status != after.last_run_status())
-        {
+        if self.get_index_entry(&after.id).await.is_none_or(|entry| {
+            entry.last_run_status != after.last_run_status()
+                || entry.last_run_error != after.last_run_error()
+                || entry.updated_at != after.updated_at
+        }) {
             self.upsert_index_from_session(after, rel.into())
                 .await
                 .map_err(storage)?;
@@ -122,6 +135,15 @@ impl SessionStoreV2 {
         };
         let (kind, root) =
             Self::copy_source_identity_from_rel(&entry.actor.actor_id, rel).map_err(storage)?;
+        if !Self::regular_actor_file(
+            &self
+                .abs_path_from_rel(rel)
+                .join(super::super::RUNTIME_SIDECAR_FILE),
+        )
+        .await?
+        {
+            return Err(ActorDirectoryError::Corrupt);
+        }
         let Some(before) = self
             .load_session_from_dir_strict(
                 &self.abs_path_from_rel(rel),
@@ -153,7 +175,20 @@ impl SessionStoreV2 {
             return Ok(());
         }
         let mut after = before.clone();
-        after.set_last_run_status(status);
+        let prior = before.last_run_status();
+        if prior
+            .as_deref()
+            .is_some_and(super::super::child_wait_control_plane::terminal)
+        {
+            if !prior
+                .as_deref()
+                .is_some_and(|prior| same_terminal_class(prior, status))
+            {
+                return Err(ActorDirectoryError::InvalidTransition);
+            }
+        } else {
+            after.set_last_run_status(status);
+        }
         if status == "completed" {
             after.clear_last_run_error();
         }
@@ -376,13 +411,9 @@ impl SessionStoreV2 {
                             && candidate.last_run_status().as_deref() != Some("pending")
                         {
                             if let Some(status) = terminal_status(activation.status) {
-                                let matches = match status {
-                                    "error" => matches!(
-                                        candidate.last_run_status().as_deref(),
-                                        Some("error" | "failed" | "timeout")
-                                    ),
-                                    _ => candidate.last_run_status().as_deref() == Some(status),
-                                };
+                                let matches = candidate.last_run_status().as_deref().is_some_and(
+                                    |candidate| same_terminal_class(candidate, status),
+                                );
                                 if !matches {
                                     return Err(conflict(
                                         "Host outcome conflicts with committed activation",
