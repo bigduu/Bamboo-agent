@@ -118,6 +118,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::supervisor::inspect_managed_sessions),
         )
         .route(
+            "/supervisor/default/sessions/{target_id}/history",
+            web::post().to(agent::supervisor::inspect_managed_history),
+        )
+        .route(
             "/supervisor/default/sessions/{target_id}",
             web::put().to(agent::supervisor::configure_managed_session),
         )

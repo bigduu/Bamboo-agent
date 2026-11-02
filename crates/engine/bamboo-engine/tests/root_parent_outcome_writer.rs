@@ -236,8 +236,16 @@ async fn surviving_old_runtime_scope_cannot_borrow_successor_or_publish_main_and
     tokio::time::timeout(WAIT, ready_rx).await.unwrap().unwrap();
 
     // The task still owns binding A at the barrier. Observe its actual expiry
-    // through the directory; no old owner has been killed or completed.
-    tokio::time::timeout(Duration::from_secs(35), async {
+    // through the directory; no old owner has been killed or completed. The
+    // window follows the lease the binding actually claimed, so a future lease
+    // length change widens this proof instead of truncating it.
+    let barrier = f.current().await;
+    assert_eq!(barrier.fence(), owner_a.fence);
+    let expiry_window = (barrier.lease_expires_at - Utc::now())
+        .to_std()
+        .unwrap_or_default()
+        + WAIT;
+    tokio::time::timeout(expiry_window, async {
         loop {
             let current = f.current().await;
             assert_eq!(current.fence(), owner_a.fence);
