@@ -3623,7 +3623,7 @@ impl ChildCompletionCoordinator {
         tokio::spawn(async move {
             use futures::FutureExt;
             let boot_cutoff = Utc::now();
-            if std::panic::AssertUnwindSafe(coordinator.reconcile_orphans_at_boot())
+            if std::panic::AssertUnwindSafe(coordinator.reconcile_orphans_at_boot_at(boot_cutoff))
                 .catch_unwind()
                 .await
                 .is_err()
@@ -3640,10 +3640,13 @@ impl ChildCompletionCoordinator {
                 ticker.tick().await;
                 // Revisit pre-boot leases which were still live during the
                 // first pass. Fresh runs remain beyond the fixed boot cutoff.
-                coordinator
-                    .reconcile_child_run_candidates(boot_cutoff)
-                    .await;
-                if std::panic::AssertUnwindSafe(coordinator.sweep_child_waits())
+                let sweep = async {
+                    coordinator
+                        .reconcile_child_run_candidates(boot_cutoff)
+                        .await;
+                    coordinator.sweep_child_waits().await;
+                };
+                if std::panic::AssertUnwindSafe(sweep)
                     .catch_unwind()
                     .await
                     .is_err()
@@ -3654,12 +3657,14 @@ impl ChildCompletionCoordinator {
         });
     }
 
-    /// One-shot startup reconciliation: a process restart kills every in-flight
-    /// child task AND the in-memory bash backstop polls, but the durable state
-    /// (child index status `running`, parents suspended on bash) survives —
-    /// previously stranding those parents forever.
+    #[cfg(test)]
     async fn reconcile_orphans_at_boot(&self) {
-        let cutoff = Utc::now();
+        self.reconcile_orphans_at_boot_at(Utc::now()).await;
+    }
+
+    /// Repair pre-boot logical runs and re-arm local Bash backstops. A missing
+    /// in-process runner does not prove that a leased Worker stopped.
+    async fn reconcile_orphans_at_boot_at(&self, cutoff: chrono::DateTime<Utc>) {
         self.reconcile_child_run_candidates(cutoff).await;
 
         // (2) Sessions suspended on `waiting_for_bash`: their backstop poll was

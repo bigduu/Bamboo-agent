@@ -428,6 +428,61 @@ async fn terminal_runtime_host_final_save_io_fault_reopens_to_trusted_outcome() 
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_runtime_real_filesystem_final_save_serializes_with_successor_start() {
+    use crate::v2::default_actor_context_tests::DefaultWriteHook;
+    struct Release(Arc<DefaultWriteHook>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let (home, store, child, activation) = fixture(AgentStatusState::Running).await;
+    store.begin_host_run(&child, "host-A").await.unwrap();
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    let second = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+    let expected = store.load_session(&child.id).await.unwrap().unwrap();
+    let hook = DefaultWriteHook::install(
+        &store,
+        "runtime.json",
+        DurableWritePhase::BeforeReplace,
+        false,
+    );
+    let _release = Release(hook.clone());
+    let host = crate::LockedSessionStore::new(store.clone());
+    let mut duplicate = expected.clone();
+    let old_save = tokio::spawn(async move { host.merge_save_runtime(&mut duplicate).await });
+    let barrier = hook.clone();
+    tokio::task::spawn_blocking(move || barrier.wait())
+        .await
+        .unwrap();
+    let mut starting =
+        tokio::spawn(async move { second.begin_host_run(&expected, "host-B").await });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(50), &mut starting)
+            .await
+            .is_err(),
+        "a second Store must wait for the actual old filesystem publication"
+    );
+    hook.release();
+    old_save.await.unwrap().unwrap();
+    starting.await.unwrap().unwrap();
+    let final_state = store.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(final_state.host_run_id(), Some("host-B"));
+    assert_eq!(final_state.last_run_status().as_deref(), Some("running"));
+    assert_eq!(
+        final_state.agent_runtime_state.unwrap().status,
+        AgentStatusState::Initializing
+    );
+}
+
 #[tokio::test]
 async fn terminal_runtime_live_lease_is_not_orphaned_and_expiry_revokes_only_logical_authority() {
     let (_home, store, child, activation) = fixture(AgentStatusState::Running).await;
