@@ -71,8 +71,18 @@ Pending publication is not repaired into an exposed completion. Committed
 receipt publication synchronizes typed status in its existing exact-snapshot CAS.
 The SDK temporarily withholds terminal typed state with the pending source,
 then restores the intended typed state and mirror for the existing proof commit.
-Published-source phase replay still belongs to #2468. Queued launch consumers
-treat completed/cancelled/error as stale; only running/suspended means started.
+For the same Run, a published terminal source cannot return to the older
+pending checkpoint, including after receipt ACK and Store reopen. The normal
+full/runtime writer rejects that replay under its existing physical locks;
+the first pending stage remains nonterminal. A new Run still requires its own
+identity transition and receipt rather than borrowing its predecessor's proof.
+Duplicate source publication repeats the guarded full commit. Runtime or Main
+bytes readable after an uncertain rename are not a durable acknowledgement:
+the retry must complete the actual file and parent-directory syncs and repair
+a Main left behind the leading sidecar. Receipt/anchor checks and the complete
+expected Session CAS remain in force, including on an identical retry.
+Queued launch consumers treat completed/cancelled/error as stale; only
+running/suspended means started.
 
 ## Recovery boundary
 
