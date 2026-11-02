@@ -203,7 +203,17 @@ impl PluginTrustConfig {
         else {
             return false;
         };
-        self.revoked_publishers.remove(id);
+        if let Some(denied) = self.revoked_publishers.remove(id) {
+            let denied: BTreeSet<_> = denied
+                .into_iter()
+                .map(|key| key.to_ascii_lowercase())
+                .collect();
+            // Restore only the reviewed current key. A retired captured key
+            // may have been copied into the custom list while it was denied;
+            // clearing the record must not silently revive those bytes too.
+            self.trusted_keys
+                .retain(|key| !denied.contains(&publisher_key_id(key)));
+        }
         if self.publisher_mode == PublisherMode::Explicit
             && !self
                 .trusted_keys

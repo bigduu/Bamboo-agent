@@ -104,6 +104,36 @@ fn mode_switch_freezes_effective_keys_and_keeps_custom_additions_without_copying
 }
 
 #[test]
+fn reviewed_restoration_never_revives_a_retired_key_copied_into_custom_keys() {
+    for mode in [PublisherMode::Explicit, PublisherMode::FollowDefaults] {
+        let mut policy = PluginTrustConfig::default();
+        policy.set_publisher_mode(mode);
+        let retired = TrustedKey {
+            public_key: "22".repeat(32),
+            ..custom()
+        };
+        policy.revoked_publishers.insert(
+            "jiandu".into(),
+            [publisher_key_id(&retired).to_uppercase()]
+                .into_iter()
+                .collect(),
+        );
+        policy.trusted_keys.extend([custom(), retired.clone()]);
+        assert!(policy.trust_official_publisher("jiandu"));
+        let effective = policy.effective_trusted_keys();
+        assert!(!effective
+            .iter()
+            .any(|key| publisher_key_id(key) == publisher_key_id(&retired)));
+        assert!(effective.contains(&custom()));
+        assert!(effective
+            .iter()
+            .any(|key| key.public_key == JIANDU_PLUGIN_PUBLIC_KEY));
+        assert!(!policy.trusted_keys.contains(&retired));
+        assert_eq!(policy.publisher_mode, mode);
+    }
+}
+
+#[test]
 fn compatibility_and_cli_updates_preserve_denials_and_explicit_empty_lists() {
     let mut config = Config::default();
     config.plugin_trust.revoke_official_publisher("jiandu");
