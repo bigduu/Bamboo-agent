@@ -240,9 +240,15 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             })
             .await
             .unwrap();
+            if matches!(probe.case, Case::Failed) {
+                // Cross the real worker's five-second renewal tick while
+                // diagnostics, the command and its work state stay unchanged.
+                tokio::time::sleep(Duration::from_secs(3)).await;
+            }
             let batch = probe.inspections.fetch_add(wanted, Ordering::SeqCst) / wanted;
             let calls: Vec<_> = (0..wanted).map(|index| json!({"index":index,"id":format!("inspect-{batch}-{index}"),"type":"function","function":{
-                "name":"SubAgent","arguments":json!({"intent":"inspect","target":result(&body,&format!("create-verifier-{index}")).unwrap()["actor_id"]}).to_string()}})).collect();
+                "name":"SubAgent","arguments":json!({"intent":"inspect","target":result(&body,&format!("create-verifier-{index}")).unwrap()["actor_id"],
+                "message":if matches!(probe.case,Case::Failed) {"diagnostics"} else {"overview"}}).to_string()}})).collect();
             (json!({"tool_calls":calls}), "tool_calls")
         }
     } else {
@@ -535,6 +541,28 @@ async fn fixture(case: Case, ultra: bool) {
         "three unchanged complete inspection batches before waiting"
     );
     let calls = probe.root_calls.load(Ordering::SeqCst);
+    if matches!(case, Case::Failed) {
+        let diagnostics: Vec<Value> = probe
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|body| {
+                (0..3)
+                    .rev()
+                    .find_map(|batch| result(body, &format!("inspect-{batch}-0")))
+            })
+            .collect();
+        let revisions: std::collections::BTreeSet<_> = diagnostics
+            .iter()
+            .filter_map(|value| value["activation"]["directory_revision"].as_u64())
+            .collect();
+        assert!(
+            revisions.len() >= 2,
+            "native diagnostics must cross a real renewal: {diagnostics:?}"
+        );
+        eprintln!("2451 native diagnostics renewal revisions={revisions:?}; still inspect={inspect_count}");
+    }
     // Outlast the audited 3–5 second polling interval while the real verifier
     // command is still held and no completion/input event has been sent.
     let quiet_started = std::time::Instant::now();

@@ -82,6 +82,27 @@ impl ChildInspectionProgress {
             object.remove("last_event_at");
             object.remove("heartbeat");
             object.remove("guidance");
+            if object.get("view").and_then(|v| v.as_str()) == Some("diagnostics") {
+                // Actor and Inbox leases renew without any new work. Keep
+                // their semantic status/fences (including expired), not the
+                // revision/expiry bookkeeping changed by a normal renewal.
+                if let Some(activation) =
+                    object.get_mut("activation").and_then(|v| v.as_object_mut())
+                {
+                    activation.remove("directory_revision");
+                }
+                if let Some(leases) = object
+                    .get_mut("leases")
+                    .and_then(|v| v.get_mut("items"))
+                    .and_then(|v| v.as_array_mut())
+                {
+                    for lease in leases {
+                        if let Some(lease) = lease.as_object_mut() {
+                            lease.remove("expires_at");
+                        }
+                    }
+                }
+            }
             let target = target.to_owned();
             let query = if args["intent"] == "inspect" {
                 let message = args["message"].as_str().unwrap_or("overview").trim();
@@ -223,6 +244,66 @@ mod tests {
                 guard.finish_round().is_empty(),
                 "new evidence/pages must remain readable"
             );
+        }
+    }
+
+    #[test]
+    fn child_inspection_wait_diagnostics_ignores_renewals_but_preserves_semantic_changes() {
+        let inspect = call(
+            "SubAgent",
+            json!({"intent":"inspect", "target":"child", "message":"diagnostics"}),
+        );
+        for change in [
+            None,
+            Some(("/activation/attempt", json!(2))),
+            Some(("/activation/status", json!("reclaimable"))),
+            Some(("/leases/items/0/expired", json!(true))),
+            Some(("/leases/items/0/epoch", json!(2))),
+            Some(("/leases/items/0/failure_count", json!(1))),
+            Some(("/queue/generation", json!(2))),
+            Some(("/question/status", json!("pending"))),
+            Some(("/permission/status", json!("pending"))),
+        ] {
+            let mut guard = ChildInspectionProgress::default();
+            for round in 0..5 {
+                let mut diagnostic = json!({
+                    "actor_id":"child", "view":"diagnostics", "available":true,
+                    "observed_status":"running",
+                    "queue":{"available":true,"pending":0,"claimed":1,"generation":1},
+                    "leases":{"available":true,"items":[{
+                        "generation":1,"epoch":1,"expires_at":format!("expiry-{round}"),
+                        "expired":false,"reclaim_count":0,"manual_retry_count":0,
+                        "failure_count":0,"last_error_code":null,"retry_after":null,
+                    }]},
+                    "activation":{"available":true,"logical_state":"active",
+                        "placement_class":"local_task","directory_revision":round,
+                        "attempt":1,"status":"running"},
+                    "dead_letters":{"available":true,"items":[]},"wait":null,
+                    "question":{"status":"none"},"permission":{"available":true,"status":"none"},
+                    "heartbeat":{"runner_observed":true,"last_event_at":round,"round_count":1},
+                    "error":{"present":false},
+                });
+                if let Some((path, value)) = &change {
+                    if round >= 2 {
+                        *diagnostic.pointer_mut(path).unwrap() = value.clone();
+                    }
+                }
+                guard.begin_round(round);
+                guard.observe(
+                    &inspect,
+                    &Ok(ToolResult::text(true, diagnostic.to_string())),
+                    Some("SubAgent"),
+                );
+                assert_eq!(
+                    guard.finish_round(),
+                    if round >= if change.is_some() { 4 } else { 2 } {
+                        vec!["child".to_string()]
+                    } else {
+                        vec![]
+                    },
+                    "semantic change={change:?}, round={round}"
+                );
+            }
         }
     }
 

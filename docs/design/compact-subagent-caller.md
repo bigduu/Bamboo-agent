@@ -13,7 +13,10 @@ times during an inspection-only stretch enters the existing durable wait
 automatically. Alternating targets cannot refund the same observation. A batch
 with new evidence is delivered to the model before any automatic wait.
 This compares successful raw observations before compression and ignores only
-transport timestamps, heartbeat and elapsed-time guidance. New evidence and
+transport timestamps, heartbeat, elapsed-time guidance and diagnostics lease
+renewal bookkeeping (directory revision and lease expiry). Diagnostics keeps
+attempt/status, expired flags, queue generations and failure/question/permission
+changes in the observation version. New evidence and
 pagination get fresh observation counters; a non-inspection call, failure or
 newly admitted human input resets the tracker. It imposes no task or round timeout.
 
