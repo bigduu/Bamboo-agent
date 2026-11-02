@@ -24,6 +24,10 @@ const ORIGINAL: &str = "Preserve this independent Root's original history and co
 const FOLLOWUP: &str = "CONTINUE_ORIGINAL_ROOT: perform the same independent work.";
 const STEER: &str = "NEW_SUPERVISOR_INPUT: acknowledge while the verifier is still running.";
 const ANSWER: &str = "Use the original selected Root; do not create another worker.";
+const DECISION: &str =
+    "USER_DECISION: Use the original selected Root; do not create another worker.";
+const NEEDS_DECISION: &str =
+    "USER_DECISION_REQUIRED: the verifier needs a decision before continuing.";
 const DONE: &str = "SUPERVISOR_COLLECTED_OUTCOMES";
 
 #[derive(Clone, Copy, Debug)]
@@ -160,11 +164,15 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             .filter(|_| !has_tool_result(&body, "answer-verifier"))
         {
             assert!(body.to_string().contains(question.id.as_str()));
-            call(
-                "answer-verifier",
-                "SubAgent",
-                json!({"reply_to":question.id.as_str(),"message":ANSWER}),
-            )
+            if !has(&body, DECISION) {
+                (json!({"content":NEEDS_DECISION}), "stop")
+            } else {
+                call(
+                    "answer-verifier",
+                    "SubAgent",
+                    json!({"reply_to":question.id.as_str(),"message":ANSWER}),
+                )
+            }
         } else if has_tool_result(&body, "answer-verifier") {
             (
                 json!({"content":"ANSWERED_VERIFIER_WITH_ORIGINAL_WAIT"}),
@@ -562,7 +570,7 @@ async fn fixture(case: Case, ultra: bool) {
     .await;
     assert_eq!(
         steered.agent_runtime_state.unwrap().waiting_for_children,
-        Some(original_wait)
+        Some(original_wait.clone())
     );
     let steered_calls = probe.root_calls.load(Ordering::SeqCst);
     post(
@@ -582,6 +590,41 @@ async fn fixture(case: Case, ultra: bool) {
         "release only fixture commands",
     )
     .unwrap();
+    if matches!(case, Case::Question) {
+        let needs_input = wait(&data, SUPERVISOR, |session| {
+            session.last_run_status().as_deref() == Some("suspended")
+                && session.messages.iter().any(|message| {
+                    message.role == Role::Assistant && message.content == NEEDS_DECISION
+                })
+        })
+        .await;
+        assert_eq!(
+            needs_input
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .as_ref(),
+            Some(&original_wait)
+        );
+        assert!(
+            outcomes(&needs_input).is_empty(),
+            "a question is nonterminal, not a completed Child"
+        );
+        assert_eq!(
+            envelopes(&needs_input)
+                .iter()
+                .filter_map(ParentQuestion::from_envelope)
+                .count(),
+            1
+        );
+        post(
+            &client,
+            format!("{base}/sessions/{SUPERVISOR}/guidance"),
+            json!({"id":"2451-decision","text":DECISION,"mode":"after_round"}),
+        )
+        .await;
+    }
     let completed = wait(&data, SUPERVISOR, |s| {
         s.last_run_status().as_deref() == Some("completed")
             && s.messages
@@ -619,6 +662,16 @@ async fn fixture(case: Case, ultra: bool) {
             .count(),
         1
     );
+    if matches!(case, Case::Question) {
+        assert_eq!(
+            completed
+                .messages
+                .iter()
+                .filter(|message| message.id == "2451-decision" && message.content == DECISION)
+                .count(),
+            1
+        );
+    }
     assert!(completed
         .agent_runtime_state
         .unwrap()
