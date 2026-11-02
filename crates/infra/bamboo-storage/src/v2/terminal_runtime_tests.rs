@@ -927,8 +927,17 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
         .unwrap()
         .unwrap();
     assert_eq!(
-        repaired.agent_runtime_state.unwrap().status,
+        repaired.agent_runtime_state.as_ref().unwrap().status,
         AgentStatusState::Idle
     );
-    assert_eq!(before, std::fs::read(runtime_path(home.path())).unwrap());
+    assert_eq!(repaired.last_run_status().as_deref(), Some("completed"));
+    // The first reconciliation binds the observed Actor fence. Subsequent
+    // repair is byte-idempotent and keeps the already opened input gate.
+    let reconciled = std::fs::read(runtime_path(home.path())).unwrap();
+    store
+        .reconcile_child_runtime(&repaired, Utc::now(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reconciled, std::fs::read(runtime_path(home.path())).unwrap());
 }
