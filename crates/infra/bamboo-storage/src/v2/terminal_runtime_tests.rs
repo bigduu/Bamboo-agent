@@ -945,9 +945,15 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
     );
     // A new failed activation cannot inherit the predecessor's ready gate.
     let now = Utc::now();
-    let next = store.claim_activation(&claim(&child.id, "legacy-B", now)).await.unwrap();
+    let next = store
+        .claim_activation(&claim(&child.id, "legacy-B", now))
+        .await
+        .unwrap();
     store.start_activation(&next.fence(), now).await.unwrap();
-    store.finish_activation(&next.fence(), Utc::now(), ActorActivationFinish::Failed).await.unwrap();
+    store
+        .finish_activation(&next.fence(), Utc::now(), ActorActivationFinish::Failed)
+        .await
+        .unwrap();
     assert_terminal(&store, AgentStatusState::Failed, "error").await;
 }
 
