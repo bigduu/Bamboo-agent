@@ -5026,6 +5026,9 @@ mod tests {
             }
             let expired_actor = mode == "expired";
             let mut child = planner_test_child(&parent, "lost-plan-child");
+            // Real first activation requires the creator's exact parent birth;
+            // the report-only legacy helper intentionally does not supply it.
+            child.parent_created_at = Some(parent.created_at);
             child.set_last_run_status("running");
             child
                 .agent_runtime_state
