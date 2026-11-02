@@ -3,6 +3,7 @@
 //! fence or by startup reconciliation, without a version migration.
 
 use super::*;
+use crate::v2::DefaultWriterGuards;
 use bamboo_domain::{AgentRuntimeState, AgentStatusState, SessionKind};
 
 fn conflict(message: &str) -> io::Error {
