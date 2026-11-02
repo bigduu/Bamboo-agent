@@ -494,7 +494,9 @@ async fn terminal_runtime_native_preparation_refusal_does_not_create_ownerless_h
     harness.runner.shutdown().await.unwrap();
     let error = harness.launch(&child).await.unwrap_err();
     assert!(error.contains("shutting down"), "{error}");
-    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let reopened = bamboo_storage::SessionStoreV2::new(home.path().into())
+        .await
+        .unwrap();
     let current = reopened.load_session(&child.id).await.unwrap().unwrap();
     assert!(current.host_run_id().is_none());
     assert_eq!(serde_json::to_value(&current).unwrap(), before);
