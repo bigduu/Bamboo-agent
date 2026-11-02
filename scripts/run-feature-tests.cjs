@@ -106,7 +106,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Host terminal/rejection/queued-closure cases are cfg(test), owned by default
 // engine packages-3 and storage packages-0. SubAgent and V2 retain their exact
 // test-utils cfg expressions; no additive case or automatic owner was added.
-const FEATURE_SOURCE_SHA256 = "48dcb3c0d3ff8e94bf411baf2c1c5c582741d6ba2aa6ae0abc0fc8e6d145054d";
+// Publisher mode/revocation serde and CLI/CAS cases are unconditional config
+// library tests in packages-4. Policy HTTP/setup cases remain server-handlers;
+// signature and compatibility-merge cases remain server-other. Moving the
+// ungated policy definitions out of config.rs changes this source fingerprint,
+// but no feature cfg expression, default target or 20 additive cases changes.
+const FEATURE_SOURCE_SHA256 = "4e52bc483fa44b73974fb832f33ee5bf0e849f6659c29adcd35de17af7667d4d";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
