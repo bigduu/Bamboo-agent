@@ -3,7 +3,7 @@
 Tracking: [#2448](https://github.com/bigduu/Bamboo-agent/issues/2448).
 Storage projection is [#2454](https://github.com/bigduu/Bamboo-agent/issues/2454);
 Child final-save and terminal consumers are [#2460](https://github.com/bigduu/Bamboo-agent/issues/2460).
-Exact Child admission remains [#2481](https://github.com/bigduu/Bamboo-agent/issues/2481),
+Exact Child admission is [#2481](https://github.com/bigduu/Bamboo-agent/issues/2481),
 receipt replay [#2468](https://github.com/bigduu/Bamboo-agent/issues/2468),
 Root outcome/recovery [#2470](https://github.com/bigduu/Bamboo-agent/issues/2470),
 and Child startup/parent proof [#2455](https://github.com/bigduu/Bamboo-agent/issues/2455).
@@ -37,8 +37,11 @@ that gate; it repairs stale `Initializing`/`Running` state instead.
 ## Identity and persistence
 
 The `Storage::begin_host_run` port binds `runtime.host_run_id` to a reserved Run.
-[Exact Host entrypoint integration](https://github.com/bigduu/Bamboo-agent/issues/2481)
-remains separate; final-save synchronization alone does not enable it. Storage compares the prior Host identity and Session
+[Child Host/SDK entrypoints](https://github.com/bigduu/Bamboo-agent/issues/2481)
+bind the actual reserved Run UUID before execution. Native backend preparation
+must succeed first; a preparation refusal preserves canonical Session state.
+A binding conflict never falls through into legacy execution. Storage compares
+the prior Host identity and Session
 incarnation under the physical Session lock, and refuses a different live Actor
 owner. This dedicated transition preserves canonical content. Ordinary full and
 runtime saves cannot change that Host identity. The captured child launch generation prevents an old activation from consuming a newer pending retry/reset/accumulate. The pipeline/Ticket runtime
@@ -46,9 +49,26 @@ runtime saves cannot change that Host identity. The captured child launch genera
 Copying a Session removes the Host Run identity.
 Ordinary legacy writers with neither incoming nor persisted Host UUID retain
 their existing contract until the Host integration binds a run. They receive no
-new activation or physical-stop proof. The first binding and automatic orphan
-notifications remain the explicit #2481/#2455 admission boundaries; this slice
-does not retrofit identity by guessing from an unmarked legacy snapshot.
+new activation or physical-stop proof. Automatic orphan notification remains
+#2455; unmarked legacy snapshots do not acquire inferred execution authority.
+
+A legacy backend can claim its Actor during execution. Binding records its exact
+terminal predecessor fence; a new Actor invalidates startup writes even before
+another Host UUID is installed. An expired Child owner is revoked under those
+same locks only without a current pending/published/unknown completion source.
+Its own authority and runtime failure commit in one retained filesystem job
+before the successor binds; renewal first makes binding refuse. This is logical
+revocation, not proof of a stopped Worker. Root expiry is not handled this way.
+
+An owned pre-execution closure retains the reserved UUID, original birth/input,
+launch generation and event publication fence. If a bound Child cannot save
+startup, cleanup conditionally commits Failed and cache under physical guards;
+caller cancellation retains that cleanup before runner/event retirement. A live
+Actor, changed input, a new completion source or successor invalidates it. Native
+cleanup continues through its existing safe-stop/unknown-quarantine boundary.
+An unstarted cancelled/failed queued launch closes its own generation tombstone
+while retaining its predecessor marker; it cannot borrow that Run's sealed
+result. Terminal merge writers never adopt a successor's launch generation.
 
 `finish_activation` validates the full activation fence. It commits authority
 before projecting the terminal read model while retaining the same lifecycle,
@@ -86,7 +106,9 @@ running/suspended means started.
 
 ## Recovery boundary
 
-[Startup integration and recovery notification fencing](https://github.com/bigduu/Bamboo-agent/issues/2455) are the next dependent slice. They must validate the recovered child at the actual parent wait commit under the shared root tree writer, preserve fresh/unexpired owners and waits, and avoid stale cache publication. This slice does not enable that automatic reconciliation.
+[Startup integration and recovery notification fencing](https://github.com/bigduu/Bamboo-agent/issues/2455) are the next dependent slice. They must validate the recovered child at the actual parent wait commit under the shared root tree writer, preserve fresh/unexpired owners and waits, and avoid stale cache publication. This slice does not enable that automatic reconciliation. Root claims with
+original reset identity are #2482; owner-attributed Root outcome recovery is
+#2470. Child admission does not enable Root Host UUID binding.
 
 `Storage::reconcile_child_runtime` also provides a targeted repair entry point.
 Targeted repairs compare the exact control-plane, birth, current activation, Host Run, Inbox admission and launch generation under the same physical locks; pending broker delivery and new pending launches are excluded. These repairs update runtime/index state, preserve Main/transcript bytes and

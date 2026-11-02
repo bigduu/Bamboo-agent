@@ -64,6 +64,8 @@ pub struct SessionExecutionReservation {
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     activation: SessionExecutionActivationOwnership,
     root_actor: Option<Box<RootActorExecution>>,
+    child_startup: Option<ChildHostStartup>,
+    child_closure: Option<tokio::task::JoinHandle<()>>,
     physical_admission: Option<super::root_execution_lifetime::RootRunAdmission>,
     execution_persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
     persistence_bound: bool,
@@ -82,6 +84,80 @@ impl SessionExecutionReservation {
 
     pub fn cancel_token(&self) -> &CancellationToken {
         &self.cancel_token
+    }
+
+    /// Retain the no-execution cleanup until the exact reservation reaches the
+    /// common spawn handoff. Dropping an HTTP future must not strand its bound
+    /// Child run, and cleanup must not release a successor's identity.
+    pub async fn arm_child_host_startup(
+        &mut self,
+        agent: &Agent,
+        expected: &Session,
+        cache: SessionCache,
+        events: tokio::sync::broadcast::Sender<AgentEvent>,
+    ) -> std::io::Result<()> {
+        self.arm_child_host_startup_inner(agent, expected, cache, Some(events))
+            .await
+    }
+
+    async fn arm_child_host_startup_inner(
+        &mut self,
+        agent: &Agent,
+        expected: &Session,
+        cache: SessionCache,
+        events: Option<tokio::sync::broadcast::Sender<AgentEvent>>,
+    ) -> std::io::Result<()> {
+        if expected.kind != bamboo_domain::SessionKind::Child || expected.id != self.session_id {
+            return Err(std::io::Error::other("Child startup target mismatch"));
+        }
+        if self.child_startup.is_none() {
+            let publication = self
+                .runners
+                .read()
+                .await
+                .get(&self.session_id)
+                .filter(|runner| runner.run_id == self.run_id)
+                .map(|runner| runner.event_publication.clone())
+                .ok_or_else(|| std::io::Error::other("Child startup runner was superseded"))?;
+            let sent = std::sync::atomic::AtomicBool::new(false);
+            self.child_startup = Some(ChildHostStartup {
+                storage: agent.storage().clone(),
+                expected: expected.clone(),
+                run_id: self.run_id.clone(),
+                publish: Arc::new(move |saved| {
+                    publication.publish(|| {
+                        cache.insert(
+                            saved.id.clone(),
+                            Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                        );
+                        if !sent.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                            if let Some(events) = &events {
+                                let _ = events.send(AgentEvent::Error {
+                                    message: saved.last_run_error().unwrap_or_else(|| {
+                                        "Child startup failed before execution".into()
+                                    }),
+                                });
+                            }
+                        }
+                    });
+                }),
+            });
+        }
+        Ok(())
+    }
+
+    pub async fn fail_child_host_startup(&mut self, detail: &str) {
+        if let Some(startup) = self.child_startup.take() {
+            let detail = detail.to_string();
+            // Once started, retain the cleanup even if this waiter is cancelled.
+            self.child_closure = Some(tokio::spawn(async move {
+                startup.close(&detail).await;
+            }));
+        }
+        if let Some(closure) = self.child_closure.as_mut() {
+            let _ = closure.await;
+        }
+        self.child_closure = None;
     }
 
     /// Bind before an adapter persists execution state or admits a provider.
@@ -250,6 +326,8 @@ impl SessionExecutionReservation {
             physical_admission: reservation.physical_admission,
             execution_persistence: None,
             persistence_bound: false,
+            child_startup: None,
+            child_closure: None,
             selected_input: false,
             armed: true,
         }
@@ -278,6 +356,8 @@ impl SessionExecutionReservation {
             physical_admission: reservation.physical_admission,
             execution_persistence: None,
             persistence_bound: false,
+            child_startup: None,
+            child_closure: None,
             selected_input: false,
             armed: true,
         }
@@ -378,7 +458,17 @@ impl SessionExecutionReservation {
         let cleanup_session_id = session_id.clone();
         let cleanup_run_id = run_id.clone();
         let selected_input = self.selected_input;
+        let child_startup = self.child_startup.take();
+        let child_closure = self.child_closure.take();
         let cleanup = tokio::spawn(async move {
+            if let Some(closure) = child_closure {
+                let _ = closure.await;
+            }
+            if let Some(startup) = child_startup {
+                startup
+                    .close("startup reservation abandoned before execution")
+                    .await;
+            }
             cleanup_execution_reservation(
                 activation,
                 runners,
@@ -403,6 +493,15 @@ impl SessionExecutionReservation {
             self.cancel_token.cancel();
         }
         self.armed = false;
+        if let Some(startup) = self.child_startup.take() {
+            if existing_run_id != self.run_id {
+                tokio::spawn(async move {
+                    startup
+                        .close("startup registration rejected before execution")
+                        .await;
+                });
+            }
+        }
     }
 
     pub(crate) fn matches_execution_target(
@@ -420,6 +519,7 @@ impl SessionExecutionReservation {
         &mut self,
     ) -> (CancellationToken, Option<SessionRunRegistration>) {
         self.armed = false;
+        self.child_startup = None;
         let registration = match std::mem::replace(
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,
@@ -452,8 +552,18 @@ impl Drop for SessionExecutionReservation {
         let session_id = self.session_id.clone();
         let run_id = self.run_id.clone();
         let selected_input = self.selected_input;
+        let child_startup = self.child_startup.take();
+        let child_closure = self.child_closure.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
+                if let Some(closure) = child_closure {
+                    let _ = closure.await;
+                }
+                if let Some(startup) = child_startup {
+                    startup
+                        .close("startup reservation dropped before execution")
+                        .await;
+                }
                 cleanup_execution_reservation(
                     activation,
                     runners,
@@ -463,6 +573,25 @@ impl Drop for SessionExecutionReservation {
                 )
                 .await;
             });
+        }
+    }
+}
+
+struct ChildHostStartup {
+    storage: Arc<dyn bamboo_domain::Storage>,
+    expected: Session,
+    run_id: String,
+    publish: bamboo_domain::storage::RootActorRuntimePublisher,
+}
+
+impl ChildHostStartup {
+    async fn close(self, detail: &str) {
+        if let Err(error) = self
+            .storage
+            .fail_child_host_startup(&self.expected, &self.run_id, detail, self.publish)
+            .await
+        {
+            tracing::warn!(session_id = %self.expected.id, run_id = %self.run_id, %error, "Child pre-execution closure unconfirmed");
         }
     }
 }
@@ -595,6 +724,8 @@ async fn reserve_logical_session(
         physical_admission: None,
         execution_persistence: None,
         persistence_bound: false,
+        child_startup: None,
+        child_closure: None,
         selected_input: false,
         armed: true,
     };
@@ -815,6 +946,8 @@ async fn reserve_session_execution_inner(
         physical_admission: reservation.physical_admission,
         execution_persistence: None,
         persistence_bound: false,
+        child_startup: None,
+        child_closure: None,
         selected_input,
         armed: true,
     };
@@ -1258,6 +1391,41 @@ pub fn spawn_session_execution_with_upstream_retry(
                 .unwrap_or_else(|| agent.persistence().clone());
             let agent = Arc::new(agent.with_execution_persistence(persistence));
             let activation_run_id = execution_reservation.run_id().to_string();
+            if session.kind == bamboo_agent_core::SessionKind::Child {
+                // Non-HTTP resumed Child entrypoints need the same retained
+                // startup closure. Their existing mpsc forwarder owns errors;
+                // the guarded callback only publishes the exact cache state.
+                if let Err(error) = execution_reservation
+                    .arm_child_host_startup_inner(&agent, &session, sessions_cache.clone(), None)
+                    .await
+                {
+                    let _ = mpsc_tx
+                        .send(AgentEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    execution_reservation.abandon().await;
+                    return;
+                }
+                if let Err(error) = agent
+                    .storage()
+                    .begin_host_run(&session, &activation_run_id)
+                    .await
+                {
+                    let _ = mpsc_tx
+                        .send(AgentEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    execution_reservation
+                        .fail_child_host_startup(&error.to_string())
+                        .await;
+                    execution_reservation.abandon().await;
+                    return;
+                }
+                session.set_host_run_id(&activation_run_id);
+                session.set_last_run_status("running");
+            }
             let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
             let (cancel_token, mut activation_registration) =
                 execution_reservation.disarm_for_execution();
@@ -2168,6 +2336,8 @@ mod reservation_tests {
             physical_admission: None,
             execution_persistence: None,
             persistence_bound: false,
+            child_startup: None,
+            child_closure: None,
             selected_input: false,
             armed: true,
         };
@@ -2203,6 +2373,8 @@ mod reservation_tests {
             physical_admission: None,
             execution_persistence: None,
             persistence_bound: false,
+            child_startup: None,
+            child_closure: None,
             selected_input: false,
             armed: true,
         };
