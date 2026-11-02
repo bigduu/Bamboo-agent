@@ -631,3 +631,157 @@ async fn root_terminal_live_main_requires_expiry_and_fixed_restart_cutoff_renewa
         }
     }
 }
+
+#[tokio::test]
+async fn root_terminal_uncertain_actor_and_runtime_writes_require_real_confirmation() {
+    use crate::v2::actor_directory_lifetime_tests::ActorWriteHook;
+    for (file, phase) in [
+        ("actor-authority.json", DurableWritePhase::BeforeReplace),
+        ("actor-authority.json", DurableWritePhase::AfterReplace),
+        ("runtime.json", DurableWritePhase::BeforeReplace),
+        ("runtime.json", DurableWritePhase::AfterReplace),
+    ] {
+        let f = Fixture::new(false, 300).await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let mark = count.clone();
+        let hook = ActorWriteHook::install(&f.store, file, phase, true);
+        hook.release();
+        assert!(f
+            .store
+            .finish_root_activation_observed(
+                &f.owner,
+                Utc::now(),
+                ActorActivationFinish::Failed,
+                Some(Arc::new(move |_| {
+                    mark.fetch_add(1, Ordering::SeqCst);
+                }))
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            0,
+            "uncertain commit cannot publish cache"
+        );
+        let observed = f.store.inspect_actor(&f.root.id).await.unwrap();
+        if file == "actor-authority.json" && phase == DurableWritePhase::BeforeReplace {
+            assert_eq!(
+                observed.activation.unwrap().status,
+                ActorActivationStatus::Running
+            );
+            assert!(f
+                .reconcile(Utc::now() + chrono::Duration::seconds(1))
+                .await
+                .unwrap()
+                .is_none());
+            f.store
+                .finish_root_activation_observed(
+                    &f.owner,
+                    Utc::now(),
+                    ActorActivationFinish::Failed,
+                    None,
+                )
+                .await
+                .unwrap();
+        } else {
+            assert_eq!(
+                observed.activation.unwrap().status,
+                ActorActivationStatus::Failed
+            );
+            f.reconcile(Utc::now() - chrono::Duration::hours(1))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                hook.reconfirmed() > 0,
+                "actual authority/runtime durability must be confirmed"
+            );
+        }
+        assert_typed(&f.current().await, "error", AgentStatusState::Failed);
+        let reopened = SessionStoreV2::new(f.home.path().into()).await.unwrap();
+        assert_typed(
+            &reopened.load_session(&f.root.id).await.unwrap().unwrap(),
+            "error",
+            AgentStatusState::Failed,
+        );
+    }
+}
+
+#[tokio::test]
+async fn root_terminal_reset_context_cannot_reuse_previous_marker_or_actual_old_owner() {
+    use bamboo_domain::{
+        conversation_reset_snapshot_sha256, prepare_conversation_reset,
+        ConversationResetPreparation, ConversationResetReadSafety, ConversationResetRequest,
+    };
+    let f = Fixture::new(false, 300).await;
+    f.store
+        .finish_root_activation_observed(&f.owner, Utc::now(), ActorActivationFinish::Failed, None)
+        .await
+        .unwrap();
+    let old = f.current().await;
+    let old_marker = old.metadata[ROOT_OBSERVATION].clone();
+    // Synthetic future producer, exactly as the existing generation fixtures.
+    // This is not a reset API or a bypass on any real Session.
+    let mut source = old.clone();
+    source.session_version = Session::new("current-contract", "model").session_version;
+    let request = ConversationResetRequest {
+        session_id: source.id.clone(),
+        operation_id: format!("0:{}", Uuid::new_v4()),
+        expected_birth_token: source.root_mode_birth_token(),
+        expected_conversation_revision: 0,
+        expected_snapshot_sha256: conversation_reset_snapshot_sha256(&source).unwrap(),
+    };
+    let ConversationResetPreparation::Prepared(prepared) = prepare_conversation_reset(
+        &source,
+        &Default::default(),
+        &request,
+        ConversationResetReadSafety::IdleObserved,
+        Utc::now(),
+    )
+    .unwrap() else {
+        panic!("synthetic settled ordinary Root reset preparation");
+    };
+    let mut next = prepared.proposed_session;
+    next.conversation_reset = Some(prepared.proposed_state);
+    next.agent_runtime_state = Some(AgentRuntimeState::new(&next.id));
+    next.set_last_run_status("running");
+    next.clear_last_run_error();
+    next.metadata.insert(ROOT_OBSERVATION.into(), old_marker);
+    f.store.flush_search_index().await;
+    let held = f.store.lock_session_lifecycle_exclusive().await.unwrap();
+    fs::write(
+        f.path("session.json"),
+        crate::v2::compact_main::serialize_main(&next).unwrap(),
+    )
+    .await
+    .unwrap();
+    fs::write(
+        f.path("runtime.json"),
+        serde_json::to_vec_pretty(&crate::v2::runtime_sidecar_snapshot(&next)).unwrap(),
+    )
+    .await
+    .unwrap();
+    SessionStoreV2::write_staged_root_tool_proof(
+        &f.path("session.json").parent().unwrap().to_path_buf(),
+        &next,
+    )
+    .await
+    .unwrap();
+    drop(held);
+    let before = fs::read(f.path("runtime.json")).await.unwrap();
+    assert!(f
+        .reconcile(Utc::now() + chrono::Duration::seconds(1))
+        .await
+        .unwrap()
+        .is_none());
+    assert!(f
+        .store
+        .finish_root_activation_observed(&f.owner, Utc::now(), ActorActivationFinish::Failed, None)
+        .await
+        .is_err());
+    assert_eq!(fs::read(f.path("runtime.json")).await.unwrap(), before);
+    assert_eq!(
+        f.current().await.agent_runtime_state.unwrap().status,
+        AgentStatusState::Initializing
+    );
+}

@@ -14,6 +14,8 @@ struct RootObservation {
     created_at: DateTime<Utc>,
     fence_sha256: String,
     conversation_reset_sha256: String,
+    project_sha256: String,
+    metadata_version: u64,
 }
 fn invalid() -> io::Error {
     io::Error::new(
@@ -31,6 +33,11 @@ fn observation(session: &Session, fence: &ActorActivationFence) -> io::Result<Ro
     Ok(RootObservation {
         schema_version: 1,
         created_at: session.created_at,
+        project_sha256: format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&session.project_id_meta())?)
+        ),
+        metadata_version: session.metadata_version,
         fence_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(fence)?)),
         conversation_reset_sha256: session
             .conversation_reset_sha256()
@@ -46,21 +53,57 @@ fn matches_observation(session: &Session, fence: &ActorActivationFence) -> io::R
         return Err(invalid());
     }
     let recorded: RootObservation = serde_json::from_str(raw).map_err(|_| invalid())?;
-    Ok(recorded == observation(session, fence)?)
+    Ok(compatible_observation(
+        &recorded,
+        &observation(session, fence)?,
+    ))
+}
+fn compatible_observation(recorded: &RootObservation, current: &RootObservation) -> bool {
+    recorded.schema_version == 1
+        && recorded.created_at == current.created_at
+        && recorded.fence_sha256 == current.fence_sha256
+        && recorded.conversation_reset_sha256 == current.conversation_reset_sha256
+        && recorded.project_sha256 == current.project_sha256
+        && current
+            .metadata_version
+            .checked_sub(recorded.metadata_version)
+            .is_some_and(|delta| delta <= 1)
 }
 pub(super) fn stamp_owned_observation(
     session: &mut Session,
     owner: &RootActorRuntimeWrite,
+    canonical: &Session,
 ) -> io::Result<()> {
     owner
         .conversation_generation
-        .check_canonical(session)
+        .check_canonical(canonical)
         .map_err(|_| invalid())?;
-    if owner.created_at != session.created_at {
+    session
+        .check_conversation_generation(canonical)
+        .map_err(|_| invalid())?;
+    if owner.created_at != canonical.created_at
+        || session.created_at != canonical.created_at
+        || session.id != canonical.id
+        || session.project_id_meta() != canonical.project_id_meta()
+    {
         return Err(invalid());
     }
-    let marker = serde_json::to_string(&observation(session, &owner.fence)?)?;
-    session.metadata.insert(ROOT_OBSERVATION.into(), marker);
+    let current = observation(canonical, &owner.fence)?;
+    if let Some(raw) = canonical.metadata.get(ROOT_OBSERVATION) {
+        if raw.len() > 2048 {
+            return Err(invalid());
+        }
+        let recorded: RootObservation = serde_json::from_str(raw).map_err(|_| invalid())?;
+        if recorded.schema_version != 1
+            || (recorded.fence_sha256 == current.fence_sha256
+                && !compatible_observation(&recorded, &current))
+        {
+            return Err(invalid());
+        }
+    }
+    session
+        .metadata
+        .insert(ROOT_OBSERVATION.into(), serde_json::to_string(&current)?);
     session
         .metadata
         .remove("runtime.reconciled_activation_fence");
@@ -74,7 +117,7 @@ pub(super) fn preserve_observation(incoming: &mut Session, canonical: Option<&Se
             .insert(ROOT_OBSERVATION.into(), raw.clone());
     }
 }
-fn validate_projection_identity(
+pub(super) fn validate_projection_identity(
     entry: &ActorDirectoryEntry,
     session: &Session,
 ) -> Result<(), ActorDirectoryError> {
@@ -163,8 +206,10 @@ impl SessionStoreV2 {
             .ok_or(ActorDirectoryError::InvalidIdentity)?;
         validate_projection_identity(entry, &current)?;
         if main.project_id_meta() != current.project_id_meta()
-            || main.metadata_version < entry.actor.observed_metadata_version
-            || main.metadata_version > current.metadata_version
+            || !current
+                .metadata_version
+                .checked_sub(main.metadata_version)
+                .is_some_and(|delta| delta <= 1)
         {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
@@ -338,6 +383,15 @@ impl SessionStoreV2 {
     ) -> Result<ActorActivation, ActorDirectoryError> {
         let fence = &owner.fence;
         let (rel, path, guards) = self.lock_actor_runtime(&fence.actor_id).await?;
+        if !Self::regular_actor_file(
+            &self
+                .abs_path_from_rel(&rel)
+                .join(super::super::RUNTIME_SIDECAR_FILE),
+        )
+        .await?
+        {
+            return Err(ActorDirectoryError::Corrupt);
+        }
         let initial = self
             .projection_target(&fence.actor_id, &rel)
             .await
@@ -372,7 +426,7 @@ impl SessionStoreV2 {
         }
         let mut marked = initial.clone();
         let was_attributed = matches_observation(&initial, fence).unwrap_or(false);
-        stamp_owned_observation(&mut marked, owner).map_err(storage)?;
+        stamp_owned_observation(&mut marked, owner, &initial).map_err(storage)?;
         if !was_attributed
             && (active.status.is_live() || initial.metadata.contains_key(ROOT_OBSERVATION))
             && !initial.has_runtime_wait()
@@ -429,6 +483,16 @@ impl SessionStoreV2 {
             .lock_actor_runtime(&expected.id)
             .await
             .map_err(io::Error::other)?;
+        if !Self::regular_actor_file(
+            &self
+                .abs_path_from_rel(&rel)
+                .join(super::super::RUNTIME_SIDECAR_FILE),
+        )
+        .await
+        .map_err(io::Error::other)?
+        {
+            return Err(invalid());
+        }
         let Some(latest) = self.projection_target(&expected.id, &rel).await? else {
             return Ok(None);
         };

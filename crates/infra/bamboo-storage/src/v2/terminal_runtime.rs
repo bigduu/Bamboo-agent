@@ -478,6 +478,9 @@ impl SessionStoreV2 {
                 super::root_terminal_runtime::stamp_owned_observation(
                     &mut observed_incoming,
                     proof.owner(),
+                    latest
+                        .as_ref()
+                        .ok_or_else(|| conflict("Root writer requires its canonical runtime"))?,
                 )?;
             } else {
                 super::root_terminal_runtime::preserve_observation(
@@ -529,6 +532,17 @@ impl SessionStoreV2 {
         } else {
             None
         };
+        if guards.root_actor.is_some() {
+            super::root_terminal_runtime::validate_projection_identity(
+                observed
+                    .as_ref()
+                    .ok_or_else(|| conflict("Root Actor authority disappeared"))?,
+                latest
+                    .as_ref()
+                    .ok_or_else(|| conflict("Root canonical runtime disappeared"))?,
+            )
+            .map_err(io::Error::other)?;
+        }
         if let Some(activation) = observed.and_then(|entry| entry.activation) {
             if candidate.host_run_id() != Some(activation.run_id.as_str()) {
                 // A newly bound executor can checkpoint its startup before
