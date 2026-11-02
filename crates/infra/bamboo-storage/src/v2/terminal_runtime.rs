@@ -124,6 +124,10 @@ impl SessionStoreV2 {
             || pending_delivery(&before)
             || !before.host_run_matches_launch()
             || before.last_run_status().as_deref() == Some("pending")
+            || (before.host_run_id().is_some()
+                && !super::super::child_wait_control_plane::terminal(
+                    before.last_run_status().as_deref().unwrap_or(""),
+                ))
             || before
                 .host_run_id()
                 .is_some_and(|id| id != activation.run_id)
@@ -132,21 +136,10 @@ impl SessionStoreV2 {
         }
         let mut after = before.clone();
         after.set_last_run_status(status);
-        let host_final_save_pending = before.host_run_id().is_some()
-            && !super::super::child_wait_control_plane::terminal(
-                before.last_run_status().as_deref().unwrap_or(""),
-            );
-        if status == "completed" && !host_final_save_pending {
+        if status == "completed" {
             after.clear_last_run_error();
         }
         after.synchronize_terminal_runtime_status();
-        // The activation result is trusted, but the Host's broker receipt and
-        // completion-source gate still owns public delivery readiness.
-        if host_final_save_pending {
-            if let Some(previous) = before.last_run_status() {
-                after.set_last_run_status(previous);
-            }
-        }
         self.commit_runtime_projection(&before, &after, rel, guards)
             .await
     }

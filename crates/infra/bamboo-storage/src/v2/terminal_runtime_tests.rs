@@ -416,7 +416,6 @@ async fn terminal_runtime_host_final_save_io_fault_reopens_to_trusted_outcome() 
             drop(host);
             drop(store);
             let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
-            assert_terminal(&reopened, typed, status).await;
             let current = reopened.load_session(&child.id).await.unwrap().unwrap();
             reopened
                 .reconcile_child_runtime(&current, Utc::now(), "error", Some("restart"))
@@ -447,6 +446,10 @@ async fn terminal_runtime_real_filesystem_final_save_serializes_with_successor_s
         )
         .await
         .unwrap();
+    let mut completed = store.load_session(&child.id).await.unwrap().unwrap();
+    completed.set_last_run_status("completed");
+    completed.synchronize_terminal_runtime_status();
+    store.save_session(&completed).await.unwrap();
     let second = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
     let expected = store.load_session(&child.id).await.unwrap().unwrap();
     let hook = DefaultWriteHook::install(
@@ -481,6 +484,134 @@ async fn terminal_runtime_real_filesystem_final_save_serializes_with_successor_s
         final_state.agent_runtime_state.unwrap().status,
         AgentStatusState::Initializing
     );
+}
+
+#[tokio::test]
+async fn terminal_runtime_pending_retry_generation_survives_old_finish_and_reconciliation() {
+    let (_home, store, child, activation) = fixture(AgentStatusState::Running).await;
+    store.begin_host_run(&child, "host-A").await.unwrap();
+    let mut completed = store.load_session(&child.id).await.unwrap().unwrap();
+    completed.set_last_run_status("cancelled");
+    store.save_session(&completed).await.unwrap();
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Cancelled,
+        )
+        .await
+        .unwrap();
+    let old = store.load_session(&child.id).await.unwrap().unwrap();
+    let mut queued = old.clone();
+    queued.advance_child_launch_generation().unwrap();
+    queued.set_last_run_status("pending");
+    queued.add_message(bamboo_domain::Message::user("retained retry input"));
+    store.save_session(&queued).await.unwrap();
+    let queued = store.load_session(&child.id).await.unwrap().unwrap();
+    assert!(store
+        .reconcile_child_runtime(&queued, Utc::now(), "error", None)
+        .await
+        .unwrap()
+        .is_none());
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Cancelled,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_run_status()
+            .as_deref(),
+        Some("pending")
+    );
+    assert!(store.save_session(&old).await.is_err());
+    assert!(store.save_runtime_state(&old).await.is_err());
+    store.begin_host_run(&queued, "host-B").await.unwrap();
+    let now = Utc::now();
+    let next = store
+        .claim_activation(&claim(&child.id, "host-B", now))
+        .await
+        .unwrap();
+    store.start_activation(&next.fence(), now).await.unwrap();
+    let resumed = store.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(resumed.host_run_id(), Some("host-B"));
+    assert!(resumed.host_run_matches_launch());
+    assert_eq!(
+        resumed
+            .messages
+            .iter()
+            .filter(|m| m.content == "retained retry input")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_runtime_uncertain_finish_readback_preserves_outcome_before_real_host_save() {
+    let (home, store, mut child, activation) = fixture(AgentStatusState::Initializing).await;
+    let hook = ActorWriteHook::install(
+        &store,
+        "runtime.json",
+        DurableWritePhase::BeforeReplace,
+        true,
+    );
+    hook.release();
+    let confirmed = store
+        .finish_activation_observed(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    assert_eq!(confirmed.status, ActorActivationStatus::Succeeded);
+    child.set_last_run_status("completed");
+    child.synchronize_terminal_runtime_status();
+    let host = crate::LockedSessionStore::new(store.clone());
+    host.merge_save_runtime(&mut child).await.unwrap();
+    drop(host);
+    drop(store);
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    assert_terminal(&reopened, AgentStatusState::Completed, "completed").await;
+}
+
+#[tokio::test]
+async fn terminal_runtime_inflight_host_does_not_publish_terminal_before_broker_source_stage() {
+    let (_home, store, child, activation) = fixture(AgentStatusState::Initializing).await;
+    store.begin_host_run(&child, "host-A").await.unwrap();
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    let mut staged = store.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(staged.last_run_status().as_deref(), Some("running"));
+    assert_eq!(
+        staged.agent_runtime_state.as_ref().unwrap().status,
+        AgentStatusState::Initializing
+    );
+    staged.metadata.insert(
+        "runtime.child_completion_source_v1".into(),
+        "{\"pending_confirmation\":{}}".into(),
+    );
+    store.save_runtime_state(&staged).await.unwrap();
+    let current = store.load_session(&child.id).await.unwrap().unwrap();
+    assert!(store
+        .reconcile_child_runtime(&current, Utc::now(), "error", None)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(current.last_run_status().as_deref(), Some("running"));
 }
 
 #[tokio::test]
