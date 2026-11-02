@@ -1010,6 +1010,28 @@ pub trait Storage: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Bind a reserved Host run before executing it. Implementations with
+    /// durable runtime state must CAS the old Host identity under their physical
+    /// Session lock; ordinary final-save cannot replace this identity.
+    async fn begin_host_run(&self, expected: &Session, run_id: &str) -> std::io::Result<()> {
+        let _ = (expected, run_id);
+        Ok(())
+    }
+
+    /// Reconcile a selected Child snapshot under the physical Session/Actor
+    /// locks. Return None when superseded, waiting or still leased. A terminal
+    /// return proves logical closure, never physical Worker termination.
+    async fn reconcile_child_runtime(
+        &self,
+        expected: &Session,
+        before: chrono::DateTime<chrono::Utc>,
+        status: &str,
+        error: Option<&str>,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, before, status, error);
+        Ok(None)
+    }
+
     /// Append one analysis record — a single JSON line — to the session's
     /// dedicated, append-only token-usage log, stored alongside the session's
     /// other files in its per-session directory.

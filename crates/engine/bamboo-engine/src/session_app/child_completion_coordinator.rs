@@ -16,10 +16,10 @@ use bamboo_domain::{
 };
 
 use crate::execution::{
-    finalize_runner, reserve_runner_core, reserve_session_execution, spawn_session_execution,
-    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource,
-    ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
-    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
+    reserve_runner_core, reserve_session_execution, spawn_session_execution, AgentRunner,
+    AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource, ReserveOutcome,
+    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
+    SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -3622,6 +3622,7 @@ impl ChildCompletionCoordinator {
         let coordinator = Arc::clone(self);
         tokio::spawn(async move {
             use futures::FutureExt;
+            let boot_cutoff = Utc::now();
             if std::panic::AssertUnwindSafe(coordinator.reconcile_orphans_at_boot())
                 .catch_unwind()
                 .await
@@ -3637,6 +3638,11 @@ impl ChildCompletionCoordinator {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
+                // Revisit pre-boot leases which were still live during the
+                // first pass. Fresh runs remain beyond the fixed boot cutoff.
+                coordinator
+                    .reconcile_child_run_candidates(boot_cutoff)
+                    .await;
                 if std::panic::AssertUnwindSafe(coordinator.sweep_child_waits())
                     .catch_unwind()
                     .await
@@ -3654,48 +3660,7 @@ impl ChildCompletionCoordinator {
     /// previously stranding those parents forever.
     async fn reconcile_orphans_at_boot(&self) {
         let cutoff = Utc::now();
-
-        // (1) Children left `running` by the previous process: no task in THIS
-        // process is driving them, so no completion will ever fire. Mark them
-        // terminal and wake their parents through the canonical path. (Root
-        // sessions left `running` are user-visible and user-recoverable; only
-        // children hold a suspended parent hostage.)
-        let running = self
-            .storage
-            .list_sessions_by_run_status("running")
-            .await
-            .unwrap_or_default();
-        for (child_id, parent_id) in running {
-            let Some(parent_id) = parent_id else { continue };
-            if self.runner_is_running(&child_id).await {
-                continue;
-            }
-            let Some(control_plane) = self.load_control_plane(&child_id).await else {
-                continue;
-            };
-            // A child that started AFTER boot is alive by definition — the
-            // cutoff guards the tiny window where a fresh spawn races this scan.
-            if control_plane.updated_at >= cutoff {
-                continue;
-            }
-            tracing::warn!(
-                child_session_id = %child_id,
-                parent_session_id = %parent_id,
-                "boot reconciliation: child was running when the process died; \
-                 marking it error and waking the parent"
-            );
-            self.synthesize_child_completion(
-                &parent_id,
-                &child_id,
-                "error",
-                Some(
-                    "orphaned by server restart: the process died while this child session \
-                     was running"
-                        .to_string(),
-                ),
-            )
-            .await;
-        }
+        self.reconcile_child_run_candidates(cutoff).await;
 
         // (2) Sessions suspended on `waiting_for_bash`: their backstop poll was
         // an in-memory task that died with the process. Re-arm it — with the
@@ -3728,6 +3693,38 @@ impl ChildCompletionCoordinator {
                         .bash_self_resume(session_id, wait.bash_ids)
                         .await;
                 });
+            }
+        }
+    }
+
+    async fn reconcile_child_run_candidates(&self, cutoff: chrono::DateTime<Utc>) {
+        let mut seen = std::collections::HashSet::new();
+        for status in [
+            "running",
+            "initializing",
+            "completed",
+            "cancelled",
+            "error",
+            "failed",
+            "timeout",
+            "skipped",
+            "pending",
+        ] {
+            let candidates = match self.storage.list_sessions_by_run_status(status).await {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::warn!(%error, "terminal runtime reconciliation census failed");
+                    continue;
+                }
+            };
+            for (child_id, parent_id) in candidates {
+                let Some(parent_id) = parent_id else { continue };
+                if !seen.insert(child_id.clone()) || self.runner_is_running(&child_id).await {
+                    continue;
+                }
+                self.synthesize_child_completion(&parent_id, &child_id, "error", Some(
+                    "orphaned by server restart: prior execution authority expired; physical Worker stop is unconfirmed".into()
+                ), cutoff).await;
             }
         }
     }
@@ -3976,6 +3973,7 @@ impl ChildCompletionCoordinator {
                         &entry.child_id,
                         &entry.status,
                         Some(entry.reason),
+                        now,
                     )
                     .await;
                 } else {
@@ -4046,9 +4044,14 @@ impl ChildCompletionCoordinator {
         child_session_id: &str,
         status: &str,
         error: Option<String>,
+        before: chrono::DateTime<Utc>,
     ) {
+        let mut reconciled_status = status.to_string();
+        let mut reconciled_error = error.clone();
+        let mut reconciled_run = None;
+        let mut was_terminal = false;
         match self.storage.load_session(child_session_id).await {
-            Ok(Some(mut child)) => {
+            Ok(Some(child)) => {
                 // Ownership guard (defense in depth — callers check too): only
                 // a session that IS a child of this parent may be mutated. An
                 // arbitrary session id named in a wait still wakes the parent
@@ -4069,19 +4072,25 @@ impl ChildCompletionCoordinator {
                     .await;
                     return;
                 }
-                child.set_last_run_status(status);
-                match &error {
-                    Some(message) => child.set_last_run_error(message.clone()),
-                    None => child.clear_last_run_error(),
-                }
-                child.updated_at = Utc::now();
-                if let Err(save_error) = self.persistence.merge_save_runtime(&mut child).await {
-                    tracing::warn!(
-                        child_session_id = %child.id,
-                        %save_error,
-                        "child-wait watchdog: failed to persist synthesized terminal status"
-                    );
-                }
+                was_terminal = child
+                    .last_run_status()
+                    .as_deref()
+                    .is_some_and(is_terminal_child_status);
+                let child = match self
+                    .storage
+                    .reconcile_child_runtime(&child, before, status, error.as_deref())
+                    .await
+                {
+                    Ok(Some(child)) => child,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(%child_session_id, %error, "child runtime reconciliation not committed");
+                        return;
+                    }
+                };
+                reconciled_status = child.last_run_status().unwrap_or_else(|| status.into());
+                reconciled_error = child.last_run_error();
+                reconciled_run = child.host_run_id().map(str::to_string);
                 self.sessions.insert(
                     child.id.clone(),
                     Arc::new(crate::SessionSnapshot::new(child)),
@@ -4094,20 +4103,32 @@ impl ChildCompletionCoordinator {
                     %load_error,
                     "child-wait watchdog: failed to load child for synthesized terminal status"
                 );
+                return;
             }
         }
-        finalize_runner(
-            &self.agent_runners,
+        if let Some(run_id) = reconciled_run {
+            crate::runtime::execution::runner_lifecycle::finalize_runner_exact(
+                &self.agent_runners,
+                child_session_id,
+                &run_id,
+                &Err(bamboo_agent_core::AgentError::LLM(
+                    error
+                        .clone()
+                        .unwrap_or_else(|| format!("synthesized {status}")),
+                )),
+            )
+            .await;
+        }
+        if was_terminal {
+            return;
+        }
+        self.publish_synthetic_completion(
+            parent_session_id,
             child_session_id,
-            &Err(bamboo_agent_core::AgentError::LLM(
-                error
-                    .clone()
-                    .unwrap_or_else(|| format!("synthesized {status}")),
-            )),
+            &reconciled_status,
+            reconciled_error,
         )
         .await;
-        self.publish_synthetic_completion(parent_session_id, child_session_id, status, error)
-            .await;
     }
 
     async fn publish_synthetic_completion(

@@ -489,6 +489,13 @@ async fn run_child_spawn_inner(
         .await;
         return Err(setup_error);
     }
+    if let Err(error) = ctx.agent.storage().begin_host_run(&session, &run_id).await {
+        let failure = Err(bamboo_agent_core::AgentError::LLM(error.to_string()));
+        finalize_runner_exact(&ctx.agent_runners, &session.id, &run_id, &failure).await;
+        execution_reservation.abandon().await;
+        return Err(error.to_string());
+    }
+    session.set_host_run_id(&run_id);
     // The native backend acquires its dedicated Actor writer before any
     // execution checkpoint. The legacy backend returns None and keeps its own
     // Worker-owned admission. Never silently retry a failed local bind remotely.
@@ -860,12 +867,7 @@ async fn run_child_spawn_inner(
         // terminality guard leaves un-counted; the real terminal completion is
         // published when the child later resumes and finishes.
         let suspended_non_terminal = parent_question_handoff
-            || (result.is_ok()
-                && (nested_wait_handoff
-                    || session
-                        .metadata
-                        .get("runtime.suspend_reason")
-                        .is_some_and(|reason| !reason.trim().is_empty())));
+            || (result.is_ok() && (nested_wait_handoff || session.has_runtime_wait()));
         let (status, error) = if let Some(reason) = timeout_error {
             ("timeout".to_string(), Some(reason))
         } else if suspended_non_terminal {
@@ -950,6 +952,7 @@ async fn run_child_spawn_inner(
 
         // Persist final session snapshot.
         session.set_last_run_status(status.clone());
+        session.synchronize_terminal_runtime_status();
         if let Some(err) = &error {
             session.set_last_run_error(err.clone());
         } else {
@@ -992,17 +995,29 @@ async fn run_child_spawn_inner(
                         source_deferred = deferred;
                         let intended_status = session.last_run_status();
                         let intended_error = session.last_run_error();
+                        let intended_runtime = session.agent_runtime_state.clone();
+                        let intended_mirror = session.metadata.get("agent.runtime.state").cloned();
                         if deferred {
                             // Status-only wait/read paths must also remain
                             // non-terminal across a crash before proof commit.
                             session.set_last_run_status("running");
                             session.clear_last_run_error();
+                            if let Some(state) = session.agent_runtime_state.as_mut() {
+                                state.status = AgentStatusState::Running;
+                                if let Ok(raw) = serde_json::to_string(state) {
+                                    session.metadata.insert("agent.runtime.state".into(), raw);
+                                }
+                            }
                         }
                         let saved = agent
                             .persistence()
                             .checkpoint_runtime_session(&mut session)
                             .await;
                         if deferred {
+                            session.agent_runtime_state = intended_runtime;
+                            if let Some(raw) = intended_mirror {
+                                session.metadata.insert("agent.runtime.state".into(), raw);
+                            }
                             if let Some(status) = intended_status {
                                 session.set_last_run_status(status);
                             }

@@ -1786,6 +1786,7 @@ pub struct SessionStoreV2 {
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
+    "runtime.host_run_id",
     "agent.runtime.state",
     "assignment_prompt",
     "clarification_resume_pending",
@@ -7061,6 +7062,8 @@ impl SessionStoreV2 {
             None => None,
         };
         let session = reconciled.as_ref().unwrap_or(session);
+        let normalized = self.normalize_terminal_runtime_write(session, rel).await?;
+        let session = &normalized;
         self.check_root_birth_guards(session, guards, false).await?;
         self.check_default_or_root_actor_context(
             session,
@@ -7299,6 +7302,10 @@ impl SessionStoreV2 {
 
         self.check_root_birth_guards(session, guards, true).await?;
         let intended_rel = Self::default_writer_rel_path(session)?;
+        let normalized = self
+            .normalize_terminal_runtime_write(session, &intended_rel)
+            .await?;
+        let session = &normalized;
         self.check_default_or_root_actor_context(
             session,
             &self.abs_path_from_rel(&intended_rel),
@@ -7633,6 +7640,21 @@ impl SessionStoreV2 {
 
 #[async_trait::async_trait]
 impl Storage for SessionStoreV2 {
+    async fn begin_host_run(&self, expected: &Session, run_id: &str) -> io::Result<()> {
+        self.begin_host_run_impl(expected, run_id).await
+    }
+
+    async fn reconcile_child_runtime(
+        &self,
+        expected: &Session,
+        before: DateTime<Utc>,
+        status: &str,
+        error: Option<&str>,
+    ) -> io::Result<Option<Session>> {
+        self.reconcile_child_runtime_impl(expected, before, status, error)
+            .await
+    }
+
     async fn find_host_session_scope(
         &self,
         caller: &bamboo_domain::SessionCallerReference,

@@ -38,6 +38,74 @@ use bamboo_skills::SkillManager;
 /// Provider that returns a single token + Done, so the child loop completes.
 struct CompletedProvider;
 
+/// A trusted executor outcome with no worker-side lifecycle mirror. This is
+/// the Host final-save gap, rather than the loop's own enum transition.
+struct TerminalOnlyRunner(&'static str);
+
+#[async_trait]
+impl ExternalChildRunner for TerminalOnlyRunner {
+    async fn should_handle(&self, _: &Session) -> bool {
+        true
+    }
+
+    async fn execute_external_child(
+        &self,
+        session: &mut Session,
+        _: &SpawnJob,
+        _: tokio::sync::mpsc::Sender<AgentEvent>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> crate::runtime::runner::Result<()> {
+        let mut state = AgentRuntimeState::new(&session.id);
+        state.status = AgentStatusState::Initializing;
+        session.agent_runtime_state = Some(state);
+        match self.0 {
+            "completed" => Ok(()),
+            "cancelled" => Err(bamboo_agent_core::AgentError::Cancelled),
+            _ => Err(bamboo_agent_core::AgentError::LLM(
+                "trusted executor failure".into(),
+            )),
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_real_sdk_final_save_converges_outcomes_without_worker_mirror() {
+    for (status, typed) in [
+        ("completed", AgentStatusState::Completed),
+        ("cancelled", AgentStatusState::Cancelled),
+        ("error", AgentStatusState::Failed),
+    ] {
+        let mut harness = build_harness(Arc::new(CompletedProvider), vec![], &[]).await;
+        harness.ctx.external_child_runner = Arc::new(TerminalOnlyRunner(status));
+        run_child_spawn(
+            harness.ctx.clone(),
+            SpawnJob {
+                parent_session_id: harness.parent_session_id.clone(),
+                child_session_id: harness.child_session_id.clone(),
+                model: "gpt-5".into(),
+                disabled_tools: None,
+            },
+        )
+        .await
+        .unwrap();
+        let events = collect_until_completed(&mut harness.parent_rx).await;
+        assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::SubAgentCompleted { status: found, .. } if found == status)));
+        let durable = harness
+            .storage
+            .load_session(&harness.child_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.last_run_status().as_deref(), Some(status));
+        assert_eq!(durable.agent_runtime_state.as_ref().unwrap().status, typed);
+        assert!(durable.host_run_id().is_some());
+        let mirror: AgentRuntimeState =
+            serde_json::from_str(&durable.metadata["agent.runtime.state"]).unwrap();
+        assert_eq!(mirror.status, typed);
+    }
+}
+
 #[async_trait]
 impl LLMProvider for CompletedProvider {
     async fn chat_stream(
