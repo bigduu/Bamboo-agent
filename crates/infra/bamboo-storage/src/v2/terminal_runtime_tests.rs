@@ -1097,7 +1097,10 @@ async fn terminal_runtime_queued_closure_after_prior_host_cannot_restart_or_reus
         queued.set_last_run_status(status);
         queued.set_last_run_error("unstarted launch closed");
         queued.synchronize_terminal_runtime_status();
-        store.save_runtime_state(&queued).await.unwrap();
+        // The production cancellation/enqueue-failure ports commit a full
+        // Child save, which also publishes the terminal status to its index.
+        store.save_session(&queued).await.unwrap();
+        store.save_session(&queued).await.unwrap();
         store.save_runtime_state(&queued).await.unwrap();
         assert!(store
             .begin_host_run(&expected_launch, "host-B")
