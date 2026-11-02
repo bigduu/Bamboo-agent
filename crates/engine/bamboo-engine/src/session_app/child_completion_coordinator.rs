@@ -4773,8 +4773,12 @@ mod tests {
             store.save_session(&parent).await.unwrap();
             let mut child = planner_test_child(&parent, "lost-plan-child");
             child.set_last_run_status("running");
-            child.agent_runtime_state.as_mut().unwrap().status =
-                bamboo_domain::AgentStatusState::Running;
+            child
+                .agent_runtime_state
+                .get_or_insert_with(|| {
+                    bamboo_domain::AgentRuntimeState::new("lost-worker-pipeline")
+                })
+                .status = bamboo_domain::AgentStatusState::Running;
             child.messages.last_mut().unwrap().content =
                 "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
             ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());

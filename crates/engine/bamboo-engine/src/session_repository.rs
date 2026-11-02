@@ -100,6 +100,7 @@ impl SessionRepository {
                     || current.kind != saved.kind
                     || current.root_session_id != saved.root_session_id
                     || current.authority_identity != saved.authority_identity
+                    || !current.execution_compatibility().execution_allowed
                     || current.created_at != saved.created_at
                     || current.parent_created_at != saved.parent_created_at
                     || current.parent_session_id != saved.parent_session_id
