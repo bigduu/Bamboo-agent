@@ -1,0 +1,654 @@
+//! Real default Host/Store/Inbox path, with a private failure at actual ACK save.
+use super::*;
+use async_trait::async_trait;
+use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
+use bamboo_domain::{Message, SessionMessageEnvelope, WorkspaceBinding};
+use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
+use bamboo_orchestration::patrol::Status;
+use bamboo_tickets::{Contract, Operation, ProjectContextSnapshot, WorkState};
+use serde_json::{json, Value};
+use std::{
+    collections::{BTreeMap, BTreeSet, HashMap},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
+
+const SEED: &str = "BAMBOO_2486_EVIDENCE_SEED";
+const WAIT: Duration = Duration::from_secs(20);
+
+pub(super) fn before_ack(store: &mut PatrolCheckpointStore) {
+    if std::env::var_os(SEED).is_some() {
+        store.reject_next_ack();
+    }
+}
+
+struct Provider {
+    calls: AtomicUsize,
+    limit: usize,
+}
+#[async_trait]
+impl LLMProvider for Provider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        tools: &[ToolSchema],
+        _max: Option<u32>,
+        model: &str,
+    ) -> std::result::Result<LLMStream, LLMError> {
+        assert_eq!(model, "patrol-evidence-local");
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        assert!(call < self.limit, "observer cannot activate provider");
+        assert!(tools.iter().any(|tool| tool.function.name == "Task"));
+        let chunk = if call == 0 {
+            LLMChunk::ToolCalls(vec![ToolCall { id:"evidence-task".into(),tool_type:"function".into(),function:FunctionCall {
+            name:"Task".into(),arguments:json!({"tasks":[{"id":"bounded-result","content":"Produce one bounded result","status":"completed"}]}).to_string()
+        }}])
+        } else {
+            LLMChunk::Token("The bounded native result awaits owner review.".into())
+        };
+        Ok(Box::pin(futures::stream::iter([
+            Ok(chunk),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+async fn host(root: &Path, limit: usize) -> (crate::AppState, Arc<Provider>) {
+    let provider = Arc::new(Provider {
+        calls: AtomicUsize::new(0),
+        limit,
+    });
+    let mut config:Config=serde_json::from_value(json!({"provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":true},
+        "providers":{"openai":{"api_key":"unused-controlled-fixture","model":"patrol-evidence-local"}},"run_budget":{"max_rounds":4},"subagents":{"max_concurrent":1}})).unwrap();
+    config
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .auto_dream_enabled = false;
+    let state = crate::AppState::new_with_provider_and_memory_store(
+        root.into(),
+        config,
+        provider.clone(),
+        bamboo_memory::memory_store::MemoryStore::new(root.join("jiandu")),
+    )
+    .await
+    .unwrap();
+    state.provider_registry.replace_with(ProviderRegistry::new(
+        HashMap::from([("openai".into(), provider.clone() as Arc<dyn LLMProvider>)]),
+        "openai".into(),
+    ));
+    (state, provider)
+}
+
+fn owner() -> Principal {
+    Principal::User {
+        user_id: "host-owner".into(),
+    }
+}
+fn now() -> u64 {
+    chrono::Utc::now().timestamp_millis().try_into().unwrap()
+}
+fn git(path: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "commit.gpgsign=false",
+            "-C",
+        ])
+        .arg(path)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+fn workspace(root: &Path) -> bamboo_tickets::ExecutionWorkspace {
+    let repo = root.join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    git(&repo, &["init", "-b", "fixture"]);
+    std::fs::write(repo.join("fixture"), "native evidence\n").unwrap();
+    git(&repo, &["add", "fixture"]);
+    git(
+        &repo,
+        &[
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+    );
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    let worktree = root.join("worktree");
+    git(
+        &repo,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "work",
+            worktree.to_str().unwrap(),
+            &base,
+        ],
+    );
+    let worktree = worktree
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+    bamboo_tickets::ExecutionWorkspace {
+        repo: repo.canonicalize().unwrap().to_string_lossy().into_owned(),
+        base_commit: base,
+        branch: "work".into(),
+        worktree: worktree.clone(),
+        write_roots: vec![worktree.clone()],
+        claims: BTreeSet::from([format!("worktree:{worktree}")]),
+    }
+}
+fn policy(
+    snapshot: &bamboo_tickets::Snapshot,
+    scope: &Scope,
+) -> bamboo_orchestration::ReadyWorkPolicy {
+    let work = &snapshot.tickets[&scope.work_id];
+    let assignment = &snapshot.assignments[&scope.assignment_id];
+    bamboo_orchestration::ReadyWorkPolicy {
+        project_id: snapshot.project.links[&work.id].clone(),
+        capacity: 1,
+        max_rounds: 4,
+        lifetime: Duration::from_secs(120),
+        grants: vec![bamboo_orchestration::ReadyWorkGrant {
+            work_id: work.id.clone(),
+            contract_revision: work.contract_revision,
+            context_hash: snapshot.project.work_contexts[&work.id].clone(),
+            workspace: assignment.workspace.clone().unwrap(),
+        }],
+    }
+}
+fn journal_file(root: &Path, snapshot: &bamboo_tickets::Snapshot, scope: &Scope) -> PathBuf {
+    root.join("orchestration/patrol")
+        .join(bamboo_tickets::content_hash(
+            &bamboo_tickets::canonical_bytes(&snapshot.binding).unwrap(),
+        ))
+        .join(format!(
+            "{}.json",
+            bamboo_orchestration::patrol::checkpoint::scope_key(scope).unwrap()
+        ))
+}
+fn notice(root: &Path, target: &str) -> SessionMessageEnvelope {
+    let values=std::fs::read_dir(root.join("sessions").join(target).join("inbox/new")).unwrap().filter_map(|entry| {
+        let transport:bamboo_subagent::InboxMessage=serde_json::from_slice(&std::fs::read(entry.ok()?.path()).ok()?).ok()?;
+        let envelope:SessionMessageEnvelope=serde_json::from_value(transport.body).ok()?;
+        matches!(&envelope.source,bamboo_domain::SessionMessageSource::Runtime{subsystem} if subsystem=="ticket_patrol").then_some(envelope)
+    }).collect::<Vec<_>>();
+    assert_eq!(values.len(), 1);
+    values.into_iter().next().unwrap()
+}
+fn actor_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(path: &Path, output: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            let kind = entry.file_type().unwrap();
+            if entry.file_name() == ".git" {
+                continue;
+            }
+            if kind.is_dir() {
+                walk(&entry.path(), output)
+            } else if entry.file_name() == "actor-authority.json"
+                || entry.file_name() == "actor-authority.initialized.json"
+            {
+                output.insert(entry.path(), std::fs::read(entry.path()).unwrap());
+            }
+        }
+    }
+    let mut output = BTreeMap::new();
+    walk(root, &mut output);
+    output
+}
+async fn ask(state: &crate::AppState, work: &str, id: &str) {
+    let (service, authority) = state.tickets.authority(owner()).await.unwrap();
+    let command = service
+        .prepare_command(
+            &authority,
+            id,
+            vec![Operation::Ask {
+                work_id: work.into(),
+                temp_id: "question".into(),
+                prompt: format!("Owner review checkpoint {id}?"),
+                action: None,
+            }],
+        )
+        .unwrap();
+    state.tickets.update(owner(), &command).await.unwrap();
+}
+
+fn assert_source_negatives(
+    service: &bamboo_tickets::TicketService,
+    authority: &bamboo_tickets::Authority,
+    source: &NoticeSource,
+    escalation: &bamboo_orchestration::patrol::Escalation,
+) {
+    use super::super::notice_evidence;
+    let good = notice_evidence::read(service, authority, source, escalation).unwrap();
+    assert_eq!(good["historical"], true);
+    assert_eq!(good["assignment"]["process_stopped"], true);
+    assert_eq!(good["references"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        good["workspace_declaration"]["sha256"]
+            .as_str()
+            .unwrap()
+            .len(),
+        64
+    );
+    assert!(serde_json::to_vec(&good).unwrap().len() <= notice_evidence::MAX_EVIDENCE_BYTES);
+    for commit in ["f".repeat(64), service.published().unwrap().0] {
+        let mut wrong = source.clone();
+        wrong.commit = commit;
+        assert!(
+            notice_evidence::read(service, authority, &wrong, escalation).is_err(),
+            "same counters cannot authorize another commit"
+        );
+    }
+    for kind in ["generation", "project", "revision"] {
+        let mut wrong = source.clone();
+        let mut event = escalation.clone();
+        match kind {
+            "generation" => wrong.operation.incident.scope.generation += 1,
+            "project" => wrong.operation.incident.scope.project_id = "foreign-project".into(),
+            _ => wrong.execution_facts_revision += 1,
+        }
+        event.operation = wrong.operation.clone();
+        event.source_revision = wrong.execution_facts_revision;
+        assert!(notice_evidence::read(service, authority, &wrong, &event).is_err());
+    }
+    let current = service.published().unwrap().1;
+    let snapshot = service.fixed_snapshot(&source.commit).unwrap();
+    let scope = &source.operation.incident.scope;
+    let mut bad = snapshot.clone();
+    let assignment = bad.assignments.get_mut(&scope.assignment_id).unwrap();
+    assignment.runtime.as_mut().unwrap().run_id = uuid::Uuid::new_v4().to_string();
+    bad.intents
+        .get_mut(&assignment.dispatch_key)
+        .unwrap()
+        .receipt = assignment.runtime.clone();
+    assert!(
+        notice_evidence::project(source, escalation, &current, &bad).is_err(),
+        "foreign receipt cannot become historical evidence"
+    );
+    let mut oversized = snapshot;
+    oversized
+        .assignments
+        .get_mut(&scope.assignment_id)
+        .unwrap()
+        .plan
+        .steps
+        .push(bamboo_tickets::LocalStep {
+            id: "large".into(),
+            parent: None,
+            title: "x".repeat(65_536),
+            completed: false,
+            status: None,
+        });
+    assert_eq!(
+        notice_evidence::project(source, escalation, &current, &oversized),
+        Err(PortError::Unavailable)
+    );
+}
+
+async fn seed(root: &Path) {
+    let execution = workspace(root);
+    let (state, provider) = host(root, 2).await;
+    let project = state.project_store.create("Evidence", None).unwrap();
+    let project = state
+        .project_store
+        .bind_workspace(
+            &project.id,
+            project.revision,
+            WorkspaceBinding {
+                path: execution.repo.clone(),
+                label: None,
+                git_common_dir: None,
+            },
+        )
+        .unwrap();
+    let (service, authority) = state.tickets.authority(owner()).await.unwrap();
+    let contract = Contract {
+        title: "Bounded result".into(),
+        objective: "Produce one bounded result".into(),
+        constraints: vec![],
+        acceptance: vec!["Owner review".into()],
+        user_acceptance_required: true,
+        allowed_tools: BTreeSet::from(["Task".into()]),
+    };
+    let create = service
+        .prepare_command(
+            &authority,
+            "create",
+            vec![
+                Operation::Create {
+                    temp_id: "work".into(),
+                    kind: bamboo_tickets::TicketKind::Work,
+                    parent: None,
+                    contract: contract.clone(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "work".into(),
+                    project_id: project.id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    let work = state.tickets.update(owner(), &create).await.unwrap().ids["work"].clone();
+    let ready = service
+        .prepare_command(
+            &authority,
+            "ready",
+            vec![
+                Operation::SetProjectContext {
+                    work_id: work.clone(),
+                    context: ProjectContextSnapshot {
+                        project_id: project.id.clone(),
+                        project_revision: project.revision,
+                        resource_revision: project.resource_revision,
+                        workspace_binding: project.workspace_bindings[0].clone(),
+                        contract_revision: 1,
+                        contract,
+                        sources: BTreeMap::new(),
+                    },
+                },
+                Operation::Ready {
+                    work_id: work.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    state.tickets.update(owner(), &ready).await.unwrap();
+    let start = service
+        .prepare_command(
+            &authority,
+            "start",
+            vec![Operation::Start {
+                work_id: work.clone(),
+                temp_id: "attempt".into(),
+                workspace: Some(execution),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        state.tickets.dispatch(owner(), &start).await.unwrap()["errors"],
+        json!([])
+    );
+    let snapshot = tokio::time::timeout(WAIT, async {
+        loop {
+            let snapshot = service.published().unwrap().1;
+            if snapshot.tickets[&work].state == WorkState::Submitted {
+                let submission = &snapshot.submissions
+                    [snapshot.tickets[&work].current_submission.as_ref().unwrap()];
+                let receipt = &submission.runtime;
+                let runner = state
+                    .agent_runners
+                    .read()
+                    .await
+                    .get(&receipt.session_id)
+                    .is_some_and(|runner| {
+                        runner.run_id == receipt.run_id
+                            && matches!(
+                                runner.status,
+                                bamboo_engine::execution::AgentStatus::Completed
+                            )
+                    });
+                if snapshot.assignments[&submission.assignment_id].process_stopped
+                    && runner
+                    && state
+                        .session_activation_router
+                        .current_run_id(&receipt.session_id)
+                        .await
+                        .is_none()
+                {
+                    break snapshot;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real stopped native submission");
+    let assignment = snapshot.tickets[&work]
+        .current_submission
+        .as_ref()
+        .map(|id| snapshot.submissions[id].assignment_id.clone())
+        .unwrap();
+    let scope = state
+        .tickets
+        .patrol_scope(project.id.as_str(), &work, &assignment)
+        .await
+        .unwrap();
+    let mut journal = state.tickets.open_patrol_checkpoints(&scope).await.unwrap();
+    let mut observation = state.tickets.patrol_observation(&scope).await.unwrap();
+    assert_eq!(
+        ProgramPatrol::new(Policy::default())
+            .unwrap()
+            .tick(&scope, &SystemClock(now()), &mut journal, &mut observation)
+            .unwrap()
+            .status,
+        Status::Incident
+    );
+    drop(journal);
+    ask(&state, &work, "first-source").await;
+    let source_head = service.published().unwrap().0;
+    let actors = actor_bytes(root);
+    assert!(!actors.is_empty());
+    let initial = state
+        .session_inbox
+        .inspect(&snapshot.binding.supervisor_session_id)
+        .await
+        .unwrap();
+    state
+        .tickets
+        .install_ready_work_policy(policy(&snapshot, &scope))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(mut journal) = state.tickets.open_patrol_checkpoints(&scope).await {
+                let stored = journal.load(&scope).unwrap().unwrap();
+                if stored
+                    .checkpoint
+                    .incident
+                    .as_ref()
+                    .unwrap()
+                    .escalation
+                    .as_ref()
+                    .is_some_and(|e| e.deliveries == 1 && !e.queued)
+                    && state
+                        .session_inbox
+                        .inspect(&snapshot.binding.supervisor_session_id)
+                        .await
+                        .unwrap()
+                        .pending
+                        == initial.pending + 1
+                {
+                    break;
+                }
+            }
+            state.tickets.wake_ready_work();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("real stage succeeded and actual ACK publication failed");
+    let first = notice(root, &snapshot.binding.supervisor_session_id);
+    let file = journal_file(root, &snapshot, &scope);
+    let record: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    assert_eq!(record["schema"], 2);
+    assert_eq!(record["source"]["commit"], source_head);
+    let before = state
+        .session_inbox
+        .inspect(&snapshot.binding.supervisor_session_id)
+        .await
+        .unwrap();
+    assert_eq!(before.activation_generation, initial.activation_generation);
+    assert_eq!(before.interrupt_generation, initial.interrupt_generation);
+    ask(&state, &work, "later-source").await;
+    assert_ne!(service.published().unwrap().0, source_head);
+    let changed = service.published().unwrap().0;
+    let source: NoticeSource = serde_json::from_value(record["source"].clone()).unwrap();
+    let event: bamboo_orchestration::patrol::Escalation =
+        serde_json::from_value(record["record"]["checkpoint"]["incident"]["escalation"].clone())
+            .unwrap();
+    let (_, runtime) = state.tickets.authority(Principal::Runtime).await.unwrap();
+    assert_source_negatives(&service, &runtime, &source, &event);
+    // The production helper runs again after a canonical source change. Its
+    // exact existing receipt proves it did not re-render current facts.
+    let _ = state.tickets.reconcile_ready_work().await;
+    assert_eq!(notice(root, &snapshot.binding.supervisor_session_id), first);
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect(&snapshot.binding.supervisor_session_id)
+            .await
+            .unwrap(),
+        before
+    );
+    assert_eq!(service.published().unwrap().0, changed);
+    assert_eq!(actor_bytes(root), actors);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    std::fs::write(root.join("2486-seed.json"),serde_json::to_vec(&json!({"scope":scope,"notice":first,"actors":actors.keys().map(|p|p.to_string_lossy()).collect::<Vec<_>>()})).unwrap()).unwrap();
+    state.tickets.revoke_ready_work_policy().await;
+    state.shutdown().await;
+}
+
+async fn reopened(root: &Path) {
+    let seed: Value =
+        serde_json::from_slice(&std::fs::read(root.join("2486-seed.json")).unwrap()).unwrap();
+    let scope: Scope = serde_json::from_value(seed["scope"].clone()).unwrap();
+    let original: SessionMessageEnvelope = serde_json::from_value(seed["notice"].clone()).unwrap();
+    let (state, provider) = host(root, 0).await;
+    let (service, _) = state.tickets.authority(owner()).await.unwrap();
+    let (head, snapshot) = service.published().unwrap();
+    let before = state
+        .session_inbox
+        .inspect(&snapshot.binding.supervisor_session_id)
+        .await
+        .unwrap();
+    let actors = actor_bytes(root);
+    let file = journal_file(root, &snapshot, &scope);
+    let original_record: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+    state
+        .tickets
+        .install_ready_work_policy(policy(&snapshot, &scope))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if let Ok(mut journal) = state.tickets.open_patrol_checkpoints(&scope).await {
+                if journal
+                    .load(&scope)
+                    .unwrap()
+                    .unwrap()
+                    .checkpoint
+                    .incident
+                    .unwrap()
+                    .escalation
+                    .unwrap()
+                    .queued
+                {
+                    break;
+                }
+            }
+            state.tickets.wake_ready_work();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("cold Host reconciles the original actual receipt");
+    assert_eq!(
+        notice(root, &snapshot.binding.supervisor_session_id),
+        original
+    );
+    assert!(state
+        .session_inbox
+        .existing_staged_delivery(&original)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        state
+            .session_inbox
+            .inspect(&snapshot.binding.supervisor_session_id)
+            .await
+            .unwrap(),
+        before
+    );
+    let record: Value = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(record["source"], original_record["source"]);
+    assert_eq!(
+        record["record"]["checkpoint"]["incident"]["escalation"]["deliveries"],
+        1
+    );
+    assert_eq!(service.published().unwrap().0, head);
+    assert_eq!(actor_bytes(root), actors);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    state.tickets.revoke_ready_work_policy().await;
+    state.shutdown().await;
+}
+
+#[test]
+fn native_staged_evidence_survives_failed_ack_source_change_and_cold_reopen() {
+    if let Some(root) = std::env::var_os(SEED) {
+        actix_web::rt::System::new().block_on(seed(Path::new(&root)));
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let case = format!(
+        "{}::native_staged_evidence_survives_failed_ack_source_change_and_cold_reopen",
+        module_path!().strip_prefix("bamboo_server::").unwrap()
+    );
+    let fixture_home = root.join("seed-home");
+    let fixture_temp = root.join("seed-tmp");
+    for directory in [
+        fixture_home.clone(),
+        fixture_home.join("config"),
+        fixture_home.join("data"),
+        fixture_home.join("cache"),
+        fixture_temp.clone(),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    // This native child receives no parent credentials, workflow channels or
+    // ambient user configuration. Git uses only the standard Unix tool path.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &fixture_home)
+        .env("XDG_CONFIG_HOME", fixture_home.join("config"))
+        .env("XDG_DATA_HOME", fixture_home.join("data"))
+        .env("XDG_CACHE_HOME", fixture_home.join("cache"))
+        .env("TMPDIR", &fixture_temp)
+        .env("TMP", &fixture_temp)
+        .env("TEMP", &fixture_temp)
+        .env("RUST_MIN_STACK", "8388608")
+        .env(SEED, &root)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    actix_web::rt::System::new().block_on(reopened(&root));
+}
