@@ -1379,7 +1379,8 @@ mod tests {
     ) -> io::Result<()> {
         use bamboo_domain::{
             ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, AgentRuntimeState,
-            AgentStatusState, RuntimeSessionPersistence,
+            AgentStatusState, ChildActorRuntimeSave, ChildActorRuntimeWrite,
+            RuntimeSessionPersistence,
         };
         for (status, typed, finish) in [
             (
@@ -1435,7 +1436,18 @@ mod tests {
                     "agent.runtime.state".into(),
                     serde_json::to_string(stage.agent_runtime_state.as_ref().unwrap()).unwrap(),
                 );
-                store.save_session(&stage).await?;
+                let owner = ChildActorRuntimeWrite::from_session(activation.fence(), &child)?;
+                store
+                    .save_child_actor_runtime(ChildActorRuntimeSave {
+                        owner: &owner,
+                        session: &mut stage,
+                        runtime_only: false,
+                        inherited: None,
+                        finalized_wait: None,
+                        input: None,
+                        publish: Arc::new(|_| {}),
+                    })
+                    .await?;
                 let stage = store.load_session(&child.id).await?.unwrap();
                 store
                     .finish_activation(&activation.fence(), Utc::now(), finish)
