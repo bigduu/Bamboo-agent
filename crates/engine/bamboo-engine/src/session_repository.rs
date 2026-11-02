@@ -155,9 +155,13 @@ impl SessionRepository {
         let abandon_directory = directory.clone();
         let abandon_owner = owner.clone();
         let terminal_cache = self.cache.clone();
-        let terminal_publisher: bamboo_domain::storage::RootActorRuntimePublisher = Arc::new(move |saved| {
-            terminal_cache.insert(saved.id.clone(), Arc::new(crate::SessionSnapshot::new(saved.clone())));
-        });
+        let terminal_publisher: bamboo_domain::storage::RootActorRuntimePublisher =
+            Arc::new(move |saved| {
+                terminal_cache.insert(
+                    saved.id.clone(),
+                    Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                );
+            });
         let abandon_publisher = terminal_publisher.clone();
         let binding = bamboo_domain::RootActorExecutionBinding::new(
             Arc::new(bound),
@@ -178,7 +182,8 @@ impl SessionRepository {
                     });
                 }
             },
-        ).with_terminal_publisher(terminal_publisher);
+        )
+        .with_terminal_publisher(terminal_publisher);
         directory
             .start_activation(&binding.owner.fence, chrono::Utc::now())
             .await

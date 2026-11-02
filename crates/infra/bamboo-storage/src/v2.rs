@@ -1787,6 +1787,7 @@ pub struct SessionStoreV2 {
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "runtime.host_run_id",
+    "runtime.root_writer_observation_v1",
     "runtime.host_launch_generation",
     "runtime.reconciled_activation_fence",
     "agent.runtime.state",
@@ -7654,7 +7655,7 @@ impl Storage for SessionStoreV2 {
         before: DateTime<Utc>,
         error: Option<&str>,
     ) -> io::Result<Option<Session>> {
-        self.reconcile_child_runtime_impl(expected, before, error, None)
+        self.reconcile_child_runtime_impl(expected, before, error)
             .await
     }
 
@@ -7669,8 +7670,8 @@ impl Storage for SessionStoreV2 {
             self.reconcile_root_runtime_impl(expected, before, &publish)
                 .await
         } else {
-            self.reconcile_child_runtime_impl(expected, before, error, Some(&publish))
-                .await
+            let _ = error;
+            Ok(None)
         }
     }
 

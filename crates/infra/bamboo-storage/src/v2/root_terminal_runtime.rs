@@ -1,6 +1,9 @@
 //! Root logical terminal repair. No lease or cache observation proves Worker stop.
 use super::*;
-use bamboo_domain::{AgentRuntimeState, AgentStatusState, RootActorRuntimeWrite, SessionKind, SupervisedRootOutcomeResult};
+use bamboo_domain::{
+    AgentRuntimeState, AgentStatusState, RootActorRuntimeWrite, SessionKind,
+    SupervisedRootOutcomeResult,
+};
 use sha2::{Digest, Sha256};
 
 pub(super) const ROOT_OBSERVATION: &str = "runtime.root_writer_observation_v1";
@@ -12,56 +15,96 @@ struct RootObservation {
     fence_sha256: String,
     conversation_reset_sha256: String,
 }
-fn invalid() -> io::Error { io::Error::new(io::ErrorKind::InvalidData, "invalid Root runtime observation") }
+fn invalid() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid Root runtime observation",
+    )
+}
 fn observation(session: &Session, fence: &ActorActivationFence) -> io::Result<RootObservation> {
-    if session.kind != SessionKind::Root || !session.authority_identity.is_ordinary()
-        || session.id != fence.actor_id { return Err(invalid()); }
+    if session.kind != SessionKind::Root
+        || !session.authority_identity.is_ordinary()
+        || session.id != fence.actor_id
+    {
+        return Err(invalid());
+    }
     Ok(RootObservation {
-        schema_version: 1, created_at: session.created_at,
+        schema_version: 1,
+        created_at: session.created_at,
         fence_sha256: format!("{:x}", Sha256::digest(serde_json::to_vec(fence)?)),
-        conversation_reset_sha256: session.conversation_reset_sha256().map_err(|_| invalid())?.unwrap_or_else(|| format!("{:x}", Sha256::digest(b"bamboo.root-runtime.no-reset.v1"))),
+        conversation_reset_sha256: session
+            .conversation_reset_sha256()
+            .map_err(|_| invalid())?
+            .unwrap_or_else(|| format!("{:x}", Sha256::digest(b"bamboo.root-runtime.no-reset.v1"))),
     })
 }
 fn matches_observation(session: &Session, fence: &ActorActivationFence) -> io::Result<bool> {
-    let Some(raw) = session.metadata.get(ROOT_OBSERVATION) else { return Ok(false); };
-    if raw.len() > 2048 { return Err(invalid()); }
+    let Some(raw) = session.metadata.get(ROOT_OBSERVATION) else {
+        return Ok(false);
+    };
+    if raw.len() > 2048 {
+        return Err(invalid());
+    }
     let recorded: RootObservation = serde_json::from_str(raw).map_err(|_| invalid())?;
     Ok(recorded == observation(session, fence)?)
 }
-pub(super) fn stamp_owned_observation(session: &mut Session, owner: &RootActorRuntimeWrite) -> io::Result<()> {
-    owner.conversation_generation.check_canonical(session).map_err(|_| invalid())?;
-    if owner.created_at != session.created_at { return Err(invalid()); }
+pub(super) fn stamp_owned_observation(
+    session: &mut Session,
+    owner: &RootActorRuntimeWrite,
+) -> io::Result<()> {
+    owner
+        .conversation_generation
+        .check_canonical(session)
+        .map_err(|_| invalid())?;
+    if owner.created_at != session.created_at {
+        return Err(invalid());
+    }
     let marker = serde_json::to_string(&observation(session, &owner.fence)?)?;
     session.metadata.insert(ROOT_OBSERVATION.into(), marker);
-    session.metadata.remove("runtime.reconciled_activation_fence");
+    session
+        .metadata
+        .remove("runtime.reconciled_activation_fence");
     Ok(())
 }
 pub(super) fn preserve_observation(incoming: &mut Session, canonical: Option<&Session>) {
     incoming.metadata.remove(ROOT_OBSERVATION);
     if let Some(raw) = canonical.and_then(|s| s.metadata.get(ROOT_OBSERVATION)) {
-        incoming.metadata.insert(ROOT_OBSERVATION.into(), raw.clone());
+        incoming
+            .metadata
+            .insert(ROOT_OBSERVATION.into(), raw.clone());
     }
 }
-fn validate_projection_identity(entry: &ActorDirectoryEntry, session: &Session) -> Result<(), ActorDirectoryError> {
-    let delta = session.metadata_version.checked_sub(entry.actor.observed_metadata_version);
-    if session.kind != SessionKind::Root || !session.authority_identity.is_ordinary()
+fn validate_projection_identity(
+    entry: &ActorDirectoryEntry,
+    session: &Session,
+) -> Result<(), ActorDirectoryError> {
+    let delta = session
+        .metadata_version
+        .checked_sub(entry.actor.observed_metadata_version);
+    if session.kind != SessionKind::Root
+        || !session.authority_identity.is_ordinary()
         || !entry.actor.matches_session(session)
         || entry.actor.project_id.as_deref() != session.project_id_meta().as_deref()
         || !delta.is_some_and(|delta| delta <= 1)
-    { return Err(ActorDirectoryError::InvalidIdentity); }
+    {
+        return Err(ActorDirectoryError::InvalidIdentity);
+    }
     Ok(())
 }
 fn terminal_finish(status: ActorActivationStatus) -> Option<ActorActivationFinish> {
     match status {
         ActorActivationStatus::Succeeded => Some(ActorActivationFinish::Succeeded),
         ActorActivationStatus::Cancelled => Some(ActorActivationFinish::Cancelled),
-        ActorActivationStatus::Failed => Some(ActorActivationFinish::Failed), _ => None,
+        ActorActivationStatus::Failed => Some(ActorActivationFinish::Failed),
+        _ => None,
     }
 }
 fn finish_status(finish: ActorActivationFinish) -> ActorActivationStatus {
-    match finish { ActorActivationFinish::Succeeded => ActorActivationStatus::Succeeded,
+    match finish {
+        ActorActivationFinish::Succeeded => ActorActivationStatus::Succeeded,
         ActorActivationFinish::Cancelled => ActorActivationStatus::Cancelled,
-        ActorActivationFinish::Failed => ActorActivationStatus::Failed }
+        ActorActivationFinish::Failed => ActorActivationStatus::Failed,
+    }
 }
 impl SessionStoreV2 {
     async fn confirmed_root_main_outcome(
@@ -104,7 +147,9 @@ impl SessionStoreV2 {
         if main.project_id_meta() != current.project_id_meta()
             || main.metadata_version < entry.actor.observed_metadata_version
             || main.metadata_version > current.metadata_version
-        { return Err(ActorDirectoryError::InvalidIdentity); }
+        {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
         main.check_conversation_generation(&current)
             .map_err(|_| ActorDirectoryError::InvalidIdentity)?;
         let record = fs::read(self.abs_path_from_rel(rel).join(ACTOR_AUTHORITY_FILE))
@@ -129,6 +174,8 @@ impl SessionStoreV2 {
         let outcome = outcomes
             .finalized_for_fence(&main, fence)
             .map_err(|_| ActorDirectoryError::Corrupt)?;
+        let outcome =
+            outcome.filter(|result| *result != SupervisedRootOutcomeResult::InterruptedUnknown);
         if outcome.is_some() {
             // A readable AfterReplace result is not a commit acknowledgement.
             // Retain the exact Actor/Session/tree guards through the real sync.
@@ -138,18 +185,35 @@ impl SessionStoreV2 {
     }
 
     async fn settle_root_entry(
-        &self, entry: &mut ActorDirectoryEntry, rel: &str, path: &Path,
-        fence: &ActorActivationFence, requested: Option<ActorActivationFinish>, now: DateTime<Utc>,
+        &self,
+        entry: &mut ActorDirectoryEntry,
+        rel: &str,
+        path: &Path,
+        fence: &ActorActivationFence,
+        requested: Option<ActorActivationFinish>,
+        now: DateTime<Utc>,
         guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<(ActorActivation, Option<SupervisedRootOutcomeResult>), ActorDirectoryError> {
-        let activation = entry.activation.as_ref().filter(|a| a.matches_fence(fence)).ok_or(ActorDirectoryError::StaleFence)?;
-        let main = self.confirmed_root_main_outcome(entry, rel, fence, guards).await?;
+        let activation = entry
+            .activation
+            .as_ref()
+            .filter(|a| a.matches_fence(fence))
+            .ok_or(ActorDirectoryError::StaleFence)?;
+        let main = self
+            .confirmed_root_main_outcome(entry, rel, fence, guards)
+            .await?;
         let selected = match main.as_ref() {
-            Some(SupervisedRootOutcomeResult::Completed | SupervisedRootOutcomeResult::Suspended) => ActorActivationFinish::Succeeded,
+            Some(
+                SupervisedRootOutcomeResult::Completed | SupervisedRootOutcomeResult::Suspended,
+            ) => ActorActivationFinish::Succeeded,
             Some(SupervisedRootOutcomeResult::Cancelled) => ActorActivationFinish::Cancelled,
             Some(SupervisedRootOutcomeResult::Failed) => ActorActivationFinish::Failed,
-            Some(SupervisedRootOutcomeResult::InterruptedUnknown) => return Err(ActorDirectoryError::InvalidTransition),
-            None => requested.or_else(|| terminal_finish(activation.status)).ok_or(ActorDirectoryError::InvalidTransition)?,
+            Some(SupervisedRootOutcomeResult::InterruptedUnknown) => {
+                return Err(ActorDirectoryError::InvalidTransition)
+            }
+            None => requested
+                .or_else(|| terminal_finish(activation.status))
+                .ok_or(ActorDirectoryError::InvalidTransition)?,
         };
         let selected_status = finish_status(selected);
         if activation.status == selected_status {
@@ -161,20 +225,30 @@ impl SessionStoreV2 {
         }
         if activation.status.is_live() {
             if entry.actor.state != ActorLogicalState::Active
-                || (selected == ActorActivationFinish::Succeeded && activation.status != ActorActivationStatus::Running)
-            { return Err(ActorDirectoryError::InvalidTransition); }
+                || (selected == ActorActivationFinish::Succeeded
+                    && activation.status != ActorActivationStatus::Running)
+            {
+                return Err(ActorDirectoryError::InvalidTransition);
+            }
             // Only the actual owner or an expired exact durable Main outcome
             // closes this fence. Recovery never gets here for an unexpired live owner.
             if requested.is_none() && (activation.lease_expires_at > now || main.is_none()) {
                 return Err(ActorDirectoryError::InvalidTransition);
             }
         }
-        let activation = entry.activation.as_mut().ok_or(ActorDirectoryError::StaleFence)?;
+        let activation = entry
+            .activation
+            .as_mut()
+            .ok_or(ActorDirectoryError::StaleFence)?;
         activation.status = selected_status;
         activation.finished_at.get_or_insert(now);
         let result = activation.clone();
         if entry.actor.state != ActorLogicalState::Retired {
-            entry.actor.state = if selected == ActorActivationFinish::Failed { ActorLogicalState::Failed } else { ActorLogicalState::Cold };
+            entry.actor.state = if selected == ActorActivationFinish::Failed {
+                ActorLogicalState::Failed
+            } else {
+                ActorLogicalState::Cold
+            };
         }
         entry.revision = checked_next(entry.revision)?;
         self.write_actor_entry(path, entry, guards).await?;
@@ -182,91 +256,252 @@ impl SessionStoreV2 {
     }
 
     async fn project_root_terminal(
-        &self, before: &Session, outcome: &str, rel: &str, guards: &Arc<ActorAuthorityGuards>,
+        &self,
+        before: &Session,
+        outcome: &str,
+        rel: &str,
+        guards: &Arc<ActorAuthorityGuards>,
         publish: Option<&bamboo_domain::storage::RootActorRuntimePublisher>,
     ) -> Result<Session, ActorDirectoryError> {
         let mut after = before.clone();
-        let same = before.last_run_status().as_deref().is_some_and(|s| terminal_runtime::same_terminal_class(s, outcome));
+        let same = before
+            .last_run_status()
+            .as_deref()
+            .is_some_and(|s| terminal_runtime::same_terminal_class(s, outcome));
         // Preserve the Host's more specific timeout/skipped spelling and its
         // diagnostic, but never upgrade a typed state to authority or a receipt.
-        if !same { after.set_last_run_status(outcome); }
+        if !same {
+            after.set_last_run_status(outcome);
+        }
         match outcome {
             "completed" => after.clear_last_run_error(),
-            "cancelled" if !same || after.last_run_error().is_none() => after.set_last_run_error("Root execution cancelled"),
-            "error" if !same || after.last_run_error().is_none() => after.set_last_run_error("Root activation failed before final-save was confirmed"),
-            _ => {},
+            "cancelled" if !same || after.last_run_error().is_none() => {
+                after.set_last_run_error("Root execution cancelled")
+            }
+            "error" if !same || after.last_run_error().is_none() => {
+                after.set_last_run_error("Root activation failed before final-save was confirmed")
+            }
+            _ => {}
         }
-        if !(same && terminal_runtime::idle_control_state(before)) { after.synchronize_terminal_runtime_status(); }
-        self.commit_runtime_projection(before, &after, rel, guards).await?;
-        if let Some(publish) = publish { publish(&after); }
+        if !(same && terminal_runtime::idle_control_state(before)) {
+            after.synchronize_terminal_runtime_status();
+        }
+        self.commit_runtime_projection(before, &after, rel, guards)
+            .await?;
+        if let Some(publish) = publish {
+            publish(&after);
+        }
         Ok(after)
     }
 
+    async fn commit_root_observation(
+        &self,
+        before: &Session,
+        after: &Session,
+        rel: &str,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> Result<(), ActorDirectoryError> {
+        let path = self
+            .abs_path_from_rel(rel)
+            .join(super::super::RUNTIME_SIDECAR_FILE);
+        let old = super::super::runtime_sidecar_snapshot(before);
+        let new = super::super::runtime_sidecar_snapshot(after);
+        if serde_json::to_value(&old).map_err(|_| ActorDirectoryError::Corrupt)?
+            != serde_json::to_value(&new).map_err(|_| ActorDirectoryError::Corrupt)?
+        {
+            self.write_actor_bytes(
+                &path,
+                serde_json::to_vec_pretty(&new).map_err(|_| ActorDirectoryError::Corrupt)?,
+                guards,
+            )
+            .await?;
+        } else {
+            self.confirm_actor_file_durable(&path, guards).await?;
+        }
+        // This is only an attribution checkpoint. Do not publish a leading
+        // sidecar's unconfirmed terminal status to the index or cache.
+        Ok(())
+    }
+
     pub(super) async fn finish_root_activation_impl(
-        &self, owner: &RootActorRuntimeWrite, now: DateTime<Utc>, outcome: ActorActivationFinish,
+        &self,
+        owner: &RootActorRuntimeWrite,
+        now: DateTime<Utc>,
+        outcome: ActorActivationFinish,
         publish: Option<&bamboo_domain::storage::RootActorRuntimePublisher>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         let fence = &owner.fence;
         let (rel, path, guards) = self.lock_actor_runtime(&fence.actor_id).await?;
-        let initial = self.projection_target(&fence.actor_id, &rel).await.map_err(storage)?.ok_or(ActorDirectoryError::InvalidIdentity)?;
-        owner.conversation_generation.check_canonical(&initial).map_err(|_| ActorDirectoryError::InvalidIdentity)?;
-        if initial.created_at != owner.created_at { return Err(ActorDirectoryError::InvalidIdentity); }
-        let mut entry = self.observed_runtime_actor(&path, &initial).await?.ok_or(ActorDirectoryError::StaleFence)?;
+        let initial = self
+            .projection_target(&fence.actor_id, &rel)
+            .await
+            .map_err(storage)?
+            .ok_or(ActorDirectoryError::InvalidIdentity)?;
+        owner
+            .conversation_generation
+            .check_canonical(&initial)
+            .map_err(|_| ActorDirectoryError::InvalidIdentity)?;
+        if initial.created_at != owner.created_at {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
+        let mut entry = self
+            .observed_runtime_actor(&path, &initial)
+            .await?
+            .ok_or(ActorDirectoryError::StaleFence)?;
         validate_projection_identity(&entry, &initial)?;
-        let active = entry.activation.as_ref().filter(|a| a.matches_fence(fence)).ok_or(ActorDirectoryError::StaleFence)?;
+        let active = entry
+            .activation
+            .as_ref()
+            .filter(|a| a.matches_fence(fence))
+            .ok_or(ActorDirectoryError::StaleFence)?;
         let mut marked = initial.clone();
         let was_attributed = matches_observation(&initial, fence).unwrap_or(false);
         stamp_owned_observation(&mut marked, owner).map_err(storage)?;
-        if !was_attributed && (active.status.is_live() || initial.metadata.contains_key(ROOT_OBSERVATION))
-            && !initial.has_runtime_wait() && initial.last_run_status().as_deref() != Some("pending") {
+        if !was_attributed
+            && (active.status.is_live() || initial.metadata.contains_key(ROOT_OBSERVATION))
+            && !initial.has_runtime_wait()
+            && initial.last_run_status().as_deref() != Some("pending")
+        {
             // First-write failure must not relabel A's error/Idle gate as B.
             // Record B's real context before committing its Actor terminal.
-            marked.set_last_run_status("running"); marked.clear_last_run_error();
-            let state = marked.agent_runtime_state.get_or_insert_with(|| AgentRuntimeState::new(&marked.id));
+            marked.set_last_run_status("running");
+            marked.clear_last_run_error();
+            let state = marked
+                .agent_runtime_state
+                .get_or_insert_with(|| AgentRuntimeState::new(&marked.id));
             state.status = AgentStatusState::Initializing;
-            marked.metadata.insert("agent.runtime.state".into(), serde_json::to_string(state).map_err(|_| ActorDirectoryError::Corrupt)?);
+            marked.metadata.insert(
+                "agent.runtime.state".into(),
+                serde_json::to_string(state).map_err(|_| ActorDirectoryError::Corrupt)?,
+            );
         }
-        self.commit_runtime_projection(&initial, &marked, &rel, &guards).await?;
-        let (finished, main) = self.settle_root_entry(&mut entry, &rel, &path, fence, Some(outcome), now, &guards).await?;
-        if main != Some(SupervisedRootOutcomeResult::Suspended) && !marked.has_runtime_wait()
-            && marked.last_run_status().as_deref() != Some("pending") {
-            self.project_root_terminal(&marked, terminal_runtime::terminal_status(finished.status).ok_or(ActorDirectoryError::InvalidTransition)?, &rel, &guards, publish).await?;
+        self.commit_root_observation(&initial, &marked, &rel, &guards)
+            .await?;
+        let (finished, main) = self
+            .settle_root_entry(&mut entry, &rel, &path, fence, Some(outcome), now, &guards)
+            .await?;
+        if main != Some(SupervisedRootOutcomeResult::Suspended)
+            && !marked.has_runtime_wait()
+            && marked.last_run_status().as_deref() != Some("pending")
+        {
+            self.project_root_terminal(
+                &marked,
+                terminal_runtime::terminal_status(finished.status)
+                    .ok_or(ActorDirectoryError::InvalidTransition)?,
+                &rel,
+                &guards,
+                publish,
+            )
+            .await?;
+        } else {
+            self.commit_runtime_projection(&marked, &marked, &rel, &guards)
+                .await?;
+            if let Some(publish) = publish {
+                publish(&marked);
+            }
         }
         Ok(finished)
     }
 
     pub(crate) async fn reconcile_root_runtime_impl(
-        &self, expected: &Session, cutoff: DateTime<Utc>,
+        &self,
+        expected: &Session,
+        cutoff: DateTime<Utc>,
         publish: &bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<Option<Session>> {
-        let (rel, path, guards) = self.lock_actor_runtime(&expected.id).await.map_err(io::Error::other)?;
-        let Some(latest) = self.projection_target(&expected.id, &rel).await? else { return Ok(None); };
+        let (rel, path, guards) = self
+            .lock_actor_runtime(&expected.id)
+            .await
+            .map_err(io::Error::other)?;
+        let Some(latest) = self.projection_target(&expected.id, &rel).await? else {
+            return Ok(None);
+        };
         super::super::reject_incompatible_session_write(&latest)?;
         super::super::reject_incompatible_session_write(expected)?;
         super::super::child_wait_control_plane::validate_incarnation(expected, &latest)?;
-        expected.check_conversation_generation(&latest).map_err(io::Error::other)?;
-        if latest.kind != SessionKind::Root || !latest.authority_identity.is_ordinary()
-            || serde_json::to_value(expected)? != serde_json::to_value(&latest)? { return Ok(None); }
-        let mut outcome = latest.last_run_status().filter(|s| super::super::child_wait_control_plane::terminal(s));
-        if let Some(mut entry) = self.observed_runtime_actor(&path, &latest).await.map_err(io::Error::other)? {
+        expected
+            .check_conversation_generation(&latest)
+            .map_err(io::Error::other)?;
+        if latest.kind != SessionKind::Root
+            || !latest.authority_identity.is_ordinary()
+            || serde_json::to_value(expected)? != serde_json::to_value(&latest)?
+        {
+            return Ok(None);
+        }
+        let mut outcome = latest
+            .last_run_status()
+            .filter(|s| super::super::child_wait_control_plane::terminal(s));
+        if let Some(mut entry) = self
+            .observed_runtime_actor(&path, &latest)
+            .await
+            .map_err(io::Error::other)?
+        {
             validate_projection_identity(&entry, &latest).map_err(io::Error::other)?;
-            let Some(activation) = entry.activation.as_ref() else { return Ok(None); };
+            let Some(activation) = entry.activation.as_ref() else {
+                return Ok(None);
+            };
             let fence = activation.fence();
             let attributed = matches_observation(&latest, &fence)?;
-            if (!attributed && (latest.metadata.contains_key(ROOT_OBSERVATION) || latest.conversation_reset.is_some()))
-                || (!attributed && latest.host_run_id().is_some_and(|id| id != activation.run_id)) { return Ok(None); }
-            if activation.status.is_live() && (latest.updated_at >= cutoff || activation.lease_expires_at > Utc::now()) { return Ok(None); }
-            if activation.status.is_live() && self.confirmed_root_main_outcome(&entry, &rel, &fence, &guards).await.map_err(io::Error::other)?.is_none() { return Ok(None); }
-            let (settled, main) = self.settle_root_entry(&mut entry, &rel, &path, &fence, None, Utc::now(), &guards).await.map_err(io::Error::other)?;
-            if main == Some(SupervisedRootOutcomeResult::Suspended) { return Ok(None); }
+            if (!attributed
+                && (latest.metadata.contains_key(ROOT_OBSERVATION)
+                    || latest.conversation_reset.is_some()))
+                || (!attributed
+                    && latest
+                        .host_run_id()
+                        .is_some_and(|id| id != activation.run_id))
+            {
+                return Ok(None);
+            }
+            if activation.status.is_live()
+                && (latest.updated_at >= cutoff || activation.lease_expires_at > Utc::now())
+            {
+                return Ok(None);
+            }
+            if activation.status.is_live()
+                && self
+                    .confirmed_root_main_outcome(&entry, &rel, &fence, &guards)
+                    .await
+                    .map_err(io::Error::other)?
+                    .is_none()
+            {
+                return Ok(None);
+            }
+            let (settled, main) = self
+                .settle_root_entry(&mut entry, &rel, &path, &fence, None, Utc::now(), &guards)
+                .await
+                .map_err(io::Error::other)?;
+            if main == Some(SupervisedRootOutcomeResult::Suspended) {
+                self.commit_runtime_projection(&latest, &latest, &rel, &guards)
+                    .await
+                    .map_err(io::Error::other)?;
+                publish(&latest);
+                return Ok(Some(latest));
+            }
             outcome = terminal_runtime::terminal_status(settled.status).map(str::to_string);
-        } else if latest.metadata.contains_key(ROOT_OBSERVATION) || latest.conversation_reset.is_some() {
+        } else if latest.metadata.contains_key(ROOT_OBSERVATION)
+            || latest.conversation_reset.is_some()
+        {
             // A lost activated sidecar is rejected by observed_runtime_actor;
             // neither a marker nor reset context can recreate authority.
             return Ok(None);
         }
-        if latest.has_runtime_wait() || latest.last_run_status().as_deref() == Some("pending") { return Ok(None); }
-        let Some(outcome) = outcome else { return Ok(None); };
-        self.project_root_terminal(&latest, &outcome, &rel, &guards, Some(publish)).await.map(Some).map_err(io::Error::other)
+        let Some(outcome) = outcome else {
+            return Ok(None);
+        };
+        if latest.has_runtime_wait() || latest.last_run_status().as_deref() == Some("pending") {
+            self.commit_runtime_projection(&latest, &latest, &rel, &guards)
+                .await
+                .map_err(io::Error::other)?;
+            publish(&latest);
+            return Ok(Some(latest));
+        }
+        self.project_root_terminal(&latest, &outcome, &rel, &guards, Some(publish))
+            .await
+            .map(Some)
+            .map_err(io::Error::other)
     }
 }
+
+#[cfg(test)]
+#[path = "root_terminal_runtime_tests.rs"]
+mod tests;

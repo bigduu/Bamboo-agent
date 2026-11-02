@@ -193,7 +193,9 @@ impl SessionStoreV2 {
         }
         super::super::reject_incompatible_session_write(&before).map_err(storage)?;
         if (before.kind == bamboo_domain::SessionKind::Root
-            && (before.metadata.contains_key(super::root_terminal_runtime::ROOT_OBSERVATION)
+            && (before
+                .metadata
+                .contains_key(super::root_terminal_runtime::ROOT_OBSERVATION)
                 || before.conversation_reset.is_some()))
             || before.has_runtime_wait()
             || pending_delivery(&before)
@@ -325,7 +327,6 @@ impl SessionStoreV2 {
         expected: &Session,
         before: DateTime<Utc>,
         error: Option<&str>,
-        publish: Option<&bamboo_domain::storage::RootActorRuntimePublisher>,
     ) -> io::Result<Option<Session>> {
         let (rel, path, guards) = self
             .lock_actor_runtime(&expected.id)
@@ -443,7 +444,6 @@ impl SessionStoreV2 {
         self.commit_runtime_projection(&latest, &after, &rel, &guards)
             .await
             .map_err(io::Error::other)?;
-        if let Some(publish) = publish { publish(&after); }
         Ok(Some(after))
     }
 
@@ -475,9 +475,15 @@ impl SessionStoreV2 {
         let mut observed_incoming = incoming.clone();
         if incoming.kind == bamboo_domain::SessionKind::Root {
             if let Some(proof) = guards.root_actor.as_ref() {
-                super::root_terminal_runtime::stamp_owned_observation(&mut observed_incoming, proof.owner())?;
+                super::root_terminal_runtime::stamp_owned_observation(
+                    &mut observed_incoming,
+                    proof.owner(),
+                )?;
             } else {
-                super::root_terminal_runtime::preserve_observation(&mut observed_incoming, latest.as_ref());
+                super::root_terminal_runtime::preserve_observation(
+                    &mut observed_incoming,
+                    latest.as_ref(),
+                );
             }
         }
         let incoming = &observed_incoming;

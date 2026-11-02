@@ -1179,7 +1179,8 @@ impl ActorDirectoryPort for SessionStoreV2 {
         outcome: ActorActivationFinish,
         publish: Option<bamboo_domain::storage::RootActorRuntimePublisher>,
     ) -> Result<ActorActivation, ActorDirectoryError> {
-        self.finish_root_activation_impl(owner, now, outcome, publish.as_ref()).await
+        self.finish_root_activation_impl(owner, now, outcome, publish.as_ref())
+            .await
     }
 
     async fn retire_actor(

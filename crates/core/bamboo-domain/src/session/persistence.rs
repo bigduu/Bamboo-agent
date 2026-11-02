@@ -717,7 +717,10 @@ impl RootActorExecutionBinding {
         }
     }
 
-    pub fn with_terminal_publisher(mut self, publish: crate::storage::RootActorRuntimePublisher) -> Self {
+    pub fn with_terminal_publisher(
+        mut self,
+        publish: crate::storage::RootActorRuntimePublisher,
+    ) -> Self {
         self.terminal_publisher = Some(publish);
         self
     }
