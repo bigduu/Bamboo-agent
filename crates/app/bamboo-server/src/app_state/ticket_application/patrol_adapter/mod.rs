@@ -3,6 +3,7 @@
 mod checkpoint_store;
 mod delivery;
 mod program;
+mod runtime_observation;
 pub use checkpoint_store::PatrolCheckpointStore;
 
 use bamboo_orchestration::patrol::{host, Scope};
@@ -14,6 +15,18 @@ impl TicketApplication {
     /// authority check. IDs/previous checkpoints cannot recreate a grant.
     pub async fn patrol_observation(&self, scope: &Scope) -> Result<host::TicketObservation> {
         let (service, authority) = self.authority(Principal::Runtime).await?;
+        if let Some(runtime) =
+            runtime_observation::prepare(self, &service, &authority, scope).await?
+        {
+            return host::read_observation_with_runtime(
+                &service,
+                &authority,
+                scope,
+                &runtime,
+                &bamboo_orchestration::patrol::Policy::default(),
+            )
+            .map_err(patrol_error);
+        }
         host::read_observation(&service, &authority, scope).map_err(patrol_error)
     }
 
