@@ -425,7 +425,7 @@ impl SessionStoreV2 {
     }
 
     /// Called only after the ordinary physical Session writer locks are held.
-    pub(crate) async fn normalize_terminal_runtime_write(
+    pub(in crate::v2) async fn normalize_terminal_runtime_write(
         &self,
         incoming: &Session,
         rel: &str,
