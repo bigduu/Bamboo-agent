@@ -424,6 +424,157 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_reconciles_terminal_roots_and_cache_without_migration_or_new_execution() {
+        use bamboo_domain::{
+            ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, AgentRuntimeState,
+            AgentStatusState, Session,
+        };
+        let home = tempfile::tempdir().unwrap();
+        let original = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let mut evidence = Vec::new();
+        for (index, outcome, typed) in [
+            (
+                0,
+                ActorActivationFinish::Succeeded,
+                AgentStatusState::Completed,
+            ),
+            (
+                1,
+                ActorActivationFinish::Cancelled,
+                AgentStatusState::Cancelled,
+            ),
+            (2, ActorActivationFinish::Failed, AgentStatusState::Failed),
+        ] {
+            let mut session = Session::new(format!("terminal-root-{index}"), "model");
+            session.session_version = None;
+            session.agent_runtime_state = Some(AgentRuntimeState::new(&session.id));
+            session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+            session.set_last_run_status("running");
+            original.save_session(&session).await.unwrap();
+            let now = Utc::now();
+            let activation = original
+                .claim_activation(&ActorActivationClaim {
+                    actor_id: session.id.clone(),
+                    run_id: format!("run-{index}"),
+                    lease_owner: format!("synthetic-owner-{index}"),
+                    lease_expires_at: now + chrono::Duration::minutes(5),
+                    inbox_generation: 0,
+                    placement_ref: None,
+                    now,
+                })
+                .await
+                .unwrap();
+            original
+                .start_activation(&activation.fence(), now)
+                .await
+                .unwrap();
+            original
+                .finish_activation(&activation.fence(), now, outcome)
+                .await
+                .unwrap();
+            let mut zombie = original.load_session(&session.id).await.unwrap().unwrap();
+            zombie.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Initializing;
+            zombie.metadata.insert(
+                "agent.runtime.state".into(),
+                serde_json::to_string(zombie.agent_runtime_state.as_ref().unwrap()).unwrap(),
+            );
+            zombie.messages.clear();
+            // Seed only this TempDir with the audited legacy split. The trusted
+            // Actor/Main files are the actual commits, not enumeration stubs.
+            let directory = home.path().join("sessions").join(&session.id);
+            tokio::fs::write(
+                directory.join("runtime.json"),
+                serde_json::to_vec_pretty(&zombie).unwrap(),
+            )
+            .await
+            .unwrap();
+            let main = tokio::fs::read(directory.join("session.json"))
+                .await
+                .unwrap();
+            evidence.push((session.id, typed, main));
+        }
+        let mut unknown = Session::new("unknown-live-root", "model");
+        unknown.agent_runtime_state = Some(AgentRuntimeState::new(&unknown.id));
+        unknown.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+        unknown.set_last_run_status("running");
+        original.save_session(&unknown).await.unwrap();
+        original.flush_search_index().await;
+        drop(original);
+
+        let reopened = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let inbox = Arc::new(FileSessionInbox::new(
+            reopened.clone(),
+            SessionInboxLimits::default(),
+        ));
+        let (router, spawner) = router(inbox, false).await;
+        let cache: bamboo_engine::SessionCache = Arc::default();
+        let shutdown = CancellationToken::new();
+        let report = reconcile_startup_inner(
+            reopened.clone(),
+            router,
+            shutdown.clone(),
+            None,
+            Some(cache.clone()),
+        )
+        .await;
+        assert_eq!(report.checked, 4);
+        assert_eq!(report.attempted, 0);
+        assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
+        shutdown.cancel();
+        let replay = TerminalRecovery {
+            store: reopened.clone(),
+            cutoff: Utc::now() - chrono::Duration::hours(1),
+            cache: Some(cache.clone()),
+        };
+        for (id, typed, main) in evidence {
+            let repaired = reopened.load_session(&id).await.unwrap().unwrap();
+            assert_eq!(repaired.session_version, None);
+            assert_eq!(repaired.agent_runtime_state.as_ref().unwrap().status, typed);
+            assert_eq!(
+                cache
+                    .get(&id)
+                    .unwrap()
+                    .read()
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                typed
+            );
+            let directory = home.path().join("sessions").join(&id);
+            let runtime = tokio::fs::read(directory.join("runtime.json"))
+                .await
+                .unwrap();
+            replay.inspect(&id).await;
+            assert_eq!(
+                tokio::fs::read(directory.join("runtime.json"))
+                    .await
+                    .unwrap(),
+                runtime
+            );
+            assert_eq!(
+                tokio::fs::read(directory.join("session.json"))
+                    .await
+                    .unwrap(),
+                main
+            );
+        }
+        assert_eq!(
+            reopened
+                .load_session(&unknown.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_runtime_state
+                .unwrap()
+                .status,
+            AgentStatusState::Running
+        );
+        assert!(!cache.contains_key(&unknown.id));
+        reopened.flush_search_index().await;
+    }
+
+    #[tokio::test]
     async fn restart_recovers_immediate_inbox_intent_with_one_cold_owner() {
         let home = tempfile::tempdir().unwrap();
         let (original_store, original_inbox) = seed(home.path()).await;
