@@ -80,6 +80,23 @@ fn runtime_status(session: &Session) -> Option<AgentStatusState> {
         .map(|state| state.status)
 }
 
+pub(super) fn runtime_identity(session: &Session) -> io::Result<Option<String>> {
+    let legacy = session
+        .metadata
+        .get("agent.runtime.state")
+        .map(|raw| serde_json::from_str::<AgentRuntimeState>(raw))
+        .transpose()
+        .map_err(|_| conflict("runtime identity mirror is invalid"))?;
+    let typed = session.agent_runtime_state.as_ref();
+    if typed
+        .zip(legacy.as_ref())
+        .is_some_and(|(a, b)| a.run_id != b.run_id)
+    {
+        return Err(conflict("runtime identity mirror differs"));
+    }
+    Ok(typed.or(legacy.as_ref()).map(|state| state.run_id.clone()))
+}
+
 pub(super) fn idle_control_state(session: &Session) -> bool {
     runtime_status(session) == Some(AgentStatusState::Idle)
 }
@@ -417,6 +434,9 @@ impl SessionStoreV2 {
             );
         }
         after.metadata.remove("runtime.reconciled_activation_fence");
+        after
+            .metadata
+            .remove("runtime.reconciled_terminal_generation");
         after.set_last_run_status("running");
         after.clear_last_run_error();
         if !after.has_runtime_wait() {
@@ -505,11 +525,59 @@ impl SessionStoreV2 {
         Ok(Some(after))
     }
 
+    async fn confirm_child_host_terminal(
+        &self,
+        latest: &Session,
+        outcome: &str,
+        rel: &str,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> io::Result<bool> {
+        let path = self.abs_path_from_rel(rel).join("session.json");
+        if !Self::regular_actor_file(&path)
+            .await
+            .map_err(io::Error::other)?
+        {
+            return Ok(false);
+        }
+        let bytes = fs::read(&path).await?;
+        super::super::compact_main::validate_full_main(&bytes)?;
+        let main: Session = serde_json::from_slice(&bytes)?;
+        super::super::reject_incompatible_session_write(&main)?;
+        if main.id != latest.id
+            || main.kind != SessionKind::Child
+            || latest.host_run_id().is_none()
+            || main.created_at != latest.created_at
+            || main.parent_session_id != latest.parent_session_id
+            || main.parent_created_at != latest.parent_created_at
+            || main.project_id_meta() != latest.project_id_meta()
+            || main.host_run_id() != latest.host_run_id()
+            || !main.host_run_matches_launch()
+            || main.child_launch_generation() != latest.child_launch_generation()
+            || main.session_inbox_admission() != latest.session_inbox_admission()
+            || runtime_identity(&main)? != runtime_identity(latest)?
+            || main.check_conversation_generation(latest).is_err()
+            || !main
+                .last_run_status()
+                .as_deref()
+                .is_some_and(|s| same_terminal_class(s, outcome))
+        {
+            return Ok(false);
+        }
+        // Runtime may lead a failed Main write. Only an exact Main Host fact
+        // can close an unactivated Host, or protect a published source while
+        // revoking an expired lease; reconfirm the actual durable boundary.
+        self.confirm_actor_file_durable(&path, guards)
+            .await
+            .map_err(io::Error::other)?;
+        Ok(true)
+    }
+
     pub(crate) async fn reconcile_child_runtime_impl(
         &self,
         expected: &Session,
         before: DateTime<Utc>,
         error: Option<&str>,
+        publish: Option<&bamboo_domain::storage::RootActorRuntimePublisher>,
     ) -> io::Result<Option<Session>> {
         let (rel, path, guards) = self
             .lock_actor_runtime(&expected.id)
@@ -524,14 +592,12 @@ impl SessionStoreV2 {
         // This is a control-plane CAS, including Host run UUID, pipeline UUID,
         // launch generation, Inbox admission and timestamp, not just a wait CAS.
         if latest.kind != SessionKind::Child
-            || latest.updated_at >= before
             || latest.has_runtime_wait()
             || pending_delivery(&latest)
             || !latest.host_run_matches_launch()
             || latest.last_run_status().as_deref() == Some("pending")
             || latest.session_inbox_admission() != expected.session_inbox_admission()
-            || serde_json::to_value(super::super::runtime_sidecar_snapshot(expected))?
-                != serde_json::to_value(super::super::runtime_sidecar_snapshot(&latest))?
+            || serde_json::to_value(expected)? != serde_json::to_value(&latest)?
         {
             return Ok(None);
         }
@@ -540,20 +606,66 @@ impl SessionStoreV2 {
             .filter(|s| super::super::child_wait_control_plane::terminal(s));
         let mut expired = false;
         let mut recovered_fence = None;
-        if let Some(mut entry) = self
+        let source_run = completion_source_run(&latest)?;
+        if source_run
+            .as_deref()
+            .zip(latest.host_run_id())
+            .is_some_and(|(source, host)| source != host)
+        {
+            return Ok(None);
+        }
+        let observed = self
             .observed_runtime_actor(&path, &latest)
             .await
-            .map_err(io::Error::other)?
+            .map_err(io::Error::other)?;
+        let activation = observed
+            .as_ref()
+            .and_then(|entry| entry.activation.as_ref());
+        if let Some(activation) =
+            activation.filter(|a| a.status == ActorActivationStatus::Succeeded)
         {
+            if latest.host_run_id().is_some() && chosen_status.is_none() {
+                // A successful Worker can hand off to a Host suspension or
+                // question. The exact Host marker identifies this
+                // in-flight phase; only its already committed Main terminal
+                // fact may close it. Actor success alone cannot close it.
+                // Failed/Cancelled remain exact negative terminal facts, with
+                // durable waits excluded above, including after a failed repair.
+                let Some(outcome) = terminal_status(activation.status) else {
+                    return Ok(None);
+                };
+                if !self
+                    .confirm_child_host_terminal(&latest, outcome, &rel, &guards)
+                    .await?
+                {
+                    return Ok(None);
+                }
+            }
+        }
+        if let Some(host) = chosen_status.as_deref().filter(|_| {
+            activation.is_none()
+                || (source_run.is_some() && activation.is_some_and(|a| a.status.is_live()))
+        }) {
+            if !self
+                .confirm_child_host_terminal(&latest, host, &rel, &guards)
+                .await?
+            {
+                return Ok(None);
+            }
+        }
+        if let Some(mut entry) = observed {
             if let Some(activation) = entry.activation.as_mut() {
                 if latest
                     .host_run_id()
                     .is_some_and(|id| id != activation.run_id)
+                    || source_run
+                        .as_deref()
+                        .is_some_and(|id| id != activation.run_id)
                 {
                     return Ok(None);
                 }
                 if activation.status.is_live() {
-                    if activation.lease_expires_at > Utc::now() {
+                    if latest.updated_at >= before || activation.lease_expires_at > Utc::now() {
                         return Ok(None);
                     }
                     // Check the existing Host fact before changing authority.
@@ -572,6 +684,12 @@ impl SessionStoreV2 {
                     entry.actor.state = ActorLogicalState::Failed;
                     entry.revision = checked_next(entry.revision).map_err(io::Error::other)?;
                     self.write_actor_entry(&path, &entry, &guards)
+                        .await
+                        .map_err(io::Error::other)?;
+                } else {
+                    // Readable AfterReplace authority is still unconfirmed.
+                    // Replay the real file+directory sync with these guards.
+                    self.confirm_actor_file_durable(&path, &guards)
                         .await
                         .map_err(io::Error::other)?;
                 }
@@ -600,6 +718,12 @@ impl SessionStoreV2 {
             return Ok(None);
         };
         let mut after = latest.clone();
+        // A negative replay fence, never completion or Worker-stop authority.
+        // Include unactivated Host repairs without inventing an Actor fence.
+        after.metadata.insert(
+            "runtime.reconciled_terminal_generation".into(),
+            latest.child_launch_generation().to_string(),
+        );
         if let Some(fence) = recovered_fence {
             after.metadata.insert(
                 "runtime.reconciled_activation_fence".into(),
@@ -627,6 +751,9 @@ impl SessionStoreV2 {
         self.commit_runtime_projection(&latest, &after, &rel, &guards)
             .await
             .map_err(io::Error::other)?;
+        if let Some(publish) = publish {
+            publish(&after);
+        }
         Ok(Some(after))
     }
 
@@ -656,6 +783,20 @@ impl SessionStoreV2 {
         )
         .await?;
         let mut observed_incoming = incoming.clone();
+        if incoming.kind == SessionKind::Child {
+            observed_incoming
+                .metadata
+                .remove("runtime.reconciled_terminal_generation");
+            if let Some(marker) = latest
+                .as_ref()
+                .and_then(|s| s.metadata.get("runtime.reconciled_terminal_generation"))
+            {
+                observed_incoming.metadata.insert(
+                    "runtime.reconciled_terminal_generation".into(),
+                    marker.clone(),
+                );
+            }
+        }
         if incoming.kind == bamboo_domain::SessionKind::Root {
             if let Some(proof) = guards.root_actor.as_ref() {
                 super::root_terminal_runtime::stamp_owned_observation(

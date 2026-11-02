@@ -58,6 +58,107 @@ pub struct SessionRepository {
 }
 
 impl SessionRepository {
+    /// Publish a committed Child repair while its Storage guards are held.
+    /// A cache belonging to another birth/run/launch/input is left untouched;
+    /// this observation grants neither execution nor parent delivery authority.
+    pub fn publish_reconciled_child(cache: &SessionCache, expected: &Session, saved: &Session) {
+        fn runtime_id(session: &Session) -> Option<Option<String>> {
+            let mirror = session
+                .metadata
+                .get("agent.runtime.state")
+                .map(|raw| serde_json::from_str::<bamboo_domain::AgentRuntimeState>(raw))
+                .transpose()
+                .ok()?;
+            let typed = session.agent_runtime_state.as_ref();
+            if typed
+                .zip(mirror.as_ref())
+                .is_some_and(|(a, b)| a.run_id != b.run_id)
+            {
+                return None;
+            }
+            Some(typed.or(mirror.as_ref()).map(|s| s.run_id.clone()))
+        }
+        fn inputs(session: &Session) -> Option<serde_json::Value> {
+            serde_json::to_value(
+                session
+                    .messages
+                    .iter()
+                    .filter(|m| m.role == bamboo_domain::Role::User)
+                    .collect::<Vec<_>>(),
+            )
+            .ok()
+        }
+        if saved.kind != bamboo_domain::SessionKind::Child {
+            return;
+        }
+        if let Some(entry) = cache.get(&saved.id) {
+            // SessionSnapshot::update retries against a concurrent publication.
+            // Leave a vacant cache vacant: loading canonical Storage remains
+            // correct, while a check-then-insert could replace a new birth.
+            entry.update(|current| {
+                if current.id != saved.id
+                    || current.kind != saved.kind
+                    || current.root_session_id != saved.root_session_id
+                    || current.authority_identity != saved.authority_identity
+                    || !current.execution_compatibility().execution_allowed
+                    || current.created_at != saved.created_at
+                    || current.parent_created_at != saved.parent_created_at
+                    || current.parent_session_id != saved.parent_session_id
+                    || current.project_id_meta() != saved.project_id_meta()
+                    || current.host_run_id() != saved.host_run_id()
+                    || current.child_launch_generation() != saved.child_launch_generation()
+                    || current.session_inbox_admission() != saved.session_inbox_admission()
+                    || current.check_conversation_generation(saved).is_err()
+                    || runtime_id(current).is_none()
+                    || runtime_id(current) != runtime_id(expected)
+                    || inputs(current).is_none()
+                    || inputs(current) != inputs(expected)
+                    || current.has_runtime_wait()
+                    || (crate::runtime::runner::state_bridge::read_runtime_state(current)
+                        .is_some_and(|s| s.status == bamboo_domain::AgentStatusState::Idle)
+                        && !crate::runtime::runner::state_bridge::read_runtime_state(expected)
+                            .is_some_and(|s| s.status == bamboo_domain::AgentStatusState::Idle))
+                    || current.last_run_status().as_deref() == Some("pending")
+                    || current.metadata.get("runtime.child_completion_source_v1")
+                        != expected.metadata.get("runtime.child_completion_source_v1")
+                {
+                    return;
+                }
+                // Only the actual repair fields change. Preserve newer UI,
+                // transcript, human engagement and accounting observations.
+                if let Some(status) = saved.last_run_status() {
+                    current.set_last_run_status(&status);
+                }
+                match saved.last_run_error() {
+                    Some(error) => current.set_last_run_error(error),
+                    None => current.clear_last_run_error(),
+                }
+                if let Some(final_state) = saved.agent_runtime_state.as_ref() {
+                    if current.agent_runtime_state.is_none() {
+                        current.agent_runtime_state =
+                            crate::runtime::runner::state_bridge::read_runtime_state(current);
+                    }
+                    let state = current
+                        .agent_runtime_state
+                        .get_or_insert_with(|| final_state.clone());
+                    state.status = final_state.status;
+                    state.tools.active_tool_calls = final_state.tools.active_tool_calls;
+                    if let Ok(raw) = serde_json::to_string(state) {
+                        current.metadata.insert("agent.runtime.state".into(), raw);
+                    }
+                }
+                for key in [
+                    "runtime.reconciled_activation_fence",
+                    "runtime.reconciled_terminal_generation",
+                ] {
+                    if let Some(marker) = saved.metadata.get(key) {
+                        current.metadata.insert(key.into(), marker.clone());
+                    }
+                }
+            });
+        }
+    }
+
     pub fn new(
         cache: SessionCache,
         storage: Arc<dyn Storage>,
@@ -1280,6 +1381,128 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn child_repair_cache_preserves_later_legacy_run_input_wait_and_ui() {
+        use bamboo_domain::{AgentRuntimeState, AgentStatusState, Message};
+        let parent = Session::new("repair-parent", "model");
+        let mut expected = Session::new_child_of("repair-child", &parent, "model", "Child");
+        expected.add_message(Message::user("original input"));
+        expected.agent_runtime_state = Some(AgentRuntimeState::new("pipeline-A"));
+        expected.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+        expected.set_last_run_status("running");
+        let mut saved = expected.clone();
+        saved.set_last_run_status("cancelled");
+        saved.synchronize_terminal_runtime_status();
+        saved
+            .metadata
+            .insert("runtime.reconciled_terminal_generation".into(), "0".into());
+        for case in [
+            "typed-run",
+            "legacy-run",
+            "mixed-mirror",
+            "input",
+            "wait",
+            "idle",
+            "source",
+        ] {
+            let cache: SessionCache = Arc::default();
+            let mut later = expected.clone();
+            match case {
+                "typed-run" => {
+                    later.agent_runtime_state.as_mut().unwrap().run_id = "pipeline-B".into()
+                }
+                "legacy-run" | "mixed-mirror" => {
+                    let mut b = AgentRuntimeState::new("pipeline-B");
+                    b.status = AgentStatusState::Running;
+                    later.metadata.insert(
+                        "agent.runtime.state".into(),
+                        serde_json::to_string(&b).unwrap(),
+                    );
+                    if case == "legacy-run" {
+                        later.agent_runtime_state = None;
+                    }
+                }
+                "input" => later.add_message(Message::user("new legacy input B")),
+                "wait" => {
+                    later.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Suspended
+                }
+                "idle" => {
+                    later.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Idle
+                }
+                "source" => {
+                    later.metadata.insert(
+                        "runtime.child_completion_source_v1".into(),
+                        "new unconfirmed source".into(),
+                    );
+                }
+                _ => unreachable!(),
+            }
+            assert!(later.host_run_id().is_none());
+            assert!(later.session_inbox_admission().is_none());
+            let before = serde_json::to_value(&later).unwrap();
+            cache.insert(
+                later.id.clone(),
+                Arc::new(crate::SessionSnapshot::new(later)),
+            );
+            SessionRepository::publish_reconciled_child(&cache, &expected, &saved);
+            assert_eq!(
+                serde_json::to_value(&*cache.get(&saved.id).unwrap().read()).unwrap(),
+                before,
+                "{case}"
+            );
+        }
+        let cache: SessionCache = Arc::default();
+        SessionRepository::publish_reconciled_child(&cache, &expected, &saved);
+        assert!(!cache.contains_key(&saved.id));
+        let mut current = expected.clone();
+        current.title = "new UI title".into();
+        current.add_message(Message::assistant("newer same-run output", None));
+        current
+            .agent_runtime_state
+            .as_mut()
+            .unwrap()
+            .round
+            .current_round = 99;
+        cache.insert(
+            current.id.clone(),
+            Arc::new(crate::SessionSnapshot::new(current.clone())),
+        );
+        SessionRepository::publish_reconciled_child(&cache, &expected, &saved);
+        let entry = cache.get(&saved.id).unwrap();
+        let repaired = entry.read();
+        assert_eq!(repaired.title, current.title);
+        assert_eq!(
+            repaired
+                .metadata
+                .get("runtime.reconciled_terminal_generation")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(repaired.messages.len(), current.messages.len());
+        assert_eq!(
+            repaired
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .round
+                .current_round,
+            99
+        );
+        assert_eq!(
+            repaired.agent_runtime_state.as_ref().unwrap().status,
+            AgentStatusState::Cancelled
+        );
+        assert_eq!(
+            repaired
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .tools
+                .active_tool_calls,
+            0
+        );
+    }
 
     #[test]
     fn runtime_cache_preserves_only_same_lifetime_main_outcome_projection() {

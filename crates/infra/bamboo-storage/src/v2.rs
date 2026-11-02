@@ -1791,6 +1791,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "runtime.host_launch_generation",
     "runtime.host_prior_activation_fence",
     "runtime.reconciled_activation_fence",
+    "runtime.reconciled_terminal_generation",
     "agent.runtime.state",
     "assignment_prompt",
     "clarification_resume_pending",
@@ -7680,7 +7681,7 @@ impl Storage for SessionStoreV2 {
         before: DateTime<Utc>,
         error: Option<&str>,
     ) -> io::Result<Option<Session>> {
-        self.reconcile_child_runtime_impl(expected, before, error)
+        self.reconcile_child_runtime_impl(expected, before, error, None)
             .await
     }
 
@@ -7695,8 +7696,8 @@ impl Storage for SessionStoreV2 {
             self.reconcile_root_runtime_impl(expected, before, &publish)
                 .await
         } else {
-            let _ = error;
-            Ok(None)
+            self.reconcile_child_runtime_impl(expected, before, error, Some(&publish))
+                .await
         }
     }
 

@@ -6,7 +6,8 @@ Child final-save and terminal consumers are [#2460](https://github.com/bigduu/Ba
 Exact Child admission is [#2481](https://github.com/bigduu/Bamboo-agent/issues/2481),
 receipt replay [#2468](https://github.com/bigduu/Bamboo-agent/issues/2468),
 Root outcome/recovery [#2470](https://github.com/bigduu/Bamboo-agent/issues/2470),
-and Child startup/parent proof [#2455](https://github.com/bigduu/Bamboo-agent/issues/2455).
+shared startup repair [#2491](https://github.com/bigduu/Bamboo-agent/issues/2491),
+and the independent parent protocol tracker [#2455](https://github.com/bigduu/Bamboo-agent/issues/2455).
 
 Session owns identity and context. An ActorActivation owns one fenced attempt.
 A Worker supplies reclaimable execution capacity. Neither an absent local runner
@@ -106,18 +107,64 @@ running/suspended means started.
 
 ## Recovery boundary
 
-[Startup integration and recovery notification fencing](https://github.com/bigduu/Bamboo-agent/issues/2455) are the next dependent slice. They must validate the recovered child at the actual parent wait commit under the shared root tree writer, preserve fresh/unexpired owners and waits, and avoid stale cache publication. This slice does not enable that automatic reconciliation. Root claims with
-original reset identity are #2482; owner-attributed Root outcome recovery is
-#2470. Child admission does not enable Root Host UUID binding.
+[Shared startup repair](https://github.com/bigduu/Bamboo-agent/issues/2491) uses
+the existing paced SessionInbox index sweep: at most 32 indexed targets per tick,
+with one fixed boot cutoff across initial, queued, refresh and retry passes.
+Already-terminal records are reconciled regardless of age or index label.
+The cutoff limits new logical lease-expiry decisions; a fresh or still-leased
+execution is not declared orphaned. Renewal and recovery share physical guards.
 
-`Storage::reconcile_child_runtime` also provides a targeted repair entry point.
-Targeted repairs compare the exact control-plane, birth, current activation, Host Run, Inbox admission and launch generation under the same physical locks; pending broker delivery and new pending launches are excluded. These repairs update runtime/index state, preserve Main/transcript bytes and
-respect the current Session contract. They run independently of Session-version
-migration. Filesystem failures propagate; a failed repair does not publish a
-synthetic completion. Settled repair is idempotent.
-An old nonterminal record without an Actor or terminal Host fact remains unknown.
-Expired logical authority cannot override a conflicting committed Host outcome;
-recovery checks that conflict before any authority or runtime mutation.
+`Storage::reconcile_session_runtime` provides targeted repair and a synchronous
+cache publication retained inside the same physical guards.
+`Storage::reconcile_child_runtime` retains the narrower compatibility entry.
+Repairs compare the complete selected Session, birth, current activation, Host
+Run, input and launch generation; pending broker delivery, waits and new pending
+launches are excluded. Repairs preserve Main/transcript bytes and the current
+Session contract, independently of Session-version migration. Filesystem errors
+propagate without publishing success. Repeated terminal Actor/Main reads
+reconfirm real durability; settled repair is idempotent.
+
+Root repair requires its exact current Actor. An unactivated legacy Root has
+no current attempt proof: a leading Runtime or historical Main cannot create
+one. Root claims retain the original caller observation (#2482); owned Root Main
+outcomes bind the complete fence/reset generation and real input producer.
+Storage confirms the actual Main file/directory commit before correcting that
+same attempt's diagnostic (#2470). Retired state and finish time remain. Root
+execution does not use the Child Host UUID admission protocol.
+
+A marked Child Host can still be persisting a question or suspension after its
+Worker finishes. A successful Actor with a nonterminal Host phase remains unknown
+without an exact committed Main Host terminal fact. For an unactivated Child,
+only matching bound Host UUID, birth, launch, input and runtime identity in Main
+can confirm its Host outcome. Readable Runtime after a failed Main write is not
+that proof. Failed/Cancelled are exact negative Actor facts; durable waits and
+pending input still take precedence. No Actor plus nonterminal state remains
+unknown. Conflicting live
+Actor/Host outcomes remain unknown; expiry cannot turn committed success or
+cancellation into failure.
+
+Child cache repair checks the original typed/legacy run identity and complete
+User input boundary again inside atomic publication. It patches only the repair
+fields, preserving newer transcript, UI and accounting. A new birth/run/input,
+wait or pending source prevents replacement; a vacant cache remains vacant.
+
+A generation-bound private repair marker also covers a Host Main repair with
+no Actor. It only denies source-less replay; it is no completion or stop proof.
+Malformed/future generations fail closed. Ordinary writers preserve it, a new
+Host binding clears it, and copies strip it. A known older launch generation
+does not block a later explicitly cancelled queued launch. Current callbacks,
+boot replay and sibling wait counts/staging all retain this boundary; a legal
+sealed sibling still satisfies Any/FirstError without staging the repaired one.
+
+Recovery-generated source-less outcomes do not authorize parent execution or
+finalize a runner by childId. Existing valid published completion sources retain
+their normal replay path. A recovered Child may be Failed while its parent
+continues waiting for confirmed completion or its existing wait policy. The real
+SIGKILL/restart test checks this boundary separately from normal sealed Planner
+publication/resume. Stronger parent observation/Inbox permission and launch
+rollback remain separate [#2455](https://github.com/bigduu/Bamboo-agent/issues/2455)
+work; a repair snapshot is not their authority. Logical closure never certifies
+physical Worker stop.
 
 ## Separate continuation slice
 

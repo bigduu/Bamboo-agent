@@ -43,7 +43,7 @@ const PLANNER_SERIAL = {
     "names": [
       "runtime::runner::loop_execution::pipeline::tests::planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it",
       "session_app::child_completion_coordinator::tests::planner_artifact_completion_publishes_before_durable_resume_and_deduplicates",
-      "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report",
+      "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_recovery_keeps_unconfirmed_wait_and_report_private",
       "session_app::child_completion_coordinator::tests::planner_artifact_terminal_sibling_recovery_publishes_the_same_bounded_reference",
       "session_app::child_session::planner_artifact::tests::planner_artifact_binds_source_revision_and_never_grants_execution",
       "session_app::child_session::planner_artifact::tests::planner_artifact_completion_only_publishes_current_sealed_report",
@@ -124,12 +124,11 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // additive context or its 20 explicit cases changed.
 // Both owner entrances now share the actual HTTP acceptance path. Their
 // original default owners remain distinct, with no additive case repetition.
-const FEATURE_SOURCE_SHA256 = "db4dffc418f55e89f5e917897ff0ed07f59e114b0ba231c62fa53b8b298e2d9e";
+const FEATURE_SOURCE_SHA256 = "1890a5c2dd1bc9a88f02058d0d474056cb0f4b250c10a9bebc2800028daa313a";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
 // contexts and 20 additive cases; its nested tests add no producer.
-
 
 
 const FEATURE_CONTEXTS = [
