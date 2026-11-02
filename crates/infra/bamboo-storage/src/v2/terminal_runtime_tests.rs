@@ -982,6 +982,40 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
 }
 
 #[tokio::test]
+async fn terminal_runtime_unmarked_old_enqueue_failure_cannot_close_new_pending_launch() {
+    for status in ["error", "cancelled"] {
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let parent = Session::new("unmarked-parent", "model");
+        store.save_session(&parent).await.unwrap();
+        let mut old = Session::new_child_of("unmarked-child", &parent, "model", "Child");
+        old.set_last_run_status("pending");
+        store.save_session(&old).await.unwrap();
+        let mut newer = old.clone();
+        newer.advance_child_launch_generation().unwrap();
+        newer.add_message(bamboo_domain::Message::user("new launch input"));
+        store.save_session(&newer).await.unwrap();
+        let main = home
+            .path()
+            .join("sessions/unmarked-parent/children/unmarked-child/session.json");
+        let before = std::fs::read(&main).unwrap();
+        old.cancel_child_launch_generation();
+        old.set_last_run_status(status);
+        old.synchronize_terminal_runtime_status();
+        let locked = crate::LockedSessionStore::new(store.clone());
+        assert!(locked.merge_save_runtime(&mut old).await.is_err());
+        assert_eq!(std::fs::read(&main).unwrap(), before);
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let current = reopened.load_session(&newer.id).await.unwrap().unwrap();
+        assert_eq!(current.last_run_status().as_deref(), Some("pending"));
+        assert_eq!(current.child_launch_generation(), 1);
+        assert!(!current.is_child_launch_cancelled(1));
+        assert!(current.host_run_id().is_none());
+        assert_eq!(current.messages.last().unwrap().content, "new launch input");
+    }
+}
+
+#[tokio::test]
 async fn terminal_runtime_host_startup_accepts_only_its_observed_terminal_predecessor() {
     let (home, store, child, activation) = fixture(AgentStatusState::Initializing).await;
     store

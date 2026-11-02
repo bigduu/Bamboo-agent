@@ -3954,7 +3954,17 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
             .runtime_metadata
             .as_ref()
             .and_then(|metadata| metadata.child_launch_generation);
-        if latest_launch > incoming_launch {
+        // A terminal write closing its cancelled generation must retain that
+        // exact generation. Promoting it to a newer pending launch would turn
+        // an old enqueue/cancel failure into the newer launch's outcome. The
+        // physical writer below must reject the retained stale generation.
+        let closes_cancelled_launch = session
+            .is_child_launch_cancelled(session.child_launch_generation())
+            && matches!(
+                session.last_run_status().as_deref(),
+                Some("completed" | "cancelled" | "error" | "timeout" | "skipped")
+            );
+        if latest_launch > incoming_launch && !closes_cancelled_launch {
             session
                 .runtime_metadata
                 .get_or_insert_with(Default::default)
