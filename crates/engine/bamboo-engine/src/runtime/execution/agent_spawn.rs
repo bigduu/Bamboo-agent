@@ -1392,10 +1392,14 @@ pub fn spawn_session_execution_with_upstream_retry(
             // "completed" so a session waiting on the user or on children isn't
             // reported as finished (mirrors the child path in `sdk::spawn`).
             let suspended_non_terminal = result.is_ok()
-                && session
-                    .metadata
-                    .get("runtime.suspend_reason")
-                    .is_some_and(|reason| !reason.trim().is_empty());
+                && (if session.kind == bamboo_agent_core::SessionKind::Child {
+                    session.has_runtime_wait()
+                } else {
+                    session
+                        .metadata
+                        .get("runtime.suspend_reason")
+                        .is_some_and(|reason| !reason.trim().is_empty())
+                });
             match &result {
                 Ok(()) if suspended_non_terminal => {
                     session.set_last_run_status("suspended");
@@ -1413,6 +1417,10 @@ pub fn spawn_session_execution_with_upstream_retry(
                     session.set_last_run_status("error");
                     session.set_last_run_error(error.to_string());
                 }
+            }
+
+            if session.kind == bamboo_agent_core::SessionKind::Child {
+                session.synchronize_terminal_runtime_status();
             }
 
             // Bespoke terminal bookkeeping (e.g. a scheduled-run status) runs

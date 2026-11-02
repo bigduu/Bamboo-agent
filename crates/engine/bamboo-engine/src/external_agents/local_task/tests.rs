@@ -477,6 +477,39 @@ fn root_id() -> String {
 }
 
 #[tokio::test]
+async fn terminal_runtime_native_preparation_refusal_does_not_create_ownerless_host_run() {
+    let home = tempfile::tempdir().unwrap();
+    let mut control = ProviderControl::new();
+    let harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    let child = harness.child("refused", "must not enter a provider").await;
+    let before = serde_json::to_value(
+        harness
+            .store
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    harness.runner.shutdown().await.unwrap();
+    let error = harness.launch(&child).await.unwrap_err();
+    assert!(error.contains("shutting down"), "{error}");
+    let reopened = bamboo_storage::SessionStoreV2::new(home.path().into())
+        .await
+        .unwrap();
+    let current = reopened.load_session(&child.id).await.unwrap().unwrap();
+    assert!(current.host_run_id().is_none());
+    assert_eq!(serde_json::to_value(&current).unwrap(), before);
+    assert!(matches!(
+        control.calls.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    assert!(lock(&harness.runner.executions).is_empty());
+    assert!(crate::execution::ChildCompletionSource::from_committed_session(&current).is_none());
+    harness.assert_no_worker_artifacts();
+}
+
+#[tokio::test]
 async fn production_local_task_completes_in_host_and_commits_history_before_parent_end() {
     let home = tempfile::tempdir().unwrap();
     let mut control = ProviderControl::new();
@@ -1644,6 +1677,75 @@ async fn local_unstarted_cleanup_failure_records_durable_unknown_stop() {
         .await
         .unwrap_err()
         .contains("unconfirmed"));
+}
+
+#[tokio::test]
+async fn local_unstarted_safe_abandon_persists_typed_failure_and_cache_after_reopen() {
+    use bamboo_domain::AgentStatusState;
+    let home = tempfile::tempdir().unwrap();
+    let mut control = ProviderControl::new();
+    let harness = Harness::open(home.path(), &root_id(), control.provider.clone(), 1).await;
+    let child = harness
+        .child("unstarted-terminal", "retain unexecuted input")
+        .await;
+    let run = "accepted-unstarted-terminal";
+    let registration = harness.router.register_run(&child.id, run).await.unwrap();
+    harness
+        .runner
+        .prepare_child_execution(&child, run, CancellationToken::new())
+        .await
+        .unwrap();
+    harness.store.begin_host_run(&child, run).await.unwrap();
+    let child = harness
+        .store
+        .load_session(&child.id)
+        .await
+        .unwrap()
+        .unwrap();
+    harness
+        .runner
+        .abandon_child_execution(&child, run)
+        .await
+        .unwrap();
+    let cold = bamboo_storage::SessionStoreV2::new(home.path().into())
+        .await
+        .unwrap();
+    let saved = cold.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(saved.last_run_status().as_deref(), Some("error"));
+    assert_eq!(
+        saved.agent_runtime_state.as_ref().unwrap().status,
+        AgentStatusState::Failed
+    );
+    assert_eq!(
+        harness
+            .ctx
+            .sessions_cache
+            .get(&child.id)
+            .unwrap()
+            .read()
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .status,
+        AgentStatusState::Failed
+    );
+    assert!(matches!(
+        control.calls.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        harness
+            .store
+            .inspect_actor(&child.id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap()
+            .status,
+        ActorActivationStatus::Failed
+    );
+    registration.finish(0).await.unwrap();
+    harness.runner.shutdown().await.unwrap();
 }
 
 #[tokio::test]
