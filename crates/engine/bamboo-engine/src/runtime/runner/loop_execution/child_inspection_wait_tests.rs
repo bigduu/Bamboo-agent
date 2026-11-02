@@ -90,6 +90,7 @@ async fn supervisor_child_inspection_wait_fixture() {
                 incarnation_id: uuid::Uuid::new_v4(),
             };
             session.set_root_orchestration_only(ultra).unwrap();
+            session.agent_runtime_state = Some(AgentRuntimeState::new("fixture-permission-owner"));
             storage.save_session(&session).await.unwrap();
             let mut config = config_with_storage(storage.clone());
             config.model_name = Some("model".into());
