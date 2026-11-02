@@ -17,6 +17,10 @@ async fn fixture(
     let parent = Session::new("terminal-parent", "model");
     store.save_session(&parent).await.unwrap();
     let mut child = Session::new_child_of("terminal-child", &parent, "model", "Child");
+    // Cover compatible legacy and current contracts without migrating either.
+    if initial == AgentStatusState::Initializing {
+        child.session_version = None;
+    }
     child.add_message(bamboo_domain::Message::user("retained retry input"));
     let mut state = AgentRuntimeState::new(&child.id);
     state.status = initial;
@@ -228,6 +232,7 @@ async fn terminal_runtime_repairs_existing_terminal_initializing_record_without_
         .unwrap()
         .unwrap();
     let repaired = assert_terminal(&reopened, AgentStatusState::Cancelled, "cancelled").await;
+    assert_eq!(repaired.session_version, None);
     let bytes = std::fs::read(runtime_path(home.path())).unwrap();
     reopened
         .reconcile_child_runtime(&repaired, Utc::now(), None)
