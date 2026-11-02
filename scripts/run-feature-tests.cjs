@@ -100,7 +100,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
 // The C1 pending predicates add two ordinary domain packages-2 cases and three
 // server-handlers Actix cases; none is an additive feature-only case.
-const FEATURE_SOURCE_SHA256 = "bbebd1f968007e8616f7e11ae284de0f1ad423e92fc71c5acd1225f629abd0aa";
+// Publisher mode/revocation serde and CLI/CAS cases are unconditional config
+// library tests in packages-4. Policy HTTP/setup cases remain server-handlers;
+// signature and compatibility-merge cases remain server-other. Moving the
+// ungated policy definitions out of config.rs changes this source fingerprint,
+// but no feature cfg expression, default target or 20 additive cases changes.
+const FEATURE_SOURCE_SHA256 = "49a1d3396198ea9b1a8514f6521d1783d2f5173edf253c533d256b85241a45b0";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
