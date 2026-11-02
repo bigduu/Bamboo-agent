@@ -23,6 +23,10 @@ pub(super) struct ChildActorWriteProof {
 }
 
 impl ChildActorWriteProof {
+    pub(super) fn owner(&self) -> &ChildActorRuntimeWrite {
+        &self.owner
+    }
+
     fn new(sessions: PathBuf, owner: ChildActorRuntimeWrite) -> io::Result<Self> {
         for id in [
             &owner.fence.actor_id,

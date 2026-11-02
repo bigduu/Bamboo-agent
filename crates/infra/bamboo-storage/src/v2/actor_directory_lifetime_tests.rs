@@ -19,6 +19,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 struct LatchState {
     entered: bool,
     released: bool,
+    reconfirmed: usize,
 }
 
 #[derive(Debug)]
@@ -31,6 +32,16 @@ pub(super) struct ActorWriteHook {
 }
 
 impl ActorWriteHook {
+    pub(super) fn record_reconfirmed(&self, path: &Path) {
+        if path.file_name().and_then(|name| name.to_str()) == Some(self.file) {
+            self.state.lock().unwrap().reconfirmed += 1;
+        }
+    }
+
+    pub(super) fn reconfirmed(&self) -> usize {
+        self.state.lock().unwrap().reconfirmed
+    }
+
     pub(super) fn install(
         store: &SessionStoreV2,
         file: &'static str,
