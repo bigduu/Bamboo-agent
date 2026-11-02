@@ -38,6 +38,11 @@ owner. This dedicated transition preserves canonical content. Ordinary full and
 runtime saves cannot change that Host identity. The captured child launch generation prevents an old activation from consuming a newer pending retry/reset/accumulate. The pipeline/Ticket runtime
 `run_id` can be a stable Session identity, so it is insufficient for this check.
 Copying a Session removes the Host Run identity.
+Ordinary legacy writers with neither incoming nor persisted Host UUID retain
+their existing contract until the Host integration binds a run. They receive no
+new activation or physical-stop proof. The first binding and automatic orphan
+notifications remain the explicit #2460/#2455 admission boundaries; this slice
+does not retrofit identity by guessing from an unmarked legacy snapshot.
 
 `finish_activation` validates the full activation fence. It commits authority
 before projecting the terminal read model while retaining the same lifecycle,

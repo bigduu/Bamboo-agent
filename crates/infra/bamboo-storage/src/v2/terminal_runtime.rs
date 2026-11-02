@@ -497,23 +497,7 @@ impl SessionStoreV2 {
                 "Host runtime writer has no matching launch identity",
             ));
         }
-        let terminal_candidate = candidate
-            .last_run_status()
-            .as_deref()
-            .is_some_and(super::super::child_wait_control_plane::terminal);
-        let terminal_typed = matches!(
-            runtime_status(&candidate),
-            Some(
-                AgentStatusState::Completed
-                    | AgentStatusState::Cancelled
-                    | AgentStatusState::Failed
-            )
-        );
-        let observed = if candidate.host_run_id().is_some()
-            || bound_fence.is_some()
-            || terminal_candidate
-            || terminal_typed
-        {
+        let observed = if candidate.host_run_id().is_some() || bound_fence.is_some() {
             self.observed_runtime_actor(&path.join(ACTOR_AUTHORITY_FILE), &candidate)
                 .await
                 .map_err(io::Error::other)?
@@ -529,13 +513,7 @@ impl SessionStoreV2 {
                 if bound_fence == Some(&activation.fence()) {
                     return Ok(candidate);
                 }
-                let newly_terminal = latest.as_ref().is_none_or(|latest| {
-                    (terminal_candidate && candidate.last_run_status() != latest.last_run_status())
-                        || (terminal_typed && runtime_status(&candidate) != runtime_status(latest))
-                });
-                if candidate.host_run_id().is_some()
-                    || (activation.status.is_live() && newly_terminal)
-                {
+                if candidate.host_run_id().is_some() {
                     return Err(conflict(
                         "Host runtime writer was superseded by another activation",
                     ));

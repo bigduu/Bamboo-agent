@@ -982,21 +982,71 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
 }
 
 #[tokio::test]
-async fn terminal_runtime_claimed_successor_refuses_old_saves_before_new_host_marker() {
-    for old_marker in [false, true] {
+async fn terminal_runtime_unmarked_legacy_save_grants_no_actor_authority() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let mut root = Session::new("legacy-runtime-root", "model");
+    root.set_last_run_status("running");
+    store.save_session(&root).await.unwrap();
+    let now = Utc::now();
+    let activation = store
+        .claim_activation(&claim(&root.id, "host-B", now))
+        .await
+        .unwrap();
+    let activation = store
+        .start_activation(&activation.fence(), now)
+        .await
+        .unwrap();
+    root.set_last_run_status("error");
+    root.set_last_run_error("legacy orphan observation");
+    store.save_runtime_state(&root).await.unwrap();
+    let mut stale_fence = activation.fence();
+    stale_fence.run_id = "host-A".into();
+    let owner = bamboo_domain::RootActorRuntimeWrite {
+        fence: stale_fence,
+        created_at: root.created_at,
+        conversation_generation: root.conversation_generation_observation(),
+    };
+    assert!(store
+        .save_root_actor_runtime(&owner, &root, true, Arc::new(|_| {}))
+        .await
+        .is_err());
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    assert_eq!(
+        reopened
+            .load_session(&root.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_run_status()
+            .as_deref(),
+        Some("error")
+    );
+    assert_eq!(
+        reopened
+            .inspect_actor(&root.id)
+            .await
+            .unwrap()
+            .activation
+            .unwrap(),
+        activation
+    );
+}
+
+#[tokio::test]
+async fn terminal_runtime_marked_predecessor_refuses_old_saves_before_new_host_marker() {
+    {
         let home = tempfile::tempdir().unwrap();
         let store = SessionStoreV2::new(home.path().into()).await.unwrap();
         let mut root = Session::new("startup-gap-root", "model");
         root.set_last_run_status("completed");
         root.synchronize_terminal_runtime_status();
         store.save_session(&root).await.unwrap();
-        if old_marker {
-            store.begin_host_run(&root, "host-A").await.unwrap();
-            root = store.load_session(&root.id).await.unwrap().unwrap();
-            root.set_last_run_status("completed");
-            root.synchronize_terminal_runtime_status();
-            store.save_session(&root).await.unwrap();
-        }
+        store.begin_host_run(&root, "host-A").await.unwrap();
+        root = store.load_session(&root.id).await.unwrap().unwrap();
+        root.set_last_run_status("completed");
+        root.synchronize_terminal_runtime_status();
+        store.save_session(&root).await.unwrap();
         let stale = store.load_session(&root.id).await.unwrap().unwrap();
         let now = Utc::now();
         let activation = store
@@ -1019,9 +1069,7 @@ async fn terminal_runtime_claimed_successor_refuses_old_saves_before_new_host_ma
             .save_root_actor_runtime(&owner, &startup, true, Arc::new(|_| {}))
             .await
             .unwrap();
-        if old_marker {
-            assert!(store.begin_host_run(&stale, "host-A").await.is_err());
-        }
+        assert!(store.begin_host_run(&stale, "host-A").await.is_err());
         let path = home.path().join("sessions/startup-gap-root/runtime.json");
         let before = std::fs::read(&path).unwrap();
         for pending_source in [false, true] {
