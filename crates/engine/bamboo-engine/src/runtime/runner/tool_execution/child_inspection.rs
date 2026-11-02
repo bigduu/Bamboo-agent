@@ -22,135 +22,6 @@ struct ChildObservation {
     unchanged: usize,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bamboo_agent_core::tools::FunctionCall;
-    use serde_json::json;
-
-    fn call(name: &str, args: serde_json::Value) -> ToolCall {
-        ToolCall {
-            id: "new-call-id".into(),
-            tool_type: "function".into(),
-            function: FunctionCall {
-                name: name.into(),
-                arguments: args.to_string(),
-            },
-        }
-    }
-
-    #[test]
-    fn child_inspection_wait_ignores_transport_churn_but_keeps_real_progress_and_paging() {
-        let mut guard = ChildInspectionProgress::default();
-        let inspect = call("SubAgent", json!({"intent":"inspect", "target":"child"}));
-        for round in 0..3 {
-            guard.begin_round(round);
-            guard.observe(
-                &inspect,
-                &Ok(ToolResult::text(
-                    true,
-                    json!({
-                        "actor_id":"child", "observed_status":"running", "message_count":4,
-                        "last_event_at":round, "heartbeat":{"sequence":round},
-                        "guidance":format!("running for {round} seconds"),
-                    })
-                    .to_string(),
-                )),
-                Some("SubAgent"),
-            );
-            assert_eq!(
-                guard.finish_round(),
-                if round == 2 {
-                    vec!["child".to_string()]
-                } else {
-                    vec![]
-                }
-            );
-        }
-        for round in 3..9 {
-            guard.begin_round(round);
-            let paged = call(
-                "SubAgent",
-                json!({"intent":"inspect", "target":"child", "message":format!("{{\"view\":\"messages\",\"cursor\":\"page-{round}\"}}") }),
-            );
-            guard.observe(
-                &paged,
-                &Ok(ToolResult::text(
-                    true,
-                    json!({"actor_id":"child","message_count":round}).to_string(),
-                )),
-                Some("SubAgent"),
-            );
-            assert!(
-                guard.finish_round().is_empty(),
-                "new evidence/pages must remain readable"
-            );
-        }
-    }
-
-    #[test]
-    fn child_inspection_wait_never_treats_failed_foreign_or_mixed_calls_as_a_quiet_batch() {
-        let inspect = call("SubAgent", json!({"intent":"inspect", "target":"child"}));
-        let output = Ok(ToolResult::text(
-            true,
-            json!({"actor_id":"child", "observed_status":"running"}).to_string(),
-        ));
-        let mut guard = ChildInspectionProgress::default();
-        for round in 0..12 {
-            guard.begin_round(round);
-            guard.observe(&inspect, &output, Some("SubAgent"));
-            match round % 4 {
-                0 => guard.observe(&inspect, &Err("denied".into()), Some("SubAgent")),
-                1 => guard.observe(&inspect, &output, Some("vendor::SubAgent")),
-                2 => guard.observe(
-                    &call("SubAgent", json!({"message":"continue work"})),
-                    &output,
-                    Some("SubAgent"),
-                ),
-                _ => guard.observe(
-                    &call("session_control", json!({"action":"directory"})),
-                    &output,
-                    Some("session_control"),
-                ),
-            }
-            assert!(guard.finish_round().is_empty());
-        }
-    }
-
-    #[test]
-    fn child_inspection_wait_alternating_targets_and_equivalent_selectors_cannot_refund_polling() {
-        let mut guard = ChildInspectionProgress::default();
-        for round in 0..7 {
-            let target = ["a", "b", "c"][round % 3];
-            let args = if round < 3 {
-                json!({"intent":"inspect","target":target})
-            } else {
-                json!({"intent":"inspect","target":target,"message":"overview"})
-            };
-            guard.begin_round(round);
-            guard.observe(
-                &call("SubAgent", args),
-                &Ok(ToolResult::text(
-                    true,
-                    json!({
-                        "actor_id":target,"observed_status":"running"
-                    })
-                    .to_string(),
-                )),
-                Some("SubAgent"),
-            );
-            assert_eq!(
-                guard.finish_round(),
-                if round == 6 {
-                    vec!["a".to_string(), "b".to_string(), "c".to_string()]
-                } else {
-                    vec![]
-                }
-            );
-        }
-    }
-}
-
 impl ChildInspectionProgress {
     pub(super) fn begin_round(&mut self, round: usize) {
         if self
@@ -286,5 +157,134 @@ impl ChildInspectionProgress {
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bamboo_agent_core::tools::FunctionCall;
+    use serde_json::json;
+
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "new-call-id".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: name.into(),
+                arguments: args.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn child_inspection_wait_ignores_transport_churn_but_keeps_real_progress_and_paging() {
+        let mut guard = ChildInspectionProgress::default();
+        let inspect = call("SubAgent", json!({"intent":"inspect", "target":"child"}));
+        for round in 0..3 {
+            guard.begin_round(round);
+            guard.observe(
+                &inspect,
+                &Ok(ToolResult::text(
+                    true,
+                    json!({
+                        "actor_id":"child", "observed_status":"running", "message_count":4,
+                        "last_event_at":round, "heartbeat":{"sequence":round},
+                        "guidance":format!("running for {round} seconds"),
+                    })
+                    .to_string(),
+                )),
+                Some("SubAgent"),
+            );
+            assert_eq!(
+                guard.finish_round(),
+                if round == 2 {
+                    vec!["child".to_string()]
+                } else {
+                    vec![]
+                }
+            );
+        }
+        for round in 3..9 {
+            guard.begin_round(round);
+            let paged = call(
+                "SubAgent",
+                json!({"intent":"inspect", "target":"child", "message":format!("{{\"view\":\"messages\",\"cursor\":\"page-{round}\"}}") }),
+            );
+            guard.observe(
+                &paged,
+                &Ok(ToolResult::text(
+                    true,
+                    json!({"actor_id":"child","message_count":round}).to_string(),
+                )),
+                Some("SubAgent"),
+            );
+            assert!(
+                guard.finish_round().is_empty(),
+                "new evidence/pages must remain readable"
+            );
+        }
+    }
+
+    #[test]
+    fn child_inspection_wait_never_treats_failed_foreign_or_mixed_calls_as_a_quiet_batch() {
+        let inspect = call("SubAgent", json!({"intent":"inspect", "target":"child"}));
+        let output = Ok(ToolResult::text(
+            true,
+            json!({"actor_id":"child", "observed_status":"running"}).to_string(),
+        ));
+        let mut guard = ChildInspectionProgress::default();
+        for round in 0..12 {
+            guard.begin_round(round);
+            guard.observe(&inspect, &output, Some("SubAgent"));
+            match round % 4 {
+                0 => guard.observe(&inspect, &Err("denied".into()), Some("SubAgent")),
+                1 => guard.observe(&inspect, &output, Some("vendor::SubAgent")),
+                2 => guard.observe(
+                    &call("SubAgent", json!({"message":"continue work"})),
+                    &output,
+                    Some("SubAgent"),
+                ),
+                _ => guard.observe(
+                    &call("session_control", json!({"action":"directory"})),
+                    &output,
+                    Some("session_control"),
+                ),
+            }
+            assert!(guard.finish_round().is_empty());
+        }
+    }
+
+    #[test]
+    fn child_inspection_wait_alternating_targets_and_equivalent_selectors_cannot_refund_polling() {
+        let mut guard = ChildInspectionProgress::default();
+        for round in 0..7 {
+            let target = ["a", "b", "c"][round % 3];
+            let args = if round < 3 {
+                json!({"intent":"inspect","target":target})
+            } else {
+                json!({"intent":"inspect","target":target,"message":"overview"})
+            };
+            guard.begin_round(round);
+            guard.observe(
+                &call("SubAgent", args),
+                &Ok(ToolResult::text(
+                    true,
+                    json!({
+                        "actor_id":target,"observed_status":"running"
+                    })
+                    .to_string(),
+                )),
+                Some("SubAgent"),
+            );
+            assert_eq!(
+                guard.finish_round(),
+                if round == 6 {
+                    vec!["a".to_string(), "b".to_string(), "c".to_string()]
+                } else {
+                    vec![]
+                }
+            );
+        }
     }
 }

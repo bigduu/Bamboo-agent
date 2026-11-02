@@ -3037,22 +3037,20 @@ async fn handle_tool_calls_path(
     }
 
     let unchanged_targets = policy_guard.unchanged_child_inspection_targets();
-    if !awaiting_clarification
+    if round_status == MetricsRoundStatus::Success
+        && !awaiting_clarification
         && !waiting_for_children
         && session.supervisor_incarnation_id().is_some()
         && !unchanged_targets.is_empty()
     {
-        if maybe_suspend_for_children(
+        waiting_for_children = maybe_suspend_for_children(
             session,
             frame.config,
             runtime_state,
             Some(&unchanged_targets),
         )
         .await?
-        .is_some()
-        {
-            waiting_for_children = true;
-        }
+        .is_some();
     }
 
     let ticket_question_yield = frame.config.ticket_worker_plan.is_some()
