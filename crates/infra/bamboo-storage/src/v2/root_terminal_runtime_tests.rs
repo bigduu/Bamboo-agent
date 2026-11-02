@@ -231,6 +231,16 @@ impl Fixture {
         }
     }
 }
+async fn assert_title_preserves_observation(store: &SessionStoreV2, mut session: Session) {
+    let before = session.metadata.get(ROOT_OBSERVATION).cloned();
+    session.title = "title cannot mint a run observation".into();
+    session.title_version += 1;
+    session.metadata_version += 1;
+    session.updated_at = Utc::now();
+    store.save_manual_title(&session).await.unwrap();
+    let saved = store.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(saved.metadata.get(ROOT_OBSERVATION), before.as_ref());
+}
 fn assert_typed(s: &Session, status: &str, typed: AgentStatusState) {
     assert_eq!(s.last_run_status().as_deref(), Some(status));
     let state = s.agent_runtime_state.as_ref().unwrap();
@@ -549,6 +559,7 @@ async fn root_terminal_first_write_failure_is_attributed_and_late_a_cannot_touch
         .unwrap();
     let previous = f.current().await;
     let b = f.successor("root-run-B").await;
+    assert_title_preserves_observation(&f.store, f.current().await).await;
     assert!(f
         .store
         .finish_root_activation_observed(&f.owner, Utc::now(), ActorActivationFinish::Failed, None)
@@ -565,7 +576,7 @@ async fn root_terminal_first_write_failure_is_attributed_and_late_a_cannot_touch
         .await
         .unwrap()
         .is_none());
-    // No B Session write has run. The actual B owner must establish its own
+    // No B-owned checkpoint has run. The actual B owner must establish its own
     // lifetime before its terminal fact, rather than leaving A marker/running.
     f.store
         .finish_root_activation_observed(&b, Utc::now(), ActorActivationFinish::Cancelled, None)
@@ -672,6 +683,7 @@ async fn root_terminal_observation_cannot_be_injected_copied_or_legacy_fallback_
         .unwrap()
         .unwrap();
     assert!(!copied.metadata.contains_key(ROOT_OBSERVATION));
+    assert_title_preserves_observation(&f.store, copied).await;
     f.store
         .finish_root_activation_observed(&f.owner, Utc::now(), ActorActivationFinish::Failed, None)
         .await
