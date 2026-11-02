@@ -1787,6 +1787,7 @@ pub struct SessionStoreV2 {
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "runtime.host_run_id",
+    "runtime.root_writer_observation_v1",
     "runtime.host_launch_generation",
     "runtime.host_prior_activation_fence",
     "runtime.reconciled_activation_fence",
@@ -7284,6 +7285,7 @@ impl SessionStoreV2 {
             false,
         )
         .await
+        .map(|_| ())
     }
 
     async fn save_session_after_lock_with_title_intent(
@@ -7293,7 +7295,7 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
         manual_title: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<Session>> {
         reject_incompatible_session_write(session)?;
         if session
             .metadata
@@ -7503,11 +7505,11 @@ impl SessionStoreV2 {
 
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
-        let session_bytes = compact_main::serialize_main(session)?;
-        let runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
+        let mut session_bytes = compact_main::serialize_main(session)?;
+        let mut runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
-        let serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+        let mut serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
         let directory_started = Instant::now();
         let rel_path = self.ensure_default_writer_dirs(session, guards).await?;
         let abs_dir = self.abs_path_from_rel(&rel_path);
@@ -7527,11 +7529,23 @@ impl SessionStoreV2 {
             let tree = self.acquire_actor_tree_write_guard(root_id).await?;
             guards.hold_tree(tree);
         }
-        let title_observations = if manual_title {
-            self.prepare_title_observations(session).await?
+        let mut title_candidate = manual_title.then(|| session.clone());
+        let title_observations = if let Some(candidate) = title_candidate.as_mut() {
+            self.prepare_title_observations(candidate).await?
         } else {
             Vec::new()
         };
+        let session = title_candidate.as_ref().unwrap_or(session);
+        if manual_title {
+            // Initial buffers preflighted before directory preparation. Only
+            // the validated title lane can normalize an existing observation;
+            // both actual files must publish that same canonical candidate.
+            let started = Instant::now();
+            session_bytes = compact_main::serialize_main(session)?;
+            runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))?;
+            serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+            stages.serialization += started.elapsed();
+        }
         if previous_projection.as_ref() != Some(&actor_tree_session_projection(session)) {
             let root = if session.kind == SessionKind::Root {
                 Some(session.clone())
@@ -7639,7 +7653,7 @@ impl SessionStoreV2 {
             total_ms = total.as_millis() as u64,
             "session durable commit completed; search indexing deferred"
         );
-        Ok(())
+        Ok(manual_title.then(|| session.clone()))
     }
 }
 
@@ -7668,6 +7682,22 @@ impl Storage for SessionStoreV2 {
     ) -> io::Result<Option<Session>> {
         self.reconcile_child_runtime_impl(expected, before, error)
             .await
+    }
+
+    async fn reconcile_session_runtime(
+        &self,
+        expected: &Session,
+        before: DateTime<Utc>,
+        error: Option<&str>,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<Option<Session>> {
+        if expected.kind == SessionKind::Root {
+            self.reconcile_root_runtime_impl(expected, before, &publish)
+                .await
+        } else {
+            let _ = error;
+            Ok(None)
+        }
     }
 
     async fn find_host_session_scope(
@@ -7706,6 +7736,10 @@ impl Storage for SessionStoreV2 {
     }
 
     async fn save_manual_title(&self, session: &Session) -> io::Result<()> {
+        self.save_manual_title_committed(session).await.map(|_| ())
+    }
+
+    async fn save_manual_title_committed(&self, session: &Session) -> io::Result<Session> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
@@ -7719,8 +7753,10 @@ impl Storage for SessionStoreV2 {
             .acquire_session_write_lock(&session.id, SaveKind::Full)
             .await?;
         let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
-        self.save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
-            .await
+        let committed = self
+            .save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
+            .await?;
+        Ok(committed.expect("manual-title transaction returns its committed candidate"))
     }
 
     async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {

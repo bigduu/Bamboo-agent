@@ -190,6 +190,8 @@ impl<T> Mutation<T> {
     }
 }
 
+#[path = "root_terminal_runtime.rs"]
+mod root_terminal_runtime;
 #[path = "terminal_runtime.rs"]
 mod terminal_runtime;
 
@@ -1196,6 +1198,17 @@ impl ActorDirectoryPort for SessionStoreV2 {
             Ok(Mutation::changed(activation.clone()).terminal())
         })
         .await
+    }
+
+    async fn finish_root_activation_observed(
+        &self,
+        owner: &bamboo_domain::RootActorRuntimeWrite,
+        now: DateTime<Utc>,
+        outcome: ActorActivationFinish,
+        publish: Option<bamboo_domain::storage::RootActorRuntimePublisher>,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        self.finish_root_activation_impl(owner, now, outcome, publish.as_ref())
+            .await
     }
 
     async fn retire_actor(

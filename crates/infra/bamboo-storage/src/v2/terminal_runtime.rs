@@ -41,7 +41,7 @@ fn conflict(message: &str) -> io::Error {
     )
 }
 
-fn terminal_status(status: ActorActivationStatus) -> Option<&'static str> {
+pub(super) fn terminal_status(status: ActorActivationStatus) -> Option<&'static str> {
     match status {
         ActorActivationStatus::Succeeded => Some("completed"),
         ActorActivationStatus::Cancelled => Some("cancelled"),
@@ -58,7 +58,7 @@ fn pending_delivery(session: &Session) -> bool {
         .is_some_and(|source| source.get("pending_confirmation").is_some())
 }
 
-fn same_terminal_class(left: &str, right: &str) -> bool {
+pub(super) fn same_terminal_class(left: &str, right: &str) -> bool {
     let class = |status| match status {
         "completed" | "skipped" => Some(0),
         "cancelled" => Some(1),
@@ -80,7 +80,7 @@ fn runtime_status(session: &Session) -> Option<AgentStatusState> {
         .map(|state| state.status)
 }
 
-fn idle_control_state(session: &Session) -> bool {
+pub(super) fn idle_control_state(session: &Session) -> bool {
     runtime_status(session) == Some(AgentStatusState::Idle)
 }
 
@@ -102,7 +102,7 @@ impl SessionStoreV2 {
             .await
     }
 
-    async fn observed_runtime_actor(
+    pub(super) async fn observed_runtime_actor(
         &self,
         path: &Path,
         session: &Session,
@@ -135,7 +135,7 @@ impl SessionStoreV2 {
         Ok(Some(entry))
     }
 
-    async fn commit_runtime_projection(
+    pub(super) async fn commit_runtime_projection(
         &self,
         before: &Session,
         after: &Session,
@@ -220,7 +220,12 @@ impl SessionStoreV2 {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
         super::super::reject_incompatible_session_write(&before).map_err(storage)?;
-        if before.has_runtime_wait()
+        if (before.kind == bamboo_domain::SessionKind::Root
+            && (before
+                .metadata
+                .contains_key(super::root_terminal_runtime::ROOT_OBSERVATION)
+                || before.conversation_reset.is_some()))
+            || before.has_runtime_wait()
             || pending_delivery(&before)
             || !before.host_run_matches_launch()
             || before.last_run_status().as_deref() == Some("pending")
@@ -650,6 +655,24 @@ impl SessionStoreV2 {
             &incoming.id,
         )
         .await?;
+        let mut observed_incoming = incoming.clone();
+        if incoming.kind == bamboo_domain::SessionKind::Root {
+            if let Some(proof) = guards.root_actor.as_ref() {
+                super::root_terminal_runtime::stamp_owned_observation(
+                    &mut observed_incoming,
+                    proof.owner(),
+                    latest
+                        .as_ref()
+                        .ok_or_else(|| conflict("Root writer requires its canonical runtime"))?,
+                )?;
+            } else {
+                super::root_terminal_runtime::preserve_observation(
+                    &mut observed_incoming,
+                    latest.as_ref(),
+                );
+            }
+        }
+        let incoming = &observed_incoming;
         if let Some(latest) = latest.as_ref() {
             if incoming.child_launch_generation() < latest.child_launch_generation() {
                 return Err(conflict(
@@ -726,6 +749,17 @@ impl SessionStoreV2 {
         } else {
             None
         };
+        if guards.root_actor.is_some() {
+            super::root_terminal_runtime::validate_projection_identity(
+                observed
+                    .as_ref()
+                    .ok_or_else(|| conflict("Root Actor authority disappeared"))?,
+                latest
+                    .as_ref()
+                    .ok_or_else(|| conflict("Root canonical runtime disappeared"))?,
+            )
+            .map_err(io::Error::other)?;
+        }
         if let Some(activation) = observed.and_then(|entry| entry.activation) {
             if candidate.host_run_id() != Some(activation.run_id.as_str()) {
                 // A newly bound executor can checkpoint its startup before

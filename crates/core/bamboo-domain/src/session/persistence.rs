@@ -694,6 +694,8 @@ pub struct RootActorExecutionBinding {
     pub directory: Arc<dyn crate::ActorDirectoryPort>,
     pub owner: crate::RootActorRuntimeWrite,
     pub lease_duration: std::time::Duration,
+    /// Synchronous publication retained by the real terminal storage guards.
+    pub terminal_publisher: Option<crate::storage::RootActorRuntimePublisher>,
     abandon: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
@@ -710,8 +712,17 @@ impl RootActorExecutionBinding {
             directory,
             owner,
             lease_duration,
+            terminal_publisher: None,
             abandon: Some(Box::new(abandon)),
         }
+    }
+
+    pub fn with_terminal_publisher(
+        mut self,
+        publish: crate::storage::RootActorRuntimePublisher,
+    ) -> Self {
+        self.terminal_publisher = Some(publish);
+        self
     }
 
     /// The runtime calls this only after handing finish to an owned detached

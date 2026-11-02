@@ -124,10 +124,10 @@ impl SessionMetadataService {
             .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
-        state
+        session = state
             .persistence()
             .storage()
-            .save_manual_title(&session)
+            .save_manual_title_committed(&session)
             .await
             .map_err(|e| MetadataError::Storage(format!("save_manual_title: {e}")))?;
         // Confirm the backend's committed observations before reporting

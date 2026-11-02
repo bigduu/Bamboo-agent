@@ -179,6 +179,14 @@ pub trait Storage: Send + Sync {
         self.save_session(session).await
     }
 
+    /// Return the exact candidate committed by the title transaction, including
+    /// backend-owned bookkeeping. Confirmation must still validate this value.
+    /// Backends which normalize the candidate must override this method.
+    async fn save_manual_title_committed(&self, session: &Session) -> std::io::Result<Session> {
+        self.save_manual_title(session).await?;
+        Ok(session.clone())
+    }
+
     /// Validate a manual title before reporting success, including a no-op.
     /// Backends with Actor metadata observations must reread canonical state
     /// under their writer guards and reject stale or incomplete observations.
@@ -1046,6 +1054,22 @@ pub trait Storage: Send + Sync {
         error: Option<&str>,
     ) -> std::io::Result<Option<Session>> {
         let _ = (expected, before, error);
+        Ok(None)
+    }
+
+    /// Targeted logical terminal repair. The backend compares the complete
+    /// expected control snapshot and publishes only after a durable repair,
+    /// while the same physical Session/Actor/tree guards are retained. The
+    /// callback must be a synchronous cache publication, never execution or IO.
+    /// Unsupported backends remain unknown. This grants no Worker stop proof.
+    async fn reconcile_session_runtime(
+        &self,
+        expected: &Session,
+        before: chrono::DateTime<chrono::Utc>,
+        error: Option<&str>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, before, error, publish);
         Ok(None)
     }
 

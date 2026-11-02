@@ -1559,15 +1559,7 @@ pub fn spawn_session_execution_with_upstream_retry(
             // child_completion_coordinator). Mark it "suspended" rather than
             // "completed" so a session waiting on the user or on children isn't
             // reported as finished (mirrors the child path in `sdk::spawn`).
-            let suspended_non_terminal = result.is_ok()
-                && (if session.kind == bamboo_agent_core::SessionKind::Child {
-                    session.has_runtime_wait()
-                } else {
-                    session
-                        .metadata
-                        .get("runtime.suspend_reason")
-                        .is_some_and(|reason| !reason.trim().is_empty())
-                });
+            let suspended_non_terminal = result.is_ok() && session.has_runtime_wait();
             match &result {
                 Ok(()) if suspended_non_terminal => {
                     session.set_last_run_status("suspended");
@@ -1587,9 +1579,7 @@ pub fn spawn_session_execution_with_upstream_retry(
                 }
             }
 
-            if session.kind == bamboo_agent_core::SessionKind::Child {
-                session.synchronize_terminal_runtime_status();
-            }
+            session.synchronize_terminal_runtime_status();
 
             // Bespoke terminal bookkeeping (e.g. a scheduled-run status) runs
             // here — before persistence — so any closing message the hook
@@ -2034,10 +2024,11 @@ impl RootActorExecution {
             None => Ok(()),
         };
         let directory = self.binding.directory.clone();
-        let fence = self.binding.owner.fence.clone();
+        let owner = self.binding.owner.clone();
+        let publish = self.binding.terminal_publisher.clone();
         let finish = tokio::spawn(async move {
             directory
-                .finish_activation(&fence, chrono::Utc::now(), outcome)
+                .finish_root_activation_observed(&owner, chrono::Utc::now(), outcome, publish)
                 .await
                 .map(|_| ())
                 .map_err(std::io::Error::other)

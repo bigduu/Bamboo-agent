@@ -357,7 +357,6 @@ impl SessionStoreV2 {
         Arc::get_mut(&mut guards)
             .expect("new Root guards are private")
             ._input_filesystem = Some(filesystem.clone());
-        let expected = crate::session_merge::bounded_live_bootstrap_value(session)?;
         let candidate = session.clone();
         let check_root = root.clone();
         let check_session_directory = self.sessions_dir.join(&session.id);
@@ -379,7 +378,13 @@ impl SessionStoreV2 {
             .map_err(conflict)
         })
         .await?;
-        self.save_session_after_lock(session, started, &guards, None)
+        // Keep the original complete precheck, then bind the exact normalized
+        // checkpoint which the owned writer will actually persist.
+        let checkpoint = self
+            .normalize_terminal_runtime_write(session, &Self::root_rel_path(&session.id), &guards)
+            .await?;
+        let expected = crate::session_merge::bounded_live_bootstrap_value(&checkpoint)?;
+        self.save_session_after_lock(&checkpoint, started, &guards, None)
             .await?;
         let check_root = root.clone();
         let check_session_directory = self.sessions_dir.join(&session.id);
