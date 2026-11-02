@@ -58,6 +58,34 @@ pub struct SessionRepository {
 }
 
 impl SessionRepository {
+    /// Publish a committed Child repair while its Storage guards are held.
+    /// A cache belonging to another birth/run/launch/input is left untouched;
+    /// this observation grants neither execution nor parent delivery authority.
+    pub fn publish_reconciled_child(cache: &SessionCache, saved: &Session) {
+        if saved.kind != bamboo_domain::SessionKind::Child {
+            return;
+        }
+        if let Some(entry) = cache.get(&saved.id) {
+            // SessionSnapshot::update retries against a concurrent publication.
+            // Leave a vacant cache vacant: loading canonical Storage remains
+            // correct, while a check-then-insert could replace a new birth.
+            entry.update(|current| {
+                if current.created_at != saved.created_at
+                    || current.parent_created_at != saved.parent_created_at
+                    || current.parent_session_id != saved.parent_session_id
+                    || current.project_id_meta() != saved.project_id_meta()
+                    || current.host_run_id() != saved.host_run_id()
+                    || current.child_launch_generation() != saved.child_launch_generation()
+                    || current.session_inbox_admission() != saved.session_inbox_admission()
+                    || current.check_conversation_generation(saved).is_err()
+                {
+                    return;
+                }
+                *current = saved.clone();
+            });
+        }
+    }
+
     pub fn new(
         cache: SessionCache,
         storage: Arc<dyn Storage>,

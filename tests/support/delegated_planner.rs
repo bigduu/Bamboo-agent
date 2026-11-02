@@ -381,21 +381,39 @@ async fn planner_fixture(crash_child: bool) {
         drop(host); // SIGKILL + wait, never a graceful cancellation or a forged terminal save.
         let mut restarted = start_host(&data, port);
         await_host(&mut restarted, &client, &base, &data).await;
-        let parent = completed(&data, "REAL_PLANNER_FAILURE_REPORTED").await;
-        assert_eq!(probe.root_calls.load(Ordering::SeqCst), 2);
+        // Observe actual logical lease expiry after the SIGKILL. A cancel ACK,
+        // absent local runner or elapsed quiet period is not a terminal fact.
+        let disk = SessionStoreV2::new(data.clone()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(90), async {
+            loop {
+                let child = disk.load_session(&child_id).await.unwrap().unwrap();
+                if child.last_run_status().as_deref() == Some("error")
+                    && child.agent_runtime_state.as_ref().is_some_and(|state| {
+                        state.status == bamboo_domain::AgentStatusState::Failed
+                    })
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("expired actual Child authority must converge after restart");
+        let parent = disk.load_session("planner-root").await.unwrap().unwrap();
+        assert_eq!(probe.root_calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
         assert!(parent
             .agent_runtime_state
             .as_ref()
             .unwrap()
             .waiting_for_children
-            .is_none());
+            .is_some());
         assert!(parent
             .agent_runtime_state
             .as_ref()
             .unwrap()
             .plan_mode
-            .is_none());
+            .is_some());
         assert_eq!(
             parent.agent_runtime_state.as_ref().unwrap().permission_mode,
             original
@@ -404,7 +422,6 @@ async fn planner_fixture(crash_child: bool) {
                 .unwrap()
                 .permission_mode
         );
-        let disk = SessionStoreV2::new(data.clone()).await.unwrap();
         let child = disk.load_session(&child_id).await.unwrap().unwrap();
         assert_eq!(child.last_run_status().as_deref(), Some("error"));
         assert!(!child
@@ -414,7 +431,7 @@ async fn planner_fixture(crash_child: bool) {
         assert!(!data.join("must-not-exist.txt").exists());
         drop(restarted);
         handle.stop(false).await;
-        eprintln!("actual delegated Plan crash: real Host SIGKILL/restart; pending worker; boot synthetic error; bounded unavailable parent resume; no sealed report/file; no redispatch; 0 paid calls");
+        eprintln!("actual delegated Plan crash: real Host SIGKILL/restart; exact expired Actor Failed; typed Failed; unconfirmed parent wait retained; no sealed report/file; no redispatch; 0 paid calls");
         return;
     }
     let parent = completed(&data, "REAL_PLANNER_ROOT_FINISHED").await;
@@ -505,7 +522,7 @@ fn real_cli_planner_publishes_versioned_artifact_and_resumes_with_partial_cold_r
 }
 
 #[test]
-fn real_cli_planner_crash_recovery_resumes_without_publishing_unsealed_report() {
+fn real_cli_planner_crash_recovery_keeps_wait_until_confirmed_completion_source() {
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(|| actix_web::rt::System::new().block_on(planner_fixture(true)))

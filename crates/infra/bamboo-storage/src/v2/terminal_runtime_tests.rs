@@ -4,6 +4,9 @@ use bamboo_domain::{
     ChildWaitPolicy, Storage, SuspensionState, WaitingForBashState, WaitingForChildrenState,
 };
 
+#[path = "terminal_reconcile_tests.rs"]
+mod recovery;
+
 async fn fixture(
     initial: AgentStatusState,
 ) -> (

@@ -57,7 +57,7 @@ jobs:
           save-if: false
       # Planner12/10 library runtime belongs to the canonical default driver.
       # This source/config remains the distinct API-only CLI and lint owner.
-      - name: Verify actual CLI worker, publication, automatic resume and cold partial reads
+      - name: Verify actual CLI worker, confirmed resume, crash wait and cold partial reads
         shell: bash
         run: |
           set -euo pipefail

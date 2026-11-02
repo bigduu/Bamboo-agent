@@ -43,7 +43,7 @@ const PLANNER_SERIAL = {
     "names": [
       "runtime::runner::loop_execution::pipeline::tests::planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it",
       "session_app::child_completion_coordinator::tests::planner_artifact_completion_publishes_before_durable_resume_and_deduplicates",
-      "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report",
+      "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_recovery_keeps_unconfirmed_wait_and_report_private",
       "session_app::child_completion_coordinator::tests::planner_artifact_terminal_sibling_recovery_publishes_the_same_bounded_reference",
       "session_app::child_session::planner_artifact::tests::planner_artifact_binds_source_revision_and_never_grants_execution",
       "session_app::child_session::planner_artifact::tests::planner_artifact_completion_only_publishes_current_sealed_report",

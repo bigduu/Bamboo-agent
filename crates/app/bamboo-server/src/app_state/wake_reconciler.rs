@@ -37,10 +37,7 @@ struct TerminalRecovery {
 
 impl TerminalRecovery {
     async fn inspect(&self, target: &str) {
-        let Some(entry) = self.store.get_index_entry(target).await else {
-            return;
-        };
-        if entry.kind != SessionKind::Root {
+        if self.store.get_index_entry(target).await.is_none() {
             return;
         }
         let result = async {
@@ -55,10 +52,16 @@ impl TerminalRecovery {
                     None,
                     Arc::new(move |saved| {
                         if let Some(cache) = &cache {
-                            cache.insert(
-                                saved.id.clone(),
-                                Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
-                            );
+                            if saved.kind == SessionKind::Child {
+                                bamboo_engine::SessionRepository::publish_reconciled_child(
+                                    cache, saved,
+                                );
+                            } else {
+                                cache.insert(
+                                    saved.id.clone(),
+                                    Arc::new(bamboo_engine::SessionSnapshot::new(saved.clone())),
+                                );
+                            }
                         }
                     }),
                 )
@@ -70,7 +73,7 @@ impl TerminalRecovery {
             // The bounded index sweep retries with the same cutoff. Neither a
             // failed/uncertain write nor an absent local runner publishes a
             // completion, changes Inbox eligibility or grants a Worker proof.
-            tracing::warn!(session_id = %target, %error, "Root terminal reconciliation unconfirmed; retained for paced retry");
+            tracing::warn!(session_id = %target, %error, "Session terminal reconciliation unconfirmed; retained for paced retry");
         }
     }
 }
@@ -424,13 +427,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_reconciles_terminal_roots_and_cache_without_migration_or_new_execution() {
+    async fn restart_reconciles_terminal_sessions_and_cache_without_migration_or_new_execution() {
         use bamboo_domain::{
             ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, AgentRuntimeState,
             AgentStatusState, Session,
         };
         let home = tempfile::tempdir().unwrap();
         let original = Arc::new(SessionStoreV2::new(home.path().into()).await.unwrap());
+        let cache: bamboo_engine::SessionCache = Arc::default();
+        let parent = Session::new("terminal-parent", "model");
+        original.save_session(&parent).await.unwrap();
         let mut evidence = Vec::new();
         for (index, outcome, typed) in [
             (
@@ -445,53 +451,77 @@ mod tests {
             ),
             (2, ActorActivationFinish::Failed, AgentStatusState::Failed),
         ] {
-            let mut session = Session::new(format!("terminal-root-{index}"), "model");
-            session.session_version = None;
-            session.agent_runtime_state = Some(AgentRuntimeState::new(&session.id));
-            session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
-            session.set_last_run_status("running");
-            original.save_session(&session).await.unwrap();
-            let now = Utc::now();
-            let activation = original
-                .claim_activation(&ActorActivationClaim {
-                    actor_id: session.id.clone(),
-                    run_id: format!("run-{index}"),
-                    lease_owner: format!("synthetic-owner-{index}"),
-                    lease_expires_at: now + chrono::Duration::minutes(5),
-                    inbox_generation: 0,
-                    placement_ref: None,
-                    now,
-                })
+            for child in [false, true] {
+                let mut session = if child {
+                    Session::new_child_of(
+                        format!("terminal-child-{index}"),
+                        &parent,
+                        "model",
+                        "Child",
+                    )
+                } else {
+                    Session::new(format!("terminal-root-{index}"), "model")
+                };
+                session.session_version = None;
+                session.agent_runtime_state = Some(AgentRuntimeState::new(&session.id));
+                session.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+                session.set_last_run_status("running");
+                original.save_session(&session).await.unwrap();
+                let now = Utc::now();
+                let activation = original
+                    .claim_activation(&ActorActivationClaim {
+                        actor_id: session.id.clone(),
+                        run_id: format!("run-{index}"),
+                        lease_owner: format!("synthetic-owner-{index}"),
+                        lease_expires_at: now + chrono::Duration::minutes(5),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    })
+                    .await
+                    .unwrap();
+                original
+                    .start_activation(&activation.fence(), now)
+                    .await
+                    .unwrap();
+                original
+                    .finish_activation(&activation.fence(), now, outcome)
+                    .await
+                    .unwrap();
+                let mut zombie = original.load_session(&session.id).await.unwrap().unwrap();
+                zombie.agent_runtime_state.as_mut().unwrap().status =
+                    AgentStatusState::Initializing;
+                zombie.metadata.insert(
+                    "agent.runtime.state".into(),
+                    serde_json::to_string(zombie.agent_runtime_state.as_ref().unwrap()).unwrap(),
+                );
+                zombie.messages.clear();
+                // Seed only this TempDir with the audited legacy split. The trusted
+                // Actor/Main files are the actual commits, not enumeration stubs.
+                let directory = if child {
+                    home.path()
+                        .join("sessions")
+                        .join(&parent.id)
+                        .join("children")
+                        .join(&session.id)
+                } else {
+                    home.path().join("sessions").join(&session.id)
+                };
+                tokio::fs::write(
+                    directory.join("runtime.json"),
+                    serde_json::to_vec_pretty(&zombie).unwrap(),
+                )
                 .await
                 .unwrap();
-            original
-                .start_activation(&activation.fence(), now)
-                .await
-                .unwrap();
-            original
-                .finish_activation(&activation.fence(), now, outcome)
-                .await
-                .unwrap();
-            let mut zombie = original.load_session(&session.id).await.unwrap().unwrap();
-            zombie.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Initializing;
-            zombie.metadata.insert(
-                "agent.runtime.state".into(),
-                serde_json::to_string(zombie.agent_runtime_state.as_ref().unwrap()).unwrap(),
-            );
-            zombie.messages.clear();
-            // Seed only this TempDir with the audited legacy split. The trusted
-            // Actor/Main files are the actual commits, not enumeration stubs.
-            let directory = home.path().join("sessions").join(&session.id);
-            tokio::fs::write(
-                directory.join("runtime.json"),
-                serde_json::to_vec_pretty(&zombie).unwrap(),
-            )
-            .await
-            .unwrap();
-            let main = tokio::fs::read(directory.join("session.json"))
-                .await
-                .unwrap();
-            evidence.push((session.id, typed, main));
+                let main = tokio::fs::read(directory.join("session.json"))
+                    .await
+                    .unwrap();
+                cache.insert(
+                    zombie.id.clone(),
+                    Arc::new(bamboo_engine::SessionSnapshot::new(zombie)),
+                );
+                evidence.push((session.id, typed, main, directory));
+            }
         }
         let mut unknown = Session::new("unknown-live-root", "model");
         unknown.agent_runtime_state = Some(AgentRuntimeState::new(&unknown.id));
@@ -507,7 +537,6 @@ mod tests {
             SessionInboxLimits::default(),
         ));
         let (router, spawner) = router(inbox, false).await;
-        let cache: bamboo_engine::SessionCache = Arc::default();
         let shutdown = CancellationToken::new();
         let report = reconcile_startup_inner(
             reopened.clone(),
@@ -517,7 +546,7 @@ mod tests {
             Some(cache.clone()),
         )
         .await;
-        assert_eq!(report.checked, 4);
+        assert_eq!(report.checked, 8);
         assert_eq!(report.attempted, 0);
         assert_eq!(spawner.launches.load(Ordering::SeqCst), 0);
         shutdown.cancel();
@@ -526,7 +555,7 @@ mod tests {
             cutoff: Utc::now() - chrono::Duration::hours(1),
             cache: Some(cache.clone()),
         };
-        for (id, typed, main) in evidence {
+        for (id, typed, main, directory) in evidence {
             let repaired = reopened.load_session(&id).await.unwrap().unwrap();
             assert_eq!(repaired.session_version, None);
             assert_eq!(repaired.agent_runtime_state.as_ref().unwrap().status, typed);
@@ -541,7 +570,6 @@ mod tests {
                     .status,
                 typed
             );
-            let directory = home.path().join("sessions").join(&id);
             let runtime = tokio::fs::read(directory.join("runtime.json"))
                 .await
                 .unwrap();

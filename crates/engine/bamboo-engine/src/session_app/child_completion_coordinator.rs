@@ -16,10 +16,10 @@ use bamboo_domain::{
 };
 
 use crate::execution::{
-    finalize_runner, reserve_runner_core, reserve_session_execution, spawn_session_execution,
-    AgentRunner, AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource,
-    ReserveOutcome, SessionExecutionArgs, SessionExecutionReservation,
-    SessionExecutionReserveOutcome, SpawnJob, SpawnScheduler,
+    reserve_runner_core, reserve_session_execution, spawn_session_execution, AgentRunner,
+    AgentStatus, ChildCompletion, ChildCompletionHandler, ChildCompletionSource, ReserveOutcome,
+    SessionExecutionArgs, SessionExecutionReservation, SessionExecutionReserveOutcome, SpawnJob,
+    SpawnScheduler,
 };
 use crate::runtime::config::{BashResumeHook, GuardianSpawner, BASH_COMPLETION_RESUME_KIND};
 use crate::runtime::guardian_state::{
@@ -3648,18 +3648,14 @@ impl ChildCompletionCoordinator {
         });
     }
 
-    /// One-shot startup reconciliation: a process restart kills every in-flight
-    /// child task AND the in-memory bash backstop polls, but the durable state
-    /// (child index status `running`, parents suspended on bash) survives —
-    /// previously stranding those parents forever.
+    /// One-shot inspection uses a fixed boot cutoff. A missing local runner
+    /// does not prove a remote Worker stopped; Storage selects exact trusted
+    /// terminal facts or revokes an expired logical lease under its guards.
     async fn reconcile_orphans_at_boot(&self) {
         let cutoff = Utc::now();
 
-        // (1) Children left `running` by the previous process: no task in THIS
-        // process is driving them, so no completion will ever fire. Mark them
-        // terminal and wake their parents through the canonical path. (Root
-        // sessions left `running` are user-visible and user-recoverable; only
-        // children hold a suspended parent hostage.)
+        // (1) Inspect old running candidates. The shared paced index sweep also
+        // repairs already-terminal records; this legacy entry remains narrow.
         let running = self
             .storage
             .list_sessions_by_run_status("running")
@@ -3681,8 +3677,7 @@ impl ChildCompletionCoordinator {
             tracing::warn!(
                 child_session_id = %child_id,
                 parent_session_id = %parent_id,
-                "boot reconciliation: child was running when the process died; \
-                 marking it error and waking the parent"
+                "boot reconciliation: inspecting exact Child terminal authority"
             );
             self.synthesize_child_completion(
                 &parent_id,
@@ -3693,6 +3688,7 @@ impl ChildCompletionCoordinator {
                      was running"
                         .to_string(),
                 ),
+                cutoff,
             )
             .await;
         }
@@ -3976,6 +3972,7 @@ impl ChildCompletionCoordinator {
                         &entry.child_id,
                         &entry.status,
                         Some(entry.reason),
+                        Utc::now(),
                     )
                     .await;
                 } else {
@@ -4024,7 +4021,12 @@ impl ChildCompletionCoordinator {
                 };
                 completion.source = ChildCompletionSource::from_committed_session(&child)
                     .filter(|source| source.matches_completion(&completion));
-                if ChildCompletionSource::has_source_record(&child) && completion.source.is_none() {
+                if (ChildCompletionSource::has_source_record(&child)
+                    || child
+                        .metadata
+                        .contains_key("runtime.reconciled_activation_fence"))
+                    && completion.source.is_none()
+                {
                     tracing::warn!(%child_id,
                             "unavailable committed replay source; leaving wait armed");
                     continue;
@@ -4035,79 +4037,40 @@ impl ChildCompletionCoordinator {
         }
     }
 
-    /// Persist a synthesized terminal status on the child (so the index flips
-    /// and nothing re-detects or re-suspends on it), finalize any lingering
-    /// runner entry (so a future re-run can reserve), then publish through the
-    /// canonical completion path — broadcast + `on_child_completed`, exactly
-    /// like a real child terminal.
+    /// Repair only the selected Child's logical state. The caller's requested
+    /// status, local runner absence and cancel ACK grant no terminal authority,
+    /// Worker-stop proof or parent delivery permission. Existing published
+    /// sources retain their normal replay path; a repair snapshot is no source.
     async fn synthesize_child_completion(
         &self,
         parent_session_id: &str,
         child_session_id: &str,
         status: &str,
         error: Option<String>,
+        before: DateTime<Utc>,
     ) {
-        match self.storage.load_session(child_session_id).await {
-            Ok(Some(mut child)) => {
-                // Ownership guard (defense in depth — callers check too): only
-                // a session that IS a child of this parent may be mutated. An
-                // arbitrary session id named in a wait still wakes the parent
-                // via the publish below, but its own state stays untouched.
-                if child.parent_session_id.as_deref() != Some(parent_session_id) {
-                    tracing::warn!(
-                        %parent_session_id,
-                        child_session_id = %child.id,
-                        "child-wait watchdog: refusing to synthesize status onto a session \
-                         that is not a child of this parent"
-                    );
-                    self.publish_synthetic_completion(
-                        parent_session_id,
-                        child_session_id,
-                        status,
-                        error,
-                    )
-                    .await;
-                    return;
-                }
-                child.set_last_run_status(status);
-                match &error {
-                    Some(message) => child.set_last_run_error(message.clone()),
-                    None => child.clear_last_run_error(),
-                }
-                child.updated_at = Utc::now();
-                if let Err(save_error) = self.persistence.merge_save_runtime(&mut child).await {
-                    tracing::warn!(
-                        child_session_id = %child.id,
-                        %save_error,
-                        "child-wait watchdog: failed to persist synthesized terminal status"
-                    );
-                }
-                self.sessions.insert(
-                    child.id.clone(),
-                    Arc::new(crate::SessionSnapshot::new(child)),
-                );
-            }
-            Ok(None) => {}
-            Err(load_error) => {
-                tracing::warn!(
-                    %child_session_id,
-                    %load_error,
-                    "child-wait watchdog: failed to load child for synthesized terminal status"
-                );
-            }
+        let Ok(Some(child)) = self.storage.load_session(child_session_id).await else {
+            return;
+        };
+        if child.parent_session_id.as_deref() != Some(parent_session_id) {
+            return;
         }
-        finalize_runner(
-            &self.agent_runners,
-            child_session_id,
-            &Err(bamboo_agent_core::AgentError::LLM(
-                error
-                    .clone()
-                    .unwrap_or_else(|| format!("synthesized {status}")),
-            )),
-        )
-        .await;
-        self.publish_synthetic_completion(parent_session_id, child_session_id, status, error)
-            .await;
+        let cache = self.sessions.clone();
+        if let Err(repair_error) = self
+            .storage
+            .reconcile_session_runtime(
+                &child,
+                before,
+                Some("Child activation lease expired without confirmed Host completion"),
+                Arc::new(move |saved| {
+                    crate::SessionRepository::publish_reconciled_child(&cache, saved)
+                }),
+            )
+            .await
+        {
+            tracing::warn!(%child_session_id, requested_status = status, ?error, %repair_error,
+                "Child terminal repair unconfirmed; no completion or Worker-stop proof published");
+        }
     }
 
     async fn publish_synthetic_completion(
@@ -4789,51 +4752,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn planner_artifact_real_boot_orphan_recovery_admits_unavailable_once_without_unsealed_report(
-    ) {
-        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
-        save_waiting_test_parent(
-            &store,
-            "lost-plan-parent",
-            vec!["lost-plan-child".into()],
-            ChildWaitPolicy::All,
-        )
-        .await;
-        let mut parent = store
-            .load_session("lost-plan-parent")
-            .await
-            .unwrap()
-            .unwrap();
-        parent.add_message(Message::user("Original selected source"));
-        store.save_session(&parent).await.unwrap();
-        let mut child = planner_test_child(&parent, "lost-plan-child");
-        child.set_last_run_status("running");
-        child.messages.last_mut().unwrap().content = "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
-        ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());
-        child.updated_at = Utc::now() - chrono::Duration::minutes(5);
-        store.save_session(&child).await.unwrap();
-
-        // Exercise the actual boot watchdog, including canonical error save
-        // and publish_synthetic_completion(source=None), not a fabricated report.
-        coordinator.reconcile_orphans_at_boot().await;
-        coordinator.reconcile_orphans_at_boot().await;
-        let claims = inbox.claim(&parent.id, 8).await.unwrap();
-        assert_eq!(
-            claims.len(),
-            1,
-            "the lost worker must not strand the six-hour wait"
-        );
-        assert_eq!(launches.load(Ordering::SeqCst), 1);
-        let message = claims[0].envelope.to_provider_message().unwrap();
-        assert!(message.content.contains("planner_artifact"));
-        assert!(message.content.contains("\"available\":false"));
-        assert!(!serde_json::to_string(&claims[0].envelope)
-            .unwrap()
-            .contains("UNSEALED_REPORT"));
-        let child = store.load_session(&child.id).await.unwrap().unwrap();
-        assert_eq!(child.last_run_status().as_deref(), Some("error"));
-        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
-        assert!(!store.bamboo_home_dir().join("plan/delegated").exists());
+    async fn planner_artifact_real_boot_recovery_keeps_unconfirmed_wait_and_report_private() {
+        use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+        for expired_actor in [false, true] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "lost-plan-parent",
+                vec!["lost-plan-child".into()],
+                ChildWaitPolicy::All,
+            )
+            .await;
+            let mut parent = store
+                .load_session("lost-plan-parent")
+                .await
+                .unwrap()
+                .unwrap();
+            parent.add_message(Message::user("Original selected source"));
+            store.save_session(&parent).await.unwrap();
+            let mut child = planner_test_child(&parent, "lost-plan-child");
+            child.set_last_run_status("running");
+            child.agent_runtime_state.as_mut().unwrap().status =
+                bamboo_domain::AgentStatusState::Running;
+            child.messages.last_mut().unwrap().content =
+                "UNSEALED_REPORT_MUST_NOT_BE_IMPORTED".into();
+            ChildCompletionSource::prepare(&mut child, "lost-worker", &Default::default());
+            child.updated_at = Utc::now() - chrono::Duration::minutes(5);
+            store.save_session(&child).await.unwrap();
+            if expired_actor {
+                let now = Utc::now() - chrono::Duration::minutes(10);
+                let activation = store
+                    .claim_activation(&ActorActivationClaim {
+                        actor_id: child.id.clone(),
+                        run_id: "lost-worker".into(),
+                        lease_owner: "synthetic-owner".into(),
+                        lease_expires_at: now + chrono::Duration::minutes(5),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    })
+                    .await
+                    .unwrap();
+                store
+                    .start_activation(&activation.fence(), now)
+                    .await
+                    .unwrap();
+            }
+            // Actual boot path twice: no Actor is unknown; an expired exact Actor
+            // can close Child authority, without granting a parent resume source.
+            coordinator.reconcile_orphans_at_boot().await;
+            coordinator.reconcile_orphans_at_boot().await;
+            let claims = inbox.claim(&parent.id, 8).await.unwrap();
+            assert!(
+                claims.is_empty(),
+                "source-less recovery is not parent delivery permission"
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 0);
+            let waiting = store.load_session(&parent.id).await.unwrap().unwrap();
+            assert!(waiting
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_children
+                .is_some());
+            let child = store.load_session(&child.id).await.unwrap().unwrap();
+            assert_eq!(
+                child.last_run_status().as_deref(),
+                Some(if expired_actor { "error" } else { "running" })
+            );
+            assert_eq!(
+                child.agent_runtime_state.as_ref().unwrap().status,
+                if expired_actor {
+                    bamboo_domain::AgentStatusState::Failed
+                } else {
+                    bamboo_domain::AgentStatusState::Running
+                }
+            );
+            assert!(ChildCompletionSource::from_committed_session(&child).is_none());
+            assert!(!store.bamboo_home_dir().join("plan/delegated").exists());
+        }
     }
 
     fn unusable_typed_test_child(
