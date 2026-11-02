@@ -215,7 +215,7 @@ impl VerifiedCli {
 }
 
 fn trust_reason(trust: &PluginTrustConfig, url: &str) -> Option<&'static str> {
-    if !trust.trusted_keys.iter().any(|key| {
+    if !trust.effective_trusted_keys().iter().any(|key| {
         key.algorithm.eq_ignore_ascii_case("ed25519")
             && key.public_key.eq_ignore_ascii_case(NOVA_PUBLIC_KEY)
     }) {
