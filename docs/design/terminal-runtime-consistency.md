@@ -148,6 +148,14 @@ User input boundary again inside atomic publication. It patches only the repair
 fields, preserving newer transcript, UI and accounting. A new birth/run/input,
 wait or pending source prevents replacement; a vacant cache remains vacant.
 
+A generation-bound private repair marker also covers a Host Main repair with
+no Actor. It only denies source-less replay; it is no completion or stop proof.
+Malformed/future generations fail closed. Ordinary writers preserve it, a new
+Host binding clears it, and copies strip it. A known older launch generation
+does not block a later explicitly cancelled queued launch. Current callbacks,
+boot replay and sibling wait counts/staging all retain this boundary; a legal
+sealed sibling still satisfies Any/FirstError without staging the repaired one.
+
 Recovery-generated source-less outcomes do not authorize parent execution or
 finalize a runner by childId. Existing valid published completion sources retain
 their normal replay path. A recovered Child may be Failed while its parent

@@ -434,6 +434,9 @@ impl SessionStoreV2 {
             );
         }
         after.metadata.remove("runtime.reconciled_activation_fence");
+        after
+            .metadata
+            .remove("runtime.reconciled_terminal_generation");
         after.set_last_run_status("running");
         after.clear_last_run_error();
         if !after.has_runtime_wait() {
@@ -715,6 +718,12 @@ impl SessionStoreV2 {
             return Ok(None);
         };
         let mut after = latest.clone();
+        // A negative replay fence, never completion or Worker-stop authority.
+        // Include unactivated Host repairs without inventing an Actor fence.
+        after.metadata.insert(
+            "runtime.reconciled_terminal_generation".into(),
+            latest.child_launch_generation().to_string(),
+        );
         if let Some(fence) = recovered_fence {
             after.metadata.insert(
                 "runtime.reconciled_activation_fence".into(),
@@ -774,6 +783,20 @@ impl SessionStoreV2 {
         )
         .await?;
         let mut observed_incoming = incoming.clone();
+        if incoming.kind == SessionKind::Child {
+            observed_incoming
+                .metadata
+                .remove("runtime.reconciled_terminal_generation");
+            if let Some(marker) = latest
+                .as_ref()
+                .and_then(|s| s.metadata.get("runtime.reconciled_terminal_generation"))
+            {
+                observed_incoming.metadata.insert(
+                    "runtime.reconciled_terminal_generation".into(),
+                    marker.clone(),
+                );
+            }
+        }
         if incoming.kind == bamboo_domain::SessionKind::Root {
             if let Some(proof) = guards.root_actor.as_ref() {
                 super::root_terminal_runtime::stamp_owned_observation(

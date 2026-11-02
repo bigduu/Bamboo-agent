@@ -389,6 +389,19 @@ fn session_provider_message(message: &Message) -> SessionProviderMessage {
     }
 }
 
+// Repair is a read-model fact, not permission to notify a parent. Only an
+// explicitly older launch generation may leave this negative fence behind.
+fn repaired_child_requires_source(child: &Session) -> bool {
+    match child.metadata.get("runtime.reconciled_terminal_generation") {
+        Some(raw) => raw.parse::<u64>().map_or(true, |generation| {
+            generation >= child.child_launch_generation()
+        }),
+        None => child
+            .metadata
+            .contains_key("runtime.reconciled_activation_fence"),
+    }
+}
+
 /// Reconstruct the set of completed child session ids for a parent from the
 /// session index (the single source of truth), folding in the child whose
 /// completion event is being processed so a momentarily-lagging index can never
@@ -1220,6 +1233,20 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                                 .as_deref()
                                 .is_some_and(is_terminal_child_status)
                         {
+                            if repaired_child_requires_source(&child) {
+                                let confirmed = self
+                                    .storage
+                                    .load_child_wait_session(&parent, id, true)
+                                    .await
+                                    .ok()
+                                    .flatten();
+                                if !confirmed.as_ref().is_some_and(|full| {
+                                    ChildCompletionSource::from_committed_session(full)
+                                        .is_some_and(|source| source.matches_parent(full, &parent))
+                                }) {
+                                    continue;
+                                }
+                            }
                             completed_child_ids.push(id.clone());
                         }
                     }
@@ -1293,6 +1320,15 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                 );
                 None
             };
+
+            if completion.source.is_none()
+                && loaded_child
+                    .as_ref()
+                    .is_some_and(repaired_child_requires_source)
+            {
+                tracing::warn!(child_session_id = %completion.child_session_id, "repaired Child has no parent completion source; leaving wait armed");
+                return;
+            }
 
             // An old committed callback cannot count a successor, stage another
             // outcome, or clear a newer wait. Source-less synthetic completions may
@@ -1643,7 +1679,8 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                                 return;
                             }
                         };
-                        if ChildCompletionSource::has_source_record(&sibling)
+                        if (ChildCompletionSource::has_source_record(&sibling)
+                            || repaired_child_requires_source(&sibling))
                             && ChildCompletionSource::from_committed_session(&sibling).is_none()
                         {
                             tracing::warn!(%child_id, "terminal sibling source is invalid; leaving wait armed");
@@ -4022,9 +4059,7 @@ impl ChildCompletionCoordinator {
                 completion.source = ChildCompletionSource::from_committed_session(&child)
                     .filter(|source| source.matches_completion(&completion));
                 if (ChildCompletionSource::has_source_record(&child)
-                    || child
-                        .metadata
-                        .contains_key("runtime.reconciled_activation_fence"))
+                    || repaired_child_requires_source(&child))
                     && completion.source.is_none()
                 {
                     tracing::warn!(%child_id,
@@ -4578,6 +4613,157 @@ mod tests {
         store.save_session(&saved).await.unwrap();
     }
 
+    async fn repaired_unactivated_test_child(
+        store: &bamboo_storage::SessionStoreV2,
+        parent: &Session,
+        id: &str,
+    ) -> Session {
+        let mut child = Session::new_child_of(id, parent, "model", "Child");
+        child.agent_runtime_state = Some(AgentRuntimeState::new("unactivated-host-pipeline"));
+        child.set_last_run_status("running");
+        child.add_message(Message::assistant(
+            "UNSEALED_REPAIR_MUST_NOT_BE_IMPORTED",
+            None,
+        ));
+        store.save_session(&child).await.unwrap();
+        store
+            .begin_host_run(&child, "unactivated-host-A")
+            .await
+            .unwrap();
+        let mut terminal = store.load_session(id).await.unwrap().unwrap();
+        terminal.set_last_run_status("cancelled");
+        // An actual legacy Host Main commit with the audited typed split.
+        store.save_session(&terminal).await.unwrap();
+        let expected = store.load_session(id).await.unwrap().unwrap();
+        let repaired = store
+            .reconcile_session_runtime(&expected, Utc::now(), None, Arc::new(|_| {}))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            repaired.agent_runtime_state.as_ref().unwrap().status,
+            AgentStatusState::Cancelled
+        );
+        assert_eq!(
+            repaired
+                .metadata
+                .get("runtime.reconciled_terminal_generation")
+                .map(String::as_str),
+            Some("0")
+        );
+        assert!(!repaired
+            .metadata
+            .contains_key("runtime.reconciled_activation_fence"));
+        assert!(ChildCompletionSource::from_committed_session(&repaired).is_none());
+        repaired
+    }
+
+    #[tokio::test]
+    async fn recovered_source_less_sibling_never_satisfies_all_or_stages_with_legal_short_circuit()
+    {
+        for policy in [
+            ChildWaitPolicy::All,
+            ChildWaitPolicy::Any,
+            ChildWaitPolicy::FirstError,
+        ] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            save_waiting_test_parent(
+                &store,
+                "repair-parent",
+                vec!["repair-A".into(), "sealed-B".into()],
+                policy,
+            )
+            .await;
+            let parent = store.load_session("repair-parent").await.unwrap().unwrap();
+            let repaired = repaired_unactivated_test_child(&store, &parent, "repair-A").await;
+            // A direct legacy-looking callback cannot borrow the repaired fact.
+            ChildCompletionHandler::on_child_completed(
+                coordinator.as_ref(),
+                ChildCompletion {
+                    parent_session_id: parent.id.clone(),
+                    child_session_id: repaired.id.clone(),
+                    status: "cancelled".into(),
+                    error: None,
+                    completed_at: repaired.updated_at,
+                    source: None,
+                },
+            )
+            .await;
+            assert_eq!(inbox.inspect(&parent.id).await.unwrap().pending, 0);
+            let b = save_completion_test_child(&store, &parent.id, "sealed-B", "error").await;
+            ChildCompletionHandler::on_child_completed(coordinator.as_ref(), b).await;
+            let claims = inbox.claim(&parent.id, 8).await.unwrap();
+            if policy == ChildWaitPolicy::All {
+                assert!(claims.is_empty());
+                assert_eq!(launches.load(Ordering::SeqCst), 0);
+            } else {
+                assert_eq!(claims.len(), 1);
+                assert!(
+                    matches!(&claims[0].envelope.body, SessionMessageBody::ChildOutcome(outcome) if outcome.child_session_id == "sealed-B")
+                );
+                assert_eq!(launches.load(Ordering::SeqCst), 1);
+            }
+            let current = store.load_session(&parent.id).await.unwrap().unwrap();
+            assert_eq!(
+                read_runtime_state(&current).waiting_for_children.is_some(),
+                policy == ChildWaitPolicy::All
+            );
+            assert!(!serde_json::to_string(&current)
+                .unwrap()
+                .contains("UNSEALED_REPAIR_MUST_NOT_BE_IMPORTED"));
+            for raw in ["bad", "1"] {
+                let mut invalid = repaired.clone();
+                invalid
+                    .metadata
+                    .insert("runtime.reconciled_terminal_generation".into(), raw.into());
+                assert!(repaired_child_requires_source(&invalid));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_generation_does_not_block_exact_later_queued_cancel() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        let mut parent = Session::new("cancel-parent", "model");
+        store.save_session(&parent).await.unwrap();
+        let mut child = repaired_unactivated_test_child(&store, &parent, "cancel-child").await;
+        child.advance_child_launch_generation().unwrap();
+        child.cancel_child_launch_generation();
+        child.set_last_run_status("cancelled");
+        store.save_session(&child).await.unwrap();
+        child = store.load_session(&child.id).await.unwrap().unwrap();
+        assert!(!child.host_run_matches_launch());
+        assert!(!repaired_child_requires_source(&child));
+        let mut runtime = AgentRuntimeState::new("fresh-wait");
+        runtime.status = AgentStatusState::Suspended;
+        runtime.waiting_for_children = Some(WaitingForChildrenState::for_children(
+            vec![child.id.clone()],
+            ChildWaitPolicy::All,
+            Utc::now(),
+        ));
+        write_runtime_state(&mut parent, &runtime);
+        store.save_session(&parent).await.unwrap();
+        ChildCompletionHandler::on_child_completed(
+            coordinator.as_ref(),
+            ChildCompletion {
+                parent_session_id: parent.id.clone(),
+                child_session_id: child.id,
+                status: "cancelled".into(),
+                error: None,
+                completed_at: child.updated_at,
+                source: None,
+            },
+        )
+        .await;
+        assert!(
+            read_runtime_state(&store.load_session(&parent.id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_none()
+        );
+        assert_eq!(inbox.claim(&parent.id, 8).await.unwrap().len(), 1);
+        assert_eq!(launches.load(Ordering::SeqCst), 1);
+    }
+
     async fn test_child_source(
         store: &bamboo_storage::SessionStoreV2,
         id: &str,
@@ -4755,7 +4941,7 @@ mod tests {
     #[tokio::test]
     async fn planner_artifact_real_boot_recovery_keeps_unconfirmed_wait_and_report_private() {
         use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
-        for expired_actor in [false, true] {
+        for mode in ["unknown", "expired", "unactivated-host"] {
             let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
             save_waiting_test_parent(
                 &store,
@@ -4771,6 +4957,20 @@ mod tests {
                 .unwrap();
             parent.add_message(Message::user("Original selected source"));
             store.save_session(&parent).await.unwrap();
+            if mode == "unactivated-host" {
+                repaired_unactivated_test_child(&store, &parent, "lost-plan-child").await;
+                coordinator.reconcile_orphans_at_boot().await;
+                coordinator.reconcile_orphans_at_boot().await;
+                assert!(inbox.claim(&parent.id, 8).await.unwrap().is_empty());
+                assert_eq!(launches.load(Ordering::SeqCst), 0);
+                assert!(read_runtime_state(
+                    &store.load_session(&parent.id).await.unwrap().unwrap()
+                )
+                .waiting_for_children
+                .is_some());
+                continue;
+            }
+            let expired_actor = mode == "expired";
             let mut child = planner_test_child(&parent, "lost-plan-child");
             child.set_last_run_status("running");
             child

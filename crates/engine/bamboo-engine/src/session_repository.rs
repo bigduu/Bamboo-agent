@@ -147,10 +147,13 @@ impl SessionRepository {
                         current.metadata.insert("agent.runtime.state".into(), raw);
                     }
                 }
-                if let Some(marker) = saved.metadata.get("runtime.reconciled_activation_fence") {
-                    current
-                        .metadata
-                        .insert("runtime.reconciled_activation_fence".into(), marker.clone());
+                for key in [
+                    "runtime.reconciled_activation_fence",
+                    "runtime.reconciled_terminal_generation",
+                ] {
+                    if let Some(marker) = saved.metadata.get(key) {
+                        current.metadata.insert(key.into(), marker.clone());
+                    }
                 }
             });
         }
@@ -1391,6 +1394,9 @@ mod tests {
         let mut saved = expected.clone();
         saved.set_last_run_status("cancelled");
         saved.synchronize_terminal_runtime_status();
+        saved
+            .metadata
+            .insert("runtime.reconciled_terminal_generation".into(), "0".into());
         for case in [
             "typed-run",
             "legacy-run",
@@ -1466,6 +1472,13 @@ mod tests {
         let entry = cache.get(&saved.id).unwrap();
         let repaired = entry.read();
         assert_eq!(repaired.title, current.title);
+        assert_eq!(
+            repaired
+                .metadata
+                .get("runtime.reconciled_terminal_generation")
+                .map(String::as_str),
+            Some("0")
+        );
         assert_eq!(repaired.messages.len(), current.messages.len());
         assert_eq!(
             repaired

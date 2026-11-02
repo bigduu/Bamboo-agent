@@ -1791,6 +1791,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "runtime.host_launch_generation",
     "runtime.host_prior_activation_fence",
     "runtime.reconciled_activation_fence",
+    "runtime.reconciled_terminal_generation",
     "agent.runtime.state",
     "assignment_prompt",
     "clarification_resume_pending",

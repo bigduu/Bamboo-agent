@@ -174,6 +174,45 @@ async fn terminal_repair_unactivated_host_requires_real_main_and_confirms_uncert
         assert!(!runtime_path(home.path())
             .with_file_name(ACTOR_AUTHORITY_FILE)
             .exists());
+        let mut repaired = reopened.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(
+            repaired
+                .metadata
+                .get("runtime.reconciled_terminal_generation")
+                .map(String::as_str),
+            Some("0")
+        );
+        repaired
+            .metadata
+            .remove("runtime.reconciled_terminal_generation");
+        reopened.save_runtime_state(&repaired).await.unwrap();
+        let repaired = reopened.load_session(&child.id).await.unwrap().unwrap();
+        assert!(repaired
+            .metadata
+            .contains_key("runtime.reconciled_terminal_generation"));
+        let copy = reopened
+            .copy_session(&child.id, "terminal-copy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!copy
+            .metadata
+            .contains_key("runtime.reconciled_terminal_generation"));
+        reopened.begin_host_run(&repaired, "host-B").await.unwrap();
+        let b = reopened.load_session(&child.id).await.unwrap().unwrap();
+        assert!(!b
+            .metadata
+            .contains_key("runtime.reconciled_terminal_generation"));
+        assert!(reopened
+            .reconcile_session_runtime(
+                &repaired,
+                Utc::now(),
+                None,
+                Arc::new(|_| panic!("late repaired A"))
+            )
+            .await
+            .unwrap()
+            .is_none());
     }
 }
 
