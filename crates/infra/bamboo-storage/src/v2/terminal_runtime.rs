@@ -39,6 +39,18 @@ fn same_terminal_class(left: &str, right: &str) -> bool {
     class(left).is_some() && class(left) == class(right)
 }
 
+fn idle_control_state(session: &Session) -> bool {
+    let legacy = session
+        .metadata
+        .get("agent.runtime.state")
+        .and_then(|raw| serde_json::from_str::<AgentRuntimeState>(raw).ok());
+    session
+        .agent_runtime_state
+        .as_ref()
+        .or(legacy.as_ref())
+        .is_some_and(|state| state.status == AgentStatusState::Idle)
+}
+
 impl SessionStoreV2 {
     async fn projection_target(&self, id: &str, rel: &str) -> io::Result<Option<Session>> {
         let (kind, root) = Self::copy_source_identity_from_rel(id, rel)?;
@@ -196,7 +208,15 @@ impl SessionStoreV2 {
         {
             after.clear_last_run_error();
         }
-        after.synchronize_terminal_runtime_status();
+        // A completed child wait can already have opened the parent's next
+        // input gate. Replaying its old outcome must not close that ready gate.
+        if !idle_control_state(&before)
+            || !prior
+                .as_deref()
+                .is_some_and(super::super::child_wait_control_plane::terminal)
+        {
+            after.synchronize_terminal_runtime_status();
+        }
         self.commit_runtime_projection(&before, &after, rel, guards)
             .await
     }
@@ -268,7 +288,6 @@ impl SessionStoreV2 {
         &self,
         expected: &Session,
         before: DateTime<Utc>,
-        status: &str,
         error: Option<&str>,
     ) -> io::Result<Option<Session>> {
         let (rel, path, guards) = self
@@ -316,6 +335,14 @@ impl SessionStoreV2 {
                     if activation.lease_expires_at > Utc::now() {
                         return Ok(None);
                     }
+                    // Check the existing Host fact before changing authority.
+                    // Expiry alone cannot revoke a committed success/cancel.
+                    if chosen_status
+                        .as_deref()
+                        .is_some_and(|host| !same_terminal_class(host, "error"))
+                    {
+                        return Ok(None);
+                    }
                     // Expiry revokes logical authority; it does not certify that
                     // a remote Worker stopped or authorize unfenced side effects.
                     activation.status = ActorActivationStatus::Failed;
@@ -336,11 +363,7 @@ impl SessionStoreV2 {
                     .zip(authoritative)
                     .is_some_and(|(host, actor)| same_terminal_class(host, actor))
                 {
-                    if chosen_status.is_some()
-                        && latest
-                            .metadata
-                            .contains_key("runtime.child_completion_source_v1")
-                    {
+                    if chosen_status.is_some() {
                         return Err(conflict(
                             "recovery outcome conflicts with committed Host source",
                         ));
@@ -350,14 +373,11 @@ impl SessionStoreV2 {
                 recovered_fence = entry.activation.as_ref().map(ActorActivation::fence);
             }
         }
-        if chosen_status.is_none()
-            && !matches!(
-                latest.last_run_status().as_deref(),
-                Some("running" | "initializing")
-            )
-        {
+        // No authority and no canonical terminal Host fact means unknown.
+        // Absence from a local runner map is not proof of a dead Worker.
+        let Some(chosen_status) = chosen_status else {
             return Ok(None);
-        }
+        };
         let mut after = latest.clone();
         if let Some(fence) = recovered_fence {
             after.metadata.insert(
@@ -365,8 +385,8 @@ impl SessionStoreV2 {
                 serde_json::to_string(&fence)?,
             );
         }
-        after.set_last_run_status(chosen_status.as_deref().unwrap_or(status));
-        if (chosen_status.is_none() || expired)
+        after.set_last_run_status(&chosen_status);
+        if expired
             && !latest
                 .metadata
                 .contains_key("runtime.child_completion_source_v1")
@@ -375,7 +395,14 @@ impl SessionStoreV2 {
                 after.set_last_run_error(error)
             }
         }
-        after.synchronize_terminal_runtime_status();
+        if !idle_control_state(&latest)
+            || !latest
+                .last_run_status()
+                .as_deref()
+                .is_some_and(super::super::child_wait_control_plane::terminal)
+        {
+            after.synchronize_terminal_runtime_status();
+        }
         self.commit_runtime_projection(&latest, &after, &rel, &guards)
             .await
             .map_err(io::Error::other)?;
@@ -457,7 +484,9 @@ impl SessionStoreV2 {
                     }
                 }
             }
-            candidate.synchronize_terminal_runtime_status();
+            if !idle_control_state(&candidate) {
+                candidate.synchronize_terminal_runtime_status();
+            }
         }
         Ok(candidate)
     }

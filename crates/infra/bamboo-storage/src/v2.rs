@@ -7650,10 +7650,9 @@ impl Storage for SessionStoreV2 {
         &self,
         expected: &Session,
         before: DateTime<Utc>,
-        status: &str,
         error: Option<&str>,
     ) -> io::Result<Option<Session>> {
-        self.reconcile_child_runtime_impl(expected, before, status, error)
+        self.reconcile_child_runtime_impl(expected, before, error)
             .await
     }
 

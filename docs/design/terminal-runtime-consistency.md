@@ -20,6 +20,9 @@ that wait or turn the Session into completed. A marked in-flight Host run retain
 authorizes finishing a live activation. Confirmed terminal projection retains
 round/accounting fields and updates both the typed state and its legacy mirror.
 Active tool counts become zero only with the terminal projection.
+After a completed child wait explicitly opens the next input gate, `Idle` is a
+valid later control state. Replaying the preceding terminal outcome preserves
+that gate; it repairs stale `Initializing`/`Running` state instead.
 
 ## Identity and persistence
 
@@ -52,6 +55,9 @@ Targeted repairs compare the exact control-plane, birth, current activation, Hos
 respect the current Session contract. They run independently of Session-version
 migration. Filesystem failures propagate; a failed repair does not publish a
 synthetic completion. Settled repair is idempotent.
+An old nonterminal record without an Actor or terminal Host fact remains unknown.
+Expired logical authority cannot override a conflicting committed Host outcome;
+recovery checks that conflict before any authority or runtime mutation.
 
 ## Separate continuation slice
 

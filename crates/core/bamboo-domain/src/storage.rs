@@ -1019,16 +1019,17 @@ pub trait Storage: Send + Sync {
     }
 
     /// Reconcile a selected Child snapshot under the physical Session/Actor
-    /// locks. Return None when superseded, waiting or still leased. A terminal
-    /// return proves logical closure, never physical Worker termination.
+    /// locks. Return None when superseded, waiting, still leased or lacking a
+    /// trusted terminal fact. The error describes a newly expired Actor only;
+    /// callers cannot supply a terminal outcome. A terminal return proves
+    /// logical closure, never physical Worker termination.
     async fn reconcile_child_runtime(
         &self,
         expected: &Session,
         before: chrono::DateTime<chrono::Utc>,
-        status: &str,
         error: Option<&str>,
     ) -> std::io::Result<Option<Session>> {
-        let _ = (expected, before, status, error);
+        let _ = (expected, before, error);
         Ok(None)
     }
 

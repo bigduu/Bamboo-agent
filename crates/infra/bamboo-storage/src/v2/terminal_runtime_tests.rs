@@ -173,7 +173,7 @@ async fn terminal_runtime_authority_commit_survives_projection_io_fault_and_reop
         let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
         let expected = reopened.load_session(&child.id).await.unwrap().unwrap();
         let repaired = reopened
-            .reconcile_child_runtime(&expected, Utc::now(), "error", Some("restart"))
+            .reconcile_child_runtime(&expected, Utc::now(), Some("restart"))
             .await
             .unwrap()
             .unwrap();
@@ -223,14 +223,14 @@ async fn terminal_runtime_repairs_existing_terminal_initializing_record_without_
         .unwrap()
         .unwrap();
     reopened
-        .reconcile_child_runtime(&expected, Utc::now(), "error", None)
+        .reconcile_child_runtime(&expected, Utc::now(), None)
         .await
         .unwrap()
         .unwrap();
     let repaired = assert_terminal(&reopened, AgentStatusState::Cancelled, "cancelled").await;
     let bytes = std::fs::read(runtime_path(home.path())).unwrap();
     reopened
-        .reconcile_child_runtime(&repaired, Utc::now(), "error", None)
+        .reconcile_child_runtime(&repaired, Utc::now(), None)
         .await
         .unwrap()
         .unwrap();
@@ -287,7 +287,7 @@ async fn terminal_runtime_old_final_save_checkpoint_finish_and_recovery_cannot_o
         .await
         .is_err());
     assert!(store
-        .reconcile_child_runtime(&latest, Utc::now(), "error", None)
+        .reconcile_child_runtime(&latest, Utc::now(), None)
         .await
         .unwrap()
         .is_none());
@@ -370,7 +370,7 @@ async fn terminal_runtime_waits_are_not_completed_by_success_or_orphan_recovery(
             expected.agent_runtime_state
         );
         assert!(store
-            .reconcile_child_runtime(&expected, Utc::now(), "error", None)
+            .reconcile_child_runtime(&expected, Utc::now(), None)
             .await
             .unwrap()
             .is_none());
@@ -419,7 +419,7 @@ async fn terminal_runtime_host_final_save_io_fault_reopens_to_trusted_outcome() 
             let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
             let current = reopened.load_session(&child.id).await.unwrap().unwrap();
             reopened
-                .reconcile_child_runtime(&current, Utc::now(), "error", Some("restart"))
+                .reconcile_child_runtime(&current, Utc::now(), Some("restart"))
                 .await
                 .unwrap()
                 .unwrap();
@@ -509,7 +509,7 @@ async fn terminal_runtime_pending_retry_generation_survives_old_finish_and_recon
     store.save_session(&queued).await.unwrap();
     let queued = store.load_session(&child.id).await.unwrap().unwrap();
     assert!(store
-        .reconcile_child_runtime(&queued, Utc::now(), "error", None)
+        .reconcile_child_runtime(&queued, Utc::now(), None)
         .await
         .unwrap()
         .is_none());
@@ -607,7 +607,7 @@ async fn terminal_runtime_inflight_host_does_not_publish_terminal_before_broker_
     store.save_runtime_state(&staged).await.unwrap();
     let current = store.load_session(&child.id).await.unwrap().unwrap();
     assert!(store
-        .reconcile_child_runtime(&current, Utc::now(), "error", None)
+        .reconcile_child_runtime(&current, Utc::now(), None)
         .await
         .unwrap()
         .is_none());
@@ -685,7 +685,7 @@ async fn terminal_runtime_finish_preserves_confirmed_timeout_status_error_and_so
         );
         assert_eq!(saved.metadata["runtime.child_completion_source_v1"], source);
         let repaired = store
-            .reconcile_child_runtime(&saved, Utc::now(), "error", Some("restart"))
+            .reconcile_child_runtime(&saved, Utc::now(), Some("restart"))
             .await
             .unwrap()
             .unwrap();
@@ -726,7 +726,7 @@ async fn terminal_runtime_finish_preserves_skipped_error_and_source() {
         );
         assert_eq!(saved.metadata["runtime.child_completion_source_v1"], source);
         let repaired = store
-            .reconcile_child_runtime(&saved, Utc::now(), "error", Some("restart"))
+            .reconcile_child_runtime(&saved, Utc::now(), Some("restart"))
             .await
             .unwrap()
             .unwrap();
@@ -755,7 +755,7 @@ async fn terminal_runtime_lost_activated_sidecar_is_not_reconstructed_from_stale
     assert!(!runtime_path(home.path()).exists());
     assert!(store.begin_host_run(&child, "new-run").await.is_err());
     assert!(store
-        .reconcile_child_runtime(&child, Utc::now(), "error", None)
+        .reconcile_child_runtime(&child, Utc::now(), None)
         .await
         .is_err());
     assert!(!runtime_path(home.path()).exists());
@@ -773,7 +773,7 @@ async fn terminal_runtime_symlink_authority_witness_cannot_authorize_begin_or_re
     let runtime = std::fs::read(runtime_path(home.path())).unwrap();
     assert!(store.begin_host_run(&child, "host-A").await.is_err());
     assert!(store
-        .reconcile_child_runtime(&child, Utc::now(), "error", None)
+        .reconcile_child_runtime(&child, Utc::now(), None)
         .await
         .is_err());
     assert_eq!(runtime, std::fs::read(runtime_path(home.path())).unwrap());
@@ -783,7 +783,7 @@ async fn terminal_runtime_symlink_authority_witness_cannot_authorize_begin_or_re
 async fn terminal_runtime_live_lease_is_not_orphaned_and_expiry_revokes_only_logical_authority() {
     let (_home, store, child, activation) = fixture(AgentStatusState::Running).await;
     assert!(store
-        .reconcile_child_runtime(&child, Utc::now(), "error", Some("restart"))
+        .reconcile_child_runtime(&child, Utc::now(), Some("restart"))
         .await
         .unwrap()
         .is_none());
@@ -817,7 +817,6 @@ async fn terminal_runtime_live_lease_is_not_orphaned_and_expiry_revokes_only_log
         .reconcile_child_runtime(
             &expected,
             Utc::now(),
-            "error",
             Some("logical expiry; physical stop unknown"),
         )
         .await
@@ -834,4 +833,102 @@ async fn terminal_runtime_live_lease_is_not_orphaned_and_expiry_revokes_only_log
         ActorActivationStatus::Failed
     );
     assert_terminal(&store, AgentStatusState::Failed, "error").await;
+}
+
+#[tokio::test]
+async fn terminal_runtime_missing_authority_and_nonterminal_host_remain_unknown() {
+    let home = tempfile::tempdir().unwrap();
+    let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let parent = Session::new("terminal-parent", "model");
+    store.save_session(&parent).await.unwrap();
+    let mut child = Session::new_child_of("terminal-child", &parent, "model", "Child");
+    child.agent_runtime_state = Some(AgentRuntimeState::new(&child.id));
+    child.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+    child.set_last_run_status("running");
+    store.save_session(&child).await.unwrap();
+    let before = std::fs::read(runtime_path(home.path())).unwrap();
+    let current = store.load_session(&child.id).await.unwrap().unwrap();
+    assert!(store
+        .reconcile_child_runtime(&current, Utc::now(), Some("no local runner"))
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(before, std::fs::read(runtime_path(home.path())).unwrap());
+    assert!(!runtime_path(home.path())
+        .with_file_name(ACTOR_AUTHORITY_FILE)
+        .exists());
+}
+
+#[tokio::test]
+async fn terminal_runtime_expiry_cannot_mutate_authority_before_host_conflict_check() {
+    for status in ["completed", "cancelled"] {
+        let (home, store, child, _) = fixture(AgentStatusState::Running).await;
+        store.begin_host_run(&child, "host-A").await.unwrap();
+        let mut final_save = store.load_session(&child.id).await.unwrap().unwrap();
+        final_save.set_last_run_status(status);
+        final_save.synchronize_terminal_runtime_status();
+        final_save.metadata.insert(
+            "runtime.child_completion_source_v1".into(),
+            format!("{{\"status\":\"{status}\",\"activation_run_id\":\"host-A\"}}"),
+        );
+        store.save_session(&final_save).await.unwrap();
+        let path = runtime_path(home.path()).with_file_name(ACTOR_AUTHORITY_FILE);
+        let mut actor: ActorDirectoryEntry =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        actor.activation.as_mut().unwrap().lease_expires_at =
+            Utc::now() - chrono::Duration::seconds(1);
+        actor.validate().unwrap();
+        std::fs::write(&path, serde_json::to_vec(&actor).unwrap()).unwrap();
+        let authority = std::fs::read(&path).unwrap();
+        let runtime = std::fs::read(runtime_path(home.path())).unwrap();
+        let current = store.load_session(&child.id).await.unwrap().unwrap();
+        assert!(store
+            .reconcile_child_runtime(&current, Utc::now(), Some("restart"))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(authority, std::fs::read(&path).unwrap());
+        assert_eq!(runtime, std::fs::read(runtime_path(home.path())).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate() {
+    let (home, store, child, activation) = fixture(AgentStatusState::Running).await;
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    let mut ready = store.load_session(&child.id).await.unwrap().unwrap();
+    ready.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Idle;
+    ready.metadata.insert(
+        "agent.runtime.state".into(),
+        serde_json::to_string(ready.agent_runtime_state.as_ref().unwrap()).unwrap(),
+    );
+    store.save_session_runtime_state(&ready).await.unwrap();
+    let before = std::fs::read(runtime_path(home.path())).unwrap();
+    store
+        .finish_activation(
+            &activation.fence(),
+            Utc::now(),
+            ActorActivationFinish::Succeeded,
+        )
+        .await
+        .unwrap();
+    assert_eq!(before, std::fs::read(runtime_path(home.path())).unwrap());
+    let latest = store.load_session(&child.id).await.unwrap().unwrap();
+    let repaired = store
+        .reconcile_child_runtime(&latest, Utc::now(), None)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        repaired.agent_runtime_state.unwrap().status,
+        AgentStatusState::Idle
+    );
+    assert_eq!(before, std::fs::read(runtime_path(home.path())).unwrap());
 }
