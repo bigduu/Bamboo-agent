@@ -280,7 +280,7 @@ async fn terminal_runtime_sdk_child_resumed_through_session_entrypoint_seals_new
         };
         let new_run = reservation.run_id().to_owned();
         assert_ne!(new_run, old_run);
-        let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(128);
         let (ack, barrier) = crate::runtime::execution::event_forwarder::history_commit_barrier();
         let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
         let drained = observed.clone();
