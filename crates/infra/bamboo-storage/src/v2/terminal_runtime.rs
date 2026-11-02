@@ -30,6 +30,19 @@ fn pending_delivery(session: &Session) -> bool {
 }
 
 impl SessionStoreV2 {
+    async fn projection_target(&self, id: &str, rel: &str) -> io::Result<Option<Session>> {
+        let (kind, root) = Self::copy_source_identity_from_rel(id, rel)?;
+        Self::regular_actor_file(
+            &self
+                .abs_path_from_rel(rel)
+                .join(super::super::RUNTIME_SIDECAR_FILE),
+        )
+        .await
+        .map_err(io::Error::other)?;
+        self.load_session_from_dir_strict(&self.abs_path_from_rel(rel), id, kind, &root)
+            .await
+    }
+
     async fn observed_runtime_actor(
         &self,
         path: &Path,
@@ -42,6 +55,11 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         let record = fs::read(path).await.map_err(storage)?;
+        if !Self::regular_actor_file(&path.with_file_name(super::super::RUNTIME_SIDECAR_FILE))
+            .await?
+        {
+            return Err(ActorDirectoryError::Corrupt);
+        }
         let marker = fs::read(path.with_file_name(ACTOR_INITIALIZED_FILE))
             .await
             .map_err(storage)?;
@@ -157,7 +175,7 @@ impl SessionStoreV2 {
             .await
             .map_err(io::Error::other)?;
         let latest = self
-            .load_session_unlocked(&expected.id)
+            .projection_target(&expected.id, &rel)
             .await?
             .ok_or_else(|| conflict("Host run Session disappeared"))?;
         super::super::reject_incompatible_session_write(&latest)?;
@@ -165,6 +183,9 @@ impl SessionStoreV2 {
         super::super::child_wait_control_plane::validate_incarnation(expected, &latest)?;
         if expected.parent_created_at != latest.parent_created_at {
             return Err(conflict("Host run parent incarnation changed"));
+        }
+        if expected.child_launch_generation() != latest.child_launch_generation() {
+            return Err(conflict("Host startup launch generation was superseded"));
         }
         if latest.host_run_id() == Some(run_id) {
             return Ok(());
@@ -212,7 +233,7 @@ impl SessionStoreV2 {
             .lock_actor_runtime(&expected.id)
             .await
             .map_err(io::Error::other)?;
-        let Some(latest) = self.load_session_unlocked(&expected.id).await? else {
+        let Some(latest) = self.projection_target(&expected.id, &rel).await? else {
             return Ok(None);
         };
         super::super::reject_incompatible_session_write(&latest)?;
