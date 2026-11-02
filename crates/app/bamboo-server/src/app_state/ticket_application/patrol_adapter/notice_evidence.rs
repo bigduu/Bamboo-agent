@@ -38,7 +38,7 @@ pub(super) fn read(
     service
         .work_inspect_sections(
             authority,
-            &[scope.work_id.clone()],
+            std::slice::from_ref(&scope.work_id),
             &InspectOptions {
                 sections: BTreeSet::new(),
                 depth: 0,
