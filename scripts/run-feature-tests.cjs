@@ -100,7 +100,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
 // The C1 pending predicates add two ordinary domain packages-2 cases and three
 // server-handlers Actix cases; none is an additive feature-only case.
-const FEATURE_SOURCE_SHA256 = "bbebd1f968007e8616f7e11ae284de0f1ad423e92fc71c5acd1225f629abd0aa";
+// Terminal projection/replay tests and hooks are cfg(test), owned by the
+// default storage packages-0 library. V2's existing test-utils cfg is unchanged;
+// the four additive contexts still own the same 20 feature-only cases.
+const FEATURE_SOURCE_SHA256 = "35aca4a98dcb5e32f1b083d0ca07fe67535c6b4561c85a61c0f4e40110a83340";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
