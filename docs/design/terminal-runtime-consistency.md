@@ -1,6 +1,11 @@
 # Terminal runtime consistency
 
-Tracking: [#2448](https://github.com/bigduu/Bamboo-agent/issues/2448); this slice is [#2454](https://github.com/bigduu/Bamboo-agent/issues/2454).
+Tracking: [#2448](https://github.com/bigduu/Bamboo-agent/issues/2448).
+Storage is [#2454](https://github.com/bigduu/Bamboo-agent/issues/2454);
+Host final-save is [#2460](https://github.com/bigduu/Bamboo-agent/issues/2460).
+Receipt replay monotonicity and automatic recovery remain the independent
+[#2468](https://github.com/bigduu/Bamboo-agent/issues/2468) and
+[#2455](https://github.com/bigduu/Bamboo-agent/issues/2455) acceptance slices.
 
 Session owns identity and context. An ActorActivation owns one fenced attempt.
 A Worker supplies reclaimable execution capacity. Neither an absent local runner
@@ -31,8 +36,11 @@ that gate; it repairs stale `Initializing`/`Running` state instead.
 ## Identity and persistence
 
 The `Storage::begin_host_run` port binds `runtime.host_run_id` to a reserved Run.
-[Host/SDK entrypoint integration](https://github.com/bigduu/Bamboo-agent/issues/2460)
-follows this Storage slice; it is not enabled by this PR. Storage compares the prior Host identity and Session
+[Host/SDK entrypoints](https://github.com/bigduu/Bamboo-agent/issues/2460)
+bind the actual reserved Run UUID before execution. Native Child backend
+preparation must succeed before this binding; a preparation refusal leaves the
+canonical Session unchanged. A refused binding or an explicit startup identity
+conflict never falls through into legacy execution. Storage compares the prior Host identity and Session
 incarnation under the physical Session lock, and refuses a different live Actor
 owner. This dedicated transition preserves canonical content. Ordinary full and
 runtime saves cannot change that Host identity. The captured child launch generation prevents an old activation from consuming a newer pending retry/reset/accumulate. The pipeline/Ticket runtime
@@ -43,6 +51,23 @@ their existing contract until the Host integration binds a run. They receive no
 new activation or physical-stop proof. The first binding and automatic orphan
 notifications remain the explicit #2460/#2455 admission boundaries; this slice
 does not retrofit identity by guessing from an unmarked legacy snapshot.
+
+A legacy backend can claim its Actor during execution. At binding, Storage
+captures the exact terminal predecessor fence so the new Host can save startup
+before that claim. Ordinary saves retain the canonical captured fence. A new
+Actor attempt invalidates it even before the next Host UUID is installed.
+This observation grants no execution or physical-stop authority.
+
+Host final-save synchronizes the typed state and legacy mirror before sealing
+the result. Deferred broker publication retains a nonterminal projection until
+the existing receipt proof commits. An explicit queued rerun consumes its old
+typed question handoff along with the old question metadata; child/Bash waits,
+plan approval and waits created by the current execution remain authoritative.
+An unstarted cancelled or failed queued launch closes its exact generation
+tombstone and retains the predecessor Run marker. It cannot borrow that Run's
+sealed result or finish. Merge-save must not promote this terminal write to a
+newer launch, including before the first Host UUID exists. Terminal generations
+are stale to launch-intent and scheduler consumers.
 
 `finish_activation` validates the full activation fence. It commits authority
 before projecting the terminal read model while retaining the same lifecycle,
@@ -55,6 +80,9 @@ pipeline runtimes use the same Session ID and omit `execution_id`.
 Strict broker delivery keeps its existing pending source/receipt boundary.
 Pending publication is not repaired into an exposed completion. Committed
 receipt publication synchronizes typed status in its existing exact-snapshot CAS.
+The separate #2468 slice must reject replay of an older pending checkpoint
+after a terminal source was already published, including after receipt ACK.
+Host integration alone does not establish that same-run replay guarantee.
 
 ## Recovery boundary
 
