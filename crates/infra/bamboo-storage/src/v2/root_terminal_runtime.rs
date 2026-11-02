@@ -131,6 +131,24 @@ impl SessionStoreV2 {
         let main: Session =
             serde_json::from_slice(&bytes).map_err(|_| ActorDirectoryError::Corrupt)?;
         super::super::reject_incompatible_session_write(&main).map_err(storage)?;
+        let Some(outcomes) = main
+            .runtime_metadata
+            .as_ref()
+            .and_then(|m| m.supervised_root_outcomes.as_ref())
+        else {
+            return Ok(None);
+        };
+        let outcome = outcomes
+            .finalized_for_fence(&main, fence)
+            .map_err(|reason| {
+                tracing::warn!(%reason, "Root Main terminal fact failed validation");
+                ActorDirectoryError::Corrupt
+            })?;
+        let outcome =
+            outcome.filter(|result| *result != SupervisedRootOutcomeResult::InterruptedUnknown);
+        if outcome.is_none() {
+            return Ok(None);
+        }
         if main.kind != SessionKind::Root
             || !main.authority_identity.is_ordinary()
             || !entry.actor.matches_session(&main)
@@ -164,18 +182,6 @@ impl SessionStoreV2 {
             .transpose()
             .map_err(|_| ActorDirectoryError::InvalidIdentity)?;
         validate_census_witnesses(&record, &marker, &main, project.as_ref()).map_err(storage)?;
-        let Some(outcomes) = main
-            .runtime_metadata
-            .as_ref()
-            .and_then(|m| m.supervised_root_outcomes.as_ref())
-        else {
-            return Ok(None);
-        };
-        let outcome = outcomes
-            .finalized_for_fence(&main, fence)
-            .map_err(|_| ActorDirectoryError::Corrupt)?;
-        let outcome =
-            outcome.filter(|result| *result != SupervisedRootOutcomeResult::InterruptedUnknown);
         if outcome.is_some() {
             // A readable AfterReplace result is not a commit acknowledgement.
             // Retain the exact Actor/Session/tree guards through the real sync.
@@ -354,6 +360,16 @@ impl SessionStoreV2 {
             .as_ref()
             .filter(|a| a.matches_fence(fence))
             .ok_or(ActorDirectoryError::StaleFence)?;
+        // Reject a conflicting repeat before changing even the observation.
+        // Main may correct a diagnostic, but an ordinary repeated finish may not.
+        if !active.status.is_live() {
+            let main = self
+                .confirmed_root_main_outcome(&entry, &rel, fence, &guards)
+                .await?;
+            if main.is_none() && terminal_finish(active.status) != Some(outcome) {
+                return Err(ActorDirectoryError::InvalidTransition);
+            }
+        }
         let mut marked = initial.clone();
         let was_attributed = matches_observation(&initial, fence).unwrap_or(false);
         stamp_owned_observation(&mut marked, owner).map_err(storage)?;

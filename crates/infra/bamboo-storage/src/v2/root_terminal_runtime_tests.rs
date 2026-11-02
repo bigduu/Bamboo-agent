@@ -438,7 +438,7 @@ async fn root_terminal_wait_pending_and_later_idle_gate_are_preserved() {
         );
         if mode == "wait" {
             assert_eq!(
-                after.agent_runtime_state.unwrap().status,
+                after.agent_runtime_state.as_ref().unwrap().status,
                 AgentStatusState::Suspended
             );
         }
@@ -447,7 +447,7 @@ async fn root_terminal_wait_pending_and_later_idle_gate_are_preserved() {
         }
         if mode == "idle" {
             assert_eq!(
-                after.agent_runtime_state.unwrap().status,
+                after.agent_runtime_state.as_ref().unwrap().status,
                 AgentStatusState::Idle
             );
         }

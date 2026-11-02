@@ -307,144 +307,239 @@ impl bamboo_llm::LLMProvider for NoProvider {
 #[tokio::test]
 async fn actual_root_spawn_terminal_badge_precedes_real_join_and_actor_finish() {
     use crate::runtime::execution::{agent_spawn::*, history_commit_barrier};
-    use bamboo_domain::Storage;
-    let home = tempfile::tempdir().unwrap();
-    let store = Arc::new(
-        bamboo_storage::SessionStoreV2::new(home.path().into())
+    for final_save_fault in [false, true] {
+        use bamboo_domain::Storage;
+        let home = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(home.path().into())
+                .await
+                .unwrap(),
+        );
+        let mut session = session();
+        session.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(&session.id));
+        store.save_session(&session).await.unwrap();
+        let cache: crate::SessionCache = Arc::default();
+        let repository = crate::SessionRepository::new(
+            cache.clone(),
+            store.clone(),
+            Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
+        )
+        .with_root_actor_directory(store.clone());
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .storage(store.clone())
+                .persistence(Arc::new(repository))
+                .attachment_reader(store.clone())
+                .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
+                .metrics_collector(bamboo_metrics::MetricsCollector::spawn(
+                    Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
+                        home.path().join("metrics.db"),
+                    )),
+                    7,
+                ))
+                .config(Arc::new(RwLock::new(bamboo_llm::Config::default())))
+                .provider(Arc::new(NoProvider))
+                .default_tools(Arc::new(NoTools))
+                .build()
+                .unwrap(),
+        );
+        let runners = Arc::new(RwLock::new(HashMap::new()));
+        let senders = Arc::default();
+        let (events, _) = broadcast::channel(32);
+        let SessionExecutionReserveOutcome::Reserved(mut reservation) =
+            reserve_session_execution(&agent, &runners, &senders, &session.id, &events).await
+        else {
+            panic!("actual reserve");
+        };
+        reservation.bind_root_actor(&agent, &session).await.unwrap();
+        assert!(
+            reservation.root_actor_writer().is_some(),
+            "fixture must use the real Root Actor finish path"
+        );
+        reservation.cancel_token().cancel(); // this fresh synthetic fixture only
+        let lifetime = runners
+            .read()
             .await
-            .unwrap(),
-    );
-    let session = session();
-    store.save_session(&session).await.unwrap();
-    let cache: crate::SessionCache = Arc::default();
-    let repository = crate::SessionRepository::new(
-        cache.clone(),
-        store.clone(),
-        Arc::new(bamboo_storage::LockedSessionStore::new(store.clone())),
-    )
-    .with_root_actor_directory(store.clone());
-    let agent = Arc::new(
-        crate::Agent::builder()
-            .storage(store.clone())
-            .persistence(Arc::new(repository))
-            .attachment_reader(store.clone())
-            .skill_manager(Arc::new(bamboo_skills::SkillManager::new()))
-            .metrics_collector(bamboo_metrics::MetricsCollector::spawn(
-                Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
-                    home.path().join("metrics.db"),
-                )),
-                7,
-            ))
-            .config(Arc::new(RwLock::new(bamboo_llm::Config::default())))
-            .provider(Arc::new(NoProvider))
-            .default_tools(Arc::new(NoTools))
-            .build()
-            .unwrap(),
-    );
-    let runners = Arc::new(RwLock::new(HashMap::new()));
-    let senders = Arc::default();
-    let (events, _) = broadcast::channel(32);
-    let SessionExecutionReserveOutcome::Reserved(mut reservation) =
-        reserve_session_execution(&agent, &runners, &senders, &session.id, &events).await
-    else {
-        panic!("actual reserve");
-    };
-    reservation.bind_root_actor(&agent, &session).await.unwrap();
-    assert!(
-        reservation.root_actor_writer().is_some(),
-        "fixture must use the real Root Actor finish path"
-    );
-    reservation.cancel_token().cancel(); // this fresh synthetic fixture only
-    let lifetime = runners
-        .read()
-        .await
-        .get(&session.id)
-        .unwrap()
-        .root_execution
-        .clone();
-    let pause = Arc::new(RootTailPause::default());
-    *lifetime.before_actor_finish.lock().unwrap() = Some(pause.clone());
-    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
-    let (ack, barrier) = history_commit_barrier();
-    let drain = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if matches!(
-                event,
-                bamboo_agent_core::AgentEvent::SessionHistoryCommitted { .. }
-            ) {
-                ack.acknowledge();
+            .get(&session.id)
+            .unwrap()
+            .root_execution
+            .clone();
+        let pause = Arc::new(RootTailPause::default());
+        *lifetime.before_actor_finish.lock().unwrap() = Some(pause.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let (ack, barrier) = history_commit_barrier();
+        let drain = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if matches!(
+                    event,
+                    bamboo_agent_core::AgentEvent::SessionHistoryCommitted { .. }
+                ) {
+                    ack.acknowledge();
+                }
             }
+        });
+        let main_path = home
+            .path()
+            .join("sessions")
+            .join(&session.id)
+            .join("session.json");
+        let fault_path = main_path.clone();
+        let on_complete: Option<SessionCompletionHook> = if final_save_fault {
+            Some(Box::new(move |_, _| {
+                Box::pin(async move {
+                    std::fs::rename(
+                        &fault_path,
+                        fault_path.with_extension("before-root-tail-fault"),
+                    )
+                    .unwrap();
+                    std::fs::create_dir(&fault_path).unwrap();
+                })
+            }))
+        } else {
+            None
+        };
+        spawn_session_execution(SessionExecutionArgs {
+            agent,
+            session_id: session.id.clone(),
+            session: session.clone(),
+            execution_reservation: reservation,
+            tools_override: None,
+            provider_override: None,
+            model_roster: crate::runtime::model_roster::ModelRoster {
+                model: Some("model".into()),
+                ..Default::default()
+            },
+            reasoning_effort: None,
+            reasoning_effort_source: "fixture".into(),
+            auxiliary_model_resolver: None,
+            disabled_filter_resolver: None,
+            disabled_tools: None,
+            disabled_skill_ids: None,
+            selected_skill_ids: None,
+            selected_skill_mode: None,
+            mpsc_tx: tx,
+            history_commit_barrier: barrier,
+            image_fallback: None,
+            gold_config: None,
+            guardian_config: None,
+            guardian_spawner: None,
+            bash_resume_hook: None,
+            bash_completion_sink: None,
+            app_data_dir: Some(home.path().into()),
+            run_budget: None,
+            runners: runners.clone(),
+            sessions_cache: cache.clone(),
+            on_complete,
+            child_completion_handler: None,
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+            .await
+            .unwrap();
+        assert!(matches!(
+            runners.read().await.get(&session.id).unwrap().status,
+            AgentStatus::Cancelled
+        ));
+        assert_eq!(lifetime.outer_closure(), RootOuterClosure::Pending);
+        assert!(lifetime
+            .reserve_reset_admission(&session, lifetime.admission_epoch(), Uuid::new_v4())
+            .is_err());
+        let fault_main = if final_save_fault {
+            assert!(
+                main_path.is_dir(),
+                "actual final-save IO obstruction was exercised"
+            );
+            std::fs::remove_dir(&main_path).unwrap();
+            std::fs::rename(
+                main_path.with_extension("before-root-tail-fault"),
+                &main_path,
+            )
+            .unwrap();
+            Some(std::fs::read(&main_path).unwrap())
+        } else {
+            None
+        };
+        pause.release.notify_one();
+        if final_save_fault {
+            assert!(matches!(
+                settled(&lifetime).await,
+                RootOuterClosure::Unconfirmed(_)
+            ));
+            tokio::time::timeout(Duration::from_secs(5), drain)
+                .await
+                .unwrap()
+                .unwrap();
+            let reopened = bamboo_storage::SessionStoreV2::new(home.path().into())
+                .await
+                .unwrap();
+            let durable = reopened.load_session(&session.id).await.unwrap().unwrap();
+            assert_eq!(durable.last_run_status().as_deref(), Some("cancelled"));
+            assert_eq!(
+                durable.agent_runtime_state.as_ref().unwrap().status,
+                bamboo_domain::AgentStatusState::Cancelled
+            );
+            assert_eq!(
+                cache
+                    .get(&session.id)
+                    .unwrap()
+                    .read()
+                    .agent_runtime_state
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                bamboo_domain::AgentStatusState::Cancelled
+            );
+            let cache_for_repair = cache.clone();
+            reopened
+                .reconcile_session_runtime(
+                    &durable,
+                    chrono::Utc::now() - chrono::Duration::hours(1),
+                    None,
+                    Arc::new(move |saved| {
+                        cache_for_repair.insert(
+                            saved.id.clone(),
+                            Arc::new(crate::SessionSnapshot::new(saved.clone())),
+                        );
+                    }),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(std::fs::read(&main_path).unwrap(), fault_main.unwrap());
+            assert!(
+                lifetime.close_and_join().await.is_err(),
+                "logical repair cannot clear Root physical/resource unknown"
+            );
+            assert!(matches!(
+                lifetime.outer_closure(),
+                RootOuterClosure::Unconfirmed(_)
+            ));
+            store.flush_search_index().await;
+            continue;
         }
-    });
-    spawn_session_execution(SessionExecutionArgs {
-        agent,
-        session_id: session.id.clone(),
-        session: session.clone(),
-        execution_reservation: reservation,
-        tools_override: None,
-        provider_override: None,
-        model_roster: crate::runtime::model_roster::ModelRoster {
-            model: Some("model".into()),
-            ..Default::default()
-        },
-        reasoning_effort: None,
-        reasoning_effort_source: "fixture".into(),
-        auxiliary_model_resolver: None,
-        disabled_filter_resolver: None,
-        disabled_tools: None,
-        disabled_skill_ids: None,
-        selected_skill_ids: None,
-        selected_skill_mode: None,
-        mpsc_tx: tx,
-        history_commit_barrier: barrier,
-        image_fallback: None,
-        gold_config: None,
-        guardian_config: None,
-        guardian_spawner: None,
-        bash_resume_hook: None,
-        bash_completion_sink: None,
-        app_data_dir: Some(home.path().into()),
-        run_budget: None,
-        runners: runners.clone(),
-        sessions_cache: cache,
-        on_complete: None,
-        child_completion_handler: None,
-    });
-    tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
-        .await
-        .unwrap();
-    assert!(matches!(
-        runners.read().await.get(&session.id).unwrap().status,
-        AgentStatus::Cancelled
-    ));
-    assert_eq!(lifetime.outer_closure(), RootOuterClosure::Pending);
-    assert!(lifetime
-        .reserve_reset_admission(&session, lifetime.admission_epoch(), Uuid::new_v4())
-        .is_err());
-    pause.release.notify_one();
-    assert_eq!(
-        settled(&lifetime).await,
-        RootOuterClosure::JoinedResourcesUnavailable {
-            actor_finished: true
-        }
-    );
-    tokio::time::timeout(Duration::from_secs(5), drain)
-        .await
-        .unwrap()
-        .unwrap();
-    let reset = runners
-        .read()
-        .await
-        .get(&session.id)
-        .unwrap()
-        .reserve_root_reset_admission(&session, lifetime.admission_epoch(), Uuid::new_v4())
-        .unwrap();
-    reset.check_current().unwrap();
-    assert_eq!(
-        reset.require_physical_closure().unwrap_err().kind(),
-        io::ErrorKind::Unsupported
-    );
-    drop(reset);
-    lifetime.close_and_join().await.unwrap();
-    store.flush_search_index().await;
+        assert_eq!(
+            settled(&lifetime).await,
+            RootOuterClosure::JoinedResourcesUnavailable {
+                actor_finished: true
+            }
+        );
+        tokio::time::timeout(Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        let reset = runners
+            .read()
+            .await
+            .get(&session.id)
+            .unwrap()
+            .reserve_root_reset_admission(&session, lifetime.admission_epoch(), Uuid::new_v4())
+            .unwrap();
+        reset.check_current().unwrap();
+        assert_eq!(
+            reset.require_physical_closure().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        drop(reset);
+        lifetime.close_and_join().await.unwrap();
+        store.flush_search_index().await;
+    }
 }

@@ -1116,7 +1116,79 @@ impl SupervisedRootOutcomes {
         let Some(result) = fact.result.clone() else {
             return Ok(None);
         };
-        self.project_inputs_from_main(main, fact.sequence)?;
+        // The ordinary Root owned-input port authenticates the original
+        // transport intent while creating these protected Main-only facts. It
+        // deliberately does not add the Child append port's checkpoint marker.
+        // Validate that real producer here; do not forge a Child checkpoint or
+        // relax the separate Observer/Child projection API.
+        if main.id != self.root_session_id
+            || main.created_at != self.root_created_at
+            || main.kind != SessionKind::Root
+            || !main.authority_identity.is_ordinary()
+            || main.parent_session_id.is_some()
+            || main.parent_created_at.is_some()
+            || main.spawn_depth != 0
+            || (!main.root_session_id.is_empty() && main.root_session_id != main.id)
+            || main
+                .runtime_metadata
+                .as_ref()
+                .and_then(|m| m.supervised_root_outcomes.as_ref())
+                != Some(self)
+            || main
+                .conversation_reset_sha256()
+                .map_err(|_| "Root Main generation is invalid")?
+                != fact.conversation_reset_sha256
+        {
+            return Err("Root finalized Main lifetime differs");
+        }
+        for input in &fact.inputs {
+            let mut messages = main
+                .messages
+                .iter()
+                .filter(|m| m.id == input.receipt_id.as_str());
+            let message = messages.next().ok_or("Root Main input is missing")?;
+            if messages.next().is_some() {
+                return Err("Root Main input is repeated");
+            }
+            let marker = message
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("session_message"))
+                .ok_or("Root Main typed input is missing")?;
+            let envelope: SessionMessageEnvelope = serde_json::from_value(marker.clone())
+                .map_err(|_| "Root Main typed input is invalid")?;
+            let checkpoint = message
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get(OWNED_INPUT_CHECKPOINT_KEY));
+            let matched = if checkpoint.is_some() {
+                matches_projected_input(message, &envelope, input, fact, main)?
+            } else {
+                matches!(
+                    envelope.kind,
+                    SessionMessageKind::UserInput | SessionMessageKind::PeerMessage
+                ) && matches!(&envelope.body, SessionMessageBody::Content(content) if content.parts.is_empty() && !content.text.trim().is_empty())
+                    && crate::is_matching_session_message(message, &envelope)
+            };
+            if envelope.id != input.receipt_id
+                || envelope.target_session_id != self.root_session_id
+                || !matched
+            {
+                return Err("Root Main input differs from its protected fact");
+            }
+            if let Some(origin) = &input.supervisor_origin {
+                let (supervisor, operation) = origin.reference_and_operation();
+                if envelope.source
+                    != (crate::SessionMessageSource::Session {
+                        session_id: supervisor.session_id.clone(),
+                    })
+                    || envelope.kind != SessionMessageKind::PeerMessage
+                    || envelope.correlation_id.as_deref() != Some(operation.as_str())
+                {
+                    return Err("Root Main Supervisor origin differs");
+                }
+            }
+        }
         Ok(Some(result))
     }
 
