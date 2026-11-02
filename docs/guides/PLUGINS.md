@@ -36,9 +36,9 @@ layers**, secure by default:
 1. **Host allowlist** — the URL's host+path must match an entry in
    `plugin_trust.trusted_hosts` (config.json; defaults to
    `github.com/bigduu/`) unless you pass `--allow-untrusted-host`.
-2. **Signature** — the bundle's `<url>.sig` must verify against a key in
-   `plugin_trust.trusted_keys` (defaults trust Jiandu's, Nova's and Magpie's official
-   signing keys) unless you pass `--allow-unsigned`.
+2. **Signature** — the bundle's `<url>.sig` must verify against an effective
+   publisher key (the selected defaults/custom keys minus revocations) unless
+   you pass `--allow-unsigned`.
 3. **Checksum** — `--sha256 <hex>` pins the downloaded bundle. Without it, a
    `url` install is refused unless you pass `--allow-unverified` — **or** the
    bundle already passed layer 2 (a verified signature is a stronger
@@ -78,6 +78,61 @@ bamboo config set plugin_trust.enforcement off
 This makes every `url` install/update behave as if `--insecure` were passed,
 with no per-install flag needed. It's an explicit opt-in (`enforcement`
 defaults to `"strict"`) and the server logs a startup warning while it's set.
+
+## Publisher defaults, custom lists and revocations
+
+The `tools-skills` section owns `plugin_trust`. Fresh configurations, or old
+policies without a `trusted_keys` field, use `publisher_mode: "follow_defaults"`.
+This follows the reviewed official publisher catalog shipped with Bamboo,
+including catalog updates in later application versions. `trusted_keys` stores
+additional custom keys, rather than a saved copy of that catalog.
+
+Every legacy policy with a serialized `trusted_keys` field stays
+`publisher_mode: "explicit"`, including an empty list and a list that happens to
+equal an earlier default. Its intent cannot be inferred from its values. No
+upgrade silently adds Jiandu to an existing explicit list.
+
+Switching to explicit mode snapshots the current effective keys. Switching back
+to defaults preserves custom keys and removes copies of current official keys
+from the additional list. Both transitions retain `revoked_publishers`:
+stable publisher IDs mapped to captured denied `algorithm:public_key`
+identities. A revoked ID blocks future catalog keys for that publisher; captured
+identities keep retired keys blocked, including duplicates with another label.
+Unknown future deny records are retained and can only deny authority.
+
+CLI list-only edits select explicit mode (`plugin_trust.trusted_keys []` denies
+all publisher keys). Compatibility PATCH and typed section PUT preserve omitted
+revocation records; an omitted policy and tools/skills reset preserve all current
+publisher decisions. Null lists/modes and unknown modes are rejected. Invalid
+section reloads retain the existing last-known-good policy.
+
+`GET /api/v1/plugins/publishers` observes one healthy policy revision, its mode,
+enforcement, custom-key count and shipped publishers with effective trusted and
+revoked status. `POST` to the same route accepts exactly:
+
+```json
+{
+  "expected_revision": 7,
+  "expected_publishers": { "publisher-id": "ed25519:reviewed-public-key" },
+  "change": { "type": "revoke", "publisher_id": "jiandu" }
+}
+```
+
+Construct `expected_publishers` from **every** publisher in the reviewed GET;
+the complete ID/key map must match the shipped catalog. Other changes are
+`{"type":"trust","publisher_id":"jiandu"}` and
+`{"type":"set_mode","publisher_mode":"follow_defaults"}` (or `"explicit"`).
+Stale revisions return 409, and changed catalog identities or unknown publishers
+return 400. The existing tools-skills CAS writer owns persistence and runtime
+publication; no separate policy writer or migration journal is introduced.
+Trust explicitly clears that publisher's revocation and adopts its current
+reviewed key. The fixed Jiandu adoption route below performs the same restoration.
+
+Neither policy changes nor trust adoption install a connector, change source
+hosts/enforcement or stop existing MCP processes. Revocation applies to future
+signature verification and installation. The pre-existing explicit generic
+signature bypasses still apply; official setup/install paths remain strict.
+Clients reconcile even an uncertain POST with a fresh GET instead of retrying.
 
 ## Optional Jiandu connector
 

@@ -108,6 +108,29 @@ pub fn apply_dot_path_set(
 
     let mut patched = before;
     apply_path(&mut patched, &segments, key, value.clone())?;
+    let mut expected_value = value.clone();
+    if segments[0] == "plugin_trust" {
+        if segments.len() == 1 || segments.get(1) == Some(&"publisher_mode") {
+            let mut policy = if segments.len() == 1 {
+                value.clone()
+            } else {
+                serde_json::json!({"publisher_mode": value})
+            };
+            current
+                .plugin_trust
+                .prepare_update(&mut policy)
+                .map_err(|error| DotPathError::InvalidValue {
+                    key: key.into(),
+                    message: error.to_string(),
+                })?;
+            patched["plugin_trust"] = policy.clone();
+            if segments.len() == 1 {
+                expected_value = policy;
+            }
+        } else if segments.get(1) == Some(&"trusted_keys") {
+            patched["plugin_trust"]["publisher_mode"] = serde_json::json!("explicit");
+        }
+    }
 
     let mut config: Config =
         serde_json::from_value(patched).map_err(|e| DotPathError::InvalidValue {
@@ -139,7 +162,7 @@ pub fn apply_dot_path_set(
                 message: format!("failed to serialize updated config: {e}"),
             })?;
         match resolve_path(&after, &segments) {
-            Some(round_tripped) if values_equivalent(round_tripped, &value) => {}
+            Some(round_tripped) if values_equivalent(round_tripped, &expected_value) => {}
             Some(round_tripped) => {
                 return Err(DotPathError::InvalidValue {
                     key: key.to_string(),

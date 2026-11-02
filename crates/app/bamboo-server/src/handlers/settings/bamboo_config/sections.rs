@@ -711,7 +711,17 @@ fn cluster_reset_response(
 
 fn default_section_value(id: SectionId) -> Result<Value, AppError> {
     let value = match id {
-        SectionId::ToolsSkills => serde_json::to_value(ToolsSkillsSection::default()),
+        // Reset tools/skills without resetting separately reviewed publisher
+        // decisions. The ordinary writer preserves an omitted policy under CAS.
+        SectionId::ToolsSkills => {
+            serde_json::to_value(ToolsSkillsSection::default()).map(|mut value| {
+                value
+                    .as_object_mut()
+                    .expect("tools-skills object")
+                    .remove("plugin_trust");
+                value
+            })
+        }
         SectionId::Memory => serde_json::to_value(MemorySection::default()),
         SectionId::Subagents => serde_json::to_value(SubagentsSection::default()),
         SectionId::Hooks => serde_json::to_value(HooksSection::default()),
