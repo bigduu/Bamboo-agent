@@ -526,6 +526,20 @@ pub trait ActorDirectoryPort: Send + Sync {
         }
         result
     }
+    /// Root final-save can fail after its immutable Main result was written.
+    /// An owning backend may confirm that exact Main commit under the same
+    /// Actor guards and prefer it over the caller's persistence diagnostic.
+    /// This never proves Worker stop or turns an old attempt live again.
+    async fn finish_root_activation_observed(
+        &self,
+        _owner: &crate::RootActorRuntimeWrite,
+        _now: DateTime<Utc>,
+        _outcome: ActorActivationFinish,
+        _publish: Option<crate::storage::RootActorRuntimePublisher>,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        Err(ActorDirectoryError::InvalidTransition)
+    }
+
     async fn retire_actor(
         &self,
         actor_id: &str,

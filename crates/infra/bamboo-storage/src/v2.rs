@@ -7654,8 +7654,24 @@ impl Storage for SessionStoreV2 {
         before: DateTime<Utc>,
         error: Option<&str>,
     ) -> io::Result<Option<Session>> {
-        self.reconcile_child_runtime_impl(expected, before, error)
+        self.reconcile_child_runtime_impl(expected, before, error, None)
             .await
+    }
+
+    async fn reconcile_session_runtime(
+        &self,
+        expected: &Session,
+        before: DateTime<Utc>,
+        error: Option<&str>,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<Option<Session>> {
+        if expected.kind == SessionKind::Root {
+            self.reconcile_root_runtime_impl(expected, before, &publish)
+                .await
+        } else {
+            self.reconcile_child_runtime_impl(expected, before, error, Some(&publish))
+                .await
+        }
     }
 
     async fn find_host_session_scope(

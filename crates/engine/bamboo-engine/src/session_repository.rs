@@ -153,7 +153,12 @@ impl SessionRepository {
             .1
             .clone();
         let abandon_directory = directory.clone();
-        let abandon_fence = owner.fence.clone();
+        let abandon_owner = owner.clone();
+        let terminal_cache = self.cache.clone();
+        let terminal_publisher: bamboo_domain::storage::RootActorRuntimePublisher = Arc::new(move |saved| {
+            terminal_cache.insert(saved.id.clone(), Arc::new(crate::SessionSnapshot::new(saved.clone())));
+        });
+        let abandon_publisher = terminal_publisher.clone();
         let binding = bamboo_domain::RootActorExecutionBinding::new(
             Arc::new(bound),
             directory.clone(),
@@ -163,16 +168,17 @@ impl SessionRepository {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
                         let _ = abandon_directory
-                            .finish_activation(
-                                &abandon_fence,
+                            .finish_root_activation_observed(
+                                &abandon_owner,
                                 chrono::Utc::now(),
                                 bamboo_domain::ActorActivationFinish::Cancelled,
+                                Some(abandon_publisher),
                             )
                             .await;
                     });
                 }
             },
-        );
+        ).with_terminal_publisher(terminal_publisher);
         directory
             .start_activation(&binding.owner.fence, chrono::Utc::now())
             .await

@@ -1033,6 +1033,22 @@ pub trait Storage: Send + Sync {
         Ok(None)
     }
 
+    /// Targeted logical terminal repair. The backend compares the complete
+    /// expected control snapshot and publishes only after a durable repair,
+    /// while the same physical Session/Actor/tree guards are retained. The
+    /// callback must be a synchronous cache publication, never execution or IO.
+    /// Unsupported backends remain unknown. This grants no Worker stop proof.
+    async fn reconcile_session_runtime(
+        &self,
+        expected: &Session,
+        before: chrono::DateTime<chrono::Utc>,
+        error: Option<&str>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, before, error, publish);
+        Ok(None)
+    }
+
     /// Append one analysis record — a single JSON line — to the session's
     /// dedicated, append-only token-usage log, stored alongside the session's
     /// other files in its per-session directory.

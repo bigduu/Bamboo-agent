@@ -1093,6 +1093,33 @@ impl SupervisedRootOutcomes {
         Ok(true)
     }
 
+    /// Select an existing Main-owned result for this exact fence and reset
+    /// generation. This pure read does not prove Main's durable commit or grant
+    /// execution authority; Storage must validate its current Actor and sync
+    /// Main under the physical guards before relying on it.
+    pub fn finalized_for_fence(
+        &self,
+        main: &Session,
+        fence: &ActorActivationFence,
+    ) -> Result<Option<SupervisedRootOutcomeResult>, &'static str> {
+        self.validate()?;
+        if !self.matches_fence_shape(fence) {
+            return Err("Root outcome target differs");
+        }
+        let Some(fact) = self
+            .facts
+            .iter()
+            .find(|fact| fact_matches_fence(fact, fence))
+        else {
+            return Ok(None);
+        };
+        let Some(result) = fact.result.clone() else {
+            return Ok(None);
+        };
+        self.project_inputs_from_main(main, fact.sequence)?;
+        Ok(Some(result))
+    }
+
     /// The durable final writer must derive this value after its last state
     /// reconciliation. This function does not itself prove the final commit.
     pub fn finalize(
