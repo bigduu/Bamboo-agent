@@ -1426,120 +1426,13 @@ pub struct TrustedKey {
 pub const JIANDU_PLUGIN_PUBLIC_KEY: &str =
     "bba9d0e5553401125f939bc3d844e891706d579a611fea9215545771d5306676";
 
-/// The official plugin-signing keys trusted by default, so an out-of-the-box
-/// `bamboo plugin install <official release url>` needs no `--allow-unsigned`
-/// for a bundle those repos' release CI signed. One entry per first-party
-/// plugin publisher; each repo commits its public half as
-/// `packaging/plugin/signing-key.pub` (nova) / `plugin/signing-key.pub`
-/// (magpie and jiandu) for cross-checking.
-fn default_trusted_keys() -> Vec<TrustedKey> {
-    vec![
-        TrustedKey {
-            label: "jiandu (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: JIANDU_PLUGIN_PUBLIC_KEY.to_string(),
-        },
-        TrustedKey {
-            label: "nova (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59"
-                .to_string(),
-        },
-        TrustedKey {
-            label: "magpie (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: "47e971c39cd93adb18cff50e097cb387df49e9c4d33b0ed62f693eabbe7fc66e"
-                .to_string(),
-        },
-    ]
-}
-
 /// Default trusted host+path prefix: the `bigduu` GitHub org/user's own repos
 /// (e.g. `github.com/bigduu/Nova/releases/...`).
-fn default_trusted_hosts() -> Vec<String> {
+pub(crate) fn default_trusted_hosts() -> Vec<String> {
     vec!["github.com/bigduu/".to_string()]
 }
 
-/// Plugin URL-install source-trust policy: a host allowlist (is the SOURCE
-/// authorized?) plus ed25519 publisher keys (is the PUBLISHER authentic?).
-/// This stacks on top of the checksum layer already enforced in
-/// `bamboo_plugin::registry::PluginSource::Url` (are the BYTES what the
-/// caller expected?) — see `bamboo-server`'s `plugin_source.rs` for where all
-/// three layers are enforced together. A pasted checksum alone cannot
-/// establish source trust (an attacker who controls the page a checksum was
-/// copied from can just publish a checksum for their own tampered bundle);
-/// the host allowlist and signature checks close that gap.
-///
-/// Both fields are user-editable (`config.json`, or the config-set HTTP/CLI
-/// path) so an operator can add their own trusted hosts/keys. Additive/
-/// back-compat: an absent `plugin_trust` key deserializes to
-/// [`PluginTrustConfig::default`] (the built-in defaults below), not an empty
-/// policy — so a fresh install can trust the official nova plugin out of the
-/// box.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PluginTrustConfig {
-    /// Host+path prefixes a `url` plugin source may be fetched from without
-    /// `--allow-untrusted-host`, e.g. `"github.com/bigduu/"` (a bare host
-    /// with no `/`, e.g. `"example.com"`, matches any path on that exact
-    /// host). Each entry is split into a host component and a path-prefix
-    /// component and matched on PARSED URL components — whole-host equality
-    /// plus a `/`-boundary path-prefix check, never a raw string
-    /// `starts_with` — see [`is_host_trusted`] for the precise rule and why
-    /// (it closes a domain-gluing bypass like `example.com` matching
-    /// `example.com.evil.com`, and a sibling-path bypass like
-    /// `github.com/bigduu` matching `github.com/bigduu-evil/x`).
-    #[serde(default = "default_trusted_hosts")]
-    pub trusted_hosts: Vec<String>,
-    /// Publisher keys a bundle's `.sig` signature may verify against without
-    /// `--allow-unsigned`.
-    #[serde(default = "default_trusted_keys")]
-    pub trusted_keys: Vec<TrustedKey>,
-    /// Persistent, config-level escape hatch for the whole three-layer
-    /// policy above: `Off` makes every `url` plugin install/update behave as
-    /// if `--insecure` (equivalently, `--allow-untrusted-host
-    /// --allow-unsigned --allow-unverified`) were passed, WITHOUT needing the
-    /// per-install flag every time — the "I run a private/dev bamboo and
-    /// don't want to pass flags on every install" customization. Defaults to
-    /// [`PluginTrustEnforcement::Strict`] — a fresh config, or one with no
-    /// `plugin_trust.enforcement` key at all, is secure by default; relaxing
-    /// it is always an explicit, user-initiated edit
-    /// (`bamboo config set plugin_trust.enforcement off`), never a silent
-    /// weakening. See `bamboo-server`'s `plugin_source.rs` for where this is
-    /// enforced, and `AppState::new` for the loud startup warning emitted
-    /// whenever a server boots with this set to `Off`.
-    #[serde(default)]
-    pub enforcement: PluginTrustEnforcement,
-}
-
-impl Default for PluginTrustConfig {
-    fn default() -> Self {
-        Self {
-            trusted_hosts: default_trusted_hosts(),
-            trusted_keys: default_trusted_keys(),
-            enforcement: PluginTrustEnforcement::default(),
-        }
-    }
-}
-
-impl PluginTrustConfig {
-    /// True when `url` is `https` and its host+path match one of
-    /// `trusted_hosts` on parsed URL components (host compared
-    /// case-insensitively as a WHOLE string, path matched on a `/` boundary
-    /// — see the free function [`is_host_trusted`] for the precise rule; an
-    /// unparseable URL or a non-`https` scheme is never trusted).
-    pub fn is_host_trusted(&self, url: &str) -> bool {
-        is_host_trusted(url, &self.trusted_hosts)
-    }
-
-    /// True when `enforcement` is [`PluginTrustEnforcement::Off`] — every
-    /// `url` plugin install/update should skip the host allowlist, signature,
-    /// and checksum-requirement layers, exactly as if `--insecure` were
-    /// passed to that individual install. See the field's doc comment for
-    /// the full rationale.
-    pub fn enforcement_is_off(&self) -> bool {
-        matches!(self.enforcement, PluginTrustEnforcement::Off)
-    }
-}
+pub use crate::plugin_trust::{PluginTrustConfig, PublisherMode};
 
 /// `plugin_trust.enforcement`: the persistent, config-level form of the
 /// `--insecure` escape hatch (see [`PluginTrustConfig::enforcement`]).

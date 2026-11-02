@@ -28,6 +28,7 @@ pub mod model_capabilities;
 pub mod model_mapping;
 pub mod patch;
 pub mod paths;
+pub mod plugin_trust;
 pub mod provider_configs;
 pub mod provider_instance;
 pub mod runtime_models;
@@ -48,6 +49,7 @@ pub use memory_config::MemoryConfigModule;
 pub use model_capabilities::*;
 pub use model_mapping::*;
 pub use paths::*;
+pub use plugin_trust::{official_plugin_publishers, publisher_key_id};
 pub use provider_configs::ProviderConfigsModule;
 pub use provider_instance::{
     materialize_legacy_provider_instances, provider_api_key_environment_override_active,

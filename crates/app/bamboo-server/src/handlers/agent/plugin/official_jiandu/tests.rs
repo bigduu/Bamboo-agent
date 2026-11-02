@@ -158,6 +158,7 @@ async fn passive_http_metadata_and_official_action_reject_caller_sources() {
     // Removing publisher trust blocks the official action even in generic manual Off mode.
     {
         let mut config = state.config.write().await;
+        config.plugin_trust.publisher_mode = bamboo_config::PublisherMode::Explicit;
         config.plugin_trust.trusted_keys.clear();
         config.plugin_trust.enforcement = PluginTrustEnforcement::Off;
     }
@@ -243,7 +244,12 @@ async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_com
             .is_none());
     }
     save(&state, original).await;
-    state.config.write().await.plugin_trust.trusted_keys.clear();
+    state
+        .config
+        .write()
+        .await
+        .plugin_trust
+        .revoke_official_publisher("jiandu");
     assert!(setup(&state, mac(), Some(release.clone()))
         .await
         .unwrap()

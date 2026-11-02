@@ -100,13 +100,21 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
 // The C1 pending predicates add two ordinary domain packages-2 cases and three
 // server-handlers Actix cases; none is an additive feature-only case.
+// Terminal projection/replay tests and hooks are cfg(test), owned by the
+// default storage packages-0 library. V2's existing test-utils cfg is unchanged;
+// the four additive contexts still own the same 20 feature-only cases.
+// Publisher mode/revocation serde and CLI/CAS cases are unconditional config
+// library tests in packages-4. Policy HTTP/setup cases remain server-handlers;
+// signature and compatibility-merge cases remain server-other. Moving the
+// ungated policy definitions out of config.rs changes this source fingerprint,
+// but no feature cfg expression, default target or 20 additive cases changes.
 // #2453 adds an unconditional token-budget owner module to TicketApplication,
 // whose existing ticket-runtime-fixtures cfg fingerprints its complete source.
 // Five canonical configuration cases join default bamboo-tickets/packages-0;
 // four native HTTP cases join native_work_token_budget/server-tests-0; the
 // Worker-auth case belongs to server-handlers. No feature cfg, package graph,
 // additive context or its 20 explicit cases changed.
-const FEATURE_SOURCE_SHA256 = "11f1eff75f7cd5694a1a8c891a5ba2ce9d6699fb4801cba2fe1c190849d1ff62";
+const FEATURE_SOURCE_SHA256 = "d75bcf77f7e35f514df756bbebc00bf2d8d88a177e79d47212227ea846f0aa91";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
