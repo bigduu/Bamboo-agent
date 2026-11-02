@@ -124,7 +124,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // additive context or its 20 explicit cases changed.
 // Both owner entrances now share the actual HTTP acceptance path. Their
 // original default owners remain distinct, with no additive case repetition.
-const FEATURE_SOURCE_SHA256 = "558974d3f22a075245a030292d0b9754f5482085837552d825dbf07837866fa0";
+const FEATURE_SOURCE_SHA256 = "67486de875057844af91ae43311398b1116ae2f374a7eb69097714fe7c3af270";
+// Child Host admission and startup failure tests retain the existing default
+// Storage/Engine/Server owners and unchanged additive contexts.
+
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

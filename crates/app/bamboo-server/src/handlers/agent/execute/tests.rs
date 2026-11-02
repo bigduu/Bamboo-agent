@@ -3161,6 +3161,176 @@ mod execution_input_http {
             .unwrap();
     }
 
+    #[actix_web::test]
+    async fn child_ready_real_startup_io_failure_closes_exact_bound_run_before_provider_and_reopens(
+    ) {
+        use bamboo_domain::{AgentRuntimeState, AgentStatusState, Storage};
+        let provider = Arc::new(OwnedRootProvider {
+            messages: std::sync::Mutex::new(vec![]),
+        });
+        let (home, state, _) = state_with_provider(None, provider.clone()).await;
+        let mut parent = bamboo_agent_core::Session::new("ready-fault-parent", "test-model");
+        state.save_and_cache_session(&mut parent).await;
+        let mut child = bamboo_agent_core::Session::new_child_of(
+            "ready-fault-child",
+            &parent,
+            "test-model",
+            "startup fault",
+        );
+        child.add_message(bamboo_agent_core::Message::user("retain this input"));
+        crate::handlers::agent::events::mark_pending_turn(&mut child);
+        state.save_and_cache_session(&mut child).await;
+        let path = home
+            .path()
+            .join("sessions/ready-fault-parent/children/ready-fault-child/runtime.json");
+        super::ready_startup_fault::install(&child.id, path);
+        let app = test::init_service(actix_web::App::new().app_data(state.clone()).route(
+            "/events/{session_id}",
+            web::get().to(crate::handlers::agent::events::handler),
+        ))
+        .await;
+        let stream = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/events/ready-fault-child")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(stream.status(), StatusCode::OK);
+        let (status, response) = execute(&state, &child.id, None).await;
+        assert!(
+            status.is_server_error() || status == StatusCode::CONFLICT,
+            "{response}"
+        );
+        assert!(
+            provider.messages.lock().unwrap().is_empty(),
+            "startup fault must precede provider execution"
+        );
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            actix_web::body::to_bytes(stream.into_body()),
+        )
+        .await
+        .expect("actual subscribed SSE must terminate")
+        .unwrap();
+        let frames = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(
+            frames
+                .matches("Child startup failed before execution")
+                .count(),
+            1,
+            "{frames}"
+        );
+        assert_eq!(frames.matches("[DONE]").count(), 1, "{frames}");
+        let current = state
+            .storage
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            current.host_run_id().is_some(),
+            "the test must fail after durable Host binding"
+        );
+        assert_eq!(current.last_run_status().as_deref(), Some("error"));
+        assert_eq!(
+            current.agent_runtime_state.as_ref().unwrap().status,
+            AgentStatusState::Failed
+        );
+        let mirror: AgentRuntimeState =
+            serde_json::from_str(&current.metadata["agent.runtime.state"]).unwrap();
+        assert_eq!(mirror.status, AgentStatusState::Failed);
+        assert_eq!(
+            current.messages.last().unwrap().content,
+            "retain this input"
+        );
+        assert_eq!(
+            state
+                .sessions
+                .get(&child.id)
+                .unwrap()
+                .read()
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .status,
+            AgentStatusState::Failed
+        );
+        state.shutdown().await;
+        let reopened = bamboo_storage::SessionStoreV2::new(home.path().into())
+            .await
+            .unwrap();
+        let after = reopened.load_session(&child.id).await.unwrap().unwrap();
+        assert_eq!(after.host_run_id(), current.host_run_id());
+        assert_eq!(after.last_run_status().as_deref(), Some("error"));
+        assert_eq!(
+            after.agent_runtime_state.as_ref().unwrap().status,
+            AgentStatusState::Failed
+        );
+        assert_eq!(after.messages.last().unwrap().content, "retain this input");
+    }
+
+    #[actix_web::test]
+    async fn child_ready_dropped_bound_reservation_closes_before_provider() {
+        use bamboo_domain::{AgentStatusState, Storage};
+        use bamboo_engine::execution::{reserve_session_execution, SessionExecutionReserveOutcome};
+        let provider = Arc::new(OwnedRootProvider::default());
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        let mut parent = bamboo_agent_core::Session::new("ready-drop-parent", "test-model");
+        state.save_and_cache_session(&mut parent).await;
+        let mut child = bamboo_agent_core::Session::new_child_of(
+            "ready-drop-child",
+            &parent,
+            "test-model",
+            "drop before spawn",
+        );
+        child.add_message(bamboo_agent_core::Message::user("retain pending input"));
+        crate::handlers::agent::events::mark_pending_turn(&mut child);
+        state.save_and_cache_session(&mut child).await;
+        let sender = state.get_session_event_sender(&child.id).await;
+        let SessionExecutionReserveOutcome::Reserved(mut reservation) = reserve_session_execution(
+            &state.agent,
+            &state.agent_runners,
+            &state.session_event_senders,
+            &child.id,
+            &sender,
+        )
+        .await
+        else {
+            panic!("real checked reservation");
+        };
+        reservation
+            .arm_child_host_startup(&state.agent, &child, state.sessions.clone(), sender.clone())
+            .await
+            .unwrap();
+        let run = reservation.run_id().to_string();
+        state.storage.begin_host_run(&child, &run).await.unwrap();
+        drop(reservation);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(Some(current)) = state.storage.load_session(&child.id).await {
+                    if current.last_run_status().as_deref() == Some("error") {
+                        assert_eq!(current.host_run_id(), Some(run.as_str()));
+                        assert_eq!(
+                            current.agent_runtime_state.as_ref().unwrap().status,
+                            AgentStatusState::Failed
+                        );
+                        assert_eq!(
+                            current.messages.last().unwrap().content,
+                            "retain pending input"
+                        );
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(provider.messages.lock().unwrap().is_empty());
+        state.shutdown().await;
+    }
+
     #[derive(Default)]
     struct OwnedRootProvider {
         messages: std::sync::Mutex<Vec<Vec<bamboo_agent_core::Message>>>,
@@ -5775,5 +5945,43 @@ mod execution_input_http {
             StatusCode::BAD_REQUEST,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+pub(super) mod ready_startup_fault {
+    use std::{
+        collections::HashMap,
+        path::PathBuf,
+        sync::{Mutex, OnceLock},
+    };
+    static FAULTS: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
+    pub(crate) fn install(id: &str, path: PathBuf) {
+        FAULTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(id.into(), path);
+    }
+    pub(crate) struct Fault {
+        path: PathBuf,
+        backup: PathBuf,
+    }
+    pub(crate) fn inject(id: &str) -> Option<Fault> {
+        let path = FAULTS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .remove(id)?;
+        let backup = path.with_extension("before-ready-fault");
+        std::fs::rename(&path, &backup).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        Some(Fault { path, backup })
+    }
+    impl Drop for Fault {
+        fn drop(&mut self) {
+            std::fs::remove_dir(&self.path).unwrap();
+            std::fs::rename(&self.backup, &self.path).unwrap();
+        }
     }
 }

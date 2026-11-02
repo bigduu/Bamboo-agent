@@ -1788,6 +1788,7 @@ pub struct SessionStoreV2 {
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "runtime.host_run_id",
     "runtime.host_launch_generation",
+    "runtime.host_prior_activation_fence",
     "runtime.reconciled_activation_fence",
     "agent.runtime.state",
     "assignment_prompt",
@@ -7646,6 +7647,17 @@ impl SessionStoreV2 {
 impl Storage for SessionStoreV2 {
     async fn begin_host_run(&self, expected: &Session, run_id: &str) -> io::Result<()> {
         self.begin_host_run_impl(expected, run_id).await
+    }
+
+    async fn fail_child_host_startup(
+        &self,
+        expected: &Session,
+        run_id: &str,
+        error: &str,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<Option<Session>> {
+        self.fail_child_host_startup_impl(expected, run_id, error, &publish)
+            .await
     }
 
     async fn reconcile_child_runtime(

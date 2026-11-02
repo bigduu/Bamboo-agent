@@ -20,6 +20,7 @@ struct LatchState {
     entered: bool,
     released: bool,
     reconfirmed: usize,
+    visits: usize,
 }
 
 #[derive(Debug)]
@@ -27,6 +28,7 @@ pub(super) struct ActorWriteHook {
     file: &'static str,
     phase: DurableWritePhase,
     fail: bool,
+    occurrence: usize,
     state: StdMutex<LatchState>,
     wake: Condvar,
 }
@@ -48,10 +50,21 @@ impl ActorWriteHook {
         phase: DurableWritePhase,
         fail: bool,
     ) -> Arc<Self> {
+        Self::install_nth(store, file, phase, fail, 1)
+    }
+
+    pub(super) fn install_nth(
+        store: &SessionStoreV2,
+        file: &'static str,
+        phase: DurableWritePhase,
+        fail: bool,
+        occurrence: usize,
+    ) -> Arc<Self> {
         let hook = Arc::new(Self {
             file,
             phase,
             fail,
+            occurrence,
             state: StdMutex::new(LatchState::default()),
             wake: Condvar::new(),
         });
@@ -66,6 +79,10 @@ impl ActorWriteHook {
         }
         let mut state = self.state.lock().unwrap();
         if state.entered {
+            return Ok(());
+        }
+        state.visits += 1;
+        if state.visits < self.occurrence {
             return Ok(());
         }
         state.entered = true;

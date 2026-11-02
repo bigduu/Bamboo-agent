@@ -3929,6 +3929,17 @@ fn adopt_fresher_disk_permission_posture(session: &mut Session, latest: &Session
 /// disk copy (e.g. [`LockedSessionStore::merge_save_runtime`]) don't pay for a
 /// second read.
 fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
+    if session.host_run_id().is_some() && session.host_run_id() == latest.host_run_id() {
+        let key = "runtime.host_prior_activation_fence";
+        match latest.metadata.get(key) {
+            Some(fence) => {
+                session.metadata.insert(key.into(), fence.clone());
+            }
+            None => {
+                session.metadata.remove(key);
+            }
+        }
+    }
     if session.kind == bamboo_domain::SessionKind::Child
         && latest.kind == bamboo_domain::SessionKind::Child
         && session.created_at == latest.created_at
@@ -3943,7 +3954,15 @@ fn apply_authoritative_metadata(session: &mut Session, latest: &Session) {
             .runtime_metadata
             .as_ref()
             .and_then(|metadata| metadata.child_launch_generation);
-        if latest_launch > incoming_launch {
+        // A terminal writer must retain the generation it actually executed.
+        // Promoting it to a newer pending launch would turn an old finish or
+        // enqueue/cancel failure into the newer launch's outcome. The
+        // physical writer below must reject the retained stale generation.
+        let closes_launch = matches!(
+            session.last_run_status().as_deref(),
+            Some("completed" | "cancelled" | "error" | "timeout" | "skipped")
+        );
+        if latest_launch > incoming_launch && !closes_launch {
             session
                 .runtime_metadata
                 .get_or_insert_with(Default::default)

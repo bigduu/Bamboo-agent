@@ -331,7 +331,7 @@ async fn enqueue_waiting_child(
         // The child was persisted as pending while the synchronous launch was
         // prepared, but it was never enqueued. Make it terminal before the
         // parent runner's end-of-turn safety net scans active child sessions.
-        let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+        let error = mark_failed_child_enqueue(sessions, parent, &child, error).await;
         return Err(tool_error_from_child_session(
             child_session::rollback_failed_wait_launch(
                 sessions,
@@ -368,7 +368,7 @@ async fn enqueue_waiting_child(
     if had_wait {
         return Err(tool_error_from_child_session(error));
     }
-    let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+    let error = mark_failed_child_enqueue(sessions, parent, &child, error).await;
     Err(tool_error_from_child_session(
         child_session::rollback_failed_wait_launch(sessions, &parent.id, child_session_id, error)
             .await,
@@ -401,13 +401,8 @@ async fn enqueue_background_child(
         Ok(bamboo_domain::AdmissionCommit::Committed(()))
         | Ok(bamboo_domain::AdmissionCommit::AlreadyCommitted) => Ok(()),
         Ok(bamboo_domain::AdmissionCommit::Cancelled) => {
-            let error = mark_failed_child_enqueue(
-                sessions,
-                parent,
-                child_session_id,
-                cancelled_launch_error(),
-            )
-            .await;
+            let error =
+                mark_failed_child_enqueue(sessions, parent, &child, cancelled_launch_error()).await;
             Err(tool_error_from_child_session(error))
         }
         Err(error) if launch_gate.is_some_and(|gate| gate.0.is_committed()) => {
@@ -415,7 +410,7 @@ async fn enqueue_background_child(
             Ok(())
         }
         Err(error) => {
-            let error = mark_failed_child_enqueue(sessions, parent, child_session_id, error).await;
+            let error = mark_failed_child_enqueue(sessions, parent, &child, error).await;
             Err(tool_error_from_child_session(error))
         }
     }
@@ -424,18 +419,22 @@ async fn enqueue_background_child(
 async fn mark_failed_child_enqueue(
     sessions: &dyn ChildSessionPort,
     parent: &bamboo_agent_core::Session,
-    child_session_id: &str,
+    expected: &bamboo_agent_core::Session,
     error: ChildSessionError,
 ) -> ChildSessionError {
     let status_update = async {
         let mut child = sessions
-            .load_child_for_parent(&parent.id, child_session_id)
+            .load_child_for_parent(&parent.id, &expected.id)
             .await?;
-        if child.last_run_status().as_deref().is_some_and(|status| {
-            matches!(status, "completed" | "cancelled" | "timeout" | "skipped")
-        }) {
+        if child.created_at != expected.created_at
+            || child.parent_created_at != expected.parent_created_at
+            || child.host_run_id() != expected.host_run_id()
+            || child.child_launch_generation() != expected.child_launch_generation()
+            || child.last_run_status().as_deref() != Some("pending")
+        {
             return Ok(());
         }
+        child.cancel_child_launch_generation();
         child.set_last_run_status("error");
         child.set_last_run_error(format!("Child launch failed: {error}"));
         child.synchronize_terminal_runtime_status();
