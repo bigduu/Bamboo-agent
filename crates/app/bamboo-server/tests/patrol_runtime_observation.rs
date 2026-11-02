@@ -32,6 +32,7 @@ use native_work::{execution_workspace, host, LocalProvider, CALL, RESULT, WAIT};
 
 const SEED: &str = "BAMBOO_PATROL_2469_SEED_ROOT";
 const CASE: &str = "native_question_wait_retains_incident_and_reopens_without_mutation";
+const OBJECTIVE: &str = "Ask one precise owner question and yield without delivering the Work";
 
 struct At(u64);
 impl Clock for At {
@@ -124,9 +125,11 @@ async fn seed(root: &Path) {
         )
         .unwrap();
     let (service, authority) = state.tickets.authority(user()).await.unwrap();
+    // The required native packet contains this Contract twice and has a
+    // 2048-byte line cap. Keep fixture input at its known-admitted size.
     let contract = Contract {
         title: "Exact native patrol Question".into(),
-        objective: format!("Ask one precise owner question before producing '{RESULT}'"),
+        objective: OBJECTIVE.into(),
         constraints: vec!["No model or observer may accept or restart this Work".into()],
         acceptance: vec!["Owner separately reviews an eventual submission".into()],
         user_acceptance_required: true,
@@ -203,7 +206,7 @@ async fn seed(root: &Path) {
     assert!(request
         .messages
         .iter()
-        .any(|message| message.content.contains(RESULT)));
+        .any(|message| message.content.contains(OBJECTIVE)));
     assert!(request
         .tools
         .iter()
@@ -494,7 +497,7 @@ async fn reopened(root: &Path, seed: SeedReceipt) {
             vec![Operation::Answer {
                 request_id: request_id.clone(),
                 prompt_revision: snapshot.requests[&request_id].prompt_revision,
-                answer: "Owner selected the explicit bounded acceptance.".into(),
+                answer: format!("The eventual result must be '{RESULT}' and receive owner review."),
             }],
         )
         .unwrap();
