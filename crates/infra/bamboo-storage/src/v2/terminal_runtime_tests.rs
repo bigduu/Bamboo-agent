@@ -176,11 +176,30 @@ async fn terminal_runtime_authority_commit_survives_projection_io_fault_and_reop
         drop(store);
         let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
         let expected = reopened.load_session(&child.id).await.unwrap().unwrap();
+        let retry_hook = ActorWriteHook::install(
+            &reopened,
+            "runtime.json",
+            DurableWritePhase::AfterReplace,
+            true,
+        );
+        retry_hook.release();
+        assert!(reopened
+            .reconcile_child_runtime(&expected, Utc::now(), Some("restart"))
+            .await
+            .is_err());
+        let expected = reopened.load_session(&child.id).await.unwrap().unwrap();
+        let readable = std::fs::read(runtime_path(home.path())).unwrap();
         let repaired = reopened
             .reconcile_child_runtime(&expected, Utc::now(), Some("restart"))
             .await
             .unwrap()
             .unwrap();
+        assert_eq!(
+            retry_hook.reconfirmed(),
+            1,
+            "byte-identical retry must actually sync the runtime file and directory"
+        );
+        assert_eq!(readable, std::fs::read(runtime_path(home.path())).unwrap());
         assert_eq!(
             repaired.last_run_status().as_deref(),
             Some("cancelled"),
@@ -1000,6 +1019,9 @@ async fn terminal_runtime_claimed_successor_refuses_old_saves_before_new_host_ma
             .save_root_actor_runtime(&owner, &startup, true, Arc::new(|_| {}))
             .await
             .unwrap();
+        if old_marker {
+            assert!(store.begin_host_run(&stale, "host-A").await.is_err());
+        }
         let path = home.path().join("sessions/startup-gap-root/runtime.json");
         let before = std::fs::read(&path).unwrap();
         for pending_source in [false, true] {

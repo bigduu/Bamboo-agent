@@ -596,35 +596,49 @@ impl SessionStoreV2 {
             if !changed {
                 // Reconfirm a prior uncertain rename without advancing the
                 // logical revision, attempt, finish time or tree projection.
-                let path = path.clone();
-                let retained = guards.clone();
-                tokio::task::spawn_blocking(move || {
-                    let _guards = retained;
-                    #[cfg(windows)]
-                    let file = std::fs::OpenOptions::new()
-                        .read(true)
-                        .write(true)
-                        .open(&path)?;
-                    #[cfg(not(windows))]
-                    let file = std::fs::File::open(&path)?;
-                    file.sync_all()?;
-                    #[cfg(unix)]
-                    std::fs::File::open(
-                        path.parent()
-                            .ok_or_else(|| io::Error::other("Actor authority parent missing"))?,
-                    )?
-                    .sync_all()?;
-                    Ok::<_, io::Error>(())
-                })
-                .await
-                .map_err(|error| storage(io::Error::other(error)))?
-                .map_err(storage)?;
+                self.confirm_actor_file_durable(&path, &guards).await?;
             }
             self.project_actor_terminal(&entry, &rel, &guards)
                 .await
                 .map_err(|error| ActorDirectoryError::RuntimeProjection(error.to_string()))?;
         }
         Ok(value)
+    }
+
+    async fn confirm_actor_file_durable(
+        &self,
+        path: &Path,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> Result<(), ActorDirectoryError> {
+        let path = path.to_path_buf();
+        let retained = guards.clone();
+        #[cfg(test)]
+        let hook = self.actor_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            let _guards = retained;
+            #[cfg(windows)]
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            #[cfg(not(windows))]
+            let file = std::fs::File::open(&path)?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            std::fs::File::open(
+                path.parent()
+                    .ok_or_else(|| io::Error::other("Actor parent missing"))?,
+            )?
+            .sync_all()?;
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook.record_reconfirmed(&path);
+            }
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(|error| storage(io::Error::other(error)))?
+        .map_err(storage)
     }
 
     async fn lock_actor_runtime(

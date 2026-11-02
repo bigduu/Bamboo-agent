@@ -123,6 +123,17 @@ impl SessionStoreV2 {
                 guards,
             )
             .await?;
+        } else {
+            // A previous AfterReplace error leaves readable bytes but an
+            // unconfirmed directory commit. Replay its actual sync boundary.
+            let directory = self.abs_path_from_rel(rel);
+            let runtime = directory.join(super::super::RUNTIME_SIDECAR_FILE);
+            let file = if Self::regular_actor_file(&runtime).await? {
+                runtime
+            } else {
+                directory.join("session.json")
+            };
+            self.confirm_actor_file_durable(&file, guards).await?;
         }
         // Replay an interrupted index publication without rewriting settled
         // records on every watchdog sweep.
@@ -261,15 +272,6 @@ impl SessionStoreV2 {
         if expected.child_launch_generation() != latest.child_launch_generation() {
             return Err(conflict("Host startup launch generation was superseded"));
         }
-        if latest.host_run_id() == Some(run_id) {
-            if !latest.host_run_matches_launch() {
-                return Err(conflict("Host run launch identity changed"));
-            }
-            return Ok(());
-        }
-        if latest.host_run_id() != expected.host_run_id() {
-            return Err(conflict("Host run was superseded before startup"));
-        }
         if self
             .observed_runtime_actor(&path, &latest)
             .await
@@ -278,6 +280,18 @@ impl SessionStoreV2 {
             .is_some_and(|activation| activation.status.is_live() && activation.run_id != run_id)
         {
             return Err(conflict("another Actor attempt owns Host startup"));
+        }
+        if latest.host_run_id() == Some(run_id) {
+            if !latest.host_run_matches_launch() {
+                return Err(conflict("Host run launch identity changed"));
+            }
+            self.commit_runtime_projection(&latest, &latest, &rel, &guards)
+                .await
+                .map_err(io::Error::other)?;
+            return Ok(());
+        }
+        if latest.host_run_id() != expected.host_run_id() {
+            return Err(conflict("Host run was superseded before startup"));
         }
         let mut after = latest.clone();
         after.set_host_run_id(run_id);
