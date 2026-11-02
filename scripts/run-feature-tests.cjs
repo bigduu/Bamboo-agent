@@ -108,17 +108,25 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // signature and compatibility-merge cases remain server-other. Moving the
 // ungated policy definitions out of config.rs changes this source fingerprint,
 // but no feature cfg expression, default target or 20 additive cases changes.
+// Terminal projection hooks/tests from accepted #2463 remain default
+// storage/packages-0 cases; existing V2 test-utils cfg is unchanged.
+// #2452 adds unconditional policy control in TicketApplication, fingerprinted
+// by its existing ticket-runtime-fixtures cfg. Six Ready owner cases belong
+// to server-tests-1 and Worker-auth to server-handlers. All four additive
+// contexts and 20 explicit cases remain unchanged.
+// Admitted #2469 runtime observation and #2460 terminal-save integration keep
+// their existing default owners; no additive context or case selection changes.
 // #2453 adds an unconditional token-budget owner module to TicketApplication,
 // whose existing ticket-runtime-fixtures cfg fingerprints its complete source.
 // Five canonical configuration cases join default bamboo-tickets/packages-0;
 // four native HTTP cases join native_work_token_budget/server-tests-0; the
 // Worker-auth case belongs to server-handlers. No feature cfg, package graph,
 // additive context or its 20 explicit cases changed.
-// Admitted #2469 runtime observation and #2460 terminal-save integration keep
-// their existing default owners; no additive context or case selection changes.
-const FEATURE_SOURCE_SHA256 = "90238c11ca66083567fbb7105e81a25a2b7afa089250c1b9d1441b52a3ffc6b5";
-// Root terminal tests use the existing default Storage/Engine/Server owners;
-// the nested test module adds no feature context or duplicate producer.
+// Both owner entrances now share the actual HTTP acceptance path. Their
+// original default owners remain distinct, with no additive case repetition.
+const FEATURE_SOURCE_SHA256 = "73c4eb72ae2fd385df8cde8588a0df1d729d5a2845b162d5909806b3cd4bad7c";
+// Root terminal recovery keeps the existing default owners, four feature
+// contexts and20 additive cases; its nested tests add no producer.
 
 
 const FEATURE_CONTEXTS = [
