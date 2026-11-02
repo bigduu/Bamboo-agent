@@ -386,6 +386,9 @@ async fn fixture(case: Case, ultra: bool) {
         App::new()
             .app_data(provider_probe.clone())
             .route("/v1/chat/completions", web::post().to(provider))
+            .route("/v1/models",web::get().to(|| async {
+                HttpResponse::Ok().json(json!({"data":[{"id":"wait-supervisor"},{"id":"wait-work"},{"id":"wait-child"},{"id":"wait-aux"}]}))
+            }))
     })
     .workers(1)
     .bind(("127.0.0.1", 0))
@@ -413,7 +416,7 @@ async fn fixture(case: Case, ultra: bool) {
         .build()
         .unwrap();
     let base = format!("http://127.0.0.1:{port}/api/v1");
-    tokio::time::timeout(Duration::from_secs(30), async {
+    let healthy = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             assert!(host.0.try_wait().unwrap().is_none());
             if client
@@ -427,8 +430,12 @@ async fn fixture(case: Case, ultra: bool) {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        healthy.is_ok(),
+        "Host startup timed out: {}",
+        std::fs::read_to_string(data.join("host.log")).unwrap()
+    );
     post(&client,format!("{base}/chat"),json!({"session_id":WORK,"message":ORIGINAL,"provider":"openai","model":"wait-work",
         "model_ref":{"provider":"openai","model":"wait-work"},"thinking_mode":"standard","permission_mode":"auto","workspace_path":work_workspace,"project_id":work_project.id})).await;
     let original = canonical(&data, WORK).await;
