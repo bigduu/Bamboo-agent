@@ -259,6 +259,10 @@ impl ChildCompletionSource {
             return false;
         };
         session.kind == SessionKind::Child
+            && session.host_run_matches_launch()
+            && session
+                .host_run_id()
+                .is_none_or(|run| run == self.activation_run_id)
             && session.id == self.child_session_id
             && session.created_at == self.child_created_at
             && session.parent_session_id.as_deref() == Some(self.parent_session_id.as_str())
@@ -375,6 +379,24 @@ mod tests {
         child.add_message(Message::assistant("answer A", None));
         child.set_last_run_status("completed");
         child
+    }
+
+    #[test]
+    fn seal_rejects_different_host_uuid_and_newer_cancelled_launch_with_same_outcome() {
+        let mut child = final_child();
+        child.set_host_run_id("host-A");
+        child.set_last_run_status("cancelled");
+        child.synchronize_terminal_runtime_status();
+        ChildCompletionSource::prepare(&mut child, "host-A", &HashSet::new());
+        assert!(ChildCompletionSource::from_committed_session(&child).is_some());
+        let mut successor = child.clone();
+        successor.set_host_run_id("host-B");
+        successor.set_last_run_status("cancelled");
+        successor.synchronize_terminal_runtime_status();
+        assert!(ChildCompletionSource::from_committed_session(&successor).is_none());
+        child.advance_child_launch_generation().unwrap();
+        child.cancel_child_launch_generation();
+        assert!(ChildCompletionSource::from_committed_session(&child).is_none());
     }
 
     #[test]

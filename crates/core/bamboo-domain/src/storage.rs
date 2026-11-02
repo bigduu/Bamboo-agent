@@ -1018,6 +1018,22 @@ pub trait Storage: Send + Sync {
         Ok(())
     }
 
+    /// The owner has not entered Child execution. Close only that reserved
+    /// Host run after startup publication fails, comparing birth, generation
+    /// and the original input/control identity under the physical writer lock.
+    /// A successor or an already executing/finalized run must be left alone.
+    /// The callback is synchronous cache publication, never a Worker stop proof.
+    async fn fail_child_host_startup(
+        &self,
+        expected: &Session,
+        run_id: &str,
+        error: &str,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, run_id, error, publish);
+        Ok(None)
+    }
+
     /// Reconcile a selected Child snapshot under the physical Session/Actor
     /// locks. Return None when superseded, waiting, still leased or lacking a
     /// trusted terminal fact. The error describes a newly expired Actor only;
