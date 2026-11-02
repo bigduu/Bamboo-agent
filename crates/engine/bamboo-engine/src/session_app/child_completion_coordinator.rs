@@ -1221,12 +1221,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     if id == &completion.child_session_id {
                         continue;
                     }
+                    completed_child_ids.retain(|completed| completed != id);
                     if let Ok(Some(child)) = self
                         .storage
                         .load_child_wait_session(&parent, id, false)
                         .await
                     {
-                        completed_child_ids.retain(|completed| completed != id);
                         if completion_child_is_owned(&parent.id, child.parent_session_id.as_deref())
                             && child
                                 .last_run_status()
@@ -1279,17 +1279,30 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
             // this parent's child. An unowned id resumes with the neutral/error
             // message (`runtime_resume_message` falls back to `completion.error`
             // when no child content is supplied).
-            let reported_child_owned = match self
+            let reported_control = match self
                 .storage
                 .load_child_wait_session(&parent, &completion.child_session_id, false)
                 .await
             {
-                Ok(Some(control_plane)) => completion_child_is_owned(
-                    &completion.parent_session_id,
-                    control_plane.parent_session_id.as_deref(),
-                ),
-                _ => false,
+                Ok(child) => child,
+                Err(error) => {
+                    tracing::warn!(child_session_id = %completion.child_session_id, %error, "Child control plane unavailable; leaving wait armed");
+                    return;
+                }
             };
+            let reported_child_owned = reported_control.as_ref().is_some_and(|child| {
+                completion_child_is_owned(
+                    &completion.parent_session_id,
+                    child.parent_session_id.as_deref(),
+                )
+            });
+            if completion.source.is_none()
+                && reported_control
+                    .as_ref()
+                    .is_some_and(repaired_child_requires_source)
+            {
+                return;
+            }
 
             // Load the completed child once, ONLY when owned. The guardian
             // branch inspects its subagent_type + final verdict; the generic
@@ -1301,14 +1314,12 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     .load_child_wait_session(&parent, &completion.child_session_id, true)
                     .await
                 {
-                    Ok(child) => child,
+                    Ok(Some(child)) => Some(child),
+                    Ok(None) => return,
                     Err(error) => {
-                        tracing::warn!(
-                            child_session_id = %completion.child_session_id,
-                            %error,
-                            "failed to load child session for runtime resume message"
-                        );
-                        None
+                        tracing::warn!(child_session_id = %completion.child_session_id, %error,
+                            "owned Child snapshot unavailable; leaving wait armed");
+                        return;
                     }
                 }
             } else {
@@ -4719,12 +4730,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recovered_child_read_failure_cannot_become_neutral_parent_permission() {
+        let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+        save_waiting_test_parent(
+            &store,
+            "fault-parent",
+            vec!["fault-child".into()],
+            ChildWaitPolicy::All,
+        )
+        .await;
+        let parent = store.load_session("fault-parent").await.unwrap().unwrap();
+        let child = repaired_unactivated_test_child(&store, &parent, "fault-child").await;
+        let dir = store
+            .bamboo_home_dir()
+            .join(store.resolve_rel_path(&child.id).await.unwrap());
+        let main = dir.join("session.json");
+        let held = dir.join("held-main.json");
+        tokio::fs::rename(&main, &held).await.unwrap();
+        tokio::fs::create_dir(&main).await.unwrap();
+        let callback = ChildCompletion {
+            parent_session_id: parent.id.clone(),
+            child_session_id: child.id,
+            status: "cancelled".into(),
+            error: None,
+            completed_at: child.updated_at,
+            source: None,
+        };
+        ChildCompletionHandler::on_child_completed(coordinator.as_ref(), callback.clone()).await;
+        assert!(inbox.claim(&parent.id, 8).await.unwrap().is_empty());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+        assert!(
+            read_runtime_state(&store.load_session(&parent.id).await.unwrap().unwrap())
+                .waiting_for_children
+                .is_some()
+        );
+        tokio::fs::remove_dir(&main).await.unwrap();
+        tokio::fs::rename(&held, &main).await.unwrap();
+        ChildCompletionHandler::on_child_completed(coordinator.as_ref(), callback).await;
+        assert!(inbox.claim(&parent.id, 8).await.unwrap().is_empty());
+        assert_eq!(launches.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn recovered_generation_does_not_block_exact_later_queued_cancel() {
         let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
         let mut parent = Session::new("cancel-parent", "model");
         store.save_session(&parent).await.unwrap();
         let mut child = repaired_unactivated_test_child(&store, &parent, "cancel-child").await;
         child.advance_child_launch_generation().unwrap();
+        child.add_message(Message::user("queued B input"));
+        child.set_last_run_status("pending");
+        store.save_session(&child).await.unwrap();
+        child = store.load_session(&child.id).await.unwrap().unwrap();
         child.cancel_child_launch_generation();
         child.set_last_run_status("cancelled");
         store.save_session(&child).await.unwrap();
