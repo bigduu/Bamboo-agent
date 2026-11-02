@@ -3,8 +3,9 @@
 Tracking: [#2448](https://github.com/bigduu/Bamboo-agent/issues/2448).
 Storage is [#2454](https://github.com/bigduu/Bamboo-agent/issues/2454);
 Host final-save is [#2460](https://github.com/bigduu/Bamboo-agent/issues/2460).
-Receipt replay monotonicity and automatic recovery remain the independent
+Receipt replay monotonicity, Root Host/recovery and Child notification remain the independent
 [#2468](https://github.com/bigduu/Bamboo-agent/issues/2468) and
+[#2470](https://github.com/bigduu/Bamboo-agent/issues/2470) and
 [#2455](https://github.com/bigduu/Bamboo-agent/issues/2455) acceptance slices.
 
 Session owns identity and context. An ActorActivation owns one fenced attempt.
@@ -36,7 +37,7 @@ that gate; it repairs stale `Initializing`/`Running` state instead.
 ## Identity and persistence
 
 The `Storage::begin_host_run` port binds `runtime.host_run_id` to a reserved Run.
-[Host/SDK entrypoints](https://github.com/bigduu/Bamboo-agent/issues/2460)
+[Child Host/SDK entrypoints](https://github.com/bigduu/Bamboo-agent/issues/2460)
 bind the actual reserved Run UUID before execution. Native Child backend
 preparation must succeed before this binding; a preparation refusal leaves the
 canonical Session unchanged. A refused binding or an explicit startup identity
@@ -87,6 +88,10 @@ Host integration alone does not establish that same-run replay guarantee.
 ## Recovery boundary
 
 [Startup integration and recovery notification fencing](https://github.com/bigduu/Bamboo-agent/issues/2455) are the next dependent slice. They must validate the recovered child at the actual parent wait commit under the shared root tree writer, preserve fresh/unexpired owners and waits, and avoid stale cache publication. This slice does not enable that automatic reconciliation.
+Root entrypoint binding and Root final-save fault recovery are kept together in
+#2470; enabling only its binding would suppress the existing unmarked terminal
+projection before the replacement recovery path is ready. The Child Host slice
+leaves that Root entrypoint unchanged.
 
 `Storage::reconcile_child_runtime` also provides a targeted repair entry point.
 Targeted repairs compare the exact control-plane, birth, current activation, Host Run, Inbox admission and launch generation under the same physical locks; pending broker delivery and new pending launches are excluded. These repairs update runtime/index state, preserve Main/transcript bytes and
