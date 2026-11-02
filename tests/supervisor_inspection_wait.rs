@@ -440,9 +440,54 @@ async fn fixture(case: Case, ultra: bool) {
         "model_ref":{"provider":"openai","model":"wait-work"},"thinking_mode":"standard","permission_mode":"auto","workspace_path":work_workspace,"project_id":work_project.id})).await;
     let original = canonical(&data, WORK).await;
     post(&client, format!("{base}/supervisor/default"), json!({})).await;
+    // Bootstrap creates an existing, unassigned Supervisor. Bind its fixture
+    // context through the same CAS endpoint as the UI, never by rewriting chat.
+    let detail = client
+        .get(format!("{base}/sessions/{SUPERVISOR}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(detail.status().is_success());
+    let etag = detail.headers().get(reqwest::header::ETAG).unwrap().clone();
+    let binding = client
+        .patch(format!("{base}/sessions/{SUPERVISOR}"))
+        .header(reqwest::header::IF_MATCH, etag)
+        .json(&json!({"project_id":project.id,"workspace_path":workspace}))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        binding.status().is_success(),
+        "{}",
+        binding.text().await.unwrap()
+    );
+    if ultra {
+        let detail: Value = client
+            .get(format!("{base}/sessions/{SUPERVISOR}"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        let session = &detail["session"];
+        let epoch = session["root_mode_transition_epoch"].as_u64().unwrap();
+        let operation = format!("{epoch}:{}", uuid::Uuid::new_v4());
+        post(&client,format!("{base}/sessions/{SUPERVISOR}/root-mode-operations/{operation}"),json!({
+            "birth_token":session["root_mode_birth_token"],"expected_epoch":epoch,"thinking_mode":"ultra"
+        })).await;
+    }
     post(&client,format!("{base}/chat"),json!({"session_id":SUPERVISOR,"message":"Continue existing independent main work using the directory, then coordinate bounded auxiliary verification.",
         "provider":"openai","model":"wait-supervisor","model_ref":{"provider":"openai","model":"wait-supervisor"},
-        "thinking_mode":if ultra {"ultra"} else {"standard"},"permission_mode":"default","workspace_path":workspace,"project_id":project.id})).await;
+        "permission_mode":"default","workspace_path":workspace,"project_id":project.id})).await;
+    assert_eq!(
+        canonical(&data, SUPERVISOR).await.root_thinking_mode(),
+        if ultra {
+            bamboo_domain::RootThinkingMode::Ultra
+        } else {
+            bamboo_domain::RootThinkingMode::Standard
+        }
+    );
     post(&client, format!("{base}/execute/{SUPERVISOR}"), json!({})).await;
     let sleeping = wait(&data, SUPERVISOR, |s| {
         s.last_run_status().as_deref() == Some("suspended")
