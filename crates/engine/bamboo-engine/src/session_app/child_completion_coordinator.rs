@@ -4693,16 +4693,13 @@ mod tests {
             let b = save_completion_test_child(&store, &parent.id, "sealed-B", "error").await;
             ChildCompletionHandler::on_child_completed(coordinator.as_ref(), b).await;
             let claims = inbox.claim(&parent.id, 8).await.unwrap();
-            if policy == ChildWaitPolicy::All {
-                assert!(claims.is_empty());
-                assert_eq!(launches.load(Ordering::SeqCst), 0);
-            } else {
-                assert_eq!(claims.len(), 1);
-                assert!(
-                    matches!(&claims[0].envelope.body, SessionMessageBody::ChildOutcome(outcome) if outcome.child_session_id == "sealed-B")
-                );
-                assert_eq!(launches.load(Ordering::SeqCst), 1);
-            }
+            // Preserve the existing incremental sealed-B notification, even
+            // while All still waits. A contributes neither count nor outcome.
+            assert_eq!(claims.len(), 1);
+            assert!(
+                matches!(&claims[0].envelope.body, SessionMessageBody::ChildOutcome(outcome) if outcome.child_session_id == "sealed-B")
+            );
+            assert_eq!(launches.load(Ordering::SeqCst), 1);
             let current = store.load_session(&parent.id).await.unwrap().unwrap();
             assert_eq!(
                 read_runtime_state(&current).waiting_for_children.is_some(),
