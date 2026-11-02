@@ -61,6 +61,13 @@ fn has(body: &Value, text: &str) -> bool {
         .iter()
         .any(|m| m["content"].as_str().is_some_and(|s| s.contains(text)))
 }
+fn has_tool_result(body: &Value, id: &str) -> bool {
+    body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool" && message["tool_call_id"] == id)
+}
 fn call(id: &str, name: &str, args: Value) -> (Value, &'static str) {
     (
         json!({"tool_calls":[{"index":0,"id":id,"type":"function","function":{"name":name,"arguments":args.to_string()}}]}),
@@ -90,7 +97,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
     let body = body.into_inner();
     probe.requests.lock().unwrap().push(body.clone());
     let (delta, finish) = if body["model"] == "wait-child" {
-        if !has(&body, "verifier-command") {
+        if !has_tool_result(&body, "verifier-command") {
             // Hold an actual foreground command, not only a provider response.
             // The test releases its file after proving the parent is quiescent.
             let index = usize::from(has(&body, "second non-overlapping acceptance"));
@@ -102,7 +109,9 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             )
         } else if matches!(probe.case, Case::Failed) {
             return HttpResponse::BadRequest().json(json!({"error":{"type":"invalid_request_error","message":"controlled verifier provider failure"}}));
-        } else if matches!(probe.case, Case::Question) && !has(&body, "verifier-question") {
+        } else if matches!(probe.case, Case::Question)
+            && !has_tool_result(&body, "verifier-question")
+        {
             call(
                 "verifier-question",
                 "SubAgent",
@@ -148,7 +157,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
         } else if let Some(question) = envelopes(&parent)
             .iter()
             .find_map(ParentQuestion::from_envelope)
-            .filter(|_| !has(&body, "answer-verifier"))
+            .filter(|_| !has_tool_result(&body, "answer-verifier"))
         {
             assert!(body.to_string().contains(question.id.as_str()));
             call(
@@ -156,7 +165,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 "SubAgent",
                 json!({"reply_to":question.id.as_str(),"message":ANSWER}),
             )
-        } else if has(&body, "answer-verifier") {
+        } else if has_tool_result(&body, "answer-verifier") {
             (
                 json!({"content":"ANSWERED_VERIFIER_WITH_ORIGINAL_WAIT"}),
                 "stop",
