@@ -343,7 +343,8 @@ impl SessionStoreV2 {
                 activation.finished_at = Some(Utc::now());
                 entry.actor.state = ActorLogicalState::Failed;
                 entry.revision = checked_next(entry.revision).map_err(io::Error::other)?;
-                let ended = (latest.host_run_matches_launch()
+                let ended = (latest.host_run_id() == Some(activation.run_id.as_str())
+                    && latest.host_run_matches_launch()
                     && !latest.has_runtime_wait()
                     && latest.last_run_status().as_deref() != Some("pending"))
                 .then(|| {

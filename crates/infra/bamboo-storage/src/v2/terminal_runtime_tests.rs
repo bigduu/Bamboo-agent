@@ -1652,3 +1652,79 @@ async fn terminal_runtime_expiry_job_finishes_old_runtime_before_failed_or_cance
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 }
+
+#[tokio::test]
+async fn terminal_runtime_expired_prebind_actor_cannot_project_its_error_into_previous_host() {
+    let (home, store, _, a) = fixture(AgentStatusState::Running).await;
+    let original = store.load_session("terminal-child").await.unwrap().unwrap();
+    store.begin_host_run(&original, "host-A").await.unwrap();
+    let mut previous = store.load_session(&original.id).await.unwrap().unwrap();
+    previous.set_last_run_status("error");
+    previous.set_last_run_error("original A error, retained by its source");
+    previous.synchronize_terminal_runtime_status();
+    // A historical source identity is an observation, not a result grant.
+    previous.metadata.insert(
+        "runtime.child_completion_source_v1".into(),
+        "{\"activation_run_id\":\"host-A\",\"status\":\"error\"}".into(),
+    );
+    let owner = bamboo_domain::ChildActorRuntimeWrite::from_session(a.fence(), &previous).unwrap();
+    store
+        .save_child_actor_runtime(bamboo_domain::ChildActorRuntimeSave {
+            owner: &owner,
+            session: &mut previous,
+            runtime_only: false,
+            inherited: None,
+            finalized_wait: None,
+            input: None,
+            publish: Arc::new(|_| {}),
+        })
+        .await
+        .unwrap();
+    store
+        .finish_activation(&a.fence(), Utc::now(), ActorActivationFinish::Failed)
+        .await
+        .unwrap();
+    // Native preparation can claim B before Host B is bound. Crash in that
+    // window: canonical Session still belongs to A while Actor B later expires.
+    let now = Utc::now();
+    let mut request = claim(&previous.id, "host-B", now);
+    request.lease_expires_at = now + chrono::Duration::seconds(2);
+    let b = store.claim_activation(&request).await.unwrap();
+    store.start_activation(&b.fence(), now).await.unwrap();
+    while Utc::now() <= request.lease_expires_at {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let previous = store.load_session(&previous.id).await.unwrap().unwrap();
+    let main = fs::read(main_path(home.path())).await.unwrap();
+    // There must be only C's runtime write. The old bug wrote B's expiry error
+    // into A, then this second-write fault stranded that false A outcome.
+    let hook = ActorWriteHook::install_nth(
+        &store,
+        "runtime.json",
+        DurableWritePhase::BeforeReplace,
+        true,
+        2,
+    );
+    hook.release();
+    store.begin_host_run(&previous, "host-C").await.unwrap();
+    let current = store.load_session(&previous.id).await.unwrap().unwrap();
+    assert_eq!(current.host_run_id(), Some("host-C"));
+    assert_eq!(current.last_run_error(), None);
+    assert_eq!(
+        current.metadata.get("runtime.child_completion_source_v1"),
+        previous.metadata.get("runtime.child_completion_source_v1")
+    );
+    assert_eq!(fs::read(main_path(home.path())).await.unwrap(), main);
+    let ended = store
+        .inspect_actor(&previous.id)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert_eq!(ended.fence(), b.fence());
+    assert_eq!(ended.status, ActorActivationStatus::Failed);
+    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let current = reopened.load_session(&previous.id).await.unwrap().unwrap();
+    assert_eq!(current.host_run_id(), Some("host-C"));
+    assert_eq!(current.last_run_error(), None);
+}
