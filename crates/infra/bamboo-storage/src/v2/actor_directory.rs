@@ -81,6 +81,67 @@ fn checked_next(value: u64) -> Result<u64, ActorDirectoryError> {
         .ok_or(ActorDirectoryError::CounterOverflow)
 }
 
+fn claim_entry(
+    entry: &mut ActorDirectoryEntry,
+    claim: &ActorActivationClaim,
+) -> Result<Mutation<ActorActivation>, ActorDirectoryError> {
+    validate_claim(claim)?;
+    if entry.actor.state == ActorLogicalState::Retired {
+        return Err(ActorDirectoryError::InvalidTransition);
+    }
+    if let Some(active) = entry.activation.as_ref() {
+        if active.status.is_live() && active.lease_expires_at > claim.now {
+            if active.run_id == claim.run_id
+                && active.lease_owner == claim.lease_owner
+                && active.lease_expires_at == claim.lease_expires_at
+                && active.inbox_generation == claim.inbox_generation
+                && active.placement_ref == claim.placement_ref
+            {
+                return Ok(Mutation::unchanged(active.clone()));
+            }
+            return Err(ActorDirectoryError::Busy);
+        }
+    }
+    let attempt = checked_next(entry.actor.current_attempt)?;
+    let lease_epoch = checked_next(
+        entry
+            .activation
+            .as_ref()
+            .map_or(0, |previous| previous.lease_epoch),
+    )?;
+    let activation = ActorActivation {
+        schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
+        actor_id: entry.actor.actor_id.clone(),
+        activation_id: Uuid::new_v4().to_string(),
+        attempt,
+        run_id: claim.run_id.clone(),
+        lease_owner: claim.lease_owner.clone(),
+        lease_epoch,
+        lease_expires_at: claim.lease_expires_at,
+        project_id: entry.actor.project_id.clone(),
+        inbox_generation: claim.inbox_generation,
+        placement_ref: claim.placement_ref.clone(),
+        status: ActorActivationStatus::Reserved,
+        checkpoint_revision: 0,
+        started_at: None,
+        finished_at: None,
+    };
+    entry.actor.current_attempt = attempt;
+    entry.actor.state = ActorLogicalState::Active;
+    entry.activation = Some(activation.clone());
+    Ok(Mutation::changed(activation))
+}
+
+fn validate_claim(claim: &ActorActivationClaim) -> Result<(), ActorDirectoryError> {
+    if claim.run_id.trim().is_empty()
+        || claim.lease_owner.trim().is_empty()
+        || claim.lease_expires_at <= claim.now
+    {
+        return Err(ActorDirectoryError::InvalidTransition);
+    }
+    Ok(())
+}
+
 pub(super) fn current_live<'a>(
     entry: &'a ActorDirectoryEntry,
     fence: &ActorActivationFence,
@@ -928,59 +989,61 @@ impl ActorDirectoryPort for SessionStoreV2 {
         &self,
         claim: &ActorActivationClaim,
     ) -> Result<ActorActivation, ActorDirectoryError> {
-        if claim.run_id.trim().is_empty()
-            || claim.lease_owner.trim().is_empty()
-            || claim.lease_expires_at <= claim.now
-        {
-            return Err(ActorDirectoryError::InvalidTransition);
+        validate_claim(claim)?;
+        self.actor_transaction(&claim.actor_id, |entry| claim_entry(entry, claim))
+            .await
+    }
+
+    async fn claim_root_activation_observed(
+        &self,
+        claim: &ActorActivationClaim,
+        expected: &Session,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        validate_claim(claim)?;
+        if claim.actor_id != expected.id || expected.kind != bamboo_domain::SessionKind::Root {
+            return Err(ActorDirectoryError::InvalidIdentity);
         }
-        self.actor_transaction(&claim.actor_id, |entry| {
-            if entry.actor.state == ActorLogicalState::Retired {
-                return Err(ActorDirectoryError::InvalidTransition);
-            }
-            if let Some(active) = entry.activation.as_ref() {
-                if active.status.is_live() && active.lease_expires_at > claim.now {
-                    if active.run_id == claim.run_id
-                        && active.lease_owner == claim.lease_owner
-                        && active.lease_expires_at == claim.lease_expires_at
-                        && active.inbox_generation == claim.inbox_generation
-                        && active.placement_ref == claim.placement_ref
-                    {
-                        return Ok(Mutation::unchanged(active.clone()));
-                    }
-                    return Err(ActorDirectoryError::Busy);
-                }
-            }
-            let attempt = checked_next(entry.actor.current_attempt)?;
-            let lease_epoch = checked_next(
-                entry
-                    .activation
-                    .as_ref()
-                    .map_or(0, |previous| previous.lease_epoch),
-            )?;
-            let activation = ActorActivation {
-                schema_version: bamboo_domain::ACTOR_DIRECTORY_SCHEMA_VERSION,
-                actor_id: entry.actor.actor_id.clone(),
-                activation_id: Uuid::new_v4().to_string(),
-                attempt,
-                run_id: claim.run_id.clone(),
-                lease_owner: claim.lease_owner.clone(),
-                lease_epoch,
-                lease_expires_at: claim.lease_expires_at,
-                project_id: entry.actor.project_id.clone(),
-                inbox_generation: claim.inbox_generation,
-                placement_ref: claim.placement_ref.clone(),
-                status: ActorActivationStatus::Reserved,
-                checkpoint_revision: 0,
-                started_at: None,
-                finished_at: None,
-            };
-            entry.actor.current_attempt = attempt;
-            entry.actor.state = ActorLogicalState::Active;
-            entry.activation = Some(activation.clone());
-            Ok(Mutation::changed(activation))
-        })
-        .await
+        let (rel, path, guards) = self.lock_actor_runtime(&claim.actor_id).await?;
+        // Check the ORIGINAL caller under the physical mutation locks, before
+        // even initializing authority. A post-claim reload cannot rebind it.
+        let current = self
+            .projection_target(&claim.actor_id, &rel)
+            .await
+            .map_err(storage)?
+            .ok_or(ActorDirectoryError::InvalidIdentity)?;
+        super::reject_incompatible_session_write(&current).map_err(storage)?;
+        super::reject_incompatible_session_write(expected).map_err(storage)?;
+        expected
+            .check_conversation_generation(&current)
+            .map_err(|_| ActorDirectoryError::InvalidIdentity)?;
+        if current.kind != bamboo_domain::SessionKind::Root
+            || !current.authority_identity.is_ordinary()
+            || expected.created_at != current.created_at
+            || expected.authority_identity != current.authority_identity
+            || !current
+                .metadata_version
+                .checked_sub(expected.metadata_version)
+                .is_some_and(|delta| delta <= 1)
+            || expected.project_id_meta() != current.project_id_meta()
+            || expected.parent_session_id != current.parent_session_id
+            || expected.parent_created_at != current.parent_created_at
+            || expected.spawn_depth != current.spawn_depth
+            || (!expected.root_session_id.is_empty() && expected.root_session_id != current.id)
+        {
+            return Err(ActorDirectoryError::InvalidIdentity);
+        }
+        let mut entry = self
+            .read_or_create_actor_entry(&claim.actor_id, &rel, &path, &guards)
+            .await?;
+        let Mutation { value, changed, .. } = claim_entry(&mut entry, claim)?;
+        if changed {
+            entry.revision = checked_next(entry.revision)?;
+            self.write_actor_entry(&path, &entry, &guards).await?;
+        } else {
+            // A readable claim after an uncertain rename is not a durable ACK.
+            self.confirm_actor_file_durable(&path, &guards).await?;
+        }
+        Ok(value)
     }
 
     async fn start_activation(

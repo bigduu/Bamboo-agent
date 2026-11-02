@@ -514,3 +514,64 @@ async fn replacement_errors_release_guards_and_reopen_actual_state(
     }
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn observed_root_claim_retains_physical_guards_after_caller_abort_and_reconfirms(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let home = tempfile::tempdir()?;
+    let (first, second) = stores(home.path()).await?;
+    first.ensure_actor(ACTOR).await?;
+    let original = first.load_session(ACTOR).await?.unwrap();
+    let request = claim("observed-root", Utc::now());
+    let hook = ActorWriteHook::install(&first, ENTRY, DurableWritePhase::AfterReplace, false);
+    let _release = ReleaseOnDrop(hook.clone());
+    let writer = {
+        let first = first.clone();
+        let original = original.clone();
+        let request = request.clone();
+        tokio::spawn(async move {
+            first
+                .claim_root_activation_observed(&request, &original)
+                .await
+        })
+    };
+    hook.wait_entered();
+    writer.abort();
+    assert!(writer.await.unwrap_err().is_cancelled());
+    assert_physical_locks_held(&first);
+    // An exclusive lifecycle transaction (including a future reset producer)
+    // cannot race the still-running real FS job after the async cancel ACK.
+    let mut exclusive = {
+        let second = second.clone();
+        tokio::spawn(async move { second.lock_session_lifecycle_exclusive().await })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(75), &mut exclusive)
+            .await
+            .is_err()
+    );
+    assert_physical_locks_held(&first);
+    hook.release();
+    drop(tokio::time::timeout(DEADLINE, exclusive).await???);
+    let settled = first.inspect_actor(ACTOR).await?.activation.unwrap();
+    assert_eq!(settled.run_id, request.run_id);
+    assert_eq!(
+        first
+            .claim_root_activation_observed(&request, &original)
+            .await?,
+        settled
+    );
+    assert_eq!(
+        hook.reconfirmed(),
+        1,
+        "idempotent claim must confirm actual file and directory durability"
+    );
+    let reopened = SessionStoreV2::new(home.path().to_path_buf()).await?;
+    assert_eq!(
+        reopened
+            .claim_root_activation_observed(&request, &original)
+            .await?,
+        settled
+    );
+    Ok(())
+}
