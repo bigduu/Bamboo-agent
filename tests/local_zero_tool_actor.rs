@@ -800,6 +800,7 @@ async fn await_host_pre_ack_cut(
             let entry = store.inspect_actor(id).await.unwrap();
             if entry.activation.as_ref().unwrap().status == ActorActivationStatus::Failed
                 && child.last_run_status().as_deref() == Some("error")
+                && child.last_run_error().is_some()
             {
                 let host_log =
                     std::fs::read_to_string(probe.data.join("host.log")).unwrap_or_default();
@@ -1225,7 +1226,12 @@ async fn fixture_with_followups(
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|_| {
+        panic!(
+            "Host startup health timeout: {}",
+            fixture_host_log_tail(&data)
+        )
+    });
     drop(listener_admission);
     let response = client.post(format!("{base}/chat")).json(&json!({"session_id":"plain-root","message":"Delegate one plain answer","model":"plain-root","provider":"openai","model_ref":{"provider":"openai","model":"plain-root"},"thinking_mode":if ultra {"ultra"} else {"standard"},"permission_mode":"bypass","workspace_path":workspace,"project_id":project.id})).send().await.unwrap();
     assert!(

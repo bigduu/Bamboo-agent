@@ -103,6 +103,7 @@ pub(super) fn current_live<'a>(
 struct Mutation<T> {
     value: T,
     changed: bool,
+    terminal: bool,
 }
 
 impl<T> Mutation<T> {
@@ -110,6 +111,7 @@ impl<T> Mutation<T> {
         Self {
             value,
             changed: true,
+            terminal: false,
         }
     }
 
@@ -117,9 +119,18 @@ impl<T> Mutation<T> {
         Self {
             value,
             changed: false,
+            terminal: false,
         }
     }
+
+    fn terminal(mut self) -> Self {
+        self.terminal = true;
+        self
+    }
 }
+
+#[path = "terminal_runtime.rs"]
+mod terminal_runtime;
 
 impl SessionStoreV2 {
     async fn regular_actor_directory(path: &Path) -> Result<bool, ActorDirectoryError> {
@@ -568,6 +579,72 @@ impl SessionStoreV2 {
         F: FnOnce(&mut ActorDirectoryEntry) -> Result<Mutation<T>, ActorDirectoryError> + Send,
         T: Send,
     {
+        let (rel, path, guards) = self.lock_actor_runtime(actor_id).await?;
+        let mut entry = self
+            .read_or_create_actor_entry(actor_id, &rel, &path, &guards)
+            .await?;
+        let Mutation {
+            value,
+            changed,
+            terminal,
+        } = operation(&mut entry)?;
+        if changed {
+            entry.revision = checked_next(entry.revision)?;
+            self.write_actor_entry(&path, &entry, &guards).await?;
+        }
+        if terminal {
+            if !changed {
+                // Reconfirm a prior uncertain rename without advancing the
+                // logical revision, attempt, finish time or tree projection.
+                self.confirm_actor_file_durable(&path, &guards).await?;
+            }
+            self.project_actor_terminal(&entry, &rel, &guards)
+                .await
+                .map_err(|error| ActorDirectoryError::RuntimeProjection(error.to_string()))?;
+        }
+        Ok(value)
+    }
+
+    async fn confirm_actor_file_durable(
+        &self,
+        path: &Path,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> Result<(), ActorDirectoryError> {
+        let path = path.to_path_buf();
+        let retained = guards.clone();
+        #[cfg(test)]
+        let hook = self.actor_write_hook.lock().unwrap().clone();
+        tokio::task::spawn_blocking(move || {
+            let _guards = retained;
+            #[cfg(windows)]
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            #[cfg(not(windows))]
+            let file = std::fs::File::open(&path)?;
+            file.sync_all()?;
+            #[cfg(unix)]
+            std::fs::File::open(
+                path.parent()
+                    .ok_or_else(|| io::Error::other("Actor parent missing"))?,
+            )?
+            .sync_all()?;
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook.record_reconfirmed(&path);
+            }
+            Ok::<_, io::Error>(())
+        })
+        .await
+        .map_err(|error| storage(io::Error::other(error)))?
+        .map_err(storage)
+    }
+
+    async fn lock_actor_runtime(
+        &self,
+        actor_id: &str,
+    ) -> Result<(String, PathBuf, Arc<ActorAuthorityGuards>), ActorDirectoryError> {
         // Same lock order as strict Session control-plane writes: lifecycle,
         // Task sidecar, then the exact Session maintenance/file lock. The last
         // lock spans read/CAS/durable rename, including independent processes.
@@ -603,15 +680,7 @@ impl SessionStoreV2 {
             .await
             .map_err(storage)?;
         *guards.tree_root.lock().expect("Actor tree Root") = Some(root);
-        let mut entry = self
-            .read_or_create_actor_entry(actor_id, &rel, &path, &guards)
-            .await?;
-        let Mutation { value, changed } = operation(&mut entry)?;
-        if changed {
-            entry.revision = checked_next(entry.revision)?;
-            self.write_actor_entry(&path, &entry, &guards).await?;
-        }
-        Ok(value)
+        Ok((rel, path, guards))
     }
 
     /// The caller owns lifecycle/Task exclusivity and this Root's tree guard.
@@ -1006,6 +1075,19 @@ impl ActorDirectoryPort for SessionStoreV2 {
         outcome: ActorActivationFinish,
     ) -> Result<ActorActivation, ActorDirectoryError> {
         self.actor_transaction(&fence.actor_id, |entry| {
+            let terminal_status = match outcome {
+                ActorActivationFinish::Succeeded => ActorActivationStatus::Succeeded,
+                ActorActivationFinish::Failed => ActorActivationStatus::Failed,
+                ActorActivationFinish::Cancelled => ActorActivationStatus::Cancelled,
+            };
+            if let Some(activation) = entry.activation.as_ref() {
+                if !activation.status.is_live()
+                    && activation.matches_fence(fence)
+                    && activation.status == terminal_status
+                {
+                    return Ok(Mutation::unchanged(activation.clone()).terminal());
+                }
+            }
             let current_status = current_live(entry, fence, now)?.status;
             if outcome == ActorActivationFinish::Succeeded
                 && current_status != ActorActivationStatus::Running
@@ -1016,18 +1098,14 @@ impl ActorDirectoryPort for SessionStoreV2 {
                 .activation
                 .as_mut()
                 .ok_or(ActorDirectoryError::StaleFence)?;
-            activation.status = match outcome {
-                ActorActivationFinish::Succeeded => ActorActivationStatus::Succeeded,
-                ActorActivationFinish::Failed => ActorActivationStatus::Failed,
-                ActorActivationFinish::Cancelled => ActorActivationStatus::Cancelled,
-            };
+            activation.status = terminal_status;
             activation.finished_at = Some(now);
             entry.actor.state = if outcome == ActorActivationFinish::Failed {
                 ActorLogicalState::Failed
             } else {
                 ActorLogicalState::Cold
             };
-            Ok(Mutation::changed(activation.clone()))
+            Ok(Mutation::changed(activation.clone()).terminal())
         })
         .await
     }
