@@ -5039,13 +5039,13 @@ mod tests {
             child.updated_at = Utc::now() - chrono::Duration::minutes(5);
             store.save_session(&child).await.unwrap();
             if expired_actor {
-                let now = Utc::now() - chrono::Duration::minutes(10);
+                let now = Utc::now();
                 let activation = store
                     .claim_activation(&ActorActivationClaim {
                         actor_id: child.id.clone(),
                         run_id: "lost-worker".into(),
                         lease_owner: "synthetic-owner".into(),
-                        lease_expires_at: now + chrono::Duration::minutes(5),
+                        lease_expires_at: now + chrono::Duration::seconds(2),
                         inbox_generation: 0,
                         placement_ref: None,
                         now,
@@ -5056,6 +5056,7 @@ mod tests {
                     .start_activation(&activation.fence(), now)
                     .await
                     .unwrap();
+                tokio::time::sleep(Duration::from_millis(2100)).await;
             }
             // Actual boot path twice: no Actor is unknown; an expired exact Actor
             // can close Child authority, without granting a parent resume source.
