@@ -1204,6 +1204,18 @@ async fn maybe_suspend_for_orphaned_children(
     config: &AgentLoopConfig,
     runtime_state: &mut AgentRuntimeState,
 ) -> Result<Option<TurnOutcome>, AgentError> {
+    maybe_suspend_for_children(session, config, runtime_state, None).await
+}
+
+/// The same completion-serialized wait gate serves both end-of-turn safety and
+/// repeated Supervisor observations. An inspection can select only currently
+/// active ordinary direct children; it cannot replace an existing wait policy.
+async fn maybe_suspend_for_children(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    runtime_state: &mut AgentRuntimeState,
+    inspected_targets: Option<&[String]>,
+) -> Result<Option<TurnOutcome>, AgentError> {
     if session
         .metadata
         .get("runtime.canonical_subagent_host")
@@ -1260,6 +1272,9 @@ async fn maybe_suspend_for_orphaned_children(
             }
         }
         active = ordinary;
+    }
+    if let Some(targets) = inspected_targets {
+        active.retain(|id| targets.contains(id));
     }
     if active.is_empty() && !inherited_wait {
         return Ok(None);
@@ -1339,6 +1354,32 @@ async fn maybe_suspend_for_orphaned_children(
         session.id,
         active.len(),
     );
+    if inspected_targets.is_some() {
+        let persistence = config.persistence.as_ref().ok_or_else(|| {
+            AgentError::Tool("unchanged child inspections require a durable wait owner".into())
+        })?;
+        // Stage before committing: a failed checkpoint must not claim a
+        // durable suspension or overwrite an unrelated wait in the live state.
+        let mut candidate = session.clone();
+        let mut candidate_runtime = runtime_state.clone();
+        let outcome = suspend_to_wait_for_children(
+            &mut candidate,
+            &mut candidate_runtime,
+            None,
+            active,
+            ChildWaitPolicy::All,
+        )
+        .await;
+        persistence
+            .save_runtime_session(&mut candidate)
+            .await
+            .map_err(|_| {
+                AgentError::Tool("unchanged child inspection wait could not be persisted".into())
+            })?;
+        *session = candidate;
+        *runtime_state = candidate_runtime;
+        return Ok(Some(outcome));
+    }
     Ok(Some(
         suspend_to_wait_for_children(
             session,
@@ -2993,6 +3034,25 @@ async fn handle_tool_calls_path(
     }
     if tool_execution.waiting_for_children {
         waiting_for_children = true;
+    }
+
+    let unchanged_targets = policy_guard.unchanged_child_inspection_targets();
+    if !awaiting_clarification
+        && !waiting_for_children
+        && session.supervisor_incarnation_id().is_some()
+        && !unchanged_targets.is_empty()
+    {
+        if maybe_suspend_for_children(
+            session,
+            frame.config,
+            runtime_state,
+            Some(&unchanged_targets),
+        )
+        .await?
+        .is_some()
+        {
+            waiting_for_children = true;
+        }
     }
 
     let ticket_question_yield = frame.config.ticket_worker_plan.is_some()
@@ -11926,6 +11986,7 @@ mod tests {
     }
 
     include!("child_index_observation_tests.rs");
+    include!("child_inspection_wait_tests.rs");
 
     #[tokio::test]
     async fn safety_net_suspends_on_orphaned_active_children() {

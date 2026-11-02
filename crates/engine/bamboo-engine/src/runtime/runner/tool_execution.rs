@@ -57,6 +57,7 @@ fn build_task_compression_hint(
     (!hint.is_empty()).then_some(hint)
 }
 
+mod child_inspection;
 mod clarification;
 mod events;
 mod execution_paths;
@@ -382,6 +383,15 @@ async fn execute_and_apply_single_tool_call(
 
     // Compare raw output: changing evidence hidden by compression is still progress.
     policy_guard.observe_raw_observation(tool_call, &outcome.result);
+    policy_guard.child_inspections.observe(
+        tool_call,
+        &outcome.result,
+        outcome
+            .portable_tool
+            .as_ref()
+            .map(|tool| tool.execution_name())
+            .or(admitted_execution_name.as_deref()),
+    );
     if quiet_guard_active {
         policy_guard
             .quiet_polls
@@ -979,6 +989,14 @@ async fn execute_round_tool_calls_inner(
 
             for (batch_call, outcome) in batch.iter().zip(&outcomes) {
                 policy_guard.observe_raw_observation(batch_call, &outcome.result);
+                policy_guard.child_inspections.observe(
+                    batch_call,
+                    &outcome.result,
+                    outcome
+                        .portable_tool
+                        .as_ref()
+                        .map(|tool| tool.execution_name()),
+                );
             }
             // Compress all outcomes in parallel before applying sequentially.
             let max_tool_tokens = session

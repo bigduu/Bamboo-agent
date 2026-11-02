@@ -232,7 +232,7 @@
       "priority": 40,
       "group": "engine-compression",
       "kind": "test",
-      "targetRegex": "^(compact_subagent_facade|skill_output_budget)$"
+      "targetRegex": "^(compact_subagent_facade|supervisor_inspection_wait|skill_output_budget)$"
     }
   ],
   "fallbackGroup": "other",
