@@ -109,6 +109,9 @@ async fn capture_persists_tool_result_and_binds_the_exact_gate() {
     assert!(proof.matches_gate(&gate));
     assert!(!proof.matches_gate(&AdmissionGate::default()));
     let durable = f.store.load_session(ROOT).await.unwrap().unwrap();
+    assert!(durable
+        .metadata
+        .contains_key("runtime.root_writer_observation_v1"));
     assert_eq!(
         durable
             .messages

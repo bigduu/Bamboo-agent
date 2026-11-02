@@ -150,6 +150,26 @@ fn finish_status(finish: ActorActivationFinish) -> ActorActivationStatus {
     }
 }
 impl SessionStoreV2 {
+    /// Only the existing, fully validated manual-title transaction calls this.
+    /// Advance a matching observation; never create one or change its fence.
+    pub(in crate::v2) fn advance_root_title_observation(
+        previous: &Session,
+        incoming: &mut Session,
+        entry: &ActorDirectoryEntry,
+    ) -> io::Result<()> {
+        if previous.kind != SessionKind::Root || !previous.authority_identity.is_ordinary() {
+            return Ok(());
+        }
+        let Some(activation) = entry.activation.as_ref() else {
+            return Ok(());
+        };
+        if matches_observation(previous, &activation.fence()).unwrap_or(false) {
+            let encoded = serde_json::to_string(&observation(incoming, &activation.fence())?)?;
+            incoming.metadata.insert(ROOT_OBSERVATION.into(), encoded);
+        }
+        Ok(())
+    }
+
     async fn confirmed_root_main_outcome(
         &self,
         entry: &ActorDirectoryEntry,

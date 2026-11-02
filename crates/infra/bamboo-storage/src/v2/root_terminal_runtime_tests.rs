@@ -446,7 +446,7 @@ async fn root_terminal_main_cancel_failure_and_suspension_override_diagnostic_on
 
 #[tokio::test]
 async fn root_terminal_scope_observation_survives_actor_refresh_without_project_aba() {
-    for mode in ["one-ui", "two-ui", "project-aba"] {
+    for mode in ["one-ui", "two-ui", "project-aba", "manual-title"] {
         let f = Fixture::new(false, 300).await;
         f.store
             .finish_root_activation_observed(
@@ -475,10 +475,39 @@ async fn root_terminal_scope_observation_survives_actor_refresh_without_project_
                 "agent.runtime.state".into(),
                 serde_json::to_string(current.agent_runtime_state.as_ref().unwrap()).unwrap(),
             );
-            f.store.save_runtime_state(&current).await.unwrap();
+            if mode == "manual-title" {
+                // Seed only the old typed split before the actual title lane.
+                let mut zombie = f.current().await;
+                zombie.agent_runtime_state = current.agent_runtime_state.clone();
+                zombie.metadata.insert(
+                    "agent.runtime.state".into(),
+                    current.metadata["agent.runtime.state"].clone(),
+                );
+                f.store.save_runtime_state(&zombie).await.unwrap();
+                current.title_version += 1;
+                current.title_generated = false;
+                current.updated_at = Utc::now();
+                f.store.save_manual_title(&current).await.unwrap();
+            } else {
+                f.store.save_runtime_state(&current).await.unwrap();
+            }
             // A fresh directory observation is not permission to refresh the
             // older writer marker or forget the Project transition history.
             f.store.inspect_actor(&f.root.id).await.unwrap();
+            if mode != "manual-title" {
+                assert_eq!(
+                    f.current().await.metadata[ROOT_OBSERVATION],
+                    original_marker
+                );
+            }
+        }
+        if mode == "project-aba" {
+            let mut title = f.current().await;
+            title.title = "title cannot launder Project ABA".into();
+            title.title_version += 1;
+            title.metadata_version += 1;
+            title.updated_at = Utc::now();
+            f.store.save_manual_title(&title).await.unwrap();
             assert_eq!(
                 f.current().await.metadata[ROOT_OBSERVATION],
                 original_marker
@@ -489,8 +518,11 @@ async fn root_terminal_scope_observation_survives_actor_refresh_without_project_
             .reconcile(Utc::now() - chrono::Duration::hours(1))
             .await
             .unwrap();
-        assert_eq!(repaired.is_some(), mode == "one-ui");
-        if mode == "one-ui" {
+        assert_eq!(
+            repaired.is_some(),
+            matches!(mode, "one-ui" | "manual-title")
+        );
+        if matches!(mode, "one-ui" | "manual-title") {
             assert_typed(&f.current().await, "error", AgentStatusState::Failed);
         } else {
             assert!(f

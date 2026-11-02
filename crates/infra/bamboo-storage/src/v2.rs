@@ -7504,11 +7504,11 @@ impl SessionStoreV2 {
 
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
-        let session_bytes = compact_main::serialize_main(session)?;
-        let runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
+        let mut session_bytes = compact_main::serialize_main(session)?;
+        let mut runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
-        let serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+        let mut serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
         let directory_started = Instant::now();
         let rel_path = self.ensure_default_writer_dirs(session, guards).await?;
         let abs_dir = self.abs_path_from_rel(&rel_path);
@@ -7528,11 +7528,23 @@ impl SessionStoreV2 {
             let tree = self.acquire_actor_tree_write_guard(root_id).await?;
             guards.hold_tree(tree);
         }
-        let title_observations = if manual_title {
-            self.prepare_title_observations(session).await?
+        let mut title_candidate = manual_title.then(|| session.clone());
+        let title_observations = if let Some(candidate) = title_candidate.as_mut() {
+            self.prepare_title_observations(candidate).await?
         } else {
             Vec::new()
         };
+        let session = title_candidate.as_ref().unwrap_or(session);
+        if manual_title {
+            // Initial buffers preflighted before directory preparation. Only
+            // the validated title lane can normalize an existing observation;
+            // both actual files must publish that same canonical candidate.
+            let started = Instant::now();
+            session_bytes = compact_main::serialize_main(session)?;
+            runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))?;
+            serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
+            stages.serialization += started.elapsed();
+        }
         if previous_projection.as_ref() != Some(&actor_tree_session_projection(session)) {
             let root = if session.kind == SessionKind::Root {
                 Some(session.clone())
