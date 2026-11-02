@@ -684,6 +684,17 @@ async fn terminal_runtime_finish_preserves_confirmed_timeout_status_error_and_so
             Some("owned child watchdog expired")
         );
         assert_eq!(saved.metadata["runtime.child_completion_source_v1"], source);
+        let repaired = store
+            .reconcile_child_runtime(&saved, Utc::now(), "error", Some("restart"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.last_run_status(), saved.last_run_status());
+        assert_eq!(repaired.last_run_error(), saved.last_run_error());
+        assert_eq!(
+            repaired.metadata["runtime.child_completion_source_v1"],
+            source
+        );
     }
 }
 
@@ -714,6 +725,17 @@ async fn terminal_runtime_finish_preserves_skipped_error_and_source() {
             Some("No pending message to execute")
         );
         assert_eq!(saved.metadata["runtime.child_completion_source_v1"], source);
+        let repaired = store
+            .reconcile_child_runtime(&saved, Utc::now(), "error", Some("restart"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repaired.last_run_status(), saved.last_run_status());
+        assert_eq!(repaired.last_run_error(), saved.last_run_error());
+        assert_eq!(
+            repaired.metadata["runtime.child_completion_source_v1"],
+            source
+        );
     }
 }
 

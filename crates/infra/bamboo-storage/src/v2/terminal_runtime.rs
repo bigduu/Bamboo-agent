@@ -327,11 +327,26 @@ impl SessionStoreV2 {
                         .await
                         .map_err(io::Error::other)?;
                 }
-                chosen_status = entry
+                let authoritative = entry
                     .activation
                     .as_ref()
-                    .and_then(|a| terminal_status(a.status))
-                    .map(str::to_string);
+                    .and_then(|a| terminal_status(a.status));
+                if !chosen_status
+                    .as_deref()
+                    .zip(authoritative)
+                    .is_some_and(|(host, actor)| same_terminal_class(host, actor))
+                {
+                    if chosen_status.is_some()
+                        && latest
+                            .metadata
+                            .contains_key("runtime.child_completion_source_v1")
+                    {
+                        return Err(conflict(
+                            "recovery outcome conflicts with committed Host source",
+                        ));
+                    }
+                    chosen_status = authoritative.map(str::to_string);
+                }
                 recovered_fence = entry.activation.as_ref().map(ActorActivation::fence);
             }
         }
@@ -351,7 +366,11 @@ impl SessionStoreV2 {
             );
         }
         after.set_last_run_status(chosen_status.as_deref().unwrap_or(status));
-        if chosen_status.is_none() || expired {
+        if (chosen_status.is_none() || expired)
+            && !latest
+                .metadata
+                .contains_key("runtime.child_completion_source_v1")
+        {
             if let Some(error) = error {
                 after.set_last_run_error(error)
             }
