@@ -1,16 +1,18 @@
 //! Regression for #2450: production Root surface -> real permission checker ->
 //! SessionControlTool -> Host directory. Only the model is a scripted fixture.
 
-use super::*;
-use crate::{app_state::AppState, tools::ToolSurface};
+use bamboo_agent_core::tools::ExecutingSupervisorObservation;
 use bamboo_agent_core::tools::{
     with_executing_session_caller, FunctionCall, ToolCall, ToolError, ToolExecutionContext,
     ToolExecutionSessionFlags, ToolOutcome,
 };
 use bamboo_domain::{Message, SessionCallerReference};
+use bamboo_domain::{Session, SessionAuthorityIdentity, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream};
+use bamboo_server::{tools::ToolSurface, AppState};
 use bamboo_tools::permission::{PermissionConfig, PermissionRule, PermissionType};
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 #[derive(Default)]
@@ -419,4 +421,12 @@ async fn directory_assembled_rejects_ordinary_forged_and_expired_supervisors() {
         .await
         .is_ok());
     f.state.shutdown().await;
+}
+
+async fn root(store: &bamboo_storage::SessionStoreV2, id: &str, project: &str) -> Session {
+    let mut session = Session::new(id, "model");
+    session.set_project_id_meta(project);
+    session.set_workspace_path_meta(format!("/workspace/{id}"));
+    store.save_session(&session).await.unwrap();
+    session
 }
