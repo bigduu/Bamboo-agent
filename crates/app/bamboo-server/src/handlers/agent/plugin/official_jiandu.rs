@@ -21,7 +21,7 @@ use crate::plugin_source::{
 };
 
 mod publisher_trust;
-pub use publisher_trust::trust_official_jiandu;
+pub use publisher_trust::{change_publisher_policy, publisher_policy, trust_official_jiandu};
 use publisher_trust::{observe_trust, PublisherTrustAction};
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -142,7 +142,7 @@ struct Setup {
 }
 
 fn trust_reason(trust: &PluginTrustConfig, release: Option<&Release>) -> Option<&'static str> {
-    if !trust.trusted_keys.iter().any(|key| {
+    if !trust.effective_trusted_keys().iter().any(|key| {
         key.algorithm.eq_ignore_ascii_case("ed25519")
             && key
                 .public_key
@@ -400,6 +400,8 @@ pub async fn install_official_jiandu(
         );
     }
     trust.enforcement = PluginTrustEnforcement::Strict;
+    trust.trusted_keys = trust.effective_trusted_keys();
+    trust.publisher_mode = bamboo_config::PublisherMode::Explicit;
     trust.trusted_keys.retain(|key| {
         key.algorithm.eq_ignore_ascii_case("ed25519")
             && key
