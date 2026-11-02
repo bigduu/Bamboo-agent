@@ -103,7 +103,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // Terminal projection/replay tests and hooks are cfg(test), owned by the
 // default storage packages-0 library. V2's existing test-utils cfg is unchanged;
 // the four additive contexts still own the same 20 feature-only cases.
-const FEATURE_SOURCE_SHA256 = "35aca4a98dcb5e32f1b083d0ca07fe67535c6b4561c85a61c0f4e40110a83340";
+// Host terminal/rejection/queued-closure cases are cfg(test), owned by default
+// engine packages-3 and storage packages-0. SubAgent and V2 retain their exact
+// test-utils cfg expressions; no additive case or automatic owner was added.
+const FEATURE_SOURCE_SHA256 = "48dcb3c0d3ff8e94bf411baf2c1c5c582741d6ba2aa6ae0abc0fc8e6d145054d";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
