@@ -28,11 +28,111 @@ async fn configured_state(proxy: &str) -> (tempfile::TempDir, AppState) {
     configured_state_inner(proxy).await
 }
 
-/// Serializes AppState construction against tests that read the process-global
-/// retry policy.
+/// This guard only serializes builders in this module. Unrelated AppState
+/// publishers do not take it, so assertions against the global retry slot use
+/// an isolated invocation of this same Cargo-built executable below.
 fn policy_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+const POLICY_CASE_ENV: &str = "BAMBOO_RETRY_POLICY_ISOLATED_CASE";
+
+async fn isolated_policy_case(case: &str) -> bool {
+    let full_name = format!("app_state::config_runtime::dependent_runtime_tests::{case}");
+    if let Some(selected) = std::env::var_os(POLICY_CASE_ENV) {
+        assert_eq!(selected, std::ffi::OsStr::new(&full_name));
+        return false;
+    }
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().canonicalize().unwrap();
+    let stdout_path = home.join("stdout");
+    let stderr_path = home.join("stderr");
+    let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", &full_name, "--nocapture", "--test-threads=1"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .env_clear()
+        .env(POLICY_CASE_ENV, &full_name)
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("TMPDIR", &home)
+        .env("TEMP", &home)
+        .env("TMP", &home)
+        .env("RUST_MIN_STACK", "8388608")
+        .stdout(std::fs::File::create(&stdout_path).unwrap())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .kill_on_drop(true);
+    // Retain only executable/platform loader inputs, never provider, workflow
+    // or publication credentials. The case supplies its own synthetic key and
+    // loopback proxy; no Cargo/compiler is launched by the child.
+    for key in [
+        "PATH",
+        "SystemRoot",
+        "WINDIR",
+        "COMSPEC",
+        "LD_LIBRARY_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
+    let mut child = command.spawn().unwrap();
+    let status = match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(status) => Some(status.unwrap()),
+        Err(_) => {
+            child.kill().await.unwrap();
+            None
+        }
+    };
+    let stdout = std::fs::read_to_string(stdout_path).unwrap();
+    let stderr = std::fs::read_to_string(stderr_path).unwrap();
+    assert!(
+        status.is_some_and(|status| status.success())
+            && stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;")
+            && stdout.contains(&format!("retry-policy-assertions-complete:{case}")),
+        "isolated policy case {full_name} failed or did not execute its assertions: \
+         {status:?}\nstdout={stdout}\nstderr={stderr}"
+    );
+    true
+}
+
+#[tokio::test]
+async fn unrelated_app_state_publication_is_not_excluded_by_the_module_guard() {
+    const CASE: &str = "unrelated_app_state_publication_is_not_excluded_by_the_module_guard";
+    if isolated_policy_case(CASE).await {
+        return;
+    }
+    let _key = bamboo_config::encryption::set_test_encryption_key([0x68; 32]);
+    let _guard = policy_lock().lock().await;
+    let sink = request_sink().await;
+    let (_first_dir, first) = configured_state_inner(&sink.uri()).await;
+    let mut core = section(&first, SectionId::Core);
+    core.data["llm_retry"] = serde_json::json!({
+        "max_attempts":11,"attempt_timeout_ms":240_000,"total_budget_ms":1_800_000,
+        "base_delay_ms":900,"max_delay_ms":45_000,
+    });
+    first
+        .put_ordinary_section(SectionId::Core, core.revision, core.data)
+        .await
+        .unwrap();
+    assert_eq!(bamboo_llm::retry::global().max_attempts, 11);
+    // This is the real constructor used by sibling modules, not the guarded
+    // helper. It can publish None while the module's guard remains held.
+    let second_dir = tempfile::tempdir().unwrap();
+    let mut second = AppState::new(second_dir.path().to_path_buf())
+        .await
+        .unwrap();
+    second.stop_config_watcher_for_test();
+    assert_eq!(
+        bamboo_llm::retry::global().max_attempts,
+        bamboo_llm::retry::RetryConfig::from_env().max_attempts
+    );
+    assert_ne!(bamboo_llm::retry::global().max_attempts, 11);
+    assert!(policy_lock().try_lock().is_err());
+    println!("retry-policy-assertions-complete:{CASE}");
 }
 
 async fn configured_state_inner(proxy: &str) -> (tempfile::TempDir, AppState) {
@@ -434,6 +534,10 @@ async fn dependent_cancelled_commit_finishes_before_later_configuration_generati
 /// using the previous policy until a restart or an unrelated edit.
 #[tokio::test]
 async fn accepted_core_write_publishes_the_llm_retry_policy_to_the_provider_layer() {
+    const CASE: &str = "accepted_core_write_publishes_the_llm_retry_policy_to_the_provider_layer";
+    if isolated_policy_case(CASE).await {
+        return;
+    }
     let _key = bamboo_config::encryption::set_test_encryption_key([0x63; 32]);
     // Hold the builder guard across build + write + read: a sibling test's
     // AppState construction would otherwise republish the defaults mid-flight.
@@ -468,6 +572,7 @@ async fn accepted_core_write_publishes_the_llm_retry_policy_to_the_provider_laye
     assert_eq!(published.max_delay, Duration::from_millis(45_000));
     assert_eq!(limits.attempt_timeout, Duration::from_millis(240_000));
     assert_eq!(limits.total_budget, Duration::from_millis(1_800_000));
+    println!("retry-policy-assertions-complete:{CASE}");
 }
 
 /// An unset policy must not be published. Otherwise upgrading a deployment that
@@ -475,6 +580,10 @@ async fn accepted_core_write_publishes_the_llm_retry_policy_to_the_provider_laye
 /// defaults, because publication stops the environment from being consulted.
 #[tokio::test]
 async fn unset_llm_retry_leaves_the_environment_derived_policy_in_force() {
+    const CASE: &str = "unset_llm_retry_leaves_the_environment_derived_policy_in_force";
+    if isolated_policy_case(CASE).await {
+        return;
+    }
     let _key = bamboo_config::encryption::set_test_encryption_key([0x65; 32]);
     let _guard = policy_lock().lock().await;
     let sink = request_sink().await;
@@ -509,12 +618,17 @@ async fn unset_llm_retry_leaves_the_environment_derived_policy_in_force() {
     );
     assert_eq!(kept_limits.attempt_timeout, Duration::from_millis(111_000));
     assert_eq!(kept_limits.total_budget, Duration::from_millis(1_234_000));
+    println!("retry-policy-assertions-complete:{CASE}");
 }
 
 /// Removing a previously saved policy must drop the live override, otherwise
 /// requests keep using settings the configuration no longer contains.
 #[tokio::test]
 async fn removing_the_persisted_policy_clears_the_published_override() {
+    const CASE: &str = "removing_the_persisted_policy_clears_the_published_override";
+    if isolated_policy_case(CASE).await {
+        return;
+    }
     let _key = bamboo_config::encryption::set_test_encryption_key([0x66; 32]);
     let _guard = policy_lock().lock().await;
     let sink = request_sink().await;
@@ -552,6 +666,7 @@ async fn removing_the_persisted_policy_clears_the_published_override() {
         "a removed policy must not stay in force"
     );
     assert_eq!(after_removal.max_attempts, previous_retry.max_attempts);
+    println!("retry-policy-assertions-complete:{CASE}");
 }
 
 /// Resetting Core removes the saved policy, so it must clear the live override
@@ -559,6 +674,10 @@ async fn removing_the_persisted_policy_clears_the_published_override() {
 /// repair this afterwards.
 #[tokio::test]
 async fn resetting_core_clears_the_published_retry_policy() {
+    const CASE: &str = "resetting_core_clears_the_published_retry_policy";
+    if isolated_policy_case(CASE).await {
+        return;
+    }
     let _key = bamboo_config::encryption::set_test_encryption_key([0x67; 32]);
     let _guard = policy_lock().lock().await;
     let sink = request_sink().await;
@@ -594,6 +713,7 @@ async fn resetting_core_clears_the_published_retry_policy() {
         after_reset.max_attempts, 7,
         "resetting Core must not leave the saved policy active"
     );
+    println!("retry-policy-assertions-complete:{CASE}");
 }
 
 /// An out-of-range policy must be rejected before it is committed, so the API
