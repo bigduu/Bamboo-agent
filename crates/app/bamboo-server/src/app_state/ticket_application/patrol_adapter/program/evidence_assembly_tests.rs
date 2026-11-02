@@ -616,8 +616,31 @@ fn native_staged_evidence_survives_failed_ack_source_change_and_cold_reopen() {
         "{}::native_staged_evidence_survives_failed_ack_source_change_and_cold_reopen",
         module_path!().strip_prefix("bamboo_server::").unwrap()
     );
+    let fixture_home = root.join("seed-home");
+    let fixture_temp = root.join("seed-tmp");
+    for directory in [
+        fixture_home.clone(),
+        fixture_home.join("config"),
+        fixture_home.join("data"),
+        fixture_home.join("cache"),
+        fixture_temp.clone(),
+    ] {
+        std::fs::create_dir_all(directory).unwrap();
+    }
+    // This native child receives no parent credentials, workflow channels or
+    // ambient user configuration. Git uses only the standard Unix tool path.
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", &case, "--nocapture", "--test-threads=1"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("HOME", &fixture_home)
+        .env("XDG_CONFIG_HOME", fixture_home.join("config"))
+        .env("XDG_DATA_HOME", fixture_home.join("data"))
+        .env("XDG_CACHE_HOME", fixture_home.join("cache"))
+        .env("TMPDIR", &fixture_temp)
+        .env("TMP", &fixture_temp)
+        .env("TEMP", &fixture_temp)
+        .env("RUST_MIN_STACK", "8388608")
         .env(SEED, &root)
         .output()
         .unwrap();
