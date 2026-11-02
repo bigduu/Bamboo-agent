@@ -201,7 +201,17 @@ impl SessionStoreV2 {
                 .as_deref()
                 .is_some_and(|prior| same_terminal_class(prior, status))
             {
-                return Err(ActorDirectoryError::InvalidTransition);
+                if before.host_run_id().is_some()
+                    || before
+                        .metadata
+                        .contains_key("runtime.child_completion_source_v1")
+                {
+                    return Err(ActorDirectoryError::InvalidTransition);
+                }
+                // An unmarked legacy predecessor without a sealed Host source
+                // cannot override this exact current activation's outcome.
+                after.set_last_run_status(status);
+                after.clear_last_run_error();
             }
         } else {
             after.set_last_run_status(status);
@@ -465,7 +475,7 @@ impl SessionStoreV2 {
                 return Err(conflict("Host runtime writer would reopen a terminal run"));
             }
         }
-        let mut candidate = incoming.clone();
+        let candidate = incoming.clone();
         if !candidate.host_run_matches_launch()
             && candidate.last_run_status().as_deref() != Some("pending")
         {
@@ -531,11 +541,6 @@ impl SessionStoreV2 {
                         return Err(conflict("Host outcome conflicts with committed activation"));
                     }
                 }
-            }
-        }
-        if !candidate.has_runtime_wait() && !pending_delivery(&candidate) {
-            if !idle_control_state(&candidate) {
-                candidate.synchronize_terminal_runtime_status();
             }
         }
         Ok(candidate)

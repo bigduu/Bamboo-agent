@@ -10685,10 +10685,14 @@ mod tests {
                 let persisted = store.load_session(&child.id).await.unwrap().unwrap();
                 assert_eq!(persisted.messages.last().unwrap().content, "PRIVATE_REPLY");
             }
-            assert!(activation
-                .finish_with_observer(ActorActivationFinish::Succeeded, Some(&observer))
-                .await
-                .is_err());
+            assert_eq!(
+                activation
+                    .finish_with_observer(ActorActivationFinish::Succeeded, Some(&observer))
+                    .await
+                    .is_ok(),
+                result.is_ok(),
+                "{cut}: exact finish retries its committed outcome"
+            );
             assert_eq!(
                 observer.events.lock().unwrap().len(),
                 events.len(),

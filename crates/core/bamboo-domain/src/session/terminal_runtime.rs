@@ -17,6 +17,23 @@ impl Session {
             "runtime.host_launch_generation".into(),
             self.child_launch_generation().to_string(),
         );
+        // Materialize the new Host runtime before its completion source can
+        // bind the pipeline identity. Keep durable waits and accounting.
+        if self.agent_runtime_state.is_none() {
+            self.agent_runtime_state = self
+                .metadata
+                .get("agent.runtime.state")
+                .and_then(|raw| serde_json::from_str(raw).ok());
+        }
+        if !self.has_runtime_wait() {
+            let state = self
+                .agent_runtime_state
+                .get_or_insert_with(|| AgentRuntimeState::new(&self.id));
+            state.status = AgentStatusState::Initializing;
+            if let Ok(raw) = serde_json::to_string(state) {
+                self.metadata.insert("agent.runtime.state".into(), raw);
+            }
+        }
     }
 
     pub fn host_run_matches_launch(&self) -> bool {
@@ -70,6 +87,15 @@ impl Session {
                 .metadata
                 .get("agent.runtime.state")
                 .and_then(|raw| serde_json::from_str::<AgentRuntimeState>(raw).ok());
+        }
+        // Legacy sources can bind the absence of a runtime identity. Adding
+        // one after sealing would invalidate their exact completion proof.
+        if self.agent_runtime_state.is_none()
+            && self
+                .metadata
+                .contains_key("runtime.child_completion_source_v1")
+        {
+            return;
         }
         let state = self
             .agent_runtime_state

@@ -20,6 +20,10 @@ that wait or turn the Session into completed. A marked in-flight Host run retain
 authorizes finishing a live activation. Confirmed terminal projection retains
 round/accounting fields and updates both the typed state and its legacy mirror.
 Active tool counts become zero only with the terminal projection.
+Host binding materializes runtime identity before sealing a new result. A legacy
+sealed result that bound an absent runtime retains that absence; adding a new
+identity afterward would invalidate its proof. It has no nonterminal typed state
+to repair. Ordinary saves validate identity without rewriting sealed snapshots.
 After a completed child wait explicitly opens the next input gate, `Idle` is a
 valid later control state. Replaying the preceding terminal outcome preserves
 that gate; it repairs stale `Initializing`/`Running` state instead.
