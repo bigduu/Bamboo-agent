@@ -35,8 +35,21 @@ test("feature shards partition package targets and additive owners exactly once"
   const agentFirst = integrationTargets(agent, "agent-tests-0");
   for (const name of ["ticket_runtime_files", "ticket_runtime_publication"]) assert.ok(agentFirst.includes(name));
   const server = packages.find(item => item.name === "bamboo-server");
+  assert.deepEqual(["server-tests-0", "server-tests-1"].filter(shard =>
+    integrationTargets(server, shard).includes("ready_work_scheduler")), ["server-tests-1"]);
+  assert.ok(!FEATURE_CONTEXTS.filter(context => context.package === server.name)
+    .some(context => context.targets.some(target => target.name === "ready_work_scheduler")),
+  "Ready owner cases use their existing default integration owner, without additive repetition");
+  assert.deepEqual(["server-tests-0", "server-tests-1"].filter(shard =>
+    integrationTargets(server, shard).includes("native_work_token_budget")), ["server-tests-0"]);
+  assert.ok(!FEATURE_CONTEXTS.filter(context => context.package === server.name)
+    .some(context => context.targets.some(target => target.name === "native_work_token_budget")),
+  "Budget owner HTTP cases use their default integration owner without additive repetition");
+  assert.equal(packageShard("bamboo-tickets"), "packages-0");
   for (const name of ["browser::one", "handlers::agent::chat::browser::two", "handlers::agent::execute::x",
-    "handlers::settings::x", "app_state::x", "handlers::other", "misc::other"]) {
+    "handlers::settings::x", "app_state::x", "handlers::other", "misc::other",
+    "handlers::agent::tickets::token_budget::tests::verified_worker_credentials_cannot_read_or_configure_owner_budget",
+    "handlers::agent::tickets::ready_policy::tests::verified_worker_credentials_cannot_observe_or_install_owner_policy"]) {
     const matches = SERVER_LIB_SHARDS.filter((shard, index) => {
       const positive = index >= SERVER_FILTERS.length || name.includes(SERVER_FILTERS[index]);
       return positive && !SERVER_FILTERS.slice(0, index).some(filter => name.includes(filter));

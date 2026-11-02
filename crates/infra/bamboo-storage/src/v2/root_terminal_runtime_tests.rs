@@ -7,6 +7,47 @@ use bamboo_domain::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[tokio::test]
+async fn root_terminal_unactivated_legacy_host_is_unknown_after_actual_main_fault() {
+    for phase in [
+        DurableWritePhase::BeforeReplace,
+        DurableWritePhase::AfterReplace,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut root = Session::new("unactivated-root", "model");
+        root.session_version = None;
+        root.agent_runtime_state = Some(AgentRuntimeState::new("legacy-run-A"));
+        root.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Initializing;
+        root.set_last_run_status("running");
+        store.save_session(&root).await.unwrap();
+        root.set_last_run_status("completed");
+        let fault = DefaultWriteHook::install(&store, "session.json", phase, true);
+        fault.release();
+        assert!(store.save_session(&root).await.is_err());
+        *store.default_write_hook.lock().unwrap() = None;
+        store.flush_search_index().await;
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let observed = reopened.load_session(&root.id).await.unwrap().unwrap();
+        let path = home.path().join("sessions/unactivated-root/runtime.json");
+        let before = fs::read(&path).await.unwrap();
+        assert!(reopened
+            .reconcile_session_runtime(
+                &observed,
+                Utc::now(),
+                None,
+                Arc::new(|_| panic!("unactivated legacy Root has no current run proof"))
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(&path).await.unwrap(), before);
+        assert!(!path.with_file_name("actor-authority.json").exists());
+        reopened.flush_search_index().await;
+    }
+}
+
 struct Fixture {
     home: tempfile::TempDir,
     store: Arc<SessionStoreV2>,
@@ -339,6 +380,134 @@ async fn root_terminal_full_save_real_faults_use_only_confirmed_main_outcome() {
         }
     }
 }
+#[tokio::test]
+async fn root_terminal_main_cancel_failure_and_suspension_override_diagnostic_only() {
+    for (status, typed, activation) in [
+        (
+            "cancelled",
+            AgentStatusState::Cancelled,
+            ActorActivationStatus::Cancelled,
+        ),
+        (
+            "error",
+            AgentStatusState::Failed,
+            ActorActivationStatus::Failed,
+        ),
+        (
+            "suspended",
+            AgentStatusState::Suspended,
+            ActorActivationStatus::Succeeded,
+        ),
+    ] {
+        let f = Fixture::new(true, 300).await;
+        let mut final_save = f.current().await;
+        final_save.set_last_run_status(status);
+        if status == "suspended" {
+            let state = final_save.agent_runtime_state.as_mut().unwrap();
+            state.status = typed;
+            state.suspension = Some(SuspensionState {
+                reason: "awaiting_clarification".into(),
+                suspended_at: Utc::now(),
+                resumable: true,
+                hook_point: None,
+            });
+        } else {
+            final_save.synchronize_terminal_runtime_status();
+        }
+        f.store
+            .save_finalized_root_actor_runtime(&f.owner, &mut final_save, None, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        let main = fs::read(f.path("session.json")).await.unwrap();
+        let finished = f
+            .store
+            .finish_root_activation_observed(
+                &f.owner,
+                Utc::now(),
+                ActorActivationFinish::Failed,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(finished.status, activation);
+        let after = f.current().await;
+        assert_eq!(after.last_run_status().as_deref(), Some(status));
+        assert_eq!(after.agent_runtime_state.as_ref().unwrap().status, typed);
+        if status == "suspended" {
+            assert!(after.has_runtime_wait());
+        }
+        f.reconcile(Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(f.path("session.json")).await.unwrap(), main);
+    }
+}
+
+#[tokio::test]
+async fn root_terminal_scope_observation_survives_actor_refresh_without_project_aba() {
+    for mode in ["one-ui", "two-ui", "project-aba"] {
+        let f = Fixture::new(false, 300).await;
+        f.store
+            .finish_root_activation_observed(
+                &f.owner,
+                Utc::now(),
+                ActorActivationFinish::Failed,
+                None,
+            )
+            .await
+            .unwrap();
+        let original_marker = f.current().await.metadata[ROOT_OBSERVATION].clone();
+        let steps = if mode == "one-ui" { 1 } else { 2 };
+        for step in 0..steps {
+            let mut current = f.current().await;
+            current.metadata_version += 1;
+            current.title = format!("ordinary UI revision {step}");
+            if mode == "project-aba" {
+                current.set_project_id_meta(if step == 0 {
+                    "other-project"
+                } else {
+                    "synthetic-project"
+                });
+            }
+            current.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Initializing;
+            current.metadata.insert(
+                "agent.runtime.state".into(),
+                serde_json::to_string(current.agent_runtime_state.as_ref().unwrap()).unwrap(),
+            );
+            f.store.save_runtime_state(&current).await.unwrap();
+            // A fresh directory observation is not permission to refresh the
+            // older writer marker or forget the Project transition history.
+            f.store.inspect_actor(&f.root.id).await.unwrap();
+            assert_eq!(
+                f.current().await.metadata[ROOT_OBSERVATION],
+                original_marker
+            );
+        }
+        let before = fs::read(f.path("runtime.json")).await.unwrap();
+        let repaired = f
+            .reconcile(Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap();
+        assert_eq!(repaired.is_some(), mode == "one-ui");
+        if mode == "one-ui" {
+            assert_typed(&f.current().await, "error", AgentStatusState::Failed);
+        } else {
+            assert!(f
+                .store
+                .finish_root_activation_observed(
+                    &f.owner,
+                    Utc::now(),
+                    ActorActivationFinish::Failed,
+                    None
+                )
+                .await
+                .is_err());
+            assert_eq!(fs::read(f.path("runtime.json")).await.unwrap(), before);
+        }
+    }
+}
+
 #[tokio::test]
 async fn root_terminal_first_write_failure_is_attributed_and_late_a_cannot_touch_c() {
     let f = Fixture::new(false, 300).await;

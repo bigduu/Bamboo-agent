@@ -1047,7 +1047,10 @@ impl ActorDirectoryPort for SessionStoreV2 {
             || !current.authority_identity.is_ordinary()
             || expected.created_at != current.created_at
             || expected.authority_identity != current.authority_identity
-            || expected.metadata_version != current.metadata_version
+            || !current
+                .metadata_version
+                .checked_sub(expected.metadata_version)
+                .is_some_and(|delta| delta <= 1)
             || expected.project_id_meta() != current.project_id_meta()
             || expected.parent_session_id != current.parent_session_id
             || expected.parent_created_at != current.parent_created_at
