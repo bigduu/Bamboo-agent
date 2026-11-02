@@ -181,6 +181,7 @@ pub trait Storage: Send + Sync {
 
     /// Return the exact candidate committed by the title transaction, including
     /// backend-owned bookkeeping. Confirmation must still validate this value.
+    /// Backends which normalize the candidate must override this method.
     async fn save_manual_title_committed(&self, session: &Session) -> std::io::Result<Session> {
         self.save_manual_title(session).await?;
         Ok(session.clone())
