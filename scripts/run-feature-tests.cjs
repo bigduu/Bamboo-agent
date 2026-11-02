@@ -100,7 +100,13 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
 // The C1 pending predicates add two ordinary domain packages-2 cases and three
 // server-handlers Actix cases; none is an additive feature-only case.
-const FEATURE_SOURCE_SHA256 = "bbebd1f968007e8616f7e11ae284de0f1ad423e92fc71c5acd1225f629abd0aa";
+// #2453 adds an unconditional token-budget owner module to TicketApplication,
+// whose existing ticket-runtime-fixtures cfg fingerprints its complete source.
+// Five canonical configuration cases join default bamboo-tickets/packages-0;
+// four native HTTP cases join native_work_token_budget/server-tests-0; the
+// Worker-auth case belongs to server-handlers. No feature cfg, package graph,
+// additive context or its 20 explicit cases changed.
+const FEATURE_SOURCE_SHA256 = "11f1eff75f7cd5694a1a8c891a5ba2ce9d6699fb4801cba2fe1c190849d1ff62";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

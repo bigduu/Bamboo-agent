@@ -1,4 +1,6 @@
 use bamboo_tickets::*;
+#[path = "execution_budget/owner_setup.rs"]
+mod owner_setup;
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::{Arc, Barrier},

@@ -390,6 +390,36 @@ impl TicketService {
         expected_revision: u64,
         limits: WorkTokenLimits,
     ) -> Result<u64> {
+        self.configure_work_token_budget_inner(authority, None, expected_revision, limits)
+            .map(|configuration| configuration.revision)
+    }
+
+    /// Owner-facing configuration identity is the scope's next budget revision.
+    /// Exact retries read its original immutable decision, even after later
+    /// configurations or spending. The current authority epoch is checked under
+    /// the same canonical transaction lock; no executable permission is stored.
+    pub fn configure_work_token_budget_at_epoch(
+        &self,
+        authority: &Authority,
+        authority_epoch: u64,
+        expected_revision: u64,
+        limits: WorkTokenLimits,
+    ) -> Result<WorkTokenConfiguration> {
+        self.configure_work_token_budget_inner(
+            authority,
+            Some(authority_epoch),
+            expected_revision,
+            limits,
+        )
+    }
+
+    fn configure_work_token_budget_inner(
+        &self,
+        authority: &Authority,
+        authority_epoch: Option<u64>,
+        expected_revision: u64,
+        limits: WorkTokenLimits,
+    ) -> Result<WorkTokenConfiguration> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
             .published
@@ -402,6 +432,25 @@ impl TicketService {
                 "explicit User token-budget decision required".into(),
             ));
         };
+        if authority_epoch.is_some_and(|epoch| epoch != snapshot.authority_epoch) {
+            return Err(Error::RevisionConflict);
+        }
+        if authority_epoch.is_some() {
+            let revision = expected_revision
+                .checked_add(1)
+                .ok_or(Error::RevisionConflict)?;
+            if let Some(previous) = snapshot
+                .execution_budget
+                .as_ref()
+                .and_then(|budget| budget.configurations.get(&revision))
+            {
+                return if previous.user_id == *user_id && previous.limits == limits {
+                    Ok(previous.clone())
+                } else {
+                    Err(Error::IdempotencyConflict)
+                };
+            }
+        }
         if store.health != Health::Writable {
             return Err(Error::AuthorityUnavailable(
                 "token ledger is not writable".into(),
@@ -444,22 +493,20 @@ impl TicketService {
         let configuration_limits = budget.limits.clone();
         next.schema = next.schema.max(8);
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
+        let configuration = WorkTokenConfiguration {
+            revision,
+            user_id: user_id.clone(),
+            committed_seq: next.seq,
+            limits: configuration_limits,
+        };
         next.execution_budget
             .as_mut()
             .expect("configured")
             .configurations
-            .insert(
-                revision,
-                WorkTokenConfiguration {
-                    revision,
-                    user_id: user_id.clone(),
-                    committed_seq: next.seq,
-                    limits: configuration_limits,
-                },
-            );
+            .insert(revision, configuration.clone());
         crate::service::validate_snapshot(&next)?;
         store.publish_accounting(next)?;
-        Ok(revision)
+        Ok(configuration)
     }
 
     pub fn work_token_budget(&self, authority: &Authority) -> Result<Option<WorkTokenBudget>> {
