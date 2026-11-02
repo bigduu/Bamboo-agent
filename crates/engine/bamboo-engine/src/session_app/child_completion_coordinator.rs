@@ -4047,7 +4047,7 @@ impl ChildCompletionCoordinator {
         child_session_id: &str,
         status: &str,
         error: Option<String>,
-        before: DateTime<Utc>,
+        before: chrono::DateTime<Utc>,
     ) {
         let Ok(Some(child)) = self.storage.load_session(child_session_id).await else {
             return;
