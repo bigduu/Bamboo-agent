@@ -64,7 +64,7 @@ pub struct SessionExecutionReservation {
     runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     activation: SessionExecutionActivationOwnership,
     root_actor: Option<Box<RootActorExecution>>,
-    child_startup: Option<ChildHostStartup>,
+    child_startup: Option<Box<ChildHostStartup>>,
     child_closure: Option<tokio::task::JoinHandle<()>>,
     physical_admission: Option<super::root_execution_lifetime::RootRunAdmission>,
     execution_persistence: Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>,
@@ -120,7 +120,7 @@ impl SessionExecutionReservation {
                 .map(|runner| runner.event_publication.clone())
                 .ok_or_else(|| std::io::Error::other("Child startup runner was superseded"))?;
             let sent = std::sync::atomic::AtomicBool::new(false);
-            self.child_startup = Some(ChildHostStartup {
+            self.child_startup = Some(Box::new(ChildHostStartup {
                 storage: agent.storage().clone(),
                 expected: expected.clone(),
                 run_id: self.run_id.clone(),
@@ -141,7 +141,7 @@ impl SessionExecutionReservation {
                         }
                     });
                 }),
-            });
+            }));
         }
         Ok(())
     }
