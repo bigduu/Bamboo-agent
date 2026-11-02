@@ -112,6 +112,16 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 json!({"cmd":command,"workdir":probe.workspace,"yield_time_ms":30000,"max_output_tokens":256}),
             )
         } else if matches!(probe.case, Case::Failed) {
+            // exec_command may yield its live handle after 30s. Keep the
+            // provider pending until the test releases that same command;
+            // the intended failure must not pre-empt the quiet-work check.
+            tokio::time::timeout(Duration::from_secs(90), async {
+                while !probe.workspace.join("verifier-release").exists() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
             return HttpResponse::BadRequest().json(json!({"error":{"type":"invalid_request_error","message":"controlled verifier provider failure"}}));
         } else if matches!(probe.case, Case::Question)
             && !has_tool_result(&body, "verifier-question")
@@ -240,10 +250,10 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             })
             .await
             .unwrap();
-            if matches!(probe.case, Case::Failed) {
-                // Cross the real worker's five-second renewal tick while
-                // diagnostics, the command and its work state stay unchanged.
-                tokio::time::sleep(Duration::from_secs(3)).await;
+            if matches!(probe.case, Case::Failed) && probe.inspections.load(Ordering::SeqCst) > 0 {
+                // The native actor adapter renews every 30s (LocalTask uses
+                // 5s). Three observations span 32s and must include renewal.
+                tokio::time::sleep(Duration::from_secs(16)).await;
             }
             let batch = probe.inspections.fetch_add(wanted, Ordering::SeqCst) / wanted;
             let calls: Vec<_> = (0..wanted).map(|index| json!({"index":index,"id":format!("inspect-{batch}-{index}"),"type":"function","function":{
@@ -542,15 +552,20 @@ async fn fixture(case: Case, ultra: bool) {
     );
     let calls = probe.root_calls.load(Ordering::SeqCst);
     if matches!(case, Case::Failed) {
-        let diagnostics: Vec<Value> = probe
-            .requests
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(|body| {
-                (0..3)
-                    .rev()
-                    .find_map(|batch| result(body, &format!("inspect-{batch}-0")))
+        // The third result itself suspends the runner, so it is durable but
+        // intentionally never sent in another provider request.
+        let diagnostics: Vec<Value> = (0..3)
+            .map(|batch| {
+                let id = format!("inspect-{batch}-0");
+                let message = sleeping
+                    .messages
+                    .iter()
+                    .find(|message| {
+                        message.role == Role::Tool
+                            && message.tool_call_id.as_deref() == Some(id.as_str())
+                    })
+                    .unwrap_or_else(|| panic!("missing durable diagnostic {id}"));
+                serde_json::from_str(&message.content).unwrap()
             })
             .collect();
         let revisions: std::collections::BTreeSet<_> = diagnostics
