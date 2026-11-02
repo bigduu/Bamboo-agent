@@ -116,7 +116,15 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // contexts and 20 explicit cases remain unchanged.
 // Admitted #2469 runtime observation and #2460 terminal-save integration keep
 // their existing default owners; no additive context or case selection changes.
-const FEATURE_SOURCE_SHA256 = "143a80bacac0a3f8b198dd2594586ac334e8d4d19ac6d737fe2fc6db4552f6f4";
+// #2453 adds an unconditional token-budget owner module to TicketApplication,
+// whose existing ticket-runtime-fixtures cfg fingerprints its complete source.
+// Five canonical configuration cases join default bamboo-tickets/packages-0;
+// four native HTTP cases join native_work_token_budget/server-tests-0; the
+// Worker-auth case belongs to server-handlers. No feature cfg, package graph,
+// additive context or its 20 explicit cases changed.
+// Both owner entrances now share the actual HTTP acceptance path. Their
+// original default owners remain distinct, with no additive case repetition.
+const FEATURE_SOURCE_SHA256 = "558974d3f22a075245a030292d0b9754f5482085837552d825dbf07837866fa0";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
