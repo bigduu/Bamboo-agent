@@ -57,7 +57,11 @@ fn idle_control_state(session: &Session) -> bool {
 }
 
 impl SessionStoreV2 {
-    async fn projection_target(&self, id: &str, rel: &str) -> io::Result<Option<Session>> {
+    pub(super) async fn projection_target(
+        &self,
+        id: &str,
+        rel: &str,
+    ) -> io::Result<Option<Session>> {
         let (kind, root) = Self::copy_source_identity_from_rel(id, rel)?;
         Self::regular_actor_file(
             &self
