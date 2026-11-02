@@ -226,7 +226,8 @@ async fn terminal_runtime_real_sdk_final_save_fault_requires_retry_before_reopen
         );
         std::fs::remove_dir(&main).unwrap();
         std::fs::rename(main.with_extension("held"), &main).unwrap();
-        let before = std::fs::read(&main).unwrap();
+        let before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&main).unwrap()).unwrap();
         harness
             .ctx
             .agent
@@ -234,6 +235,7 @@ async fn terminal_runtime_real_sdk_final_save_fault_requires_retry_before_reopen
             .checkpoint_runtime_session(&mut retry)
             .await
             .unwrap();
+        let committed_main = std::fs::read(&main).unwrap();
         harness
             .ctx
             .agent
@@ -251,10 +253,15 @@ async fn terminal_runtime_real_sdk_final_save_fault_requires_retry_before_reopen
         assert!(
             crate::execution::ChildCompletionSource::from_committed_session(&durable).is_some()
         );
+        let after: serde_json::Value = serde_json::from_slice(&committed_main).unwrap();
+        assert_eq!(
+            after["messages"], before["messages"],
+            "Host final-save retains the canonical transcript"
+        );
         assert_eq!(
             std::fs::read(&main).unwrap(),
-            before,
-            "runtime retry preserves canonical Main"
+            committed_main,
+            "duplicate final-save retains the same committed Main bytes"
         );
     }
 }
