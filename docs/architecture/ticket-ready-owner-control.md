@@ -119,6 +119,13 @@ Run focused cases with:
 RUST_MIN_STACK=8388608 cargo test --locked -p bamboo-server --test ready_work_scheduler owner_control
 ```
 
+The existing default `server-tests-1` shard owns all six owner integration cases;
+the Worker-auth library case belongs to default `server-handlers`. No additive
+feature-only case, separate workflow, or package configuration is added. The
+existing `ticket-runtime-fixtures` cfg fingerprints the whole TicketApplication
+source file, so its source digest and ownership routing guard are updated
+together in `scripts/run-feature-tests{,.test}.cjs`.
+
 The final Issue/PR records exact source and executed counts for the affected
 crate suites and directory/wait/lifecycle regressions. Until those runs complete,
 test presence is not a green acceptance result. Controlled provider evidence

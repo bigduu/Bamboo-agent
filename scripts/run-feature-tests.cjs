@@ -100,7 +100,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // They add no feature-only cfg or new owner. The 20 additive cases are unchanged.
 // The C1 pending predicates add two ordinary domain packages-2 cases and three
 // server-handlers Actix cases; none is an additive feature-only case.
-const FEATURE_SOURCE_SHA256 = "bbebd1f968007e8616f7e11ae284de0f1ad423e92fc71c5acd1225f629abd0aa";
+// #2452 adds unconditional owner policy control beneath TicketApplication;
+// its existing ticket-runtime-fixtures cfg fingerprints that whole source file.
+// The Worker-auth library case belongs to default server-handlers; six
+// owner cases join default ready_work_scheduler in server-tests-1. No feature
+// cfg, package graph, additive context or its 20 explicit cases changed.
+const FEATURE_SOURCE_SHA256 = "9c398e197b10110a3da7463fac10b3e51f3fd0ad70612a70345ca8c15b4d200a";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [
