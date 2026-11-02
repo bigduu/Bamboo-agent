@@ -1,6 +1,12 @@
 # Terminal runtime consistency
 
-Tracking: [#2448](https://github.com/bigduu/Bamboo-agent/issues/2448); this slice is [#2454](https://github.com/bigduu/Bamboo-agent/issues/2454).
+Tracking: [#2448](https://github.com/bigduu/Bamboo-agent/issues/2448).
+Storage projection is [#2454](https://github.com/bigduu/Bamboo-agent/issues/2454);
+Child final-save and terminal consumers are [#2460](https://github.com/bigduu/Bamboo-agent/issues/2460).
+Exact Child admission remains [#2481](https://github.com/bigduu/Bamboo-agent/issues/2481),
+receipt replay [#2468](https://github.com/bigduu/Bamboo-agent/issues/2468),
+Root outcome/recovery [#2470](https://github.com/bigduu/Bamboo-agent/issues/2470),
+and Child startup/parent proof [#2455](https://github.com/bigduu/Bamboo-agent/issues/2455).
 
 Session owns identity and context. An ActorActivation owns one fenced attempt.
 A Worker supplies reclaimable execution capacity. Neither an absent local runner
@@ -31,8 +37,8 @@ that gate; it repairs stale `Initializing`/`Running` state instead.
 ## Identity and persistence
 
 The `Storage::begin_host_run` port binds `runtime.host_run_id` to a reserved Run.
-[Host/SDK entrypoint integration](https://github.com/bigduu/Bamboo-agent/issues/2460)
-follows this Storage slice; it is not enabled by this PR. Storage compares the prior Host identity and Session
+[Exact Host entrypoint integration](https://github.com/bigduu/Bamboo-agent/issues/2481)
+remains separate; final-save synchronization alone does not enable it. Storage compares the prior Host identity and Session
 incarnation under the physical Session lock, and refuses a different live Actor
 owner. This dedicated transition preserves canonical content. Ordinary full and
 runtime saves cannot change that Host identity. The captured child launch generation prevents an old activation from consuming a newer pending retry/reset/accumulate. The pipeline/Ticket runtime
@@ -41,7 +47,7 @@ Copying a Session removes the Host Run identity.
 Ordinary legacy writers with neither incoming nor persisted Host UUID retain
 their existing contract until the Host integration binds a run. They receive no
 new activation or physical-stop proof. The first binding and automatic orphan
-notifications remain the explicit #2460/#2455 admission boundaries; this slice
+notifications remain the explicit #2481/#2455 admission boundaries; this slice
 does not retrofit identity by guessing from an unmarked legacy snapshot.
 
 `finish_activation` validates the full activation fence. It commits authority
@@ -52,9 +58,21 @@ revision. A different outcome or successor attempt rejects the old finish.
 Final-save and recovery cannot overwrite a later Host Run, even when both
 pipeline runtimes use the same Session ID and omit `execution_id`.
 
+Child SDK and resumed Child final-save synchronize typed state and the legacy
+mirror before sealing the terminal source. Genuine typed waits are honored even
+without a legacy suspend-reason string. An explicit queued rerun consumes its old
+question/approval handoff just as the existing metadata contract does; independently
+owned child/Bash/plan waits and waits created by the current run remain intact.
+Native safe prelaunch cleanup synchronizes its owned failure before publishing
+the cache. Unknown physical cleanup remains quarantined by its existing owner.
+
 Strict broker delivery keeps its existing pending source/receipt boundary.
 Pending publication is not repaired into an exposed completion. Committed
 receipt publication synchronizes typed status in its existing exact-snapshot CAS.
+The SDK temporarily withholds terminal typed state with the pending source,
+then restores the intended typed state and mirror for the existing proof commit.
+Published-source phase replay still belongs to #2468. Queued launch consumers
+treat completed/cancelled/error as stale; only running/suspended means started.
 
 ## Recovery boundary
 
