@@ -1,7 +1,10 @@
 //! Assembly for the existing opt-in Ready worker; no new loop or policy grant.
 
 use super::super::{Error, Principal, Result, TicketApplication};
-use super::{patrol_error, runtime_observation, PatrolCheckpointStore};
+use super::{
+    checkpoint_record::{self, NoticeSource},
+    patrol_error, runtime_observation, PatrolCheckpointStore,
+};
 use bamboo_orchestration::{
     patrol::{
         program::{ProgramPatrol, ProgramSelection},
@@ -9,6 +12,9 @@ use bamboo_orchestration::{
     },
     ReadyAdmissionFence,
 };
+
+#[cfg(all(test, unix))]
+mod evidence_assembly_tests;
 
 struct SystemClock(u64);
 impl Clock for SystemClock {
@@ -62,7 +68,16 @@ impl CheckpointPort for FencedJournal {
         checkpoint: &Checkpoint,
     ) -> std::result::Result<u64, PortError> {
         self.current()?;
-        let saved = self.store.save(version, checkpoint)?;
+        let previous = self.store.load(&checkpoint.scope)?;
+        let source = if checkpoint_record::new_escalation(
+            previous.as_ref().map(|r| &r.checkpoint),
+            checkpoint,
+        ) {
+            Some(NoticeSource::capture(&self.service, checkpoint)?)
+        } else {
+            None
+        };
+        let saved = self.store.save_with_source(version, checkpoint, source)?;
         self.current()?;
         Ok(saved)
     }
@@ -174,7 +189,14 @@ impl TicketApplication {
                     Error::AuthorityUnavailable(format!("Patrol delivery rejected: {error:?}"))
                 })?;
                 journal.current().map_err(patrol_error)?;
-                Ok((journal, pending))
+                let source = match &pending {
+                    Some(pending) => journal
+                        .store
+                        .notice_source(&pending.escalation.operation.incident.scope)
+                        .map_err(patrol_error)?,
+                    None => None,
+                };
+                Ok((journal, pending, source))
             })
             .await
             .map_err(|_| Error::AuthorityUnavailable("Patrol delivery worker stopped".into()))??;
@@ -182,11 +204,18 @@ impl TicketApplication {
             if let Some(pending) = prepared.1 {
                 journal.fence.check()?;
                 if self
-                    .stage_ready_patrol_notice(&expected_binding, &pending, &journal.fence)
+                    .stage_ready_patrol_notice(
+                        &expected_binding,
+                        &pending,
+                        prepared.2.as_ref(),
+                        &journal.fence,
+                    )
                     .await?
                 {
                     journal = tokio::task::spawn_blocking(move || -> Result<_> {
                         journal.current().map_err(patrol_error)?;
+                        #[cfg(all(test, unix))]
+                        evidence_assembly_tests::before_ack(&mut journal.store);
                         pending.acknowledge(&mut journal).map_err(|error| {
                             Error::AuthorityUnavailable(format!(
                                 "Patrol delivery ACK rejected: {error:?}"
