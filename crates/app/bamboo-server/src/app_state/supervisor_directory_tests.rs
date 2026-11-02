@@ -2,6 +2,9 @@
 //! authority denial for ordinary callers, links∪index merge with origins,
 //! pagination, and engagement mirroring through the tool action.
 
+#[path = "supervisor_directory_execution_tests.rs"]
+mod execution;
+
 use std::sync::Arc;
 
 use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolCtx};
