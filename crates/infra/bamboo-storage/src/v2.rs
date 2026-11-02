@@ -7064,7 +7064,9 @@ impl SessionStoreV2 {
             None => None,
         };
         let session = reconciled.as_ref().unwrap_or(session);
-        let normalized = self.normalize_terminal_runtime_write(session, rel).await?;
+        let normalized = self
+            .normalize_terminal_runtime_write(session, rel, guards)
+            .await?;
         let session = &normalized;
         self.check_root_birth_guards(session, guards, false).await?;
         self.check_default_or_root_actor_context(
@@ -7305,7 +7307,7 @@ impl SessionStoreV2 {
         self.check_root_birth_guards(session, guards, true).await?;
         let intended_rel = Self::default_writer_rel_path(session)?;
         let normalized = self
-            .normalize_terminal_runtime_write(session, &intended_rel)
+            .normalize_terminal_runtime_write(session, &intended_rel, guards)
             .await?;
         let session = &normalized;
         self.check_default_or_root_actor_context(

@@ -39,7 +39,7 @@ fn same_terminal_class(left: &str, right: &str) -> bool {
     class(left).is_some() && class(left) == class(right)
 }
 
-fn idle_control_state(session: &Session) -> bool {
+fn runtime_status(session: &Session) -> Option<AgentStatusState> {
     let legacy = session
         .metadata
         .get("agent.runtime.state")
@@ -48,7 +48,11 @@ fn idle_control_state(session: &Session) -> bool {
         .agent_runtime_state
         .as_ref()
         .or(legacy.as_ref())
-        .is_some_and(|state| state.status == AgentStatusState::Idle)
+        .map(|state| state.status)
+}
+
+fn idle_control_state(session: &Session) -> bool {
+    runtime_status(session) == Some(AgentStatusState::Idle)
 }
 
 impl SessionStoreV2 {
@@ -414,14 +418,27 @@ impl SessionStoreV2 {
         &self,
         incoming: &Session,
         rel: &str,
+        guards: &Arc<DefaultWriterGuards>,
     ) -> io::Result<Session> {
         let path = self.abs_path_from_rel(rel);
-        if let Some(latest) = Self::read_runtime_sidecar_at(
+        let bound_fence = guards
+            .root_actor
+            .as_ref()
+            .map(|proof| &proof.owner().fence)
+            .or_else(|| {
+                guards
+                    .child_actor
+                    .as_ref()
+                    .map(|proof| &proof.owner().fence)
+            });
+        let successor_startup =
+            bound_fence.is_some_and(|fence| incoming.host_run_id() != Some(fence.run_id.as_str()));
+        let latest = Self::read_runtime_sidecar_at(
             &path.join(super::super::RUNTIME_SIDECAR_FILE),
             &incoming.id,
         )
-        .await?
-        {
+        .await?;
+        if let Some(latest) = latest.as_ref() {
             if incoming.child_launch_generation() < latest.child_launch_generation() {
                 return Err(conflict(
                     "Host runtime writer belongs to an older launch generation",
@@ -442,6 +459,7 @@ impl SessionStoreV2 {
                 && !(incoming.last_run_status().as_deref() == Some("pending")
                     && incoming.child_launch_generation() > latest.child_launch_generation())
                 && !pending_delivery(incoming)
+                && !successor_startup
             {
                 return Err(conflict("Host runtime writer would reopen a terminal run"));
             }
@@ -454,36 +472,67 @@ impl SessionStoreV2 {
                 "Host runtime writer has no matching launch identity",
             ));
         }
-        if !candidate.has_runtime_wait() && !pending_delivery(&candidate) {
-            if let Some(entry) = if candidate.host_run_id().is_some() {
-                self.observed_runtime_actor(&path.join(ACTOR_AUTHORITY_FILE), &candidate)
-                    .await
-                    .map_err(io::Error::other)?
-            } else {
-                None
-            } {
-                if let Some(activation) = entry.activation {
-                    if candidate
-                        .host_run_id()
-                        .is_none_or(|id| id == activation.run_id)
+        let terminal_candidate = candidate
+            .last_run_status()
+            .as_deref()
+            .is_some_and(super::super::child_wait_control_plane::terminal);
+        let terminal_typed = matches!(
+            runtime_status(&candidate),
+            Some(
+                AgentStatusState::Completed
+                    | AgentStatusState::Cancelled
+                    | AgentStatusState::Failed
+            )
+        );
+        let observed = if candidate.host_run_id().is_some()
+            || bound_fence.is_some()
+            || terminal_candidate
+            || terminal_typed
+        {
+            self.observed_runtime_actor(&path.join(ACTOR_AUTHORITY_FILE), &candidate)
+                .await
+                .map_err(io::Error::other)?
+        } else {
+            None
+        };
+        if let Some(activation) = observed.and_then(|entry| entry.activation) {
+            if candidate.host_run_id() != Some(activation.run_id.as_str()) {
+                // A newly bound executor can checkpoint its startup before
+                // begin_host_run replaces the predecessor's (or absent) marker.
+                // The ordinary predecessor receives no such grant, including
+                // when it retains a wait or pending completion source.
+                if bound_fence == Some(&activation.fence()) {
+                    return Ok(candidate);
+                }
+                let newly_terminal = latest.as_ref().is_none_or(|latest| {
+                    (terminal_candidate && candidate.last_run_status() != latest.last_run_status())
+                        || (terminal_typed && runtime_status(&candidate) != runtime_status(latest))
+                });
+                if candidate.host_run_id().is_some()
+                    || (activation.status.is_live() && newly_terminal)
+                {
+                    return Err(conflict(
+                        "Host runtime writer was superseded by another activation",
+                    ));
+                }
+            }
+            if !candidate.has_runtime_wait()
+                && !pending_delivery(&candidate)
+                && candidate.host_run_matches_launch()
+                && candidate.last_run_status().as_deref() != Some("pending")
+            {
+                if let Some(status) = terminal_status(activation.status) {
+                    if !candidate
+                        .last_run_status()
+                        .as_deref()
+                        .is_some_and(|candidate| same_terminal_class(candidate, status))
                     {
-                        if candidate.host_run_matches_launch()
-                            && candidate.last_run_status().as_deref() != Some("pending")
-                        {
-                            if let Some(status) = terminal_status(activation.status) {
-                                let matches = candidate.last_run_status().as_deref().is_some_and(
-                                    |candidate| same_terminal_class(candidate, status),
-                                );
-                                if !matches {
-                                    return Err(conflict(
-                                        "Host outcome conflicts with committed activation",
-                                    ));
-                                }
-                            }
-                        }
+                        return Err(conflict("Host outcome conflicts with committed activation"));
                     }
                 }
             }
+        }
+        if !candidate.has_runtime_wait() && !pending_delivery(&candidate) {
             if !idle_control_state(&candidate) {
                 candidate.synchronize_terminal_runtime_status();
             }

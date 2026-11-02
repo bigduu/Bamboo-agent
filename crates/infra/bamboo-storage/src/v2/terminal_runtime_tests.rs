@@ -939,5 +939,85 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(reconciled, std::fs::read(runtime_path(home.path())).unwrap());
+    assert_eq!(
+        reconciled,
+        std::fs::read(runtime_path(home.path())).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn terminal_runtime_claimed_successor_refuses_old_saves_before_new_host_marker() {
+    for old_marker in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut root = Session::new("startup-gap-root", "model");
+        root.set_last_run_status("completed");
+        root.synchronize_terminal_runtime_status();
+        store.save_session(&root).await.unwrap();
+        if old_marker {
+            store.begin_host_run(&root, "host-A").await.unwrap();
+            root = store.load_session(&root.id).await.unwrap().unwrap();
+            root.set_last_run_status("completed");
+            root.synchronize_terminal_runtime_status();
+            store.save_session(&root).await.unwrap();
+        }
+        let stale = store.load_session(&root.id).await.unwrap().unwrap();
+        let now = Utc::now();
+        let activation = store
+            .claim_activation(&claim(&root.id, "host-B", now))
+            .await
+            .unwrap();
+        let activation = store
+            .start_activation(&activation.fence(), now)
+            .await
+            .unwrap();
+        let owner = bamboo_domain::RootActorRuntimeWrite {
+            fence: activation.fence(),
+            created_at: root.created_at,
+            conversation_generation: root.conversation_generation_observation(),
+        };
+        let mut startup = stale.clone();
+        startup.set_last_run_status("running");
+        startup.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+        store
+            .save_root_actor_runtime(&owner, &startup, true, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        let path = home.path().join("sessions/startup-gap-root/runtime.json");
+        let before = std::fs::read(&path).unwrap();
+        for pending_source in [false, true] {
+            let mut old = stale.clone();
+            if pending_source {
+                old.metadata.insert(
+                    "runtime.child_completion_source_v1".into(),
+                    "{\"pending_confirmation\":{}}".into(),
+                );
+            }
+            assert!(store.save_runtime_state(&old).await.is_err());
+            assert!(store.save_session(&old).await.is_err());
+            assert_eq!(before, std::fs::read(&path).unwrap());
+        }
+        let current = store.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(current.last_run_status().as_deref(), Some("running"));
+        assert_eq!(
+            current.agent_runtime_state.as_ref().unwrap().status,
+            AgentStatusState::Running
+        );
+        store.begin_host_run(&current, "host-B").await.unwrap();
+        let mut running = store.load_session(&root.id).await.unwrap().unwrap();
+        running.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+        store
+            .save_root_actor_runtime(&owner, &running, true, Arc::new(|_| {}))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .load_session(&root.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .host_run_id(),
+            Some("host-B")
+        );
+    }
 }
