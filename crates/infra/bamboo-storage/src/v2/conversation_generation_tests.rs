@@ -1416,3 +1416,55 @@ async fn selector_only_claim_is_a_negative_control_for_original_root_generation(
     );
     fixture.finish().await;
 }
+
+#[tokio::test]
+async fn observed_root_claim_accepts_one_same_project_revision_without_adopting_context() {
+    use bamboo_domain::{ActorActivationClaim, ActorDirectoryPort};
+    for revisions in [1, 2] {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let original = Session::new("original-root-caller-ui", "original-model");
+        store.save_session(&original).await.unwrap();
+        let mut current = original.clone();
+        for revision in 1..=revisions {
+            current.title = format!("ordinary UI revision {revision}");
+            current.metadata_version += 1;
+            store.save_runtime_state(&current).await.unwrap();
+        }
+        let now = Utc::now();
+        let claimed = store
+            .claim_root_activation_observed(
+                &ActorActivationClaim {
+                    actor_id: original.id.clone(),
+                    run_id: "original-ui-caller".into(),
+                    lease_owner: "original-ui-caller".into(),
+                    lease_expires_at: now + chrono::Duration::minutes(5),
+                    inbox_generation: 0,
+                    placement_ref: None,
+                    now,
+                },
+                &original,
+            )
+            .await;
+        if revisions == 1 {
+            let claimed = claimed.unwrap();
+            assert_eq!(
+                claimed.status,
+                bamboo_domain::ActorActivationStatus::Reserved
+            );
+            // The caller observation stays original; this port does not adopt
+            // a new execution profile or weaken bound-startup's final CAS.
+            original
+                .conversation_generation_observation()
+                .check_canonical(&store.load_session(&original.id).await.unwrap().unwrap())
+                .unwrap();
+        } else {
+            assert!(claimed.is_err(), "two revisions can hide Project A→B→A");
+            assert!(!store
+                .sessions_root_dir()
+                .join(&original.id)
+                .join("actor-authority.json")
+                .exists());
+        }
+    }
+}
