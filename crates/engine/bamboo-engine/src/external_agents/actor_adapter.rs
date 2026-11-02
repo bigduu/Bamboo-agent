@@ -558,7 +558,7 @@ async fn fail_pre_dispatch_activation(
     fence: &ActorActivationFence,
 ) -> Result<(), bamboo_domain::ActorDirectoryError> {
     actor_store
-        .finish_activation(fence, chrono::Utc::now(), ActorActivationFinish::Failed)
+        .finish_activation_observed(fence, chrono::Utc::now(), ActorActivationFinish::Failed)
         .await
         .map(|_| ())
 }
@@ -963,7 +963,7 @@ impl ActivePlacementLease {
             .await
             .map_err(|_| remote_broker_unavailable())?;
         self.actor_store
-            .finish_activation(&self.fence, chrono::Utc::now(), outcome)
+            .finish_activation_observed(&self.fence, chrono::Utc::now(), outcome)
             .await
             .map_err(|_| remote_broker_unavailable())?;
         // A terminal ActorDirectory record permits an immediate retry. Free
@@ -5425,7 +5425,7 @@ impl PlainActorActivation {
     ) -> Result<(), AgentError> {
         let committed = self
             .store
-            .finish_activation(&self.fence, chrono::Utc::now(), outcome)
+            .finish_activation_observed(&self.fence, chrono::Utc::now(), outcome)
             .await
             .map_err(|error| AgentError::LLM(format!("Actor completion unconfirmed: {error}")))?;
         // A validated final Terminal hands off this one router. Failed writes

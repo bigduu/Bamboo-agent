@@ -122,6 +122,8 @@ impl SessionStoreV2 {
         super::super::reject_incompatible_session_write(&before).map_err(storage)?;
         if before.has_runtime_wait()
             || pending_delivery(&before)
+            || !before.host_run_matches_launch()
+            || before.last_run_status().as_deref() == Some("pending")
             || before
                 .host_run_id()
                 .is_some_and(|id| id != activation.run_id)
@@ -130,10 +132,21 @@ impl SessionStoreV2 {
         }
         let mut after = before.clone();
         after.set_last_run_status(status);
-        if status == "completed" {
+        let host_final_save_pending = before.host_run_id().is_some()
+            && !super::super::child_wait_control_plane::terminal(
+                before.last_run_status().as_deref().unwrap_or(""),
+            );
+        if status == "completed" && !host_final_save_pending {
             after.clear_last_run_error();
         }
         after.synchronize_terminal_runtime_status();
+        // The activation result is trusted, but the Host's broker receipt and
+        // completion-source gate still owns public delivery readiness.
+        if host_final_save_pending {
+            if let Some(previous) = before.last_run_status() {
+                after.set_last_run_status(previous);
+            }
+        }
         self.commit_runtime_projection(&before, &after, rel, guards)
             .await
     }
@@ -177,6 +190,7 @@ impl SessionStoreV2 {
         }
         let mut after = latest.clone();
         after.set_host_run_id(run_id);
+        after.metadata.remove("runtime.reconciled_activation_fence");
         after.set_last_run_status("running");
         after.clear_last_run_error();
         if !after.has_runtime_wait() {
@@ -217,6 +231,8 @@ impl SessionStoreV2 {
             || latest.updated_at >= before
             || latest.has_runtime_wait()
             || pending_delivery(&latest)
+            || !latest.host_run_matches_launch()
+            || latest.last_run_status().as_deref() == Some("pending")
             || latest.session_inbox_admission() != expected.session_inbox_admission()
             || serde_json::to_value(super::super::runtime_sidecar_snapshot(expected))?
                 != serde_json::to_value(super::super::runtime_sidecar_snapshot(&latest))?
@@ -227,6 +243,7 @@ impl SessionStoreV2 {
             .last_run_status()
             .filter(|s| super::super::child_wait_control_plane::terminal(s));
         let mut expired = false;
+        let mut recovered_fence = None;
         if let Some(mut entry) = self
             .observed_runtime_actor(&path, &latest)
             .await
@@ -259,6 +276,7 @@ impl SessionStoreV2 {
                     .as_ref()
                     .and_then(|a| terminal_status(a.status))
                     .map(str::to_string);
+                recovered_fence = entry.activation.as_ref().map(ActorActivation::fence);
             }
         }
         if chosen_status.is_none()
@@ -270,6 +288,12 @@ impl SessionStoreV2 {
             return Ok(None);
         }
         let mut after = latest.clone();
+        if let Some(fence) = recovered_fence {
+            after.metadata.insert(
+                "runtime.reconciled_activation_fence".into(),
+                serde_json::to_string(&fence)?,
+            );
+        }
         after.set_last_run_status(chosen_status.as_deref().unwrap_or(status));
         if chosen_status.is_none() || expired {
             if let Some(error) = error {
@@ -296,6 +320,11 @@ impl SessionStoreV2 {
         )
         .await?
         {
+            if incoming.child_launch_generation() < latest.child_launch_generation() {
+                return Err(conflict(
+                    "Host runtime writer belongs to an older launch generation",
+                ));
+            }
             if latest.host_run_id() != incoming.host_run_id()
                 && (latest.host_run_id().is_some() || incoming.host_run_id().is_some())
             {
@@ -308,6 +337,9 @@ impl SessionStoreV2 {
                 && !super::super::child_wait_control_plane::terminal(
                     incoming.last_run_status().as_deref().unwrap_or(""),
                 )
+                && !(incoming.last_run_status().as_deref() == Some("pending")
+                    && incoming.child_launch_generation() > latest.child_launch_generation())
+                && !pending_delivery(incoming)
             {
                 return Err(conflict("Host runtime writer would reopen a terminal run"));
             }
@@ -326,8 +358,23 @@ impl SessionStoreV2 {
                         .host_run_id()
                         .is_none_or(|id| id == activation.run_id)
                     {
-                        if let Some(status) = terminal_status(activation.status) {
-                            candidate.set_last_run_status(status)
+                        if candidate.host_run_matches_launch()
+                            && candidate.last_run_status().as_deref() != Some("pending")
+                        {
+                            if let Some(status) = terminal_status(activation.status) {
+                                let matches = match status {
+                                    "error" => matches!(
+                                        candidate.last_run_status().as_deref(),
+                                        Some("error" | "failed" | "timeout")
+                                    ),
+                                    _ => candidate.last_run_status().as_deref() == Some(status),
+                                };
+                                if !matches {
+                                    return Err(conflict(
+                                        "Host outcome conflicts with committed activation",
+                                    ));
+                                }
+                            }
                         }
                     }
                 }

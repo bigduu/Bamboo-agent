@@ -488,6 +488,32 @@ pub trait ActorDirectoryPort: Send + Sync {
         now: DateTime<Utc>,
         outcome: ActorActivationFinish,
     ) -> Result<ActorActivation, ActorDirectoryError>;
+    /// Resolve an uncertain finish write using the exact committed authority.
+    /// A read-model projection error must not relabel a confirmed Run outcome.
+    async fn finish_activation_observed(
+        &self,
+        fence: &ActorActivationFence,
+        now: DateTime<Utc>,
+        outcome: ActorActivationFinish,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        let result = self.finish_activation(fence, now, outcome).await;
+        if !matches!(result, Err(ActorDirectoryError::Storage(_))) {
+            return result;
+        }
+        let expected = match outcome {
+            ActorActivationFinish::Succeeded => ActorActivationStatus::Succeeded,
+            ActorActivationFinish::Failed => ActorActivationStatus::Failed,
+            ActorActivationFinish::Cancelled => ActorActivationStatus::Cancelled,
+        };
+        if let Ok(entry) = self.inspect_actor(&fence.actor_id).await {
+            if let Some(activation) = entry.activation {
+                if activation.matches_fence(fence) && activation.status == expected {
+                    return Ok(activation);
+                }
+            }
+        }
+        result
+    }
     async fn retire_actor(
         &self,
         actor_id: &str,

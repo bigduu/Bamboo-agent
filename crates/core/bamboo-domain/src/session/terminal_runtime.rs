@@ -13,6 +13,17 @@ impl Session {
 
     pub fn set_host_run_id(&mut self, run_id: &str) {
         self.metadata.insert(HOST_RUN_ID.into(), run_id.into());
+        self.metadata.insert(
+            "runtime.host_launch_generation".into(),
+            self.child_launch_generation().to_string(),
+        );
+    }
+
+    pub fn host_run_matches_launch(&self) -> bool {
+        self.metadata
+            .get("runtime.host_launch_generation")
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_none_or(|generation| generation == self.child_launch_generation())
     }
 
     /// A completed activation may have handed execution to a durable wait.
