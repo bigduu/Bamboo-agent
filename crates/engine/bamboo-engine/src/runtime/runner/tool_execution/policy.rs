@@ -12,7 +12,7 @@ const MAX_TRACKED_OBSERVATIONS: usize = 80;
 const SUBAGENT_INSPECTION_LABEL: &str = "SubAgent (inspect)";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum ToolCircuitKey {
+pub(super) enum ToolCircuitKey {
     Tool(String),
     SubAgentInspection,
 }
@@ -161,7 +161,10 @@ fn normalize_tool_for_policy(raw_tool_name: &str, admitted_execution_name: Optio
 /// Separate read-only SubAgent inspection from delegation only when the
 /// arguments unambiguously select an inspection route. Ambiguous or malformed
 /// requests remain in the delegation circuit, including compact/legacy mixes.
-fn tool_policy_key(tool_call: &ToolCall, admitted_execution_name: Option<&str>) -> ToolCircuitKey {
+pub(super) fn tool_policy_key(
+    tool_call: &ToolCall,
+    admitted_execution_name: Option<&str>,
+) -> ToolCircuitKey {
     let name = normalize_tool_for_policy(&tool_call.function.name, admitted_execution_name);
     if name != "SubAgent" {
         return ToolCircuitKey::Tool(name);
@@ -297,6 +300,7 @@ pub(crate) struct ToolPolicyGuard {
     executed_calls: usize,
     consecutive_failures: HashMap<ToolCircuitKey, usize>,
     observation_progress: ObservationProgress,
+    pub(super) child_inspections: super::child_inspection::ChildInspectionProgress,
     pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
     progress_feedback: super::progress_feedback::ProgressFeedbackBudget,
 }
@@ -312,6 +316,7 @@ impl ToolPolicyGuard {
             executed_calls: 0,
             consecutive_failures: HashMap::new(),
             observation_progress: ObservationProgress::default(),
+            child_inspections: super::child_inspection::ChildInspectionProgress::default(),
             quiet_polls: super::quiet_poll::QuietPollGuard::default(),
             progress_feedback: super::progress_feedback::ProgressFeedbackBudget::default(),
         }
@@ -354,6 +359,11 @@ impl ToolPolicyGuard {
 
     pub(super) fn begin_observation_round(&mut self, round: usize) {
         self.observation_progress.begin_round(round);
+        self.child_inspections.begin_round(round);
+    }
+
+    pub(crate) fn unchanged_child_inspection_targets(&mut self) -> Vec<String> {
+        self.child_inspections.finish_round()
     }
 
     #[cfg(test)]
@@ -398,6 +408,7 @@ impl ToolPolicyGuard {
 
     pub(crate) fn reset_observation_progress(&mut self) {
         self.observation_progress = ObservationProgress::default();
+        self.child_inspections = super::child_inspection::ChildInspectionProgress::default();
         self.quiet_polls = super::quiet_poll::QuietPollGuard::default();
         self.progress_feedback.reset_for_human_input();
     }
