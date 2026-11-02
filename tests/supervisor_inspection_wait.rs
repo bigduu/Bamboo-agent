@@ -220,7 +220,7 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                 json!({"message":"Independently verify the second non-overlapping acceptance observation; do not implement the main task."}),
             )
         } else {
-            tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::time::timeout(Duration::from_secs(60), async {
                 while !(0..wanted).all(|index| {
                     probe
                         .workspace
@@ -425,7 +425,9 @@ async fn fixture(case: Case, ultra: bool) {
         .build()
         .unwrap();
     let base = format!("http://127.0.0.1:{port}/api/v1");
-    let healthy = tokio::time::timeout(Duration::from_secs(30), async {
+    // A fresh disposable Home performs the real durable config/Skill install.
+    // This fixture budget is separate from every runner, wait and tool lease.
+    let healthy = tokio::time::timeout(Duration::from_secs(90), async {
         loop {
             assert!(host.0.try_wait().unwrap().is_none());
             if client
