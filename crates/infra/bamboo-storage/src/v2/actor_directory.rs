@@ -588,6 +588,17 @@ impl SessionStoreV2 {
         bytes: Vec<u8>,
         guards: &Arc<ActorAuthorityGuards>,
     ) -> Result<(), ActorDirectoryError> {
+        self.write_actor_bytes_followed_by_runtime(path, bytes, None, guards)
+            .await
+    }
+
+    async fn write_actor_bytes_followed_by_runtime(
+        &self,
+        path: &Path,
+        bytes: Vec<u8>,
+        runtime: Option<(PathBuf, Vec<u8>)>,
+        guards: &Arc<ActorAuthorityGuards>,
+    ) -> Result<(), ActorDirectoryError> {
         if !guards
             .tree_bumped
             .load(std::sync::atomic::Ordering::Acquire)
@@ -624,7 +635,21 @@ impl SessionStoreV2 {
                 }
                 let _ = phase;
                 Ok(())
-            })
+            })?;
+            // Once authority commits, caller cancellation cannot skip the
+            // corresponding old-run runtime projection. Both writes retain
+            // the same physical guards in this actual filesystem job.
+            if let Some((runtime, bytes)) = runtime {
+                durable_atomic_write_blocking(&runtime, &bytes, |phase| {
+                    #[cfg(test)]
+                    if let Some(hook) = &hook {
+                        return hook.visit(&runtime, phase);
+                    }
+                    let _ = phase;
+                    Ok(())
+                })?;
+            }
+            Ok::<_, io::Error>(())
         })
         .await
         .map_err(|error| storage(io::Error::other(format!("join actor write: {error}"))))?
