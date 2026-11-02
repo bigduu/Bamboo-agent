@@ -115,7 +115,8 @@ impl Fixture {
                     &SessionInboxLeaseRequest {
                         consumer: SessionInboxConsumerId::new(),
                         now: Utc::now(),
-                        duration: chrono::Duration::seconds(1),
+                        duration: chrono::Duration::seconds(30)
+                            .min(expires - Utc::now() - chrono::Duration::milliseconds(100)),
                     },
                 )
                 .await
@@ -564,7 +565,7 @@ async fn root_terminal_main_corrects_same_fence_diagnostic_without_unretiring_or
 #[tokio::test]
 async fn root_terminal_live_main_requires_expiry_and_fixed_restart_cutoff_renewal_wins() {
     for renewed in [false, true] {
-        let f = Fixture::new(true, 3).await;
+        let f = Fixture::new(true, 10).await;
         let mut completed = f.current().await;
         completed.set_last_run_status("completed");
         completed.synchronize_terminal_runtime_status();
@@ -723,7 +724,10 @@ async fn root_terminal_reset_context_cannot_reuse_previous_marker_or_actual_old_
     // Synthetic future producer, exactly as the existing generation fixtures.
     // This is not a reset API or a bypass on any real Session.
     let mut source = old.clone();
-    source.session_version = Session::new("current-contract", "model").session_version;
+    // The future producer must first migrate the legacy control-plane mirror;
+    // reset deliberately refuses to reinterpret it. Only this synthetic source
+    // is changed; the canonical old generation remains untouched below.
+    source.metadata.remove("agent.runtime.state");
     let request = ConversationResetRequest {
         session_id: source.id.clone(),
         operation_id: format!("0:{}", Uuid::new_v4()),
@@ -731,19 +735,21 @@ async fn root_terminal_reset_context_cannot_reuse_previous_marker_or_actual_old_
         expected_conversation_revision: 0,
         expected_snapshot_sha256: conversation_reset_snapshot_sha256(&source).unwrap(),
     };
-    let ConversationResetPreparation::Prepared(prepared) = prepare_conversation_reset(
+    let preparation = prepare_conversation_reset(
         &source,
         &Default::default(),
         &request,
         ConversationResetReadSafety::IdleObserved,
         Utc::now(),
     )
-    .unwrap() else {
-        panic!("synthetic settled ordinary Root reset preparation");
+    .unwrap();
+    let ConversationResetPreparation::Prepared(prepared) = preparation else {
+        panic!("synthetic settled ordinary Root reset preparation: {preparation:?}");
     };
     let mut next = prepared.proposed_session;
     next.conversation_reset = Some(prepared.proposed_state);
     next.agent_runtime_state = Some(AgentRuntimeState::new(&next.id));
+    next.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Initializing;
     next.set_last_run_status("running");
     next.clear_last_run_error();
     next.metadata.insert(ROOT_OBSERVATION.into(), old_marker);

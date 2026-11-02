@@ -317,6 +317,8 @@ async fn actual_root_spawn_terminal_badge_precedes_real_join_and_actor_finish() 
         );
         let mut session = session();
         session.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::new(&session.id));
+        session.agent_runtime_state.as_mut().unwrap().status =
+            bamboo_domain::AgentStatusState::Initializing;
         store.save_session(&session).await.unwrap();
         let cache: crate::SessionCache = Arc::default();
         let repository = crate::SessionRepository::new(
