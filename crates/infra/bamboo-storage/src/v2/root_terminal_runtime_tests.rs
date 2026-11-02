@@ -231,6 +231,16 @@ impl Fixture {
         }
     }
 }
+async fn assert_title_preserves_observation(store: &SessionStoreV2, mut session: Session) {
+    let before = session.metadata.get(ROOT_OBSERVATION).cloned();
+    session.title = "title cannot mint a run observation".into();
+    session.title_version += 1;
+    session.metadata_version += 1;
+    session.updated_at = Utc::now();
+    store.save_manual_title(&session).await.unwrap();
+    let saved = store.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(saved.metadata.get(ROOT_OBSERVATION), before.as_ref());
+}
 fn assert_typed(s: &Session, status: &str, typed: AgentStatusState) {
     assert_eq!(s.last_run_status().as_deref(), Some(status));
     let state = s.agent_runtime_state.as_ref().unwrap();
@@ -446,7 +456,7 @@ async fn root_terminal_main_cancel_failure_and_suspension_override_diagnostic_on
 
 #[tokio::test]
 async fn root_terminal_scope_observation_survives_actor_refresh_without_project_aba() {
-    for mode in ["one-ui", "two-ui", "project-aba"] {
+    for mode in ["one-ui", "two-ui", "project-aba", "manual-title"] {
         let f = Fixture::new(false, 300).await;
         f.store
             .finish_root_activation_observed(
@@ -475,10 +485,47 @@ async fn root_terminal_scope_observation_survives_actor_refresh_without_project_
                 "agent.runtime.state".into(),
                 serde_json::to_string(current.agent_runtime_state.as_ref().unwrap()).unwrap(),
             );
-            f.store.save_runtime_state(&current).await.unwrap();
+            if mode == "manual-title" {
+                // Seed only the old typed split before the actual title lane.
+                let mut zombie = f.current().await;
+                zombie.agent_runtime_state = current.agent_runtime_state.clone();
+                zombie.metadata.insert(
+                    "agent.runtime.state".into(),
+                    current.metadata["agent.runtime.state"].clone(),
+                );
+                f.store.save_runtime_state(&zombie).await.unwrap();
+                current.title_version += 1;
+                current.title_generated = false;
+                current.updated_at = Utc::now();
+                let committed = f.store.save_manual_title_committed(&current).await.unwrap();
+                f.store
+                    .validate_title_observations(&committed)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&committed).unwrap(),
+                    serde_json::to_value(f.current().await).unwrap()
+                );
+            } else {
+                f.store.save_runtime_state(&current).await.unwrap();
+            }
             // A fresh directory observation is not permission to refresh the
             // older writer marker or forget the Project transition history.
             f.store.inspect_actor(&f.root.id).await.unwrap();
+            if mode != "manual-title" {
+                assert_eq!(
+                    f.current().await.metadata[ROOT_OBSERVATION],
+                    original_marker
+                );
+            }
+        }
+        if mode == "project-aba" {
+            let mut title = f.current().await;
+            title.title = "title cannot launder Project ABA".into();
+            title.title_version += 1;
+            title.metadata_version += 1;
+            title.updated_at = Utc::now();
+            f.store.save_manual_title(&title).await.unwrap();
             assert_eq!(
                 f.current().await.metadata[ROOT_OBSERVATION],
                 original_marker
@@ -489,8 +536,11 @@ async fn root_terminal_scope_observation_survives_actor_refresh_without_project_
             .reconcile(Utc::now() - chrono::Duration::hours(1))
             .await
             .unwrap();
-        assert_eq!(repaired.is_some(), mode == "one-ui");
-        if mode == "one-ui" {
+        assert_eq!(
+            repaired.is_some(),
+            matches!(mode, "one-ui" | "manual-title")
+        );
+        if matches!(mode, "one-ui" | "manual-title") {
             assert_typed(&f.current().await, "error", AgentStatusState::Failed);
         } else {
             assert!(f
@@ -517,6 +567,7 @@ async fn root_terminal_first_write_failure_is_attributed_and_late_a_cannot_touch
         .unwrap();
     let previous = f.current().await;
     let b = f.successor("root-run-B").await;
+    assert_title_preserves_observation(&f.store, f.current().await).await;
     assert!(f
         .store
         .finish_root_activation_observed(&f.owner, Utc::now(), ActorActivationFinish::Failed, None)
@@ -533,7 +584,7 @@ async fn root_terminal_first_write_failure_is_attributed_and_late_a_cannot_touch
         .await
         .unwrap()
         .is_none());
-    // No B Session write has run. The actual B owner must establish its own
+    // No B-owned checkpoint has run. The actual B owner must establish its own
     // lifetime before its terminal fact, rather than leaving A marker/running.
     f.store
         .finish_root_activation_observed(&b, Utc::now(), ActorActivationFinish::Cancelled, None)
@@ -640,6 +691,7 @@ async fn root_terminal_observation_cannot_be_injected_copied_or_legacy_fallback_
         .unwrap()
         .unwrap();
     assert!(!copied.metadata.contains_key(ROOT_OBSERVATION));
+    assert_title_preserves_observation(&f.store, copied).await;
     f.store
         .finish_root_activation_observed(&f.owner, Utc::now(), ActorActivationFinish::Failed, None)
         .await

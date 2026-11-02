@@ -4,3 +4,6 @@
 
 #[path = "../src/app_state/ticket_application/patrol_adapter/checkpoint_store.rs"]
 pub mod checkpoint_store;
+
+#[path = "../src/app_state/ticket_application/patrol_adapter/checkpoint_record.rs"]
+mod checkpoint_record;

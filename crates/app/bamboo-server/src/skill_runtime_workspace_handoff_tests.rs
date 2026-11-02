@@ -246,6 +246,13 @@ pub(super) async fn after_completed_call(
         assert_eq!(titled.title_version, durable.title_version + 1);
         assert_eq!(titled.workspace_path_meta(), durable.workspace_path_meta());
         assert_eq!(titled.project_id_meta(), durable.project_id_meta());
+        let cached = state.sessions.get(&durable.id).unwrap();
+        assert_eq!(
+            cached.read().metadata.get("runtime.root_writer_observation_v1"),
+            titled.metadata.get("runtime.root_writer_observation_v1"),
+            "title cache must publish the exact committed bookkeeping"
+        );
+        drop(cached);
         probe
             .observed
             .lock()

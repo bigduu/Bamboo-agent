@@ -194,7 +194,7 @@ impl SessionStoreV2 {
 
     pub(super) async fn prepare_title_observations(
         &self,
-        incoming: &Session,
+        incoming: &mut Session,
     ) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
         let previous = self.title_canonical_session(incoming).await?;
         if !self.ordinary_title_tree(&previous).await? {
@@ -209,6 +209,9 @@ impl SessionStoreV2 {
         {
             let mut changed = false;
             if row.actor.actor_id == previous.id {
+                // The whole title-only change and complete current Actor set
+                // were validated above, under the same physical tree guards.
+                Self::advance_root_title_observation(&previous, incoming, &row)?;
                 row.actor.observed_metadata_version = incoming.metadata_version;
                 changed = true;
             }
