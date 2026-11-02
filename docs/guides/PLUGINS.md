@@ -91,6 +91,27 @@ immutable release, installed state, and optional `external_client` configuration
 The producer supports macOS x86_64/aarch64, Windows x86_64, and Linux x86_64 with
 glibc 2.35 or newer. Unknown hosts and unavailable artifacts stay unavailable.
 
+Existing serialized publisher lists are preserved on upgrade, including empty
+and custom lists. When the reviewed Jiandu key is absent, setup can advertise
+`trust_action` with the official Ed25519 publisher identity and the observed
+`tools-skills` configuration revision. Missing/unhealthy configuration authority,
+restricted source hosts, unsupported hosts and unavailable artifacts cannot
+authorize this action. Reading setup never adds trust.
+
+After explicitly reviewing the publisher, send
+`POST /api/v1/plugins/official/jiandu/trust` with exactly
+`{"expected_revision": <observed revision>, "expected_public_key": "<displayed key>"}`.
+The key must match the program's reviewed Jiandu key. The existing revisioned
+configuration writer appends only that key, preserves source restrictions,
+enforcement and all other settings, and publishes the committed configuration
+to the running server. A stale revision returns 409; caller-supplied keys, URLs
+or bypass flags are rejected. An already trusted key at the current revision is
+a no-op. This action does not install the connector or touch the memory store.
+After success or an uncertain response, read setup again before deciding whether
+installation is available. Do not automatically retry the POST. Older services
+without this advertised capability require a server update or explicit server
+configuration through their supported settings authority.
+
 `POST /api/v1/plugins/official/jiandu/install` takes exactly `{}`. The server
 selects the reviewed source and checksum, requires the Jiandu publisher key,
 and uses the existing installer with strict trust, even if generic manual plugin
