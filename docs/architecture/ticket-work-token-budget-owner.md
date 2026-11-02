@@ -87,16 +87,19 @@ source ownership is refreshed with its routing guard; four additive contexts and
 their 20 explicit cases are unchanged.
 
 The independent dev-based native fixture explicitly initializes a disposable
-scope, creates/prepares Work, configures limits through HTTP, installs a finite
-policy through the existing trusted Rust port, then exercises actual canonical
-Inbox/Host/Task submission and explicit HTTP User acceptance. This is not proof
-that the separate #2464 policy HTTP change has been admitted. A combined-source
-HTTP integration observation must identify both source heads and any diagnostic
-caller patch separately. No fallback route or synthetic worker receipt is used.
+scope, creates/prepares Work and configures limits through HTTP. The standalone
+budget producer used the existing trusted Rust policy port. The Ready owner
+slice connects this same fixture to actual Ready GET/PUT and original receipt
+replay, then exercises canonical Inbox/Host/Task submission and explicit HTTP
+User acceptance. Each result must identify its actual standalone or combined
+source; local diagnostic caller patches remain distinct from admitted source.
+No fallback route or synthetic worker receipt is used.
 
 Unknown-usage exhaustion, concurrent/changed/stale requests, scope/Worker denial,
 restart, original receipts and no automatic re-dispatch have controlled coverage.
 Exact executed commands/results belong in the Issue/PR evidence; source presence
-alone is not an acceptance result. External real-model judgment, Windows/Linux
-native acceptance, optimized macOS unwind acceptance, UI and #2049's missing
-started/heartbeat/valid-progress/wait facts remain separate.
+alone is not an acceptance result. External real-model judgment, additional
+native-platform diagnostics, optimized macOS unwind acceptance, UI and missing
+started/heartbeat/valid-progress measurements remain separate. #2469 supplies
+verified current wait observations; these are not progress measurements.
+Canonical FileStore supports macOS/Linux, without Windows store authority.

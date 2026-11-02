@@ -1,10 +1,7 @@
 //! Owner budget HTTP over the actual FileStore/Inbox/native Host.
 use super::*;
 use actix_web::http::Method;
-use bamboo_server::{
-    app_state::ticket_application::{ReadyWorkGrant, ReadyWorkPolicy},
-    AppState,
-};
+use bamboo_server::AppState;
 use bamboo_tickets::{ExecutionTokenUsage, ExecutionWorkspace, TicketService};
 use serde_json::Value;
 
@@ -216,25 +213,28 @@ impl Fixture {
             "expected_revision":status["budget_revision"],"limits":{"work_tokens":BTreeMap::from([(self.work.clone(),limit)]),"utc_day_tokens":limit,"total_tokens":limit}})
     }
     async fn policy(&self) {
-        let snapshot = self.service().published().unwrap().1;
-        // #2464 owns the separate policy HTTP producer. This dev-based PR uses
-        // the pre-existing trusted installer; combined HTTP acceptance is separate.
-        self.state
-            .tickets
-            .install_ready_work_policy(ReadyWorkPolicy {
-                project_id: self.project.clone(),
-                capacity: 1,
-                max_rounds: 4,
-                lifetime: Duration::from_secs(60),
-                grants: vec![ReadyWorkGrant {
-                    work_id: self.work.clone(),
-                    contract_revision: 1,
-                    context_hash: snapshot.project.work_contexts[&self.work].clone(),
-                    workspace: self.workspace.clone(),
-                }],
-            })
-            .await
-            .unwrap();
+        // Ready owner acceptance consumes the separately admitted budget API.
+        // A missing HTTP entrance must fail; there is no trusted-port fallback.
+        let policy_uri = "/api/v1/tickets/ready-policy";
+        let (code, status) = http(&self.state, Method::GET, policy_uri, None).await;
+        assert_eq!(code, StatusCode::OK, "{status}");
+        let (commit, snapshot) = self.service().published().unwrap();
+        let request = json!({
+            "process_id":status["process_id"],"expected_revision":status["revision"],
+            "operation_id":"budget-http-finite-policy","action":{"kind":"install","policy":{
+                "binding":snapshot.binding,
+                "observed":{"commit":commit,"seq":snapshot.seq,"authority_epoch":snapshot.authority_epoch},
+                "project_id":self.project,"capacity":1,"max_rounds":4,"lifetime_secs":60,
+                "grants":[{"work_id":self.work,"contract_revision":1,
+                    "context_hash":snapshot.project.work_contexts[&self.work],"workspace":self.workspace}],
+            }},
+        });
+        let receipt = http(&self.state, Method::PUT, policy_uri, Some(&request)).await;
+        assert_eq!(receipt.0, StatusCode::OK, "{:?}", receipt.1);
+        assert_eq!(
+            http(&self.state, Method::PUT, policy_uri, Some(&request)).await,
+            receipt
+        );
     }
     async fn next(&mut self) -> native_work::ModelRequest {
         tokio::time::timeout(WAIT, self.requests.recv())
