@@ -17,7 +17,7 @@ and no initialization permission. No local setting or legacy Supervisor changed.
 | Cumulative token budget | `bamboo-tickets/src/execution_budget.rs`; `bamboo-engine/src/ticket_token_budget{,/provider}.rs` | #2262 and Native integration already exist. Only canonical Ticket HEAD stores limits, reservations and cumulative spending. Unknown usage retains its reservation. Rounds are an additional run ceiling, not money accounting. |
 | Canonical worker and durable Inbox | `bamboo-engine/src/{ticket_runtime,ticket_worker_plan}.rs`; server `tools/ticket_dispatch_adapter.rs` | Existing native one-shot worker/Task/submission path, including stopped-process proof. This slice creates no worker adapter or second task queue. #1794 remains a broader open tracker. |
 | Wait, directory and lifecycle integration | Engine `sdk/tests.rs`; server `app_state/{parent_question_reconcile,supervisor_directory_tests}.rs`, `tests/{native_work_acceptance,native_work_interruption,native_work_project_isolation,ticket_writer_lifecycle}.rs` | #1479/#1480 and #2265/#2269/#2280 have delivery records. Current-source execution results must be reported separately from those historical records. |
-| Program patrol | `bamboo-orchestration/src/patrol/{host,program}.rs` and server `ticket_application/patrol_adapter` | Program observation/delivery calls no model. `host.rs` currently supplies `None` for started, heartbeat, progress and expected wait. Those missing facts remain unknown; a heartbeat cannot prove progress. |
+| Program patrol | `bamboo-orchestration/src/patrol/{host,program}.rs` and server `ticket_application/patrol_adapter` | Program observation/delivery calls no model. Admitted #2469 projects bounded current runtime waits after exact identity and wait checks. Started, heartbeat and meaningful progress remain unknown; a supported wait or heartbeat cannot prove progress. |
 
 Paths in the table are relative to each named crate's root. Source presence and
 historical delivery do not prove the installed app is using formal Work.
@@ -89,9 +89,10 @@ receipt means an authorization decision, never worker start, progress or accepta
 
 ## Remaining independent production work
 
-- #2049 owns missing runtime started/heartbeat/valid-progress/wait observations,
-  bounded diagnostics and their UI projections. Do not fabricate those values or
-  enable semantic model patrol because this owner endpoint exists.
+- #2469 has connected verified current Question/Child/Bash wait observations to
+  the existing program pass. #2049 still owns missing started/heartbeat/valid
+  progress measurements, broader diagnostics and UI projections. Do not fabricate
+  those values or enable semantic model patrol because this owner endpoint exists.
 - Canonical cumulative budget configuration is still a trusted Rust User/Host
   port. #2453 owns a separate owner HTTP setup slice; frontend setup remains separate. This
   endpoint deliberately refuses to invent an allowance when setup is missing.
@@ -99,8 +100,10 @@ receipt means an authorization decision, never worker start, progress or accepta
   installer grants no new generation or replacement worker and does not resolve
   unknown execution by re-dispatching. Scope repair, legacy migration, UI and
   ongoing production operation require their own evidence and focused changes.
-- No real external model, Windows/Linux native acceptance, product publication
-  or installed-app replacement is performed by this slice.
+- Controlled-provider results require exact source and platform receipts. They
+  do not establish real external-model judgment, all-platform acceptance,
+  product publication or installed-app replacement. Canonical FileStore supports
+  macOS/Linux; this slice does not enable Windows store authority.
 
 ## Current-source verification
 

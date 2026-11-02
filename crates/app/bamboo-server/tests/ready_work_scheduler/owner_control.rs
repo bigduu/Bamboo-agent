@@ -589,9 +589,58 @@ async fn owner_status_and_revoke_do_not_wait_for_a_full_real_native_queue() {
         busy["active"].is_null(),
         "busy admission is unknown, never a false running fact"
     );
-    tokio::time::timeout(WAIT, revoke(&fixture, "queue-revoke"))
-        .await
-        .expect("revoke must cancel and drain admission without freeing queue capacity");
+    let revoke_request = json!({"process_id":busy["process_id"],
+        "expected_revision":busy["revision"],"operation_id":"queue-revoke",
+        "action":{"kind":"revoke"}});
+    let app = test::init_service(
+        App::new()
+            .app_data(fixture.state.clone())
+            .configure(bamboo_server::routes::configure_routes),
+    )
+    .await;
+    let mut waiter = Box::pin(test::call_service(
+        &app,
+        test::TestRequest::put()
+            .uri(URI)
+            .peer_addr("127.0.0.1:43210".parse().unwrap())
+            .set_json(&revoke_request)
+            .to_request(),
+    ));
+    // The managed pass still owns the real admission lock. First poll records
+    // the revoke and cancels that pass, then waits for its drain. Drop this
+    // actual HTTP future before the cancelled pass can run its cleanup.
+    assert!(futures::poll!(waiter.as_mut()).is_pending());
+    drop(waiter);
+    let (_, pending) = http(&fixture.state, Method::GET, None).await;
+    assert_eq!(pending["pending_revoke_operation"], "queue-revoke");
+    assert_eq!(pending["revision"], 2);
+    assert!(pending["policy"].is_null());
+    assert_eq!(pending["receipt_capacity_remaining"], 126);
+    let replacement = install(&fixture, &pending, "blocked-replacement", 1, 60);
+    assert_eq!(
+        http(&fixture.state, Method::PUT, Some(&replacement))
+            .await
+            .0,
+        StatusCode::LOCKED,
+        "an unfinished revoke cannot admit a replacement policy"
+    );
+    let retried = tokio::time::timeout(
+        WAIT,
+        http(&fixture.state, Method::PUT, Some(&revoke_request)),
+    )
+    .await
+    .expect("the original revoke must finish its original drain");
+    assert_eq!(retried.0, StatusCode::OK, "{}", retried.1);
+    assert_eq!(retried.1["revision"], 2);
+    assert_eq!(
+        http(&fixture.state, Method::PUT, Some(&revoke_request)).await,
+        retried,
+        "retry returns one immutable receipt without another revision"
+    );
+    let (_, drained) = http(&fixture.state, Method::GET, None).await;
+    assert!(drained["pending_revoke_operation"].is_null());
+    assert_eq!(drained["revision"], 2);
+    assert_eq!(drained["receipt_capacity_remaining"], 126);
     assert_eq!(
         http(&fixture.state, Method::PUT, Some(&request)).await,
         (StatusCode::OK, receipt)
