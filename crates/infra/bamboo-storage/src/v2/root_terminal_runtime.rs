@@ -508,10 +508,7 @@ impl SessionStoreV2 {
         {
             return Ok(None);
         }
-        let mut outcome = latest
-            .last_run_status()
-            .filter(|s| super::super::child_wait_control_plane::terminal(s));
-        if let Some(mut entry) = self
+        let outcome = if let Some(mut entry) = self
             .observed_runtime_actor(&path, &latest)
             .await
             .map_err(io::Error::other)?
@@ -557,14 +554,12 @@ impl SessionStoreV2 {
                 publish(&latest);
                 return Ok(Some(latest));
             }
-            outcome = terminal_runtime::terminal_status(settled.status).map(str::to_string);
-        } else if latest.metadata.contains_key(ROOT_OBSERVATION)
-            || latest.conversation_reset.is_some()
-        {
-            // A lost activated sidecar is rejected by observed_runtime_actor;
-            // neither a marker nor reset context can recreate authority.
+            terminal_runtime::terminal_status(settled.status).map(str::to_string)
+        } else {
+            // An unactivated legacy Root has no exact current Actor/run proof.
+            // Neither leading Runtime nor historical Main can create it here.
             return Ok(None);
-        }
+        };
         let Some(outcome) = outcome else {
             return Ok(None);
         };

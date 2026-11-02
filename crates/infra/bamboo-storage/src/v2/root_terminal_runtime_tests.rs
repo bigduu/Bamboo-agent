@@ -7,6 +7,47 @@ use bamboo_domain::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[tokio::test]
+async fn root_terminal_unactivated_legacy_host_is_unknown_after_actual_main_fault() {
+    for phase in [
+        DurableWritePhase::BeforeReplace,
+        DurableWritePhase::AfterReplace,
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let store = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let mut root = Session::new("unactivated-root", "model");
+        root.session_version = None;
+        root.agent_runtime_state = Some(AgentRuntimeState::new("legacy-run-A"));
+        root.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Initializing;
+        root.set_last_run_status("running");
+        store.save_session(&root).await.unwrap();
+        root.set_last_run_status("completed");
+        let fault = DefaultWriteHook::install(&store, "session.json", phase, true);
+        fault.release();
+        assert!(store.save_session(&root).await.is_err());
+        *store.default_write_hook.lock().unwrap() = None;
+        store.flush_search_index().await;
+        drop(store);
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let observed = reopened.load_session(&root.id).await.unwrap().unwrap();
+        let path = home.path().join("sessions/unactivated-root/runtime.json");
+        let before = fs::read(&path).await.unwrap();
+        assert!(reopened
+            .reconcile_session_runtime(
+                &observed,
+                Utc::now(),
+                None,
+                Arc::new(|_| panic!("unactivated legacy Root has no current run proof"))
+            )
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(fs::read(&path).await.unwrap(), before);
+        assert!(!path.with_file_name("actor-authority.json").exists());
+        reopened.flush_search_index().await;
+    }
+}
+
 struct Fixture {
     home: tempfile::TempDir,
     store: Arc<SessionStoreV2>,
