@@ -1011,8 +1011,8 @@ impl ActorDirectoryPort for SessionStoreV2 {
             .await
             .map_err(storage)?
             .ok_or(ActorDirectoryError::InvalidIdentity)?;
-        super::super::reject_incompatible_session_write(&current).map_err(storage)?;
-        super::super::reject_incompatible_session_write(expected).map_err(storage)?;
+        super::reject_incompatible_session_write(&current).map_err(storage)?;
+        super::reject_incompatible_session_write(expected).map_err(storage)?;
         expected
             .check_conversation_generation(&current)
             .map_err(|_| ActorDirectoryError::InvalidIdentity)?;
