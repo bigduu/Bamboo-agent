@@ -720,6 +720,7 @@ impl bamboo_domain::RuntimeSessionPersistence for FailFirstInboxCheckpointPersis
 }
 
 struct Harness {
+    home: std::path::PathBuf,
     ctx: SpawnContext,
     storage: Arc<dyn Storage>,
     parent_session_id: String,
@@ -756,6 +757,15 @@ async fn build_harness(
     tool_names: Vec<String>,
     child_metadata: &[(&str, &str)],
 ) -> Harness {
+    build_harness_backend(provider, tool_names, child_metadata, false).await
+}
+
+async fn build_harness_backend(
+    provider: Arc<dyn LLMProvider>,
+    tool_names: Vec<String>,
+    child_metadata: &[(&str, &str)],
+    v2: bool,
+) -> Harness {
     let home = temp_dir("bamboo-sdk-test");
     tokio::fs::create_dir_all(&home).await.unwrap();
 
@@ -764,11 +774,15 @@ async fn build_harness(
             .await
             .unwrap(),
     );
-    let storage_dir = home.join("storage");
-    tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-    let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
-    jsonl.init().await.unwrap();
-    let storage: Arc<dyn Storage> = Arc::new(jsonl);
+    let storage: Arc<dyn Storage> = if v2 {
+        session_store.clone()
+    } else {
+        let storage_dir = home.join("storage");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
+        jsonl.init().await.unwrap();
+        Arc::new(jsonl)
+    };
 
     let metrics_storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
         home.join("metrics.db"),
@@ -794,12 +808,16 @@ async fn build_harness(
     parent.title = "Root".to_string();
     storage.save_session(&parent).await.unwrap();
 
-    let mut child = Session::new_child(
-        child_session_id.clone(),
-        parent_session_id.clone(),
-        "gpt-5",
-        "Child session",
-    );
+    let mut child = if v2 {
+        Session::new_child_of(child_session_id.clone(), &parent, "gpt-5", "Child session")
+    } else {
+        Session::new_child(
+            child_session_id.clone(),
+            parent_session_id.clone(),
+            "gpt-5",
+            "Child session",
+        )
+    };
     child
         .metadata
         .insert("last_run_status".to_string(), "queued".to_string());
@@ -846,6 +864,7 @@ async fn build_harness(
     };
 
     Harness {
+        home,
         ctx,
         storage,
         parent_session_id,
