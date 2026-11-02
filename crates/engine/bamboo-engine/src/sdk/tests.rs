@@ -129,6 +129,7 @@ async fn terminal_runtime_real_sdk_final_save_converges_outcomes_without_worker_
                 .unwrap();
             assert_eq!(durable.last_run_status().as_deref(), Some(status));
             assert_eq!(durable.agent_runtime_state.as_ref().unwrap().status, typed);
+            assert!(durable.host_run_id().is_some());
             let mirror: AgentRuntimeState =
                 serde_json::from_str(&durable.metadata["agent.runtime.state"]).unwrap();
             assert_eq!(mirror.status, typed);
@@ -137,6 +138,121 @@ async fn terminal_runtime_real_sdk_final_save_converges_outcomes_without_worker_
             );
         }
     }
+}
+
+#[tokio::test]
+async fn terminal_runtime_sdk_child_resumed_through_session_entrypoint_seals_new_run() {
+    let mut harness = build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+    harness.ctx.external_child_runner = Arc::new(TerminalOnlyRunner {
+        status: "completed",
+        initial: Some(AgentStatusState::Initializing),
+        fault_main: None,
+        observed: Arc::default(),
+    });
+    let job = SpawnJob {
+        parent_session_id: harness.parent_session_id.clone(),
+        child_session_id: harness.child_session_id.clone(),
+        model: "gpt-5".into(),
+        disabled_tools: None,
+    };
+    run_child_spawn(harness.ctx.clone(), job).await.unwrap();
+    collect_until_completed(&mut harness.parent_rx).await;
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_run = child.host_run_id().unwrap().to_owned();
+    child.advance_child_launch_generation().unwrap();
+    child.set_last_run_status("pending");
+    child.add_message(Message::user(
+        "resume through the existing Session execution entrypoint",
+    ));
+    harness.storage.save_session(&child).await.unwrap();
+    let (events, _) = broadcast::channel(128);
+    let crate::execution::SessionExecutionReserveOutcome::Reserved(reservation) =
+        crate::execution::reserve_session_execution(
+            &harness.ctx.agent,
+            &harness.ctx.agent_runners,
+            &harness.ctx.session_event_senders,
+            &child.id,
+            &events,
+        )
+        .await
+    else {
+        panic!("resumed child reservation");
+    };
+    let new_run = reservation.run_id().to_owned();
+    assert_ne!(new_run, old_run);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let (ack, barrier) = crate::runtime::execution::event_forwarder::history_commit_barrier();
+    let drain = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                ack.acknowledge();
+            }
+        }
+    });
+    let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::execution::spawn_session_execution(crate::execution::SessionExecutionArgs {
+        agent: harness.ctx.agent.clone(),
+        session_id: child.id.clone(),
+        session: child.clone(),
+        execution_reservation: reservation,
+        tools_override: None,
+        provider_override: None,
+        model_roster: crate::runtime::model_roster::ModelRoster {
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        },
+        reasoning_effort: None,
+        reasoning_effort_source: "terminal regression".into(),
+        auxiliary_model_resolver: None,
+        disabled_filter_resolver: None,
+        disabled_tools: None,
+        disabled_skill_ids: None,
+        selected_skill_ids: None,
+        selected_skill_mode: None,
+        mpsc_tx: tx,
+        history_commit_barrier: barrier,
+        image_fallback: None,
+        gold_config: None,
+        guardian_config: None,
+        guardian_spawner: None,
+        bash_resume_hook: None,
+        bash_completion_sink: None,
+        app_data_dir: Some(harness.home.clone()),
+        run_budget: None,
+        runners: harness.ctx.agent_runners.clone(),
+        sessions_cache: harness.ctx.sessions_cache.clone(),
+        on_complete: None,
+        child_completion_handler: Some(Arc::new(TerminalDeliveryCompletion(completed_tx))),
+    });
+    let completed = tokio::time::timeout(Duration::from_secs(30), completed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let source = completed.source.unwrap();
+    assert_eq!(source.activation_run_id, new_run);
+    assert_eq!(completed.status, "completed");
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .unwrap()
+        .unwrap();
+    let reopened = bamboo_storage::SessionStoreV2::new(harness.home.clone())
+        .await
+        .unwrap();
+    let durable = reopened.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(durable.host_run_id(), Some(new_run.as_str()));
+    assert_eq!(
+        durable.agent_runtime_state.as_ref().unwrap().status,
+        AgentStatusState::Completed
+    );
+    assert_eq!(
+        crate::execution::ChildCompletionSource::from_committed_session(&durable),
+        Some(source)
+    );
 }
 
 #[tokio::test]
@@ -198,6 +314,119 @@ async fn terminal_runtime_explicit_rerun_consumes_prior_typed_question_handoff()
         assert_eq!(state.status, AgentStatusState::Completed);
         assert!(state.suspension.is_none());
     }
+}
+
+struct SupersedingPreparation {
+    storage: Arc<dyn Storage>,
+    executions: AtomicUsize,
+}
+
+#[async_trait]
+impl ExternalChildRunner for SupersedingPreparation {
+    async fn should_handle(&self, _: &Session) -> bool {
+        true
+    }
+    async fn prepare_child_execution(
+        &self,
+        session: &Session,
+        _: &str,
+        _: tokio_util::sync::CancellationToken,
+    ) -> Result<Option<Arc<dyn bamboo_domain::RuntimeSessionPersistence>>, String> {
+        self.storage
+            .begin_host_run(session, "newer-host-run")
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(None)
+    }
+    async fn execute_external_child(
+        &self,
+        _: &mut Session,
+        _: &SpawnJob,
+        _: tokio::sync::mpsc::Sender<AgentEvent>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> crate::runtime::runner::Result<()> {
+        self.executions.fetch_add(1, Ordering::SeqCst);
+        panic!("a refused Host binding must not enter legacy execution")
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_legacy_startup_save_conflict_never_enters_executor() {
+    let mut harness = build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+    let observed = Arc::new(std::sync::Mutex::new(None));
+    harness.ctx.external_child_runner = Arc::new(TerminalOnlyRunner {
+        status: "completed",
+        initial: None,
+        fault_main: None,
+        observed: observed.clone(),
+    });
+    let controlled = Arc::new(FailFirstInboxCheckpointPersistence {
+        inner: Arc::new(bamboo_storage::LockedSessionStore::new(
+            harness.storage.clone(),
+        )),
+        message_id: "unused-startup-race".into(),
+        failures: AtomicUsize::new(0),
+        supersede_startup: Some(harness.storage.clone()),
+    });
+    harness.ctx.agent = Arc::new(harness.ctx.agent.with_execution_persistence(controlled));
+    let error = run_child_spawn(
+        harness.ctx.clone(),
+        SpawnJob {
+            parent_session_id: harness.parent_session_id.clone(),
+            child_session_id: harness.child_session_id.clone(),
+            model: "gpt-5".into(),
+            disabled_tools: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("startup was not admitted"), "{error}");
+    assert!(observed.lock().unwrap().is_none());
+    let reopened = bamboo_storage::SessionStoreV2::new(harness.home.clone())
+        .await
+        .unwrap();
+    let current = reopened
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.host_run_id(), Some("newer-startup-run"));
+    assert_eq!(current.last_run_status().as_deref(), Some("running"));
+    assert!(crate::execution::ChildCompletionSource::from_committed_session(&current).is_none());
+}
+
+#[tokio::test]
+async fn terminal_runtime_legacy_binding_rejection_never_enters_executor() {
+    let mut harness = build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+    let runner = Arc::new(SupersedingPreparation {
+        storage: harness.storage.clone(),
+        executions: AtomicUsize::new(0),
+    });
+    harness.ctx.external_child_runner = runner.clone();
+    let error = run_child_spawn(
+        harness.ctx.clone(),
+        SpawnJob {
+            parent_session_id: harness.parent_session_id.clone(),
+            child_session_id: harness.child_session_id.clone(),
+            model: "gpt-5".into(),
+            disabled_tools: None,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("superseded"), "{error}");
+    assert_eq!(runner.executions.load(Ordering::SeqCst), 0);
+    let reopened = bamboo_storage::SessionStoreV2::new(harness.home.clone())
+        .await
+        .unwrap();
+    let current = reopened
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(current.host_run_id(), Some("newer-host-run"));
+    assert_eq!(current.last_run_status().as_deref(), Some("running"));
+    assert!(crate::execution::ChildCompletionSource::from_committed_session(&current).is_none());
 }
 
 #[tokio::test]
@@ -657,11 +886,17 @@ struct FailFirstInboxCheckpointPersistence {
     inner: Arc<bamboo_storage::LockedSessionStore>,
     message_id: String,
     failures: AtomicUsize,
+    supersede_startup: Option<Arc<dyn Storage>>,
 }
 
 #[async_trait]
 impl bamboo_domain::RuntimeSessionPersistence for FailFirstInboxCheckpointPersistence {
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        if let Some(storage) = self.supersede_startup.as_ref() {
+            if self.failures.fetch_add(1, Ordering::SeqCst) == 0 {
+                storage.begin_host_run(session, "newer-startup-run").await?;
+            }
+        }
         bamboo_domain::RuntimeSessionPersistence::save_runtime_session(self.inner.as_ref(), session)
             .await
     }
@@ -894,6 +1129,7 @@ async fn build_terminal_delivery_harness(
                 inner: locked.clone(),
                 message_id,
                 failures: AtomicUsize::new(0),
+                supersede_startup: None,
             }),
             None => locked.clone(),
         };

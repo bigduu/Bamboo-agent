@@ -565,7 +565,28 @@ async fn run_child_spawn_inner(
     if let Some(persistence) = prepared_persistence {
         ctx.agent = Arc::new(ctx.agent.with_execution_persistence(persistence));
     }
+    if !local_backend {
+        execution_reservation
+            .arm_child_host_startup(
+                &ctx.agent,
+                &session,
+                ctx.sessions_cache.clone(),
+                child_tx.clone(),
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+    }
+
+    let mut host_bound = false;
     let publish_running = async {
+        // Backend refusal has not started this Run. Bind only after successful
+        // preparation; a binding failure uses the existing exact pre-launch
+        // cleanup path below instead of leaving an ownerless running marker.
+        if let Err(error) = ctx.agent.storage().begin_host_run(&session, &run_id).await {
+            return (false, Err(error));
+        }
+        session.set_host_run_id(&run_id);
+        host_bound = true;
         // Publish the child's process-global workspace only after this task owns
         // both the exact runner slot and logical-session router. A rejected
         // cross-entry caller must not overwrite a live owner's tool root or
@@ -654,7 +675,23 @@ async fn run_child_spawn_inner(
                 "Local Child running checkpoint failed before launch: {error}"
             ));
         }
+        if !host_bound
+            || error
+                .get_ref()
+                .is_some_and(|cause| cause.is::<bamboo_domain::SessionAuthorityConflict>())
+        {
+            execution_reservation
+                .fail_child_host_startup(&error.to_string())
+                .await;
+            let failure = Err(bamboo_agent_core::AgentError::LLM(error.to_string()));
+            finalize_runner_exact(&ctx.agent_runners, &session.id, &run_id, &failure).await;
+            execution_reservation.abandon().await;
+            return Err(format!("Child Host startup was not admitted: {error}"));
+        }
         if retired_pending {
+            execution_reservation
+                .fail_child_host_startup(&error.to_string())
+                .await;
             return Err(format!(
                 "Failed to retire previous Child terminal delivery before execution: {error}"
             ));

@@ -6,6 +6,34 @@ use super::*;
 use crate::v2::DefaultWriterGuards;
 use bamboo_domain::{AgentRuntimeState, AgentStatusState, SessionKind};
 
+const HOST_PRIOR_ACTIVATION: &str = "runtime.host_prior_activation_fence";
+
+// Read identity only; neither phase is authority to invent a terminal outcome.
+fn completion_source_run(session: &Session) -> io::Result<Option<String>> {
+    let Some(raw) = session.metadata.get("runtime.child_completion_source_v1") else {
+        return Ok(None);
+    };
+    if raw.len() > 8192 {
+        return Err(conflict("Child completion source exceeds bound"));
+    }
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| conflict("Child completion source is invalid"))?;
+    let source = if let Some(pending) = value.get("pending_confirmation") {
+        if value.as_object().is_none_or(|object| object.len() != 1) {
+            return Err(conflict("Child completion source phase is ambiguous"));
+        }
+        pending
+    } else {
+        &value
+    };
+    let run = source
+        .get("activation_run_id")
+        .and_then(|id| id.as_str())
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| conflict("Child completion source identity is unavailable"))?;
+    Ok(Some(run.into()))
+}
+
 fn conflict(message: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::WouldBlock,
@@ -259,7 +287,7 @@ impl SessionStoreV2 {
             .lock_actor_runtime(&expected.id)
             .await
             .map_err(io::Error::other)?;
-        let latest = self
+        let mut latest = self
             .projection_target(&expected.id, &rel)
             .await?
             .ok_or_else(|| conflict("Host run Session disappeared"))?;
@@ -272,15 +300,89 @@ impl SessionStoreV2 {
         if expected.child_launch_generation() != latest.child_launch_generation() {
             return Err(conflict("Host startup launch generation was superseded"));
         }
-        if self
+        if expected.kind == SessionKind::Child
+            && expected.last_run_status().as_deref() == Some("pending")
+            && latest.host_run_id() != Some(run_id)
+            && (latest.last_run_status().as_deref() != Some("pending")
+                || latest.is_child_launch_cancelled(latest.child_launch_generation()))
+        {
+            return Err(conflict("queued Host launch was closed before startup"));
+        }
+        if latest.host_run_id() != Some(run_id) && latest.host_run_id() != expected.host_run_id() {
+            return Err(conflict("Host run was superseded before startup"));
+        }
+        let mut observed_entry = self
             .observed_runtime_actor(&path, &latest)
             .await
-            .map_err(io::Error::other)?
-            .and_then(|entry| entry.activation)
-            .is_some_and(|activation| activation.status.is_live() && activation.run_id != run_id)
-        {
-            return Err(conflict("another Actor attempt owns Host startup"));
+            .map_err(io::Error::other)?;
+        if let Some(entry) = observed_entry.as_mut() {
+            if let Some(activation) = entry
+                .activation
+                .as_mut()
+                .filter(|a| a.status.is_live() && a.run_id != run_id)
+            {
+                if activation.lease_expires_at > Utc::now() || latest.kind != SessionKind::Child {
+                    return Err(conflict("another Actor attempt owns Host startup"));
+                }
+                // Match existing Child lease-loss recovery under the same
+                // physical locks as renewal and takeover. Capturing an expired
+                // live fence alone would allow A to renew after binding B.
+                let source_for_predecessor =
+                    completion_source_run(&latest)?.as_deref() == Some(activation.run_id.as_str());
+                if source_for_predecessor
+                    || latest.last_run_status().as_deref().is_some_and(|status| {
+                        super::super::child_wait_control_plane::terminal(status)
+                            && !same_terminal_class(status, "error")
+                    })
+                {
+                    return Err(conflict(
+                        "expired predecessor retains a conflicting Host terminal fact",
+                    ));
+                }
+                activation.status = ActorActivationStatus::Failed;
+                activation.finished_at = Some(Utc::now());
+                entry.actor.state = ActorLogicalState::Failed;
+                entry.revision = checked_next(entry.revision).map_err(io::Error::other)?;
+                let ended = (latest.host_run_matches_launch()
+                    && !latest.has_runtime_wait()
+                    && latest.last_run_status().as_deref() != Some("pending"))
+                .then(|| {
+                    let mut ended = latest.clone();
+                    ended.set_last_run_status("error");
+                    ended.set_last_run_error(
+                        "Child activation lease expired before successor Host startup",
+                    );
+                    ended.synchronize_terminal_runtime_status();
+                    ended
+                });
+                entry.validate().map_err(io::Error::other)?;
+                let runtime = ended
+                    .as_ref()
+                    .map(|ended| {
+                        Ok::<_, io::Error>((
+                            self.abs_path_from_rel(&rel)
+                                .join(super::super::RUNTIME_SIDECAR_FILE),
+                            serde_json::to_vec_pretty(&super::super::runtime_sidecar_snapshot(
+                                ended,
+                            ))?,
+                        ))
+                    })
+                    .transpose()?;
+                self.write_actor_bytes_followed_by_runtime(
+                    &path,
+                    serde_json::to_vec_pretty(entry)?,
+                    runtime,
+                    &guards,
+                )
+                .await
+                .map_err(io::Error::other)?;
+                if let Some(ended) = ended {
+                    self.upsert_index_from_session(&ended, rel.clone()).await?;
+                    latest = ended;
+                }
+            }
         }
+        let observed = observed_entry.and_then(|entry| entry.activation);
         if latest.host_run_id() == Some(run_id) {
             if !latest.host_run_matches_launch() {
                 return Err(conflict("Host run launch identity changed"));
@@ -295,6 +397,15 @@ impl SessionStoreV2 {
         }
         let mut after = latest.clone();
         after.set_host_run_id(run_id);
+        after.metadata.remove(HOST_PRIOR_ACTIVATION);
+        if let Some(prior) = observed
+            .filter(|activation| !activation.status.is_live() && activation.run_id != run_id)
+        {
+            after.metadata.insert(
+                HOST_PRIOR_ACTIVATION.into(),
+                serde_json::to_string(&prior.fence())?,
+            );
+        }
         after.metadata.remove("runtime.reconciled_activation_fence");
         after.set_last_run_status("running");
         after.clear_last_run_error();
@@ -311,6 +422,77 @@ impl SessionStoreV2 {
         self.commit_runtime_projection(&latest, &after, &rel, &guards)
             .await
             .map_err(io::Error::other)
+    }
+
+    pub(crate) async fn fail_child_host_startup_impl(
+        &self,
+        expected: &Session,
+        run_id: &str,
+        error: &str,
+        publish: &bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<Option<Session>> {
+        let (rel, path, guards) = self
+            .lock_actor_runtime(&expected.id)
+            .await
+            .map_err(io::Error::other)?;
+        let Some(latest) = self.projection_target(&expected.id, &rel).await? else {
+            return Ok(None);
+        };
+        super::super::reject_incompatible_session_write(&latest)?;
+        super::super::child_wait_control_plane::validate_incarnation(expected, &latest)?;
+        super::super::reject_incompatible_session_write(expected)?;
+        let work = "execute.pending_turn_message_id";
+        if latest.kind != SessionKind::Child
+            || latest.host_run_id() != Some(run_id)
+            || latest.parent_created_at != expected.parent_created_at
+            || latest.child_launch_generation() != expected.child_launch_generation()
+            || !latest.host_run_matches_launch()
+            || latest.has_runtime_wait()
+            || latest.session_inbox_admission() != expected.session_inbox_admission()
+            || latest.messages.last().map(|m| &m.id) != expected.messages.last().map(|m| &m.id)
+            || latest
+                .metadata
+                .get(work)
+                .is_some_and(|id| expected.metadata.get(work) != Some(id))
+        {
+            return Ok(None);
+        }
+        if completion_source_run(&latest)?.as_deref() == Some(run_id) {
+            return Ok(None);
+        }
+        if let Some(activation) = self
+            .observed_runtime_actor(&path, &latest)
+            .await
+            .map_err(io::Error::other)?
+            .and_then(|entry| entry.activation)
+        {
+            let prior = latest
+                .metadata
+                .get(HOST_PRIOR_ACTIVATION)
+                .and_then(|raw| serde_json::from_str::<ActorActivationFence>(raw).ok());
+            if activation.status.is_live() || prior.as_ref() != Some(&activation.fence()) {
+                return Ok(None);
+            }
+        }
+        let detail = format!("Child startup failed before execution: {error}");
+        if super::super::child_wait_control_plane::terminal(
+            latest.last_run_status().as_deref().unwrap_or(""),
+        ) && !(latest.last_run_status().as_deref() == Some("error")
+            && latest.last_run_error().as_deref() == Some(detail.as_str()))
+        {
+            return Ok(None);
+        }
+        let mut after = latest.clone();
+        after.set_last_run_status("error");
+        after.set_last_run_error(&detail);
+        after.synchronize_terminal_runtime_status();
+        after.metadata.remove(work);
+        after.metadata.remove("execute.startup_handoff_at");
+        self.commit_runtime_projection(&latest, &after, &rel, &guards)
+            .await
+            .map_err(io::Error::other)?;
+        publish(&after);
+        Ok(Some(after))
     }
 
     pub(crate) async fn reconcile_child_runtime_impl(
@@ -489,10 +671,44 @@ impl SessionStoreV2 {
                 return Err(conflict("Host runtime writer would reopen a terminal run"));
             }
         }
-        let candidate = incoming.clone();
+        let mut candidate = incoming.clone();
+        if let Some(latest) = latest.as_ref().filter(|latest| {
+            latest.host_run_id().is_some() && latest.host_run_id() == candidate.host_run_id()
+        }) {
+            match latest.metadata.get(HOST_PRIOR_ACTIVATION) {
+                Some(fence) => {
+                    candidate
+                        .metadata
+                        .insert(HOST_PRIOR_ACTIVATION.into(), fence.clone());
+                }
+                None => {
+                    candidate.metadata.remove(HOST_PRIOR_ACTIVATION);
+                }
+            }
+        }
         if !candidate.host_run_matches_launch()
             && candidate.last_run_status().as_deref() != Some("pending")
         {
+            // A queued generation has no new Host run to bind. Its existing
+            // generation tombstone closes only that unstarted launch; retaining
+            // the predecessor marker prevents its late final-save/finish from
+            // becoming proof for this newer cancelled/failed launch.
+            if let Some(latest) = latest.as_ref() {
+                let same_snapshot =
+                    serde_json::to_value(super::super::runtime_sidecar_snapshot(&candidate))?
+                        == serde_json::to_value(latest)?;
+                if candidate.kind == SessionKind::Child
+                    && candidate.child_launch_generation() == latest.child_launch_generation()
+                    && candidate.is_child_launch_cancelled(candidate.child_launch_generation())
+                    && matches!(
+                        candidate.last_run_status().as_deref(),
+                        Some("cancelled" | "error" | "skipped")
+                    )
+                    && (latest.last_run_status().as_deref() == Some("pending") || same_snapshot)
+                {
+                    return Ok(candidate);
+                }
+            }
             return Err(conflict(
                 "Host runtime writer has no matching launch identity",
             ));
@@ -513,6 +729,25 @@ impl SessionStoreV2 {
                 if bound_fence == Some(&activation.fence()) {
                     return Ok(candidate);
                 }
+                // A legacy backend claims its Actor inside execute. The exact
+                // new Host binding observed this terminal predecessor under the
+                // same lock; permit its startup before that claim. Any new
+                // Actor fence, including a finished successor, invalidates it.
+                if !activation.status.is_live()
+                    && latest.as_ref().is_some_and(|latest| {
+                        latest.host_run_id() == candidate.host_run_id()
+                            && latest
+                                .metadata
+                                .get(HOST_PRIOR_ACTIVATION)
+                                .and_then(|raw| {
+                                    serde_json::from_str::<ActorActivationFence>(raw).ok()
+                                })
+                                .as_ref()
+                                == Some(&activation.fence())
+                    })
+                {
+                    return Ok(candidate);
+                }
                 if candidate.host_run_id().is_some() {
                     return Err(conflict(
                         "Host runtime writer was superseded by another activation",
@@ -521,6 +756,11 @@ impl SessionStoreV2 {
             }
             if !candidate.has_runtime_wait()
                 && !pending_delivery(&candidate)
+                && !latest.as_ref().is_some_and(|latest| {
+                    activation.status == ActorActivationStatus::Succeeded
+                        && latest.last_run_status().as_deref() == Some("suspended")
+                        && candidate.last_run_status().as_deref() == Some("suspended")
+                })
                 && candidate.host_run_matches_launch()
                 && candidate.last_run_status().as_deref() != Some("pending")
             {
