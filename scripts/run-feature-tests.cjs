@@ -124,9 +124,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // additive context or its 20 explicit cases changed.
 // Both owner entrances now share the actual HTTP acceptance path. Their
 // original default owners remain distinct, with no additive case repetition.
-const FEATURE_SOURCE_SHA256 = "73c4eb72ae2fd385df8cde8588a0df1d729d5a2845b162d5909806b3cd4bad7c";
+const FEATURE_SOURCE_SHA256 = "086b7bb1916e99b987caa4d9256c9645cc6eb0b4ab6331f25d27507eed47283b";
+// Child Host admission and startup failure tests retain the existing default
+// Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
 // contexts and20 additive cases; its nested tests add no producer.
+
 
 
 const FEATURE_CONTEXTS = [
