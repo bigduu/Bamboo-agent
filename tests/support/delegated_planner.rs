@@ -104,25 +104,11 @@ async fn planner_response(body: web::Json<Value>, probe: web::Data<PlannerProbe>
         }
     } else {
         let round = probe.root_calls.fetch_add(1, Ordering::SeqCst);
-        if probe.crash_child && round == 1 {
-            let projection = body["messages"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter_map(|m| m["content"].as_str())
-                .find_map(resume_typed_projection)
-                .expect(
-                    "real boot recovery must resume the parent with a bounded unavailable outcome",
-                );
-            assert_eq!(projection["view"], "planner_artifact");
-            assert_eq!(projection["available"], false);
-            assert_eq!(projection["execution_approved"], false);
-            assert!(projection["read"].is_null());
-            let event = json!({"id":"planner-failure-response","object":"chat.completion.chunk",
-                "choices":[{"index":0,"delta":{"content":"REAL_PLANNER_FAILURE_REPORTED"},"finish_reason":"stop"}]});
-            return HttpResponse::Ok()
-                .content_type("text/event-stream")
-                .body(format!("data: {event}\n\ndata: [DONE]\n\n"));
+        if probe.crash_child {
+            assert_eq!(
+                round, 0,
+                "unconfirmed completion must not start another Root execution"
+            );
         }
         match round {
             0 => {
@@ -378,6 +364,9 @@ async fn planner_fixture(crash_child: bool) {
                 .as_deref(),
             Some("running")
         );
+        let before_restart = disk.load_session("planner-root").await.unwrap().unwrap();
+        let before_runtime = before_restart.agent_runtime_state.as_ref().unwrap();
+        assert!(before_runtime.waiting_for_children.is_some());
         drop(host); // SIGKILL + wait, never a graceful cancellation or a forged terminal save.
         let mut restarted = start_host(&data, port);
         await_host(&mut restarted, &client, &base, &data).await;
@@ -402,31 +391,41 @@ async fn planner_fixture(crash_child: bool) {
         let parent = disk.load_session("planner-root").await.unwrap().unwrap();
         assert_eq!(probe.root_calls.load(Ordering::SeqCst), 1);
         assert_eq!(probe.child_calls.load(Ordering::SeqCst), 1);
-        assert!(parent
-            .agent_runtime_state
-            .as_ref()
-            .unwrap()
-            .waiting_for_children
-            .is_some());
-        assert!(parent
-            .agent_runtime_state
-            .as_ref()
-            .unwrap()
-            .plan_mode
-            .is_some());
+        let after_runtime = parent.agent_runtime_state.as_ref().unwrap();
         assert_eq!(
-            parent.agent_runtime_state.as_ref().unwrap().permission_mode,
-            original
-                .agent_runtime_state
-                .as_ref()
-                .unwrap()
-                .permission_mode
+            serde_json::to_value(&after_runtime.waiting_for_children).unwrap(),
+            serde_json::to_value(&before_runtime.waiting_for_children).unwrap(),
+            "repair preserves the exact pre-crash wait"
+        );
+        assert_eq!(
+            serde_json::to_value(&after_runtime.plan_mode).unwrap(),
+            serde_json::to_value(&before_runtime.plan_mode).unwrap(),
+            "Plan delegation does not imply interactive plan mode"
+        );
+        assert_eq!(
+            after_runtime.permission_mode,
+            before_runtime.permission_mode
         );
         let child = disk.load_session(&child_id).await.unwrap().unwrap();
         assert_eq!(child.last_run_status().as_deref(), Some("error"));
         assert!(!child
             .metadata
             .contains_key("runtime.child_completion_source_v1"));
+        let inbox = bamboo_storage::FileSessionInbox::new(
+            Arc::new(disk),
+            bamboo_domain::SessionInboxLimits::default(),
+        );
+        assert!(
+            bamboo_domain::SessionInboxPort::pending_child_outcomes(
+                &inbox,
+                "planner-root",
+                &child_id
+            )
+            .await
+            .unwrap()
+            .is_empty(),
+            "a repaired Child grants no parent outcome or activation"
+        );
         assert!(!data.join("plan/delegated").exists());
         assert!(!data.join("must-not-exist.txt").exists());
         drop(restarted);
