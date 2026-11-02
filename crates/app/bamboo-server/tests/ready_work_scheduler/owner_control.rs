@@ -15,6 +15,15 @@ async fn http(
     method: Method,
     body: Option<&Value>,
 ) -> (StatusCode, Value) {
+    http_uri(state, method, URI, body).await
+}
+
+async fn http_uri(
+    state: &web::Data<AppState>,
+    method: Method,
+    uri: &str,
+    body: Option<&Value>,
+) -> (StatusCode, Value) {
     let app = test::init_service(
         App::new()
             .app_data(state.clone())
@@ -23,7 +32,7 @@ async fn http(
     .await;
     let mut request = test::TestRequest::default()
         .method(method)
-        .uri(URI)
+        .uri(uri)
         .peer_addr("127.0.0.1:43210".parse().unwrap());
     if let Some(body) = body {
         request = request.set_json(body);
@@ -42,22 +51,24 @@ async fn configure_budget(fixture: &Fixture, limit: u64) {
     fixture.state.config.write().await.extra.insert("model_limits".into(), json!([{
         "model_pattern":MODEL,"max_context_tokens":65536,"max_output_tokens":1024,"safety_margin":1000,
     }]));
-    let (service, authority) = fixture.state.tickets.authority(owner()).await.unwrap();
-    service
-        .configure_work_token_budget(
-            &authority,
-            0,
-            WorkTokenLimits {
-                work_tokens: fixture
-                    .works
-                    .iter()
-                    .map(|work| (work.id.clone(), limit))
-                    .collect(),
-                utc_day_tokens: limit * fixture.works.len() as u64,
-                total_tokens: limit * fixture.works.len() as u64,
-            },
-        )
-        .unwrap();
+    let budget_uri = "/api/v1/tickets/token-budget";
+    let (code, status) = http_uri(&fixture.state, Method::GET, budget_uri, None).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    let request = json!({
+        "binding":status["binding"],"authority_epoch":status["observed"]["authority_epoch"],
+        "expected_revision":status["budget_revision"],"limits":WorkTokenLimits {
+            work_tokens: fixture.works.iter().map(|work| (work.id.clone(), limit)).collect(),
+            utc_day_tokens: limit * fixture.works.len() as u64,
+            total_tokens: limit * fixture.works.len() as u64,
+        },
+    });
+    let installed = http_uri(&fixture.state, Method::PUT, budget_uri, Some(&request)).await;
+    assert_eq!(installed.0, StatusCode::OK, "{}", installed.1);
+    assert_eq!(
+        http_uri(&fixture.state, Method::PUT, budget_uri, Some(&request)).await,
+        installed,
+        "budget retry reads one original canonical decision"
+    );
 }
 
 fn install(
