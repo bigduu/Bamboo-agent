@@ -38,6 +38,227 @@ use bamboo_skills::SkillManager;
 /// Provider that returns a single token + Done, so the child loop completes.
 struct CompletedProvider;
 
+/// A trusted executor outcome with no worker-side lifecycle mirror. This is
+/// the Host final-save gap, rather than the loop's own enum transition.
+struct TerminalOnlyRunner {
+    status: &'static str,
+    initial: AgentStatusState,
+    fault_main: Option<std::path::PathBuf>,
+    observed: Arc<std::sync::Mutex<Option<(Session, bool)>>>,
+}
+
+#[async_trait]
+impl ExternalChildRunner for TerminalOnlyRunner {
+    async fn should_handle(&self, _: &Session) -> bool {
+        true
+    }
+
+    async fn execute_external_child(
+        &self,
+        session: &mut Session,
+        _: &SpawnJob,
+        _: tokio::sync::mpsc::Sender<AgentEvent>,
+        _: tokio_util::sync::CancellationToken,
+    ) -> crate::runtime::runner::Result<()> {
+        let mut state = AgentRuntimeState::new(&session.id);
+        state.status = self.initial;
+        session.agent_runtime_state = Some(state);
+        if let Some(main) = self.fault_main.as_ref() {
+            std::fs::rename(main, main.with_extension("held")).unwrap();
+            std::fs::create_dir(main).unwrap();
+        }
+        match self.status {
+            "completed" => Ok(()),
+            "cancelled" => Err(bamboo_agent_core::AgentError::Cancelled),
+            _ => Err(bamboo_agent_core::AgentError::LLM(
+                "trusted executor failure".into(),
+            )),
+        }
+    }
+
+    async fn confirm_durable_child_delivery(
+        &self,
+        session: &Session,
+        _: &str,
+        committed: bool,
+    ) -> Result<(), String> {
+        *self.observed.lock().unwrap() = Some((session.clone(), committed));
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_real_sdk_final_save_converges_outcomes_without_worker_mirror() {
+    for (status, typed) in [
+        ("completed", AgentStatusState::Completed),
+        ("cancelled", AgentStatusState::Cancelled),
+        ("error", AgentStatusState::Failed),
+    ] {
+        for initial in [AgentStatusState::Initializing, AgentStatusState::Running] {
+            let mut harness =
+                build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+            harness.ctx.external_child_runner = Arc::new(TerminalOnlyRunner {
+                status,
+                initial,
+                fault_main: None,
+                observed: Arc::default(),
+            });
+            run_child_spawn(
+                harness.ctx.clone(),
+                SpawnJob {
+                    parent_session_id: harness.parent_session_id.clone(),
+                    child_session_id: harness.child_session_id.clone(),
+                    model: "gpt-5".into(),
+                    disabled_tools: None,
+                },
+            )
+            .await
+            .unwrap();
+            let events = collect_until_completed(&mut harness.parent_rx).await;
+            assert!(events.iter().any(|event| matches!(event,
+            AgentEvent::SubAgentCompleted { status: found, .. } if found == status)));
+            let reopened = bamboo_storage::SessionStoreV2::new(harness.home.clone())
+                .await
+                .unwrap();
+            let durable = reopened
+                .load_session(&harness.child_session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.last_run_status().as_deref(), Some(status));
+            assert_eq!(durable.agent_runtime_state.as_ref().unwrap().status, typed);
+            assert!(durable.host_run_id().is_some());
+            let mirror: AgentRuntimeState =
+                serde_json::from_str(&durable.metadata["agent.runtime.state"]).unwrap();
+            assert_eq!(mirror.status, typed);
+            assert!(
+                crate::execution::ChildCompletionSource::from_committed_session(&durable).is_some()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_closed_launch_is_stale_for_intent_and_real_scheduler() {
+    for status in ["completed", "cancelled", "error"] {
+        let mut harness =
+            build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+        let mut child = harness
+            .storage
+            .load_session(&harness.child_session_id)
+            .await
+            .unwrap()
+            .unwrap();
+        child.advance_child_launch_generation().unwrap();
+        child.mark_child_auto_run_launch_intent();
+        child.set_last_run_status(status);
+        child.synchronize_terminal_runtime_status();
+        harness.storage.save_session(&child).await.unwrap();
+        let locked = bamboo_storage::LockedSessionStore::new(harness.storage.clone());
+        assert!(locked
+            .ensure_child_auto_run_launch_intent(&child)
+            .await
+            .unwrap()
+            .is_none());
+        let scheduler = crate::runtime::execution::spawn::SpawnScheduler::new(harness.ctx.clone());
+        let commit = scheduler
+            .enqueue_announced_for_generation(
+                SpawnJob {
+                    parent_session_id: harness.parent_session_id.clone(),
+                    child_session_id: harness.child_session_id.clone(),
+                    model: "gpt-5".into(),
+                    disabled_tools: None,
+                },
+                None,
+                None,
+                Some(child.child_launch_generation()),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(commit, bamboo_domain::AdmissionCommit::Cancelled));
+        assert!(matches!(
+            harness.parent_rx.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        assert!(harness.ctx.agent_runners.read().await.is_empty());
+        let durable = harness
+            .storage
+            .load_session(&child.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.last_run_status().as_deref(), Some(status));
+        assert_eq!(durable.agent_runtime_state, child.agent_runtime_state);
+    }
+}
+
+#[tokio::test]
+async fn terminal_runtime_real_sdk_final_save_fault_requires_retry_before_reopen_proof() {
+    for status in ["completed", "cancelled", "error"] {
+        let mut harness =
+            build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+        let main = harness
+            .home
+            .join("sessions/root-session/children/child-session/session.json");
+        let observed = Arc::new(std::sync::Mutex::new(None));
+        harness.ctx.external_child_runner = Arc::new(TerminalOnlyRunner {
+            status,
+            initial: AgentStatusState::Initializing,
+            fault_main: Some(main.clone()),
+            observed: observed.clone(),
+        });
+        run_child_spawn(
+            harness.ctx.clone(),
+            SpawnJob {
+                parent_session_id: harness.parent_session_id.clone(),
+                child_session_id: harness.child_session_id.clone(),
+                model: "gpt-5".into(),
+                disabled_tools: None,
+            },
+        )
+        .await
+        .unwrap();
+        collect_until_completed(&mut harness.parent_rx).await;
+        let (mut retry, committed) = observed.lock().unwrap().take().unwrap();
+        assert!(
+            !committed,
+            "a failed actual Host save is not durable delivery proof"
+        );
+        std::fs::remove_dir(&main).unwrap();
+        std::fs::rename(main.with_extension("held"), &main).unwrap();
+        let before = std::fs::read(&main).unwrap();
+        harness
+            .ctx
+            .agent
+            .persistence()
+            .checkpoint_runtime_session(&mut retry)
+            .await
+            .unwrap();
+        harness
+            .ctx
+            .agent
+            .persistence()
+            .checkpoint_runtime_session(&mut retry)
+            .await
+            .unwrap();
+        let reopened = bamboo_storage::SessionStoreV2::new(harness.home.clone())
+            .await
+            .unwrap();
+        let durable = reopened.load_session(&retry.id).await.unwrap().unwrap();
+        assert_eq!(durable.last_run_status().as_deref(), Some(status));
+        assert_eq!(durable.host_run_id(), retry.host_run_id());
+        assert_eq!(durable.agent_runtime_state, retry.agent_runtime_state);
+        assert!(
+            crate::execution::ChildCompletionSource::from_committed_session(&durable).is_some()
+        );
+        assert_eq!(
+            std::fs::read(&main).unwrap(),
+            before,
+            "runtime retry preserves canonical Main"
+        );
+    }
+}
+
 #[async_trait]
 impl LLMProvider for CompletedProvider {
     async fn chat_stream(
@@ -430,6 +651,7 @@ impl bamboo_domain::RuntimeSessionPersistence for FailFirstInboxCheckpointPersis
 }
 
 struct Harness {
+    home: std::path::PathBuf,
     ctx: SpawnContext,
     storage: Arc<dyn Storage>,
     parent_session_id: String,
@@ -466,6 +688,15 @@ async fn build_harness(
     tool_names: Vec<String>,
     child_metadata: &[(&str, &str)],
 ) -> Harness {
+    build_harness_backend(provider, tool_names, child_metadata, false).await
+}
+
+async fn build_harness_backend(
+    provider: Arc<dyn LLMProvider>,
+    tool_names: Vec<String>,
+    child_metadata: &[(&str, &str)],
+    v2: bool,
+) -> Harness {
     let home = temp_dir("bamboo-sdk-test");
     tokio::fs::create_dir_all(&home).await.unwrap();
 
@@ -474,11 +705,15 @@ async fn build_harness(
             .await
             .unwrap(),
     );
-    let storage_dir = home.join("storage");
-    tokio::fs::create_dir_all(&storage_dir).await.unwrap();
-    let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
-    jsonl.init().await.unwrap();
-    let storage: Arc<dyn Storage> = Arc::new(jsonl);
+    let storage: Arc<dyn Storage> = if v2 {
+        session_store.clone()
+    } else {
+        let storage_dir = home.join("storage");
+        tokio::fs::create_dir_all(&storage_dir).await.unwrap();
+        let jsonl = bamboo_storage::JsonlStorage::new(&storage_dir);
+        jsonl.init().await.unwrap();
+        Arc::new(jsonl)
+    };
 
     let metrics_storage = Arc::new(bamboo_metrics::SqliteMetricsStorage::new(
         home.join("metrics.db"),
@@ -504,12 +739,16 @@ async fn build_harness(
     parent.title = "Root".to_string();
     storage.save_session(&parent).await.unwrap();
 
-    let mut child = Session::new_child(
-        child_session_id.clone(),
-        parent_session_id.clone(),
-        "gpt-5",
-        "Child session",
-    );
+    let mut child = if v2 {
+        Session::new_child_of(child_session_id.clone(), &parent, "gpt-5", "Child session")
+    } else {
+        Session::new_child(
+            child_session_id.clone(),
+            parent_session_id.clone(),
+            "gpt-5",
+            "Child session",
+        )
+    };
     child
         .metadata
         .insert("last_run_status".to_string(), "queued".to_string());
@@ -556,6 +795,7 @@ async fn build_harness(
     };
 
     Harness {
+        home,
         ctx,
         storage,
         parent_session_id,

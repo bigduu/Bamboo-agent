@@ -982,6 +982,61 @@ async fn terminal_runtime_replayed_finish_does_not_close_an_idle_next_input_gate
 }
 
 #[tokio::test]
+async fn terminal_runtime_queued_closure_after_prior_host_cannot_restart_or_reuse_old_finish() {
+    for (status, typed) in [
+        ("cancelled", AgentStatusState::Cancelled),
+        ("error", AgentStatusState::Failed),
+    ] {
+        let (home, store, child, activation) = fixture(AgentStatusState::Initializing).await;
+        store.begin_host_run(&child, "host-A").await.unwrap();
+        let mut completed = store.load_session(&child.id).await.unwrap().unwrap();
+        completed.set_last_run_status("completed");
+        completed.synchronize_terminal_runtime_status();
+        store.save_session(&completed).await.unwrap();
+        store
+            .finish_activation(
+                &activation.fence(),
+                Utc::now(),
+                ActorActivationFinish::Succeeded,
+            )
+            .await
+            .unwrap();
+        let mut queued = store.load_session(&child.id).await.unwrap().unwrap();
+        queued.advance_child_launch_generation().unwrap();
+        queued.mark_child_auto_run_launch_intent();
+        queued.set_last_run_status("pending");
+        store.save_session(&queued).await.unwrap();
+        let expected_launch = queued.clone();
+        queued.cancel_child_launch_generation();
+        queued.set_last_run_status(status);
+        queued.set_last_run_error("unstarted launch closed");
+        queued.synchronize_terminal_runtime_status();
+        store.save_runtime_state(&queued).await.unwrap();
+        store.save_runtime_state(&queued).await.unwrap();
+        assert!(store
+            .begin_host_run(&expected_launch, "host-B")
+            .await
+            .is_err());
+        assert!(store.save_session(&completed).await.is_err());
+        let before = std::fs::read(runtime_path(home.path())).unwrap();
+        store
+            .finish_activation(
+                &activation.fence(),
+                Utc::now(),
+                ActorActivationFinish::Succeeded,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(runtime_path(home.path())).unwrap(), before);
+        let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+        let current = assert_terminal(&reopened, typed, status).await;
+        assert_eq!(current.child_launch_generation(), 1);
+        assert_eq!(current.host_run_id(), Some("host-A"));
+        assert!(!current.host_run_matches_launch());
+    }
+}
+
+#[tokio::test]
 async fn terminal_runtime_unmarked_legacy_save_grants_no_actor_authority() {
     let home = tempfile::tempdir().unwrap();
     let store = SessionStoreV2::new(home.path().into()).await.unwrap();

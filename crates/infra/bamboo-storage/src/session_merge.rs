@@ -1407,7 +1407,7 @@ impl LockedSessionStore {
                 == Some(generation);
             let already_started = matches!(
                 latest.last_run_status().as_deref(),
-                Some("running" | "completed" | "error" | "timeout" | "skipped" | "suspended")
+                Some("running" | "suspended")
             );
             return Ok((already_promised && already_started).then_some(latest));
         }

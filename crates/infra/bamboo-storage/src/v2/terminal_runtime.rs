@@ -272,6 +272,14 @@ impl SessionStoreV2 {
         if expected.child_launch_generation() != latest.child_launch_generation() {
             return Err(conflict("Host startup launch generation was superseded"));
         }
+        if expected.kind == SessionKind::Child
+            && expected.last_run_status().as_deref() == Some("pending")
+            && latest.host_run_id() != Some(run_id)
+            && (latest.last_run_status().as_deref() != Some("pending")
+                || latest.is_child_launch_cancelled(latest.child_launch_generation()))
+        {
+            return Err(conflict("queued Host launch was closed before startup"));
+        }
         if self
             .observed_runtime_actor(&path, &latest)
             .await
@@ -493,6 +501,26 @@ impl SessionStoreV2 {
         if !candidate.host_run_matches_launch()
             && candidate.last_run_status().as_deref() != Some("pending")
         {
+            // A queued generation has no new Host run to bind. Its existing
+            // generation tombstone closes only that unstarted launch; retaining
+            // the predecessor marker prevents its late final-save/finish from
+            // becoming proof for this newer cancelled/failed launch.
+            if let Some(latest) = latest.as_ref() {
+                let same_snapshot =
+                    serde_json::to_value(super::super::runtime_sidecar_snapshot(&candidate))?
+                        == serde_json::to_value(latest)?;
+                if candidate.kind == SessionKind::Child
+                    && candidate.child_launch_generation() == latest.child_launch_generation()
+                    && candidate.is_child_launch_cancelled(candidate.child_launch_generation())
+                    && matches!(
+                        candidate.last_run_status().as_deref(),
+                        Some("cancelled" | "error" | "skipped")
+                    )
+                    && (latest.last_run_status().as_deref() == Some("pending") || same_snapshot)
+                {
+                    return Ok(candidate);
+                }
+            }
             return Err(conflict(
                 "Host runtime writer has no matching launch identity",
             ));

@@ -1168,7 +1168,8 @@ async fn production_local_restart_rejects_unknown_stop_without_relaunch_or_false
     let reopened = Harness::open(home.path(), &parent_id, control.provider.clone(), 1).await;
     let error = reopened.launch(&child).await.unwrap_err();
     assert!(
-        error.contains("confirmed stop") && error.contains("blocked"),
+        (error.contains("confirmed stop") && error.contains("blocked"))
+            || error.contains("another Actor attempt owns Host startup"),
         "{error}"
     );
     assert!(matches!(

@@ -436,8 +436,12 @@ async fn mark_failed_child_enqueue(
         }) {
             return Ok(());
         }
+        if child.last_run_status().as_deref() == Some("pending") {
+            child.cancel_child_launch_generation();
+        }
         child.set_last_run_status("error");
         child.set_last_run_error(format!("Child launch failed: {error}"));
+        child.synchronize_terminal_runtime_status();
         child.updated_at = chrono::Utc::now();
         sessions.save_child_session(&mut child).await
     }
