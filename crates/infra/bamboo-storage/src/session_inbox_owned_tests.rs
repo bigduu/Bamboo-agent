@@ -1056,6 +1056,69 @@ async fn interrupted_upgrade_ignores_old_interrupt_write_and_rejects_missing_sna
     }
 }
 
+#[tokio::test]
+async fn cancel_if_absent_treats_existing_tombstone_as_idempotent_success() {
+    let (_temp, _, inbox) = fixture().await;
+    immediate(&inbox, "scoped cancellation").await;
+    let (dir, filesystem) = inbox.owned_filesystem("target").await.unwrap();
+    let queue = dir.join("new");
+    let mut entries = tokio::fs::read_dir(&queue).await.unwrap();
+    let entry = entries.next_entry().await.unwrap().unwrap();
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let path = queue.join(&name);
+    // First cancellation moves the transport into its tombstone.
+    filesystem
+        .cancel_if_absent(&dir, &path, &name)
+        .await
+        .unwrap();
+    let tombstone = dir.join("cancelled").join(&name);
+    let evidence = tokio::fs::read(&tombstone).await.unwrap();
+    assert!(!path.exists());
+    // A retried cancellation replays a transport with the same bytes at the
+    // same name: the existing tombstone is the same benign terminal state, so
+    // it must succeed, drop the duplicate source from the active queue, and
+    // leave the preserved tombstone bytes untouched.
+    tokio::fs::write(&path, &evidence).await.unwrap();
+    filesystem
+        .cancel_if_absent(&dir, &path, &name)
+        .await
+        .unwrap();
+    assert!(
+        !path.exists(),
+        "replayed cancellation must drop the duplicate source"
+    );
+    assert_eq!(tokio::fs::read(&tombstone).await.unwrap(), evidence);
+}
+
+#[tokio::test]
+async fn cancel_if_absent_fails_closed_on_foreign_tombstone_collision() {
+    let (_temp, _, inbox) = fixture().await;
+    immediate(&inbox, "scoped cancellation").await;
+    let (dir, filesystem) = inbox.owned_filesystem("target").await.unwrap();
+    let queue = dir.join("new");
+    let mut entries = tokio::fs::read_dir(&queue).await.unwrap();
+    let entry = entries.next_entry().await.unwrap().unwrap();
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let path = queue.join(&name);
+    let original = tokio::fs::read(&path).await.unwrap();
+    // Foreign forensic evidence already occupies the tombstone name.
+    let cancelled = dir.join("cancelled");
+    tokio::fs::create_dir_all(&cancelled).await.unwrap();
+    let tombstone = cancelled.join(&name);
+    let existing = b"preexisting immutable forensic collision".to_vec();
+    tokio::fs::write(&tombstone, &existing).await.unwrap();
+    // A transport with different bytes must not silently retire into the
+    // foreign tombstone: the collision fails closed and both sides keep their
+    // original bytes, so the caller can withhold the Stop ACK.
+    let error = filesystem
+        .cancel_if_absent(&dir, &path, &name)
+        .await
+        .unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(tokio::fs::read(&tombstone).await.unwrap(), existing);
+    assert_eq!(tokio::fs::read(&path).await.unwrap(), original);
+}
+
 // Frozen v2 ACK body from 20e6276b. It reads InboxMessage.kind at the held
 // physical path, never either version header, then validates envelope/generation
 // before receipt+remove. Helper semantic/receipt parsing remains v2-compatible.
