@@ -1445,6 +1445,7 @@ async fn cancel_child_action_inner(
     }
     child.set_last_run_status("cancelled");
     child.set_last_run_error("Cancelled by parent");
+    child.synchronize_terminal_runtime_status();
     port.save_child_session(&mut child).await?;
     Ok(json!({
         "child_session_id": child_session_id,

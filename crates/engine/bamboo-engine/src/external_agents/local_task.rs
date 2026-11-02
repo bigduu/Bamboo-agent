@@ -1021,6 +1021,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         }
         stopped.set_last_run_status("error");
         stopped.set_last_run_error("initial local Child checkpoint failed");
+        stopped.synchronize_terminal_runtime_status();
         execution
             .persistence
             .checkpoint_runtime_session(&mut stopped)

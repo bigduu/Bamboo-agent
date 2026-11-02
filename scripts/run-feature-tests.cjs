@@ -114,7 +114,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // by its existing ticket-runtime-fixtures cfg. Six Ready owner cases belong
 // to server-tests-1 and Worker-auth to server-handlers. All four additive
 // contexts and 20 explicit cases remain unchanged.
-const FEATURE_SOURCE_SHA256 = "d7d406766c403c6bcfc472c99e7c4048043711496973827145fcf3d7e90d983e";
+// Admitted #2469 runtime observation and #2460 terminal-save integration keep
+// their existing default owners; no additive context or case selection changes.
+const FEATURE_SOURCE_SHA256 = "143a80bacac0a3f8b198dd2594586ac334e8d4d19ac6d737fe2fc6db4552f6f4";
 
 const FEATURE_CONTEXTS = [
   { package: "bamboo-infrastructure", features: ["otel-otlp", "test-utils"], targets: [

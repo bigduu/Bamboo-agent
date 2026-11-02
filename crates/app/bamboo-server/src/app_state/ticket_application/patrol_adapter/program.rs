@@ -1,7 +1,7 @@
 //! Assembly for the existing opt-in Ready worker; no new loop or policy grant.
 
 use super::super::{Error, Principal, Result, TicketApplication};
-use super::{patrol_error, PatrolCheckpointStore};
+use super::{patrol_error, runtime_observation, PatrolCheckpointStore};
 use bamboo_orchestration::{
     patrol::{
         program::{ProgramPatrol, ProgramSelection},
@@ -78,6 +78,12 @@ impl TicketApplication {
         let (service, authority) = self.authority(Principal::Runtime).await?;
         let (_, snapshot) = service.published()?;
         let facts_revision = snapshot.execution_facts_revision();
+        // Canonical runtime I/O stays outside the synchronous journal/Ticket
+        // pass. Each prepared sample remains bound to its original commit and
+        // receipt; the factory rechecks both against fresh ledger authority.
+        let observations =
+            runtime_observation::prepare_selection(self, &service, &authority, selection).await?;
+        fence.check()?;
         let expected_binding = snapshot.binding.clone();
         let binding =
             bamboo_tickets::content_hash(&bamboo_tickets::canonical_bytes(&snapshot.binding)?);
@@ -111,7 +117,7 @@ impl TicketApplication {
                     Error::AuthorityUnavailable("program patrol clock unavailable".into())
                 })?;
             program
-                .tick_project(
+                .tick_project_with_observations(
                     &service,
                     &authority,
                     &ProgramSelection {
@@ -120,6 +126,20 @@ impl TicketApplication {
                     },
                     &SystemClock(now),
                     &mut journal,
+                    &mut |scope| match observations.get(scope) {
+                        Some(runtime) => {
+                            bamboo_orchestration::patrol::host::read_observation_with_runtime(
+                                &service,
+                                &authority,
+                                scope,
+                                runtime,
+                                &Policy::default(),
+                            )
+                        }
+                        None => bamboo_orchestration::patrol::host::read_observation(
+                            &service, &authority, scope,
+                        ),
+                    },
                 )
                 .map_err(|error| match error {
                     bamboo_orchestration::patrol::Error::Port(error) => patrol_error(error),
