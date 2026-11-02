@@ -2,6 +2,7 @@
 // Native Host/worker acceptance is recorded separately, never inferred here.
 struct RepeatedChildInspector {
     calls: AtomicUsize,
+    diagnostics: bool,
 }
 
 #[async_trait::async_trait]
@@ -23,7 +24,11 @@ impl LLMProvider for RepeatedChildInspector {
             Ok(LLMChunk::ToolCalls(vec![activation_call(
                 &format!("inspect-{round}"),
                 "SubAgent",
-                r#"{"intent":"inspect","target":"inspected-child"}"#,
+                if self.diagnostics {
+                    r#"{"intent":"inspect","target":"inspected-child","message":"diagnostics"}"#
+                } else {
+                    r#"{"intent":"inspect","target":"inspected-child"}"#
+                },
             )])),
             Ok(LLMChunk::Done),
         ])))
@@ -33,6 +38,7 @@ impl LLMProvider for RepeatedChildInspector {
 struct ChildInspectionExecutor {
     calls: AtomicUsize,
     change_at: Option<usize>,
+    diagnostics: bool,
 }
 
 #[async_trait::async_trait]
@@ -42,13 +48,24 @@ impl bamboo_agent_core::tools::ToolExecutor for ChildInspectionExecutor {
         _: &ToolCall,
     ) -> Result<ToolResult, bamboo_agent_core::tools::ToolError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ToolResult::text(
-            true,
+        let progress = usize::from(self.change_at.is_some_and(|at| call >= at));
+        let observation = if self.diagnostics {
+            serde_json::json!({
+                "actor_id":"inspected-child", "view":"diagnostics", "available":true,
+                "observed_status":"running",
+                "activation":{"available":true,"directory_revision":call,"attempt":1,"status":"running"},
+                "leases":{"available":true,"items":[{"generation":1,"epoch":1,"expires_at":format!("expiry-{call}"),"expired":false}]},
+                "queue":{"available":true,"generation":progress},
+            })
+        } else {
             serde_json::json!({
                 "actor_id":"inspected-child", "observed_status":"running", "is_running":true,
-                "round_count":usize::from(self.change_at.is_some_and(|at| call >= at)),
+                "round_count":progress,
             })
-            .to_string(),
+        };
+        Ok(ToolResult::text(
+            true,
+            observation.to_string(),
         ))
     }
     fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
@@ -76,7 +93,7 @@ fn supervisor_child_inspection_wait_bounds_provider_calls_and_resets_on_changed_
 
 async fn supervisor_child_inspection_wait_fixture() {
     for ultra in [false, true] {
-        for change_at in [None, Some(2)] {
+        for (change_at, diagnostics) in [(None, false), (Some(2), false), (None, true), (Some(2), true)] {
             let inner = Arc::new(TestStorage::default());
             let storage: Arc<dyn Storage> = Arc::new(ChildIndexStorage {
                 inner,
@@ -106,10 +123,12 @@ async fn supervisor_child_inspection_wait_fixture() {
             let mut state = e2e_loop_state(&session.id);
             let provider = Arc::new(RepeatedChildInspector {
                 calls: AtomicUsize::new(0),
+                diagnostics,
             });
             let tools = Arc::new(ChildInspectionExecutor {
                 calls: AtomicUsize::new(0),
                 change_at,
+                diagnostics,
             });
             let cancel = CancellationToken::new();
             let (tx, mut rx) = mpsc::channel(256);
@@ -127,6 +146,7 @@ async fn supervisor_child_inspection_wait_fixture() {
             let bound = change_at.unwrap_or(0) + 3;
             assert_eq!(provider.calls.load(Ordering::SeqCst), bound);
             assert_eq!(tools.calls.load(Ordering::SeqCst), bound);
+            eprintln!("2451 controlled-provider/synthetic-tool ultra={ultra}, diagnostics={diagnostics}, change_at={change_at:?}: provider={bound}, inspect={bound}, durable_wait=true");
             assert!(!sent_complete);
             assert!(
                 !cancel.is_cancelled(),
