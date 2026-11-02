@@ -55,8 +55,10 @@ mod ready_retry_store;
 mod resolution;
 mod scheduling;
 mod sprints;
+mod token_budget;
 pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
 pub use ready_retry_store::{FileReadyRetryStore, ReadyRetryFilePhase, ReadyRetryPublicationFault};
+pub use token_budget::WorkTokenBudgetSetup;
 #[cfg(test)]
 mod tests;
 
