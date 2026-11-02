@@ -33,6 +33,7 @@ pub mod scoped_loop_control;
 pub mod supervised_root_outcome;
 pub mod supervisor_management;
 pub mod task;
+mod terminal_runtime;
 pub mod tool_authority;
 pub mod tool_types;
 pub mod types;

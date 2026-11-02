@@ -973,6 +973,7 @@ impl SessionStoreV2 {
         } else {
             published_expected.clear_last_run_error();
         }
+        published_expected.synchronize_terminal_runtime_status();
         if expected
             .metadata
             .get(COMPLETION_SOURCE_KEY)
