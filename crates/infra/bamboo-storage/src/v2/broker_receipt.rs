@@ -1375,6 +1375,133 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn published_terminal_receipt_cannot_regress_to_older_pending_stage_after_ack_or_reopen(
+    ) -> io::Result<()> {
+        use bamboo_domain::{
+            ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, AgentRuntimeState,
+            AgentStatusState, RuntimeSessionPersistence,
+        };
+        for (status, typed, finish) in [
+            (
+                "completed",
+                AgentStatusState::Completed,
+                ActorActivationFinish::Succeeded,
+            ),
+            (
+                "cancelled",
+                AgentStatusState::Cancelled,
+                ActorActivationFinish::Cancelled,
+            ),
+            (
+                "error",
+                AgentStatusState::Failed,
+                ActorActivationFinish::Failed,
+            ),
+        ] {
+            for acknowledged in [false, true] {
+                let (home, store, child) = fixture().await?;
+                store.begin_host_run(&child, "strict-run").await?;
+                let child = store.load_session(&child.id).await?.unwrap();
+                let now = Utc::now();
+                let activation = store
+                    .claim_activation(&ActorActivationClaim {
+                        actor_id: child.id.clone(),
+                        run_id: "strict-run".into(),
+                        lease_owner: "receipt-owner".into(),
+                        lease_expires_at: now + chrono::Duration::minutes(5),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    })
+                    .await
+                    .map_err(io::Error::other)?;
+                store
+                    .start_activation(&activation.fence(), now)
+                    .await
+                    .map_err(io::Error::other)?;
+                let mut terminal = child.clone();
+                terminal.add_message(Message::assistant("verified terminal response", None));
+                terminal.set_last_run_status(status);
+                if status != "completed" {
+                    terminal.set_last_run_error(format!("worker {status}"));
+                }
+                terminal.synchronize_terminal_runtime_status();
+                let proof =
+                    HostTerminalCompleteness::from_verified_host(&terminal, "strict-run", 7, 2)?;
+                prepare_strict(&store, &terminal, &proof).await?;
+                let (mut stage, intended, published) = pending_terminal(&terminal);
+                stage.agent_runtime_state.as_mut().unwrap().status = AgentStatusState::Running;
+                stage.metadata.insert(
+                    "agent.runtime.state".into(),
+                    serde_json::to_string(stage.agent_runtime_state.as_ref().unwrap()).unwrap(),
+                );
+                store.save_session(&stage).await?;
+                let stage = store.load_session(&child.id).await?.unwrap();
+                store
+                    .finish_activation(&activation.fence(), Utc::now(), finish)
+                    .await
+                    .map_err(io::Error::other)?;
+                assert_eq!(
+                    store
+                        .load_session(&child.id)
+                        .await?
+                        .unwrap()
+                        .last_run_status()
+                        .as_deref(),
+                    Some("running"),
+                    "first pending stage remains nonterminal"
+                );
+                let receipt = store
+                    .commit_broker_terminal_receipt_with_completeness(
+                        &intended,
+                        "strict-run",
+                        &proof,
+                    )
+                    .await?;
+                store
+                    .publish_broker_terminal_source(&receipt, &stage, &published)
+                    .await?;
+                if acknowledged {
+                    store
+                        .clear_acknowledged_broker_terminal_receipt(
+                            &child.id,
+                            child.created_at,
+                            "strict-run",
+                            TEST_PARENT_MAILBOX,
+                        )
+                        .await?;
+                }
+                drop(store);
+                let store = Arc::new(SessionStoreV2::new(home.path().into()).await?);
+                let directory = home
+                    .path()
+                    .join("sessions/broker-receipt-root/children/broker-receipt-child");
+                let before = fs::read(directory.join("session.json")).await?;
+                assert!(
+                    store.save_runtime_state(&stage).await.is_err(),
+                    "a published terminal receipt must reject an older pending runtime snapshot"
+                );
+                assert!(store.save_session(&stage).await.is_err());
+                let locked = crate::LockedSessionStore::new(store.clone());
+                let mut replay = stage.clone();
+                assert!(locked
+                    .checkpoint_runtime_session(&mut replay)
+                    .await
+                    .is_err());
+                let current = store.load_session(&child.id).await?.unwrap();
+                assert_eq!(current.last_run_status().as_deref(), Some(status));
+                assert_eq!(current.agent_runtime_state.as_ref().unwrap().status, typed);
+                let mirror: AgentRuntimeState =
+                    serde_json::from_str(&current.metadata["agent.runtime.state"]).unwrap();
+                assert_eq!(mirror.status, typed);
+                assert_eq!(current.metadata[COMPLETION_SOURCE_KEY], published);
+                assert_eq!(fs::read(directory.join("session.json")).await?, before);
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn staged_running_receipt_requires_live_commit_before_source_publication(
     ) -> io::Result<()> {
         for strict in [false, true] {
