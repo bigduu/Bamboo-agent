@@ -1258,6 +1258,23 @@ pub fn spawn_session_execution_with_upstream_retry(
                 .unwrap_or_else(|| agent.persistence().clone());
             let agent = Arc::new(agent.with_execution_persistence(persistence));
             let activation_run_id = execution_reservation.run_id().to_string();
+            if session.kind == bamboo_agent_core::SessionKind::Child {
+                if let Err(error) = agent
+                    .storage()
+                    .begin_host_run(&session, &activation_run_id)
+                    .await
+                {
+                    let _ = mpsc_tx
+                        .send(AgentEvent::Error {
+                            message: error.to_string(),
+                        })
+                        .await;
+                    execution_reservation.abandon().await;
+                    return;
+                }
+                session.set_host_run_id(&activation_run_id);
+                session.set_last_run_status("running");
+            }
             let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
             let (cancel_token, mut activation_registration) =
                 execution_reservation.disarm_for_execution();
@@ -1392,10 +1409,14 @@ pub fn spawn_session_execution_with_upstream_retry(
             // "completed" so a session waiting on the user or on children isn't
             // reported as finished (mirrors the child path in `sdk::spawn`).
             let suspended_non_terminal = result.is_ok()
-                && session
-                    .metadata
-                    .get("runtime.suspend_reason")
-                    .is_some_and(|reason| !reason.trim().is_empty());
+                && (if session.kind == bamboo_agent_core::SessionKind::Child {
+                    session.has_runtime_wait()
+                } else {
+                    session
+                        .metadata
+                        .get("runtime.suspend_reason")
+                        .is_some_and(|reason| !reason.trim().is_empty())
+                });
             match &result {
                 Ok(()) if suspended_non_terminal => {
                     session.set_last_run_status("suspended");
@@ -1413,6 +1434,10 @@ pub fn spawn_session_execution_with_upstream_retry(
                     session.set_last_run_status("error");
                     session.set_last_run_error(error.to_string());
                 }
+            }
+
+            if session.kind == bamboo_agent_core::SessionKind::Child {
+                session.synchronize_terminal_runtime_status();
             }
 
             // Bespoke terminal bookkeeping (e.g. a scheduled-run status) runs

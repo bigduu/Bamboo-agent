@@ -141,6 +141,121 @@ async fn terminal_runtime_real_sdk_final_save_converges_outcomes_without_worker_
 }
 
 #[tokio::test]
+async fn terminal_runtime_sdk_child_resumed_through_session_entrypoint_seals_new_run() {
+    let mut harness = build_harness_backend(Arc::new(CompletedProvider), vec![], &[], true).await;
+    harness.ctx.external_child_runner = Arc::new(TerminalOnlyRunner {
+        status: "completed",
+        initial: Some(AgentStatusState::Initializing),
+        fault_main: None,
+        observed: Arc::default(),
+    });
+    let job = SpawnJob {
+        parent_session_id: harness.parent_session_id.clone(),
+        child_session_id: harness.child_session_id.clone(),
+        model: "gpt-5".into(),
+        disabled_tools: None,
+    };
+    run_child_spawn(harness.ctx.clone(), job).await.unwrap();
+    collect_until_completed(&mut harness.parent_rx).await;
+    let mut child = harness
+        .storage
+        .load_session(&harness.child_session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let old_run = child.host_run_id().unwrap().to_owned();
+    child.advance_child_launch_generation().unwrap();
+    child.set_last_run_status("pending");
+    child.add_message(Message::user(
+        "resume through the existing Session execution entrypoint",
+    ));
+    harness.storage.save_session(&child).await.unwrap();
+    let (events, _) = broadcast::channel(128);
+    let crate::execution::SessionExecutionReserveOutcome::Reserved(reservation) =
+        crate::execution::reserve_session_execution(
+            &harness.ctx.agent,
+            &harness.ctx.agent_runners,
+            &harness.ctx.session_event_senders,
+            &child.id,
+            &events,
+        )
+        .await
+    else {
+        panic!("resumed child reservation");
+    };
+    let new_run = reservation.run_id().to_owned();
+    assert_ne!(new_run, old_run);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+    let (ack, barrier) = crate::runtime::execution::event_forwarder::history_commit_barrier();
+    let drain = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::SessionHistoryCommitted { .. }) {
+                ack.acknowledge();
+            }
+        }
+    });
+    let (completed_tx, mut completed_rx) = tokio::sync::mpsc::unbounded_channel();
+    crate::execution::spawn_session_execution(crate::execution::SessionExecutionArgs {
+        agent: harness.ctx.agent.clone(),
+        session_id: child.id.clone(),
+        session: child.clone(),
+        execution_reservation: reservation,
+        tools_override: None,
+        provider_override: None,
+        model_roster: crate::runtime::model_roster::ModelRoster {
+            model: Some("gpt-5".into()),
+            ..Default::default()
+        },
+        reasoning_effort: None,
+        reasoning_effort_source: "terminal regression".into(),
+        auxiliary_model_resolver: None,
+        disabled_filter_resolver: None,
+        disabled_tools: None,
+        disabled_skill_ids: None,
+        selected_skill_ids: None,
+        selected_skill_mode: None,
+        mpsc_tx: tx,
+        history_commit_barrier: barrier,
+        image_fallback: None,
+        gold_config: None,
+        guardian_config: None,
+        guardian_spawner: None,
+        bash_resume_hook: None,
+        bash_completion_sink: None,
+        app_data_dir: Some(harness.home.clone()),
+        run_budget: None,
+        runners: harness.ctx.agent_runners.clone(),
+        sessions_cache: harness.ctx.sessions_cache.clone(),
+        on_complete: None,
+        child_completion_handler: Some(Arc::new(TerminalDeliveryCompletion(completed_tx))),
+    });
+    let completed = tokio::time::timeout(Duration::from_secs(30), completed_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let source = completed.source.unwrap();
+    assert_eq!(source.activation_run_id, new_run);
+    assert_eq!(completed.status, "completed");
+    tokio::time::timeout(Duration::from_secs(5), drain)
+        .await
+        .unwrap()
+        .unwrap();
+    let reopened = bamboo_storage::SessionStoreV2::new(harness.home.clone())
+        .await
+        .unwrap();
+    let durable = reopened.load_session(&child.id).await.unwrap().unwrap();
+    assert_eq!(durable.host_run_id(), Some(new_run.as_str()));
+    assert_eq!(
+        durable.agent_runtime_state.as_ref().unwrap().status,
+        AgentStatusState::Completed
+    );
+    assert_eq!(
+        crate::execution::ChildCompletionSource::from_committed_session(&durable),
+        Some(source)
+    );
+}
+
+#[tokio::test]
 async fn terminal_runtime_explicit_rerun_consumes_prior_typed_question_handoff() {
     for reason in ["awaiting_clarification", "awaiting_parent_approval"] {
         let mut harness =
