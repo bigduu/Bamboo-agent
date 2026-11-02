@@ -688,6 +688,36 @@ async fn terminal_runtime_finish_preserves_confirmed_timeout_status_error_and_so
 }
 
 #[tokio::test]
+async fn terminal_runtime_finish_preserves_skipped_error_and_source() {
+    let (_home, store, child, activation) = fixture(AgentStatusState::Running).await;
+    store.begin_host_run(&child, "host-A").await.unwrap();
+    let mut skipped = store.load_session(&child.id).await.unwrap().unwrap();
+    skipped.set_last_run_status("skipped");
+    skipped.set_last_run_error("No pending message to execute");
+    let source = "{\"status\":\"skipped\",\"activation_run_id\":\"host-A\"}";
+    skipped
+        .metadata
+        .insert("runtime.child_completion_source_v1".into(), source.into());
+    store.save_session(&skipped).await.unwrap();
+    for _ in 0..2 {
+        store
+            .finish_activation(
+                &activation.fence(),
+                Utc::now(),
+                ActorActivationFinish::Succeeded,
+            )
+            .await
+            .unwrap();
+        let saved = assert_terminal(&store, AgentStatusState::Completed, "skipped").await;
+        assert_eq!(
+            saved.last_run_error().as_deref(),
+            Some("No pending message to execute")
+        );
+        assert_eq!(saved.metadata["runtime.child_completion_source_v1"], source);
+    }
+}
+
+#[tokio::test]
 async fn terminal_runtime_lost_activated_sidecar_is_not_reconstructed_from_stale_main() {
     let (home, store, child, activation) = fixture(AgentStatusState::Running).await;
     let old_main = std::fs::read(main_path(home.path())).unwrap();

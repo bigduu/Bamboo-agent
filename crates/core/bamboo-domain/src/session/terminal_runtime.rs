@@ -20,10 +20,10 @@ impl Session {
     }
 
     pub fn host_run_matches_launch(&self) -> bool {
-        self.metadata
-            .get("runtime.host_launch_generation")
-            .and_then(|s| s.parse::<u64>().ok())
-            .is_none_or(|generation| generation == self.child_launch_generation())
+        match self.metadata.get("runtime.host_launch_generation") {
+            Some(value) => value.parse::<u64>().ok() == Some(self.child_launch_generation()),
+            None => self.host_run_id().is_none(),
+        }
     }
 
     /// A completed activation may have handed execution to a durable wait.

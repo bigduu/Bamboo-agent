@@ -189,7 +189,11 @@ impl SessionStoreV2 {
         } else {
             after.set_last_run_status(status);
         }
-        if status == "completed" {
+        if status == "completed"
+            && !prior
+                .as_deref()
+                .is_some_and(super::super::child_wait_control_plane::terminal)
+        {
             after.clear_last_run_error();
         }
         after.synchronize_terminal_runtime_status();
@@ -223,6 +227,9 @@ impl SessionStoreV2 {
             return Err(conflict("Host startup launch generation was superseded"));
         }
         if latest.host_run_id() == Some(run_id) {
+            if !latest.host_run_matches_launch() {
+                return Err(conflict("Host run launch identity changed"));
+            }
             return Ok(());
         }
         if latest.host_run_id() != expected.host_run_id() {
@@ -394,6 +401,13 @@ impl SessionStoreV2 {
             }
         }
         let mut candidate = incoming.clone();
+        if !candidate.host_run_matches_launch()
+            && candidate.last_run_status().as_deref() != Some("pending")
+        {
+            return Err(conflict(
+                "Host runtime writer has no matching launch identity",
+            ));
+        }
         if !candidate.has_runtime_wait() && !pending_delivery(&candidate) {
             if let Some(entry) = if candidate.host_run_id().is_some() {
                 self.observed_runtime_actor(&path.join(ACTOR_AUTHORITY_FILE), &candidate)
