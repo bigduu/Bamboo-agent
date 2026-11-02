@@ -242,6 +242,16 @@ pub struct ReadyWorkScheduler {
 }
 
 impl ReadyWorkScheduler {
+    /// Permission observation only; it proves no execution or progress. Never
+    /// wait behind queue backpressure: an owner must still be able to revoke.
+    pub fn policy_is_active(&self) -> Option<bool> {
+        self.state.try_lock().ok().map(|state| {
+            state.as_ref().is_some_and(|installed| {
+                !installed.revoked.is_cancelled() && Instant::now() < installed.expires
+            })
+        })
+    }
+
     /// Host-only retry metadata; installing this store does not install a policy.
     pub fn with_recovery(
         store: Arc<dyn ready_recovery::ReadyRetryStore>,

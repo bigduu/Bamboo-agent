@@ -219,7 +219,7 @@ impl Work {
 }
 
 struct Fixture {
-    state: AppState,
+    state: actix_web::web::Data<AppState>,
     requests: mpsc::UnboundedReceiver<Request>,
     provider: Arc<ControlledProvider>,
     project: ProjectId,
@@ -290,11 +290,23 @@ fn workspace(root: &Path, index: usize) -> ExecutionWorkspace {
 
 impl Fixture {
     async fn new(work_count: usize) -> Self {
+        Self::with_explicit_scope(work_count, false).await
+    }
+
+    async fn with_explicit_scope(work_count: usize, explicit: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         // The named-profile reader opens the physical home without following
         // symlinks. macOS TempDir may use /var; pass its canonical directory to
         // every Host adapter, as the same-root lifecycle fixture already does.
         let physical_root = root.path().canonicalize().unwrap();
+        if explicit {
+            use bamboo_domain::Storage;
+            let storage = SessionStoreV2::new(physical_root.clone()).await.unwrap();
+            storage
+                .get_or_create_default_supervisor(MODEL)
+                .await
+                .unwrap();
+        }
         let (send, requests) = mpsc::unbounded_channel();
         let provider = Arc::new(ControlledProvider {
             requests: send,
@@ -312,19 +324,44 @@ impl Fixture {
             .memory_mut()
             .get_or_insert_with(Default::default)
             .auto_dream_enabled = false;
-        let state = AppState::new_with_provider_and_memory_store(
-            physical_root.clone(),
-            config,
-            provider.clone(),
-            bamboo_memory::memory_store::MemoryStore::new(physical_root.join("jiandu")),
-        )
-        .await
-        .unwrap();
+        let state = actix_web::web::Data::new(
+            Box::pin(AppState::new_with_provider_and_memory_store(
+                physical_root.clone(),
+                config,
+                provider.clone(),
+                bamboo_memory::memory_store::MemoryStore::new(physical_root.join("jiandu")),
+            ))
+            .await
+            .unwrap(),
+        );
         // Keep the shared registry Arc already held by the assembled runner.
         state.provider_registry.replace_with(ProviderRegistry::new(
             HashMap::from([(PROVIDER.into(), provider.clone() as Arc<dyn LLMProvider>)]),
             PROVIDER.into(),
         ));
+        if explicit {
+            use actix_web::{test, App};
+            let before = state.tickets.status().await;
+            assert_eq!(before["available"], false);
+            assert_eq!(before["can_initialize"], true);
+            assert!(state.tickets.service().is_err());
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(bamboo_server::routes::configure_routes),
+            )
+            .await;
+            let request = test::TestRequest::post()
+                .uri("/api/v1/tickets/initialize")
+                .peer_addr("127.0.0.1:43210".parse().unwrap())
+                .set_json(&before["initialization"])
+                .to_request();
+            let response = test::call_service(&app, request).await;
+            assert!(response.status().is_success());
+            let initialized: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(initialized["created"], true);
+            assert_eq!(initialized["scope"]["available"], true);
+        }
         {
             let assembled_config = state.config.read().await;
             assert!(assembled_config.subagents().broker.is_none());
@@ -2123,3 +2160,5 @@ async fn reopening_the_ticket_writer_advances_epoch_without_restoring_host_polic
 
 #[path = "ready_work_scheduler/admission.rs"]
 mod admission;
+#[path = "ready_work_scheduler/owner_control.rs"]
+mod owner_control;

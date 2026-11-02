@@ -24,6 +24,8 @@ use tokio::sync::mpsc;
 #[path = "common/native_work.rs"]
 mod native_work;
 use native_work::{execution_workspace, host, LocalProvider, MODEL, WAIT};
+#[path = "native_work_token_budget/owner_setup.rs"]
+mod owner_setup;
 const INPUT: u32 = 65_536;
 const OUTPUT: u32 = 1_024;
 const CAP: u64 = INPUT as u64 + OUTPUT as u64;
