@@ -316,7 +316,10 @@ async fn directory_assembled_standard_and_ultra_preserve_read_only_pagination() 
             json!({"action":"cancel","target_session_id":"directory-a","expected_run_id":"run-directory-guard"}),
         ] {
             let error = f.call(&supervisor, args).await.unwrap_err().to_string();
-            assert!(error.contains("Permission denied"), "{error}");
+            assert!(
+                error.contains("permission denied by explicit policy"),
+                "{error}"
+            );
         }
         assert!(f.state.agent_runners.read().await.is_empty());
         assert_eq!(
