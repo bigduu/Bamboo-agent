@@ -257,6 +257,16 @@ impl Calls {
 
     /// Reconcile completed receipts without observing the original Work. A
     /// fresh Runtime budget port still authorizes the exact accounting write.
+    pub fn needs_accounting(&self) -> bool {
+        self.state.lock().is_ok_and(|mut state| {
+            state
+                .entries
+                .values_mut()
+                .any(|entry| entry.delivery().is_some_and(|delivery| !delivery.accounted))
+        })
+    }
+
+    /// Reconcile the currently completed receipts once.
     pub fn reconcile_accounting(&self, budget: &mut dyn BudgetPort) -> Result<usize, PortError> {
         let due: Vec<_> = self
             .state
