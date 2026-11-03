@@ -30,7 +30,7 @@ struct Provider {
     calls: AtomicUsize,
     limit: usize,
     gate: Option<Arc<tokio::sync::Semaphore>>,
-    write_path: PathBuf,
+    write_path: Option<PathBuf>,
 }
 #[async_trait]
 impl LLMProvider for Provider {
@@ -44,7 +44,7 @@ impl LLMProvider for Provider {
         assert_eq!(model, "patrol-evidence-local");
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(call < self.limit, "observer cannot activate provider");
-        if call >= 2 {
+        if self.write_path.is_none() || call >= 2 {
             if let Some(gate) = &self.gate {
                 gate.acquire()
                     .await
@@ -57,7 +57,7 @@ impl LLMProvider for Provider {
             LLMChunk::ToolCalls(vec![ToolCall { id:"evidence-task".into(),tool_type:"function".into(),function:FunctionCall {
             name:"Task".into(),arguments:json!({"tasks":[{"id":"bounded-result","content":"Produce one bounded result","status":"completed"}]}).to_string()
         }}])
-        } else if call == 1 && self.gate.is_some() {
+        } else if let Some(write_path) = self.write_path.as_ref().filter(|_| call == 1) {
             assert!(tools.iter().any(|tool| tool.function.name == "Write"));
             LLMChunk::ToolCalls(vec![ToolCall {
                 id: "evidence-write".into(),
@@ -65,7 +65,7 @@ impl LLMProvider for Provider {
                 function: FunctionCall {
                     name: "Write".into(),
                     arguments:
-                        json!({"file_path": self.write_path, "content": "verified native result"})
+                        json!({"file_path": write_path, "content": "verified native result"})
                             .to_string(),
                 },
             }])
@@ -80,18 +80,19 @@ impl LLMProvider for Provider {
 }
 
 async fn host(root: &Path, limit: usize) -> (crate::AppState, Arc<Provider>) {
-    host_with_gate(root, limit, None).await
+    host_with_gate(root, limit, None, None).await
 }
 async fn host_with_gate(
     root: &Path,
     limit: usize,
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    write_path: Option<PathBuf>,
 ) -> (crate::AppState, Arc<Provider>) {
     let provider = Arc::new(Provider {
         calls: AtomicUsize::new(0),
         limit,
         gate,
-        write_path: root.join("worktree/native-result.txt"),
+        write_path,
     });
     let mut config:Config=serde_json::from_value(json!({"provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":true},
         "providers":{"openai":{"api_key":"unused-controlled-fixture","model":"patrol-evidence-local"}},"run_budget":{"max_rounds":4},"subagents":{"max_concurrent":1}})).unwrap();
@@ -493,7 +494,14 @@ async fn ready_semantic_fixture(change_project: bool) {
     let root = tempfile::tempdir().unwrap();
     let data = root.path().canonicalize().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    let (state, agent) = Box::pin(host_with_gate(&data, 3, Some(gate.clone()))).await;
+    let result_path = data.join("worktree/native-result.txt");
+    let (state, agent) = Box::pin(host_with_gate(
+        &data,
+        3,
+        Some(gate.clone()),
+        Some(result_path.clone()),
+    ))
+    .await;
     let (work, project) = Box::pin(start_work(
         &state,
         workspace(&data),
@@ -508,7 +516,7 @@ async fn ready_semantic_fixture(change_project: bool) {
     .await
     .unwrap();
     assert_eq!(
-        std::fs::read_to_string(data.join("worktree/native-result.txt")).unwrap(),
+        std::fs::read_to_string(&result_path).unwrap(),
         "verified native result",
     );
 
@@ -958,7 +966,7 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
     let root = root.path().canonicalize().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let execution = workspace(&root);
-    let (state, provider) = host_with_gate(&root, 1, Some(gate.clone())).await;
+    let (state, provider) = host_with_gate(&root, 1, Some(gate.clone()), None).await;
     let (work, project) = start_work(&state, execution, BTreeSet::from(["Task".into()])).await;
     tokio::time::timeout(WAIT, async {
         while provider.calls.load(Ordering::SeqCst) != 1 {

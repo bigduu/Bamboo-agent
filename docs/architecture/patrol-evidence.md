@@ -167,7 +167,7 @@ meter, exact payload retention, over-cap refusal and a Ticket HEAD change
 during measurement. Configured preparation is also tested with the local native
 profile, exact-cap acceptance, over-cap refusal, and a stale model selection.
 A controlled loopback provider fixture also exercises the raw request, the
-native Work ledger and stale configuration refusal. Live model and
+native Work ledger, stale Ready grants and Project changes before submission. Live model and
 installed-application measurements remain separate under
 [#2049](https://github.com/bigduu/Bamboo-agent/issues/2049) and
 [#2050](https://github.com/bigduu/Bamboo-agent/issues/2050).
