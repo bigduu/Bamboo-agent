@@ -133,6 +133,25 @@ async fn incompatible_or_nonlocal_profile_never_receives_the_prompt() {
 }
 
 #[tokio::test]
+async fn unbounded_duration_is_rejected_before_network_submission() {
+    let server = MockServer::start().await;
+    profile(&server, MODEL, 4096, PROBE_TOKENS).await;
+    let prompt = GptOssPrompt::encode("Return JSON.", "Work evidence").unwrap();
+    let client = GptOssLocalClient::new(*server.address()).unwrap();
+    assert!(matches!(
+        client.prepare(&prompt, 64, Duration::MAX).await,
+        Err(CompletionError::InvalidRequest)
+    ));
+    assert!(server.received_requests().await.unwrap().is_empty());
+    let prepared = client.prepare(&prompt, 64, TIMEOUT).await.unwrap();
+    assert!(matches!(
+        prepared.complete(Duration::MAX).await,
+        Err(CompletionError::InvalidRequest)
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn advisory_output_and_accounting_are_validated_independently() {
     let prompt = GptOssPrompt::encode("Return JSON.", "Work evidence").unwrap();
     let normal = answer(&prompt, &final_answer("{}"));

@@ -16,6 +16,7 @@ const RETURN: u32 = 200_002;
 const FIRST_SPECIAL: u32 = 199_998;
 const ASSISTANT: u32 = 173_781;
 const RESPONSE_BYTES: usize = 128 * 1024;
+const MAX_TIMEOUT: Duration = Duration::from_secs(60);
 const PROBE: &str = "<|start|>assistant<|channel|>final<|message|><|return|>";
 const PROBE_TOKENS: &[u32] = &[START, ASSISTANT, CHANNEL, 17_196, MESSAGE, RETURN];
 
@@ -99,6 +100,7 @@ impl GptOssLocalClient {
         if !(1..=MAX_INPUT_TOKENS).contains(&input_tokens)
             || !(1..=MAX_OUTPUT_TOKENS).contains(&max_output_tokens)
             || timeout.is_zero()
+            || timeout > MAX_TIMEOUT
         {
             return Err(CompletionError::InvalidRequest);
         }
@@ -180,7 +182,7 @@ impl PreparedCompletion {
         mut self,
         timeout: Duration,
     ) -> Result<GptOssCompletion, CompletionError> {
-        if timeout.is_zero() {
+        if timeout.is_zero() || timeout > MAX_TIMEOUT {
             return Err(CompletionError::InvalidRequest);
         }
         *self.request.timeout_mut() = Some(timeout);
@@ -208,11 +210,9 @@ impl PreparedCompletion {
                     && completion.truncated.as_bool() == Some(false) =>
             {
                 let tokens: Option<Vec<u32>> = serde_json::from_value(completion.tokens).ok();
-                tokens.and_then(|tokens| {
-                    (tokens.len() as u64 == counts.completion_tokens)
-                        .then(|| decode_final(&tokens))
-                        .flatten()
-                })
+                tokens
+                    .filter(|tokens| tokens.len() as u64 == counts.completion_tokens)
+                    .and_then(|tokens| decode_final(&tokens))
             }
             _ => None,
         };
