@@ -503,6 +503,7 @@ async fn exercise_configured_diagnostic(state: &AppState, through: &Observation,
     assert_eq!(exact.prompt_tokens(), prepared.prompt_tokens());
     assert!(matches!(
         state
+            .patrol_evidence_reader()
             .read_patrol_diagnostic_for_selection(through, commit, 0, old_selection)
             .await,
         Err(Error::RevisionConflict),
@@ -611,6 +612,7 @@ async fn interleaving_and_source_negatives(
     let memory = state.memory_store.clone();
     let project_read = project.clone();
     let result = state
+        .patrol_evidence_reader()
         .read_evidence_with(
             scope,
             &expected,
@@ -701,6 +703,7 @@ async fn interleaving_and_source_negatives(
     let baseline = authority_files(state.project_store.paths().data_dir());
     assert!(matches!(
         state
+            .patrol_evidence_reader()
             .read_evidence_with(
                 scope,
                 &expected,
@@ -721,6 +724,7 @@ async fn interleaving_and_source_negatives(
     let memory = state.memory_store.clone();
     let storage = state.storage.clone();
     let result = state
+        .patrol_evidence_reader()
         .read_evidence_with(
             scope,
             &expected,

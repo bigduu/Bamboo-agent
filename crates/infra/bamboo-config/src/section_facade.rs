@@ -7702,6 +7702,9 @@ mod tests {
         let mut invalid = root.clone();
         invalid["patrol_model"]["model"] = json!("gpt-oss-120b");
         assert!(serde_json::from_value::<Config>(invalid).is_err());
+        let mut invalid = root.clone();
+        invalid["patrol_model"]["endpoint"] = json!("192.0.2.1:8080");
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
 
         write_json(&dir.path().join("config.json"), &root);
         migrate_config_facade_layout(dir.path()).unwrap();
@@ -7749,6 +7752,23 @@ mod tests {
         assert_eq!(
             facade.registry().model_policy.snapshot().data.patrol_model,
             effective.patrol_model,
+        );
+        let mut candidate = snapshot.data.as_ref().clone();
+        candidate.patrol_model.as_mut().unwrap().endpoint = Some("127.0.0.1:8080".parse().unwrap());
+        facade
+            .registry()
+            .model_policy
+            .commit(snapshot.revision, candidate)
+            .unwrap();
+        let reopened = ConfigFacade::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened
+                .effective_config()
+                .patrol_model
+                .as_ref()
+                .unwrap()
+                .endpoint,
+            Some("127.0.0.1:8080".parse().unwrap())
         );
     }
 

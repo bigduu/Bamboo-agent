@@ -295,6 +295,7 @@
       "aliases": [],
       "default": null,
       "example": {
+        "endpoint": "127.0.0.1:8080",
         "max_evidence_bytes": 16384,
         "max_evidence_refs": 16,
         "max_input_tokens": 4096,
@@ -304,7 +305,7 @@
         "provider": "patrol-local"
       },
       "key": "patrol_model",
-      "meaning": "Optional independent model for offline patrol prompt preparation. The raw profile pins gpt-oss-20b. Provider execution requires separate admission.",
+      "meaning": "Independent patrol model selection. The optional numeric loopback endpoint enables semantic calls after Work budget and Host admission. The raw profile pins gpt-oss-20b.",
       "section": "model-policy",
       "type": "option<object>"
     },

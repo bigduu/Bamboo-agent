@@ -63,6 +63,38 @@ impl ProgramPatrol {
         checkpoints: &mut dyn CheckpointPort,
         observations: &mut dyn FnMut(&Scope) -> Result<super::host::TicketObservation, PortError>,
     ) -> Result<usize, Error> {
+        self.visit_project_with_observations(
+            service,
+            authority,
+            selection,
+            clock,
+            checkpoints,
+            observations,
+            &mut |scope, checkpoints, observations, _existing| {
+                self.tick(scope, clock, checkpoints, observations)
+                    .map(|_| ())
+            },
+        )
+    }
+
+    /// Visit only due, currently authorized scopes through the same bounded
+    /// Ready selection. The outer Host can supply the staged semantic pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_project_with_observations(
+        &self,
+        service: &bamboo_tickets::TicketService,
+        authority: &bamboo_tickets::Authority,
+        selection: &ProgramSelection<'_>,
+        clock: &dyn Clock,
+        checkpoints: &mut dyn CheckpointPort,
+        observations: &mut dyn FnMut(&Scope) -> Result<super::host::TicketObservation, PortError>,
+        visit: &mut dyn FnMut(
+            &Scope,
+            &mut dyn CheckpointPort,
+            &mut dyn ObservationPort,
+            Option<&StoredCheckpoint>,
+        ) -> Result<(), Error>,
+    ) -> Result<usize, Error> {
         if selection.work_ids.len() > bamboo_tickets::CLAIM_CANDIDATE_LIMIT
             || selection.work_ids.iter().any(|id| !super::valid_id(id))
             || selection
@@ -81,6 +113,7 @@ impl ProgramPatrol {
             return Err(PortError::Denied.into());
         }
         let (commit, snapshot) = service.published().map_err(|_| PortError::Unavailable)?;
+        let health = service.health();
         // Ready permits 64 Works; the canonical inspect API bounds each read
         // to 32. Authorize every chunk against one fixed snapshot before any
         // journal write, without relaxing that API's limit.
@@ -103,7 +136,13 @@ impl ProgramPatrol {
         }
         let mut checked = 0;
         for work_id in selection.work_ids {
-            if service.published().map_err(|_| PortError::Unavailable)?.0 != commit {
+            let (_, current) = service.published().map_err(|_| PortError::Unavailable)?;
+            // Settlement can advance HEAD without changing any execution fact.
+            if current.execution_facts_revision() != snapshot.execution_facts_revision()
+                || current.binding != snapshot.binding
+                || current.seq < snapshot.seq
+                || service.health() != health
+            {
                 return Err(PortError::Conflict.into());
             }
             if snapshot.project.links.get(work_id) != Some(selection.project_id) {
@@ -139,7 +178,7 @@ impl ProgramPatrol {
                     continue;
                 }
             }
-            self.tick(&scope, clock, checkpoints, &mut observation)?;
+            visit(&scope, checkpoints, &mut observation, existing.as_ref())?;
             checked += 1;
         }
         Ok(checked)

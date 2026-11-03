@@ -141,7 +141,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // progress case to the existing Ready integration owner in server-tests-1.
 // The receipt implementation changes the fingerprinted file source while the
 // four additive contexts and twenty selected cases remain the same.
-const FEATURE_SOURCE_SHA256 = "238b496044f9c28f95199ee4917a83508365bbd3b751cc157ee8fae08080e482";
+// #2534 adds patrol endpoint configuration and the Ready Host adapter.
+// The existing config and server-app-state owners cover those regressions.
+const FEATURE_SOURCE_SHA256 = "908a8a92823cc549c30da89484160b04ff92bbafdc2ebbac8f24286251ac6e31";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

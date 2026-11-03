@@ -20,6 +20,7 @@ use std::{
 
 pub(super) struct PreparedRuntimeFacts {
     facts: host::RuntimeFacts,
+    facts_revision: u64,
     live_start: Option<(Weak<ChildSessionAdapter>, NativeTaskStart)>,
 }
 
@@ -42,11 +43,17 @@ impl PreparedRuntimeFacts {
                 .native_task_liveness(&sample.session_id, &sample.run_id, sample.child_birth)
                 .filter(|live| &live.start == sample)
         });
-        let without_start =
-            (self.facts.started_at_ms.is_some() && live.is_none()).then(|| host::RuntimeFacts {
-                started_at_ms: None,
-                ..self.facts.clone()
-            });
+        let (commit, current) = service.published().map_err(|_| PortError::Unavailable)?;
+        if current.execution_facts_revision() != self.facts_revision {
+            return Err(PortError::Conflict);
+        }
+        // A settlement earlier in the same Ready pass can advance the commit
+        // while retaining the facts under which this live sample was taken.
+        let facts = host::RuntimeFacts {
+            source_commit: commit,
+            started_at_ms: live.as_ref().and(self.facts.started_at_ms),
+            ..self.facts.clone()
+        };
         let heartbeat_at_ms = live
             .and_then(|live| live.heartbeat_at_ms())
             .filter(|at| pass_cutoff_ms.is_none_or(|cutoff| *at <= cutoff));
@@ -55,7 +62,7 @@ impl PreparedRuntimeFacts {
             service,
             authority,
             scope,
-            without_start.as_ref().unwrap_or(&self.facts),
+            &facts,
             heartbeat_at_ms,
             progress_cutoff_ms,
             policy,
@@ -395,6 +402,7 @@ async fn prepare_inner(
         return Err(Error::RevisionConflict);
     }
     Ok(Some(PreparedRuntimeFacts {
+        facts_revision: snapshot.execution_facts_revision(),
         facts: host::RuntimeFacts {
             scope: scope.clone(),
             source_commit: commit,

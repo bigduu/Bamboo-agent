@@ -6,8 +6,8 @@ Host Rust API returns `UnmeteredWorkPatrolEvidence`. It obtains current Host
 authority independently; the supplied Scope, commit and cursor are selectors.
 No HTTP route or model tool exposes this API.
 
-This reader is a prerequisite for semantic patrol. The existing program patrol
-remains zero-model, and its semantic `diagnostic_input` port remains unavailable.
+This reader is a prerequisite for the staged semantic pass. The program-only
+pass still uses zero model calls.
 The output has no provider, model, token estimate or budget reservation, and no
 automatic conversion into `DiagnosticInput`. The separate preparation API below
 requires an explicit selected model and a trusted local protocol meter.
@@ -107,6 +107,7 @@ data can contain:
     "provider": "patrol-local",
     "model": "gpt-oss-20b",
     "protocol": "llama_cpp_raw_v1",
+    "endpoint": "127.0.0.1:8080",
     "max_input_tokens": 4096,
     "max_output_tokens": 256,
     "max_evidence_bytes": 16384,
@@ -115,7 +116,7 @@ data can contain:
 }
 ```
 
-The provider is an explicit routing identifier for future admission. The
+The provider is an explicit routing identifier for patrol admission. The
 profile requires the pinned model name and uses the bundled Harmony
 vocabulary. Orchestration renders the read-only instructions, response schema
 and exact summary/reference data. The LLM layer adds the Harmony role framing
@@ -130,9 +131,23 @@ submitting any evidence. The checks identify the deployment's compatible
 protocol profile. Only raw output tokens in a completed final-channel frame
 can yield advisory text. Native final input and output counters are returned
 separately, including observed excess output. A transport failure or missing
-usage retains unknown status. The caller must acquire canonical Work budget
-admission before consuming the prepared request. Program patrol has yet to
-assemble this transport into its runtime.
+usage retains unknown status. The optional endpoint enables the existing Ready
+worker to use this transport for an eligible anomaly. Omit it to keep the
+program-only pass and the read-only preparation API.
+
+Orchestration stages the input and reserves against the canonical Work,
+UTC-day and total token ceilings before publishing the exact diagnostic
+checkpoint. Only a live staged submission can schedule the provider call.
+The Host checks the selected configuration, Ready fence, current Ticket,
+Project and unsettled receipt before sending. The provider task reports usage
+against the original receipt even if the diagnostic result has become stale.
+Unknown usage retains the original caps. An observed overrun halts admission
+when recorded, and exact results awaiting accounting use the original receipt.
+Graceful shutdown stops new provider calls, waits for bounded accounting
+writes, and attempts a final drain. An unresolved drain logs a warning. If
+the process exits before usage reaches the ledger or checkpoint, the original
+reservation remains charged at its caps. The operator supplies and trusts the
+loopback deployment.
 
 [Harmony format](https://developers.openai.com/cookbook/articles/openai-harmony) ·
 [llama.cpp raw completion](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-completion-given-a-prompt-it-returns-the-predicted-completion)
@@ -151,8 +166,10 @@ The native fixture also exercises metered preparation with a controlled local
 meter, exact payload retention, over-cap refusal and a Ticket HEAD change
 during measurement. Configured preparation is also tested with the local native
 profile, exact-cap acceptance, over-cap refusal, and a stale model selection.
-Provider execution, usage/Work budget assembly and remaining runtime
-measurements are separate slices under
+A controlled loopback provider fixture exercises the raw request, the native
+Work ledger and Project changes before submission. It also verifies that a
+later Ready pass settles an unknown receipt after a write failure using the
+original reply and receipt. Live model and installed-application measurements
+remain separate under
 [#2049](https://github.com/bigduu/Bamboo-agent/issues/2049) and
-[#2050](https://github.com/bigduu/Bamboo-agent/issues/2050). No paid-provider or
-installed-application acceptance is implied.
+[#2050](https://github.com/bigduu/Bamboo-agent/issues/2050).
