@@ -2,8 +2,8 @@
 //! or provider execution is created. Construct from a fresh Host authority for
 //! each pass; an Authority value cached across a revoke is not a live grant.
 use bamboo_tickets::{
-    Authority, ExecutionBudgetPurpose, ExecutionTokenUsage, TicketService, WorkTokenAdmission,
-    WorkTokenAttempt, WorkTokenBlock, WorkTokenRequest,
+    Authority, ExecutionBudgetPurpose, ExecutionTokenOverCapUsage, ExecutionTokenUsage,
+    TicketService, WorkTokenAdmission, WorkTokenAttempt, WorkTokenBlock, WorkTokenRequest,
 };
 
 use super::{
@@ -59,30 +59,13 @@ impl BudgetPort for TicketBudget<'_> {
         let observation = source
             .observation(scope, 0)
             .map_err(|_| BudgetBlock::Unavailable)?;
-        let identity = request(diagnostic, 0).map_err(|_| BudgetBlock::Unavailable)?;
-        // Exact old receipts reconcile accounting only, never provider permission.
-        if let Some(record) = self
-            .service
-            .work_token_budget(self.authority)
-            .map_err(|_| BudgetBlock::Unavailable)?
-            .and_then(|budget| budget.reservations.get(&identity.operation_id).cloned())
-        {
-            if record.request
-                != request(diagnostic, record.request.observed_seq)
-                    .map_err(|_| BudgetBlock::Unavailable)?
-            {
-                return Err(BudgetBlock::Unavailable);
-            }
-            return Ok(Reservation {
-                operation: diagnostic.operation.clone(),
-                request: Box::new(diagnostic.clone()),
-                receipt: record.receipt,
-            });
-        }
-        if diagnostic.input.source_revision != observation.source_revision
+        let now = self.clock.now_ms();
+        if observation.terminal
+            || observation.execution_unknown
+            || diagnostic.input.source_revision != observation.source_revision
             || diagnostic.input.through_cursor > observation.cursor
             || diagnostic.input.since_cursor > diagnostic.input.through_cursor
-            || self.clock.now_ms() >= diagnostic.deadline_ms
+            || now >= diagnostic.deadline_ms
         {
             return Err(BudgetBlock::Unavailable);
         }
@@ -94,17 +77,37 @@ impl BudgetPort for TicketBudget<'_> {
         if snapshot.execution_facts_revision() != diagnostic.input.source_revision {
             return Err(BudgetBlock::Unavailable);
         }
-        let request = request(diagnostic, snapshot.seq).map_err(|_| BudgetBlock::Unavailable)?;
+        let mut request =
+            request(diagnostic, snapshot.seq).map_err(|_| BudgetBlock::Unavailable)?;
+        let budget = snapshot
+            .execution_budget
+            .as_ref()
+            .ok_or(BudgetBlock::Unavailable)?;
+        if let Some(record) = budget.reservations.get(&request.operation_id) {
+            if budget
+                .reservations
+                .values()
+                .any(|r| r.over_cap_usage.is_some())
+            {
+                return Err(BudgetBlock::Unavailable);
+            }
+            request.observed_seq = record.request.observed_seq;
+        }
         match self
             .service
-            .reserve_work_tokens(self.authority, &request, self.clock.now_ms())
+            .reserve_work_tokens(self.authority, &request, now)
             .map_err(|_| BudgetBlock::Unavailable)?
         {
-            WorkTokenAdmission::Reserved(record) => Ok(Reservation {
-                operation: diagnostic.operation.clone(),
-                request: Box::new(diagnostic.clone()),
-                receipt: record.receipt,
-            }),
+            WorkTokenAdmission::Reserved(record)
+                if record.usage.is_none() && record.over_cap_usage.is_none() =>
+            {
+                Ok(Reservation {
+                    operation: diagnostic.operation.clone(),
+                    request: Box::new(diagnostic.clone()),
+                    receipt: record.receipt,
+                })
+            }
+            WorkTokenAdmission::Reserved(_) => Err(BudgetBlock::Unavailable),
             WorkTokenAdmission::Blocked(block) => Err(match block {
                 WorkTokenBlock::Work => BudgetBlock::Work,
                 WorkTokenBlock::Daily => BudgetBlock::Daily,
@@ -129,10 +132,42 @@ impl BudgetPort for TicketBudget<'_> {
         if record.request != request || record.receipt != reservation.receipt {
             return Err(PortError::Denied);
         }
+        if usage == Usage::Unknown
+            && (matches!(record.usage, Some(ExecutionTokenUsage::Known { .. }))
+                || record.over_cap_usage.is_some())
+        {
+            // The ledger already knows the outcome, even if the caller lost
+            // its checkpoint or provider status after the accounting commit.
+            return Ok(());
+        }
         // The original Assignment need not remain active. A fresh Runtime proof
         // for this binding may settle its old receipt after restart/Submitted/
         // generation changes, without granting another provider admission.
         let usage = match usage {
+            Usage::Known {
+                input_tokens,
+                output_tokens,
+            } if reservation
+                .request
+                .model
+                .exceeds_token_caps(input_tokens, output_tokens) =>
+            {
+                return self
+                    .service
+                    .report_work_token_over_cap(
+                        self.authority,
+                        &request.operation_id,
+                        &request.request_hash,
+                        &reservation.receipt,
+                        ExecutionTokenOverCapUsage {
+                            input_tokens: Some(u64::from(input_tokens)),
+                            output_tokens: Some(u64::from(output_tokens)),
+                            total_tokens: None,
+                        },
+                    )
+                    .map(|_| ())
+                    .map_err(host::ticket_error);
+            }
             Usage::Known {
                 input_tokens,
                 output_tokens,

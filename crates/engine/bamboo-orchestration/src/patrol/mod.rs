@@ -75,6 +75,12 @@ pub struct Model {
     pub max_evidence_refs: usize,
 }
 
+impl Model {
+    fn exceeds_token_caps(&self, input_tokens: u32, output_tokens: u32) -> bool {
+        input_tokens > self.max_input_tokens || output_tokens > self.max_output_tokens
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Progress {
     /// Host-verified meaningful progress; heartbeats and recovery ACKs never increment it.
@@ -232,6 +238,8 @@ pub enum Usage {
 /// and amounts are not inferred from rounds or these token ceilings.
 pub trait BudgetPort {
     fn reserve(&mut self, request: &DiagnosticRequest) -> Result<Reservation, BudgetBlock>;
+    /// An observed over-cap count is evidence of an accounting breach. Keep
+    /// the original charge and record the breach rather than refunding it.
     fn settle(&mut self, reservation: &Reservation, usage: Usage) -> Result<(), PortError>;
 }
 
@@ -890,13 +898,8 @@ impl Patrol {
             DiagnosticStatus::Pending => {}
             DiagnosticStatus::Finished { diagnosis, usage } => {
                 let usage_valid = matches!(usage, Usage::Known { input_tokens, output_tokens }
-                    if input_tokens <= request.model.max_input_tokens && output_tokens <= request.model.max_output_tokens);
-                if !settle_usage(
-                    incident,
-                    &reservation,
-                    if usage_valid { usage } else { Usage::Unknown },
-                    host,
-                ) {
+                    if !request.model.exceeds_token_caps(input_tokens, output_tokens));
+                if !settle_usage(incident, &reservation, usage, host) {
                     incident.phase = Phase::Blocked(Block::Budget(BudgetBlock::Unavailable));
                     escalate(incident, SupervisorReason::BudgetBlocked, o, now);
                     return Ok(());
@@ -936,18 +939,6 @@ impl Patrol {
                 }
             }
             DiagnosticStatus::Failed { usage } => {
-                // Unknown or malformed usage keeps the full reservation.
-                let usage = match usage {
-                    Usage::Known {
-                        input_tokens,
-                        output_tokens,
-                    } if input_tokens <= request.model.max_input_tokens
-                        && output_tokens <= request.model.max_output_tokens =>
-                    {
-                        usage
-                    }
-                    _ => Usage::Unknown,
-                };
                 settle_usage(incident, &reservation, usage, host);
                 incident.phase = Phase::Blocked(Block::Provider);
                 escalate(incident, SupervisorReason::DiagnosticUnavailable, o, now);
@@ -1010,14 +1001,8 @@ fn validate_checkpoint(cp: &Checkpoint, scope: &Scope) -> Result<(), Error> {
                 || r.request.input.scope != *scope
                 || !valid_id(&r.receipt)
         })
-        || i.pending_settlement_usage.is_some_and(|usage| {
-            i.pending_settlement.as_ref().is_none_or(|reservation| {
-                matches!(usage, Usage::Known { input_tokens, output_tokens }
-                    if input_tokens > reservation.request.model.max_input_tokens
-                        || output_tokens > reservation.request.model.max_output_tokens)
-            })
-        })
-        || (i.pending_settlement_usage.is_some() && matches!(i.phase, Phase::Diagnosing { .. }))
+        || (i.pending_settlement_usage.is_some()
+            && (i.pending_settlement.is_none() || matches!(i.phase, Phase::Diagnosing { .. })))
         || i.last_diagnosis.as_ref().is_some_and(|r| {
             !diagnostic_operation(&r.operation)
                 || r.source_revision > cp.source_revision
