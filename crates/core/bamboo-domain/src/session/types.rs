@@ -911,20 +911,30 @@ impl Session {
         }
     }
 
-    /// The effective token budget: a genuine/child override (`token_budget`) if
-    /// set, otherwise the current round's resolved-budget snapshot
-    /// (`resolved_token_budget`). Both are `None` until the first resolution.
-    /// Downstream readers should use this rather than `token_budget` directly so
-    /// they observe the engine-resolved budget without persisting it. Note the
-    /// snapshot is returned regardless of which model it was resolved for; that is
-    /// safe because `resolve_token_budget` runs at round start (re-keying to the
-    /// current model) before any reader — don't call this expecting model-freshness
-    /// without a preceding same-round resolve. (#180)
+    /// Freshly resolved shared policy takes precedence over its source override.
+    /// A host replacement of any actual limit takes effect immediately instead
+    /// of being hidden behind an older resolved snapshot.
+    /// The execute request can select a model without changing `Session.model`,
+    /// so freshness belongs to round-start resolution and model-change invalidation,
+    /// rather than a comparison against that persisted conversation label.
     pub fn effective_token_budget(&self) -> Option<&TokenBudget> {
-        self.token_budget.as_ref().or_else(|| {
-            self.resolved_token_budget
-                .as_ref()
-                .map(|(_, budget)| budget)
+        let resolved = self
+            .resolved_token_budget
+            .as_ref()
+            .map(|(_, budget)| budget);
+        let Some(assigned) = self.token_budget.as_ref() else {
+            return resolved;
+        };
+        let Some(resolved) = resolved else {
+            return Some(assigned);
+        };
+        let mut normalized = assigned.clone();
+        normalized.compression_trigger_percent = resolved.compression_trigger_percent;
+        normalized.compression_target_percent = resolved.compression_target_percent;
+        Some(if normalized == *resolved {
+            resolved
+        } else {
+            assigned
         })
     }
 
@@ -2087,5 +2097,58 @@ mod tests {
             r#"{"id":"m1","role":"assistant","content":"old","created_at":"2026-01-01T00:00:00Z"}"#;
         let message: Message = serde_json::from_str(legacy).expect("legacy deserializes");
         assert_eq!(message.reasoning_signature, None);
+    }
+    #[test]
+    fn effective_token_budget_prefers_execution_model_policy_snapshot_without_persisting_it() {
+        let mut session = Session::new("effective-range", "current");
+        let mut durable = crate::TokenBudget::for_model(200_000);
+        durable.compression_trigger_percent = 95;
+        let mut resolved = durable.clone();
+        resolved.compression_trigger_percent = 80;
+        session.token_budget = Some(durable);
+        session.resolved_token_budget = Some(("execute-request-model".into(), resolved));
+        assert_eq!(
+            session
+                .effective_token_budget()
+                .unwrap()
+                .compression_trigger_percent,
+            80
+        );
+        assert_eq!(
+            session
+                .token_budget
+                .as_ref()
+                .unwrap()
+                .compression_trigger_percent,
+            95
+        );
+        session.token_budget = None;
+        assert_eq!(
+            session
+                .effective_token_budget()
+                .unwrap()
+                .compression_trigger_percent,
+            80
+        );
+        session.resolved_token_budget = None;
+        assert!(session.effective_token_budget().is_none());
+    }
+
+    #[test]
+    fn effective_token_budget_honors_replaced_host_limits_before_next_resolution() {
+        let mut original = crate::TokenBudget::for_model(200_000);
+        original.max_tool_output_tokens = 512;
+        original.compression_trigger_percent = 95;
+        let mut resolved = original.clone();
+        resolved.compression_trigger_percent = 80;
+        for (window, cap) in [(200_000, 64), (200_000, 0), (100_000, 512)] {
+            let mut session = Session::new("host-budget-replacement", "stale-model-label");
+            let mut replacement = original.clone();
+            replacement.max_context_tokens = window;
+            replacement.max_tool_output_tokens = cap;
+            session.token_budget = Some(replacement.clone());
+            session.resolved_token_budget = Some(("execute-model".into(), resolved.clone()));
+            assert_eq!(session.effective_token_budget(), Some(&replacement));
+        }
     }
 }

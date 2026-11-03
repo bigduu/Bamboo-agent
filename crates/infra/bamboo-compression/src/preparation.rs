@@ -469,13 +469,14 @@ fn maybe_compact_old_tool_outputs_for_prompt(
     if compacted_count > 0 {
         let usage_after = (total_tokens as f64 / context_window as f64) * 100.0;
         tracing::info!(
-            "[{}] Prompt-side tool output cache applied: compacted_messages={}, saved_tokens={}, usage_before={:.1}%, usage_after={:.1}%, trigger={}%",
+            "[{}] Prompt-side tool output cache applied: compacted_messages={}, saved_tokens={}, usage_before={:.1}%, usage_after={:.1}%, trigger={:.1}%, trigger_tokens={}",
             session.id,
             compacted_count,
             saved_tokens_total,
             usage_before,
             usage_after,
-            budget.compression_trigger_percent
+            (trigger_limit as f64 / context_window as f64) * 100.0,
+            trigger_limit
         );
     }
 
@@ -2337,7 +2338,7 @@ mod tests {
         let counter = DeterministicCounter::new(6)
             .with_message_token("System", 20)
             .with_message_token("u1", 6)
-            .with_message_token(big_analysis.clone(), 760)
+            .with_message_token(big_analysis.clone(), 770)
             .with_message_token("u2", 6)
             .with_message_token("u3", 6);
 

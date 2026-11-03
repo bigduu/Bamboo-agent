@@ -696,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn default_output_allowance_keeps_258k_context_until_fixed_reserve_trigger() {
+    fn default_output_allowance_leaves_dynamic_working_headroom_in_258k_context() {
         let mut registry = ModelLimitsRegistry::new();
         registry.add_limit(ModelLimit::new("gpt-5.6-sol", 258_000));
 
@@ -705,7 +705,7 @@ mod tests {
 
         assert_eq!(budget.max_output_tokens, 32_000);
         assert_eq!(budget.max_request_input_tokens(), 223_420);
-        assert_eq!(budget.compression_trigger_context_tokens(), 208_000);
+        assert_eq!(budget.compression_trigger_context_tokens(), 191_420);
     }
 
     #[test]
