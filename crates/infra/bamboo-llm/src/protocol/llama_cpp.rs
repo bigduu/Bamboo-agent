@@ -1,5 +1,10 @@
 //! Numeric prompt for the local gpt-oss-20b Harmony profile.
 
+mod completion;
+pub use completion::{
+    CompletionError, CompletionUsage, GptOssCompletion, GptOssLocalClient, PreparedCompletion,
+};
+
 use super::{ProtocolError, ProtocolResult};
 use std::sync::OnceLock;
 use tiktoken_rs::{o200k_harmony, CoreBPE};
