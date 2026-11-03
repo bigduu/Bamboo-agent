@@ -524,6 +524,7 @@ async fn ready_semantic_fixture(change_project: bool) {
             },
         )
         .unwrap();
+    let (_, runtime) = state.tickets.authority(Principal::Runtime).await.unwrap();
     let snapshot = service.published().unwrap().1;
     let assignment = snapshot.tickets[&work].active_assignment.as_ref().unwrap();
     let scope = state
@@ -591,12 +592,12 @@ async fn ready_semantic_fixture(change_project: bool) {
     response.push(200002);
     let response_tokens = response.len() as u64;
     let ledger_at_send = service.clone();
-    let owner_at_send = owner.clone();
+    let runtime_at_send = runtime.clone();
     Mock::given(method("POST"))
         .and(path("/completion"))
         .respond_with(move |req: &Request| {
             let ledger = ledger_at_send
-                .work_token_budget(&owner_at_send)
+                .work_token_budget(&runtime_at_send)
                 .unwrap()
                 .unwrap();
             assert_eq!(ledger.total_charged, 4224);
@@ -629,7 +630,7 @@ async fn ready_semantic_fixture(change_project: bool) {
     Box::pin(scheduler.reconcile(&host)).await.unwrap();
     assert!(provider.received_requests().await.unwrap().is_empty());
     assert!(service
-        .work_token_budget(&owner)
+        .work_token_budget(&runtime)
         .unwrap()
         .unwrap()
         .reservations
@@ -640,7 +641,7 @@ async fn ready_semantic_fixture(change_project: bool) {
     let ledger = tokio::time::timeout(WAIT, async {
         loop {
             Box::pin(scheduler.reconcile(&host)).await.unwrap();
-            let ledger = service.work_token_budget(&owner).unwrap().unwrap();
+            let ledger = service.work_token_budget(&runtime).unwrap().unwrap();
             if ledger
                 .reservations
                 .values()

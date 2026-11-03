@@ -493,7 +493,7 @@ async fn read_project(
         .map_err(|_| Error::AuthorityUnavailable("Project evidence reader stopped".into()))?
 }
 
-fn read_project_manifest(
+pub(super) fn read_project_manifest(
     projects: &ProjectStore,
     root: &std::path::Path,
     project: &bamboo_domain::ProjectId,

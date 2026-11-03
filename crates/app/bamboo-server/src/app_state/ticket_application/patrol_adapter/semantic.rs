@@ -1,6 +1,10 @@
 //! Concrete evidence, transport and authority I/O for the orchestration pass.
 
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use bamboo_config::{Config, PatrolModelConfig};
 use bamboo_domain::{ProjectManifest, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
@@ -21,7 +25,7 @@ use bamboo_tickets::{Authority, Principal, TicketService};
 use tokio::sync::RwLock;
 
 use super::{
-    evidence::{current_project_manifest, EvidenceReader},
+    evidence::{current_project_manifest, read_project_manifest, EvidenceReader},
     patrol_error,
     program::SystemClock,
     Error, Result, TicketApplication,
@@ -244,6 +248,21 @@ impl ReadyPatrolIo {
     }
 }
 
+fn check_project_after_ticket_proof(
+    projects: &ProjectStore,
+    root: &Path,
+    expected: &ProjectManifest,
+    ticket_proof: impl FnOnce() -> std::result::Result<(), PortError>,
+) -> std::result::Result<(), PortError> {
+    ticket_proof()?;
+    let project =
+        read_project_manifest(projects, root, &expected.id).map_err(|_| PortError::Conflict)?;
+    if project != *expected {
+        return Err(PortError::Conflict);
+    }
+    Ok(())
+}
+
 #[async_trait::async_trait]
 impl CallIo for ReadyPatrolIo {
     async fn admit(&self, reservation: &Reservation) -> std::result::Result<(), PortError> {
@@ -269,20 +288,23 @@ impl CallIo for ReadyPatrolIo {
             if manifest != expected_project {
                 return Err(PortError::Conflict);
             }
-            let clock = SystemClock::current().map_err(|_| PortError::Unavailable)?;
-            TicketBudget {
-                service: &service,
-                authority: &authority,
-                clock: &clock,
-            }
-            .confirm_submission(&reservation)?;
-            let (_, snapshot) = service.published().map_err(|_| PortError::Unavailable)?;
-            if snapshot.execution_facts_revision() != reservation.request.input.source_revision {
-                return Err(PortError::Conflict);
-            }
-            fence
-                .check_semantic_scope(&snapshot, scope)
-                .map_err(|_| PortError::Denied)
+            check_project_after_ticket_proof(&projects, &root, &expected_project, || {
+                let clock = SystemClock::current().map_err(|_| PortError::Unavailable)?;
+                TicketBudget {
+                    service: &service,
+                    authority: &authority,
+                    clock: &clock,
+                }
+                .confirm_submission(&reservation)?;
+                let (_, snapshot) = service.published().map_err(|_| PortError::Unavailable)?;
+                if snapshot.execution_facts_revision() != reservation.request.input.source_revision
+                {
+                    return Err(PortError::Conflict);
+                }
+                fence
+                    .check_semantic_scope(&snapshot, scope)
+                    .map_err(|_| PortError::Denied)
+            })
         })
         .await
         .map_err(|_| PortError::Unavailable)??;
@@ -328,5 +350,28 @@ impl CallIo for ReadyPatrolIo {
         })
         .await
         .map_err(|_| PortError::Unavailable)?
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_project_proof_rejects_change_during_ticket_proof() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let store = ProjectStore::open(&root).unwrap();
+        let original = store.create("Current Project", None).unwrap();
+        let result = check_project_after_ticket_proof(&store, &root, &original, || {
+            store
+                .update(&original.id, original.revision, |manifest| {
+                    manifest.name = "Changed during Ticket proof".into();
+                    Ok(())
+                })
+                .unwrap();
+            Ok(())
+        });
+        assert_eq!(result, Err(PortError::Conflict));
     }
 }
