@@ -13,6 +13,7 @@ pub mod diagnostic_input;
 pub mod evidence;
 pub mod host;
 pub mod program;
+pub mod staged;
 
 use bamboo_domain::patrol_model_limits::{
     MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
@@ -511,6 +512,17 @@ impl Patrol {
         host: &mut dyn Host,
         provider: &mut dyn ReadOnlyDiagnosticProvider,
     ) -> Result<Report, Error> {
+        self.tick_inner(scope, clock, host, provider, None)
+    }
+
+    fn tick_inner(
+        &self,
+        scope: &Scope,
+        clock: &dyn Clock,
+        host: &mut dyn Host,
+        provider: &mut dyn ReadOnlyDiagnosticProvider,
+        mut stage: Option<&mut staged::Stage>,
+    ) -> Result<Report, Error> {
         let (mut cp, mut version, observation, now) = self.begin_tick(scope, clock, host)?;
         if needs_resync(&cp, &observation) {
             save(host, &mut version, &mut cp)?;
@@ -661,7 +673,18 @@ impl Patrol {
                     if let Some(reason) = supervisor {
                         escalate(&mut incident, reason, &observation, now);
                     } else {
-                        self.prepare(&mut incident, &observation, now, host, provider)?;
+                        self.prepare(
+                            &mut incident,
+                            &observation,
+                            now,
+                            host,
+                            provider,
+                            stage.as_deref_mut(),
+                        )?;
+                        if stage.as_ref().is_some_and(|stage| stage.demand.is_some()) {
+                            cp.incident = Some(incident);
+                            return Ok(report(&cp, status(&cp)));
+                        }
                         // Persist incident/operation/attempt BEFORE any provider side effect.
                         cp.incident = Some(incident);
                         save(host, &mut version, &mut cp)?;
@@ -671,7 +694,13 @@ impl Patrol {
                             reservation,
                         } = incident.phase.clone()
                         {
-                            if provider.submit(&request).is_err() {
+                            let submitted = if let Some(stage) = stage.as_mut() {
+                                stage.submission = Some(reservation.clone());
+                                Ok(())
+                            } else {
+                                provider.submit(&request)
+                            };
+                            if submitted.is_err() {
                                 settle_usage(&mut incident, &reservation, Usage::Unknown, host);
                                 incident.phase = Phase::Blocked(Block::Provider);
                                 escalate(
@@ -692,7 +721,7 @@ impl Patrol {
         }
         // Save outbox intent and its bounded attempt before queue delivery. A
         // restart retries the SAME key; the Host queue must deduplicate it.
-        if let Some(escalation) = incident.escalation.as_mut() {
+        if let Some(escalation) = incident.escalation.as_mut().filter(|_| stage.is_none()) {
             if !escalation.queued
                 && now >= escalation.next_delivery_ms
                 && escalation.deliveries < self.policy.max_escalation_deliveries
@@ -801,6 +830,7 @@ impl Patrol {
         now: u64,
         host: &mut dyn Host,
         provider: &dyn ReadOnlyDiagnosticProvider,
+        stage: Option<&mut staged::Stage>,
     ) -> Result<(), Error> {
         let model = self.model.as_ref().ok_or(Error::InvalidConfiguration)?;
         if provider.identity() != (model.provider.as_str(), model.model.as_str()) {
@@ -808,7 +838,15 @@ impl Patrol {
             escalate(incident, SupervisorReason::DiagnosticUnavailable, o, now);
             return Ok(());
         }
-        let input = match host.diagnostic_input(&o.scope, incident.last_diagnostic_cursor, o) {
+        let input = if let Some(stage) = stage {
+            let Some(input) = stage.input(model, o, incident.last_diagnostic_cursor) else {
+                return Ok(());
+            };
+            input
+        } else {
+            host.diagnostic_input(&o.scope, incident.last_diagnostic_cursor, o)
+        };
+        let input = match input {
             Ok(input) if valid_input(&input, model, o, incident.last_diagnostic_cursor) => input,
             _ => {
                 incident.phase = Phase::Blocked(Block::Input);
