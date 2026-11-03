@@ -24,6 +24,24 @@
     },
     {
       "aliases": [],
+      "default": 0.25,
+      "example": 0.25,
+      "key": "context_management.target_usage_ratio",
+      "meaning": "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
+      "section": "core",
+      "type": "f64"
+    },
+    {
+      "aliases": [],
+      "default": 0.8,
+      "example": 0.8,
+      "key": "context_management.trigger_usage_ratio",
+      "meaning": "Shared proactive trigger upper bound for every context strategy; runtime output/safety headroom can move the effective token boundary earlier.",
+      "section": "core",
+      "type": "f64"
+    },
+    {
+      "aliases": [],
       "default": false,
       "example": true,
       "key": "lifecycle_hooks.enabled",
@@ -452,7 +470,7 @@
     },
     {
       "coverage": "selected_fields",
-      "documented_entries": 1,
+      "documented_entries": 3,
       "kind": "compatibility_dto_field",
       "root": "context_management",
       "section": "core"
