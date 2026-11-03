@@ -375,6 +375,7 @@ async fn exercise(state: &AppState, provider: &Provider, root: &Path, scope: &Sc
     assert!(!text.contains("FOREIGN_PROJECT"));
     assert!(!text.contains("input_tokens"));
     let through = current_observation(state, scope).await;
+    exercise_configured_diagnostic(state, &through, &commit).await;
     let model = diagnostic_model();
     let mut measured = None;
     let input = state
@@ -453,6 +454,77 @@ async fn exercise(state: &AppState, provider: &Provider, root: &Path, scope: &Sc
     );
     assert_eq!(service.published().unwrap().0, commit);
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
+}
+
+async fn exercise_configured_diagnostic(state: &AppState, through: &Observation, commit: &str) {
+    assert!(state
+        .read_configured_work_patrol_diagnostic_input(through, commit, 0)
+        .await
+        .unwrap()
+        .is_none());
+    let mut selection: PatrolModelConfig = serde_json::from_value(json!({
+        "provider": "patrol-local",
+        "model": "gpt-oss-20b",
+        "protocol": "llama_cpp_raw_v1",
+        "max_input_tokens": 4096,
+        "max_output_tokens": 64,
+        "max_evidence_bytes": 16384,
+        "max_evidence_refs": 16
+    }))
+    .unwrap();
+    state.config.write().await.patrol_model = Some(selection.clone());
+    let prepared = state
+        .read_configured_work_patrol_diagnostic_input(through, commit, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(prepared.model().provider, "patrol-local");
+    assert_eq!(prepared.model().model, "gpt-oss-20b");
+    let input = prepared.input();
+    assert_eq!(input.scope, through.scope);
+    assert_eq!(input.through_cursor, through.cursor);
+    assert_eq!(input.input_tokens as usize, prepared.prompt_tokens().len());
+    let (instructions, evidence) = diagnostic_prompt(&input.summary, &input.references).unwrap();
+    assert_eq!(
+        prepared.prompt_tokens(),
+        GptOssPrompt::encode(&instructions, &evidence)
+            .unwrap()
+            .tokens(),
+    );
+
+    let old_selection = selection.clone();
+    selection.max_input_tokens = input.input_tokens.try_into().unwrap();
+    state.config.write().await.patrol_model = Some(selection.clone());
+    let exact = state
+        .read_configured_work_patrol_diagnostic_input(through, commit, 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(exact.prompt_tokens(), prepared.prompt_tokens());
+    assert!(matches!(
+        state
+            .read_patrol_diagnostic_for_selection(through, commit, 0, old_selection)
+            .await,
+        Err(Error::RevisionConflict),
+    ));
+
+    selection.max_input_tokens = (input.input_tokens - 1).try_into().unwrap();
+    state.config.write().await.patrol_model = Some(selection.clone());
+    assert!(matches!(
+        state
+            .read_configured_work_patrol_diagnostic_input(through, commit, 0)
+            .await,
+        Err(Error::ScopeDenied(_)),
+    ));
+    selection.model = "unpinned-model".into();
+    state.config.write().await.patrol_model = Some(selection);
+    assert!(matches!(
+        state
+            .read_configured_work_patrol_diagnostic_input(through, commit, 0)
+            .await,
+        Err(Error::AuthorityUnavailable(_)),
+    ));
+    state.config.write().await.patrol_model = None;
 }
 
 fn diagnostic_model() -> Model {
@@ -561,7 +633,7 @@ async fn interleaving_and_source_negatives(
                     read
                 }
             },
-            Ok,
+            |evidence| ready(Ok(evidence)),
         )
         .await;
     assert!(
@@ -634,7 +706,7 @@ async fn interleaving_and_source_negatives(
                 &expected,
                 0,
                 |_| async { Err(std::io::Error::other("private source path")) },
-                Ok
+                |evidence| ready(Ok(evidence)),
             )
             .await
             .unwrap()
@@ -672,7 +744,7 @@ async fn interleaving_and_source_negatives(
                     read
                 }
             },
-            Ok,
+            |evidence| ready(Ok(evidence)),
         )
         .await;
     assert!(

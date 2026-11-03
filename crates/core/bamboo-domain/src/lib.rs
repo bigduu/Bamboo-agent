@@ -10,6 +10,7 @@ pub mod host_session_scope;
 pub mod llm_request_diagnostic;
 pub mod model_usage;
 pub mod observer_subscription;
+pub mod patrol_model_limits;
 pub mod poison;
 pub mod reasoning;
 pub mod token_usage;

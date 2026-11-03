@@ -711,6 +711,7 @@ fn project_dependent_section_candidate(
             candidate.keyword_masking = section.keyword_masking;
             candidate.anthropic_model_mapping = section.anthropic_model_mapping;
             candidate.gemini_model_mapping = section.gemini_model_mapping;
+            candidate.patrol_model = section.patrol_model;
         }
         _ => unreachable!("only dependent ordinary sections are projected here"),
     }
@@ -2335,6 +2336,7 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.keyword_masking = source.keyword_masking.clone();
             target.anthropic_model_mapping = source.anthropic_model_mapping.clone();
             target.gemini_model_mapping = source.gemini_model_mapping.clone();
+            target.patrol_model = source.patrol_model.clone();
         }
         SectionId::ModelLimits | SectionId::Credentials => {}
     }

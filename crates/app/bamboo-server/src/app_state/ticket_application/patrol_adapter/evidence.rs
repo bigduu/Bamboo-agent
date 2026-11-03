@@ -1,11 +1,13 @@
 //! Host/native I/O adapter. Pure evidence policy belongs to bamboo-orchestration.
 use super::super::{Error, Principal, Result};
 use super::patrol_error;
+use bamboo_config::{PatrolModelConfig, PatrolModelProtocol};
 use bamboo_domain::ProjectManifest;
+use bamboo_llm::protocol::llama_cpp::GptOssPrompt;
 use bamboo_memory::memory_store::{DurableMemoryStatus, ProjectMemoryRead, ProjectMemoryRef};
 use bamboo_orchestration::patrol::{
-    diagnostic_input::prepare_diagnostic_input, evidence as core, host, DiagnosticInput,
-    EvidenceRef, Model, Observation, PortError, Scope,
+    diagnostic_input::{diagnostic_prompt, prepare_diagnostic_input},
+    evidence as core, host, DiagnosticInput, EvidenceRef, Model, Observation, PortError, Scope,
 };
 use bamboo_tickets::{Authority, ProjectContextSnapshot, Snapshot, TicketService};
 pub use core::{
@@ -13,7 +15,10 @@ pub use core::{
     WorkPatrolRequestEvidence, WorkPatrolTicketEvidence, MAX_WORK_PATROL_EVIDENCE_BYTES,
     MAX_WORK_PATROL_EVIDENCE_REFS,
 };
-use std::{future::Future, sync::Arc};
+use std::{
+    future::{ready, Future},
+    sync::Arc,
+};
 pub type UnmeteredWorkPatrolEvidence =
     core::UnmeteredWorkPatrolEvidence<ProjectMemoryRef, DurableMemoryStatus>;
 pub type WorkPatrolSourceEvidence =
@@ -21,6 +26,70 @@ pub type WorkPatrolSourceEvidence =
 pub type WorkPatrolSourceOutcome =
     core::WorkPatrolSourceOutcome<ProjectMemoryRef, DurableMemoryStatus>;
 type Plan = core::EvidencePlan<ProjectMemoryRef, DurableMemoryStatus>;
+
+/// The selected model and exact raw prompt whose count is in the diagnostic input.
+pub struct PreparedPatrolDiagnostic {
+    model: Model,
+    input: DiagnosticInput,
+    prompt: GptOssPrompt,
+}
+
+impl PreparedPatrolDiagnostic {
+    pub fn model(&self) -> &Model {
+        &self.model
+    }
+
+    pub fn input(&self) -> &DiagnosticInput {
+        &self.input
+    }
+
+    pub fn prompt_tokens(&self) -> &[u32] {
+        self.prompt.tokens()
+    }
+}
+
+fn prepare_configured_diagnostic(
+    evidence: UnmeteredWorkPatrolEvidence,
+    expected_commit: &str,
+    since_cursor: u64,
+    through: &Observation,
+    selection: PatrolModelConfig,
+) -> Result<PreparedPatrolDiagnostic> {
+    let model = Model {
+        provider: selection.provider,
+        model: selection.model,
+        max_input_tokens: selection.max_input_tokens.get(),
+        max_output_tokens: selection.max_output_tokens.get(),
+        max_evidence_bytes: selection.max_evidence_bytes.get(),
+        max_evidence_refs: selection.max_evidence_refs.get(),
+    };
+    let mut prompt = None;
+    let input = prepare_diagnostic_input(
+        &evidence,
+        expected_commit,
+        since_cursor,
+        through,
+        &model,
+        |_, summary, references| {
+            let (instructions, evidence) = diagnostic_prompt(summary, references)?;
+            let encoded = match selection.protocol {
+                PatrolModelProtocol::LlamaCppRawV1 => {
+                    GptOssPrompt::encode(&instructions, &evidence)
+                        .map_err(|_| PortError::Unavailable)?
+                }
+            };
+            let tokens = u32::try_from(encoded.tokens().len()).map_err(|_| PortError::Denied)?;
+            prompt = Some(encoded);
+            Ok(tokens)
+        },
+    )
+    .map_err(patrol_error)?;
+    Ok(PreparedPatrolDiagnostic {
+        model,
+        input,
+        prompt: prompt.ok_or_else(|| patrol_error(PortError::Unavailable))?,
+    })
+}
 
 fn resolve(
     expected: &ProjectMemoryRef,
@@ -140,8 +209,10 @@ impl crate::app_state::AppState {
         expected_ticket_commit: &str,
         since_cursor: u64,
     ) -> Result<UnmeteredWorkPatrolEvidence> {
-        self.with_work_patrol_evidence(scope, expected_ticket_commit, since_cursor, Ok)
-            .await
+        self.with_work_patrol_evidence(scope, expected_ticket_commit, since_cursor, |evidence| {
+            ready(Ok(evidence))
+        })
+        .await
     }
 
     /// Prepare input for the selected diagnostic model from an exact Host read.
@@ -161,27 +232,101 @@ impl crate::app_state::AppState {
             expected_ticket_commit,
             since_cursor,
             |evidence| {
-                prepare_diagnostic_input(
-                    &evidence,
-                    expected_ticket_commit,
-                    since_cursor,
-                    through,
-                    model,
-                    meter,
+                ready(
+                    prepare_diagnostic_input(
+                        &evidence,
+                        expected_ticket_commit,
+                        since_cursor,
+                        through,
+                        model,
+                        meter,
+                    )
+                    .map_err(patrol_error),
                 )
-                .map_err(patrol_error)
             },
         )
         .await
     }
 
-    async fn with_work_patrol_evidence<T>(
+    /// Read and meter the configured patrol prompt. The numeric prompt must be
+    /// sent unchanged if a future provider adapter admits this preparation.
+    pub async fn read_configured_work_patrol_diagnostic_input(
+        &self,
+        through: &Observation,
+        expected_ticket_commit: &str,
+        since_cursor: u64,
+    ) -> Result<Option<PreparedPatrolDiagnostic>> {
+        let selection = self.config.read().await.patrol_model.clone();
+        let Some(selection) = selection else {
+            return Ok(None);
+        };
+        self.read_patrol_diagnostic_for_selection(
+            through,
+            expected_ticket_commit,
+            since_cursor,
+            selection,
+        )
+        .await
+        .map(Some)
+    }
+
+    async fn read_patrol_diagnostic_for_selection(
+        &self,
+        through: &Observation,
+        expected_ticket_commit: &str,
+        since_cursor: u64,
+        selection: PatrolModelConfig,
+    ) -> Result<PreparedPatrolDiagnostic> {
+        selection.validate().map_err(Error::AuthorityUnavailable)?;
+        let prepared = self
+            .with_work_patrol_evidence(
+                &through.scope,
+                expected_ticket_commit,
+                since_cursor,
+                |evidence| {
+                    let selection = selection.clone();
+                    let through = through.clone();
+                    let expected = expected_ticket_commit.to_owned();
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            prepare_configured_diagnostic(
+                                evidence,
+                                &expected,
+                                since_cursor,
+                                &through,
+                                selection,
+                            )
+                        })
+                        .await
+                        .map_err(|_| {
+                            Error::AuthorityUnavailable("patrol prompt meter stopped".into())
+                        })?
+                    }
+                },
+            )
+            .await?;
+        // The evidence read just fenced Ticket and Project again after metering.
+        // Avoid another suspension point before checking the selected profile.
+        let config = self
+            .config
+            .try_read()
+            .map_err(|_| Error::RevisionConflict)?;
+        if config.patrol_model.as_ref() != Some(&selection) {
+            return Err(Error::RevisionConflict);
+        }
+        Ok(prepared)
+    }
+
+    async fn with_work_patrol_evidence<T, F>(
         &self,
         scope: &Scope,
         expected_ticket_commit: &str,
         since_cursor: u64,
-        finish: impl FnOnce(UnmeteredWorkPatrolEvidence) -> Result<T>,
-    ) -> Result<T> {
+        finish: impl FnOnce(UnmeteredWorkPatrolEvidence) -> F,
+    ) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
         let memory = self.memory_store.clone();
         let project: bamboo_domain::ProjectId = scope
             .project_id
@@ -258,17 +403,18 @@ impl crate::app_state::AppState {
 
     // Private per-call reader seam: tests may interleave real source reads with
     // authority changes; no environment hook or production fault capability.
-    async fn read_evidence_with<R, F, T>(
+    async fn read_evidence_with<R, F, T, P>(
         &self,
         scope: &Scope,
         expected: &str,
         since: u64,
         mut read: R,
-        finish: impl FnOnce(UnmeteredWorkPatrolEvidence) -> Result<T>,
+        finish: impl FnOnce(UnmeteredWorkPatrolEvidence) -> P,
     ) -> Result<T>
     where
         R: FnMut(ProjectMemoryRef) -> F,
         F: Future<Output = std::io::Result<ProjectMemoryRead>>,
+        P: Future<Output = Result<T>>,
     {
         let (service, authority) = self.tickets.authority(Principal::Runtime).await?;
         let snapshot = authorized(&service, &authority, scope, expected)?;
@@ -288,7 +434,7 @@ impl crate::app_state::AppState {
                 plan.record_source(index, WorkPatrolSourceOutcome::Unsupported)?;
             }
         }
-        let result = finish(plan.finish()?)?;
+        let result = finish(plan.finish()?).await?;
         self.evidence_fence(&service, scope, expected, &plan, &manifest)
             .await?;
         Ok(result)

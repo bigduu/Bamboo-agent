@@ -57,6 +57,9 @@
 //!   plaintext key in `providers.json`.
 
 use anyhow::{Context, Result};
+use bamboo_domain::patrol_model_limits::{
+    MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+};
 use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1778,6 +1781,57 @@ impl<'de> Deserialize<'de> for ContextManagementConfig {
     }
 }
 
+/// Protocol whose model-visible input can be metered locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatrolModelProtocol {
+    LlamaCppRawV1,
+}
+
+/// Independent selection for semantic patrol preparation. Absent disables it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatrolModelConfig {
+    pub provider: String,
+    pub model: String,
+    pub protocol: PatrolModelProtocol,
+    pub max_input_tokens: std::num::NonZeroU32,
+    pub max_output_tokens: std::num::NonZeroU32,
+    pub max_evidence_bytes: std::num::NonZeroUsize,
+    pub max_evidence_refs: std::num::NonZeroUsize,
+}
+
+impl PatrolModelConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.provider.is_empty()
+            || self.provider.len() > 256
+            || self
+                .provider
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err("patrol_model requires an explicit provider identifier".into());
+        }
+        if self.max_input_tokens.get() > MAX_INPUT_TOKENS
+            || self.max_output_tokens.get() > MAX_OUTPUT_TOKENS
+            || self.max_evidence_bytes.get() > MAX_EVIDENCE_BYTES
+            || self.max_evidence_refs.get() > MAX_EVIDENCE_REFS
+        {
+            return Err(format!(
+                "patrol_model limits must be at most {MAX_INPUT_TOKENS} input tokens, \
+                 {MAX_OUTPUT_TOKENS} output tokens, {MAX_EVIDENCE_BYTES} evidence bytes, \
+                 and {MAX_EVIDENCE_REFS} evidence references"
+            ));
+        }
+        match self.protocol {
+            PatrolModelProtocol::LlamaCppRawV1 if self.model == "gpt-oss-20b" => Ok(()),
+            PatrolModelProtocol::LlamaCppRawV1 => {
+                Err("llama_cpp_raw_v1 requires the gpt-oss-20b patrol model".into())
+            }
+        }
+    }
+}
+
 /// Main configuration structure for Bamboo agent
 ///
 /// Contains all settings needed to run the agent, including provider credentials,
@@ -1850,6 +1904,10 @@ pub struct ConfigValues {
     /// Previously persisted in `gemini-model-mapping.json` (now unified into `config.json`).
     #[serde(default)]
     pub gemini_model_mapping: GeminiModelMapping,
+
+    /// Explicit model selection for offline semantic patrol input preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patrol_model: Option<PatrolModelConfig>,
 
     /// Request preflight hooks.
     ///
@@ -1992,6 +2050,7 @@ impl Default for ConfigValues {
             keyword_masking: KeywordMaskingConfig::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_model_mapping: GeminiModelMapping::default(),
+            patrol_model: None,
             hooks: HooksConfig::default(),
             lifecycle_hooks: LifecycleHooksConfig::default(),
             tools: ToolsConfig::default(),
@@ -2062,6 +2121,8 @@ struct ModelBehaviorConfigSection {
     anthropic_model_mapping: AnthropicModelMapping,
     #[serde(default)]
     gemini_model_mapping: GeminiModelMapping,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patrol_model: Option<PatrolModelConfig>,
     #[serde(default)]
     hooks: HooksConfig,
     #[serde(default, skip_serializing_if = "LifecycleHooksConfig::is_empty")]
@@ -2204,6 +2265,7 @@ impl From<ConfigValues> for ConfigRoot {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
             tools,
@@ -2245,6 +2307,7 @@ impl From<ConfigValues> for ConfigRoot {
                 keyword_masking,
                 anthropic_model_mapping,
                 gemini_model_mapping,
+                patrol_model,
                 hooks,
                 lifecycle_hooks,
             },
@@ -2307,6 +2370,7 @@ impl From<ConfigRoot> for ConfigValues {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
         } = model_behavior;
@@ -2346,6 +2410,7 @@ impl From<ConfigRoot> for ConfigValues {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
             tools,
@@ -2464,6 +2529,9 @@ impl<'de> Deserialize<'de> for Config {
             .map_err(D::Error::custom)?
             .unwrap_or_default();
         let root: ConfigRoot = serde_json::from_value(value).map_err(D::Error::custom)?;
+        if let Some(model) = &root.model_behavior.patrol_model {
+            model.validate().map_err(D::Error::custom)?;
+        }
 
         Ok(Self::from_parts(root.into(), memory, subagents, providers))
     }
@@ -4894,6 +4962,7 @@ impl Config {
                 keyword_masking: KeywordMaskingConfig::default(),
                 anthropic_model_mapping: AnthropicModelMapping::default(),
                 gemini_model_mapping: GeminiModelMapping::default(),
+                patrol_model: None,
                 hooks: HooksConfig::default(),
                 lifecycle_hooks: LifecycleHooksConfig::default(),
                 tools: ToolsConfig::default(),

@@ -25,9 +25,10 @@ use crate::{
     CredentialStatus, CredentialStore, CredentialStoreHealth, DefaultWorkAreaConfig,
     DefaultsConfig, EnvVarEntry, FeatureFlags, GeminiModelMapping, HooksConfig,
     KeywordMaskingConfig, LifecycleHooksConfig, LiveSection, LlmRetryConfig, MemoryConfig,
-    NotificationsConfig, PluginTrustConfig, ProviderConfigs, ProviderInstanceConfig,
-    RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus, ServerConfig, SkillsConfig,
-    StreamTimeoutConfig, SubagentsConfig, ToolsConfig, WorktreeSettings,
+    NotificationsConfig, PatrolModelConfig, PluginTrustConfig, ProviderConfigs,
+    ProviderInstanceConfig, RunBudgetConfig, SectionEnvelope, SectionSourceKind, SectionStatus,
+    ServerConfig, SkillsConfig, StreamTimeoutConfig, SubagentsConfig, ToolsConfig,
+    WorktreeSettings,
 };
 
 pub(crate) const SECTION_SCHEMA_VERSION: u32 = 1;
@@ -287,7 +288,7 @@ impl SectionId {
 /// `proxy_auth` and `proxy_auth_encrypted` remain compatibility read fields,
 /// but their owner is still core; section serialization always drops them in
 /// favour of `proxy_auth_credential_ref`.
-pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 32] = [
+pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 33] = [
     ("http_proxy", SectionId::Core),
     ("https_proxy", SectionId::Core),
     ("proxy_auth", SectionId::Core),
@@ -302,6 +303,7 @@ pub const CONFIG_VALUE_FIELD_OWNERS: [(&str, SectionId); 32] = [
     ("keyword_masking", SectionId::ModelPolicy),
     ("anthropic_model_mapping", SectionId::ModelPolicy),
     ("gemini_model_mapping", SectionId::ModelPolicy),
+    ("patrol_model", SectionId::ModelPolicy),
     ("hooks", SectionId::Hooks),
     ("lifecycle_hooks", SectionId::Hooks),
     ("tools", SectionId::ToolsSkills),
@@ -441,6 +443,8 @@ pub struct ModelPolicySection {
     pub anthropic_model_mapping: AnthropicModelMapping,
     #[serde(default)]
     pub gemini_model_mapping: GeminiModelMapping,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patrol_model: Option<PatrolModelConfig>,
 }
 
 /// The compression crate owns the row schema. Keeping the rows as JSON here
@@ -589,6 +593,7 @@ impl SectionProjection {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
             tools,
@@ -659,6 +664,7 @@ impl SectionProjection {
                 keyword_masking,
                 anthropic_model_mapping,
                 gemini_model_mapping,
+                patrol_model,
             },
             model_limits,
         })
@@ -713,6 +719,7 @@ impl SectionProjection {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
         } = model_policy;
         let SubagentsSection {
             subagents: mut subagent_values,
@@ -736,6 +743,7 @@ impl SectionProjection {
                 keyword_masking,
                 anthropic_model_mapping,
                 gemini_model_mapping,
+                patrol_model,
                 hooks: hooks.request_hooks,
                 lifecycle_hooks: hooks.lifecycle_hooks,
                 tools,
@@ -878,6 +886,7 @@ pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut
             target.keyword_masking = source.keyword_masking.clone();
             target.anthropic_model_mapping = source.anthropic_model_mapping.clone();
             target.gemini_model_mapping = source.gemini_model_mapping.clone();
+            target.patrol_model = source.patrol_model.clone();
         }
         SectionId::ModelLimits | SectionId::Credentials => {}
     }
@@ -2836,6 +2845,9 @@ fn validate_hooks(value: &HooksSection) -> Result<(), String> {
 }
 
 fn validate_model_policy(value: &ModelPolicySection) -> Result<(), String> {
+    if let Some(model) = &value.patrol_model {
+        model.validate()?;
+    }
     value.keyword_masking.validate().map_err(|errors| {
         errors
             .into_iter()
@@ -3751,7 +3763,10 @@ fn project_legacy_raw_sections(
             "lifecycle_hooks" => {
                 hooks.insert(key.clone(), value.clone());
             }
-            "keyword_masking" | "anthropic_model_mapping" | "gemini_model_mapping" => {
+            "keyword_masking"
+            | "anthropic_model_mapping"
+            | "gemini_model_mapping"
+            | "patrol_model" => {
                 model_policy.insert(key.clone(), value.clone());
             }
             "model_limits" => {
@@ -7661,6 +7676,80 @@ mod tests {
         ] {
             assert!(names.contains(required), "missing owner for {required}");
         }
+    }
+
+    #[test]
+    fn patrol_model_policy_migrates_and_reopens_independently_of_provider_defaults() {
+        let _key = crate::encryption::set_test_encryption_key([62; 32]);
+        let dir = TempDir::new().unwrap();
+        let patrol = json!({
+            "provider": "patrol-local",
+            "model": "gpt-oss-20b",
+            "protocol": "llama_cpp_raw_v1",
+            "max_input_tokens": 32_768,
+            "max_output_tokens": 8_192,
+            "max_evidence_bytes": 131_072,
+            "max_evidence_refs": 32
+        });
+        assert!(Config::default().patrol_model.is_none());
+        let root = json!({"provider": "gemini", "patrol_model": patrol});
+        let mut invalid = root.clone();
+        invalid["patrol_model"]["protocol"] = json!("openai_chat");
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
+        let mut invalid = root.clone();
+        invalid["patrol_model"]["max_input_tokens"] = json!(0);
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
+        let mut invalid = root.clone();
+        invalid["patrol_model"]["model"] = json!("gpt-oss-120b");
+        assert!(serde_json::from_value::<Config>(invalid).is_err());
+
+        write_json(&dir.path().join("config.json"), &root);
+        migrate_config_facade_layout(dir.path()).unwrap();
+        let facade = ConfigFacade::open(dir.path()).unwrap();
+        let snapshot = facade.registry().model_policy.snapshot();
+        let effective = facade.effective_config();
+        assert_eq!(snapshot.data.patrol_model, effective.patrol_model);
+        assert_eq!(
+            effective.to_compatibility_value().unwrap()["patrol_model"],
+            patrol
+        );
+        assert_eq!(effective.provider, "gemini");
+        assert!(!effective.extra.contains_key("patrol_model"));
+        let mut candidate = snapshot.data.as_ref().clone();
+        candidate.patrol_model.as_mut().unwrap().model = "different-model".into();
+        assert!(facade
+            .registry()
+            .model_policy
+            .commit(snapshot.revision, candidate)
+            .is_err());
+        for (key, value) in [
+            ("max_input_tokens", 32_769),
+            ("max_output_tokens", 8_193),
+            ("max_evidence_bytes", 131_073),
+            ("max_evidence_refs", 33),
+        ] {
+            let mut invalid = root.clone();
+            invalid["patrol_model"][key] = json!(value);
+            let mut candidate = snapshot.data.as_ref().clone();
+            candidate.patrol_model =
+                Some(serde_json::from_value(invalid["patrol_model"].clone()).unwrap());
+            assert!(
+                serde_json::from_value::<Config>(invalid).is_err(),
+                "loaded patrol_model with {key} above the limit"
+            );
+            assert!(
+                facade
+                    .registry()
+                    .model_policy
+                    .commit(snapshot.revision, candidate)
+                    .is_err(),
+                "committed patrol_model with {key} above the limit"
+            );
+        }
+        assert_eq!(
+            facade.registry().model_policy.snapshot().data.patrol_model,
+            effective.patrol_model,
+        );
     }
 
     #[test]
@@ -15020,9 +15109,10 @@ fn reconciliation_root_sections(root: &Value) -> ReconciliationRootSectionsResul
                 }),
             },
             "lifecycle_hooks" => object(SectionId::Hooks, key, value, &mut object_sections),
-            "keyword_masking" | "anthropic_model_mapping" | "gemini_model_mapping" => {
-                object(SectionId::ModelPolicy, key, value, &mut object_sections)
-            }
+            "keyword_masking"
+            | "anthropic_model_mapping"
+            | "gemini_model_mapping"
+            | "patrol_model" => object(SectionId::ModelPolicy, key, value, &mut object_sections),
             "model_limits" => {
                 sections.insert(SectionId::ModelLimits, value.clone());
             }

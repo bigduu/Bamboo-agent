@@ -14,6 +14,9 @@ pub mod evidence;
 pub mod host;
 pub mod program;
 
+use bamboo_domain::patrol_model_limits::{
+    MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+};
 use serde::{Deserialize, Serialize};
 
 /// Epoch milliseconds from the Host's clock, including across process restarts.
@@ -1078,10 +1081,10 @@ fn validate_observation(o: &Observation, scope: &Scope, now: u64) -> Result<(), 
 fn valid_model(model: &Model) -> bool {
     valid_id(&model.provider)
         && valid_id(&model.model)
-        && (1..=32_768).contains(&model.max_input_tokens)
-        && (1..=8_192).contains(&model.max_output_tokens)
-        && (1..=131_072).contains(&model.max_evidence_bytes)
-        && (1..=32).contains(&model.max_evidence_refs)
+        && (1..=MAX_INPUT_TOKENS).contains(&model.max_input_tokens)
+        && (1..=MAX_OUTPUT_TOKENS).contains(&model.max_output_tokens)
+        && (1..=MAX_EVIDENCE_BYTES).contains(&model.max_evidence_bytes)
+        && (1..=MAX_EVIDENCE_REFS).contains(&model.max_evidence_refs)
 }
 
 fn valid_input_tokens(input_tokens: u32, model: &Model) -> bool {
