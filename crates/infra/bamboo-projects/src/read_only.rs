@@ -29,11 +29,14 @@ mod unix {
     use crate::{decode_manifest, FileLock, ProjectStoreError};
     use fs2::FileExt;
     use std::{
-        ffi::CString,
+        ffi::{CString, OsStr},
         fs::{File, OpenOptions},
         io::Read,
-        os::{fd::AsRawFd, unix::fs::MetadataExt},
-        path::Path,
+        os::{
+            fd::AsRawFd,
+            unix::{ffi::OsStrExt, fs::MetadataExt},
+        },
+        path::{Component, Path},
     };
 
     const MAX_MANIFEST_BYTES: usize = 1_048_576;
@@ -43,14 +46,23 @@ mod unix {
         ProjectStoreError::Validation("current read-only Project proof unavailable".into())
     }
 
-    fn name(value: &str) -> ProjectStoreResult<CString> {
-        if value.is_empty() || value == "." || value == ".." || value.contains('/') {
+    fn name(value: &OsStr) -> ProjectStoreResult<CString> {
+        let bytes = value.as_bytes();
+        if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
             return Err(invalid());
         }
-        CString::new(value).map_err(|_| invalid())
+        CString::new(bytes).map_err(|_| invalid())
     }
 
     fn open_at(parent: &File, component: &str, directory: bool) -> ProjectStoreResult<File> {
+        open_component(parent, OsStr::new(component), directory)
+    }
+
+    fn open_component(
+        parent: &File,
+        component: &OsStr,
+        directory: bool,
+    ) -> ProjectStoreResult<File> {
         use std::os::fd::FromRawFd;
         let component = name(component)?;
         let flags = libc::O_RDONLY
@@ -74,7 +86,7 @@ mod unix {
         file: &File,
         directory: bool,
     ) -> ProjectStoreResult<()> {
-        let component = name(component)?;
+        let component = name(OsStr::new(component))?;
         let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
         // SAFETY: both descriptors/names are live and fstatat initializes stat
         // on success. AT_SYMLINK_NOFOLLOW inspects the named entry itself.
@@ -128,9 +140,30 @@ mod unix {
         Ok((file, bytes))
     }
 
+    fn root_at(path: &Path) -> ProjectStoreResult<File> {
+        use std::os::unix::fs::OpenOptionsExt;
+        if !path.is_absolute() {
+            return Err(invalid());
+        }
+        let mut current = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/")?;
+        for component in path.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(value) => current = open_component(&current, value, true)?,
+                _ => return Err(invalid()),
+            }
+        }
+        Ok(current)
+    }
+
     fn check_root(root: &File, path: &Path) -> ProjectStoreResult<()> {
         let opened = root.metadata()?;
-        let named = std::fs::symlink_metadata(path)?;
+        // Walk every existing ancestor again, rather than following an alias
+        // back to the old inode through an intermediate replacement symlink.
+        let named = root_at(path)?.metadata()?;
         if !opened.is_dir()
             || !named.is_dir()
             || named.file_type().is_symlink()
@@ -147,11 +180,7 @@ mod unix {
         id: &ProjectId,
         after_read: impl FnOnce(),
     ) -> ProjectStoreResult<ProjectManifest> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let root = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(store.paths.data_dir())?;
+        let root = root_at(store.paths.data_dir())?;
         check_root(&root, store.paths.data_dir())?;
         let projects = open_at(&root, "projects", true)?;
         let home = open_at(&projects, id.as_str(), true)?;
@@ -338,6 +367,27 @@ mod unix {
             assert!(store.get_read_only(&project.id).is_err());
             assert_eq!(bytes(root.path()), before);
             assert_eq!(bytes(external.path()), outside);
+        }
+
+        #[test]
+        fn ancestor_symlink_is_rejected_at_entry_and_at_final_proof() {
+            use std::os::unix::fs::symlink;
+            let root = tempfile::tempdir().unwrap();
+            let base = root.path().join("base");
+            let saved = root.path().join("base-retained");
+            let store = ProjectStore::open(base.join("data")).unwrap();
+            let project = store.create("Ancestor proof", None).unwrap();
+            assert!(read(&store, &project.id, || {
+                std::fs::rename(&base, &saved).unwrap();
+                symlink(&saved, &base).unwrap();
+            })
+            .is_err());
+            let before = bytes(root.path());
+            assert!(store.get_read_only(&project.id).is_err());
+            assert_eq!(bytes(root.path()), before);
+            std::fs::remove_file(&base).unwrap();
+            std::fs::rename(&saved, &base).unwrap();
+            assert_eq!(store.get_read_only(&project.id).unwrap(), project);
         }
     }
 }
