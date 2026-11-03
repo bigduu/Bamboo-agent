@@ -9,9 +9,8 @@ No HTTP route or model tool exposes this API.
 This reader is a prerequisite for semantic patrol. The existing program patrol
 remains zero-model, and its semantic `diagnostic_input` port remains unavailable.
 The output has no provider, model, token estimate or budget reservation, and no
-automatic conversion into `DiagnosticInput`. A later protocol adapter must meter
-its complete request envelope and obtain canonical cumulative Work budget
-admission before submitting anything to a provider.
+automatic conversion into `DiagnosticInput`. The separate preparation API below
+requires an explicit selected model and a trusted local protocol meter.
 
 ## Crate ownership
 
@@ -79,6 +78,28 @@ state, run reconcile, dispatch a worker, stage an escalation, activate a Session
 or call a provider. The existing checkpoint codecs and Inbox bodies retain their
 original identity and retry behavior.
 
+## Metered diagnostic input preparation
+
+`AppState::read_work_patrol_diagnostic_input` accepts the current patrol
+observation, expected Ticket commit, since cursor, selected patrol model and
+trusted local meter. It uses the same native evidence reader. Orchestration
+checks the exact Scope, source revision and cursor window, then builds bounded
+canonical JSON and opaque references for the Ticket snapshot, adopted context
+and selected source pins. Every selected source must have matched its pinned
+version at the read. An empty selection still has the two fixed references.
+
+The meter receives the selected model and exact summary and reference payload.
+It accounts for the complete model-visible protocol envelope, including
+instructions and schema, without submitting a provider request. A missing,
+zero or over-cap count fails preparation. The Host checks current authority,
+Ticket HEAD, Assignment and Project proof again after measurement. Native
+content retains the read-time exact-version semantics of the evidence snapshot.
+
+The prepared input is scoped to the measured model and payload. The future
+provider adapter must submit those same model-visible fields and obtain
+canonical Work budget admission at the provider boundary. Concrete protocol
+meters, configuration and provider execution remain separate from this API.
+
 ## Validation boundary
 
 Focused tests exercise the public Host reader against a disposable canonical
@@ -89,9 +110,11 @@ changes. Persistent-byte comparisons and provider call counts cover the reads;
 fixture setup deliberately creates its own disposable authoritative state.
 Runtime counts belong to the exact tested source, platform and configuration.
 
-This proves the evidence reader only. Automatic semantic patrol consumption,
-independent provider configuration, protocol-specific metering, usage/Work
-budget assembly and remaining runtime measurements are separate slices under
+The native fixture also exercises metered preparation with a controlled local
+meter, exact payload retention, over-cap refusal and a Ticket HEAD change
+during measurement. Automatic semantic patrol consumption, independent provider
+configuration, concrete protocol meters, usage/Work budget assembly and
+remaining runtime measurements are separate slices under
 [#2049](https://github.com/bigduu/Bamboo-agent/issues/2049) and
 [#2050](https://github.com/bigduu/Bamboo-agent/issues/2050). No paid-provider or
 installed-application acceptance is implied.

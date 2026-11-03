@@ -2,9 +2,10 @@
 //! neither resolve native memory nor grant Host/runtime authority.
 use super::*;
 use bamboo_domain::{ProjectManifest, ProjectStatus};
+use bamboo_orchestration::patrol::diagnostic_input::prepare_diagnostic_input;
 use bamboo_orchestration::patrol::evidence::{
-    EvidencePlan, WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit, WorkPatrolSourceOutcome,
-    MAX_WORK_PATROL_EVIDENCE_BYTES,
+    EvidencePlan, UnmeteredWorkPatrolEvidence, WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit,
+    WorkPatrolSourceOutcome, MAX_WORK_PATROL_EVIDENCE_BYTES,
 };
 use bamboo_tickets::{Error, ProjectContextSnapshot, Snapshot};
 type Plan = EvidencePlan<String, String>;
@@ -266,4 +267,195 @@ fn evidence_overflow_marker_keeps_earlier_partial_content_near_the_aggregate_lim
     )));
     assert!(!evidence.all_sources_matched);
     assert!(serde_json::to_vec(&evidence).unwrap().len() <= MAX_WORK_PATROL_EVIDENCE_BYTES);
+}
+
+type Evidence = UnmeteredWorkPatrolEvidence<String, String>;
+
+fn diagnostic_fixture(selected_source: bool) -> (Evidence, Observation, Model) {
+    let fixture = Fixture::new();
+    let (commit, snapshot) = fixture.service().published().unwrap();
+    let since = snapshot.seq - 1;
+    let through = fixture
+        .observation()
+        .observation(&fixture.scope, since)
+        .unwrap();
+    let snapshot = if selected_source {
+        snapshot
+    } else {
+        context(&snapshot, &fixture.scope, |value| value.sources.clear())
+    };
+    let mut plan = Plan::prepare(&snapshot, &fixture.scope, &commit, since).unwrap();
+    if selected_source {
+        plan.record_source(
+            0,
+            WorkPatrolSourceOutcome::VersionMatched {
+                reference: "opaque native versioned ref".into(),
+                title: "Adopted context".into(),
+                content: "Exact source bytes for metering.".into(),
+            },
+        )
+        .unwrap();
+    }
+    let model = Model {
+        provider: "fixture-provider".into(),
+        model: "fixture-model".into(),
+        max_input_tokens: 1000,
+        max_output_tokens: 128,
+        max_evidence_bytes: MAX_WORK_PATROL_EVIDENCE_BYTES,
+        max_evidence_refs: 8,
+    };
+    (plan.finish().unwrap(), through, model)
+}
+
+#[test]
+fn diagnostic_input_keeps_the_exact_metered_envelope_and_fixed_refs() {
+    for selected_source in [false, true] {
+        let (evidence, through, mut model) = diagnostic_fixture(selected_source);
+        let bytes = bamboo_tickets::canonical_bytes(&evidence).unwrap();
+        let count = if selected_source { 3 } else { 2 };
+        model.max_evidence_bytes = bytes.len() + count * 64;
+        model.max_evidence_refs = count;
+        let mut metered = None;
+        let input = prepare_diagnostic_input(
+            &evidence,
+            &evidence.source_commit,
+            evidence.since_cursor,
+            &through,
+            &model,
+            |selected, summary, refs| {
+                assert_eq!(selected, &model);
+                assert_eq!(summary.as_bytes(), bytes.as_slice());
+                assert_eq!(refs.len(), count);
+                assert_eq!(
+                    refs.iter().map(|r| &r.id).collect::<BTreeSet<_>>().len(),
+                    count
+                );
+                assert!(refs
+                    .iter()
+                    .all(|r| r.id.len() == 64 && r.revision == through.source_revision));
+                metered = Some((summary.to_owned(), refs.to_vec()));
+                Ok(model.max_input_tokens)
+            },
+        )
+        .unwrap();
+        assert_eq!(input.scope, through.scope);
+        assert_eq!(input.source_revision, through.source_revision);
+        assert_eq!(input.since_cursor, evidence.since_cursor);
+        assert_eq!(input.through_cursor, through.cursor);
+        assert_eq!(input.input_tokens, model.max_input_tokens);
+        assert_eq!((input.summary, input.references), metered.unwrap());
+    }
+}
+
+fn unexpected_meter(_: &Model, _: &str, _: &[EvidenceRef]) -> Result<u32, PortError> {
+    panic!("invalid evidence must never invoke the meter")
+}
+
+#[test]
+fn diagnostic_input_rejects_stale_or_foreign_snapshot_before_metering() {
+    let (evidence, through, model) = diagnostic_fixture(true);
+    let prepare = |commit: &str, since, through: &Observation| {
+        prepare_diagnostic_input(&evidence, commit, since, through, &model, unexpected_meter)
+    };
+    assert_eq!(
+        prepare("different-commit", evidence.since_cursor, &through),
+        Err(PortError::Conflict)
+    );
+    assert_eq!(
+        prepare(&evidence.source_commit, evidence.since_cursor + 1, &through),
+        Err(PortError::Conflict)
+    );
+    let mut foreign = through.clone();
+    foreign.scope.generation += 1;
+    assert_eq!(
+        prepare(&evidence.source_commit, evidence.since_cursor, &foreign),
+        Err(PortError::Conflict)
+    );
+    let mut newer = through.clone();
+    newer.source_revision += 1;
+    assert_eq!(
+        prepare(&evidence.source_commit, evidence.since_cursor, &newer),
+        Err(PortError::Conflict)
+    );
+    newer = through;
+    newer.cursor += 1;
+    assert_eq!(
+        prepare(&evidence.source_commit, evidence.since_cursor, &newer),
+        Err(PortError::Conflict)
+    );
+}
+
+#[test]
+fn diagnostic_input_rejects_partial_inconsistent_or_overbudget_evidence_before_metering() {
+    let (evidence, through, model) = diagnostic_fixture(true);
+    let prepare = |evidence: &Evidence, model: &Model| {
+        prepare_diagnostic_input(
+            evidence,
+            &evidence.source_commit,
+            evidence.since_cursor,
+            &through,
+            model,
+            unexpected_meter,
+        )
+    };
+    for outcome in [
+        WorkPatrolSourceOutcome::Missing,
+        WorkPatrolSourceOutcome::VersionMismatch {
+            observed_version: "v2".into(),
+        },
+    ] {
+        let mut partial = evidence.clone();
+        partial.sources[0].outcome = outcome;
+        partial.all_sources_matched = false;
+        assert_eq!(prepare(&partial, &model), Err(PortError::Denied));
+    }
+    let mut rejected = evidence.clone();
+    rejected.all_sources_matched = false;
+    assert_eq!(prepare(&rejected, &model), Err(PortError::Denied));
+    rejected = evidence.clone();
+    rejected.reference_count -= 1;
+    assert_eq!(prepare(&rejected, &model), Err(PortError::Denied));
+    rejected = evidence.clone();
+    rejected.sources.push(evidence.sources[0].clone());
+    rejected.reference_count += 1;
+    assert_eq!(prepare(&rejected, &model), Err(PortError::Denied));
+    rejected = evidence.clone();
+    rejected.ticket.contract.objective = "界".repeat(MAX_WORK_PATROL_EVIDENCE_BYTES / 3 + 1);
+    assert_eq!(prepare(&rejected, &model), Err(PortError::Denied));
+    for invalid_model in [
+        Model {
+            max_evidence_bytes: 1,
+            ..model.clone()
+        },
+        Model {
+            max_evidence_refs: 2,
+            ..model.clone()
+        },
+        Model {
+            max_input_tokens: 0,
+            ..model.clone()
+        },
+    ] {
+        assert_eq!(prepare(&evidence, &invalid_model), Err(PortError::Denied));
+    }
+}
+
+#[test]
+fn diagnostic_input_rejects_meter_failure_zero_and_over_cap() {
+    let (evidence, through, model) = diagnostic_fixture(true);
+    for (metered, expected) in [
+        (Err(PortError::Unavailable), PortError::Unavailable),
+        (Ok(0), PortError::Denied),
+        (Ok(model.max_input_tokens + 1), PortError::Denied),
+    ] {
+        let result = prepare_diagnostic_input(
+            &evidence,
+            &evidence.source_commit,
+            evidence.since_cursor,
+            &through,
+            &model,
+            |_, _, _| metered,
+        );
+        assert_eq!(result, Err(expected));
+    }
 }

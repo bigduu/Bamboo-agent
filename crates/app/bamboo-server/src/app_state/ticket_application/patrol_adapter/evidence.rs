@@ -3,7 +3,10 @@ use super::super::{Error, Principal, Result};
 use super::patrol_error;
 use bamboo_domain::ProjectManifest;
 use bamboo_memory::memory_store::{DurableMemoryStatus, ProjectMemoryRead, ProjectMemoryRef};
-use bamboo_orchestration::patrol::{evidence as core, host, Scope};
+use bamboo_orchestration::patrol::{
+    diagnostic_input::prepare_diagnostic_input, evidence as core, host, DiagnosticInput,
+    EvidenceRef, Model, Observation, PortError, Scope,
+};
 use bamboo_tickets::{Authority, ProjectContextSnapshot, Snapshot, TicketService};
 pub use core::{
     WorkPatrolAdoptedContextEvidence, WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit,
@@ -137,20 +140,72 @@ impl crate::app_state::AppState {
         expected_ticket_commit: &str,
         since_cursor: u64,
     ) -> Result<UnmeteredWorkPatrolEvidence> {
+        self.with_work_patrol_evidence(scope, expected_ticket_commit, since_cursor, Ok)
+            .await
+    }
+
+    /// Prepare input for the selected diagnostic model from an exact Host read.
+    /// The trusted local meter accounts for the protocol's full model-visible
+    /// envelope without submitting a request. The final Host fence runs after
+    /// metering. The returned input is a read, with no provider admission.
+    pub async fn read_work_patrol_diagnostic_input(
+        &self,
+        through: &Observation,
+        expected_ticket_commit: &str,
+        since_cursor: u64,
+        model: &Model,
+        meter: impl FnOnce(&Model, &str, &[EvidenceRef]) -> std::result::Result<u32, PortError>,
+    ) -> Result<DiagnosticInput> {
+        self.with_work_patrol_evidence(
+            &through.scope,
+            expected_ticket_commit,
+            since_cursor,
+            |evidence| {
+                prepare_diagnostic_input(
+                    &evidence,
+                    expected_ticket_commit,
+                    since_cursor,
+                    through,
+                    model,
+                    meter,
+                )
+                .map_err(patrol_error)
+            },
+        )
+        .await
+    }
+
+    async fn with_work_patrol_evidence<T>(
+        &self,
+        scope: &Scope,
+        expected_ticket_commit: &str,
+        since_cursor: u64,
+        finish: impl FnOnce(UnmeteredWorkPatrolEvidence) -> Result<T>,
+    ) -> Result<T> {
         let memory = self.memory_store.clone();
         let project: bamboo_domain::ProjectId = scope
             .project_id
             .parse()
             .map_err(|_| Error::ScopeDenied("invalid Project selector".into()))?;
-        self.read_evidence_with(scope, expected_ticket_commit, since_cursor, move |pin| {
-            let memory = memory.clone();
-            let project = project.clone();
-            async move {
-                memory
-                    .read_project_source_read_only(&project, pin.memory_id(), pin.content_version())
-                    .await
-            }
-        })
+        self.read_evidence_with(
+            scope,
+            expected_ticket_commit,
+            since_cursor,
+            move |pin| {
+                let memory = memory.clone();
+                let project = project.clone();
+                async move {
+                    memory
+                        .read_project_source_read_only(
+                            &project,
+                            pin.memory_id(),
+                            pin.content_version(),
+                        )
+                        .await
+                }
+            },
+            finish,
+        )
         .await
     }
 
@@ -203,13 +258,14 @@ impl crate::app_state::AppState {
 
     // Private per-call reader seam: tests may interleave real source reads with
     // authority changes; no environment hook or production fault capability.
-    async fn read_evidence_with<R, F>(
+    async fn read_evidence_with<R, F, T>(
         &self,
         scope: &Scope,
         expected: &str,
         since: u64,
         mut read: R,
-    ) -> Result<UnmeteredWorkPatrolEvidence>
+        finish: impl FnOnce(UnmeteredWorkPatrolEvidence) -> Result<T>,
+    ) -> Result<T>
     where
         R: FnMut(ProjectMemoryRef) -> F,
         F: Future<Output = std::io::Result<ProjectMemoryRead>>,
@@ -232,10 +288,10 @@ impl crate::app_state::AppState {
                 plan.record_source(index, WorkPatrolSourceOutcome::Unsupported)?;
             }
         }
-        let evidence = plan.finish()?;
+        let result = finish(plan.finish()?)?;
         self.evidence_fence(&service, scope, expected, &plan, &manifest)
             .await?;
-        Ok(evidence)
+        Ok(result)
     }
 }
 

@@ -9,6 +9,7 @@ use bamboo_domain::Message;
 use bamboo_domain::WorkspaceBinding;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use bamboo_memory::memory_store::{MemoryRetrievalInput, MemoryStore};
+use bamboo_orchestration::patrol::ObservationPort;
 use bamboo_tickets::{Contract, ExecutionWorkspace, Operation, TicketKind, WorkState};
 use serde_json::{json, Value};
 use std::{
@@ -373,6 +374,40 @@ async fn exercise(state: &AppState, provider: &Provider, root: &Path, scope: &Sc
     let text = String::from_utf8(encoded.clone()).unwrap();
     assert!(!text.contains("FOREIGN_PROJECT"));
     assert!(!text.contains("input_tokens"));
+    let through = current_observation(state, scope).await;
+    let model = diagnostic_model();
+    let mut measured = None;
+    let input = state
+        .read_work_patrol_diagnostic_input(
+            &through,
+            &commit,
+            0,
+            &model,
+            |selected, summary, refs| {
+                assert_eq!(selected, &model);
+                assert_eq!(
+                    summary.as_bytes(),
+                    bamboo_tickets::canonical_bytes(&evidence).unwrap()
+                );
+                assert_eq!(refs.len(), evidence.reference_count);
+                measured = Some((summary.to_owned(), refs.to_vec()));
+                Ok(model.max_input_tokens)
+            },
+        )
+        .await
+        .unwrap();
+    let (summary, references) = measured.unwrap();
+    assert_eq!(input.scope, *scope);
+    assert_eq!(input.through_cursor, snapshot.seq);
+    assert_eq!(input.summary, summary);
+    assert_eq!(input.references, references);
+    assert_eq!(input.input_tokens, model.max_input_tokens);
+    assert!(state
+        .read_work_patrol_diagnostic_input(&through, &commit, 0, &model, |_, _, _| {
+            Ok(model.max_input_tokens + 1)
+        })
+        .await
+        .is_err());
     for _ in 0..3 {
         assert_eq!(
             serde_json::to_vec(
@@ -420,6 +455,27 @@ async fn exercise(state: &AppState, provider: &Provider, root: &Path, scope: &Sc
     assert_eq!(provider.calls.load(Ordering::SeqCst), calls);
 }
 
+fn diagnostic_model() -> Model {
+    Model {
+        provider: "fixture-local-protocol".into(),
+        model: "fixture-diagnostic-model".into(),
+        max_input_tokens: 4096,
+        max_output_tokens: 64,
+        max_evidence_bytes: 20 * 1024,
+        max_evidence_refs: MAX_WORK_PATROL_EVIDENCE_REFS,
+    }
+}
+
+async fn current_observation(state: &AppState, scope: &Scope) -> Observation {
+    state
+        .tickets
+        .patrol_observation(scope)
+        .await
+        .unwrap()
+        .observation(scope, 0)
+        .unwrap()
+}
+
 async fn interleaving_and_source_negatives(
     state: &AppState,
     provider: &Provider,
@@ -444,36 +500,69 @@ async fn interleaving_and_source_negatives(
         Err(Error::ScopeDenied(_))
     ));
     let (current, authority) = state.tickets.authority(owner()).await.unwrap();
-    let command = current
-        .prepare_command(
-            &authority,
-            "head-control",
-            vec![Operation::Create {
-                temp_id: "other".into(),
-                kind: TicketKind::Work,
-                parent: None,
-                contract: contract(),
-                depends_on: BTreeSet::new(),
-            }],
+    let advance_command = |key| {
+        current
+            .prepare_command(
+                &authority,
+                key,
+                vec![Operation::Create {
+                    temp_id: "other".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract(),
+                    depends_on: BTreeSet::new(),
+                }],
+            )
+            .unwrap()
+    };
+    let through = current_observation(state, scope).await;
+    let command = advance_command("meter-head-control");
+    let result = state
+        .read_work_patrol_diagnostic_input(
+            &through,
+            &expected,
+            0,
+            &diagnostic_model(),
+            |_, _, _| {
+                current.execute(&authority, &command).unwrap();
+                Ok(100)
+            },
         )
-        .unwrap();
+        .await;
+    assert!(
+        matches!(result, Err(Error::RevisionConflict)),
+        "HEAD advance during metering must invalidate the prepared input"
+    );
+    assert_ne!(service.published().unwrap().0, expected);
+    let expected = service.published().unwrap().0;
+    let command = advance_command("head-control");
     let memory = state.memory_store.clone();
     let project_read = project.clone();
     let result = state
-        .read_evidence_with(scope, &expected, 0, move |pin| {
-            let memory = memory.clone();
-            let project = project_read.clone();
-            let service = current.clone();
-            let authority = authority.clone();
-            let command = command.clone();
-            async move {
-                let read = memory
-                    .read_project_source_read_only(&project, pin.memory_id(), pin.content_version())
-                    .await;
-                service.execute(&authority, &command).unwrap();
-                read
-            }
-        })
+        .read_evidence_with(
+            scope,
+            &expected,
+            0,
+            move |pin| {
+                let memory = memory.clone();
+                let project = project_read.clone();
+                let service = current.clone();
+                let authority = authority.clone();
+                let command = command.clone();
+                async move {
+                    let read = memory
+                        .read_project_source_read_only(
+                            &project,
+                            pin.memory_id(),
+                            pin.content_version(),
+                        )
+                        .await;
+                    service.execute(&authority, &command).unwrap();
+                    read
+                }
+            },
+            Ok,
+        )
         .await;
     assert!(
         matches!(result, Err(Error::RevisionConflict)),
@@ -505,6 +594,17 @@ async fn interleaving_and_source_negatives(
         changed.sources[0].outcome,
         WorkPatrolSourceOutcome::VersionMismatch { .. }
     ));
+    let through = current_observation(state, scope).await;
+    assert!(state
+        .read_work_patrol_diagnostic_input(
+            &through,
+            &expected,
+            0,
+            &diagnostic_model(),
+            |_, _, _| { panic!("mismatched adopted source must be rejected before metering") }
+        )
+        .await
+        .is_err());
     state
         .memory_store
         .for_project(&project)
@@ -529,9 +629,13 @@ async fn interleaving_and_source_negatives(
     let baseline = authority_files(state.project_store.paths().data_dir());
     assert!(matches!(
         state
-            .read_evidence_with(scope, &expected, 0, |_| async {
-                Err(std::io::Error::other("private source path"))
-            })
+            .read_evidence_with(
+                scope,
+                &expected,
+                0,
+                |_| async { Err(std::io::Error::other("private source path")) },
+                Ok
+            )
             .await
             .unwrap()
             .sources[0]
@@ -545,21 +649,31 @@ async fn interleaving_and_source_negatives(
     let memory = state.memory_store.clone();
     let storage = state.storage.clone();
     let result = state
-        .read_evidence_with(scope, &expected, 0, move |pin| {
-            let memory = memory.clone();
-            let project = project.clone();
-            let storage = storage.clone();
-            async move {
-                let read = memory
-                    .read_project_source_read_only(&project, pin.memory_id(), pin.content_version())
-                    .await;
-                storage
-                    .delete_session(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
-                    .await
-                    .unwrap();
-                read
-            }
-        })
+        .read_evidence_with(
+            scope,
+            &expected,
+            0,
+            move |pin| {
+                let memory = memory.clone();
+                let project = project.clone();
+                let storage = storage.clone();
+                async move {
+                    let read = memory
+                        .read_project_source_read_only(
+                            &project,
+                            pin.memory_id(),
+                            pin.content_version(),
+                        )
+                        .await;
+                    storage
+                        .delete_session(bamboo_domain::DEFAULT_SUPERVISOR_SESSION_ID)
+                        .await
+                        .unwrap();
+                    read
+                }
+            },
+            Ok,
+        )
         .await;
     assert!(
         matches!(result, Err(Error::ScopeDenied(_))),
