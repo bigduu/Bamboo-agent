@@ -369,6 +369,31 @@ async fn seed(root: &Path) {
             Some(wait.clone())
         );
     }
+    let response = actix_web::test::call_service(
+        &app,
+        actix_web::test::TestRequest::post()
+            .uri("/api/v1/tickets/patrol/observation")
+            .peer_addr("127.0.0.1:43210".parse().unwrap())
+            .set_json(json!({
+                "project_id":scope.project_id,
+                "work_id":scope.work_id,
+                "assignment_id":scope.assignment_id
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    let live: serde_json::Value = actix_web::test::read_body_json(response).await;
+    assert_eq!(live["state"], "observed");
+    assert!(live["progress"].is_null());
+    assert_eq!(
+        live["expected_wait"],
+        json!({
+            "kind":"user",
+            "issued_at_ms":wait.issued_at_ms,
+            "diagnostic_allowance_until_ms":wait.until_ms
+        })
+    );
     let mut source = state.tickets.patrol_observation(&scope).await.unwrap();
     assert_eq!(
         program

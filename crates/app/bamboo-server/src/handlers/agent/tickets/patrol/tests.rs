@@ -174,11 +174,14 @@ fn body(scope: &Scope) -> Value {
     json!({"project_id":scope.project_id,"work_id":scope.work_id,"assignment_id":scope.assignment_id})
 }
 macro_rules! query {
-    ($app:expr,$body:expr,$status:expr) => {{
+    ($app:expr,$body:expr,$status:expr) => {
+        query!($app, "/api/v1/tickets/patrol/status", $body, $status)
+    };
+    ($app:expr,$route:expr,$body:expr,$status:expr) => {{
         let response = actix_web::test::call_service(
             &$app,
             actix_web::test::TestRequest::post()
-                .uri("/api/v1/tickets/patrol/status")
+                .uri($route)
                 .peer_addr("127.0.0.1:43210".parse().unwrap())
                 .set_json($body)
                 .to_request(),
@@ -341,6 +344,20 @@ async fn exercise(
     let service = state.tickets.service().unwrap();
     let before = files(root);
     let ticket = service.published().unwrap();
+    let live_route = "/api/v1/tickets/patrol/observation";
+    let unknown = json!({
+        "state": "unknown", "scope": scope, "ticket_commit": ticket.0,
+        "started_at_ms": null, "heartbeat_at_ms": null, "progress": null,
+        "expected_wait": null, "execution_outcome_unknown": false
+    });
+    for _ in 0..2 {
+        assert_eq!(query!(app, live_route, &request, StatusCode::OK), unknown);
+    }
+    assert_eq!(
+        files(root),
+        before,
+        "live observations must not initialize or touch journal, Ticket or Actor files"
+    );
     if seed {
         assert_eq!(
             query!(app, &request, StatusCode::OK)["state"],
@@ -382,6 +399,7 @@ async fn exercise(
         let mut wrong = request.clone();
         wrong[field] = json!("foreign");
         let _ = query!(app, &wrong, StatusCode::FORBIDDEN);
+        let _ = query!(app, live_route, &wrong, StatusCode::FORBIDDEN);
     }
     assert!(matches!(
         state
@@ -464,42 +482,47 @@ async fn status_rejects_worker_remote_unauthenticated_and_malformed_selectors() 
     .await;
     let body = json!({"project_id":"project","work_id":"work","assignment_id":"assignment"});
     let before = files(root.path());
-    let request = actix_web::test::TestRequest::post()
-        .uri("/api/v1/tickets/patrol/status")
-        .peer_addr("203.0.113.1:43210".parse().unwrap())
-        .set_json(&body)
-        .to_request();
-    assert_eq!(
-        actix_web::test::call_service(&app, request).await.status(),
-        StatusCode::FORBIDDEN
-    );
-    let request = actix_web::test::TestRequest::post()
-        .uri("/api/v1/tickets/patrol/status")
-        .peer_addr("127.0.0.1:43210".parse().unwrap())
-        .set_json(&body)
-        .to_request();
-    request
-        .extensions_mut()
-        .insert(crate::codex_run_tokens::CodexRunAuthContext {
-            session_id: "worker".into(),
-        });
-    assert_eq!(
-        actix_web::test::call_service(&app, request).await.status(),
-        StatusCode::FORBIDDEN
-    );
-    for field in ["generation", "authority_epoch", "path", "principal"] {
-        let mut malformed = body.clone();
-        malformed[field] = json!(1);
-        let response = actix_web::test::call_service(
-            &app,
-            actix_web::test::TestRequest::post()
-                .uri("/api/v1/tickets/patrol/status")
-                .peer_addr("127.0.0.1:43210".parse().unwrap())
-                .set_json(malformed)
-                .to_request(),
-        )
-        .await;
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    for route in [
+        "/api/v1/tickets/patrol/status",
+        "/api/v1/tickets/patrol/observation",
+    ] {
+        let request = actix_web::test::TestRequest::post()
+            .uri(route)
+            .peer_addr("203.0.113.1:43210".parse().unwrap())
+            .set_json(&body)
+            .to_request();
+        assert_eq!(
+            actix_web::test::call_service(&app, request).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let request = actix_web::test::TestRequest::post()
+            .uri(route)
+            .peer_addr("127.0.0.1:43210".parse().unwrap())
+            .set_json(&body)
+            .to_request();
+        request
+            .extensions_mut()
+            .insert(crate::codex_run_tokens::CodexRunAuthContext {
+                session_id: "worker".into(),
+            });
+        assert_eq!(
+            actix_web::test::call_service(&app, request).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        for field in ["generation", "authority_epoch", "path", "principal"] {
+            let mut malformed = body.clone();
+            malformed[field] = json!(1);
+            let response = actix_web::test::call_service(
+                &app,
+                actix_web::test::TestRequest::post()
+                    .uri(route)
+                    .peer_addr("127.0.0.1:43210".parse().unwrap())
+                    .set_json(malformed)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
     }
     assert_eq!(files(root.path()), before);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
