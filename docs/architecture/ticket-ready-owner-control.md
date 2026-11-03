@@ -17,7 +17,7 @@ and no initialization permission. No local setting or legacy Supervisor changed.
 | Cumulative token budget | `bamboo-tickets/src/execution_budget.rs`; `bamboo-engine/src/ticket_token_budget{,/provider}.rs` | #2262 and Native integration already exist. Only canonical Ticket HEAD stores limits, reservations and cumulative spending. Unknown usage retains its reservation. Rounds are an additional run ceiling, not money accounting. |
 | Canonical worker and durable Inbox | `bamboo-engine/src/{ticket_runtime,ticket_worker_plan}.rs`; server `tools/ticket_dispatch_adapter.rs` | Existing native one-shot worker/Task/submission path, including stopped-process proof. This slice creates no worker adapter or second task queue. #1794 remains a broader open tracker. |
 | Wait, directory and lifecycle integration | Engine `sdk/tests.rs`; server `app_state/{parent_question_reconcile,supervisor_directory_tests}.rs`, `tests/{native_work_acceptance,native_work_interruption,native_work_project_isolation,ticket_writer_lifecycle}.rs` | #1479/#1480 and #2265/#2269/#2280 have delivery records. Current-source execution results must be reported separately from those historical records. |
-| Program patrol | `bamboo-orchestration/src/patrol/{host,program}.rs` and server `ticket_application/patrol_adapter` | Program observation/delivery calls no model. Admitted #2469 projects bounded current runtime waits after exact identity and wait checks. Started, heartbeat and meaningful progress remain unknown; a supported wait or heartbeat cannot prove progress. |
+| Program patrol | `bamboo-orchestration/src/patrol/{host,program}.rs` and server `ticket_application/patrol_adapter` | Program observation/delivery calls no model. #2469 projects verified current runtime waits; #2506 adds exact live native Task entry from Engine. Missing live samples, heartbeat and meaningful progress remain unknown; neither start nor wait proves progress. See [runtime facts](patrol-runtime-observations.md). |
 
 Paths in the table are relative to each named crate's root. Source presence and
 historical delivery do not prove the installed app is using formal Work.
@@ -90,8 +90,9 @@ receipt means an authorization decision, never worker start, progress or accepta
 ## Remaining independent production work
 
 - #2469 has connected verified current Question/Child/Bash wait observations to
-  the existing program pass. #2049 still owns missing started/heartbeat/valid
-  progress measurements, broader diagnostics and UI projections. Do not fabricate
+  the existing program pass. #2506 supplies only current native Task entry;
+  historical start, heartbeat, valid progress, broader diagnostics and UI
+  projections remain under #2049. Do not fabricate
   those values or enable semantic model patrol because this owner endpoint exists.
 - #2453 owns separate owner HTTP setup/readback over the canonical cumulative
   budget. This installer requires those explicit limits and refuses to invent

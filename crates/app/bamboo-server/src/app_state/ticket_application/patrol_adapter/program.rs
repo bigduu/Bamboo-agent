@@ -95,7 +95,7 @@ impl TicketApplication {
         let facts_revision = snapshot.execution_facts_revision();
         // Canonical runtime I/O stays outside the synchronous journal/Ticket
         // pass. Each prepared sample remains bound to its original commit and
-        // receipt; the factory rechecks both against fresh ledger authority.
+        // receipt. At projection the factory also rechecks any live start.
         let observations =
             runtime_observation::prepare_selection(self, &service, &authority, selection).await?;
         fence.check()?;
@@ -142,15 +142,12 @@ impl TicketApplication {
                     &SystemClock(now),
                     &mut journal,
                     &mut |scope| match observations.get(scope) {
-                        Some(runtime) => {
-                            bamboo_orchestration::patrol::host::read_observation_with_runtime(
-                                &service,
-                                &authority,
-                                scope,
-                                runtime,
-                                &Policy::default(),
-                            )
-                        }
+                        Some(runtime) => runtime.read_observation(
+                            &service,
+                            &authority,
+                            scope,
+                            &Policy::default(),
+                        ),
                         None => bamboo_orchestration::patrol::host::read_observation(
                             &service, &authority, scope,
                         ),

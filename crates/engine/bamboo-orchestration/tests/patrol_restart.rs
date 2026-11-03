@@ -49,6 +49,69 @@ struct Fixture {
     serial: u64,
 }
 
+#[test]
+fn live_runtime_facts_require_current_scope_receipt_and_preserve_wait_api() {
+    let fixture = Fixture::new();
+    let mut facts = host::RuntimeFacts {
+        scope: fixture.scope.clone(),
+        source_commit: fixture.service().published().unwrap().0,
+        receipt: fixture.receipt.clone(),
+        started_at_ms: Some(5),
+        wait: None,
+    };
+    let read = |facts: &host::RuntimeFacts| {
+        host::read_observation_with_runtime_facts(
+            fixture.service(),
+            &fixture.runtime(),
+            &fixture.scope,
+            facts,
+            &Policy::default(),
+        )
+    };
+    let observed = read(&facts)
+        .unwrap()
+        .observation(&fixture.scope, 0)
+        .unwrap();
+    assert_eq!(observed.started_at_ms, Some(5));
+    assert_eq!(observed.heartbeat_at_ms, None);
+    assert_eq!(observed.progress, None);
+    facts.started_at_ms = Some(0);
+    assert!(matches!(read(&facts), Err(PortError::Denied)));
+    facts.started_at_ms = Some(5);
+    facts.receipt.run_id = "foreign-run".into();
+    assert!(matches!(read(&facts), Err(PortError::Denied)));
+    facts.receipt = fixture.receipt.clone();
+    facts.scope.generation += 1;
+    assert!(matches!(read(&facts), Err(PortError::Conflict)));
+    facts.scope = fixture.scope.clone();
+    facts.source_commit = "0".repeat(64);
+    assert!(matches!(read(&facts), Err(PortError::Conflict)));
+    let original = host::RuntimeObservation {
+        scope: fixture.scope.clone(),
+        source_commit: fixture.service().published().unwrap().0,
+        receipt: fixture.receipt.clone(),
+        wait: host::RuntimeWait {
+            kind: WaitKind::Dependency,
+            registered_at_ms: 5,
+            timeout_at_ms: None,
+            request_id: None,
+            evidence_ref: "original-wait".into(),
+        },
+    };
+    let observed = host::read_observation_with_runtime(
+        fixture.service(),
+        &fixture.runtime(),
+        &fixture.scope,
+        &original,
+        &Policy::default(),
+    )
+    .unwrap()
+    .observation(&fixture.scope, 0)
+    .unwrap();
+    assert_eq!(observed.started_at_ms, None);
+    assert_eq!(observed.expected_wait.unwrap().kind, WaitKind::Dependency);
+}
+
 impl Fixture {
     fn service(&self) -> &TicketService {
         self.service.as_ref().unwrap()

@@ -1,9 +1,10 @@
-# Read-only native wait observations
+# Read-only native runtime observations
 
-Issue #2469, parent #2049/#2050. Source base: accepted dev
+Wait slice #2469; live Task-entry slice #2506; parent #2049/#2050.
+Original wait source base: accepted dev
 `3d3f60b6085a3ff255b8a0ca3a3059b949ca328c`.
 
-The existing zero-model program patrol now accepts a prepared runtime wait
+The existing zero-model program patrol accepts prepared runtime wait and live-start
 projection. The original ledger-only `ProgramPatrol::tick_project` remains
 available. The new factory pass retains the same fixed-snapshot, chunked
 authorization, exact Scope, journal CAS and Ready admission fences. Runtime I/O
@@ -55,14 +56,36 @@ accounting receipts are retained; waiting is not meaningful progress and does
 not resolve the old incident. An outstanding diagnostic or settlement still
 requires its original adapter and takes precedence over a normal wait report.
 
+## Live native Task entry
+
+Engine owns one non-persisted, once-only entry timestamp on the existing native
+`Execution`. The actual owned Tokio Task sets it immediately before Agent
+execution, after native capacity and admission. `ExternalChildRunner` and
+`SpawnScheduler` expose a read-only sample bound to session birth, Run and the
+physical resource-owner instance. The composite runner forwards it only for its
+existing sole-native backend. Other backends provide no sample.
+
+Orchestration's `RuntimeFacts` projects the start after canonical Scope, commit
+and receipt checks. The original wait-only `RuntimeObservation` API remains
+compatible. Server joins the Engine sample to its existing fresh Project,
+Ticket, parent and Child proof; it rechecks the exact live sample after the last
+asynchronous read and again when the program factory consumes a prepared batch.
+The batch keeps a weak adapter reference; a vanished or replaced sample clears
+only start, with the independently checked wait and canonical fences preserved.
+These observations add no execution authority or writer.
+
+Queued/preparing tasks have no entry sample. Stop, shutdown and cold reopen
+provide no live sample; files do not restore it or an execution grant. This
+slice supplies no durable historical start time. Actor activation start and the
+running/preparation `runtime.local_task.observed_at` observation alone do not
+prove actual Task entry. Its verified stopped observation remains the Question
+diagnostic anchor described above.
+
 ## Measurements that remain unavailable
 
-Production start, actual heartbeat and meaningful progress remain `None`.
-There is no existing safe private Actor reader exposing exact run/start timing;
-the public snapshot deliberately redacts those fields. Local task observation
-times, round/token counters, metadata revisions, polling time and lease expiry
-are not substituted for these measurements. Adding a start/heartbeat/progress
-producer or a lifecycle read port is separate work.
+Actual heartbeat and meaningful progress remain `None`. Round/token counters,
+metadata revisions, polling time and lease expiry do not supply either fact.
+Their producers remain separate work.
 
 Policy no longer substitutes a known start for a missing heartbeat/progress
 measurement. Unsupported measurements yield `EvidenceUnknown`, unless a valid
@@ -80,6 +103,15 @@ The byte baseline follows exact runner/router finalization and a pure-read
 terminal Actor check; a canonical owned stop alone precedes that writer tail.
 The existing orchestration `patrol` target owns policy transition regressions;
 the server default library owns compact identity-helper negatives.
+
+The existing `ready_work_scheduler` target owns real native capacity/entry,
+repeat-read and wrong-identity controls. The Question scenario additionally
+checks live start and its absence after stop/reopen. The server default library
+owns a controlled shutdown at the last Host read and between batch collection
+and projection: the in-flight read must conflict, and the prepared batch must
+project an unknown start, both without a Ticket write. Pure `patrol_restart`
+cases check projection fences and wait-only API compatibility; start alone
+still cannot prove health.
 
 These are controlled-provider/native mechanisms, not paid-model, installed-app,
 all-platform or complete #2049 acceptance. Exact executed results belong in the

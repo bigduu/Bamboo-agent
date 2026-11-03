@@ -222,6 +222,14 @@ async fn seed(root: &Path) {
         .patrol_scope(project.id.as_str(), &work, &assignment)
         .await
         .unwrap();
+    let mut live = state.tickets.patrol_observation(&scope).await.unwrap();
+    let entered = live.observation(&scope, 0).unwrap();
+    assert!(
+        entered.started_at_ms.is_some(),
+        "actual provider gate has a live Engine entry witness"
+    );
+    assert_eq!(entered.heartbeat_at_ms, None);
+    assert_eq!(entered.progress, None);
     let mut checkpoints = state.tickets.open_patrol_checkpoints(&scope).await.unwrap();
     let program = ProgramPatrol::new(Policy::default()).unwrap();
     let mut source = state.tickets.patrol_observation(&scope).await.unwrap();

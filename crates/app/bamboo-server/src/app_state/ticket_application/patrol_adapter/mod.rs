@@ -23,14 +23,14 @@ impl TicketApplication {
         if let Some(runtime) =
             runtime_observation::prepare(self, &service, &authority, scope).await?
         {
-            return host::read_observation_with_runtime(
-                &service,
-                &authority,
-                scope,
-                &runtime,
-                &bamboo_orchestration::patrol::Policy::default(),
-            )
-            .map_err(patrol_error);
+            return runtime
+                .read_observation(
+                    &service,
+                    &authority,
+                    scope,
+                    &bamboo_orchestration::patrol::Policy::default(),
+                )
+                .map_err(patrol_error);
         }
         host::read_observation(&service, &authority, scope).map_err(patrol_error)
     }
