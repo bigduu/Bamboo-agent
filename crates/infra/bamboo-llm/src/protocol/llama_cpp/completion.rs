@@ -11,6 +11,7 @@ use serde_json::{json, Value};
 use super::{tokenizer, GptOssPrompt, END, MESSAGE, START};
 
 const MODEL: &str = "gpt-oss-20b";
+const VOCAB_SIZE: u32 = 201_088;
 const CHANNEL: u32 = 200_005;
 const RETURN: u32 = 200_002;
 const FIRST_SPECIAL: u32 = 199_998;
@@ -152,7 +153,7 @@ impl GptOssLocalClient {
         // vocabulary as well, including the 20B versus 120B parameter class.
         if model.id != MODEL
             || model.owned_by != "llamacpp"
-            || model.meta.n_vocab != 201_088
+            || model.meta.n_vocab != VOCAB_SIZE
             || model.meta.n_embd != 2880
             || !(20_000_000_000..22_000_000_000).contains(&model.meta.n_params)
         {
@@ -199,7 +200,9 @@ impl PreparedCompletion {
         if completion.model != MODEL || !completion.stop {
             return Err(CompletionError::InvalidResponse);
         }
-        let tokens: Option<Vec<u32>> = serde_json::from_value(completion.tokens).ok();
+        let tokens = serde_json::from_value::<Vec<u32>>(completion.tokens)
+            .ok()
+            .filter(|ids| ids.iter().all(|&id| id < VOCAB_SIZE));
         let emitted = tokens.as_ref().map(|tokens| tokens.len() as u64);
         let reported = completion.tokens_predicted.as_u64();
         let exact_output =

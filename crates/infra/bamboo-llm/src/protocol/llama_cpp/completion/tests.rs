@@ -159,6 +159,7 @@ async fn advisory_output_and_accounting_are_validated_independently() {
     *tool_attempt.last_mut().unwrap() = 200_012;
     for (key, value, known, expected_count) in [
         ("tokens", json!("invalid frame"), true, None),
+        ("tokens", json!(vec![u32::MAX; 129]), true, Some(5)),
         ("tokens", json!(tool_attempt), true, None),
         ("tokens_predicted", Value::Null, false, None),
         ("tokens_predicted", json!(0), false, None),
