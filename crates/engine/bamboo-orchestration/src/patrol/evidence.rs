@@ -11,6 +11,8 @@ use serde::Serialize;
 pub const MAX_WORK_PATROL_EVIDENCE_BYTES: usize = 16 * 1024;
 pub const MAX_WORK_PATROL_EVIDENCE_REFS: usize = 8;
 const MAX_SOURCE_BYTES: usize = 8 * 1024;
+pub(super) const MAX_SOURCE_KEY_BYTES: usize = 512;
+pub(super) const MAX_SOURCE_VERSION_BYTES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -169,10 +171,9 @@ impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
             .get(hash)
             .ok_or(Error::IdempotencyConflict)?;
         if context.sources.len() + 2 > MAX_WORK_PATROL_EVIDENCE_REFS
-            || context
-                .sources
-                .iter()
-                .any(|(key, version)| key.len() > 512 || version.len() > 256)
+            || context.sources.iter().any(|(key, version)| {
+                key.len() > MAX_SOURCE_KEY_BYTES || version.len() > MAX_SOURCE_VERSION_BYTES
+            })
         {
             return Err(Error::ContextBudgetExceeded);
         }

@@ -9,6 +9,7 @@
 pub mod budget;
 pub mod checkpoint;
 pub mod delivery;
+pub mod diagnostic_input;
 pub mod evidence;
 pub mod host;
 pub mod program;
@@ -483,18 +484,7 @@ impl Patrol {
         .any(|n| *n == 0 || *n > 86_400_000)
             || !(1..=8).contains(&policy.max_diagnostic_attempts)
             || !(1..=8).contains(&policy.max_escalation_deliveries)
-            || model.as_ref().is_some_and(|m| {
-                !valid_id(&m.provider)
-                    || !valid_id(&m.model)
-                    || m.max_input_tokens == 0
-                    || m.max_output_tokens == 0
-                    || m.max_input_tokens > 32_768
-                    || m.max_output_tokens > 8_192
-                    || m.max_evidence_bytes == 0
-                    || m.max_evidence_bytes > 131_072
-                    || m.max_evidence_refs == 0
-                    || m.max_evidence_refs > 32
-            })
+            || model.as_ref().is_some_and(|model| !valid_model(model))
         {
             return Err(Error::InvalidConfiguration);
         }
@@ -1085,15 +1075,35 @@ fn validate_observation(o: &Observation, scope: &Scope, now: u64) -> Result<(), 
     Ok(())
 }
 
+fn valid_model(model: &Model) -> bool {
+    valid_id(&model.provider)
+        && valid_id(&model.model)
+        && (1..=32_768).contains(&model.max_input_tokens)
+        && (1..=8_192).contains(&model.max_output_tokens)
+        && (1..=131_072).contains(&model.max_evidence_bytes)
+        && (1..=32).contains(&model.max_evidence_refs)
+}
+
+fn valid_input_tokens(input_tokens: u32, model: &Model) -> bool {
+    (1..=model.max_input_tokens).contains(&input_tokens)
+}
+
 fn valid_input(input: &DiagnosticInput, model: &Model, o: &Observation, since: u64) -> bool {
+    valid_input_tokens(input.input_tokens, model) && valid_input_evidence(input, model, o, since)
+}
+
+fn valid_input_evidence(
+    input: &DiagnosticInput,
+    model: &Model,
+    o: &Observation,
+    since: u64,
+) -> bool {
     input.scope == o.scope
         && input.source_revision == o.source_revision
         && input.since_cursor == since
         && input.through_cursor == o.cursor
         && input.since_cursor <= input.through_cursor
         && !input.summary.is_empty()
-        && input.input_tokens > 0
-        && input.input_tokens <= model.max_input_tokens
         && input
             .summary
             .len()
