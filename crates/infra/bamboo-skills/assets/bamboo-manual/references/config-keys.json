@@ -25,7 +25,7 @@
     {
       "aliases": [],
       "default": 0.25,
-      "example": 0.25,
+      "example": 0.2,
       "key": "context_management.target_usage_ratio",
       "meaning": "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
       "section": "core",
@@ -34,7 +34,7 @@
     {
       "aliases": [],
       "default": 0.8,
-      "example": 0.8,
+      "example": 0.7,
       "key": "context_management.trigger_usage_ratio",
       "meaning": "Shared proactive trigger upper bound for every context strategy; runtime output/safety headroom can move the effective token boundary earlier.",
       "section": "core",

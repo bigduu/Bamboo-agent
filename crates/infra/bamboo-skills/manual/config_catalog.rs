@@ -120,10 +120,10 @@ pub fn entries() -> Vec<Entry> {
     entries.push(Entry { key: "context_management.strategy", kind: "enum", example: json!("retrieval_window"),
         meaning: "Context strategy; retrieval-window validation and history-tool requirements still apply.",
         aliases: &[], read: |c| json!(c.context_management.strategy), required_when: None });
-    entries.push(Entry { key: "context_management.trigger_usage_ratio", kind: "f64", example: json!(0.80),
+    entries.push(Entry { key: "context_management.trigger_usage_ratio", kind: "f64", example: json!(0.70),
         meaning: "Shared proactive trigger upper bound for every context strategy; runtime output/safety headroom can move the effective token boundary earlier.",
         aliases: &[], read: |c| json!(c.context_management.trigger_usage_ratio), required_when: None });
-    entries.push(Entry { key: "context_management.target_usage_ratio", kind: "f64", example: json!(0.25),
+    entries.push(Entry { key: "context_management.target_usage_ratio", kind: "f64", example: json!(0.20),
         meaning: "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
         aliases: &[], read: |c| json!(c.context_management.target_usage_ratio), required_when: None });
     entries.sort_by_key(|entry| entry.key);
