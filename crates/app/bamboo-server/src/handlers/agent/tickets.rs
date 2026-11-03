@@ -1,4 +1,5 @@
 //! Authenticated single-owner HTTP projections over the same Ticket service.
+pub mod patrol;
 pub mod ready_policy;
 pub mod sprints;
 pub mod token_budget;

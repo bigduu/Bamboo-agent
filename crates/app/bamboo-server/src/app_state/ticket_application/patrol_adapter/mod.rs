@@ -6,6 +6,7 @@ mod delivery;
 mod notice_evidence;
 mod program;
 mod runtime_observation;
+mod status;
 pub use checkpoint_store::PatrolCheckpointStore;
 
 use bamboo_orchestration::patrol::{host, Scope};
