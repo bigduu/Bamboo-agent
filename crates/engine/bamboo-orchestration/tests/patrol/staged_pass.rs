@@ -338,7 +338,7 @@ fn expired_staged_call_retains_the_original_receipt_until_late_usage_is_durable(
 mod calls {
     use std::{
         sync::{
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             Arc, Mutex,
         },
         time::Duration,
@@ -356,6 +356,8 @@ mod calls {
         release: Notify,
         sends: AtomicUsize,
         settlements: Mutex<Vec<(Reservation, Usage)>>,
+        settling: Notify,
+        hold_settle: AtomicBool,
     }
 
     struct Io {
@@ -388,6 +390,10 @@ mod calls {
                 .lock()
                 .unwrap()
                 .push((receipt.clone(), usage));
+            self.control.settling.notify_one();
+            if self.control.hold_settle.load(Ordering::SeqCst) {
+                std::future::pending::<()>().await;
+            }
             if self.fail_settle {
                 Err(PortError::Unavailable)
             } else {
@@ -603,5 +609,46 @@ mod calls {
                 output_tokens: Some(21)
             })
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_waits_for_observed_usage_and_preserves_failed_settlement_for_drain() {
+        let calls = Calls::default();
+        let (mut host, submission) = staged_operation();
+        let original = submission.reservation().clone();
+        let control = Arc::new(Controlled::default());
+        control.hold_settle.store(true, Ordering::SeqCst);
+        control.release.notify_one();
+        calls
+            .launch(
+                submission,
+                101,
+                Io {
+                    control: control.clone(),
+                    admitted: true,
+                    fail_settle: false,
+                    reply: Some(ProviderReply {
+                        diagnosis: None,
+                        exact_usage: None,
+                        observed_input_tokens: None,
+                        observed_output_tokens: Some(21),
+                    }),
+                },
+            )
+            .unwrap();
+        control.settling.notified().await;
+        assert!(!calls.needs_accounting());
+        calls.quiesce().await.unwrap();
+        assert!(calls.needs_accounting());
+        assert_eq!(calls.reconcile_accounting(&mut host), Ok(1));
+        assert!(!calls.needs_accounting());
+        assert_eq!(
+            host.durable.borrow().charges[&original.operation].settled,
+            Some(Usage::OverCap {
+                input_tokens: None,
+                output_tokens: Some(21),
+            })
+        );
+        assert_eq!(control.sends.load(Ordering::SeqCst), 1);
     }
 }
