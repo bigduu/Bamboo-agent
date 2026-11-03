@@ -1626,7 +1626,27 @@ async fn maybe_apply_summary_context_compression_with_budget(
         Some(budget),
         ledger_usage.tokens,
     );
-    let usage_percent = exposure.active_usage_percent;
+    // All strategies admit maintenance against the same complete request.
+    // This pure preflight includes schemas/native content without paid image
+    // transforms; reported exposure remains a conservative stale-usage floor.
+    let preflight = retrieval_window_preflight(
+        session,
+        config,
+        model_name,
+        tool_schemas,
+        llm,
+        budget,
+        &counter,
+    )
+    .await?;
+    let active_tokens = exposure.active_tokens.max(preflight.active_tokens);
+    let usage_percent =
+        exposure
+            .active_usage_percent
+            .max(bamboo_compression::context_window_usage_percent(
+                preflight.active_tokens,
+                budget.max_context_tokens,
+            ));
     let trigger_context_tokens = budget.compression_trigger_context_tokens();
     let auto_threshold = if budget.max_context_tokens > 0 {
         (trigger_context_tokens as f64 / budget.max_context_tokens as f64) * 100.0
@@ -1954,6 +1974,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
             projected_tokens,
             budget.max_context_tokens,
         );
+        plan.active_usage_before_percent = usage_percent;
         let changed = commit_message_summary_plan(session, config, &plan).await?;
         if changed > 0 {
             if let Some(output) = prepared_output {
@@ -2047,7 +2068,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
             CompressionTriggerType::Auto => "threshold",
         };
         let payload = HookPayload::Compression {
-            estimated_tokens: exposure.active_tokens,
+            estimated_tokens: active_tokens,
             usage_percent,
             max_context_tokens: budget.max_context_tokens,
             trigger_context_tokens,
@@ -2243,6 +2264,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
         projected_tokens,
         budget.max_context_tokens,
     );
+    plan.active_usage_before_percent = usage_percent;
     plan.summary_budget_clamped |= summary_report.budget_clamped;
     plan.summary_budget_clamp_reason = summary_report
         .budget_clamp_reason

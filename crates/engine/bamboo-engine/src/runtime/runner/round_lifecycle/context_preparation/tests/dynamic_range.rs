@@ -92,6 +92,93 @@ async fn shared_range_compresses_both_summary_modes_at_eighty_percent_during_wor
 }
 
 #[tokio::test]
+async fn shared_range_summary_trigger_includes_the_complete_provider_request() {
+    let _env = isolate_prompt_safe_env_cache();
+    let counter = TiktokenTokenCounter::default();
+    let repeated = |unit: &str, tokens: u32| {
+        let first = unit.repeat((tokens / counter.count_text(unit)) as usize);
+        let repeats = (first.len() / unit.len()) as u64 * u64::from(tokens)
+            / u64::from(counter.count_text(&first));
+        unit.repeat(repeats as usize + 1)
+    };
+    let schemas = [ToolSchema {
+        schema_type: "function".into(),
+        function: FunctionSchema {
+            name: "provider-footprint".into(),
+            description: repeated("mandatory tool argument detail ", 10_000),
+            parameters: serde_json::json!({"type":"object","properties":{}}),
+        },
+    }];
+    for strategy in [
+        ContextManagementStrategy::Summary,
+        ContextManagementStrategy::MessageSummary,
+    ] {
+        let id = format!("shared-range-provider-trigger-{strategy:?}");
+        let mut session = Session::new(&id, "test-model");
+        session.add_message(Message::system("system"));
+        session.add_message(Message::user("old requirement"));
+        session.add_message(Message::assistant(
+            repeated("compressible implementation evidence ", 75_000),
+            None,
+        ));
+        session.add_message(Message::user("recent requirement"));
+        session.add_message(Message::assistant("recent outcome", None));
+        session.add_message(Message::user("current requirement"));
+        let budget =
+            TokenBudget::with_safety_margin(100_000, 4_000, BudgetStrategy::default(), 1_000);
+        session.token_budget = Some(budget.clone());
+        let (provider, calls) = prompt_capture_llm();
+        let mut config = bounded_compression_config(Arc::clone(&provider));
+        config.context_management.strategy = strategy;
+        let preflight = super::super::retrieval_window_preflight(
+            &session,
+            &config,
+            "test-model",
+            &schemas,
+            &provider,
+            &budget,
+            &counter,
+        )
+        .await
+        .unwrap();
+        assert!(counter.count_messages(&session.messages) < 80_000);
+        assert!(preflight.active_tokens > 80_000);
+        let prepared = prepare_round_context(
+            &mut session,
+            &config,
+            "test-model",
+            &id,
+            &schemas,
+            &provider,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!calls.lock().unwrap().is_empty(), "strategy={strategy:?}");
+        assert!(session.messages.iter().any(|message| message.compressed));
+        let projected = super::super::super::stream_execution::project_request_usage(
+            &session,
+            &prepared.prepared_context,
+            &config,
+            &schemas,
+            "test-model",
+            &provider,
+        )
+        .await
+        .unwrap();
+        assert!(projected.input_tokens <= 25_000, "strategy={strategy:?}");
+        assert!(
+            session
+                .compression_events
+                .last()
+                .unwrap()
+                .usage_before_percent
+                >= 80.0
+        );
+    }
+}
+
+#[tokio::test]
 async fn shared_range_retrieval_receipt_uses_the_same_target_without_summary_calls() {
     let _env = isolate_prompt_safe_env_cache();
     let id = "shared-range-retrieval";

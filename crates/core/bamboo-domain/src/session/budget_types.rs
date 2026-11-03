@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Token budget configuration for a conversation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenBudget {
     /// Maximum context window size for the model (input + output)
     pub max_context_tokens: u32,
@@ -268,7 +268,7 @@ impl Default for TokenBudget {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetStrategy {
     Window {
