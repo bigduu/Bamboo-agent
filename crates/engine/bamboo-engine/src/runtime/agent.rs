@@ -407,8 +407,8 @@ impl Agent {
     ) -> crate::runtime::runner::Result<bool> {
         use crate::model_config_helper::{
             get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_gold_config,
-            resolve_live_image_fallback, resolve_provider_type, try_resolve_primary_model,
-            GOLD_CONFIG_METADATA_KEY,
+            resolve_live_image_fallback, resolve_provider_routing_key, resolve_provider_type,
+            try_resolve_primary_model, GOLD_CONFIG_METADATA_KEY,
         };
         use crate::runtime::config::AgentLoopConfig;
         use crate::runtime::runner::image_fallback;
@@ -417,12 +417,16 @@ impl Agent {
         use bamboo_agent_core::AgentError;
 
         let config = self.runtime.config.read().await.clone();
-        let default_provider = config.effective_default_provider();
+        let default_provider =
+            resolve_provider_routing_key(&config, config.effective_default_provider(), registry);
         let (target, model, _) = resolve_execution_model(
             session,
             &ExecuteInput::default(),
             &ExecutionConfigSnapshot {
-                default_model: get_default_model_for_provider(&config, default_provider).ok(),
+                default_model: default_provider
+                    .as_ref()
+                    .ok()
+                    .and_then(|key| get_default_model_for_provider(&config, key).ok()),
                 default_model_ref: config
                     .defaults
                     .as_ref()
@@ -440,7 +444,7 @@ impl Agent {
                 ));
             }
             None => bamboo_domain::ProviderModelRef::new(
-                default_provider,
+                default_provider.map_err(|error| AgentError::LLM(error.to_string()))?,
                 model
                     .ok_or_else(|| AgentError::LLM("A model is required for compaction".into()))?,
             ),
