@@ -8,6 +8,7 @@ use bamboo_agent_core::{AgentError, Message};
 use bamboo_llm::{LLMProvider, ResolvedModel};
 
 mod attachment_urls;
+pub(crate) use attachment_urls::parse_bamboo_attachment_url;
 mod input_references;
 #[cfg(test)]
 pub(crate) use input_references::conversation_image_reference;

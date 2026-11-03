@@ -375,6 +375,7 @@ async fn exec_handles_survive_both_summary_strategies_and_reach_actual_provider(
                 None,
                 "continuity-test",
                 None,
+                None,
             )
             .await
             .unwrap());
@@ -385,13 +386,14 @@ async fn exec_handles_survive_both_summary_strategies_and_reach_actual_provider(
                 .unwrap();
             assert!(stored_result.compressed);
             assert_eq!(stored_result.content, result.to_string());
-            assert_eq!(
+            assert!(
                 session
                     .compression_events
                     .last()
                     .unwrap()
-                    .fixed_prompt_tokens,
-                block_tokens
+                    .fixed_prompt_tokens
+                    >= block_tokens,
+                "fixed prompt reserve includes exec handles and the complete provider frame"
             );
             if strategy == ContextManagementStrategy::MessageSummary {
                 let sent = serde_json::to_string(&*summary_requests.lock().unwrap()).unwrap();

@@ -168,12 +168,20 @@ async fn resolve_token_budget_with_model_limits_path(
     // model defaults.
     if let Some(ref budget) = session.token_budget {
         tracing::debug!("Using session-specific token budget");
-        return budget.clone();
+        let resolved = config
+            .context_management
+            .apply_compression_policy(budget.clone());
+        session.resolved_token_budget = Some((model_name.to_string(), resolved.clone()));
+        return resolved;
     }
 
     if let Some(ref budget) = config.token_budget {
         tracing::debug!("Using config token budget");
-        return budget.clone();
+        let resolved = config
+            .context_management
+            .apply_compression_policy(budget.clone());
+        session.resolved_token_budget = Some((model_name.to_string(), resolved.clone()));
+        return resolved;
     }
 
     // Resolve each source independently so an exact lower-priority provider
@@ -208,12 +216,15 @@ async fn resolve_token_budget_with_model_limits_path(
         );
     }
 
-    let resolved = TokenBudget::with_safety_margin(
-        model_limit.max_context_tokens,
-        model_limit.get_max_output_tokens(),
-        bamboo_compression::BudgetStrategy::default(),
-        model_limit.get_safety_margin(),
-    );
+    let resolved =
+        config
+            .context_management
+            .apply_compression_policy(TokenBudget::with_safety_margin(
+                model_limit.max_context_tokens,
+                model_limit.get_max_output_tokens(),
+                bamboo_compression::BudgetStrategy::default(),
+                model_limit.get_safety_margin(),
+            ));
 
     // Publish the freshly resolved budget on the session so every downstream
     // reader in this round — `build_context_pressure` (tool-output truncation),

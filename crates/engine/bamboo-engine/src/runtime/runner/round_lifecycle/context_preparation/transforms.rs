@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::runtime::config::AgentLoopConfig;
+use crate::runtime::config::{AgentLoopConfig, ImageFallbackMode};
 use bamboo_agent_core::{AgentError, Message, Role};
 use bamboo_compression::PreparedContext;
 use bamboo_llm::LLMProvider;
@@ -9,6 +9,47 @@ use bamboo_llm::LLMProvider;
 use super::super::super::image_fallback::{
     apply_image_fallback_to_llm_messages, resolve_bamboo_attachments_for_llm,
 };
+
+pub(super) enum ImageProjection {
+    Native,
+    Nonvision,
+    LegacyFallback(ImageFallbackMode),
+}
+
+impl ImageProjection {
+    pub(super) fn keeps_native_images(self) -> bool {
+        match self {
+            Self::Native => true,
+            Self::LegacyFallback(ImageFallbackMode::Ocr) => !cfg!(windows),
+            Self::Nonvision | Self::LegacyFallback(_) => false,
+        }
+    }
+}
+
+pub(super) async fn image_projection(
+    config: &AgentLoopConfig,
+    llm: &dyn LLMProvider,
+    model_name: &str,
+) -> ImageProjection {
+    if !llm.supports_vision(model_name).await {
+        return ImageProjection::Nonvision;
+    }
+    // Explicit Vision support bypasses the separately configured legacy hook.
+    if let Some(fallback) = config.image_fallback.as_ref() {
+        if llm.vision_support_override(model_name).await != Some(true) {
+            return ImageProjection::LegacyFallback(fallback.mode);
+        }
+    }
+    ImageProjection::Native
+}
+
+pub(super) fn has_image_parts(message: &Message) -> bool {
+    message.content_parts.as_ref().is_some_and(|parts| {
+        parts
+            .iter()
+            .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
+    })
+}
 
 pub(super) async fn apply_message_transforms(
     config: &AgentLoopConfig,
@@ -18,29 +59,23 @@ pub(super) async fn apply_message_transforms(
     model_name: &str,
 ) -> Result<(), AgentError> {
     normalize_tool_chains(&mut prepared_context.messages, session_id);
-    if !llm.supports_vision(model_name).await {
-        let has_images = prepared_context.messages.iter().any(|message| {
-            message.content_parts.as_ref().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
-            })
-        });
-        if has_images && config.vision_model_resolver.is_none() {
-            return Err(AgentError::LLM(
-                super::super::super::image_fallback::VISION_CONFIGURATION_ERROR.into(),
-            ));
+    match image_projection(config, llm.as_ref(), model_name).await {
+        ImageProjection::Nonvision => {
+            let has_images = prepared_context.messages.iter().any(has_image_parts);
+            if has_images && config.vision_model_resolver.is_none() {
+                return Err(AgentError::LLM(
+                    super::super::super::image_fallback::VISION_CONFIGURATION_ERROR.into(),
+                ));
+            }
+            super::super::super::image_fallback::project_nonvision_images(
+                &mut prepared_context.messages,
+                session_id,
+            );
         }
-        super::super::super::image_fallback::project_nonvision_images(
-            &mut prepared_context.messages,
-            session_id,
-        );
-    } else if llm.vision_support_override(model_name).await != Some(true) {
-        // Vision remains enabled by default. Preserve a legacy fallback only
-        // when the user independently opted into that transform; it is not a
-        // declaration that this model lacks Vision. Explicit support sends the
-        // native image parts without rewriting them.
-        apply_image_fallback(config, prepared_context, llm).await?;
+        ImageProjection::LegacyFallback(_) => {
+            apply_image_fallback(config, prepared_context, llm).await?;
+        }
+        ImageProjection::Native => {}
     }
     resolve_attachments(config, prepared_context).await?;
     Ok(())
@@ -140,13 +175,7 @@ async fn apply_image_fallback(
     // LLM context only. This must never mutate the persisted session messages
     // (UI should still show images).
     if let Some(mut fallback) = config.image_fallback.clone() {
-        let has_images = prepared_context.messages.iter().any(|message| {
-            message.content_parts.as_ref().is_some_and(|parts| {
-                parts
-                    .iter()
-                    .any(|part| matches!(part, bamboo_domain::MessagePart::ImageUrl { .. }))
-            })
-        });
+        let has_images = prepared_context.messages.iter().any(has_image_parts);
         let target = if has_images
             && fallback.mode == crate::ImageFallbackMode::Vision
             && config.legacy_vision_model_resolver.is_some()

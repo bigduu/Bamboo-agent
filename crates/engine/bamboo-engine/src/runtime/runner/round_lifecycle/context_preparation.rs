@@ -13,11 +13,10 @@ use bamboo_agent_core::{
 };
 use bamboo_compression::{
     active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan_with_trigger,
-    build_forced_compression_candidate_plan_with_fixed_tokens,
-    build_message_summary_candidate_plan_with_fixed_tokens,
+    build_forced_compression_candidate_plan_with_input_costs,
+    build_message_summary_candidate_plan_with_input_costs,
     build_retrieval_window_candidate_plan_with_token_accounting,
     build_retrieval_window_critical_overflow_plan_with_token_accounting,
-    effective_retrieval_window_target_tokens,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
     prepare_hybrid_context_with_fixed_tokens, CompressionPlan, CompressionPlanError,
@@ -844,7 +843,11 @@ fn estimate_inline_original_image_patches(url: &str) -> Option<u32> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded_prefix)
         .ok()?;
-    let size = imagesize::blob_size(&bytes).ok()?;
+    estimate_original_image_patches(&bytes)
+}
+
+fn estimate_original_image_patches(bytes: &[u8]) -> Option<u32> {
+    let size = imagesize::blob_size(bytes).ok()?;
     if size.width == 0 || size.height == 0 {
         return None;
     }
@@ -853,6 +856,62 @@ fn estimate_inline_original_image_patches(url: &str) -> Option<u32> {
         .div_ceil(ORIGINAL_IMAGE_PATCH_SIZE)
         .saturating_mul(size.height.div_ceil(ORIGINAL_IMAGE_PATCH_SIZE));
     Some(patches.min(ORIGINAL_IMAGE_MAX_PATCHES as usize) as u32)
+}
+
+struct StoredOriginalImage<'a> {
+    message_id: &'a str,
+    session_id: &'a str,
+    attachment_id: &'a str,
+}
+
+async fn summary_native_image_costs<'a>(
+    session: &'a Session,
+    config: &AgentLoopConfig,
+    llm: &dyn LLMProvider,
+    model_name: &str,
+    counter: &dyn TokenCounter,
+) -> (HashMap<&'a str, u32>, Vec<StoredOriginalImage<'a>>) {
+    let image_messages = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed && transforms::has_image_parts(message))
+        .collect::<Vec<_>>();
+    let mut costs = HashMap::<&str, u32>::new();
+    let mut stored_originals = Vec::new();
+    if image_messages.is_empty()
+        || !transforms::image_projection(config, llm, model_name)
+            .await
+            .keeps_native_images()
+    {
+        return (costs, stored_originals);
+    }
+    for message in image_messages {
+        let id = message.id.as_str();
+        let extra_tokens = provider_prepared_message_tokens(message, counter)
+            .saturating_sub(counter.count_message(message));
+        costs.insert(id, extra_tokens);
+        if config.attachment_reader.is_none() {
+            continue;
+        }
+        for part in message.content_parts.iter().flatten() {
+            let MessagePart::ImageUrl { image_url } = part else {
+                continue;
+            };
+            if image_url.detail.as_deref() != Some("original") {
+                continue;
+            }
+            if let Some((session_id, attachment_id)) =
+                super::super::image_fallback::parse_bamboo_attachment_url(&image_url.url)
+            {
+                stored_originals.push(StoredOriginalImage {
+                    message_id: id,
+                    session_id,
+                    attachment_id,
+                });
+            }
+        }
+    }
+    (costs, stored_originals)
 }
 
 fn late_bound_tool_schema_reserve(
@@ -1100,25 +1159,27 @@ async fn build_retrieval_window_accounting_frame(
 }
 
 fn retrieval_window_trigger_tokens(config: &AgentLoopConfig, budget: &TokenBudget) -> u32 {
-    let configured_trigger = (f64::from(budget.max_context_tokens)
-        * config
-            .context_management
-            .retrieval_window
-            .trigger_usage_ratio)
-        .floor() as u32;
-    let capped_trigger = configured_trigger
-        .min(budget.max_request_input_tokens())
-        .max(1);
-    let target_tokens = effective_retrieval_window_target_tokens(
-        budget,
-        config.context_management.retrieval_target_usage_percent(),
-    );
+    config
+        .context_management
+        .apply_compression_policy(budget.clone())
+        .compression_thresholds()
+        .trigger_tokens
+}
 
-    // A provider request-input cap or integer rounding can collapse two valid
-    // configured ratios onto the same token count. Route the first archive at
-    // least one token above the planner target so an exactly-at-limit request
-    // remains dispatchable instead of failing with TargetAlreadySatisfied.
-    capped_trigger.max(target_tokens.saturating_add(1))
+fn ensure_compression_range(budget: &TokenBudget) -> Result<(), AgentError> {
+    let range = budget.compression_thresholds();
+    if range.target_usage_percent == 0
+        || range.target_tokens == 0
+        || range.target_tokens >= range.trigger_tokens
+        || range.trigger_tokens >= range.input_limit
+    {
+        return Err(AgentError::Budget(format!(
+            "context compression range is infeasible: context={}, input_limit={}, headroom={}, trigger={}, target={}",
+            budget.max_context_tokens, range.input_limit, range.headroom,
+            range.trigger_tokens, range.target_tokens,
+        )));
+    }
+    Ok(())
 }
 
 fn retrieval_window_fallback_is_summary(config: &AgentLoopConfig) -> bool {
@@ -1139,6 +1200,12 @@ async fn maybe_prepare_retrieval_window_context(
     trigger_type: CompressionTriggerType,
     manual_archive_request: Option<&ResponseOccurrence>,
 ) -> Result<RetrievalWindowPreparationOutcome, AgentError> {
+    let budget = config
+        .context_management
+        .apply_compression_policy(budget.clone());
+    let budget = &budget;
+    ensure_compression_range(budget)?;
+    let range = budget.compression_thresholds();
     // A retrieval boundary cannot be layered on top of summary-owned history.
     // This is a permanent precondition failure for this specific manual call,
     // even when summary fallback is explicitly allowed for other routes. Consume
@@ -1170,10 +1237,7 @@ async fn maybe_prepare_retrieval_window_context(
 
     let counter = TiktokenTokenCounter::default();
     let trigger_tokens = retrieval_window_trigger_tokens(config, budget);
-    let target_tokens = effective_retrieval_window_target_tokens(
-        budget,
-        config.context_management.retrieval_target_usage_percent(),
-    );
+    let target_tokens = range.target_tokens;
     let forced = trigger_type != CompressionTriggerType::Auto;
     let critical_overflow = matches!(&trigger_type, CompressionTriggerType::CriticalOverflow);
     let preflight = retrieval_window_preflight(
@@ -1201,7 +1265,7 @@ async fn maybe_prepare_retrieval_window_context(
             .context_management
             .retrieval_window
             .min_recent_user_turns,
-        target_usage_percent: config.context_management.retrieval_target_usage_percent(),
+        target_usage_percent: range.target_usage_percent,
     };
     let mut candidate_base = session.clone();
 
@@ -1470,6 +1534,128 @@ async fn maybe_prepare_retrieval_window_context(
     unreachable!("bounded retrieval-window checkpoint loop must return")
 }
 
+/// Count provider-visible fixed cost after the same reset a summary commits.
+/// Keeping only System rows in this projection avoids charging archiveable history
+/// as fixed, while the provider seam still includes tools and runtime capsules.
+#[allow(clippy::too_many_arguments)]
+async fn summary_boundary_fixed_tokens(
+    session: &Session,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+) -> Result<u32, AgentError> {
+    let mut staged = Box::new(session.clone());
+    staged.reset_model_context_epoch(ModelContextResetReason::Compression);
+    staged
+        .metadata
+        .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    staged.conversation_summary = None;
+    staged
+        .messages
+        .retain(|message| message.role == Role::System && !message.compressed);
+    let prepared = all_active_prepared_context(&staged, budget, counter);
+    let projected = super::stream_execution::project_request_usage(
+        &staged,
+        &prepared,
+        config,
+        tool_schemas,
+        model_name,
+        llm,
+    )
+    .await?;
+    let late_bound = late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, counter)?;
+    let boundary_block = build_history_boundary_reservation_context_block();
+    let boundary = bamboo_domain::render_model_context_snapshot(
+        &format!("ctx_{}", "0".repeat(64)),
+        u64::MAX,
+        u64::MAX,
+        &boundary_block,
+        u64::MAX,
+        Some(u64::MAX),
+    );
+    let boundary_reserve = counter
+        .count_message(&Message::user(boundary))
+        .saturating_sub(projected.history_boundary_input_tokens);
+    Ok(projected
+        .input_tokens
+        .saturating_sub(counter.count_messages(&prepared.messages))
+        .saturating_add(late_bound)
+        .saturating_add(boundary_reserve))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn projected_summary_request_tokens(
+    session: &Session,
+    plan: &CompressionPlan,
+    config: &AgentLoopConfig,
+    model_name: &str,
+    session_id: &str,
+    tool_schemas: &[ToolSchema],
+    llm: &Arc<dyn LLMProvider>,
+    budget: &TokenBudget,
+    counter: &dyn TokenCounter,
+) -> Result<(u32, PreparedContext), AgentError> {
+    let mut staged = Box::new(session.clone());
+    apply_compression_plan(&mut staged, plan.clone());
+    staged
+        .metadata
+        .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    let ledger = enforce_model_context_ledger_retention(&mut staged, budget, counter);
+    let mut prepared =
+        prepare_hybrid_context_with_fixed_tokens(&staged, budget, counter, ledger.tokens)
+            .map_err(|error| AgentError::Budget(error.to_string()))?;
+    transforms::apply_message_transforms(config, &mut prepared, llm, session_id, model_name)
+        .await?;
+    let projected = super::stream_execution::project_request_usage(
+        &staged,
+        &prepared,
+        config,
+        tool_schemas,
+        model_name,
+        llm,
+    )
+    .await?;
+    let late_bound = late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, counter)?;
+    let native_delta = prepared.messages.iter().fold(0u32, |total, message| {
+        total.saturating_add(
+            provider_prepared_message_tokens(message, counter)
+                .saturating_sub(counter.count_message(message)),
+        )
+    });
+    prepared.token_usage.window_tokens = prepared
+        .token_usage
+        .window_tokens
+        .saturating_add(native_delta);
+    prepared.token_usage.total_tokens = prepared
+        .token_usage
+        .total_tokens
+        .saturating_add(native_delta);
+    Ok((
+        projected
+            .input_tokens
+            .saturating_add(late_bound)
+            .saturating_add(native_delta),
+        prepared,
+    ))
+}
+
+fn summary_prepared_provider_state(session: &Session) -> Result<serde_json::Value, AgentError> {
+    let mut state = serde_json::to_value(session).map_err(|error| {
+        AgentError::Budget(format!("cannot snapshot prepared summary state: {error}"))
+    })?;
+    // These fields record UI/usage bookkeeping; all transcript, authority,
+    // runtime-context and provider replay fields remain in the comparison.
+    if let Some(object) = state.as_object_mut() {
+        for key in ["updated_at", "token_usage", "prompt_snapshot"] {
+            object.remove(key);
+        }
+    }
+    Ok(state)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maybe_apply_summary_context_compression_with_budget(
     session: &mut Session,
@@ -1482,7 +1668,14 @@ async fn maybe_apply_summary_context_compression_with_budget(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
     forced_trigger_type: Option<CompressionTriggerType>,
+    prepared_output: Option<&mut Option<PreparedContext>>,
 ) -> Result<bool, AgentError> {
+    let budget = config
+        .context_management
+        .apply_compression_policy(budget.clone());
+    let budget = &budget;
+    ensure_compression_range(budget)?;
+    let range = budget.compression_thresholds();
     let message_summary =
         config.context_management.strategy == ContextManagementStrategy::MessageSummary;
     let counter = TiktokenTokenCounter::default();
@@ -1493,7 +1686,27 @@ async fn maybe_apply_summary_context_compression_with_budget(
         Some(budget),
         ledger_usage.tokens,
     );
-    let usage_percent = exposure.active_usage_percent;
+    // All strategies admit maintenance against the same complete request.
+    // This pure preflight includes schemas/native content without paid image
+    // transforms; reported exposure remains a conservative stale-usage floor.
+    let preflight = retrieval_window_preflight(
+        session,
+        config,
+        model_name,
+        tool_schemas,
+        llm,
+        budget,
+        &counter,
+    )
+    .await?;
+    let active_tokens = exposure.active_tokens.max(preflight.active_tokens);
+    let usage_percent =
+        exposure
+            .active_usage_percent
+            .max(bamboo_compression::context_window_usage_percent(
+                preflight.active_tokens,
+                budget.max_context_tokens,
+            ));
     let trigger_context_tokens = budget.compression_trigger_context_tokens();
     let auto_threshold = if budget.max_context_tokens > 0 {
         (trigger_context_tokens as f64 / budget.max_context_tokens as f64) * 100.0
@@ -1520,56 +1733,107 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(false);
     }
 
-    // Defer auto-triggered compression when active execution tasks are running
-    // and context pressure is only moderately above the trigger (within a buffer
-    // zone). Critical overflow and manual requests always proceed.
-    let deferral_buffer_tokens: u32 = 10_000;
-    if host_auto_requested
-        && !critical_fallback_requested
-        && !manual_requested
-        && !forced_requested
+    let legacy_vision_images = config
+        .image_fallback
+        .as_ref()
+        .is_some_and(|fallback| fallback.mode == crate::ImageFallbackMode::Vision)
         && session
-            .task_list
-            .as_ref()
-            .is_some_and(|tl| tl.has_active_execution_tasks())
+            .messages
+            .iter()
+            .filter(|message| !message.compressed)
+            .any(transforms::has_image_parts);
+    if prepared_output.is_none()
+        && legacy_vision_images
+        && llm.supports_vision(model_name).await
+        && llm.vision_support_override(model_name).await != Some(true)
     {
-        let trigger_tokens = budget.compression_trigger_context_tokens();
-        let buffered_trigger = trigger_tokens.saturating_add(deferral_buffer_tokens);
-        let active_tokens = exposure.active_tokens;
-        if active_tokens <= buffered_trigger {
-            tracing::debug!(
-                "[{}] {} auto-compression deferred: active execution tasks running, usage within buffer zone ({:.1}% < trigger+buffer)",
-                session_id, phase_label, usage_percent
-            );
-            return Ok(false);
-        }
+        session
+            .force_manual_compression
+            .get_or_insert_with(String::new);
+        emit_context_compression_status(event_tx, phase_label, "deferred_vision_transform").await;
+        // Overflow recovery may retry through pre-turn preparation, which now
+        // owns the sole paid transform and can reuse it for actual dispatch.
+        return Ok(matches!(
+            forced_trigger_type.as_ref(),
+            Some(CompressionTriggerType::CriticalOverflow)
+        ));
     }
 
+    // Running tasks do not postpone maintenance past the shared trigger.
+    // Message/tool protocol completeness is still checked by the planner.
+    tracing::debug!(
+        session_id,
+        phase_label,
+        input_limit = range.input_limit,
+        headroom = range.headroom,
+        trigger_tokens = range.trigger_tokens,
+        target_tokens = range.target_tokens,
+        "Resolved shared dynamic context compression range"
+    );
+
+    // Cheap estimates cannot attest a paid legacy rewrite or provider-native
+    // replay. Those paths use the complete staged projection below instead.
+    let cheap_shortcuts = !legacy_vision_images && session.provider_transcript.groups().is_empty();
+    let native_delta = active_messages_for_budget(session)
+        .iter()
+        .fold(0u32, |total, message| {
+            total.saturating_add(
+                provider_prepared_message_tokens(message, &counter)
+                    .saturating_sub(counter.count_message(message)),
+            )
+        });
     // For auto-triggered (non-critical, non-manual) compression, try lightweight
     // prompt section degradation first. If a section can be stripped, skip the
     // expensive LLM summarization pass entirely.
     if !message_summary
+        && cheap_shortcuts
         && host_auto_requested
         && !critical_fallback_requested
         && !manual_requested
         && !forced_requested
     {
         if let Some(degraded) = degrade_prompt_context_sections_for_overflow(session) {
+            let after = estimate_context_compression_exposure_with_fixed_tokens(
+                session,
+                model_name,
+                Some(budget),
+                ledger_usage.tokens,
+            );
             tracing::info!(
-                "[{}] {} pre-summarization degradation stripped: {}, skipping LLM summarization",
                 session_id,
                 phase_label,
                 degraded,
+                active_tokens = after.active_tokens,
+                target_tokens = range.target_tokens,
+                "Pre-summarization degradation checked against shared target"
             );
-            emit_context_compression_status(event_tx, phase_label, "degraded_sections").await;
-            return Ok(true);
+            let fixed = summary_boundary_fixed_tokens(
+                session,
+                config,
+                model_name,
+                tool_schemas,
+                llm,
+                budget,
+                &counter,
+            )
+            .await?;
+            if after
+                .active_tokens
+                .saturating_add(native_delta)
+                .saturating_add(fixed)
+                <= range.target_tokens
+            {
+                emit_context_compression_status(event_tx, phase_label, "degraded_sections").await;
+                return Ok(true);
+            }
         }
     }
 
     // Microcompact-first: estimate how many tokens prompt cache compaction would save.
-    // If projected usage drops below the trigger threshold, skip LLM summarization —
-    // the cheaper prompt-side compaction in prepare_hybrid_context will handle it.
+    // Only skip the model when prompt-side compaction reaches the shared target.
+    // Merely falling below the trigger would leave the context near capacity.
     if !message_summary
+        && cheap_shortcuts
         && host_auto_requested
         && !critical_fallback_requested
         && !manual_requested
@@ -1588,16 +1852,30 @@ async fn maybe_apply_summary_context_compression_with_budget(
             ledger_usage.tokens,
         );
         if savings > 0 {
-            let projected = exposure.active_tokens.saturating_sub(savings);
+            let fixed = summary_boundary_fixed_tokens(
+                session,
+                config,
+                model_name,
+                tool_schemas,
+                llm,
+                budget,
+                &counter,
+            )
+            .await?;
+            let projected = exposure
+                .active_tokens
+                .saturating_sub(savings)
+                .saturating_add(native_delta)
+                .saturating_add(fixed);
             let projected_pct = if budget.max_context_tokens > 0 {
                 (projected as f64 / budget.max_context_tokens as f64) * 100.0
             } else {
                 0.0
             };
-            if projected_pct < auto_threshold {
+            if projected <= range.target_tokens {
                 tracing::info!(
-                    "[{}] {} microcompact-first: skipping LLM summarization, prompt cache saves {} tokens (projected {:.1}% < trigger {:.1}%)",
-                    session_id, phase_label, savings, projected_pct, auto_threshold
+                    "[{}] {} microcompact-first: skipping LLM summarization, prompt cache saves {} tokens (projected {:.1}%, target_tokens={})",
+                    session_id, phase_label, savings, projected_pct, range.target_tokens
                 );
                 return Ok(false);
             }
@@ -1650,20 +1928,87 @@ async fn maybe_apply_summary_context_compression_with_budget(
             )
             .map(|block| counter.count_message(&block.render_runtime_context_message()))
             .unwrap_or(0),
+        )
+        .max(
+            summary_boundary_fixed_tokens(
+                session,
+                config,
+                model_name,
+                tool_schemas,
+                llm,
+                budget,
+                &counter,
+            )
+            .await?,
         );
+    let (mut input_costs, stored_originals) =
+        summary_native_image_costs(session, config, llm.as_ref(), model_name, &counter).await;
     let build_candidate = if message_summary {
-        build_message_summary_candidate_plan_with_fixed_tokens
+        build_message_summary_candidate_plan_with_input_costs
     } else {
-        build_forced_compression_candidate_plan_with_fixed_tokens
+        build_forced_compression_candidate_plan_with_input_costs
     };
-    let candidate = match build_candidate(
-        session,
-        model_name,
-        Some(budget),
-        config.summary_target_ratio,
-        trigger_type_clone,
-        additional_fixed_tokens,
-    ) {
+    let plan_candidate = |input_costs: &HashMap<&str, u32>| {
+        build_candidate(
+            session,
+            model_name,
+            Some(budget),
+            config.summary_target_ratio,
+            trigger_type_clone.clone(),
+            additional_fixed_tokens,
+            input_costs,
+        )
+    };
+    let mut candidate = plan_candidate(&input_costs);
+    let can_refine_originals = !stored_originals.is_empty()
+        && matches!(
+            candidate,
+            Err(CompressionPlanError::ProtectedContentExceedsTarget { .. })
+        );
+    if let Some(reader) = config
+        .attachment_reader
+        .as_deref()
+        .filter(|_| can_refine_originals)
+    {
+        // Try without the unknown stored-image costs to find the rows that
+        // would survive. The draft is used only to select local reads.
+        let mut draft_costs = input_costs.clone();
+        for original in &stored_originals {
+            let tokens = draft_costs.entry(original.message_id).or_default();
+            *tokens = tokens.saturating_sub(ORIGINAL_IMAGE_MAX_PATCHES);
+        }
+        if let Ok(archived) = plan_candidate(&draft_costs).map(|draft| {
+            draft
+                .compressed_message_ids
+                .into_iter()
+                .collect::<HashSet<_>>()
+        }) {
+            for original in stored_originals {
+                if archived.contains(original.message_id) {
+                    continue;
+                }
+                let Ok(Some((bytes, mime))) = reader
+                    .read_attachment(original.session_id, original.attachment_id)
+                    .await
+                else {
+                    continue;
+                };
+                if mime.starts_with("image/") {
+                    let prefix_len = bytes
+                        .len()
+                        .min(MAX_INLINE_IMAGE_HEADER_BASE64_BYTES / 4 * 3);
+                    if let Some(patches) = estimate_original_image_patches(&bytes[..prefix_len]) {
+                        let tokens = input_costs.entry(original.message_id).or_default();
+                        *tokens = tokens
+                            .saturating_sub(ORIGINAL_IMAGE_MAX_PATCHES)
+                            .saturating_add(patches);
+                    }
+                }
+            }
+            candidate = plan_candidate(&input_costs);
+        }
+    }
+    let candidate = match candidate {
         Ok(candidate) => candidate,
         Err(CompressionPlanError::MessageSummaryToolProtocol { reason }) => {
             tracing::debug!(
@@ -1705,8 +2050,45 @@ async fn maybe_apply_summary_context_compression_with_budget(
         let mut plan = finalize_compression_candidate_plan(session, candidate, summary)
             .map_err(|error| AgentError::Budget(error.to_string()))?;
         plan.logical_pass_id = Some(logical_pass_id);
+        let projected_tokens = projected_summary_request_tokens(
+            session,
+            &plan,
+            config,
+            model_name,
+            session_id,
+            tool_schemas,
+            llm,
+            budget,
+            &counter,
+        )
+        .await;
+        let (projected_tokens, prepared_context) = match projected_tokens {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                emit_context_compression_status(
+                    event_tx,
+                    phase_label,
+                    &format!("failed_postcondition:{error}"),
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        if projected_tokens > range.target_tokens {
+            emit_context_compression_status(event_tx, phase_label,
+                &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
+            return Ok(false);
+        }
+        plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
+            projected_tokens,
+            budget.max_context_tokens,
+        );
+        plan.active_usage_before_percent = usage_percent;
         let changed = commit_message_summary_plan(session, config, &plan).await?;
         if changed > 0 {
+            if let Some(output) = prepared_output {
+                *output = Some(prepared_context);
+            }
             emit_context_compression_status(event_tx, phase_label, "completed").await;
             let tokens_saved = archived_message_tokens_saved(session, &plan);
             let trigger_label = match &plan.trigger_type {
@@ -1795,7 +2177,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
             CompressionTriggerType::Auto => "threshold",
         };
         let payload = HookPayload::Compression {
-            estimated_tokens: exposure.active_tokens,
+            estimated_tokens: active_tokens,
             usage_percent,
             max_context_tokens: budget.max_context_tokens,
             trigger_context_tokens,
@@ -1951,8 +2333,51 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 return Ok(false);
             }
         };
-    plan.summary_budget_clamped = summary_report.budget_clamped;
-    plan.summary_budget_clamp_reason = summary_report.budget_clamp_reason;
+    let projected_tokens = projected_summary_request_tokens(
+        session,
+        &plan,
+        config,
+        model_name,
+        session_id,
+        tool_schemas,
+        llm,
+        budget,
+        &counter,
+    )
+    .await;
+    let (projected_tokens, prepared_context) = match projected_tokens {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            emit_context_compression_status(
+                event_tx,
+                phase_label,
+                &format!("failed_postcondition:{error}"),
+            )
+            .await;
+            return Err(error);
+        }
+    };
+    if projected_tokens > range.target_tokens {
+        tracing::warn!(
+            session_id,
+            phase_label,
+            projected_tokens,
+            target_tokens = range.target_tokens,
+            "Summary leaves the complete provider request above its compression target"
+        );
+        emit_context_compression_status(event_tx, phase_label,
+            &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
+        return Ok(false);
+    }
+    plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
+        projected_tokens,
+        budget.max_context_tokens,
+    );
+    plan.active_usage_before_percent = usage_percent;
+    plan.summary_budget_clamped |= summary_report.budget_clamped;
+    plan.summary_budget_clamp_reason = summary_report
+        .budget_clamp_reason
+        .or(plan.summary_budget_clamp_reason);
     plan.summarization_map_calls = summary_report.map_calls;
     plan.summarization_reduce_calls = summary_report.reduce_calls;
     plan.summarization_fallback_used = summary_report.fallback_used;
@@ -1986,6 +2411,10 @@ async fn maybe_apply_summary_context_compression_with_budget(
     }
 
     if let Some(persistence) = config.persistence.as_ref().filter(|_| !message_summary) {
+        let expected = prepared_output
+            .as_ref()
+            .map(|_| summary_prepared_provider_state(session))
+            .transpose()?;
         if let Err(error) = persistence.save_runtime_session(session).await {
             tracing::warn!(
                 "[{}] Failed to persist forced context compression result: {}",
@@ -1993,6 +2422,17 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 error
             );
         }
+        if expected.is_some_and(|before| {
+            summary_prepared_provider_state(session).map_or(true, |after| before != after)
+        }) {
+            emit_context_compression_status(event_tx, phase_label,
+                "failed_postcondition:prepared summary became stale during persistence; retry with admitted context").await;
+            return Err(AgentError::Budget(
+                "prepared summary became stale during persistence; adopted context retained, provider request not sent".into()));
+        }
+    }
+    if let Some(output) = prepared_output {
+        *output = Some(prepared_context);
     }
 
     tracing::info!(
@@ -2241,6 +2681,7 @@ pub(super) async fn maybe_apply_host_context_compression(
             event_tx,
             phase_label,
             None,
+            None,
         )
         .await?;
         if !applied {
@@ -2264,6 +2705,7 @@ pub(super) async fn maybe_apply_host_context_compression(
         &budget,
         event_tx,
         phase_label,
+        None,
         None,
     )
     .await
@@ -2403,6 +2845,7 @@ pub(crate) async fn force_overflow_context_recovery(
         event_tx,
         "overflow-recovery",
         Some(CompressionTriggerType::CriticalOverflow),
+        None,
     )
     .await
 }
@@ -2527,9 +2970,10 @@ pub(super) async fn prepare_round_context(
 
     let budget =
         super::token_budget::resolve_token_budget(session, config, model_name, llm.as_ref()).await;
+    ensure_compression_range(&budget)?;
 
     let counter = TiktokenTokenCounter::default();
-    let mut retrieval_prepared = None;
+    let mut boundary_prepared = None;
 
     if retrieval_window_enabled {
         if session.force_manual_compression.is_some() {
@@ -2552,6 +2996,7 @@ pub(super) async fn prepare_round_context(
                 event_tx,
                 "pre-turn",
                 None,
+                Some(&mut boundary_prepared),
             )
             .await?;
             if !fallback_applied {
@@ -2580,7 +3025,7 @@ pub(super) async fn prepare_round_context(
             .await?
             {
                 RetrievalWindowPreparationOutcome::Archived(prepared) => {
-                    retrieval_prepared = Some(prepared)
+                    boundary_prepared = Some(prepared)
                 }
                 RetrievalWindowPreparationOutcome::NotNeeded => {
                     checkpoint_manual_archive_outcome(session, config, request, None, event_tx)
@@ -2610,7 +3055,7 @@ pub(super) async fn prepare_round_context(
             .await
             {
                 Ok(RetrievalWindowPreparationOutcome::Archived(prepared)) => {
-                    retrieval_prepared = Some(prepared)
+                    boundary_prepared = Some(prepared)
                 }
                 Ok(
                     RetrievalWindowPreparationOutcome::NotNeeded
@@ -2640,6 +3085,7 @@ pub(super) async fn prepare_round_context(
                         event_tx,
                         "pre-turn-retrieval-fallback",
                         Some(CompressionTriggerType::Auto),
+                        Some(&mut boundary_prepared),
                     )
                     .await?;
                     if !fallback_applied {
@@ -2666,6 +3112,7 @@ pub(super) async fn prepare_round_context(
         event_tx,
         "pre-turn",
         None,
+        Some(&mut boundary_prepared),
     )
     .await?
     {
@@ -2681,7 +3128,7 @@ pub(super) async fn prepare_round_context(
     let ledger_usage = enforce_model_context_ledger_retention(session, &budget, &counter);
     let request_input_limit = budget.max_request_input_tokens();
     let mut refit_pass = 0usize;
-    let mut prepared_context = if let Some(prepared) = retrieval_prepared {
+    let mut prepared_context = if let Some(prepared) = boundary_prepared {
         prepared
     } else {
         let mut prepared = prepare_hybrid_context_with_fixed_tokens(
