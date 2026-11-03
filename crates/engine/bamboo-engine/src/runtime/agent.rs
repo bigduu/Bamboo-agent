@@ -396,6 +396,138 @@ impl SdkInputSubmission {
 }
 
 impl Agent {
+    /// Stage compaction with the current Host configuration and the Session's
+    /// existing model route. The caller must commit under its own idle writer.
+    pub async fn stage_context_compaction(
+        &self,
+        session: &mut Session,
+        registry: &Arc<bamboo_llm::ProviderRegistry>,
+        tools: &dyn bamboo_agent_core::tools::ToolExecutor,
+        app_data_dir: &std::path::Path,
+    ) -> crate::runtime::runner::Result<bool> {
+        use crate::model_config_helper::{
+            get_default_model_for_provider, get_reasoning_effort_for_provider, resolve_gold_config,
+            resolve_live_image_fallback, resolve_provider_type, try_resolve_primary_model,
+            GOLD_CONFIG_METADATA_KEY,
+        };
+        use crate::runtime::config::AgentLoopConfig;
+        use crate::runtime::runner::image_fallback;
+        use crate::session_app::provider_model::{
+            schedule_bound_model_ref, session_effective_model_ref,
+        };
+        use bamboo_agent_core::AgentError;
+
+        let config = self.runtime.config.read().await.clone();
+        let scheduled = schedule_bound_model_ref(session).map_err(AgentError::LLM)?;
+        if session.metadata.contains_key("created_by_schedule_id") && scheduled.is_none() {
+            return Err(AgentError::LLM(
+                "Scheduled session has no provider/model target".into(),
+            ));
+        }
+        let bound = scheduled
+            .or_else(|| session.model_ref.clone())
+            .or_else(|| session_effective_model_ref(session));
+        let default_target = config
+            .defaults
+            .as_ref()
+            .filter(|_| config.features.provider_model_ref)
+            .map(|defaults| defaults.chat.clone());
+        let target = match bound.or(default_target) {
+            Some(target) => target,
+            None => {
+                let provider = config.effective_default_provider();
+                let model = if session.model.trim().is_empty() || session.model == "unknown" {
+                    get_default_model_for_provider(&config, provider)
+                        .map_err(|error| AgentError::LLM(error.to_string()))?
+                } else {
+                    session.model.clone()
+                };
+                bamboo_domain::ProviderModelRef::new(provider, model)
+            }
+        };
+        let selected = try_resolve_primary_model(&config, registry, &target)
+            .map_err(|error| AgentError::LLM(error.to_string()))?;
+        let provider_name = &selected.target.provider;
+        let model = &selected.target.model;
+        let llm = &selected.provider;
+        let data_dir = Some(app_data_dir.to_path_buf());
+        let fallback = resolve_live_image_fallback(&config).map_err(AgentError::LLM)?;
+        let legacy_vision_model_resolver = fallback
+            .as_ref()
+            .filter(|fallback| fallback.mode == crate::ImageFallbackMode::Vision)
+            .map(|fallback| {
+                let source = bamboo_llm::provider_registry::LegacyVisionProviderSource::capture(
+                    &config,
+                    provider_name,
+                    llm.clone(),
+                    selected.managed_origin.clone(),
+                )
+                .ok()
+                .map(Arc::new);
+                image_fallback::legacy_vision_resolver(
+                    config.clone(),
+                    provider_name.clone(),
+                    llm.clone(),
+                    fallback.vision_model.clone(),
+                    data_dir.clone(),
+                    true,
+                    source,
+                )
+            });
+        let memory = config.memory();
+        let loop_config = AgentLoopConfig {
+            legacy_model_limits: config.extra.get("model_limits").cloned(),
+            model_limits_section: self.runtime.model_limits_section.clone(),
+            attachment_reader: Some(self.runtime.attachment_reader.clone()),
+            model_name: Some(model.clone()),
+            provider_name: Some(provider_name.clone()),
+            provider_type: resolve_provider_type(&config, provider_name, registry),
+            reasoning_effort: session
+                .reasoning_effort
+                .or(target.reasoning_effort)
+                .or_else(|| get_reasoning_effort_for_provider(&config, provider_name)),
+            context_management: config.context_management.clone(),
+            gold_config: resolve_gold_config(
+                &config,
+                session
+                    .metadata
+                    .get(GOLD_CONFIG_METADATA_KEY)
+                    .map(String::as_str),
+            ),
+            summary_target_ratio: memory.as_ref().map_or(0.20, |m| m.summary_target_ratio),
+            summary_safe_window_percent: memory
+                .as_ref()
+                .map_or(80, |m| m.summary_safe_window_percent),
+            auxiliary_model_resolver: Some(crate::model_areas::live_auxiliary_model_resolver(
+                self.runtime.config.clone(),
+                registry.clone(),
+                provider_name.clone(),
+            )),
+            disabled_tools: config.disabled_tool_references(),
+            disabled_skill_ids: config.disabled_skill_ids(),
+            image_fallback: fallback,
+            legacy_vision_model_resolver,
+            vision_model_resolver: Some(image_fallback::configured_vision_resolver(
+                self.runtime.config.clone(),
+                data_dir.clone(),
+                provider_name.clone(),
+            )),
+            app_data_dir: data_dir,
+            ..Default::default()
+        };
+        let tools = crate::runtime::runner::session_setup::tool_schemas::resolve_available_tool_schemas_for_session(
+            &loop_config, tools, session,
+        );
+        crate::runtime::runner::round_lifecycle::stage_user_context_compaction(
+            session,
+            &loop_config,
+            model,
+            &tools,
+            llm,
+        )
+        .await
+    }
+
     /// Wrap an existing [`AgentRuntime`] in an `Agent`.
     pub fn from_runtime(runtime: Arc<AgentRuntime>) -> Self {
         Agent { runtime }

@@ -1199,6 +1199,7 @@ async fn maybe_prepare_retrieval_window_context(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     trigger_type: CompressionTriggerType,
     manual_archive_request: Option<&ResponseOccurrence>,
+    stage_only: bool,
 ) -> Result<RetrievalWindowPreparationOutcome, AgentError> {
     let budget = config
         .context_management
@@ -1313,12 +1314,13 @@ async fn maybe_prepare_retrieval_window_context(
             }
             return Ok(RetrievalWindowPreparationOutcome::NotNeeded);
         }
-        let Some(persistence) = config.persistence.as_ref() else {
+        let persistence = config.persistence.as_ref();
+        if !stage_only && persistence.is_none() {
             return Err(AgentError::Budget(
                 "retrieval-window requires RuntimeSessionPersistence for a durable pre-dispatch checkpoint"
                     .to_string(),
             ));
-        };
+        }
 
         // The exact post-OCR base is the optimistic compare value. All archive
         // mutations and provider preparation happen on a separate staged clone.
@@ -1450,7 +1452,15 @@ async fn maybe_prepare_retrieval_window_context(
             )));
         }
 
+        if stage_only {
+            // The user-command adapter owns the exact idle Session writer.
+            // Publish neither a checkpoint nor an event until it commits.
+            set_compaction_usage(&mut staged, &retained, budget, projected_input_tokens);
+            *session = staged;
+            return Ok(RetrievalWindowPreparationOutcome::Archived(retained));
+        }
         match persistence
+            .expect("durable retrieval requires persistence")
             .checkpoint_retrieval_window(&expected_base, &mut staged)
             .await
             .map_err(|error| {
@@ -1656,6 +1666,112 @@ fn summary_prepared_provider_state(session: &Session) -> Result<serde_json::Valu
     Ok(state)
 }
 
+fn set_compaction_usage(
+    session: &mut Session,
+    prepared: &PreparedContext,
+    budget: &TokenBudget,
+    total_tokens: u32,
+) {
+    let usage = &prepared.token_usage;
+    session.token_usage = Some(bamboo_agent_core::TokenBudgetUsage {
+        system_tokens: usage.system_tokens,
+        summary_tokens: usage.summary_tokens,
+        window_tokens: total_tokens
+            .saturating_sub(usage.system_tokens.saturating_add(usage.summary_tokens)),
+        total_tokens,
+        max_context_tokens: budget.max_context_tokens,
+        budget_limit: usage.budget_limit,
+        truncation_occurred: false,
+        segments_removed: 0,
+        prompt_cached_tool_outputs: prepared.prompt_cached_tool_outputs,
+        prompt_cached_tool_tokens_saved: prepared.prompt_cached_tool_tokens_saved,
+        thinking_tokens: 0,
+        cache_read_input_tokens: 0,
+        provider_prompt_usage: None,
+    });
+}
+
+/// Prepare an explicit user compaction on an isolated Session snapshot.
+/// The caller owns the idle reservation and atomic commit of this result.
+pub(crate) async fn stage_user_context_compaction(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    model: &str,
+    tools: &[ToolSchema],
+    provider: &Arc<dyn LLMProvider>,
+) -> Result<bool, AgentError> {
+    debug_assert!(config.persistence.is_none());
+    if bamboo_domain::ChildContextBinding::from_session(session)
+        .map_err(|error| AgentError::Budget(error.to_string()))?
+        .is_some()
+    {
+        return Err(AgentError::Budget(
+            "Lossy compaction is unavailable for required one-shot context".into(),
+        ));
+    }
+    let id = session.id.clone();
+    let schemas = super::context_tool_schemas_for_session(session, provider, model, tools).await;
+    let budget =
+        super::token_budget::resolve_token_budget(session, config, model, provider.as_ref()).await;
+    let staged = if config.context_management.strategy == ContextManagementStrategy::RetrievalWindow
+    {
+        if session.conversation_summary.is_some() {
+            return Err(AgentError::Budget(
+                "Retrieval-window cannot archive a Session that already has a conversation summary"
+                    .into(),
+            ));
+        }
+        matches!(
+            Box::pin(maybe_prepare_retrieval_window_context(
+                session,
+                config,
+                model,
+                &id,
+                &schemas,
+                provider,
+                &budget,
+                None,
+                CompressionTriggerType::Manual,
+                None,
+                true,
+            ))
+            .await?,
+            RetrievalWindowPreparationOutcome::Archived(_)
+        )
+    } else {
+        let mut prepared = None;
+        let applied = Box::pin(maybe_apply_summary_context_compression_with_budget(
+            session,
+            config,
+            model,
+            &id,
+            &schemas,
+            provider,
+            &budget,
+            None,
+            "user-command",
+            Some(CompressionTriggerType::Manual),
+            Some(&mut prepared),
+        ))
+        .await?;
+        if let Some(prepared) = prepared {
+            session
+                .metadata
+                .remove(super::stream_execution::SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+            let event = session
+                .compression_events
+                .last()
+                .expect("summary appended a compression event");
+            let total_tokens = (event.usage_after_percent * f64::from(budget.max_context_tokens)
+                / 100.0)
+                .round() as u32;
+            set_compaction_usage(session, &prepared, &budget, total_tokens);
+        }
+        applied
+    };
+    Ok(staged)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maybe_apply_summary_context_compression_with_budget(
     session: &mut Session,
@@ -1699,6 +1815,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
         &counter,
     )
     .await?;
+    if matches!(forced_trigger_type, Some(CompressionTriggerType::Manual))
+        && preflight.active_tokens <= range.target_tokens
+    {
+        return Ok(false);
+    }
     let active_tokens = exposure.active_tokens.max(preflight.active_tokens);
     let usage_percent =
         exposure
@@ -2639,6 +2760,7 @@ pub(super) async fn maybe_apply_host_context_compression(
                 event_tx,
                 CompressionTriggerType::Manual,
                 Some(request),
+                false,
             ))
             .await?
             {
@@ -2774,6 +2896,7 @@ pub(crate) async fn force_overflow_context_recovery(
             event_tx,
             CompressionTriggerType::CriticalOverflow,
             None,
+            false,
         ))
         .await;
 
@@ -3021,6 +3144,7 @@ pub(super) async fn prepare_round_context(
                 event_tx,
                 CompressionTriggerType::Manual,
                 Some(request),
+                false,
             ))
             .await?
             {
@@ -3051,6 +3175,7 @@ pub(super) async fn prepare_round_context(
                 event_tx,
                 CompressionTriggerType::Auto,
                 None,
+                false,
             ))
             .await
             {
