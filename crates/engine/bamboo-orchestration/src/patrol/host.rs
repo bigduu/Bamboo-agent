@@ -293,7 +293,7 @@ fn current(service: &TicketService, commit: &str) -> Result<(), PortError> {
     Ok(())
 }
 
-fn project(snapshot: &Snapshot, scope: &Scope) -> Result<Observation, PortError> {
+pub(super) fn project(snapshot: &Snapshot, scope: &Scope) -> Result<Observation, PortError> {
     if !super::valid_scope(scope) {
         return Err(PortError::Denied);
     }
