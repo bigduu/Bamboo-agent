@@ -714,10 +714,7 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
         .unwrap();
     #[cfg(unix)]
     {
-        let mut journal = fixture
-            .state
-            .tickets
-            .open_patrol_checkpoints(&scope)
+        let mut journal = journal_readback::open(&fixture.state.tickets, &scope)
             .await
             .unwrap();
         use bamboo_orchestration::patrol::CheckpointPort;
@@ -756,21 +753,23 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
             loop {
                 fixture.state.tickets.wake_ready_work();
                 fixture.state.tickets.reconcile_ready_work().await.unwrap();
-                if let Ok(mut journal) = fixture.state.tickets.open_patrol_checkpoints(&scope).await
-                {
-                    let stored = journal
+                let stored = {
+                    let mut journal = journal_readback::open(&fixture.state.tickets, &scope)
+                        .await
+                        .unwrap();
+                    journal
                         .load(&scope)
                         .unwrap()
-                        .expect("existing Ready observation has a canonical checkpoint");
-                    if stored
-                        .checkpoint
-                        .incident
-                        .as_ref()
-                        .and_then(|incident| incident.escalation.as_ref())
-                        .is_some_and(|escalation| escalation.queued)
-                    {
-                        break stored;
-                    }
+                        .expect("existing Ready observation has a canonical checkpoint")
+                };
+                if stored
+                    .checkpoint
+                    .incident
+                    .as_ref()
+                    .and_then(|incident| incident.escalation.as_ref())
+                    .is_some_and(|escalation| escalation.queued)
+                {
+                    break stored;
                 }
                 tokio::task::yield_now().await;
             }
@@ -2160,5 +2159,8 @@ async fn reopening_the_ticket_writer_advances_epoch_without_restoring_host_polic
 
 #[path = "ready_work_scheduler/admission.rs"]
 mod admission;
+#[cfg(unix)]
+#[path = "ready_work_scheduler/journal_readback.rs"]
+mod journal_readback;
 #[path = "ready_work_scheduler/owner_control.rs"]
 mod owner_control;
