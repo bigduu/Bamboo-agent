@@ -911,14 +911,14 @@ impl Session {
         }
     }
 
-    /// Current-model runtime limits and shared compression policy take precedence
-    /// over the durable input/output override from which they were resolved.
-    /// An old snapshot from another model must never shadow the explicit override.
-    /// Resolution refreshes this non-persisted snapshot at the start of each round.
+    /// Freshly resolved runtime limits and shared compression policy take
+    /// precedence over the durable override from which they were resolved.
+    /// The execute request can select a model without changing `Session.model`,
+    /// so freshness belongs to round-start resolution and model-change invalidation,
+    /// rather than a comparison against that persisted conversation label.
     pub fn effective_token_budget(&self) -> Option<&TokenBudget> {
         self.resolved_token_budget
             .as_ref()
-            .filter(|(model, _)| model == &self.model)
             .map(|(_, budget)| budget)
             .or(self.token_budget.as_ref())
     }
@@ -2084,14 +2084,14 @@ mod tests {
         assert_eq!(message.reasoning_signature, None);
     }
     #[test]
-    fn effective_token_budget_prefers_current_model_policy_snapshot_without_persisting_it() {
+    fn effective_token_budget_prefers_execution_model_policy_snapshot_without_persisting_it() {
         let mut session = Session::new("effective-range", "current");
         let mut durable = crate::TokenBudget::for_model(200_000);
         durable.compression_trigger_percent = 95;
         let mut resolved = durable.clone();
         resolved.compression_trigger_percent = 80;
         session.token_budget = Some(durable);
-        session.resolved_token_budget = Some(("current".into(), resolved));
+        session.resolved_token_budget = Some(("execute-request-model".into(), resolved));
         assert_eq!(
             session
                 .effective_token_budget()
@@ -2107,13 +2107,15 @@ mod tests {
                 .compression_trigger_percent,
             95
         );
-        session.model = "different".into();
+        session.token_budget = None;
         assert_eq!(
             session
                 .effective_token_budget()
                 .unwrap()
                 .compression_trigger_percent,
-            95
+            80
         );
+        session.resolved_token_budget = None;
+        assert!(session.effective_token_budget().is_none());
     }
 }

@@ -1537,7 +1537,7 @@ async fn projected_summary_request_tokens(
     llm: &Arc<dyn LLMProvider>,
     budget: &TokenBudget,
     counter: &dyn TokenCounter,
-) -> Result<u32, AgentError> {
+) -> Result<(u32, PreparedContext), AgentError> {
     let mut staged = Box::new(session.clone());
     apply_compression_plan(&mut staged, plan.clone());
     staged
@@ -1559,7 +1559,27 @@ async fn projected_summary_request_tokens(
     )
     .await?;
     let late_bound = late_bound_tool_schema_reserve(&staged, tool_schemas, &projected, counter)?;
-    Ok(projected.input_tokens.saturating_add(late_bound))
+    let native_delta = prepared.messages.iter().fold(0u32, |total, message| {
+        total.saturating_add(
+            provider_prepared_message_tokens(message, counter)
+                .saturating_sub(counter.count_message(message)),
+        )
+    });
+    prepared.token_usage.window_tokens = prepared
+        .token_usage
+        .window_tokens
+        .saturating_add(native_delta);
+    prepared.token_usage.total_tokens = prepared
+        .token_usage
+        .total_tokens
+        .saturating_add(native_delta);
+    Ok((
+        projected
+            .input_tokens
+            .saturating_add(late_bound)
+            .saturating_add(native_delta),
+        prepared,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1574,6 +1594,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
     event_tx: Option<&mpsc::Sender<AgentEvent>>,
     phase_label: &str,
     forced_trigger_type: Option<CompressionTriggerType>,
+    prepared_output: Option<&mut Option<PreparedContext>>,
 ) -> Result<bool, AgentError> {
     let budget = config
         .context_management
@@ -1616,6 +1637,38 @@ async fn maybe_apply_summary_context_compression_with_budget(
         );
     if !host_auto_requested && !critical_fallback_requested && !manual_requested {
         return Ok(false);
+    }
+
+    let legacy_vision_images = config
+        .image_fallback
+        .as_ref()
+        .is_some_and(|fallback| fallback.mode == crate::ImageFallbackMode::Vision)
+        && session
+            .messages
+            .iter()
+            .filter(|message| !message.compressed)
+            .any(|message| {
+                message.content_parts.as_ref().is_some_and(|parts| {
+                    parts
+                        .iter()
+                        .any(|part| matches!(part, MessagePart::ImageUrl { .. }))
+                })
+            });
+    if prepared_output.is_none()
+        && legacy_vision_images
+        && llm.supports_vision(model_name).await
+        && llm.vision_support_override(model_name).await != Some(true)
+    {
+        session
+            .force_manual_compression
+            .get_or_insert_with(String::new);
+        emit_context_compression_status(event_tx, phase_label, "deferred_vision_transform").await;
+        // Overflow recovery may retry through pre-turn preparation, which now
+        // owns the sole paid transform and can reuse it for actual dispatch.
+        return Ok(matches!(
+            forced_trigger_type.as_ref(),
+            Some(CompressionTriggerType::CriticalOverflow)
+        ));
     }
 
     // Running tasks do not postpone maintenance past the shared trigger.
@@ -1823,14 +1876,33 @@ async fn maybe_apply_summary_context_compression_with_budget(
             budget,
             &counter,
         )
-        .await?;
+        .await;
+        let (projected_tokens, prepared_context) = match projected_tokens {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                emit_context_compression_status(
+                    event_tx,
+                    phase_label,
+                    &format!("failed_postcondition:{error}"),
+                )
+                .await;
+                return Err(error);
+            }
+        };
         if projected_tokens > range.target_tokens {
             emit_context_compression_status(event_tx, phase_label,
                 &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
             return Ok(false);
         }
+        plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
+            projected_tokens,
+            budget.max_context_tokens,
+        );
         let changed = commit_message_summary_plan(session, config, &plan).await?;
         if changed > 0 {
+            if let Some(output) = prepared_output {
+                *output = Some(prepared_context);
+            }
             emit_context_compression_status(event_tx, phase_label, "completed").await;
             let tokens_saved = archived_message_tokens_saved(session, &plan);
             let trigger_label = match &plan.trigger_type {
@@ -2086,7 +2158,19 @@ async fn maybe_apply_summary_context_compression_with_budget(
         budget,
         &counter,
     )
-    .await?;
+    .await;
+    let (projected_tokens, prepared_context) = match projected_tokens {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            emit_context_compression_status(
+                event_tx,
+                phase_label,
+                &format!("failed_postcondition:{error}"),
+            )
+            .await;
+            return Err(error);
+        }
+    };
     if projected_tokens > range.target_tokens {
         tracing::warn!(
             session_id,
@@ -2099,6 +2183,10 @@ async fn maybe_apply_summary_context_compression_with_budget(
             &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
         return Ok(false);
     }
+    plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
+        projected_tokens,
+        budget.max_context_tokens,
+    );
     plan.summary_budget_clamped |= summary_report.budget_clamped;
     plan.summary_budget_clamp_reason = summary_report
         .budget_clamp_reason
@@ -2135,6 +2223,9 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(false);
     }
 
+    if let Some(output) = prepared_output {
+        *output = Some(prepared_context);
+    }
     if let Some(persistence) = config.persistence.as_ref().filter(|_| !message_summary) {
         if let Err(error) = persistence.save_runtime_session(session).await {
             tracing::warn!(
@@ -2391,6 +2482,7 @@ pub(super) async fn maybe_apply_host_context_compression(
             event_tx,
             phase_label,
             None,
+            None,
         )
         .await?;
         if !applied {
@@ -2414,6 +2506,7 @@ pub(super) async fn maybe_apply_host_context_compression(
         &budget,
         event_tx,
         phase_label,
+        None,
         None,
     )
     .await
@@ -2553,6 +2646,7 @@ pub(crate) async fn force_overflow_context_recovery(
         event_tx,
         "overflow-recovery",
         Some(CompressionTriggerType::CriticalOverflow),
+        None,
     )
     .await
 }
@@ -2680,7 +2774,7 @@ pub(super) async fn prepare_round_context(
     ensure_compression_range(&budget)?;
 
     let counter = TiktokenTokenCounter::default();
-    let mut retrieval_prepared = None;
+    let mut boundary_prepared = None;
 
     if retrieval_window_enabled {
         if session.force_manual_compression.is_some() {
@@ -2703,6 +2797,7 @@ pub(super) async fn prepare_round_context(
                 event_tx,
                 "pre-turn",
                 None,
+                Some(&mut boundary_prepared),
             )
             .await?;
             if !fallback_applied {
@@ -2731,7 +2826,7 @@ pub(super) async fn prepare_round_context(
             .await?
             {
                 RetrievalWindowPreparationOutcome::Archived(prepared) => {
-                    retrieval_prepared = Some(prepared)
+                    boundary_prepared = Some(prepared)
                 }
                 RetrievalWindowPreparationOutcome::NotNeeded => {
                     checkpoint_manual_archive_outcome(session, config, request, None, event_tx)
@@ -2761,7 +2856,7 @@ pub(super) async fn prepare_round_context(
             .await
             {
                 Ok(RetrievalWindowPreparationOutcome::Archived(prepared)) => {
-                    retrieval_prepared = Some(prepared)
+                    boundary_prepared = Some(prepared)
                 }
                 Ok(
                     RetrievalWindowPreparationOutcome::NotNeeded
@@ -2791,6 +2886,7 @@ pub(super) async fn prepare_round_context(
                         event_tx,
                         "pre-turn-retrieval-fallback",
                         Some(CompressionTriggerType::Auto),
+                        Some(&mut boundary_prepared),
                     )
                     .await?;
                     if !fallback_applied {
@@ -2817,6 +2913,7 @@ pub(super) async fn prepare_round_context(
         event_tx,
         "pre-turn",
         None,
+        Some(&mut boundary_prepared),
     )
     .await?
     {
@@ -2832,7 +2929,7 @@ pub(super) async fn prepare_round_context(
     let ledger_usage = enforce_model_context_ledger_retention(session, &budget, &counter);
     let request_input_limit = budget.max_request_input_tokens();
     let mut refit_pass = 0usize;
-    let mut prepared_context = if let Some(prepared) = retrieval_prepared {
+    let mut prepared_context = if let Some(prepared) = boundary_prepared {
         prepared
     } else {
         let mut prepared = prepare_hybrid_context_with_fixed_tokens(

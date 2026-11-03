@@ -226,13 +226,17 @@ async fn shared_range_summary_does_not_stop_after_cache_only_reaches_below_trigg
     session.add_message(Message::system("system"));
     session.add_message(Message::user("initial request"));
     let counter = TiktokenTokenCounter::default();
+    let repeated = |unit: &str, target: u32| {
+        let first = unit.repeat((target / counter.count_text(unit)) as usize);
+        let adjusted = ((first.len() / unit.len()) as u64 * u64::from(target)
+            / u64::from(counter.count_text(&first))) as usize
+            + 1;
+        unit.repeat(adjusted)
+    };
     let old_unit = "old tool line\n";
     let prose_unit = "durable design evidence ";
     for (call, output) in [
-        (
-            "old",
-            old_unit.repeat((24_000 / counter.count_text(old_unit)) as usize),
-        ),
+        ("old", repeated(old_unit, 24_000)),
         ("recent-one", "recent result".into()),
         ("recent-two", "latest result".into()),
     ] {
@@ -248,10 +252,7 @@ async fn shared_range_summary_does_not_stop_after_cache_only_reaches_below_trigg
         session.add_message(assistant);
         session.add_message(Message::tool_result(call, output));
         if call == "old" {
-            session.add_message(Message::assistant(
-                prose_unit.repeat((32_000 / counter.count_text(prose_unit)) as usize),
-                None,
-            ));
+            session.add_message(Message::assistant(repeated(prose_unit, 32_000), None));
         }
         session.add_message(Message::user(format!("continue after {call}")));
     }
@@ -262,7 +263,10 @@ async fn shared_range_summary_does_not_stop_after_cache_only_reaches_below_trigg
         &session, &budget, &counter, 0, 0,
     );
     let projected = before - savings;
-    assert!(before > budget.compression_thresholds().trigger_tokens);
+    assert!(
+        before > budget.compression_thresholds().trigger_tokens,
+        "before={before}"
+    );
     assert!(projected < budget.compression_thresholds().trigger_tokens);
     assert!(projected > budget.compression_thresholds().target_tokens);
     session.token_budget = Some(budget);
@@ -282,4 +286,170 @@ async fn shared_range_summary_does_not_stop_after_cache_only_reaches_below_trigg
     .unwrap());
     assert!(!calls.lock().unwrap().is_empty());
     assert!(!session.compression_events.is_empty());
+}
+
+struct CountingVisionProvider {
+    vision_calls: Arc<AtomicUsize>,
+    main_requests: Arc<Mutex<Vec<Vec<Message>>>>,
+    explicit_native: bool,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for CountingVisionProvider {
+    async fn vision_support_override(&self, _model: &str) -> Option<bool> {
+        self.explicit_native.then_some(true)
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[Message],
+        _tools: &[ToolSchema],
+        _output: Option<u32>,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        let response = if model == "vision-single" {
+            let call = self.vision_calls.fetch_add(1, Ordering::SeqCst) + 1;
+            format!("VISION_DESCRIPTION_{call}")
+        } else {
+            self.main_requests.lock().unwrap().push(messages.to_vec());
+            "main answer".into()
+        };
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token(response)),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[tokio::test]
+async fn shared_range_reuses_the_only_paid_vision_transform_for_actual_dispatch() {
+    let _env = isolate_prompt_safe_env_cache();
+    for strategy in [
+        ContextManagementStrategy::Summary,
+        ContextManagementStrategy::MessageSummary,
+    ] {
+        let id = format!("shared-range-vision-{strategy:?}");
+        let mut session = bounded_compression_session(&id);
+        session.token_budget = Some(TokenBudget::with_safety_margin(
+            200_000,
+            8_000,
+            BudgetStrategy::default(),
+            2_000,
+        ));
+        session.add_message(Message::user_with_parts(
+            "latest image",
+            vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/latest.png".into(),
+                    detail: None,
+                },
+            }
+            .into()],
+        ));
+        let (summary_provider, _) = prompt_capture_llm();
+        let mut config = bounded_compression_config(summary_provider);
+        config.model_name = Some("test-model".into());
+        config.context_management.strategy = strategy;
+        config.image_fallback = Some(ImageFallbackConfig {
+            mode: ImageFallbackMode::Vision,
+            vision_model: Some("vision-single".into()),
+        });
+        let vision_calls = Arc::new(AtomicUsize::new(0));
+        let main_requests = Arc::new(Mutex::new(Vec::new()));
+        let llm: Arc<dyn LLMProvider> = Arc::new(CountingVisionProvider {
+            vision_calls: Arc::clone(&vision_calls),
+            main_requests: Arc::clone(&main_requests),
+            explicit_native: false,
+        });
+        let before = archive_state(&session);
+        assert!(!maybe_apply_host_context_compression(
+            &mut session,
+            &config,
+            "test-model",
+            &id,
+            &[],
+            &llm,
+            None,
+            "mid-turn"
+        )
+        .await
+        .unwrap());
+        assert_eq!(archive_state(&session), before);
+        assert_eq!(vision_calls.load(Ordering::SeqCst), 0);
+        let (tx, _) = mpsc::channel(128);
+        super::super::super::execute_llm_round(
+            &mut session,
+            &config,
+            &llm,
+            &tx,
+            &tokio_util::sync::CancellationToken::new(),
+            &id,
+            "test-model",
+            &[],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(vision_calls.load(Ordering::SeqCst), 1);
+        let requests = main_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = serde_json::to_string(&requests[0]).unwrap();
+        assert!(sent.contains("VISION_DESCRIPTION_1"));
+        assert!(!sent.contains("VISION_DESCRIPTION_2"));
+        assert!(session.messages.last().unwrap().content_parts.is_some());
+        assert!(!session.compression_events.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn shared_range_native_image_cost_cannot_pass_a_text_only_target_check() {
+    let _env = isolate_prompt_safe_env_cache();
+    let mut session = Session::new("shared-range-native-image", "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(Message::user("old requirement"));
+    session.add_message(Message::assistant("old response", None));
+    session.add_message(Message::user_with_parts(
+        "latest image",
+        vec![ContentPart::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://example.com/latest.png".into(),
+                detail: Some("original".into()),
+            },
+        }
+        .into()],
+    ));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        1_000,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session.force_manual_compression = Some(String::new());
+    let before = archive_state(&session);
+    let (summary_provider, _) = prompt_capture_llm();
+    let mut config = bounded_compression_config(summary_provider);
+    config.context_management.strategy = ContextManagementStrategy::MessageSummary;
+    let llm: Arc<dyn LLMProvider> = Arc::new(CountingVisionProvider {
+        vision_calls: Arc::new(AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+        explicit_native: true,
+    });
+    let (tx, mut rx) = mpsc::channel(128);
+    assert!(!maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "shared-range-native-image",
+        &[],
+        &llm,
+        Some(&tx),
+        "pre-turn"
+    )
+    .await
+    .unwrap());
+    assert_eq!(archive_state(&session), before);
+    assert!(session.compression_events.is_empty());
+    assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(event,
+        AgentEvent::ContextCompressionStatus { status, .. } if status.starts_with("failed_postcondition:"))));
 }
