@@ -14,6 +14,7 @@ pub const FILE_BYTES_LIMIT: usize = 16384;
 // Includes the HostBridge's result envelope and JSON escaping. A raw file
 // within FILE_BYTES_LIMIT can still exceed the existing SubAgent reply budget.
 const FILE_REPLY_BYTES_LIMIT: usize = 16384;
+const WRITE_PROGRESS_AT_MS: &str = "workspace_write_progress_at_ms";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "tool", deny_unknown_fields)]
@@ -50,6 +51,46 @@ pub struct FileReply {
 
 struct FileContents {
     bytes: Vec<u8>,
+}
+
+impl Snapshot {
+    /// Sequence and physical completion time of the latest qualifying write
+    /// for a current Assignment, bounded by the live Task's observation window.
+    pub fn latest_workspace_write_progress(
+        &self,
+        assignment_id: &str,
+        started_at_ms: u64,
+        cutoff_ms: u64,
+    ) -> Option<(u64, u64)> {
+        let assignment = self.assignments.get(assignment_id)?;
+        active_permit(self, assignment).ok()?;
+        assignment
+            .effects
+            .iter()
+            .filter_map(|(id, effect)| {
+                let intent = effect.file_intent.as_ref()?;
+                let artifact = effect.artifact.as_ref()?;
+                let receipt = self.receipts.get(id)?;
+                let at_ms = receipt.ids.get(WRITE_PROGRESS_AT_MS)?.parse::<u64>().ok()?;
+                let confirmed_hash = effect
+                    .provider_receipt
+                    .as_deref()?
+                    .strip_prefix("local-file:")?;
+                (effect.state == EffectState::Succeeded
+                    && confirmed_hash == artifact.sha256
+                    && receipt.operation_id == *id
+                    && receipt.principal == intent.principal
+                    && receipt.request_hash == effect.action_fingerprint
+                    && receipt.canonical_request == intent.canonical_request
+                    && receipt.ids.get("artifact") == Some(&artifact.uri)
+                    && receipt.ids.get("sha256") == Some(&artifact.sha256)
+                    && (1..=assignment.updated_seq).contains(&receipt.committed_seq)
+                    && at_ms > 0
+                    && (started_at_ms..=cutoff_ms).contains(&at_ms))
+                .then_some((receipt.committed_seq, at_ms))
+            })
+            .max_by_key(|(sequence, _)| *sequence)
+    }
 }
 
 impl TicketService {
@@ -197,6 +238,7 @@ impl TicketService {
         // IO can fail after installation. Retain Started and the resource claim until
         // an actual stopped Run and explicit reconciliation are confirmed.
         physical::create_absent(&dir, &name, content.as_bytes())?;
+        let observed_at_ms = chrono::Utc::now().timestamp_millis();
         let mut next = store.published.as_ref().expect("published start").1.clone();
         next.seq += 1;
         let a = next
@@ -205,19 +247,29 @@ impl TicketService {
             .expect("verified Assignment");
         a.record_revision += 1;
         a.updated_seq = next.seq;
+        // A second path with identical bytes adds no new managed Artifact.
+        let already_produced = a.effects.values().any(|effect| {
+            effect.file_intent.is_some()
+                && effect.state == EffectState::Succeeded
+                && effect.artifact.as_ref() == Some(&artifact)
+        });
         let effect = a.effects.get_mut(&operation_id).expect("durable intent");
         effect.state = EffectState::Succeeded;
         effect.provider_receipt = Some(format!("local-file:{}", artifact.sha256));
+        let mut ids = BTreeMap::from([
+            ("sha256".into(), artifact.sha256.clone()),
+            ("artifact".into(), artifact.uri.clone()),
+        ]);
+        if !already_produced && observed_at_ms > 0 {
+            ids.insert(WRITE_PROGRESS_AT_MS.into(), observed_at_ms.to_string());
+        }
         let receipt = OperationReceipt {
             operation_id: operation_id.clone(),
             principal: authority.identity(),
             request_hash,
             canonical_request: String::from_utf8(canonical_bytes(op)?).expect("JSON UTF-8"),
             committed_seq: next.seq,
-            ids: BTreeMap::from([
-                ("sha256".into(), artifact.sha256.clone()),
-                ("artifact".into(), artifact.uri.clone()),
-            ]),
+            ids,
         };
         next.receipts.insert(operation_id.clone(), receipt);
         validate_snapshot(&next)?;

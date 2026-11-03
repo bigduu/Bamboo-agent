@@ -97,10 +97,31 @@ that pass's cutoff is unavailable for that pass. Closure or replacement clears
 live start and heartbeat while preserving independent wait evidence and the
 original Ticket fences.
 
-Meaningful progress remains `None`. A fresh heartbeat with unknown progress
-still yields `EvidenceUnknown`. A measured stale heartbeat can yield
-`MissingHeartbeat` under the existing policy. An unavailable heartbeat remains
-unknown, and neither signal authorizes recovery or proves physical stop.
+A fresh heartbeat with unavailable progress can still yield `EvidenceUnknown`.
+A measured stale heartbeat can yield `MissingHeartbeat` under the existing
+policy. An unavailable heartbeat remains unknown.
+
+## Verified workspace progress
+
+#2527 supplies a progress observation from a nonempty new artifact created
+through the current Assignment's guarded workspace file port. Ticket records
+the Host completion time on the original success receipt after the physical
+create. The receipt's committed sequence identifies the progress boundary.
+Existing receipt metadata is preserved when the same request is replayed.
+
+The Host projects this evidence only for the exact live native Task and
+current Ticket Scope and receipt. The observation uses the latest qualifying
+receipt from Task entry through the fixed patrol clock. Legacy receipts without
+the completion time, duplicate artifact content for the same Assignment, file
+reads, Task-list updates, model output and lease renewals supply no new progress.
+Unknown outcomes keep their reconciliation status. User reconciliation of
+bytes on disk supplies no physical completion timestamp.
+
+When no qualifying evidence is available, progress remains `None`. The sample
+does not survive a stopped Task or cold Host reopen as live progress. The
+existing patrol can diagnose stale measured progress or resolve an incident
+after a later observed boundary. Submission and acceptance retain their
+existing independent authority.
 
 ## Acceptance ownership
 
