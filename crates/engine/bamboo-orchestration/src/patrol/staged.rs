@@ -3,8 +3,18 @@
 
 use super::{
     Clock, DiagnosticInput, DiagnosticRequest, DiagnosticStatus, Error, Host, Model, Observation,
-    OperationId, Patrol, PortError, ReadOnlyDiagnosticProvider, Report, Reservation, Scope,
+    OperationId, Patrol, Phase, PortError, ReadOnlyDiagnosticProvider, Report, Reservation, Scope,
+    StoredCheckpoint,
 };
+
+pub fn has_semantic_debt(stored: Option<&StoredCheckpoint>) -> bool {
+    stored
+        .and_then(|stored| stored.checkpoint.incident.as_ref())
+        .is_some_and(|incident| {
+            matches!(incident.phase, Phase::Diagnosing { .. })
+                || incident.pending_settlement.is_some()
+        })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputDemand {

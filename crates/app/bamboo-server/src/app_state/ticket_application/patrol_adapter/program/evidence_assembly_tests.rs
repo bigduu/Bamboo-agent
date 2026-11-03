@@ -407,6 +407,276 @@ async fn start_work(
     );
     (work, project.id)
 }
+
+#[tokio::test]
+async fn staged_host_calls_the_configured_provider_and_settles_the_real_work_receipt() {
+    use bamboo_orchestration::{
+        patrol::{calls::CallIo, DiagnosticInput, DiagnosticStatus, Observation, ObservationPort},
+        ReadyDispatch, ReadyWorkHost, ReadyWorkScheduler,
+    };
+    use bamboo_tickets::{Authority, Command, DispatchSpec, TicketService, WorkTokenLimits};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, ResponseTemplate,
+    };
+
+    struct Capture<'a> {
+        tickets: &'a TicketApplication,
+        fence: std::sync::Mutex<Option<ReadyAdmissionFence>>,
+    }
+    #[async_trait]
+    impl ReadyWorkHost for Capture<'_> {
+        async fn authority(&self) -> Result<(Arc<TicketService>, Authority)> {
+            ReadyWorkHost::authority(self.tickets).await
+        }
+        async fn check_budget(&self, max_rounds: u32) -> Result<()> {
+            self.tickets.check_budget(max_rounds).await
+        }
+        async fn reconcile_program_patrol(
+            &self,
+            _: &ProgramSelection<'_>,
+            fence: &ReadyAdmissionFence,
+        ) -> Result<()> {
+            *self.fence.lock().unwrap() = Some(fence.clone());
+            Ok(())
+        }
+        async fn preflight(&self, command: &Command) -> Result<()> {
+            self.tickets.preflight(command).await
+        }
+        async fn ensure(
+            &self,
+            key: &str,
+            spec: &DispatchSpec,
+            rounds: u32,
+        ) -> Result<ReadyDispatch> {
+            self.tickets.ensure(key, spec, rounds).await
+        }
+        async fn dispatch(&self, command: &Command, rounds: u32) -> Result<ReadyDispatch> {
+            ReadyWorkHost::dispatch(self.tickets, command, rounds).await
+        }
+    }
+    struct Trigger(Observation);
+    impl ObservationPort for Trigger {
+        fn observation(
+            &mut self,
+            _: &Scope,
+            _: u64,
+        ) -> std::result::Result<Observation, PortError> {
+            Ok(self.0.clone())
+        }
+        fn diagnostic_input(
+            &mut self,
+            _: &Scope,
+            _: u64,
+            _: &Observation,
+        ) -> std::result::Result<DiagnosticInput, PortError> {
+            panic!("semantic evidence is acquired through the concrete asynchronous Host reader")
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (state, agent) = host_with_gate(&root, 2, Some(gate.clone())).await;
+    let (work, project) = start_work(&state, workspace(&root)).await;
+    tokio::time::timeout(WAIT, async {
+        while agent.calls.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (service, owner) = state.tickets.authority(owner()).await.unwrap();
+    service
+        .configure_work_token_budget(
+            &owner,
+            0,
+            WorkTokenLimits {
+                work_tokens: BTreeMap::from([(work.clone(), 8192)]),
+                utc_day_tokens: 8192,
+                total_tokens: 8192,
+            },
+        )
+        .unwrap();
+    let snapshot = service.published().unwrap().1;
+    let assignment = snapshot.tickets[&work].active_assignment.as_ref().unwrap();
+    let scope = state
+        .tickets
+        .patrol_scope(project.as_str(), &work, assignment)
+        .await
+        .unwrap();
+    let capture = Capture {
+        tickets: &state.tickets,
+        fence: std::sync::Mutex::new(None),
+    };
+    let scheduler = ReadyWorkScheduler::default();
+    scheduler
+        .install(&capture, policy(&snapshot, &scope))
+        .await
+        .unwrap();
+    scheduler.reconcile(&capture).await.unwrap();
+    let fence = capture.fence.lock().unwrap().take().unwrap();
+    let (_, authority) = state.tickets.authority(Principal::Runtime).await.unwrap();
+    let mut observed = state
+        .tickets
+        .patrol_observation(&scope)
+        .await
+        .unwrap()
+        .observation(&scope, 0)
+        .unwrap();
+    // Trigger the semantic branch without waiting on the production anomaly
+    // clock. All evidence, admission, HTTP and accounting below are concrete.
+    observed.repeated_errors = true;
+    let mut observation = Trigger(observed);
+    let mut journal = state.tickets.open_patrol_checkpoints(&scope).await.unwrap();
+    let provider = MockServer::start().await;
+    for (verb, route, body) in [
+        (
+            "GET",
+            "/v1/models",
+            json!({"data":[{"id":"gpt-oss-20b","owned_by":"llamacpp","meta":{"n_vocab":201088,"n_embd":2880,"n_params":20914790400u64}}]}),
+        ),
+        (
+            "GET",
+            "/props",
+            json!({"model_alias":"gpt-oss-20b","default_generation_settings":{"n_ctx":8192}}),
+        ),
+        (
+            "POST",
+            "/tokenize",
+            json!({"tokens":[200006,173781,200005,17196,200008,200002]}),
+        ),
+    ] {
+        Mock::given(method(verb))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&provider)
+            .await;
+    }
+    let selection: bamboo_config::PatrolModelConfig = serde_json::from_value(json!({
+        "provider": "patrol-local", "model": "gpt-oss-20b", "protocol": "llama_cpp_raw_v1",
+        "endpoint": provider.address().to_string(), "max_input_tokens":4096,"max_output_tokens":128,
+        "max_evidence_bytes":16384,"max_evidence_refs":8
+    }))
+    .unwrap();
+    state.config.write().await.patrol_model = Some(selection.clone());
+    let patrol = Patrol::new(Policy::default(), Some(configured_model(&selection))).unwrap();
+    let clock = SystemClock::current().unwrap();
+    let mut ports = semantic::Ports {
+        journal: &mut journal,
+        observation: &mut observation,
+        budget: TicketBudget {
+            service: &service,
+            authority: &authority,
+            clock: &clock,
+        },
+    };
+    assert!(matches!(
+        patrol
+            .tick_staged(&scope, &clock, &mut ports, None, |_| Ok(
+                DiagnosticStatus::OutcomeUnknown
+            ))
+            .unwrap(),
+        Outcome::Complete {
+            submission: None,
+            ..
+        }
+    ));
+    let Outcome::InputRequired(demand) = patrol
+        .tick_staged(&scope, &clock, &mut ports, None, |_| {
+            Ok(DiagnosticStatus::OutcomeUnknown)
+        })
+        .unwrap()
+    else {
+        panic!("expected demand for this controlled anomaly");
+    };
+    let prepared = state
+        .tickets
+        .prepare_semantic_call(&service, &authority, demand, selection.clone(), fence)
+        .await
+        .unwrap();
+    let input = prepared.input.result.as_ref().unwrap();
+    let diagnosis = json!({"advice":"observe","evidence":[input.references[0].id],"uncertain":false,"note":"Controlled advice."});
+    let (instructions, literal) =
+        bamboo_orchestration::patrol::diagnostic_input::diagnostic_prompt(
+            &input.summary,
+            &input.references,
+        )
+        .unwrap();
+    let exact =
+        bamboo_llm::protocol::llama_cpp::GptOssPrompt::encode(&instructions, &literal).unwrap();
+    let generated =
+        bamboo_llm::protocol::llama_cpp::GptOssPrompt::encode("", &diagnosis.to_string()).unwrap();
+    let ids = generated.tokens();
+    let body = ids.iter().rposition(|&id| id == 200008).unwrap() + 1;
+    let end = ids.iter().rposition(|&id| id == 200007).unwrap();
+    let mut response = vec![200005, 17196, 200008];
+    response.extend_from_slice(&ids[body..end]);
+    response.push(200002);
+    let charged = exact.tokens().len() as u64 + response.len() as u64;
+    Mock::given(method("POST")).and(path("/completion"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "model":"gpt-oss-20b","stop":true,"stop_type":"eos","truncated":false,
+            "tokens_evaluated":exact.tokens().len(),"tokens_predicted":response.len(),"tokens":response
+        }))).expect(1).mount(&provider).await;
+    assert_eq!(provider.received_requests().await.unwrap().len(), 3);
+    let Outcome::Complete {
+        submission: Some(submission),
+        ..
+    } = patrol
+        .tick_staged(&scope, &clock, &mut ports, Some(prepared.input), |_| {
+            Ok(DiagnosticStatus::OutcomeUnknown)
+        })
+        .unwrap()
+    else {
+        panic!("expected the exact checkpointed Work reservation");
+    };
+    let operation = submission.reservation().operation.clone();
+    let reserved = service.work_token_budget(&authority).unwrap().unwrap();
+    assert_eq!(reserved.total_charged, 4224);
+    assert_eq!(
+        reserved.reservations.values().next().unwrap().receipt,
+        submission.reservation().receipt
+    );
+    drop(journal);
+    state.config.write().await.patrol_model = None;
+    assert_eq!(
+        prepared.io.admit(submission.reservation()).await,
+        Err(PortError::Conflict)
+    );
+    assert_eq!(provider.received_requests().await.unwrap().len(), 3);
+    state.config.write().await.patrol_model = Some(selection);
+    state
+        .tickets
+        .patrol_calls
+        .launch(submission, now(), prepared.io)
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match state.tickets.patrol_calls.status(&operation).unwrap() {
+                DiagnosticStatus::Pending => tokio::time::sleep(Duration::from_millis(10)).await,
+                DiagnosticStatus::Finished { .. } => break,
+                other => panic!("unexpected semantic result: {other:?}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let ledger = service.work_token_budget(&authority).unwrap().unwrap();
+    assert_eq!(ledger.reservations.len(), 1);
+    assert_eq!(ledger.total_charged, charged);
+    let requests = provider.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    assert_eq!(
+        requests[3].body_json::<Value>().unwrap()["prompt"],
+        json!(exact.tokens())
+    );
+    assert_eq!(agent.calls.load(Ordering::SeqCst), 1);
+    scheduler.revoke().await;
+    gate.add_permits(2);
+    state.shutdown().await;
+}
+
 async fn seed(root: &Path) {
     let execution = workspace(root);
     let (state, provider) = host(root, 2).await;

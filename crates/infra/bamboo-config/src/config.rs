@@ -1795,6 +1795,10 @@ pub struct PatrolModelConfig {
     pub provider: String,
     pub model: String,
     pub protocol: PatrolModelProtocol,
+    /// Explicit local provider activation. Omitted keeps prompt preparation
+    /// available without enabling outbound model calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<std::net::SocketAddr>,
     pub max_input_tokens: std::num::NonZeroU32,
     pub max_output_tokens: std::num::NonZeroU32,
     pub max_evidence_bytes: std::num::NonZeroUsize,
@@ -1822,6 +1826,14 @@ impl PatrolModelConfig {
                  {MAX_OUTPUT_TOKENS} output tokens, {MAX_EVIDENCE_BYTES} evidence bytes, \
                  and {MAX_EVIDENCE_REFS} evidence references"
             ));
+        }
+        if self
+            .endpoint
+            .is_some_and(|endpoint| !endpoint.ip().is_loopback() || endpoint.port() == 0)
+        {
+            return Err(
+                "patrol_model endpoint requires a numeric loopback address and port".into(),
+            );
         }
         match self.protocol {
             PatrolModelProtocol::LlamaCppRawV1 if self.model == "gpt-oss-20b" => Ok(()),

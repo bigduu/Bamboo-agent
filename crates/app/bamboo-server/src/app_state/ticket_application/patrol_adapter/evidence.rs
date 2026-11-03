@@ -1,14 +1,17 @@
 //! Host/native I/O adapter. Pure evidence policy belongs to bamboo-orchestration.
-use super::super::{Error, Principal, Result};
+use super::super::{Error, Principal, Result, TicketApplication};
 use super::patrol_error;
-use bamboo_config::{PatrolModelConfig, PatrolModelProtocol};
+use bamboo_config::{Config, PatrolModelConfig, PatrolModelProtocol};
 use bamboo_domain::ProjectManifest;
 use bamboo_llm::protocol::llama_cpp::GptOssPrompt;
-use bamboo_memory::memory_store::{DurableMemoryStatus, ProjectMemoryRead, ProjectMemoryRef};
+use bamboo_memory::memory_store::{
+    DurableMemoryStatus, MemoryStore, ProjectMemoryRead, ProjectMemoryRef,
+};
 use bamboo_orchestration::patrol::{
     diagnostic_input::{diagnostic_prompt, prepare_diagnostic_input},
     evidence as core, host, DiagnosticInput, EvidenceRef, Model, Observation, PortError, Scope,
 };
+use bamboo_projects::ProjectStore;
 use bamboo_tickets::{Authority, ProjectContextSnapshot, Snapshot, TicketService};
 pub use core::{
     WorkPatrolAdoptedContextEvidence, WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit,
@@ -46,6 +49,22 @@ impl PreparedPatrolDiagnostic {
     pub fn prompt_tokens(&self) -> &[u32] {
         self.prompt.tokens()
     }
+
+    pub(super) fn prompt(&self) -> &GptOssPrompt {
+        &self.prompt
+    }
+}
+
+pub(in crate::app_state::ticket_application) struct EvidenceSources {
+    pub(super) memory: MemoryStore,
+    pub(super) projects: Arc<ProjectStore>,
+}
+
+pub(super) struct EvidenceReader<'a> {
+    pub(super) tickets: &'a TicketApplication,
+    pub(super) config: &'a tokio::sync::RwLock<Config>,
+    pub(super) memory_store: &'a MemoryStore,
+    pub(super) project_store: &'a Arc<ProjectStore>,
 }
 
 fn prepare_configured_diagnostic(
@@ -55,14 +74,7 @@ fn prepare_configured_diagnostic(
     through: &Observation,
     selection: PatrolModelConfig,
 ) -> Result<PreparedPatrolDiagnostic> {
-    let model = Model {
-        provider: selection.provider,
-        model: selection.model,
-        max_input_tokens: selection.max_input_tokens.get(),
-        max_output_tokens: selection.max_output_tokens.get(),
-        max_evidence_bytes: selection.max_evidence_bytes.get(),
-        max_evidence_refs: selection.max_evidence_refs.get(),
-    };
+    let model = configured_model(&selection);
     let mut prompt = None;
     let input = prepare_diagnostic_input(
         &evidence,
@@ -89,6 +101,17 @@ fn prepare_configured_diagnostic(
         input,
         prompt: prompt.ok_or_else(|| patrol_error(PortError::Unavailable))?,
     })
+}
+
+pub(super) fn configured_model(selection: &PatrolModelConfig) -> Model {
+    Model {
+        provider: selection.provider.clone(),
+        model: selection.model.clone(),
+        max_input_tokens: selection.max_input_tokens.get(),
+        max_output_tokens: selection.max_output_tokens.get(),
+        max_evidence_bytes: selection.max_evidence_bytes.get(),
+        max_evidence_refs: selection.max_evidence_refs.get(),
+    }
 }
 
 fn resolve(
@@ -201,6 +224,15 @@ fn authorized(
 }
 
 impl crate::app_state::AppState {
+    fn patrol_evidence_reader(&self) -> EvidenceReader<'_> {
+        EvidenceReader {
+            tickets: &self.tickets,
+            config: &self.config,
+            memory_store: &self.memory_store,
+            project_store: &self.project_store,
+        }
+    }
+
     /// Bounded, unmetered Host read of this Assignment's exact adopted sources.
     /// No provider activation, token estimate, source discovery or read grant.
     pub async fn read_work_patrol_evidence(
@@ -209,10 +241,11 @@ impl crate::app_state::AppState {
         expected_ticket_commit: &str,
         since_cursor: u64,
     ) -> Result<UnmeteredWorkPatrolEvidence> {
-        self.with_work_patrol_evidence(scope, expected_ticket_commit, since_cursor, |evidence| {
-            ready(Ok(evidence))
-        })
-        .await
+        self.patrol_evidence_reader()
+            .with_work_patrol_evidence(scope, expected_ticket_commit, since_cursor, |evidence| {
+                ready(Ok(evidence))
+            })
+            .await
     }
 
     /// Prepare input for the selected diagnostic model from an exact Host read.
@@ -227,30 +260,48 @@ impl crate::app_state::AppState {
         model: &Model,
         meter: impl FnOnce(&Model, &str, &[EvidenceRef]) -> std::result::Result<u32, PortError>,
     ) -> Result<DiagnosticInput> {
-        self.with_work_patrol_evidence(
-            &through.scope,
-            expected_ticket_commit,
-            since_cursor,
-            |evidence| {
-                ready(
-                    prepare_diagnostic_input(
-                        &evidence,
-                        expected_ticket_commit,
-                        since_cursor,
-                        through,
-                        model,
-                        meter,
+        self.patrol_evidence_reader()
+            .with_work_patrol_evidence(
+                &through.scope,
+                expected_ticket_commit,
+                since_cursor,
+                |evidence| {
+                    ready(
+                        prepare_diagnostic_input(
+                            &evidence,
+                            expected_ticket_commit,
+                            since_cursor,
+                            through,
+                            model,
+                            meter,
+                        )
+                        .map_err(patrol_error),
                     )
-                    .map_err(patrol_error),
-                )
-            },
-        )
-        .await
+                },
+            )
+            .await
     }
 
     /// Read and meter the configured patrol prompt. The numeric prompt must be
     /// sent unchanged if a future provider adapter admits this preparation.
     pub async fn read_configured_work_patrol_diagnostic_input(
+        &self,
+        through: &Observation,
+        expected_ticket_commit: &str,
+        since_cursor: u64,
+    ) -> Result<Option<PreparedPatrolDiagnostic>> {
+        self.patrol_evidence_reader()
+            .read_configured_work_patrol_diagnostic_input(
+                through,
+                expected_ticket_commit,
+                since_cursor,
+            )
+            .await
+    }
+}
+
+impl EvidenceReader<'_> {
+    pub(super) async fn read_configured_work_patrol_diagnostic_input(
         &self,
         through: &Observation,
         expected_ticket_commit: &str,
@@ -270,7 +321,7 @@ impl crate::app_state::AppState {
         .map(Some)
     }
 
-    async fn read_patrol_diagnostic_for_selection(
+    pub(super) async fn read_patrol_diagnostic_for_selection(
         &self,
         through: &Observation,
         expected_ticket_commit: &str,
@@ -358,21 +409,12 @@ impl crate::app_state::AppState {
         &self,
         context: &ProjectContextSnapshot,
     ) -> Result<ProjectManifest> {
-        let projects = self.project_store.clone();
-        let root = self.tickets.root.clone();
-        let project = context.project_id.clone();
-        tokio::task::spawn_blocking(move || {
-            if projects.paths().data_dir().canonicalize()? != root.canonicalize()? {
-                return Err(Error::ScopeDenied(
-                    "Project store is outside the current Host".into(),
-                ));
-            }
-            projects.get_read_only(&project).map_err(|_| {
-                Error::AuthorityUnavailable("Project read-only proof unavailable".into())
-            })
-        })
+        read_project(
+            self.project_store.clone(),
+            self.tickets.root.clone(),
+            context.project_id.clone(),
+        )
         .await
-        .map_err(|_| Error::AuthorityUnavailable("Project evidence reader stopped".into()))?
     }
 
     async fn evidence_fence(
@@ -439,6 +481,47 @@ impl crate::app_state::AppState {
             .await?;
         Ok(result)
     }
+}
+
+async fn read_project(
+    projects: Arc<ProjectStore>,
+    root: std::path::PathBuf,
+    project: bamboo_domain::ProjectId,
+) -> Result<ProjectManifest> {
+    tokio::task::spawn_blocking(move || {
+        if projects.paths().data_dir().canonicalize()? != root.canonicalize()? {
+            return Err(Error::ScopeDenied(
+                "Project store is outside the current Host".into(),
+            ));
+        }
+        projects
+            .get_read_only(&project)
+            .map_err(|_| Error::AuthorityUnavailable("Project read-only proof unavailable".into()))
+    })
+    .await
+    .map_err(|_| Error::AuthorityUnavailable("Project evidence reader stopped".into()))?
+}
+
+pub(super) async fn current_project_manifest(
+    projects: Arc<ProjectStore>,
+    root: std::path::PathBuf,
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    source_revision: u64,
+) -> Result<ProjectManifest> {
+    let (commit, _) = service.published()?;
+    let snapshot = authorized(service, authority, scope, &commit)?;
+    if snapshot.execution_facts_revision() != source_revision {
+        return Err(Error::RevisionConflict);
+    }
+    let plan = Plan::prepare(&snapshot, scope, &commit, 0)?;
+    let manifest = read_project(projects, root, plan.context().project_id.clone()).await?;
+    plan.validate_project(&manifest)?;
+    if service.published()?.1.execution_facts_revision() != source_revision {
+        return Err(Error::RevisionConflict);
+    }
+    Ok(manifest)
 }
 
 #[cfg(all(test, unix))]

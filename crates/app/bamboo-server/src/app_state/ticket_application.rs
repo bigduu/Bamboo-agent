@@ -28,6 +28,8 @@ pub struct TicketApplication {
     workspace: String,
     ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
     ready_owner: tokio::sync::Mutex<ready_owner::ReadyOwnerControl>,
+    patrol_sources: OnceLock<patrol_adapter::EvidenceSources>,
+    patrol_calls: Arc<bamboo_orchestration::patrol::calls::Calls>,
     // Registration and close share a short, synchronous gate. TaskTracker's
     // close alone does not prevent a new task from retaining the writer.
     cancellation_tasks: parking_lot::Mutex<tokio_util::task::TaskTracker>,
@@ -99,6 +101,8 @@ impl TicketApplication {
                 Arc::new(bamboo_orchestration::ready_recovery::SystemReadyRetryClock),
             )),
             ready_owner: tokio::sync::Mutex::new(ready_owner::ReadyOwnerControl::default()),
+            patrol_sources: OnceLock::new(),
+            patrol_calls: Arc::default(),
             cancellation_tasks: parking_lot::Mutex::new(tokio_util::task::TaskTracker::new()),
             #[cfg(test)]
             cancellation_probe: parking_lot::Mutex::new(CancellationProbe::default()),

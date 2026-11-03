@@ -63,6 +63,38 @@ impl ProgramPatrol {
         checkpoints: &mut dyn CheckpointPort,
         observations: &mut dyn FnMut(&Scope) -> Result<super::host::TicketObservation, PortError>,
     ) -> Result<usize, Error> {
+        self.visit_project_with_observations(
+            service,
+            authority,
+            selection,
+            clock,
+            checkpoints,
+            observations,
+            &mut |scope, checkpoints, observations, _existing| {
+                self.tick(scope, clock, checkpoints, observations)
+                    .map(|_| ())
+            },
+        )
+    }
+
+    /// Visit only due, currently authorized scopes through the same bounded
+    /// Ready selection. The outer Host can supply the staged semantic pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn visit_project_with_observations(
+        &self,
+        service: &bamboo_tickets::TicketService,
+        authority: &bamboo_tickets::Authority,
+        selection: &ProgramSelection<'_>,
+        clock: &dyn Clock,
+        checkpoints: &mut dyn CheckpointPort,
+        observations: &mut dyn FnMut(&Scope) -> Result<super::host::TicketObservation, PortError>,
+        visit: &mut dyn FnMut(
+            &Scope,
+            &mut dyn CheckpointPort,
+            &mut dyn ObservationPort,
+            Option<&StoredCheckpoint>,
+        ) -> Result<(), Error>,
+    ) -> Result<usize, Error> {
         if selection.work_ids.len() > bamboo_tickets::CLAIM_CANDIDATE_LIMIT
             || selection.work_ids.iter().any(|id| !super::valid_id(id))
             || selection
@@ -139,7 +171,7 @@ impl ProgramPatrol {
                     continue;
                 }
             }
-            self.tick(&scope, clock, checkpoints, &mut observation)?;
+            visit(&scope, checkpoints, &mut observation, existing.as_ref())?;
             checked += 1;
         }
         Ok(checked)

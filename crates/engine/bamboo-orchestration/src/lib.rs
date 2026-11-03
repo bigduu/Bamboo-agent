@@ -156,8 +156,9 @@ pub trait ReadyWorkHost: Send + Sync {
     async fn authority(&self) -> Result<(Arc<TicketService>, Authority)>;
     async fn check_budget(&self, max_rounds: u32) -> Result<()>;
     /// Observe only the Works selected by this already installed Host policy.
-    /// This creates no grant, diagnostic model call or recovery action. The
-    /// Host may stage a bounded decision notice without granting activation.
+    /// The Host may stage a bounded decision notice or a diagnostic under
+    /// this live fence and the canonical Work budget. The pass grants no
+    /// additional execution authority.
     async fn reconcile_program_patrol(
         &self,
         _selection: &patrol::program::ProgramSelection<'_>,
@@ -443,7 +444,7 @@ impl ReadyWorkScheduler {
         let policy = installed.policy.clone();
         host.check_budget(policy.max_rounds).await?;
         let (service, authority) = host.authority().await?;
-        let (commit, snapshot) = service.published()?;
+        let (_, snapshot) = service.published()?;
         if snapshot.binding != installed.binding || snapshot.authority_epoch != installed.epoch {
             return Ok(ReadyReconcile::Disabled);
         }
@@ -463,9 +464,15 @@ impl ReadyWorkScheduler {
         {
             // A degraded observer never changes Work facts or blocks otherwise
             // legal dispatch. Keep the actual error visible for the next pass.
-            tracing::warn!(%error, "Ready Work program patrol remains unavailable");
+            tracing::warn!(%error, "Ready Work patrol remains unavailable");
         }
         patrol_fence.check()?;
+        // Patrol accounting may advance HEAD while preserving the execution
+        // facts. Any later Start or retry still uses a fresh canonical view.
+        let (commit, snapshot) = service.published()?;
+        if snapshot.binding != installed.binding || snapshot.authority_epoch != installed.epoch {
+            return Ok(ReadyReconcile::Disabled);
+        }
         let mut candidates = Vec::new();
         let mut retry_permits = BTreeMap::new();
         let mut blocked = None;

@@ -107,6 +107,7 @@ data can contain:
     "provider": "patrol-local",
     "model": "gpt-oss-20b",
     "protocol": "llama_cpp_raw_v1",
+    "endpoint": "127.0.0.1:8080",
     "max_input_tokens": 4096,
     "max_output_tokens": 256,
     "max_evidence_bytes": 16384,
@@ -115,7 +116,7 @@ data can contain:
 }
 ```
 
-The provider is an explicit routing identifier for future admission. The
+The provider is an explicit routing identifier for patrol admission. The
 profile requires the pinned model name and uses the bundled Harmony
 vocabulary. Orchestration renders the read-only instructions, response schema
 and exact summary/reference data. The LLM layer adds the Harmony role framing
@@ -130,9 +131,19 @@ submitting any evidence. The checks identify the deployment's compatible
 protocol profile. Only raw output tokens in a completed final-channel frame
 can yield advisory text. Native final input and output counters are returned
 separately, including observed excess output. A transport failure or missing
-usage retains unknown status. The caller must acquire canonical Work budget
-admission before consuming the prepared request. Program patrol has yet to
-assemble this transport into its runtime.
+usage retains unknown status. The optional endpoint enables the existing Ready
+worker to use this transport for an eligible anomaly. Omit it to keep the
+program-only pass and the read-only preparation API.
+
+Orchestration stages the input and reserves against the canonical Work,
+UTC-day and total token ceilings before publishing the exact diagnostic
+checkpoint. Only a live staged submission can schedule the provider call.
+The Host checks the selected configuration, Ready fence, current Ticket,
+Project and unsettled receipt before sending. The provider task reports usage
+against the original receipt even if the diagnostic result has become stale.
+Unknown usage retains the original caps. An observed overrun halts admission,
+and exact results awaiting accounting use the existing receipt and checkpoint.
+The operator supplies and trusts the loopback deployment.
 
 [Harmony format](https://developers.openai.com/cookbook/articles/openai-harmony) ·
 [llama.cpp raw completion](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-completion-given-a-prompt-it-returns-the-predicted-completion)
