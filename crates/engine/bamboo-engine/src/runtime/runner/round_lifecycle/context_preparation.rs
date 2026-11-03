@@ -1815,9 +1815,14 @@ async fn maybe_apply_summary_context_compression_with_budget(
         &counter,
     )
     .await?;
-    if matches!(forced_trigger_type, Some(CompressionTriggerType::Manual))
-        && preflight.active_tokens <= range.target_tokens
-    {
+    let user_command = matches!(forced_trigger_type, Some(CompressionTriggerType::Manual));
+    if user_command && preflight.active_tokens <= range.target_tokens {
+        tracing::debug!(
+            session_id,
+            active_tokens = preflight.active_tokens,
+            target_tokens = range.target_tokens,
+            "Context already fits the command's target"
+        );
         return Ok(false);
     }
     let active_tokens = exposure.active_tokens.max(preflight.active_tokens);
@@ -2139,7 +2144,17 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 "Message summary deferred until tool protocol is complete and compressible"
             );
             emit_context_compression_status(event_tx, phase_label, "deferred_tool_protocol").await;
+            if user_command {
+                return Err(AgentError::Budget(format!(
+                    "Tool history must be complete before compression: {reason}"
+                )));
+            }
             return Ok(false);
+        }
+        Err(reason @ CompressionPlanError::ProtectedContentExceedsTarget { .. })
+            if user_command =>
+        {
+            return Err(AgentError::Budget(reason.to_string()));
         }
         Err(reason) => {
             tracing::warn!(
@@ -2198,7 +2213,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
         if projected_tokens > range.target_tokens {
             emit_context_compression_status(event_tx, phase_label,
                 &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
-            return Ok(false);
+            return command_target_outcome(user_command, projected_tokens, range.target_tokens);
         }
         plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
             projected_tokens,
@@ -2284,6 +2299,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
         .filter(|value| !value.is_empty())
     else {
         emit_context_compression_status(event_tx, phase_label, "skipped_no_background_model").await;
+        if user_command {
+            return Err(AgentError::Budget(
+                "No task-summary model is available".into(),
+            ));
+        }
         return Ok(false);
     };
 
@@ -2488,7 +2508,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
         );
         emit_context_compression_status(event_tx, phase_label,
             &format!("failed_postcondition:provider request exceeds target (projected={projected_tokens}, target={})", range.target_tokens)).await;
-        return Ok(false);
+        return command_target_outcome(user_command, projected_tokens, range.target_tokens);
     }
     plan.active_usage_after_percent = bamboo_compression::context_window_usage_percent(
         projected_tokens,
@@ -2632,6 +2652,19 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // Clear manual compression flag after successful compression.
     session.force_manual_compression = None;
     Ok(true)
+}
+
+fn command_target_outcome(
+    user_command: bool,
+    projected_tokens: u32,
+    target_tokens: u32,
+) -> Result<bool, AgentError> {
+    if user_command {
+        return Err(AgentError::Budget(format!(
+            "Estimated provider request exceeds the compression target ({projected_tokens} > {target_tokens} tokens)"
+        )));
+    }
+    Ok(false)
 }
 
 fn archived_message_tokens_saved(session: &Session, plan: &CompressionPlan) -> u32 {

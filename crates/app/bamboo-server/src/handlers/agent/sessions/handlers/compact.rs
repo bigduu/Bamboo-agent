@@ -113,7 +113,7 @@ async fn compact_owned_session(
         staged.last_run_status().as_deref(),
         Some("pending" | "running" | "suspended")
     ) || has_pending_user_message(&staged)
-        || bamboo_domain::conversation_clear_readback_pending_rejection(&staged).is_some()
+        || bamboo_domain::conversation_compaction_pending_rejection(&staged).is_some()
     {
         return Ok(conflict(
             "Wait for pending Session work or responses before compressing",
@@ -240,7 +240,3 @@ async fn compact_owned_session(
         ))),
     }
 }
-
-#[cfg(test)]
-#[path = "compact_tests.rs"]
-mod tests;

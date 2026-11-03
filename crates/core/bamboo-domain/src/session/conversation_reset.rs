@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{AgentStatusState, PlanModeStatus, Role, Session, SessionKind};
+use super::{AgentRuntimeState, AgentStatusState, PlanModeStatus, Role, Session, SessionKind};
 
 pub const CONVERSATION_RESET_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_RESET_RECEIPT_LIMIT: usize = 8;
@@ -210,7 +210,7 @@ impl ConversationResetState {
 pub fn conversation_reset_pending_rejection(
     session: &Session,
 ) -> Option<ConversationResetRejection> {
-    pending_snapshot_rejection(session, false)
+    pending_snapshot_rejection(session, false, false)
 }
 
 /// C1 preserves an idle, non-approval Plan. Every other pending or uncertain
@@ -218,12 +218,25 @@ pub fn conversation_reset_pending_rejection(
 pub fn conversation_clear_readback_pending_rejection(
     session: &Session,
 ) -> Option<ConversationResetRejection> {
-    pending_snapshot_rejection(session, true)
+    pending_snapshot_rejection(session, true, false)
+}
+
+/// Compaction preserves the control plane. Accept a readable legacy runtime
+/// mirror only when it and the typed state both permit idle maintenance.
+pub fn conversation_compaction_pending_rejection(
+    session: &Session,
+) -> Option<ConversationResetRejection> {
+    pending_snapshot_rejection(session, true, true).or_else(|| {
+        session
+            .has_runtime_wait()
+            .then_some(ConversationResetRejection::PendingWait)
+    })
 }
 
 fn pending_snapshot_rejection(
     session: &Session,
     allow_idle_plan: bool,
+    read_legacy_runtime: bool,
 ) -> Option<ConversationResetRejection> {
     use ConversationResetRejection as Rejection;
     if session
@@ -244,15 +257,24 @@ fn pending_snapshot_rejection(
     if session.pending_question.is_some() {
         return Some(Rejection::PendingQuestion);
     }
-    // The engine still reads this mirror as a fallback. Do not erase or
-    // silently reinterpret a legacy control plane during conversation reset.
-    if session.metadata.contains_key("agent.runtime.state") {
-        return Some(Rejection::LegacyRuntimeState);
-    }
+    // Clear/reset cannot discard an old control plane. Compaction keeps it,
+    // so inspect both representations and reject any unreadable mirror.
+    let legacy_runtime = match session.metadata.get("agent.runtime.state") {
+        Some(raw) if read_legacy_runtime => match serde_json::from_str::<AgentRuntimeState>(raw) {
+            Ok(runtime) => Some(runtime),
+            Err(_) => return Some(Rejection::LegacyRuntimeState),
+        },
+        Some(_) => return Some(Rejection::LegacyRuntimeState),
+        None => None,
+    };
     if session.has_pending_injected_messages() {
         return Some(Rejection::PendingInput);
     }
-    if let Some(runtime) = &session.agent_runtime_state {
+    for runtime in session
+        .agent_runtime_state
+        .iter()
+        .chain(legacy_runtime.as_ref())
+    {
         if matches!(
             runtime.status,
             AgentStatusState::Initializing
