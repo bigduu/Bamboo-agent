@@ -58,6 +58,40 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
     assert!(started > 0);
     assert!(sample(&fixture, &second_work).await.started_at_ms.is_some());
     assert_eq!(sample(&fixture, &queued_work).await.started_at_ms, None);
+    let queued_assignment = before
+        .1
+        .assignments
+        .values()
+        .find(|a| a.work_id == queued_work)
+        .unwrap();
+    let queued_child = ticket_runtime::ticket_child_id(&queued_assignment.dispatch_key);
+    let (queued_run, queued_birth) = tokio::time::timeout(WAIT, async {
+        loop {
+            if let (Some(run), Some(child)) = (
+                fixture
+                    .state
+                    .session_activation_router
+                    .current_run_id(&queued_child)
+                    .await,
+                fixture
+                    .state
+                    .storage
+                    .load_runtime_control_plane(&queued_child)
+                    .await
+                    .unwrap(),
+            ) {
+                break (run, child.created_at);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the third native logical Run is prepared behind the two real slots");
+    assert!(fixture
+        .state
+        .spawn_scheduler
+        .native_task_start(&queued_child, &queued_run, queued_birth)
+        .is_none());
     assert_eq!(
         sample(&fixture, &first_work).await.started_at_ms,
         Some(started)
