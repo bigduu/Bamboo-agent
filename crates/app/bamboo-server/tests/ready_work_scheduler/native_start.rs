@@ -1,4 +1,4 @@
-//! Live native entry and renewal evidence from the real runner.
+//! Live native entry, renewal and verified progress from the real runner.
 use super::*;
 use bamboo_domain::ActorDirectoryPort;
 use bamboo_orchestration::patrol::{Observation, ObservationPort};
@@ -16,9 +16,158 @@ async fn sample(fixture: &Fixture, work: &str, assignment: &str) -> Observation 
         .patrol_observation(&scope)
         .await
         .unwrap();
-    let sample = port.observation(&scope, 0).unwrap();
-    assert_eq!(sample.progress, None);
-    sample
+    port.observation(&scope, 0).unwrap()
+}
+
+fn file_call(request: Request, id: &str, tool: &str, arguments: serde_json::Value) {
+    assert!(request
+        .tools
+        .iter()
+        .any(|schema| schema.function.name == tool));
+    request
+        .reply
+        .send(Reply::File(ToolCall {
+            id: id.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: tool.into(),
+                arguments: arguments.to_string(),
+            },
+        }))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn live_workspace_progress_requires_an_actual_committed_native_write() {
+    use bamboo_orchestration::patrol::{
+        program::ProgramPatrol, CheckpointPort, Clock, Policy, Reason, Status,
+    };
+    use bamboo_server::app_state::ticket_application::PatrolCheckpointStore;
+
+    struct FixedClock(u64);
+    impl Clock for FixedClock {
+        fn now_ms(&self) -> u64 {
+            self.0
+        }
+    }
+    let clock = || FixedClock(chrono::Utc::now().timestamp_millis().try_into().unwrap());
+    let mut fixture = Fixture::with_tools(1, true, &["Read", "Write"]).await;
+    fixture
+        .state
+        .tickets
+        .install_ready_work_policy(fixture.policy(1))
+        .await
+        .unwrap();
+    let first = fixture.next_request().await;
+    let work = fixture.works[0].id.clone();
+    let path = Path::new(&fixture.works[0].workspace.worktree).join("native-result.txt");
+    let before = fixture.snapshot();
+    let assignment = before.tickets[&work].active_assignment.clone().unwrap();
+    let receipt = before.assignments[&assignment].runtime.clone().unwrap();
+    let initial = sample(&fixture, &work, &assignment).await;
+    let entered = initial.started_at_ms.expect("real native Task entered");
+    assert_eq!(initial.progress, None);
+    assert!(!path.exists());
+    let scope = initial.scope;
+    let program = ProgramPatrol::new(Policy::default()).unwrap();
+    let mut journal = PatrolCheckpointStore::open(
+        &fixture
+            ._root
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("progress-control"),
+    )
+    .unwrap();
+    let mut before_write = fixture
+        .state
+        .tickets
+        .patrol_observation(&scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        program
+            .tick(&scope, &clock(), &mut journal, &mut before_write)
+            .unwrap()
+            .status,
+        Status::Incident
+    );
+    assert_eq!(
+        journal
+            .load(&scope)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .incident
+            .unwrap()
+            .reason,
+        Reason::EvidenceUnknown
+    );
+
+    file_call(
+        first,
+        "work-progress-write",
+        "Write",
+        json!({"file_path":path,"content":"verified output"}),
+    );
+    let after_write = fixture.next_request().await;
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "verified output");
+    let observed = sample(&fixture, &work, &assignment).await;
+    let progress = observed
+        .progress
+        .expect("committed artifact was observed while live");
+    let snapshot = fixture.snapshot();
+    let (effect_id, effect) = snapshot.assignments[&assignment]
+        .effects
+        .iter()
+        .next()
+        .unwrap();
+    assert_eq!(effect.state, bamboo_tickets::EffectState::Succeeded);
+    assert_eq!(
+        progress.sequence,
+        snapshot.receipts[effect_id].committed_seq
+    );
+    assert!(progress.at_ms >= entered);
+    let mut after_write_observation = fixture
+        .state
+        .tickets
+        .patrol_observation(&scope)
+        .await
+        .unwrap();
+    assert_eq!(
+        program
+            .tick(&scope, &clock(), &mut journal, &mut after_write_observation)
+            .unwrap()
+            .status,
+        Status::Resolved
+    );
+    assert_eq!(
+        sample(&fixture, &work, &assignment).await.progress,
+        Some(progress)
+    );
+
+    file_call(
+        after_write,
+        "work-progress-read",
+        "Read",
+        json!({"file_path":path}),
+    );
+    let after_read = fixture.next_request().await;
+    assert!(after_read.messages.iter().any(|message| {
+        message.role == Role::Tool && message.content.contains("verified output")
+    }));
+    assert_eq!(
+        sample(&fixture, &work, &assignment).await.progress,
+        Some(progress)
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 3);
+
+    after_read.complete();
+    fixture.wait_submitted(&work).await;
+    wait_native_terminal(&fixture.state, &receipt.session_id).await;
+    let stopped = sample(&fixture, &work, &assignment).await;
+    assert_eq!(stopped.started_at_ms, None);
+    assert_eq!(stopped.progress, None);
 }
 
 #[tokio::test]
@@ -182,6 +331,7 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
     .await
     .expect("the admitted Task reports a successful renewal");
     let observed = sample(&fixture, &first_work, first_assignment).await;
+    assert_eq!(observed.progress, None);
     assert!(heartbeat >= started);
     assert!(observed.heartbeat_at_ms.is_some_and(|at| at >= heartbeat));
     assert_eq!(

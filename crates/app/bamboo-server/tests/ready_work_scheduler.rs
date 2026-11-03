@@ -38,6 +38,7 @@ const MAX_ROUNDS: u32 = 4;
 enum Reply {
     Task,
     LoopTask(u32),
+    File(ToolCall),
     Complete,
 }
 
@@ -133,6 +134,7 @@ impl LLMProvider for ControlledProvider {
                     .to_string(),
                 },
             }]),
+            Reply::File(call) => LLMChunk::ToolCalls(vec![call]),
             Reply::Complete => LLMChunk::Token(RESULT.into()),
         };
         Ok(Box::pin(futures::stream::iter([
@@ -294,6 +296,10 @@ impl Fixture {
     }
 
     async fn with_explicit_scope(work_count: usize, explicit: bool) -> Self {
+        Self::with_tools(work_count, explicit, &["Task"]).await
+    }
+
+    async fn with_tools(work_count: usize, explicit: bool, allowed_tools: &[&str]) -> Self {
         let root = tempfile::tempdir().unwrap();
         // The named-profile reader opens the physical home without following
         // symlinks. macOS TempDir may use /var; pass its canonical directory to
@@ -401,7 +407,7 @@ impl Fixture {
                 constraints: vec!["Use only the granted local plan".into()],
                 acceptance: vec!["A human reviews the submitted result".into()],
                 user_acceptance_required: true,
-                allowed_tools: BTreeSet::from(["Task".into()]),
+                allowed_tools: allowed_tools.iter().map(|tool| (*tool).into()).collect(),
             };
             let create = service
                 .prepare_command(
