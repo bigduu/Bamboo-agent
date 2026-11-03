@@ -2,6 +2,9 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use bamboo_orchestration::patrol::*;
 
+#[path = "patrol/staged_pass.rs"]
+mod staged_pass;
+
 struct FakeClock(u64);
 impl Clock for FakeClock {
     fn now_ms(&self) -> u64 {
