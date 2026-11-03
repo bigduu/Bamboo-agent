@@ -123,6 +123,29 @@ existing patrol can diagnose stale measured progress or resolve an incident
 after a later observed boundary. Submission and acceptance retain their
 existing independent authority.
 
+## Owner runtime observation API
+
+Send `POST /api/v1/tickets/patrol/observation` with one `project_id`, `work_id`
+and `assignment_id`. The Host authorizes the owner and verifies the current
+attempt. The response includes the canonical Scope, Ticket commit, nullable
+`started_at_ms`, `heartbeat_at_ms`, `progress` and `expected_wait`. A progress
+sample has `sequence` and `at_ms`. A supported wait has its kind, issue time
+and diagnostic allowance limit. That limit is a patrol threshold.
+
+`state: "observed"` means at least one of these facts is available.
+`state: "unknown"` means the current read yielded none. A partial sample can
+have a known heartbeat and unknown progress. `execution_outcome_unknown`
+reports when the ledger cannot establish the execution outcome. Clients receive
+`Cache-Control: no-store` and should render the individual nullable facts.
+Foreign or stale selectors fail closed. The Host checks authority and the
+Ticket commit during source collection, and HTTP rechecks owner access before
+returning the sample. Error responses preserve the status code and use a
+generic message for Host observation errors.
+
+The separate `/patrol/status` route continues to read saved checkpoint
+bookkeeping. Both routes are read-only. A runtime observation uses the same
+Host fences as program patrol and can be read without creating a journal.
+
 ## Acceptance ownership
 
 Ordinary Cargo integration target `patrol_runtime_observation` owns the real

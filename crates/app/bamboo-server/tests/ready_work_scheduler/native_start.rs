@@ -1,7 +1,7 @@
 //! Live native entry, renewal and verified progress from the real runner.
 use super::*;
 use bamboo_domain::ActorDirectoryPort;
-use bamboo_orchestration::patrol::{Observation, ObservationPort};
+use bamboo_orchestration::patrol::{Observation, ObservationPort, Scope};
 
 async fn sample(fixture: &Fixture, work: &str, assignment: &str) -> Observation {
     let scope = fixture
@@ -17,6 +17,38 @@ async fn sample(fixture: &Fixture, work: &str, assignment: &str) -> Observation 
         .await
         .unwrap();
     port.observation(&scope, 0).unwrap()
+}
+
+async fn sample_http(
+    fixture: &Fixture,
+    scope: &Scope,
+    expected_status: actix_web::http::StatusCode,
+) -> serde_json::Value {
+    use actix_web::{test, App};
+    let app = test::init_service(
+        App::new()
+            .app_data(fixture.state.clone())
+            .configure(bamboo_server::routes::configure_routes),
+    )
+    .await;
+    let response = test::call_service(
+        &app,
+        test::TestRequest::post()
+            .uri("/api/v1/tickets/patrol/observation")
+            .peer_addr("127.0.0.1:43210".parse().unwrap())
+            .set_json(json!({
+                "project_id":scope.project_id,
+                "work_id":scope.work_id,
+                "assignment_id":scope.assignment_id
+            }))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), expected_status);
+    if response.status().is_success() {
+        assert_eq!(response.headers().get("cache-control").unwrap(), "no-store");
+    }
+    test::read_body_json(response).await
 }
 
 fn file_call(request: Request, id: &str, tool: &str, arguments: serde_json::Value) {
@@ -39,6 +71,7 @@ fn file_call(request: Request, id: &str, tool: &str, arguments: serde_json::Valu
 
 #[tokio::test]
 async fn live_workspace_progress_requires_an_actual_committed_native_write() {
+    use actix_web::http::StatusCode;
     use bamboo_orchestration::patrol::{
         program::ProgramPatrol, CheckpointPort, Clock, Policy, Reason, Status,
     };
@@ -69,6 +102,11 @@ async fn live_workspace_progress_requires_an_actual_committed_native_write() {
     assert_eq!(initial.progress, None);
     assert!(!path.exists());
     let scope = initial.scope;
+    let live = sample_http(&fixture, &scope, StatusCode::OK).await;
+    assert_eq!(live["scope"], serde_json::to_value(&scope).unwrap());
+    assert_eq!(live["state"], "observed");
+    assert_eq!(live["started_at_ms"], entered);
+    assert!(live["progress"].is_null());
     let program = ProgramPatrol::new(Policy::default()).unwrap();
     let mut journal = PatrolCheckpointStore::open(
         &fixture
@@ -128,6 +166,18 @@ async fn live_workspace_progress_requires_an_actual_committed_native_write() {
         snapshot.receipts[effect_id].committed_seq
     );
     assert!(progress.at_ms >= entered);
+    let service = fixture.state.tickets.service().unwrap();
+    let head = service.published().unwrap().0;
+    let response = sample_http(&fixture, &scope, StatusCode::OK).await;
+    assert_eq!(response["ticket_commit"], head);
+    assert_eq!(
+        response["progress"],
+        json!({"sequence":progress.sequence,"at_ms":progress.at_ms})
+    );
+    let repeated = sample_http(&fixture, &scope, StatusCode::OK).await;
+    assert_eq!(repeated["progress"], response["progress"]);
+    assert_eq!(service.published().unwrap().0, head);
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 2);
     let mut after_write_observation = fixture
         .state
         .tickets
@@ -168,6 +218,100 @@ async fn live_workspace_progress_requires_an_actual_committed_native_write() {
     let stopped = sample(&fixture, &work, &assignment).await;
     assert_eq!(stopped.started_at_ms, None);
     assert_eq!(stopped.progress, None);
+    let response = sample_http(&fixture, &scope, StatusCode::OK).await;
+    assert_eq!(response["state"], "unknown");
+    assert!(response["progress"].is_null());
+    assert!(response["started_at_ms"].is_null());
+
+    fixture.state.tickets.revoke_ready_work_policy().await;
+    let submission_id = fixture.snapshot().tickets[&work]
+        .current_submission
+        .clone()
+        .unwrap();
+    let principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (_, authority) = fixture
+        .state
+        .tickets
+        .authority(principal.clone())
+        .await
+        .unwrap();
+    let reject = service
+        .prepare_command(
+            &authority,
+            "retire-progress-attempt",
+            vec![Operation::Reject {
+                work_id: work,
+                submission_id,
+                reason: "fixture rework".into(),
+            }],
+        )
+        .unwrap();
+    fixture
+        .state
+        .tickets
+        .update(principal, &reject)
+        .await
+        .unwrap();
+    sample_http(&fixture, &scope, StatusCode::FORBIDDEN).await;
+}
+
+#[tokio::test]
+async fn owner_http_preserves_canonical_outcome_uncertainty_without_measurements() {
+    use actix_web::http::StatusCode;
+    let mut fixture = Fixture::new(1).await;
+    fixture
+        .state
+        .tickets
+        .install_ready_work_policy(fixture.policy(1))
+        .await
+        .unwrap();
+    let held = fixture.next_request().await;
+    let work = &fixture.works[0].id;
+    let assignment = fixture.snapshot().tickets[work]
+        .active_assignment
+        .clone()
+        .unwrap();
+    let scope = sample(&fixture, work, &assignment).await.scope;
+    assert_eq!(
+        sample_http(&fixture, &scope, StatusCode::OK).await["state"],
+        "observed"
+    );
+
+    let (service, authority) = fixture
+        .state
+        .tickets
+        .authority(Principal::Runtime)
+        .await
+        .unwrap();
+    let command = service
+        .prepare_command(
+            &authority,
+            "fixture-uncertain-outcome",
+            vec![Operation::OutcomeUnknown {
+                assignment_id: assignment,
+                reason: "fixture unconfirmed outcome".into(),
+            }],
+        )
+        .unwrap();
+    service.execute(&authority, &command).unwrap();
+    let head = service.published().unwrap().0;
+    let response = sample_http(&fixture, &scope, StatusCode::OK).await;
+    assert_eq!(response["state"], "unknown");
+    assert_eq!(response["execution_outcome_unknown"], true);
+    for field in [
+        "started_at_ms",
+        "heartbeat_at_ms",
+        "progress",
+        "expected_wait",
+    ] {
+        assert!(response[field].is_null(), "{field}: {response}");
+    }
+    assert_eq!(service.published().unwrap().0, head);
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 1);
+    drop(held);
+    fixture.state.shutdown().await;
 }
 
 #[tokio::test]
@@ -334,6 +478,11 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
     assert_eq!(observed.progress, None);
     assert!(heartbeat >= started);
     assert!(observed.heartbeat_at_ms.is_some_and(|at| at >= heartbeat));
+    let response = sample_http(&fixture, &observed.scope, actix_web::http::StatusCode::OK).await;
+    assert!(response["heartbeat_at_ms"]
+        .as_u64()
+        .is_some_and(|at| at >= heartbeat));
+    assert!(response["progress"].is_null());
     assert_eq!(
         fixture
             .state
