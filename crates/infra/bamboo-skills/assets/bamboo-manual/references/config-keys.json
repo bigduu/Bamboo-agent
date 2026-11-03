@@ -293,6 +293,23 @@
     },
     {
       "aliases": [],
+      "default": null,
+      "example": {
+        "max_evidence_bytes": 16384,
+        "max_evidence_refs": 16,
+        "max_input_tokens": 4096,
+        "max_output_tokens": 256,
+        "model": "gpt-oss-20b",
+        "protocol": "llama_cpp_raw_v1",
+        "provider": "patrol-local"
+      },
+      "key": "patrol_model",
+      "meaning": "Optional independent model for offline patrol prompt preparation. The raw profile pins gpt-oss-20b. Provider execution requires separate admission.",
+      "section": "model-policy",
+      "type": "option<object>"
+    },
+    {
+      "aliases": [],
       "default": "127.0.0.1",
       "example": "0.0.0.0",
       "key": "server.bind",
@@ -585,6 +602,13 @@
       "kind": "compatibility_dto_field",
       "root": "notifications",
       "section": "notifications"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 1,
+      "kind": "compatibility_dto_field",
+      "root": "patrol_model",
+      "section": "model-policy"
     },
     {
       "coverage": "not_documented",

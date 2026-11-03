@@ -126,6 +126,23 @@ pub fn entries() -> Vec<Entry> {
     entries.push(Entry { key: "context_management.target_usage_ratio", kind: "f64", example: json!(0.20),
         meaning: "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
         aliases: &[], read: |c| json!(c.context_management.target_usage_ratio), required_when: None });
+    entries.push(Entry {
+        key: "patrol_model",
+        kind: "option<object>",
+        example: json!({
+            "provider": "patrol-local",
+            "model": "gpt-oss-20b",
+            "protocol": "llama_cpp_raw_v1",
+            "max_input_tokens": 4096,
+            "max_output_tokens": 256,
+            "max_evidence_bytes": 16384,
+            "max_evidence_refs": 16
+        }),
+        meaning: "Optional independent model for offline patrol prompt preparation. The raw profile pins gpt-oss-20b. Provider execution requires separate admission.",
+        aliases: &[],
+        read: |c| json!(c.patrol_model),
+        required_when: None,
+    });
     entries.sort_by_key(|entry| entry.key);
     entries
 }
