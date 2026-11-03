@@ -163,6 +163,86 @@ fn existing_replacement_is_denied_without_effect_and_new_files_are_private() {
 }
 
 #[test]
+fn workspace_progress_uses_only_new_confirmed_artifact_receipts_in_the_window() {
+    let f = fixture();
+    let root = Path::new(&f.workspace.worktree);
+    let snapshot = || f.service.published().unwrap().1;
+    let latest = || snapshot().latest_workspace_write_progress(&f.assignment, 1, u64::MAX);
+    assert_eq!(latest(), None);
+
+    let first_path = root.join("first");
+    let first = write(&first_path, "first result", None);
+    let reply = f
+        .service
+        .workspace_file(&f.worker, "first", &first)
+        .unwrap();
+    let (sequence, at_ms) = latest().expect("committed new artifact");
+    let committed = snapshot();
+    assert_eq!(sequence, committed.seq);
+    assert_eq!(
+        std::fs::read_to_string(&first_path).unwrap(),
+        "first result"
+    );
+    assert_eq!(
+        committed.latest_workspace_write_progress(&f.assignment, at_ms, at_ms),
+        Some((sequence, at_ms))
+    );
+    assert_eq!(
+        committed.latest_workspace_write_progress(&f.assignment, 1, at_ms - 1),
+        None
+    );
+    assert_eq!(
+        committed.latest_workspace_write_progress(&f.assignment, at_ms + 1, u64::MAX),
+        None
+    );
+
+    let mut legacy = committed;
+    let id = legacy.assignments[&f.assignment]
+        .effects
+        .keys()
+        .next()
+        .unwrap()
+        .clone();
+    legacy
+        .receipts
+        .get_mut(&id)
+        .unwrap()
+        .ids
+        .retain(|key, _| key == "sha256" || key == "artifact");
+    assert_eq!(
+        legacy.latest_workspace_write_progress(&f.assignment, 1, u64::MAX),
+        None
+    );
+
+    assert_eq!(
+        f.service
+            .workspace_file(&f.worker, "first", &first)
+            .unwrap(),
+        reply
+    );
+    assert_eq!(snapshot().seq, sequence);
+    f.service
+        .workspace_file(
+            &f.worker,
+            "duplicate-content",
+            &write(&root.join("copy"), "first result", None),
+        )
+        .unwrap();
+    assert!(snapshot().seq > sequence);
+    assert_eq!(latest(), Some((sequence, at_ms)));
+
+    f.service
+        .workspace_file(
+            &f.worker,
+            "second",
+            &write(&root.join("second"), "another result", None),
+        )
+        .unwrap();
+    assert_eq!(latest().unwrap().0, snapshot().seq);
+    assert!(latest().unwrap().0 > sequence);
+}
+
+#[test]
 fn actual_file_write_receipt_replay_changed_payload_and_full_manifest_backup() {
     let f = fixture();
     let path = Path::new(&f.workspace.worktree).join("code.rs");
@@ -584,6 +664,10 @@ fn check_external_editor_window(modes: &[&'static str]) {
         let (id, effect) = effects.iter().next().unwrap();
         assert_eq!(effect.state, EffectState::Started);
         assert!(!snapshot.receipts.contains_key(id));
+        assert_eq!(
+            snapshot.latest_workspace_write_progress(&f.assignment, 1, u64::MAX),
+            None
+        );
         assert!(matches!(
             f.service.workspace_file(&f.worker, "window-write", &op),
             Err(Error::ResourceBlocked(_))
