@@ -73,8 +73,10 @@ asynchronous read. These observations add no execution authority or writer.
 
 Queued/preparing tasks have no entry sample. Stop, shutdown and cold reopen
 provide no live sample; files do not restore it or an execution grant. This
-slice supplies no durable historical start time. Actor activation start and
-`runtime.local_task.observed_at` are preparation facts, not actual Task entry.
+slice supplies no durable historical start time. Actor activation start and the
+running/preparation `runtime.local_task.observed_at` observation alone do not
+prove actual Task entry. Its verified stopped observation remains the Question
+diagnostic anchor described above.
 
 ## Measurements that remain unavailable
 
