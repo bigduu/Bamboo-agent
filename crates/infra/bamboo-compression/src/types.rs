@@ -57,15 +57,15 @@ mod tests {
     use super::{BudgetStrategy, TokenBudget};
 
     #[test]
-    fn compression_trigger_defaults_to_eighty_five_percent() {
+    fn compression_trigger_defaults_to_eighty_percent() {
         let budget = TokenBudget::for_model(128_000);
-        assert_eq!(budget.compression_trigger_percent, 85);
+        assert_eq!(budget.compression_trigger_percent, 80);
     }
 
     #[test]
-    fn compression_target_defaults_to_forty_percent() {
+    fn compression_target_defaults_to_twenty_five_percent() {
         let budget = TokenBudget::for_model(128_000);
-        assert_eq!(budget.compression_target_percent, 40);
+        assert_eq!(budget.compression_target_percent, 25);
     }
 
     #[test]
@@ -82,7 +82,7 @@ mod tests {
     fn compression_trigger_context_tokens_respects_percent() {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
-        budget.working_reserve_tokens = 0; // use legacy percentage mode
+        budget.working_reserve_tokens = 0; // no additional legacy reserve
         budget.compression_trigger_percent = 50;
         assert_eq!(budget.compression_trigger_context_tokens(), 500);
     }
@@ -100,51 +100,51 @@ mod tests {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
         budget.compression_target_percent = 10;
-        assert_eq!(budget.compression_target_context_tokens(), 200);
+        assert_eq!(budget.compression_target_context_tokens(), 100);
     }
 
     #[test]
     fn compression_target_always_stays_below_trigger_limit() {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
-        budget.working_reserve_tokens = 0; // use legacy percentage mode
+        budget.working_reserve_tokens = 0; // no additional legacy reserve
         budget.compression_trigger_percent = 30;
         budget.compression_target_percent = 50;
-        assert_eq!(budget.compression_target_context_tokens(), 299);
+        assert_eq!(budget.compression_target_context_tokens(), 290);
     }
 
     #[test]
-    fn trigger_percent_zero_disables_proactive_trigger_but_respects_request_limit() {
+    fn trigger_percent_zero_still_reserves_dynamic_working_space() {
         let mut budget =
             TokenBudget::with_safety_margin(1000, 200, BudgetStrategy::Window { size: 20 }, 100);
-        budget.working_reserve_tokens = 0; // use legacy percentage mode
+        budget.working_reserve_tokens = 0; // no additional legacy reserve
         budget.compression_trigger_percent = 0;
-        assert_eq!(
-            budget.compression_trigger_context_tokens(),
-            budget.max_request_input_tokens()
-        );
+        assert_eq!(budget.compression_trigger_context_tokens(), 560);
     }
 
     #[test]
     fn fixed_reserve_trigger_subtracts_reserve_from_context() {
-        let budget =
+        let mut budget =
             TokenBudget::with_safety_margin(200_000, 4_096, BudgetStrategy::default(), 1000);
-        // default working_reserve_tokens = 50_000
+        budget.working_reserve_tokens = 50_000;
+        // Explicit legacy reserve remains a conservative cap.
         assert_eq!(budget.compression_trigger_context_tokens(), 150_000);
     }
 
     #[test]
     fn fixed_reserve_trigger_for_small_context() {
-        let budget =
+        let mut budget =
             TokenBudget::with_safety_margin(100_000, 4_096, BudgetStrategy::default(), 1000);
+        budget.working_reserve_tokens = 50_000;
         // 100K >= 50K * 2, so fixed reserve: 100K - 50K = 50K
         assert_eq!(budget.compression_trigger_context_tokens(), 50_000);
     }
 
     #[test]
     fn fixed_reserve_fallback_for_tiny_context() {
-        let budget =
+        let mut budget =
             TokenBudget::with_safety_margin(60_000, 4_096, BudgetStrategy::default(), 1000);
+        budget.working_reserve_tokens = 50_000;
         // 60K < 50K * 2 = 100K, so fallback to 75%
         assert_eq!(budget.compression_trigger_context_tokens(), 45_000);
     }
