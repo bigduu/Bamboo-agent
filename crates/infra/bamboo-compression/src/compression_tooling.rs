@@ -61,7 +61,7 @@ fn close_compressed_set_over_tool_chains(
     }
 }
 use chrono::Utc;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Structured reason why a compression plan could not be built.
 #[derive(Debug, Clone)]
@@ -227,6 +227,7 @@ pub struct CompressionCandidatePlan {
     pub segments_removed: usize,
     pub trigger_type: CompressionTriggerType,
     additional_fixed_tokens: u32,
+    retained_input_tokens: u32,
     context_window: u32,
     target_limit: u32,
     message_summary_snapshot: Option<Vec<u8>>,
@@ -290,6 +291,13 @@ fn cap_summary_to_context_target(
         });
     }
     Ok(desired_summary_tokens.min(available))
+}
+
+fn retained_input_tokens(messages: &[Message], input_costs: &HashMap<&str, u32>) -> u32 {
+    messages
+        .iter()
+        .filter_map(|message| input_costs.get(message.id.as_str()).copied())
+        .fold(0, u32::saturating_add)
 }
 
 fn protected_compression_message_ids(non_system: &[Message]) -> HashSet<String> {
@@ -377,6 +385,28 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
     trigger_type: CompressionTriggerType,
     additional_fixed_tokens: u32,
 ) -> Result<CompressionCandidatePlan, CompressionPlanError> {
+    build_forced_compression_candidate_plan_with_input_costs(
+        session,
+        model_name,
+        configured_budget,
+        summary_target_ratio,
+        trigger_type,
+        additional_fixed_tokens,
+        &HashMap::new(),
+    )
+}
+
+/// Reserve extra provider input costs only for messages retained by the plan.
+/// The per-message costs are independent of the summary source token count.
+pub fn build_forced_compression_candidate_plan_with_input_costs(
+    session: &Session,
+    model_name: &str,
+    configured_budget: Option<&TokenBudget>,
+    summary_target_ratio: f64,
+    trigger_type: CompressionTriggerType,
+    additional_fixed_tokens: u32,
+    input_costs: &HashMap<&str, u32>,
+) -> Result<CompressionCandidatePlan, CompressionPlanError> {
     let exposure = estimate_context_compression_exposure(session, model_name, configured_budget);
     let budget = &exposure.budget;
     let counter = TiktokenTokenCounter::default();
@@ -405,7 +435,7 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
     let system_tokens = counter.count_messages(&system_messages);
     let protected_ids = protected_compression_message_ids(&non_system);
     let segments = crate::segmenter::MessageSegmenter::new().segment(non_system.clone());
-    let protected_tokens = segments
+    let (protected_tokens, protected_input_tokens) = segments
         .iter()
         .filter(|segment| {
             segment
@@ -413,9 +443,16 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
                 .iter()
                 .any(|message| protected_ids.contains(&message.id))
         })
-        .fold(0u32, |total, segment| {
-            total.saturating_add(counter.count_messages(&segment.messages))
+        .fold((0u32, 0u32), |(text, input), segment| {
+            (
+                text.saturating_add(counter.count_messages(&segment.messages)),
+                input.saturating_add(retained_input_tokens(&segment.messages, input_costs)),
+            )
         });
+    let system_input_tokens = retained_input_tokens(&system_messages, input_costs);
+    let protected_input_tokens = protected_input_tokens.saturating_add(system_input_tokens);
+    let mut remaining_input_tokens =
+        system_input_tokens.saturating_add(retained_input_tokens(&non_system, input_costs));
     let mut remaining_tokens = counter.count_messages(&non_system);
     let mut source_tokens = 0u32;
     let mut selected_messages = Vec::new();
@@ -424,6 +461,7 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
     let summary_envelope_tokens = counter.count_messages(&[compression_summary_message("")]);
     let mut projected_tokens = system_tokens
         .saturating_add(remaining_tokens)
+        .saturating_add(remaining_input_tokens)
         .saturating_add(additional_fixed_tokens);
     let mut target_summary_tokens = 0u32;
     let mut summary_budget_clamped = false;
@@ -445,6 +483,8 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
         let segment_tokens = counter.count_messages(&segment.messages);
         source_tokens = source_tokens.saturating_add(segment_tokens);
         remaining_tokens = remaining_tokens.saturating_sub(segment_tokens);
+        remaining_input_tokens = remaining_input_tokens
+            .saturating_sub(retained_input_tokens(&segment.messages, input_costs));
         selected_messages.extend(segment.messages);
         selected_segment_count += 1;
 
@@ -455,14 +495,22 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
             post_compaction_recovery_tokens(&selected_messages, session, &counter);
         let required_tokens = system_tokens
             .saturating_add(protected_tokens)
+            .saturating_add(remaining_input_tokens)
             .saturating_add(additional_fixed_tokens)
             .saturating_add(summary_envelope_tokens)
             .saturating_add(recovery_tokens);
         target_summary_tokens =
-            cap_summary_to_context_target(desired, required_tokens, target_limit)?;
+            match cap_summary_to_context_target(desired, required_tokens, target_limit) {
+                Ok(tokens) => tokens,
+                // Some of the extra input is still archiveable. Keep selecting
+                // segments before treating this projection as an impossible floor.
+                Err(_) if remaining_input_tokens > protected_input_tokens => continue,
+                Err(error) => return Err(error),
+            };
         summary_budget_clamped = target_summary_tokens < desired;
         projected_tokens = system_tokens
             .saturating_add(remaining_tokens)
+            .saturating_add(remaining_input_tokens)
             .saturating_add(additional_fixed_tokens)
             .saturating_add(summary_envelope_tokens)
             .saturating_add(target_summary_tokens)
@@ -511,6 +559,7 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
         segments_removed: selected_segment_count,
         trigger_type,
         additional_fixed_tokens,
+        retained_input_tokens: remaining_input_tokens,
         context_window,
         target_limit,
         message_summary_snapshot: None,
@@ -624,6 +673,28 @@ pub fn build_message_summary_candidate_plan_with_fixed_tokens(
     trigger_type: CompressionTriggerType,
     additional_fixed_tokens: u32,
 ) -> Result<CompressionCandidatePlan, CompressionPlanError> {
+    build_message_summary_candidate_plan_with_input_costs(
+        session,
+        model_name,
+        configured_budget,
+        summary_target_ratio,
+        trigger_type,
+        additional_fixed_tokens,
+        &HashMap::new(),
+    )
+}
+
+/// Reserve extra provider input costs for retained rows while keeping the
+/// summary source restricted to the selected prose.
+pub fn build_message_summary_candidate_plan_with_input_costs(
+    session: &Session,
+    model_name: &str,
+    configured_budget: Option<&TokenBudget>,
+    summary_target_ratio: f64,
+    trigger_type: CompressionTriggerType,
+    additional_fixed_tokens: u32,
+    input_costs: &HashMap<&str, u32>,
+) -> Result<CompressionCandidatePlan, CompressionPlanError> {
     let exposure = estimate_context_compression_exposure_with_fixed_tokens(
         session,
         model_name,
@@ -713,8 +784,10 @@ pub fn build_message_summary_candidate_plan_with_fixed_tokens(
     } else {
         0
     };
+    let retained_input_tokens = retained_input_tokens(&remaining, input_costs);
     let required_tokens = counter
         .count_messages(&remaining)
+        .saturating_add(retained_input_tokens)
         .saturating_add(additional_fixed_tokens)
         .saturating_add(summary_envelope_tokens);
     let budget = &exposure.budget;
@@ -742,6 +815,7 @@ pub fn build_message_summary_candidate_plan_with_fixed_tokens(
         segments_removed: crate::MessageSegmenter::new().segment(archived).len(),
         trigger_type,
         additional_fixed_tokens,
+        retained_input_tokens,
         context_window: budget.max_context_tokens,
         target_limit,
         message_summary_snapshot: Some(message_summary_snapshot(session)?),
@@ -805,6 +879,7 @@ pub fn finalize_compression_candidate_plan(
     let projected_tokens = counter
         .count_messages(&remaining_tokens)
         .saturating_add(candidate.additional_fixed_tokens)
+        .saturating_add(candidate.retained_input_tokens)
         .saturating_add(summary_tokens)
         .saturating_add(recovery_tokens);
     if projected_tokens > candidate.target_limit {

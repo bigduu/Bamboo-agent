@@ -1100,6 +1100,7 @@ enum BoundedFailureMode {
     Call(usize),
     PartialWithoutDone(usize),
     Reduce,
+    FillFinalBudget,
 }
 
 struct BoundedCompressionProvider {
@@ -1150,6 +1151,15 @@ impl LLMProvider for BoundedCompressionProvider {
                 Ok(Box::pin(stream::iter(vec![Ok::<LLMChunk, LLMError>(
                     LLMChunk::Token("partial summary that must not commit".to_string()),
                 )])))
+            }
+            BoundedFailureMode::FillFinalBudget
+                if messages.iter().any(|message| message.content.contains("final reduce stage")) =>
+            {
+                let tokens = max_output_tokens.unwrap_or_default().saturating_sub(128).max(1);
+                Ok(Box::pin(stream::iter(vec![
+                    Ok(LLMChunk::Token(" evidence".repeat(tokens as usize))),
+                    Ok(LLMChunk::Done),
+                ])))
             }
             _ => Ok(Box::pin(stream::iter(vec![
                 Ok::<LLMChunk, LLMError>(LLMChunk::Token(format!(

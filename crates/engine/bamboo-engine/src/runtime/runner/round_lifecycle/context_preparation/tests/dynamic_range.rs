@@ -489,22 +489,32 @@ async fn shared_range_reuses_the_only_paid_vision_transform_for_actual_dispatch(
     }
 }
 
+fn original_image_message(text: &str, url: &str) -> Message {
+    Message::user_with_parts(
+        text,
+        vec![
+            ContentPart::Text { text: text.into() }.into(),
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: url.into(),
+                    detail: Some("original".into()),
+                },
+            }
+            .into(),
+        ],
+    )
+}
+
 #[tokio::test]
-async fn shared_range_native_image_cost_cannot_pass_a_text_only_target_check() {
+async fn shared_range_infeasible_retained_native_image_skips_summary_generation() {
     let _env = isolate_prompt_safe_env_cache();
     let mut session = Session::new("shared-range-native-image", "test-model");
     session.add_message(Message::system("system"));
     session.add_message(Message::user("old requirement"));
     session.add_message(Message::assistant("old response", None));
-    session.add_message(Message::user_with_parts(
+    session.add_message(original_image_message(
         "latest image",
-        vec![ContentPart::ImageUrl {
-            image_url: ImageUrl {
-                url: "https://example.com/latest.png".into(),
-                detail: Some("original".into()),
-            },
-        }
-        .into()],
+        "https://example.com/latest.png",
     ));
     session.token_budget = Some(TokenBudget::with_safety_margin(
         32_000,
@@ -514,7 +524,7 @@ async fn shared_range_native_image_cost_cannot_pass_a_text_only_target_check() {
     ));
     session.force_manual_compression = Some(String::new());
     let before = archive_state(&session);
-    let (summary_provider, _) = prompt_capture_llm();
+    let (summary_provider, summary_calls) = prompt_capture_llm();
     let mut config = bounded_compression_config(summary_provider);
     config.context_management.strategy = ContextManagementStrategy::MessageSummary;
     let llm: Arc<dyn LLMProvider> = Arc::new(CountingVisionProvider {
@@ -535,10 +545,175 @@ async fn shared_range_native_image_cost_cannot_pass_a_text_only_target_check() {
     )
     .await
     .unwrap());
+    assert!(summary_calls.lock().unwrap().is_empty());
     assert_eq!(archive_state(&session), before);
     assert!(session.compression_events.is_empty());
     assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(event,
-        AgentEvent::ContextCompressionStatus { status, .. } if status.starts_with("failed_postcondition:"))));
+        AgentEvent::ContextCompressionStatus { status, .. } if status.starts_with("failed_candidate_plan:"))));
+}
+
+#[tokio::test]
+async fn shared_range_summary_reserves_retained_native_image_cost() {
+    assert_summary_reserves_retained_native_image_cost(ContextManagementStrategy::Summary).await;
+}
+
+#[tokio::test]
+async fn shared_range_message_summary_reserves_retained_native_image_cost() {
+    assert_summary_reserves_retained_native_image_cost(ContextManagementStrategy::MessageSummary)
+        .await;
+}
+
+async fn assert_summary_reserves_retained_native_image_cost(strategy: ContextManagementStrategy) {
+    let _env = isolate_prompt_safe_env_cache();
+    let id = format!("shared-range-native-image-{strategy:?}");
+    let mut session = Session::new(&id, "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(Message::user("old requirement"));
+    session.add_message(Message::assistant(" evidence".repeat(34_000), None));
+    let old_image = original_image_message("superseded image", "https://example.com/old.png");
+    let old_image_id = old_image.id.clone();
+    session.add_message(old_image);
+    for _ in 0..3 {
+        session.add_message(Message::user("recent requirement"));
+        session.add_message(Message::assistant("recent result", None));
+    }
+    let caption = " latest constraint".repeat(600);
+    let latest_image = original_image_message(&caption, "https://example.com/latest.png");
+    let latest_image_id = latest_image.id.clone();
+    session.add_message(latest_image);
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        64_000,
+        1_000,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session.force_manual_compression = Some(String::new());
+    let (summary_provider, calls) =
+        bounded_compression_llm_with_limits(BoundedFailureMode::FillFinalBudget, 128_000, 32_000);
+    let mut config = bounded_compression_config(summary_provider);
+    config.summary_target_ratio = 0.50;
+    config.context_management.strategy = strategy;
+    let llm: Arc<dyn LLMProvider> = Arc::new(CountingVisionProvider {
+        vision_calls: Arc::new(AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+        explicit_native: true,
+    });
+    let applied = maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        &id,
+        &[],
+        &llm,
+        None,
+        "pre-turn",
+    )
+    .await
+    .unwrap();
+    assert!(
+        applied,
+        "{strategy:?} should fit an image plus a smaller summary"
+    );
+    let archived: Vec<_> = session
+        .messages
+        .iter()
+        .filter(|m| m.compressed)
+        .cloned()
+        .collect();
+    assert!(archived.iter().any(|m| m.id == old_image_id));
+    assert!(session
+        .messages
+        .iter()
+        .any(|m| m.id == latest_image_id && !m.compressed));
+    let event = session.compression_events.last().unwrap();
+    assert!(event.usage_after_percent <= 25.0);
+    assert_eq!(
+        event.source_tokens,
+        TiktokenTokenCounter::default().count_messages(&archived)
+    );
+    let calls = calls.lock().unwrap();
+    let terminal = calls.last().unwrap();
+    assert_eq!(terminal.max_output_tokens, event.target_summary_tokens);
+    assert!((1..=6_000).contains(&terminal.max_output_tokens));
+    assert!(event.actual_summary_tokens > 1_000);
+    assert!(event.fixed_prompt_tokens < 10_000);
+}
+
+#[derive(Default)]
+struct SmallImageAttachmentReader {
+    reads: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl bamboo_agent_core::storage::AttachmentReader for SmallImageAttachmentReader {
+    async fn read_attachment(
+        &self,
+        _session_id: &str,
+        attachment_id: &str,
+    ) -> io::Result<Option<(Vec<u8>, String)>> {
+        use base64::Engine as _;
+
+        self.reads.lock().unwrap().push(attachment_id.to_owned());
+        if attachment_id != "tiny" {
+            return Ok(None);
+        }
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/C1cAAAAASUVORK5CYII=")
+            .unwrap();
+        Ok(Some((png, "image/png".into())))
+    }
+}
+
+#[tokio::test]
+async fn shared_range_retained_native_image_uses_stored_original_dimensions() {
+    let _env = isolate_prompt_safe_env_cache();
+    let id = "shared-range-original-attachment";
+    let mut session = Session::new(id, "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(original_image_message(
+        "archive an old missing image",
+        "bamboo-attachment://shared-range-original-attachment/missing",
+    ));
+    session.add_message(Message::assistant("old response", None));
+    session.add_message(original_image_message(
+        "retain the tiny original",
+        "bamboo-attachment://shared-range-original-attachment/tiny",
+    ));
+    session.token_budget = Some(TokenBudget::with_safety_margin(
+        32_000,
+        1_000,
+        BudgetStrategy::default(),
+        0,
+    ));
+    session.force_manual_compression = Some(String::new());
+    let (summary_provider, calls) = prompt_capture_llm();
+    let mut config = bounded_compression_config(summary_provider);
+    config.context_management.strategy = ContextManagementStrategy::MessageSummary;
+    let reader = Arc::new(SmallImageAttachmentReader::default());
+    config.attachment_reader = Some(reader.clone());
+    assert!(maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        id,
+        &[],
+        &noop_llm(),
+        None,
+        "pre-turn",
+    )
+    .await
+    .unwrap());
+    assert!(!calls.lock().unwrap().is_empty());
+    assert!(session.messages[1].compressed);
+    assert_eq!(*reader.reads.lock().unwrap(), ["tiny", "tiny"]);
+    assert!(
+        session
+            .compression_events
+            .last()
+            .unwrap()
+            .usage_after_percent
+            <= 25.0
+    );
 }
 
 struct AdoptingSummaryPersistence {

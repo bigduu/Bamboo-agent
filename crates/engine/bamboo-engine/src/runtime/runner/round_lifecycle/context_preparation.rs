@@ -13,8 +13,8 @@ use bamboo_agent_core::{
 };
 use bamboo_compression::{
     active_messages_for_budget, apply_compression_plan, apply_retrieval_window_plan_with_trigger,
-    build_forced_compression_candidate_plan_with_fixed_tokens,
-    build_message_summary_candidate_plan_with_fixed_tokens,
+    build_forced_compression_candidate_plan_with_input_costs,
+    build_message_summary_candidate_plan_with_input_costs,
     build_retrieval_window_candidate_plan_with_token_accounting,
     build_retrieval_window_critical_overflow_plan_with_token_accounting,
     estimate_context_compression_exposure_with_fixed_tokens,
@@ -843,7 +843,11 @@ fn estimate_inline_original_image_patches(url: &str) -> Option<u32> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(encoded_prefix)
         .ok()?;
-    let size = imagesize::blob_size(&bytes).ok()?;
+    estimate_original_image_patches(&bytes)
+}
+
+fn estimate_original_image_patches(bytes: &[u8]) -> Option<u32> {
+    let size = imagesize::blob_size(bytes).ok()?;
     if size.width == 0 || size.height == 0 {
         return None;
     }
@@ -852,6 +856,62 @@ fn estimate_inline_original_image_patches(url: &str) -> Option<u32> {
         .div_ceil(ORIGINAL_IMAGE_PATCH_SIZE)
         .saturating_mul(size.height.div_ceil(ORIGINAL_IMAGE_PATCH_SIZE));
     Some(patches.min(ORIGINAL_IMAGE_MAX_PATCHES as usize) as u32)
+}
+
+struct StoredOriginalImage<'a> {
+    message_id: &'a str,
+    session_id: &'a str,
+    attachment_id: &'a str,
+}
+
+async fn summary_native_image_costs<'a>(
+    session: &'a Session,
+    config: &AgentLoopConfig,
+    llm: &dyn LLMProvider,
+    model_name: &str,
+    counter: &dyn TokenCounter,
+) -> (HashMap<&'a str, u32>, Vec<StoredOriginalImage<'a>>) {
+    let image_messages = session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed && transforms::has_image_parts(message))
+        .collect::<Vec<_>>();
+    let mut costs = HashMap::<&str, u32>::new();
+    let mut stored_originals = Vec::new();
+    if image_messages.is_empty()
+        || !transforms::image_projection(config, llm, model_name)
+            .await
+            .keeps_native_images()
+    {
+        return (costs, stored_originals);
+    }
+    for message in image_messages {
+        let id = message.id.as_str();
+        let extra_tokens = provider_prepared_message_tokens(message, counter)
+            .saturating_sub(counter.count_message(message));
+        costs.insert(id, extra_tokens);
+        if config.attachment_reader.is_none() {
+            continue;
+        }
+        for part in message.content_parts.iter().flatten() {
+            let MessagePart::ImageUrl { image_url } = part else {
+                continue;
+            };
+            if image_url.detail.as_deref() != Some("original") {
+                continue;
+            }
+            if let Some((session_id, attachment_id)) =
+                super::super::image_fallback::parse_bamboo_attachment_url(&image_url.url)
+            {
+                stored_originals.push(StoredOriginalImage {
+                    message_id: id,
+                    session_id,
+                    attachment_id,
+                });
+            }
+        }
+    }
+    (costs, stored_originals)
 }
 
 fn late_bound_tool_schema_reserve(
@@ -1681,13 +1741,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
             .messages
             .iter()
             .filter(|message| !message.compressed)
-            .any(|message| {
-                message.content_parts.as_ref().is_some_and(|parts| {
-                    parts
-                        .iter()
-                        .any(|part| matches!(part, MessagePart::ImageUrl { .. }))
-                })
-            });
+            .any(transforms::has_image_parts);
     if prepared_output.is_none()
         && legacy_vision_images
         && llm.supports_vision(model_name).await
@@ -1887,19 +1941,74 @@ async fn maybe_apply_summary_context_compression_with_budget(
             )
             .await?,
         );
+    let (mut input_costs, stored_originals) =
+        summary_native_image_costs(session, config, llm.as_ref(), model_name, &counter).await;
     let build_candidate = if message_summary {
-        build_message_summary_candidate_plan_with_fixed_tokens
+        build_message_summary_candidate_plan_with_input_costs
     } else {
-        build_forced_compression_candidate_plan_with_fixed_tokens
+        build_forced_compression_candidate_plan_with_input_costs
     };
-    let candidate = match build_candidate(
-        session,
-        model_name,
-        Some(budget),
-        config.summary_target_ratio,
-        trigger_type_clone,
-        additional_fixed_tokens,
-    ) {
+    let plan_candidate = |input_costs: &HashMap<&str, u32>| {
+        build_candidate(
+            session,
+            model_name,
+            Some(budget),
+            config.summary_target_ratio,
+            trigger_type_clone.clone(),
+            additional_fixed_tokens,
+            input_costs,
+        )
+    };
+    let mut candidate = plan_candidate(&input_costs);
+    let can_refine_originals = !stored_originals.is_empty()
+        && matches!(
+            candidate,
+            Err(CompressionPlanError::ProtectedContentExceedsTarget { .. })
+        );
+    if let Some(reader) = config
+        .attachment_reader
+        .as_deref()
+        .filter(|_| can_refine_originals)
+    {
+        // Try without the unknown stored-image costs to find the rows that
+        // would survive. The draft is used only to select local reads.
+        let mut draft_costs = input_costs.clone();
+        for original in &stored_originals {
+            let tokens = draft_costs.entry(original.message_id).or_default();
+            *tokens = tokens.saturating_sub(ORIGINAL_IMAGE_MAX_PATCHES);
+        }
+        if let Ok(archived) = plan_candidate(&draft_costs).map(|draft| {
+            draft
+                .compressed_message_ids
+                .into_iter()
+                .collect::<HashSet<_>>()
+        }) {
+            for original in stored_originals {
+                if archived.contains(original.message_id) {
+                    continue;
+                }
+                let Ok(Some((bytes, mime))) = reader
+                    .read_attachment(original.session_id, original.attachment_id)
+                    .await
+                else {
+                    continue;
+                };
+                if mime.starts_with("image/") {
+                    let prefix_len = bytes
+                        .len()
+                        .min(MAX_INLINE_IMAGE_HEADER_BASE64_BYTES / 4 * 3);
+                    if let Some(patches) = estimate_original_image_patches(&bytes[..prefix_len]) {
+                        let tokens = input_costs.entry(original.message_id).or_default();
+                        *tokens = tokens
+                            .saturating_sub(ORIGINAL_IMAGE_MAX_PATCHES)
+                            .saturating_add(patches);
+                    }
+                }
+            }
+            candidate = plan_candidate(&input_costs);
+        }
+    }
+    let candidate = match candidate {
         Ok(candidate) => candidate,
         Err(CompressionPlanError::MessageSummaryToolProtocol { reason }) => {
             tracing::debug!(
