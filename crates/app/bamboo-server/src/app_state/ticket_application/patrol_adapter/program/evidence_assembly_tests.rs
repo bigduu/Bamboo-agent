@@ -681,7 +681,7 @@ async fn seed(root: &Path) {
     let execution = workspace(root);
     let (state, provider) = host(root, 2).await;
     let (work, project) = start_work(&state, execution).await;
-    let (service, authority) = state.tickets.authority(owner()).await.unwrap();
+    let (service, _) = state.tickets.authority(owner()).await.unwrap();
     let snapshot = tokio::time::timeout(WAIT, async {
         loop {
             let snapshot = service.published().unwrap().1;
