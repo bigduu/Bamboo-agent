@@ -11,6 +11,9 @@ use bamboo_tickets::{
     TicketService, WorkState,
 };
 
+#[path = "patrol/evidence.rs"]
+mod evidence;
+
 struct Root(PathBuf);
 impl Root {
     fn new() -> Self {

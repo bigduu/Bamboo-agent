@@ -9,6 +9,7 @@
 pub mod budget;
 pub mod checkpoint;
 pub mod delivery;
+pub mod evidence;
 pub mod host;
 pub mod program;
 
