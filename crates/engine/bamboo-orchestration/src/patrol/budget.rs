@@ -3,7 +3,8 @@
 //! each pass; an Authority value cached across a revoke is not a live grant.
 use bamboo_tickets::{
     Authority, ExecutionBudgetPurpose, ExecutionTokenOverCapUsage, ExecutionTokenUsage, Health,
-    TicketService, WorkTokenAdmission, WorkTokenAttempt, WorkTokenBlock, WorkTokenRequest,
+    Principal, TicketService, WorkTokenAdmission, WorkTokenAttempt, WorkTokenBlock,
+    WorkTokenRequest,
 };
 
 use super::{
@@ -23,7 +24,9 @@ impl TicketBudget<'_> {
     /// grant. The caller also owns its live Host policy/configuration fence.
     pub fn confirm_submission(&self, reservation: &Reservation) -> Result<(), PortError> {
         let diagnostic = &reservation.request;
-        if reservation.operation != diagnostic.operation {
+        if !matches!(self.authority.principal(), Principal::Runtime)
+            || reservation.operation != diagnostic.operation
+        {
             return Err(PortError::Denied);
         }
         let scope = &reservation.operation.incident.scope;
@@ -255,6 +258,7 @@ impl BudgetPort for TicketBudget<'_> {
                 output_tokens: u64::from(output_tokens),
             },
             Usage::Unknown => ExecutionTokenUsage::Unknown,
+            Usage::AwaitingProvider => return Err(PortError::Denied),
         };
         self.service
             .settle_work_tokens(

@@ -1332,6 +1332,18 @@ fn partial_provider_overrun_halts_the_exact_real_receipt() {
     let receipt = budget.reserve(&request).unwrap();
     let admission_commit = fixture.service().published().unwrap().0;
     assert_eq!(budget.confirm_submission(&receipt), Ok(()));
+    let supervisor = fixture.authority(Principal::Supervisor {
+        session_id: "supervisor".into(),
+    });
+    let supervisor_budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &supervisor,
+        clock: &ClockAt(100),
+    };
+    assert_eq!(
+        supervisor_budget.confirm_submission(&receipt),
+        Err(PortError::Denied)
+    );
     let mut wrong = receipt.clone();
     wrong.receipt.push_str("-mismatch");
     assert_eq!(budget.confirm_submission(&wrong), Err(PortError::Denied));

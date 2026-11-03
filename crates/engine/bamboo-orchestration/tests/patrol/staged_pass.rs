@@ -15,7 +15,8 @@ fn open(patrol: &Patrol, host: &mut FakeHost) {
                 status: Status::Incident,
                 ..
             },
-            submission: None
+            submission: None,
+            ..
         }
     ));
 }
@@ -75,6 +76,7 @@ fn staged_input_is_deferred_and_fenced_before_reservation() {
     let Outcome::Complete {
         report,
         submission: Some(submission),
+        ..
     } = patrol
         .tick_staged(
             &scope(),
@@ -104,7 +106,9 @@ fn staged_input_is_deferred_and_fenced_before_reservation() {
         .calls
         .ends_with(&["observe", "reserve", "save", "save"]));
 
-    let Outcome::Complete { report, submission } = patrol
+    let Outcome::Complete {
+        report, submission, ..
+    } = patrol
         .tick_staged(&scope(), &FakeClock(103), &mut host, None, |operation| {
             assert_eq!(operation, &reservation.operation);
             Ok(DiagnosticStatus::Finished {
@@ -152,7 +156,9 @@ fn staged_submission_is_withheld_after_a_checkpoint_error() {
         host.fail_save = None;
         if failed_save == 2 {
             let original = host.incident().pending_settlement.unwrap().operation;
-            let Outcome::Complete { report, submission } = patrol
+            let Outcome::Complete {
+                report, submission, ..
+            } = patrol
                 .tick_staged(&scope(), &FakeClock(101), &mut host, None, |operation| {
                     assert_eq!(operation, &original);
                     Ok(DiagnosticStatus::OutcomeUnknown)
@@ -212,6 +218,123 @@ fn staged_budget_denial_preserves_program_and_outbox_ownership() {
     assert!(host.durable.borrow().queue.is_empty());
 }
 
+#[test]
+fn expired_staged_call_retains_the_original_receipt_until_late_usage_is_durable() {
+    let patrol = configured();
+    let mut host = FakeHost::new();
+    open(&patrol, &mut host);
+    let request = demand(&patrol, &mut host, 100);
+    let input = prepared(&mut host, request);
+    let Outcome::Complete {
+        submission: Some(submission),
+        ..
+    } = patrol
+        .tick_staged(
+            &scope(),
+            &FakeClock(100),
+            &mut host,
+            Some(input),
+            no_prior_call,
+        )
+        .unwrap()
+    else {
+        panic!("expected live operation");
+    };
+    let original = submission.reservation();
+    let Outcome::Complete {
+        submission: None,
+        reconciled: None,
+        ..
+    } = patrol
+        .tick_staged(&scope(), &FakeClock(150), &mut host, None, |operation| {
+            assert_eq!(operation, &original.operation);
+            Ok(DiagnosticStatus::Pending)
+        })
+        .unwrap()
+    else {
+        panic!("expired advice must not discard unfinished accounting");
+    };
+    let awaiting = host.checkpoint();
+    assert_eq!(
+        awaiting.incident.as_ref().unwrap().pending_settlement_usage,
+        Some(Usage::AwaitingProvider)
+    );
+    assert_eq!(host.usage(), 120);
+    let mut legacy = awaiting.clone();
+    legacy.incident.as_mut().unwrap().pending_settlement_usage = None;
+    assert_eq!(
+        checkpoint::validate_update(&awaiting, &legacy),
+        Err(PortError::Conflict)
+    );
+    patrol
+        .tick_staged(&scope(), &FakeClock(151), &mut host, None, |_| {
+            Err(PortError::Unavailable)
+        })
+        .unwrap();
+    assert_eq!(
+        host.incident().pending_settlement_usage,
+        Some(Usage::AwaitingProvider)
+    );
+    host.fail_settle = true;
+    let late = Usage::OverCap {
+        input_tokens: None,
+        output_tokens: Some(21),
+    };
+    assert!(matches!(
+        patrol
+            .tick_staged(&scope(), &FakeClock(151), &mut host, None, |operation| {
+                assert_eq!(operation, &original.operation);
+                Ok(DiagnosticStatus::Failed { usage: late })
+            })
+            .unwrap(),
+        Outcome::Complete {
+            submission: None,
+            reconciled: Some(_),
+            ..
+        }
+    ));
+    let settled = host.load(&scope()).unwrap().unwrap();
+    checkpoint::validate_update(&awaiting, &settled.checkpoint).unwrap();
+    let bytes = checkpoint::encode(settled.version, &settled.checkpoint).unwrap();
+    let recovered = checkpoint::decode(&scope(), &bytes).unwrap();
+    assert_eq!(
+        recovered
+            .checkpoint
+            .incident
+            .as_ref()
+            .unwrap()
+            .pending_settlement_usage,
+        Some(late)
+    );
+    let mut malformed = recovered.checkpoint.clone();
+    malformed
+        .incident
+        .as_mut()
+        .unwrap()
+        .pending_settlement_usage = Some(Usage::OverCap {
+        input_tokens: None,
+        output_tokens: Some(1),
+    });
+    assert_eq!(
+        checkpoint::encode(100, &malformed),
+        Err(PortError::Unavailable)
+    );
+    host.durable
+        .borrow_mut()
+        .checkpoints
+        .insert(scope(), recovered);
+    host.fail_settle = false;
+    patrol
+        .tick_staged(&scope(), &FakeClock(152), &mut host, None, no_prior_call)
+        .unwrap();
+    assert!(host.incident().pending_settlement.is_none());
+    assert_eq!(
+        host.durable.borrow().charges[&original.operation].settled,
+        Some(late)
+    );
+    assert_eq!(host.usage(), 120);
+}
+
 mod calls {
     use std::{
         sync::{
@@ -239,6 +362,7 @@ mod calls {
         control: Arc<Controlled>,
         admitted: bool,
         reply: Option<ProviderReply>,
+        fail_settle: bool,
     }
 
     #[async_trait::async_trait]
@@ -264,11 +388,15 @@ mod calls {
                 .lock()
                 .unwrap()
                 .push((receipt.clone(), usage));
-            Ok(())
+            if self.fail_settle {
+                Err(PortError::Unavailable)
+            } else {
+                Ok(())
+            }
         }
     }
 
-    fn admitted_submission() -> staged::Submission {
+    fn staged_operation() -> (FakeHost, staged::Submission) {
         let mut policy = policy();
         policy.diagnostic_timeout_ms = 5_000;
         let patrol = Patrol::new(policy, Some(model())).unwrap();
@@ -291,7 +419,11 @@ mod calls {
         else {
             panic!("expected live admission");
         };
-        submission
+        (host, submission)
+    }
+
+    fn admitted_submission() -> staged::Submission {
+        staged_operation().1
     }
 
     async fn result(calls: &Calls, operation: &OperationId) -> DiagnosticStatus {
@@ -327,6 +459,7 @@ mod calls {
                 Io {
                     control: control.clone(),
                     admitted: true,
+                    fail_settle: false,
                     reply: Some(ProviderReply {
                         diagnosis: Some(serde_json::to_string(&diagnosis).unwrap()),
                         exact_usage: Some(TokenUsage {
@@ -389,6 +522,7 @@ mod calls {
                     Io {
                         control: control.clone(),
                         admitted,
+                        fail_settle: false,
                         reply: observed_output.map(|output| ProviderReply {
                             diagnosis: None,
                             exact_usage: None,
@@ -407,5 +541,67 @@ mod calls {
             assert_eq!(&*control.settlements.lock().unwrap(), &[(original, usage)]);
             assert_eq!(control.sends.load(Ordering::SeqCst), usize::from(admitted));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn elapsed_deadline_does_not_evict_unreconciled_over_cap_evidence() {
+        let calls = Calls::default();
+        let (mut old_scope, submission) = staged_operation();
+        let operation = submission.reservation().operation.clone();
+        let receipt = submission.reservation().clone();
+        let control = Arc::new(Controlled::default());
+        control.release.notify_one();
+        calls
+            .launch(
+                submission,
+                101,
+                Io {
+                    control: control.clone(),
+                    admitted: true,
+                    fail_settle: true,
+                    reply: Some(ProviderReply {
+                        diagnosis: None,
+                        exact_usage: None,
+                        observed_input_tokens: None,
+                        observed_output_tokens: Some(21),
+                    }),
+                },
+            )
+            .unwrap();
+        let expected = DiagnosticStatus::Failed {
+            usage: Usage::OverCap {
+                input_tokens: None,
+                output_tokens: Some(21),
+            },
+        };
+        assert_eq!(result(&calls, &operation).await, expected);
+        tokio::time::advance(Duration::from_secs(20)).await;
+        assert_eq!(
+            calls.launch(
+                admitted_submission(),
+                101,
+                Io {
+                    control: control.clone(),
+                    admitted: true,
+                    fail_settle: false,
+                    reply: None,
+                }
+            ),
+            Err(PortError::Unavailable)
+        );
+        assert_eq!(calls.status(&operation).unwrap(), expected);
+        assert_eq!(control.sends.load(Ordering::SeqCst), 1);
+        old_scope.denied = true;
+        assert_eq!(calls.reconcile_accounting(&mut old_scope), Ok(1));
+        assert_eq!(calls.reconcile_accounting(&mut old_scope), Ok(0));
+        let state = old_scope.durable.borrow();
+        assert_eq!(state.charges[&operation].reservation, receipt);
+        assert_eq!(
+            state.charges[&operation].settled,
+            Some(Usage::OverCap {
+                input_tokens: None,
+                output_tokens: Some(21)
+            })
+        );
     }
 }

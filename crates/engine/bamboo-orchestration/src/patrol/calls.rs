@@ -12,7 +12,8 @@ use tokio::{
 };
 
 use super::{
-    staged::Submission, Diagnosis, DiagnosticRequest, DiagnosticStatus, OperationId, PortError,
+    staged::{Reconciled, Submission},
+    BudgetPort, Diagnosis, DiagnosticRequest, DiagnosticStatus, OperationId, PortError,
     Reservation, Usage,
 };
 
@@ -94,13 +95,21 @@ pub trait CallIo: Send + Sync {
 /// Only volatile delivery and status, with a fixed bound and no retry loop.
 #[derive(Default)]
 pub struct Calls {
-    entries: Mutex<BTreeMap<OperationId, Entry>>,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    entries: BTreeMap<OperationId, Entry>,
+    closed: bool,
 }
 
 struct Entry {
+    receipt: Reservation,
     expires: Instant,
     task: AbortHandle,
     status: CallStatus,
+    checkpoint_ack: bool,
 }
 
 impl Drop for Entry {
@@ -110,8 +119,49 @@ impl Drop for Entry {
 }
 
 enum CallStatus {
-    Receiving(oneshot::Receiver<DiagnosticStatus>),
-    Complete(DiagnosticStatus),
+    Receiving(oneshot::Receiver<Delivery>),
+    Complete(Delivery),
+}
+
+struct Delivery {
+    status: DiagnosticStatus,
+    accounted: bool,
+}
+
+impl Delivery {
+    fn usage(&self) -> Usage {
+        match self.status {
+            DiagnosticStatus::Finished { usage, .. } | DiagnosticStatus::Failed { usage } => usage,
+            _ => Usage::Unknown,
+        }
+    }
+}
+
+impl Entry {
+    fn delivery(&mut self) -> Option<&Delivery> {
+        if let CallStatus::Receiving(receiver) = &mut self.status {
+            let delivery = match receiver.try_recv() {
+                Ok(delivery) => delivery,
+                Err(oneshot::error::TryRecvError::Empty) => return None,
+                Err(oneshot::error::TryRecvError::Closed) => Delivery {
+                    status: DiagnosticStatus::OutcomeUnknown,
+                    accounted: false,
+                },
+            };
+            self.status = CallStatus::Complete(delivery);
+        }
+        match &self.status {
+            CallStatus::Complete(delivery) => Some(delivery),
+            CallStatus::Receiving(_) => None,
+        }
+    }
+
+    fn retain(&mut self, now: Instant) -> bool {
+        let checkpoint_ack = self.checkpoint_ack;
+        let within_deadline = self.expires > now;
+        self.delivery()
+            .is_none_or(|delivery| !delivery.accounted || (!checkpoint_ack && within_deadline))
+    }
 }
 
 impl Calls {
@@ -129,15 +179,19 @@ impl Calls {
             .filter(|remaining| (1..=MAX_DEADLINE_MS).contains(remaining))
             .ok_or(PortError::Denied)?;
         let runtime = Handle::try_current().map_err(|_| PortError::Unavailable)?;
-        let mut entries = self.entries.lock().map_err(|_| PortError::Unavailable)?;
+        let mut state = self.state.lock().map_err(|_| PortError::Unavailable)?;
         let now = Instant::now();
-        entries.retain(|_, entry| entry.expires > now);
-        if entries.len() >= MAX_CALLS || entries.contains_key(&receipt.operation) {
+        state.entries.retain(|_, entry| entry.retain(now));
+        if state.closed
+            || state.entries.len() >= MAX_CALLS
+            || state.entries.contains_key(&receipt.operation)
+        {
             return Err(PortError::Unavailable);
         }
         let deadline = now + Duration::from_millis(remaining);
         let (send, receive) = oneshot::channel();
         let operation = receipt.operation.clone();
+        let exact_receipt = receipt.clone();
         let task = runtime.spawn(async move {
             let status = timeout_at(deadline, async {
                 io.admit(&receipt).await?;
@@ -159,36 +213,102 @@ impl Calls {
             };
             // Prefer writing through before reporting. A ledger outage keeps
             // the exact result available to the checkpoint's settlement path.
-            let _ = timeout(ACCOUNTING_TIMEOUT, io.settle(&receipt, usage)).await;
-            let _ = send.send(status);
+            let accounted = matches!(
+                timeout(ACCOUNTING_TIMEOUT, io.settle(&receipt, usage)).await,
+                Ok(Ok(()))
+            );
+            let _ = send.send(Delivery { status, accounted });
         });
-        entries.insert(
+        state.entries.insert(
             operation,
             Entry {
+                receipt: exact_receipt,
                 expires: deadline + ACCOUNTING_TIMEOUT,
                 task: task.abort_handle(),
                 status: CallStatus::Receiving(receive),
+                checkpoint_ack: false,
             },
         );
         Ok(())
     }
 
     pub fn status(&self, operation: &OperationId) -> Result<DiagnosticStatus, PortError> {
-        let mut entries = self.entries.lock().map_err(|_| PortError::Unavailable)?;
-        let Some(entry) = entries.get_mut(operation) else {
+        let mut state = self.state.lock().map_err(|_| PortError::Unavailable)?;
+        let Some(entry) = state.entries.get_mut(operation) else {
             return Ok(DiagnosticStatus::OutcomeUnknown);
         };
-        if let CallStatus::Receiving(receiver) = &mut entry.status {
-            let status = match receiver.try_recv() {
-                Ok(status) => status,
-                Err(oneshot::error::TryRecvError::Empty) => return Ok(DiagnosticStatus::Pending),
-                Err(oneshot::error::TryRecvError::Closed) => DiagnosticStatus::OutcomeUnknown,
-            };
-            entry.status = CallStatus::Complete(status);
+        Ok(entry
+            .delivery()
+            .map_or(DiagnosticStatus::Pending, |delivery| {
+                delivery.status.clone()
+            }))
+    }
+
+    pub fn acknowledge(&self, reconciled: Reconciled) {
+        if let Ok(mut state) = self.state.lock() {
+            if let Some(entry) = state.entries.get_mut(&reconciled.0) {
+                entry.checkpoint_ack = true;
+                if entry.delivery().is_some_and(|delivery| delivery.accounted) {
+                    state.entries.remove(&reconciled.0);
+                }
+            }
         }
-        match &entry.status {
-            CallStatus::Complete(status) => Ok(status.clone()),
-            CallStatus::Receiving(_) => unreachable!("receive either returned or completed"),
+    }
+
+    /// Reconcile completed receipts without observing the original Work. A
+    /// fresh Runtime budget port still authorizes the exact accounting write.
+    pub fn needs_accounting(&self) -> bool {
+        self.state.lock().is_ok_and(|mut state| {
+            state
+                .entries
+                .values_mut()
+                .any(|entry| entry.delivery().is_some_and(|delivery| !delivery.accounted))
+        })
+    }
+
+    /// Reconcile the currently completed receipts once.
+    pub fn reconcile_accounting(&self, budget: &mut dyn BudgetPort) -> Result<usize, PortError> {
+        let due: Vec<_> = self
+            .state
+            .lock()
+            .map_err(|_| PortError::Unavailable)?
+            .entries
+            .values_mut()
+            .filter_map(|entry| {
+                let usage = entry
+                    .delivery()
+                    .filter(|delivery| !delivery.accounted)?
+                    .usage();
+                Some((entry.receipt.clone(), usage))
+            })
+            .collect();
+        let mut settled = 0;
+        for (receipt, usage) in due {
+            if budget.settle(&receipt, usage).is_err() {
+                continue;
+            }
+            settled += 1;
+            let mut state = self.state.lock().map_err(|_| PortError::Unavailable)?;
+            if let Some(entry) = state
+                .entries
+                .get_mut(&receipt.operation)
+                .filter(|entry| entry.receipt == receipt)
+            {
+                if let CallStatus::Complete(delivery) = &mut entry.status {
+                    delivery.accounted = true;
+                }
+                if entry.checkpoint_ack {
+                    state.entries.remove(&receipt.operation);
+                }
+            }
+        }
+        Ok(settled)
+    }
+
+    pub fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+            state.entries.clear();
         }
     }
 }
