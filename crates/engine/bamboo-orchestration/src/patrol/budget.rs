@@ -2,7 +2,7 @@
 //! or provider execution is created. Construct from a fresh Host authority for
 //! each pass; an Authority value cached across a revoke is not a live grant.
 use bamboo_tickets::{
-    Authority, ExecutionBudgetPurpose, ExecutionTokenOverCapUsage, ExecutionTokenUsage,
+    Authority, ExecutionBudgetPurpose, ExecutionTokenOverCapUsage, ExecutionTokenUsage, Health,
     TicketService, WorkTokenAdmission, WorkTokenAttempt, WorkTokenBlock, WorkTokenRequest,
 };
 
@@ -112,6 +112,7 @@ impl BudgetPort for TicketBudget<'_> {
                                 .any(|r| r.over_cap_usage.is_some())
                     })
                     || self.clock.now_ms() >= diagnostic.deadline_ms
+                    || self.service.health() != Health::Writable
                 {
                     return Err(BudgetBlock::Unavailable);
                 }
