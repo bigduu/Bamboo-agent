@@ -428,20 +428,33 @@ async fn start_work(
 
 #[tokio::test]
 async fn ready_semantic_patrol_settles_native_workspace_progress() {
-    Box::pin(ready_semantic_fixture(false)).await;
+    Box::pin(ready_semantic_fixture(SemanticCase::Known)).await;
 }
 
 #[tokio::test]
 async fn ready_semantic_patrol_keeps_unknown_charge_if_project_changes_before_send() {
-    Box::pin(ready_semantic_fixture(true)).await;
+    Box::pin(ready_semantic_fixture(SemanticCase::ProjectChanged)).await;
 }
 
-async fn ready_semantic_fixture(change_project: bool) {
+#[tokio::test]
+async fn ready_semantic_patrol_retries_late_usage_against_the_original_receipt() {
+    Box::pin(ready_semantic_fixture(SemanticCase::LateUsage)).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SemanticCase {
+    Known,
+    ProjectChanged,
+    LateUsage,
+}
+
+async fn ready_semantic_fixture(case: SemanticCase) {
     use bamboo_orchestration::{
         patrol::ObservationPort, ReadyDispatch, ReadyWorkHost, ReadyWorkScheduler,
     };
     use bamboo_tickets::{
-        Authority, Command, DispatchSpec, ExecutionTokenUsage, TicketService, WorkTokenLimits,
+        Authority, Command, DispatchSpec, ExecutionTokenUsage, FaultPoint, TicketService,
+        WorkTokenLimits,
     };
     use wiremock::{
         matchers::{method, path},
@@ -568,6 +581,7 @@ async fn ready_semantic_fixture(change_project: bool) {
             .await;
     }
     let projects = state.project_store.clone();
+    let change_project = case == SemanticCase::ProjectChanged;
     Mock::given(method("POST"))
         .and(path("/tokenize"))
         .respond_with(move |_: &Request| {
@@ -601,6 +615,8 @@ async fn ready_semantic_fixture(change_project: bool) {
     let response_tokens = response.len() as u64;
     let ledger_at_send = service.clone();
     let runtime_at_send = runtime.clone();
+    let failed_publications = Arc::new(AtomicUsize::new(0));
+    let failure_probe = failed_publications.clone();
     Mock::given(method("POST"))
         .and(path("/completion"))
         .respond_with(move |req: &Request| {
@@ -610,7 +626,28 @@ async fn ready_semantic_fixture(change_project: bool) {
                 .unwrap();
             assert_eq!(ledger.total_charged, 4224);
             assert_eq!(ledger.reservations.len(), 1);
-            assert!(ledger.reservations.values().next().unwrap().usage.is_none());
+            let original = ledger.reservations.values().next().unwrap();
+            assert!(original.usage.is_none());
+            if case == SemanticCase::LateUsage {
+                // Record the conservative outcome while the reply is in flight.
+                ledger_at_send
+                    .settle_work_tokens(
+                        &runtime_at_send,
+                        &original.request.operation_id,
+                        &original.request.request_hash,
+                        &original.receipt,
+                        ExecutionTokenUsage::Unknown,
+                    )
+                    .unwrap();
+                let failure_probe = failure_probe.clone();
+                ledger_at_send.set_publication_fault(Some(Arc::new(move |point| {
+                    if point == FaultPoint::BeforeHeadRename {
+                        failure_probe.fetch_add(1, Ordering::SeqCst);
+                        return Err(std::io::Error::other("controlled settlement write failure"));
+                    }
+                    Ok(())
+                })));
+            }
             let body: Value = serde_json::from_slice(&req.body).unwrap();
             let prompt = body["prompt"].as_array().unwrap();
             assert!(prompt.iter().all(Value::is_u64));
@@ -646,15 +683,18 @@ async fn ready_semantic_fixture(change_project: bool) {
     scheduler.revoke().await;
 
     scheduler.install(&host, granted).await.unwrap();
-    let ledger = tokio::time::timeout(WAIT, async {
+    let mut ledger = tokio::time::timeout(WAIT, async {
         loop {
             Box::pin(scheduler.reconcile(&host)).await.unwrap();
             let ledger = service.work_token_budget(&runtime).unwrap().unwrap();
-            if ledger
-                .reservations
-                .values()
-                .any(|record| record.usage.is_some())
-            {
+            let ready = match case {
+                SemanticCase::LateUsage => state.tickets.patrol_calls.needs_accounting(),
+                _ => ledger
+                    .reservations
+                    .values()
+                    .any(|record| record.usage.is_some()),
+            };
+            if ready {
                 break ledger;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -662,6 +702,24 @@ async fn ready_semantic_fixture(change_project: bool) {
     })
     .await
     .unwrap();
+    if case == SemanticCase::LateUsage {
+        assert_eq!(ledger.total_charged, 4224);
+        assert_eq!(ledger.reservations.len(), 1);
+        assert!(failed_publications.load(Ordering::SeqCst) > 0);
+        let original = ledger.reservations.values().next().unwrap().clone();
+        assert_eq!(original.usage, Some(ExecutionTokenUsage::Unknown));
+        // The next Ready pass can finish accounting after model selection is
+        // removed, using the exact original receipt and no provider request.
+        state.config.write().await.patrol_model = None;
+        service.set_publication_fault(None);
+        Box::pin(scheduler.reconcile(&host)).await.unwrap();
+        assert!(!state.tickets.patrol_calls.needs_accounting());
+        ledger = service.work_token_budget(&runtime).unwrap().unwrap();
+        assert_eq!(ledger.reservations.len(), 1);
+        let reconciled = ledger.reservations.values().next().unwrap();
+        assert_eq!(reconciled.receipt, original.receipt);
+        assert_eq!(reconciled.request, original.request);
+    }
     scheduler.revoke().await;
     assert_eq!(ledger.reservations.len(), 1);
     let receipt = ledger.reservations.values().next().unwrap();

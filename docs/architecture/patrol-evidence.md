@@ -166,8 +166,10 @@ The native fixture also exercises metered preparation with a controlled local
 meter, exact payload retention, over-cap refusal and a Ticket HEAD change
 during measurement. Configured preparation is also tested with the local native
 profile, exact-cap acceptance, over-cap refusal, and a stale model selection.
-A controlled loopback provider fixture also exercises the raw request, the
-native Work ledger, stale Ready grants and Project changes before submission. Live model and
-installed-application measurements remain separate under
+A controlled loopback provider fixture exercises the raw request, the native
+Work ledger and Project changes before submission. It also verifies that a
+later Ready pass settles an unknown receipt after a write failure using the
+original reply and receipt. Live model and installed-application measurements
+remain separate under
 [#2049](https://github.com/bigduu/Bamboo-agent/issues/2049) and
 [#2050](https://github.com/bigduu/Bamboo-agent/issues/2050).
