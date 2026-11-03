@@ -2,7 +2,7 @@
 use super::*;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
-use bamboo_domain::{Message, SessionMessageEnvelope, WorkspaceBinding};
+use bamboo_domain::{Message, ProjectId, SessionMessageEnvelope, WorkspaceBinding};
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use bamboo_orchestration::patrol::Status;
 use bamboo_tickets::{Contract, Operation, ProjectContextSnapshot, WorkState};
@@ -29,6 +29,7 @@ pub(super) fn before_ack(store: &mut PatrolCheckpointStore) {
 struct Provider {
     calls: AtomicUsize,
     limit: usize,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
 }
 #[async_trait]
 impl LLMProvider for Provider {
@@ -42,6 +43,12 @@ impl LLMProvider for Provider {
         assert_eq!(model, "patrol-evidence-local");
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(call < self.limit, "observer cannot activate provider");
+        if let Some(gate) = &self.gate {
+            gate.acquire()
+                .await
+                .expect("controlled provider gate")
+                .forget();
+        }
         assert!(tools.iter().any(|tool| tool.function.name == "Task"));
         let chunk = if call == 0 {
             LLMChunk::ToolCalls(vec![ToolCall { id:"evidence-task".into(),tool_type:"function".into(),function:FunctionCall {
@@ -58,9 +65,17 @@ impl LLMProvider for Provider {
 }
 
 async fn host(root: &Path, limit: usize) -> (crate::AppState, Arc<Provider>) {
+    host_with_gate(root, limit, None).await
+}
+async fn host_with_gate(
+    root: &Path,
+    limit: usize,
+    gate: Option<Arc<tokio::sync::Semaphore>>,
+) -> (crate::AppState, Arc<Provider>) {
     let provider = Arc::new(Provider {
         calls: AtomicUsize::new(0),
         limit,
+        gate,
     });
     let mut config:Config=serde_json::from_value(json!({"provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":true},
         "providers":{"openai":{"api_key":"unused-controlled-fixture","model":"patrol-evidence-local"}},"run_budget":{"max_rounds":4},"subagents":{"max_concurrent":1}})).unwrap();
@@ -305,9 +320,10 @@ fn assert_source_negatives(
     );
 }
 
-async fn seed(root: &Path) {
-    let execution = workspace(root);
-    let (state, provider) = host(root, 2).await;
+async fn start_work(
+    state: &crate::AppState,
+    execution: bamboo_tickets::ExecutionWorkspace,
+) -> (String, ProjectId) {
     let project = state.project_store.create("Evidence", None).unwrap();
     let project = state
         .project_store
@@ -389,6 +405,13 @@ async fn seed(root: &Path) {
         state.tickets.dispatch(owner(), &start).await.unwrap()["errors"],
         json!([])
     );
+    (work, project.id)
+}
+async fn seed(root: &Path) {
+    let execution = workspace(root);
+    let (state, provider) = host(root, 2).await;
+    let (work, project) = start_work(&state, execution).await;
+    let (service, authority) = state.tickets.authority(owner()).await.unwrap();
     let snapshot = tokio::time::timeout(WAIT, async {
         loop {
             let snapshot = service.published().unwrap().1;
@@ -431,7 +454,7 @@ async fn seed(root: &Path) {
         .unwrap();
     let scope = state
         .tickets
-        .patrol_scope(project.id.as_str(), &work, &assignment)
+        .patrol_scope(project.as_str(), &work, &assignment)
         .await
         .unwrap();
     let mut journal = state.tickets.open_patrol_checkpoints(&scope).await.unwrap();
@@ -651,4 +674,85 @@ fn native_staged_evidence_survives_failed_ack_source_change_and_cold_reopen() {
         String::from_utf8_lossy(&output.stderr)
     );
     actix_web::rt::System::new().block_on(reopened(&root));
+}
+
+#[tokio::test]
+async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket_writes() {
+    use crate::app_state::ticket_application::patrol_adapter::runtime_observation;
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let execution = workspace(&root);
+    let (state, provider) = host_with_gate(&root, 1, Some(gate.clone())).await;
+    let (work, project) = start_work(&state, execution).await;
+    tokio::time::timeout(WAIT, async {
+        while provider.calls.load(Ordering::SeqCst) != 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (service, authority) = state.tickets.authority(Principal::Runtime).await.unwrap();
+    let before = service.published().unwrap();
+    let assignment = before.1.tickets[&work].active_assignment.as_ref().unwrap();
+    let scope = state
+        .tickets
+        .patrol_scope(project.as_str(), &work, assignment)
+        .await
+        .unwrap();
+    let receipt = before.1.assignments[assignment].runtime.as_ref().unwrap();
+    let child = state
+        .storage
+        .load_runtime_control_plane(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(state
+        .spawn_scheduler
+        .native_task_start(&child.id, &receipt.run_id, child.created_at)
+        .is_some());
+    let (entered, enter) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let read = runtime_observation::prepare_with_probe(
+        &state.tickets,
+        &service,
+        &authority,
+        &scope,
+        async {
+            entered.send(()).unwrap();
+            released.await.unwrap();
+        },
+    );
+    tokio::pin!(read);
+    tokio::select! { biased;
+        _ = &mut read => panic!("the reader must remain at its final proof barrier"),
+        result = enter => result.unwrap(),
+    }
+    let shutdown = state.external_child_runner.shutdown();
+    tokio::pin!(shutdown);
+    // Current-thread runtime: close the real native source but do not yield to
+    // its terminal writer. The same read/Ticket commit must detect that loss.
+    assert!(futures::poll!(&mut shutdown).is_pending());
+    assert!(state
+        .spawn_scheduler
+        .native_task_start(&child.id, &receipt.run_id, child.created_at)
+        .is_none());
+    assert_eq!(service.published().unwrap().0, before.0);
+    release.send(()).unwrap();
+    assert!(matches!(
+        futures::poll!(&mut read),
+        std::task::Poll::Ready(Err(Error::RevisionConflict))
+    ));
+    assert_eq!(service.published().unwrap().0, before.0);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    eprintln!(
+        "2506 final-read source removed: unchanged commit={}, original native provider calls=1",
+        before.0
+    );
+    gate.add_permits(1);
+    tokio::time::timeout(WAIT, &mut shutdown)
+        .await
+        .unwrap()
+        .unwrap();
+    state.shutdown().await;
 }

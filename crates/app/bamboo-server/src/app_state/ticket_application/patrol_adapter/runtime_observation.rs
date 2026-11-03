@@ -144,6 +144,16 @@ pub(super) async fn prepare(
     authority: &Authority,
     scope: &Scope,
 ) -> Result<Option<host::RuntimeFacts>> {
+    prepare_inner(app, service, authority, scope, std::future::ready(())).await
+}
+
+async fn prepare_inner(
+    app: &TicketApplication,
+    service: &Arc<TicketService>,
+    authority: &Authority,
+    scope: &Scope,
+    before_return: impl std::future::Future<Output = ()>,
+) -> Result<Option<host::RuntimeFacts>> {
     let mut port = host::read_observation(service, authority, scope).map_err(patrol_error)?;
     let ledger = port.observation(scope, 0).map_err(patrol_error)?;
     if ledger.execution_unknown || ledger.terminal {
@@ -317,9 +327,6 @@ pub(super) async fn prepare(
     if fingerprint(&current)? != fingerprint(&child)? {
         return Err(Error::RevisionConflict);
     }
-    if native_start() != started {
-        return Err(Error::RevisionConflict);
-    }
     let (fresh, _) = app.authority(Principal::Runtime).await?;
     if !Arc::ptr_eq(&fresh, service) || fresh.published()?.0 != commit {
         return Err(Error::RevisionConflict);
@@ -330,7 +337,13 @@ pub(super) async fn prepare(
         &snapshot.binding.supervisor_session_id,
     )
     .await?;
+    before_return.await;
     lineage(&current, &fresh_parent, &assignment.id)?;
+    // No await after this live-owner check. Ticket commit/receipt checks alone
+    // cannot detect a native owner closing during the preceding Host reads.
+    if native_start() != started {
+        return Err(Error::RevisionConflict);
+    }
     Ok(Some(host::RuntimeFacts {
         scope: scope.clone(),
         source_commit: commit,
@@ -338,6 +351,17 @@ pub(super) async fn prepare(
         started_at_ms,
         wait,
     }))
+}
+
+#[cfg(test)]
+pub(super) async fn prepare_with_probe(
+    app: &TicketApplication,
+    service: &Arc<TicketService>,
+    authority: &Authority,
+    scope: &Scope,
+    before_return: impl std::future::Future<Output = ()>,
+) -> Result<Option<host::RuntimeFacts>> {
+    prepare_inner(app, service, authority, scope, before_return).await
 }
 
 pub(super) async fn prepare_selection(

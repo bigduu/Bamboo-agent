@@ -2,9 +2,7 @@
 use super::*;
 use bamboo_orchestration::patrol::{Observation, ObservationPort};
 
-async fn sample(fixture: &Fixture, work: &str) -> Observation {
-    let snapshot = fixture.snapshot();
-    let assignment = snapshot.tickets[work].active_assignment.as_ref().unwrap();
+async fn sample(fixture: &Fixture, work: &str, assignment: &str) -> Observation {
     let scope = fixture
         .state
         .tickets
@@ -51,13 +49,34 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
         .unwrap()
         .published()
         .unwrap();
-    let first_sample = sample(&fixture, &first_work).await;
+    let exact_assignment = |work: &str| {
+        before
+            .1
+            .assignments
+            .values()
+            .find(|a| a.work_id == work)
+            .unwrap()
+            .id
+            .as_str()
+    };
+    let first_assignment = exact_assignment(&first_work);
+    let second_assignment = exact_assignment(&second_work);
+    let queued_assignment_id = exact_assignment(&queued_work);
+    let first_sample = sample(&fixture, &first_work, first_assignment).await;
     let started = first_sample
         .started_at_ms
         .expect("actual native Agent execution entered before provider admission");
     assert!(started > 0);
-    assert!(sample(&fixture, &second_work).await.started_at_ms.is_some());
-    assert_eq!(sample(&fixture, &queued_work).await.started_at_ms, None);
+    assert!(sample(&fixture, &second_work, second_assignment)
+        .await
+        .started_at_ms
+        .is_some());
+    assert_eq!(
+        sample(&fixture, &queued_work, queued_assignment_id)
+            .await
+            .started_at_ms,
+        None
+    );
     let queued_assignment = before
         .1
         .assignments
@@ -93,7 +112,9 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
         .native_task_start(&queued_child, &queued_run, queued_birth)
         .is_none());
     assert_eq!(
-        sample(&fixture, &first_work).await.started_at_ms,
+        sample(&fixture, &first_work, first_assignment)
+            .await
+            .started_at_ms,
         Some(started)
     );
     assert_eq!(
@@ -164,10 +185,18 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
     first.complete();
     let queued = fixture.next_request().await;
     assert!(queued.is_work(queued_index));
-    assert!(sample(&fixture, &queued_work).await.started_at_ms.is_some());
+    assert!(sample(&fixture, &queued_work, queued_assignment_id)
+        .await
+        .started_at_ms
+        .is_some());
     fixture.wait_submitted(&first_work).await;
     wait_native_terminal(&fixture.state, &child.id).await;
-    assert_eq!(sample(&fixture, &first_work).await.started_at_ms, None);
+    assert_eq!(
+        sample(&fixture, &first_work, first_assignment)
+            .await
+            .started_at_ms,
+        None
+    );
     assert!(fixture
         .state
         .spawn_scheduler
