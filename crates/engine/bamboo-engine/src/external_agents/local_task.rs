@@ -8,13 +8,14 @@ use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentError, AgentEvent, Session};
 use bamboo_domain::{
-    ActorActivationClaim, ActorActivationFinish, ActorDirectoryPort, ChildActorRuntimeWrite,
-    RuntimeSessionPersistence, SessionKind, Storage,
+    ActorActivationClaim, ActorActivationFinish, ActorDirectoryError, ActorDirectoryPort,
+    ChildActorRuntimeWrite, RuntimeSessionPersistence, SessionKind, Storage,
 };
 use bamboo_llm::{Config, ProviderModelRouter};
 use futures::FutureExt;
 use std::{
     collections::HashMap,
+    future::Future,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -90,12 +91,38 @@ enum LaunchState {
     Stopped,
 }
 
+#[derive(Default)]
+struct LiveTaskSignals {
+    entered_at: OnceLock<chrono::DateTime<chrono::Utc>>,
+    renewal_started_at: Mutex<Option<chrono::DateTime<chrono::Utc>>>,
+}
+
+impl LiveTaskSignals {
+    async fn observe_renewal<T, F>(
+        &self,
+        renew: impl FnOnce(chrono::DateTime<chrono::Utc>) -> F,
+    ) -> Result<T, ActorDirectoryError>
+    where
+        F: Future<Output = Result<T, ActorDirectoryError>>,
+    {
+        // A queued renewal may finish after entry. Capture entry before the
+        // request and publish its timestamp only after successful renewal.
+        let entered_at = self.entered_at.get().copied();
+        let now = chrono::Utc::now();
+        let receipt = renew(now).await?;
+        if entered_at.is_some_and(|at| at <= now) {
+            *lock(&self.renewal_started_at) = Some(now);
+        }
+        Ok(receipt)
+    }
+}
+
 struct Execution {
     owner: ChildActorRuntimeWrite,
     persistence: Arc<dyn RuntimeSessionPersistence>,
     cancel: CancellationToken,
     resources: bamboo_tools::LocalTaskResources,
-    entered_at: Arc<OnceLock<chrono::DateTime<chrono::Utc>>>,
+    signals: Arc<LiveTaskSignals>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<ExecutionOutput>>>,
     stop: Mutex<Option<ConfirmedTaskStop>>,
     finalized: AtomicBool,
@@ -433,11 +460,26 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         run_id: &str,
         child_birth: chrono::DateTime<chrono::Utc>,
     ) -> Option<crate::execution::spawn::NativeTaskStart> {
+        self.native_task_liveness(session_id, run_id, child_birth)
+            .map(|live| live.start)
+    }
+
+    fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::execution::spawn::NativeTaskLiveness> {
         if self.closed.load(Ordering::Acquire) {
             return None;
         }
         let execution = lock(&self.executions).get(session_id)?.clone();
-        if execution.owner.fence.run_id != run_id
+        let entered_at = *execution.signals.entered_at.get()?;
+        let renewal_started_at = *lock(&execution.signals.renewal_started_at);
+        // Sample first so a renewal confirmed during closure cannot pass a
+        // lifecycle check that preceded the sample.
+        if self.closed.load(Ordering::Acquire)
+            || execution.owner.fence.run_id != run_id
             || execution.owner.created_at != child_birth
             || execution.owner.fence.actor_id != session_id
             || execution.cancel.is_cancelled()
@@ -446,12 +488,15 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         {
             return None;
         }
-        Some(crate::execution::spawn::NativeTaskStart {
-            session_id: session_id.into(),
-            child_birth,
-            run_id: run_id.into(),
-            instance_id: execution.resources.identity().owner_id,
-            entered_at: *execution.entered_at.get()?,
+        Some(crate::execution::spawn::NativeTaskLiveness {
+            start: crate::execution::spawn::NativeTaskStart {
+                session_id: session_id.into(),
+                child_birth,
+                run_id: run_id.into(),
+                instance_id: execution.resources.identity().owner_id,
+                entered_at,
+            },
+            renewal_started_at,
         })
     }
 
@@ -664,26 +709,29 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                 };
             }
         };
+        let signals = Arc::new(LiveTaskSignals::default());
         let heartbeat_stop = CancellationToken::new();
         let heartbeat = {
             let store = store.clone();
             let fence = owner.fence.clone();
             let done = heartbeat_stop.clone();
             let cancel = cancel.clone();
+            let signals = signals.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 interval.tick().await;
                 loop {
                     tokio::select! { _ = done.cancelled() => break, _ = interval.tick() => {} }
-                    let now = chrono::Utc::now();
-                    match store
-                        .renew_activation(&fence, now, now + chrono::Duration::seconds(60))
+                    match signals
+                        .observe_renewal(|now| {
+                            store.renew_activation(&fence, now, now + chrono::Duration::seconds(60))
+                        })
                         .await
                     {
                         Ok(_) => {}
                         // Transient storage failures only delay one heartbeat;
                         // the next tick retries before the lease can expire.
-                        Err(error @ bamboo_domain::ActorDirectoryError::Storage(_)) => {
+                        Err(error @ ActorDirectoryError::Storage(_)) => {
                             tracing::warn!(actor_id = %fence.actor_id, run_id = %fence.run_id,
                                 %error, "local task heartbeat hit transient storage failure; retrying next tick");
                         }
@@ -699,7 +747,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             owner,
             persistence: persistence.clone(),
             cancel,
-            entered_at: Arc::new(OnceLock::new()),
+            signals,
             resources: bamboo_tools::LocalTaskResources::new(
                 &session.id,
                 run_id,
@@ -884,7 +932,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         let (event_store, event_observer) = { let bindings=lock(&self.bindings); (bindings.store.clone().expect("prepared store"), bindings.observer.clone()) };
         let event_owner = execution.owner.clone();
         let event_cancel = cancel_token.clone();
-        let entered_at = execution.entered_at.clone();
+        let signals = execution.signals.clone();
         let task = tokio::spawn(async move {
             let forward = tokio::spawn(events::forward(event_store, event_owner, event_observer, local_event_rx, event_tx, event_cancel));
             let result = std::panic::AssertUnwindSafe(
@@ -901,7 +949,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                     // This physical Task has reached Agent execution with its
                     // native slot and exact owner. Preparation/Actor start is
                     // earlier and cannot set this once-only, non-persisted fact.
-                    let _ = entered_at.set(chrono::Utc::now());
+                    let _ = signals.entered_at.set(chrono::Utc::now());
                     agent.execute(&mut owned_session, request.build()).await
                 })),
             )

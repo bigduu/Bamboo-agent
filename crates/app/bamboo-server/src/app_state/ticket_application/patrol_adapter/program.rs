@@ -95,7 +95,7 @@ impl TicketApplication {
         let facts_revision = snapshot.execution_facts_revision();
         // Canonical runtime I/O stays outside the synchronous journal/Ticket
         // pass. Each prepared sample remains bound to its original commit and
-        // receipt. At projection the factory also rechecks any live start.
+        // receipt. At projection the factory rechecks the live Task instance.
         let observations =
             runtime_observation::prepare_selection(self, &service, &authority, selection).await?;
         fence.check()?;
@@ -147,6 +147,7 @@ impl TicketApplication {
                             &authority,
                             scope,
                             &Policy::default(),
+                            Some(now),
                         ),
                         None => bamboo_orchestration::patrol::host::read_observation(
                             &service, &authority, scope,

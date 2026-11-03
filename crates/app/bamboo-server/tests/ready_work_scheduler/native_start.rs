@@ -1,5 +1,6 @@
-//! Actual native entry evidence, independent of preparation/Actor timestamps.
+//! Live native entry and renewal evidence from the real runner.
 use super::*;
+use bamboo_domain::ActorDirectoryPort;
 use bamboo_orchestration::patrol::{Observation, ObservationPort};
 
 async fn sample(fixture: &Fixture, work: &str, assignment: &str) -> Observation {
@@ -16,7 +17,6 @@ async fn sample(fixture: &Fixture, work: &str, assignment: &str) -> Observation 
         .await
         .unwrap();
     let sample = port.observation(&scope, 0).unwrap();
-    assert_eq!(sample.heartbeat_at_ms, None);
     assert_eq!(sample.progress, None);
     sample
 }
@@ -71,12 +71,9 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
         .await
         .started_at_ms
         .is_some());
-    assert_eq!(
-        sample(&fixture, &queued_work, queued_assignment_id)
-            .await
-            .started_at_ms,
-        None
-    );
+    let queued_sample = sample(&fixture, &queued_work, queued_assignment_id).await;
+    assert_eq!(queued_sample.started_at_ms, None);
+    assert_eq!(queued_sample.heartbeat_at_ms, None);
     let queued_assignment = before
         .1
         .assignments
@@ -106,30 +103,48 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
     })
     .await
     .expect("the third native logical Run is prepared behind the two real slots");
+    // Inspect the real Actor lease only as a control for the queued renewal.
+    // The patrol read path never consults this lease to infer a heartbeat.
+    let queued_lease = || async {
+        fixture
+            .state
+            .session_store
+            .inspect_actor(&queued_child)
+            .await
+            .unwrap()
+            .activation
+            .filter(|activation| activation.run_id == queued_run)
+            .map(|activation| activation.lease_expires_at)
+    };
+    let (before_renewal, after_renewal) = tokio::time::timeout(WAIT, async {
+        let mut initial = None;
+        loop {
+            if let Some(current) = queued_lease().await {
+                let first = *initial.get_or_insert(current);
+                if current > first {
+                    break (first, current);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the existing heartbeat loop renews the third Actor while it is still queued");
     assert!(fixture
         .state
         .spawn_scheduler
-        .native_task_start(&queued_child, &queued_run, queued_birth)
+        .native_task_liveness(&queued_child, &queued_run, queued_birth)
         .is_none());
+    let queued_sample = sample(&fixture, &queued_work, queued_assignment_id).await;
+    assert_eq!(queued_sample.started_at_ms, None);
+    assert_eq!(queued_sample.heartbeat_at_ms, None);
+    eprintln!("2525 queued renewal {before_renewal} -> {after_renewal}; no heartbeat observation");
     assert_eq!(
         sample(&fixture, &first_work, first_assignment)
             .await
             .started_at_ms,
         Some(started)
     );
-    assert_eq!(
-        fixture
-            .state
-            .tickets
-            .service()
-            .unwrap()
-            .published()
-            .unwrap()
-            .0,
-        before.0
-    );
-    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 2);
-
     let assignment = before
         .1
         .assignments
@@ -151,15 +166,45 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
         .unwrap();
     assert_eq!(live.started_at_ms(), Some(started));
     assert!(!live.instance_id.is_nil());
+    let heartbeat = tokio::time::timeout(WAIT, async {
+        loop {
+            if let Some(at) = fixture
+                .state
+                .spawn_scheduler
+                .native_task_liveness(&child.id, &receipt.run_id, child.created_at)
+                .and_then(|live| live.heartbeat_at_ms())
+            {
+                break at;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the admitted Task reports a successful renewal");
+    let observed = sample(&fixture, &first_work, first_assignment).await;
+    assert!(heartbeat >= started);
+    assert!(observed.heartbeat_at_ms.is_some_and(|at| at >= heartbeat));
+    assert_eq!(
+        fixture
+            .state
+            .tickets
+            .service()
+            .unwrap()
+            .published()
+            .unwrap()
+            .0,
+        before.0
+    );
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 2);
     assert!(fixture
         .state
         .spawn_scheduler
-        .native_task_start(&child.id, "wrong-run", child.created_at)
+        .native_task_liveness(&child.id, "wrong-run", child.created_at)
         .is_none());
     assert!(fixture
         .state
         .spawn_scheduler
-        .native_task_start(
+        .native_task_liveness(
             &child.id,
             &receipt.run_id,
             child.created_at + chrono::Duration::milliseconds(1)
@@ -191,16 +236,13 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
         .is_some());
     fixture.wait_submitted(&first_work).await;
     wait_native_terminal(&fixture.state, &child.id).await;
-    assert_eq!(
-        sample(&fixture, &first_work, first_assignment)
-            .await
-            .started_at_ms,
-        None
-    );
+    let stopped = sample(&fixture, &first_work, first_assignment).await;
+    assert_eq!(stopped.started_at_ms, None);
+    assert_eq!(stopped.heartbeat_at_ms, None);
     assert!(fixture
         .state
         .spawn_scheduler
-        .native_task_start(&child.id, &receipt.run_id, child.created_at)
+        .native_task_liveness(&child.id, &receipt.run_id, child.created_at)
         .is_none());
     queued.complete();
     second.complete();
@@ -224,6 +266,6 @@ async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shu
     assert!(fixture
         .state
         .spawn_scheduler
-        .native_task_start(&child.id, &receipt.run_id, child.created_at)
+        .native_task_liveness(&child.id, &receipt.run_id, child.created_at)
         .is_none());
 }

@@ -115,6 +115,14 @@ fn known_heartbeat_does_not_fill_an_unavailable_progress_measurement() {
     observations.observation.progress = None;
     pass(&mut checkpoints, &mut observations, 100);
     assert_eq!(checkpoints.incident().reason, Reason::EvidenceUnknown);
+    let incident = checkpoints.incident().id;
+    pass(
+        &mut checkpoints,
+        &mut observations,
+        100 + policy().heartbeat_timeout_ms,
+    );
+    assert_eq!(checkpoints.incident().reason, Reason::MissingHeartbeat);
+    assert_eq!(checkpoints.incident().id, incident);
     only_program_calls(&checkpoints, &observations);
 }
 

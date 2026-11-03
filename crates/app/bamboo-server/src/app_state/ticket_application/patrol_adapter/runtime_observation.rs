@@ -1,4 +1,4 @@
-//! Host proof for exact waits and the Engine's live Task-entry read port.
+//! Host proof for exact waits and the Engine's live native Task observations.
 //! No ActorDirectory inspect/ensure (which can write),
 //! transcript load, liveness inference, executable grant or runtime mutation.
 use super::super::{ChildSessionAdapter, Error, Principal, Result, TicketApplication};
@@ -30,33 +30,32 @@ impl PreparedRuntimeFacts {
         authority: &Authority,
         scope: &Scope,
         policy: &Policy,
+        heartbeat_cutoff_ms: Option<u64>,
     ) -> std::result::Result<host::TicketObservation, PortError> {
         // A batch may await another Scope or journal open after preparation.
-        // Re-read the exact Engine instance at projection, without retaining
-        // the adapter or reviving a stopped owner. Wait is independent of start.
-        let still_live = self.live_start.as_ref().is_some_and(|(adapter, sample)| {
+        // Re-read the same Task instance at projection. Heartbeat can advance
+        // during collection. Wait remains independent of a live owner.
+        let live = self.live_start.as_ref().and_then(|(adapter, sample)| {
             adapter
-                .upgrade()
-                .and_then(|adapter| {
-                    adapter.scheduler.native_task_start(
-                        &sample.session_id,
-                        &sample.run_id,
-                        sample.child_birth,
-                    )
-                })
-                .as_ref()
-                == Some(sample)
+                .upgrade()?
+                .scheduler
+                .native_task_liveness(&sample.session_id, &sample.run_id, sample.child_birth)
+                .filter(|live| &live.start == sample)
         });
         let without_start =
-            (self.facts.started_at_ms.is_some() && !still_live).then(|| host::RuntimeFacts {
+            (self.facts.started_at_ms.is_some() && live.is_none()).then(|| host::RuntimeFacts {
                 started_at_ms: None,
                 ..self.facts.clone()
             });
-        host::read_observation_with_runtime_facts(
+        let heartbeat_at_ms = live
+            .and_then(|live| live.heartbeat_at_ms())
+            .filter(|at| heartbeat_cutoff_ms.is_none_or(|cutoff| *at <= cutoff));
+        host::read_observation_with_runtime_heartbeat(
             service,
             authority,
             scope,
             without_start.as_ref().unwrap_or(&self.facts),
+            heartbeat_at_ms,
             policy,
         )
     }
@@ -388,8 +387,8 @@ async fn prepare_inner(
     .await?;
     before_return.await;
     lineage(&current, &fresh_parent, &assignment.id)?;
-    // No await after this live-owner check. Ticket commit/receipt checks alone
-    // cannot detect a native owner closing during the preceding Host reads.
+    // Check the immutable Task entry after the last await. Heartbeat advances
+    // independently and is sampled only when consuming the prepared facts.
     if native_start() != started {
         return Err(Error::RevisionConflict);
     }

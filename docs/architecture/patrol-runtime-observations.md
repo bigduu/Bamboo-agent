@@ -81,15 +81,26 @@ running/preparation `runtime.local_task.observed_at` observation alone do not
 prove actual Task entry. Its verified stopped observation remains the Question
 diagnostic anchor described above.
 
-## Measurements that remain unavailable
+## Live native heartbeat
 
-Actual heartbeat and meaningful progress remain `None`. Round/token counters,
-metadata revisions, polling time and lease expiry do not supply either fact.
-Their producers remain separate work.
+#2525 exposes the latest successfully acknowledged Actor renewal from the
+existing heartbeat loop. The loop captures Task entry before requesting a
+renewal and records the renewal's request time only after success. A queued
+renewal that finishes after entry still supplies no heartbeat. The timestamp is
+conservative when storage is slow and remains with the same live native
+execution instance. Reopening a Host cannot reconstruct it from a lease.
 
-Policy no longer substitutes a known start for a missing heartbeat/progress
-measurement. Unsupported measurements yield `EvidenceUnknown`, unless a valid
-supported wait or authoritative terminal state applies.
+Host preparation fences the immutable Task entry. At projection the program
+re-reads the heartbeat of the same instance, so an intervening renewal can
+advance the sample. The Ready pass has a fixed clock. A heartbeat later than
+that pass's cutoff is unavailable for that pass. Closure or replacement clears
+live start and heartbeat while preserving independent wait evidence and the
+original Ticket fences.
+
+Meaningful progress remains `None`. A fresh heartbeat with unknown progress
+still yields `EvidenceUnknown`. A measured stale heartbeat can yield
+`MissingHeartbeat` under the existing policy. An unavailable heartbeat remains
+unknown, and neither signal authorizes recovery or proves physical stop.
 
 ## Acceptance ownership
 
@@ -104,14 +115,14 @@ terminal Actor check; a canonical owned stop alone precedes that writer tail.
 The existing orchestration `patrol` target owns policy transition regressions;
 the server default library owns compact identity-helper negatives.
 
-The existing `ready_work_scheduler` target owns real native capacity/entry,
-repeat-read and wrong-identity controls. The Question scenario additionally
-checks live start and its absence after stop/reopen. The server default library
-owns a controlled shutdown at the last Host read and between batch collection
-and projection: the in-flight read must conflict, and the prepared batch must
-project an unknown start, both without a Ticket write. Pure `patrol_restart`
-cases check projection fences and wait-only API compatibility; start alone
-still cannot prove health.
+The existing `ready_work_scheduler` target owns native capacity, entry, queued
+renewal and admitted heartbeat controls. The Question scenario checks the
+absence of live facts after stop and reopen. The server default library
+advances a real renewal during final Host sampling, then closes the source
+during another read. The in-flight read conflicts on closure and the prepared
+batch loses live start and heartbeat without a Ticket write. Pure patrol
+cases check projection fences, API compatibility and the distinction between
+unavailable progress and a measured stale heartbeat.
 
 These are controlled-provider/native mechanisms, not paid-model, installed-app,
 all-platform or complete #2049 acceptance. Exact executed results belong in the

@@ -722,12 +722,94 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
             .unwrap();
     let runtime = &prepared[&scope];
     assert!(runtime
-        .read_observation(&service, &authority, &scope, &Policy::default())
+        .read_observation(&service, &authority, &scope, &Policy::default(), None)
         .unwrap()
         .observation(&scope, 0)
         .unwrap()
         .started_at_ms
         .is_some());
+    let wait_for_renewal = |after: Option<u64>| {
+        let state = &state;
+        let child = &child;
+        async move {
+            tokio::time::timeout(WAIT, async {
+                loop {
+                    let at = state
+                        .spawn_scheduler
+                        .native_task_liveness(&child.id, &receipt.run_id, child.created_at)
+                        .and_then(|live| live.heartbeat_at_ms());
+                    if let Some(at) = at.filter(|at| after.is_none_or(|old| *at > old)) {
+                        break at;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+            .expect("the held native Task renews its real Actor activation")
+        }
+    };
+    let first_heartbeat = wait_for_renewal(None).await;
+    let advanced = runtime_observation::prepare_with_probe(
+        &state.tickets,
+        &service,
+        &authority,
+        &scope,
+        async {
+            // Advance the actual renewal after initial Host collection, while
+            // the same execution instance and the same Ticket commit remain.
+            wait_for_renewal(Some(first_heartbeat)).await;
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    for prepared in [runtime, &advanced] {
+        let observed = prepared
+            .read_observation(&service, &authority, &scope, &Policy::default(), None)
+            .unwrap()
+            .observation(&scope, 0)
+            .unwrap();
+        assert!(observed
+            .heartbeat_at_ms
+            .is_some_and(|at| at > first_heartbeat));
+        assert!(observed.progress.is_none());
+    }
+
+    // The Ready pass has one fixed clock. A later real heartbeat must not
+    // break an otherwise valid ProgramPatrol tick at the earlier cutoff.
+    let policy = Policy::default();
+    let program = ProgramPatrol::new(policy.clone()).unwrap();
+    let clock = SystemClock(first_heartbeat);
+    let mut journal = PatrolCheckpointStore::open(&root.join("heartbeat-clock-control")).unwrap();
+    let mut unbounded = runtime
+        .read_observation(&service, &authority, &scope, &policy, None)
+        .unwrap();
+    assert!(matches!(
+        program.tick(&scope, &clock, &mut journal, &mut unbounded),
+        Err(bamboo_orchestration::patrol::Error::InvalidObservation)
+    ));
+    let mut bounded = runtime
+        .read_observation(&service, &authority, &scope, &policy, Some(first_heartbeat))
+        .unwrap();
+    assert_eq!(
+        program
+            .tick(&scope, &clock, &mut journal, &mut bounded)
+            .unwrap()
+            .status,
+        Status::Incident
+    );
+    assert_eq!(
+        journal
+            .load(&scope)
+            .unwrap()
+            .unwrap()
+            .checkpoint
+            .incident
+            .unwrap()
+            .reason,
+        bamboo_orchestration::patrol::Reason::EvidenceUnknown
+    );
+
     let (entered, enter) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     let read = runtime_observation::prepare_with_probe(
@@ -758,7 +840,7 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
     // This is the same reader the program factory uses after collecting its
     // batch. The previously valid sample cannot survive a lost live source.
     let observed = runtime
-        .read_observation(&service, &authority, &scope, &Policy::default())
+        .read_observation(&service, &authority, &scope, &Policy::default(), None)
         .unwrap()
         .observation(&scope, 0)
         .unwrap();
@@ -773,7 +855,7 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
     assert_eq!(service.published().unwrap().0, before.0);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     eprintln!(
-        "2506 final-read source removed: unchanged commit={}, original native provider calls=1",
+        "2525 heartbeat advanced and vanished at shutdown: unchanged commit={}, native provider calls=1",
         before.0
     );
     gate.add_permits(1);
