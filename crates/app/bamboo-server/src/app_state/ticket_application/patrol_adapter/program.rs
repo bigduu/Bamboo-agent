@@ -112,6 +112,9 @@ impl TicketApplication {
     ) -> Result<()> {
         fence.check()?;
         let (service, authority) = self.authority(Principal::Runtime).await?;
+        self.reconcile_semantic_accounting(&service, &authority)
+            .await?;
+        fence.check()?;
         let (_, snapshot) = service.published()?;
         let facts_revision = snapshot.execution_facts_revision();
         // Canonical runtime I/O stays outside the synchronous journal/Ticket
@@ -197,12 +200,21 @@ impl TicketApplication {
                                     clock: &clock,
                                 },
                             };
-                            if let Outcome::InputRequired(next) =
-                                patrol.tick_staged(scope, &clock, &mut host, None, |operation| {
-                                    calls.status(operation)
-                                })?
-                            {
-                                demand.get_or_insert(next);
+                            match patrol.tick_staged(
+                                scope,
+                                &clock,
+                                &mut host,
+                                None,
+                                |operation| calls.status(operation),
+                            )? {
+                                Outcome::InputRequired(next) => {
+                                    demand.get_or_insert(next);
+                                }
+                                Outcome::Complete { reconciled, .. } => {
+                                    if let Some(reconciled) = reconciled {
+                                        calls.acknowledge(reconciled);
+                                    }
+                                }
                             }
                             Ok(())
                         },
@@ -368,7 +380,16 @@ impl TicketApplication {
                 })
                 .map_err(pass_error)?;
             let submission = match outcome {
-                Outcome::Complete { submission, .. } => submission,
+                Outcome::Complete {
+                    submission,
+                    reconciled,
+                    ..
+                } => {
+                    if let Some(reconciled) = reconciled {
+                        calls.acknowledge(reconciled);
+                    }
+                    submission
+                }
                 Outcome::InputRequired(_) => None,
             };
             Ok((journal, submission))

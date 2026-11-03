@@ -449,7 +449,7 @@ async fn staged_host_calls_the_configured_provider_and_settles_the_real_work_rec
             spec: &DispatchSpec,
             rounds: u32,
         ) -> Result<ReadyDispatch> {
-            self.tickets.ensure(key, spec, rounds).await
+            ReadyWorkHost::ensure(self.tickets, key, spec, rounds).await
         }
         async fn dispatch(&self, command: &Command, rounds: u32) -> Result<ReadyDispatch> {
             ReadyWorkHost::dispatch(self.tickets, command, rounds).await

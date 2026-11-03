@@ -93,6 +93,33 @@ pub(super) struct PreparedCall {
 }
 
 impl TicketApplication {
+    pub(in crate::app_state::ticket_application) async fn reconcile_semantic_accounting(
+        &self,
+        service: &Arc<TicketService>,
+        authority: &Authority,
+    ) -> Result<()> {
+        if !self.patrol_calls.needs_accounting() {
+            return Ok(());
+        }
+        let calls = self.patrol_calls.clone();
+        let service = service.clone();
+        let authority = authority.clone();
+        tokio::task::spawn_blocking(move || {
+            let clock = SystemClock::current()?;
+            let mut budget = TicketBudget {
+                service: &service,
+                authority: &authority,
+                clock: &clock,
+            };
+            calls
+                .reconcile_accounting(&mut budget)
+                .map(|_| ())
+                .map_err(patrol_error)
+        })
+        .await
+        .map_err(|_| unavailable())?
+    }
+
     pub(super) async fn prepare_semantic_call(
         &self,
         service: &Arc<TicketService>,
@@ -254,7 +281,7 @@ impl CallIo for ReadyPatrolIo {
             .await
             .map_err(|_| PortError::OutcomeUnknown)?;
         Ok(ProviderReply {
-            diagnosis: reply.final_text,
+            diagnosis: self.require_selection().ok().and(reply.final_text),
             exact_usage: reply.usage.known(),
             observed_input_tokens: reply.usage.input_tokens,
             observed_output_tokens: reply.usage.output_tokens,

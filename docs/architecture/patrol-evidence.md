@@ -6,8 +6,8 @@ Host Rust API returns `UnmeteredWorkPatrolEvidence`. It obtains current Host
 authority independently; the supplied Scope, commit and cursor are selectors.
 No HTTP route or model tool exposes this API.
 
-This reader is a prerequisite for semantic patrol. The existing program patrol
-remains zero-model, and its semantic `diagnostic_input` port remains unavailable.
+This reader is a prerequisite for the staged semantic pass. The program-only
+pass still uses zero model calls.
 The output has no provider, model, token estimate or budget reservation, and no
 automatic conversion into `DiagnosticInput`. The separate preparation API below
 requires an explicit selected model and a trusted local protocol meter.
@@ -141,9 +141,13 @@ checkpoint. Only a live staged submission can schedule the provider call.
 The Host checks the selected configuration, Ready fence, current Ticket,
 Project and unsettled receipt before sending. The provider task reports usage
 against the original receipt even if the diagnostic result has become stale.
-Unknown usage retains the original caps. An observed overrun halts admission,
-and exact results awaiting accounting use the existing receipt and checkpoint.
-The operator supplies and trusts the loopback deployment.
+Unknown usage retains the original caps. An observed overrun halts admission
+when recorded, and exact results awaiting accounting use the original receipt.
+Graceful shutdown stops new provider calls, waits for bounded accounting
+writes, and attempts a final drain. An unresolved drain logs a warning. If
+the process exits before usage reaches the ledger or checkpoint, the original
+reservation remains charged at its caps. The operator supplies and trusts the
+loopback deployment.
 
 [Harmony format](https://developers.openai.com/cookbook/articles/openai-harmony) ·
 [llama.cpp raw completion](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-completion-given-a-prompt-it-returns-the-predicted-completion)
@@ -162,8 +166,8 @@ The native fixture also exercises metered preparation with a controlled local
 meter, exact payload retention, over-cap refusal and a Ticket HEAD change
 during measurement. Configured preparation is also tested with the local native
 profile, exact-cap acceptance, over-cap refusal, and a stale model selection.
-Provider execution, usage/Work budget assembly and remaining runtime
-measurements are separate slices under
+A controlled loopback provider fixture also exercises the raw request, the
+native Work ledger and stale configuration refusal. Live model and
+installed-application measurements remain separate under
 [#2049](https://github.com/bigduu/Bamboo-agent/issues/2049) and
-[#2050](https://github.com/bigduu/Bamboo-agent/issues/2050). No paid-provider or
-installed-application acceptance is implied.
+[#2050](https://github.com/bigduu/Bamboo-agent/issues/2050).
