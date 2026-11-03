@@ -123,11 +123,16 @@ and encodes ordinary text separately from control tokens. The Host meters
 outside the async executor and Ticket locks, rechecks the evidence fences and
 selection, and returns the model, input and immutable numeric prompt together.
 
-A future adapter must verify the actual deployment and submit the numeric
-sequence to llama.cpp's native `/completion` endpoint after canonical Work
-budget admission. The length is the logical input token count for that raw
-contract. Actual usage and billing are separate. The program patrol still
-performs zero model calls.
+The LLM layer offers a one-use native `/completion` transport for an explicitly
+trusted numeric loopback address. It checks the single gpt-oss-20b alias and
+model metadata, slot context and a literal Harmony tokenizer probe before
+submitting any evidence. The checks identify the deployment's compatible
+protocol profile. Only raw output tokens in a completed final-channel frame
+can yield advisory text. Native final input and output counters are returned
+separately, including observed excess output. A transport failure or missing
+usage retains unknown status. The caller must acquire canonical Work budget
+admission before consuming the prepared request. Program patrol has yet to
+assemble this transport into its runtime.
 
 [Harmony format](https://developers.openai.com/cookbook/articles/openai-harmony) ·
 [llama.cpp raw completion](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-completion-given-a-prompt-it-returns-the-predicted-completion)
