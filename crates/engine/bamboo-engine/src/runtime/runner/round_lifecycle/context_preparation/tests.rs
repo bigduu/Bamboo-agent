@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+mod dynamic_range;
 #[cfg(unix)]
 mod exec_sessions;
 mod message_summary;
@@ -736,6 +737,8 @@ fn retrieval_window_config(persistence: Arc<dyn RuntimeSessionPersistence>) -> A
         persistence: Some(persistence),
         context_management: ContextManagementConfig {
             strategy: ContextManagementStrategy::RetrievalWindow,
+            trigger_usage_ratio: 0.45,
+            target_usage_ratio: 0.30,
             retrieval_window: RetrievalWindowContextConfig {
                 min_recent_user_turns: 2,
                 trigger_usage_ratio: 0.45,
@@ -3700,6 +3703,8 @@ fn retrieval_window_capped_trigger_stays_above_capped_target() {
     let config = AgentLoopConfig {
         context_management: ContextManagementConfig {
             strategy: ContextManagementStrategy::RetrievalWindow,
+            trigger_usage_ratio: 0.95,
+            target_usage_ratio: 0.90,
             retrieval_window: RetrievalWindowContextConfig {
                 target_usage_ratio: 0.90,
                 trigger_usage_ratio: 0.95,
@@ -3715,7 +3720,7 @@ fn retrieval_window_capped_trigger_stays_above_capped_target() {
     );
     assert_eq!(
         super::retrieval_window_trigger_tokens(&config, &budget),
-        801
+        640
     );
 }
 
@@ -6401,6 +6406,7 @@ fn context_pressure_notification_reports_explicit_summary_fallback_for_summarize
             fallback_strategy: ContextManagementFallbackStrategy::Summary,
             ..RetrievalWindowContextConfig::default()
         },
+        ..ContextManagementConfig::default()
     };
     let effective_strategy = effective_context_pressure_strategy(&session, &context_management);
     assert_eq!(effective_strategy, ContextManagementStrategy::Summary);

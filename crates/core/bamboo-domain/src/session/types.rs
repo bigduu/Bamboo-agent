@@ -911,21 +911,16 @@ impl Session {
         }
     }
 
-    /// The effective token budget: a genuine/child override (`token_budget`) if
-    /// set, otherwise the current round's resolved-budget snapshot
-    /// (`resolved_token_budget`). Both are `None` until the first resolution.
-    /// Downstream readers should use this rather than `token_budget` directly so
-    /// they observe the engine-resolved budget without persisting it. Note the
-    /// snapshot is returned regardless of which model it was resolved for; that is
-    /// safe because `resolve_token_budget` runs at round start (re-keying to the
-    /// current model) before any reader — don't call this expecting model-freshness
-    /// without a preceding same-round resolve. (#180)
+    /// Current-model runtime limits and shared compression policy take precedence
+    /// over the durable input/output override from which they were resolved.
+    /// An old snapshot from another model must never shadow the explicit override.
+    /// Resolution refreshes this non-persisted snapshot at the start of each round.
     pub fn effective_token_budget(&self) -> Option<&TokenBudget> {
-        self.token_budget.as_ref().or_else(|| {
-            self.resolved_token_budget
-                .as_ref()
-                .map(|(_, budget)| budget)
-        })
+        self.resolved_token_budget
+            .as_ref()
+            .filter(|(model, _)| model == &self.model)
+            .map(|(_, budget)| budget)
+            .or(self.token_budget.as_ref())
     }
 
     pub fn new(id: impl Into<String>, model: impl Into<String>) -> Self {
@@ -2087,5 +2082,38 @@ mod tests {
             r#"{"id":"m1","role":"assistant","content":"old","created_at":"2026-01-01T00:00:00Z"}"#;
         let message: Message = serde_json::from_str(legacy).expect("legacy deserializes");
         assert_eq!(message.reasoning_signature, None);
+    }
+    #[test]
+    fn effective_token_budget_prefers_current_model_policy_snapshot_without_persisting_it() {
+        let mut session = Session::new("effective-range", "current");
+        let mut durable = crate::TokenBudget::for_model(200_000);
+        durable.compression_trigger_percent = 95;
+        let mut resolved = durable.clone();
+        resolved.compression_trigger_percent = 80;
+        session.token_budget = Some(durable);
+        session.resolved_token_budget = Some(("current".into(), resolved));
+        assert_eq!(
+            session
+                .effective_token_budget()
+                .unwrap()
+                .compression_trigger_percent,
+            80
+        );
+        assert_eq!(
+            session
+                .token_budget
+                .as_ref()
+                .unwrap()
+                .compression_trigger_percent,
+            95
+        );
+        session.model = "different".into();
+        assert_eq!(
+            session
+                .effective_token_budget()
+                .unwrap()
+                .compression_trigger_percent,
+            95
+        );
     }
 }

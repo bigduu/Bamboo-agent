@@ -1607,6 +1607,14 @@ fn default_retrieval_window_min_recent_user_turns() -> usize {
     3
 }
 
+fn default_context_trigger_usage_ratio() -> f64 {
+    0.80
+}
+
+fn default_context_target_usage_ratio() -> f64 {
+    0.25
+}
+
 fn default_retrieval_window_trigger_usage_ratio() -> f64 {
     0.80
 }
@@ -1651,6 +1659,11 @@ impl Default for RetrievalWindowContextConfig {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ContextManagementConfig {
     pub strategy: ContextManagementStrategy,
+    /// Shared upper bound for proactive compression across every strategy.
+    /// The effective token boundary can be earlier after output/safety reserves.
+    pub trigger_usage_ratio: f64,
+    /// Shared post-compression target relative to the model's complete window.
+    pub target_usage_ratio: f64,
     pub retrieval_window: RetrievalWindowContextConfig,
 }
 
@@ -1658,6 +1671,8 @@ impl Default for ContextManagementConfig {
     fn default() -> Self {
         Self {
             strategy: ContextManagementStrategy::Summary,
+            trigger_usage_ratio: default_context_trigger_usage_ratio(),
+            target_usage_ratio: default_context_target_usage_ratio(),
             retrieval_window: RetrievalWindowContextConfig::default(),
         }
     }
@@ -1669,6 +1684,19 @@ impl ContextManagementConfig {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.target_usage_ratio.is_finite()
+            || !self.trigger_usage_ratio.is_finite()
+            || self.target_usage_ratio < 0.01
+            || self.target_usage_ratio >= self.trigger_usage_ratio
+            || self.trigger_usage_ratio > 1.0
+            || (self.target_usage_ratio * 100.0).floor()
+                >= (self.trigger_usage_ratio * 100.0).floor()
+        {
+            return Err(
+                "context_management ratios must satisfy 0.01 <= target_usage_ratio < trigger_usage_ratio <= 1 with distinct whole-percent boundaries"
+                    .to_string(),
+            );
+        }
         let policy = &self.retrieval_window;
         if policy.min_recent_user_turns == 0 {
             return Err(
@@ -1697,12 +1725,22 @@ impl ContextManagementConfig {
         Ok(())
     }
 
-    /// Planner policy is intentionally percent-based in the domain primitive.
-    /// Flooring keeps fractional configuration conservative rather than
-    /// archiving less history than the configured target permits. The planner's
-    /// minimum representable positive target is one percent.
+    /// Resolve the common policy onto a runtime-only budget snapshot. Provider
+    /// limits and durable session overrides remain unchanged; only maintenance
+    /// ratios are shared, independent of the selected history representation.
+    pub fn apply_compression_policy(
+        &self,
+        mut budget: bamboo_domain::TokenBudget,
+    ) -> bamboo_domain::TokenBudget {
+        budget.compression_trigger_percent = (self.trigger_usage_ratio * 100.0).floor() as u8;
+        budget.compression_target_percent = (self.target_usage_ratio * 100.0).floor() as u8;
+        budget
+    }
+
+    /// Compatibility accessor. New runtime paths use the dynamically resolved
+    /// budget's target percentage, also for retrieval archive receipts.
     pub fn retrieval_target_usage_percent(&self) -> u8 {
-        ((self.retrieval_window.target_usage_ratio * 100.0).floor() as u8).max(1)
+        ((self.target_usage_ratio * 100.0).floor() as u8).max(1)
     }
 }
 
@@ -1711,27 +1749,29 @@ impl<'de> Deserialize<'de> for ContextManagementConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
+        #[derive(Default, Deserialize)]
         #[serde(default)]
         struct Wire {
             strategy: ContextManagementStrategy,
-            retrieval_window: RetrievalWindowContextConfig,
-        }
-
-        impl Default for Wire {
-            fn default() -> Self {
-                let defaults = ContextManagementConfig::default();
-                Self {
-                    strategy: defaults.strategy,
-                    retrieval_window: defaults.retrieval_window,
-                }
-            }
+            trigger_usage_ratio: Option<f64>,
+            target_usage_ratio: Option<f64>,
+            retrieval_window: Option<RetrievalWindowContextConfig>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
+        let retrieval_window = wire.retrieval_window.unwrap_or_default();
+        // Older clients stored ratios under retrieval_window. Preserve stricter
+        // settings as common limits, while the old default 80/60 adopts 80/25.
+        // Explicit common fields take precedence on subsequent saves.
         let config = Self {
             strategy: wire.strategy,
-            retrieval_window: wire.retrieval_window,
+            trigger_usage_ratio: wire.trigger_usage_ratio.unwrap_or_else(|| {
+                default_context_trigger_usage_ratio().min(retrieval_window.trigger_usage_ratio)
+            }),
+            target_usage_ratio: wire.target_usage_ratio.unwrap_or_else(|| {
+                default_context_target_usage_ratio().min(retrieval_window.target_usage_ratio)
+            }),
+            retrieval_window,
         };
         config.validate().map_err(serde::de::Error::custom)?;
         Ok(config)
@@ -6035,7 +6075,7 @@ mod tests {
         );
         assert_eq!(
             config.context_management.retrieval_target_usage_percent(),
-            60
+            25
         );
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("context_management").is_none());
@@ -6109,6 +6149,52 @@ mod tests {
             ContextManagementConfig::default().strategy,
             ContextManagementStrategy::Summary
         );
+    }
+
+    #[test]
+    fn context_management_uses_one_explicit_policy_for_every_strategy() {
+        for strategy in ["summary", "message_summary", "retrieval_window"] {
+            let policy: ContextManagementConfig = serde_json::from_value(serde_json::json!({
+                "strategy": strategy,
+                "trigger_usage_ratio": 0.72,
+                "target_usage_ratio": 0.20,
+                "retrieval_window": {"trigger_usage_ratio": 0.9, "target_usage_ratio": 0.6}
+            }))
+            .unwrap();
+            let budget =
+                policy.apply_compression_policy(bamboo_domain::TokenBudget::for_model(200_000));
+            assert_eq!(budget.compression_trigger_percent, 72);
+            assert_eq!(budget.compression_target_percent, 20);
+            let saved = serde_json::to_value(&policy).unwrap();
+            let restored: ContextManagementConfig = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored, policy);
+        }
+    }
+
+    #[test]
+    fn context_management_migrates_stricter_legacy_ratios_without_preserving_old_sixty_percent_target(
+    ) {
+        for strategy in ["summary", "message_summary", "retrieval_window"] {
+            for (trigger, target, expected_trigger, expected_target) in
+                [(0.80, 0.60, 0.80, 0.25), (0.65, 0.15, 0.65, 0.15)]
+            {
+                let policy: ContextManagementConfig = serde_json::from_value(serde_json::json!({
+                    "strategy": strategy,
+                    "retrieval_window": {"trigger_usage_ratio": trigger, "target_usage_ratio": target}
+                })).unwrap();
+                assert_eq!(policy.trigger_usage_ratio, expected_trigger);
+                assert_eq!(policy.target_usage_ratio, expected_target);
+            }
+        }
+    }
+
+    #[test]
+    fn context_management_rejects_unrepresentable_shared_range() {
+        for (trigger, target) in [(0.80, 0.80), (1.01, 0.25), (0.015, 0.01), (0.80, 0.005)] {
+            let value =
+                serde_json::json!({"trigger_usage_ratio": trigger, "target_usage_ratio": target});
+            assert!(serde_json::from_value::<ContextManagementConfig>(value).is_err());
+        }
     }
 
     #[test]

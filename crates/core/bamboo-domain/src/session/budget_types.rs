@@ -16,21 +16,16 @@ pub struct TokenBudget {
     pub safety_margin: u32,
     /// Proactive compression trigger threshold as a percentage of context window tokens.
     ///
-    /// Legacy field — only used when `working_reserve_tokens == 0`.
+    /// Combined with the request input ceiling and dynamically reserved working space.
     #[serde(default = "default_compression_trigger_percent")]
     pub compression_trigger_percent: u8,
     /// Compression target threshold as a percentage of context window tokens.
     #[serde(default = "default_compression_target_percent")]
     pub compression_target_percent: u8,
-    /// Fixed number of input tokens kept free before the request hard limit.
+    /// Optional legacy reserve measured from the total context window.
     ///
-    /// Compression triggers when `(max_context_tokens - working_reserve_tokens)` is
-    /// exceeded, but never later than the request input limit after reserving
-    /// `max_output_tokens` and `safety_margin`. This provides consistent working
-    /// space regardless of model context window size (Claude Code uses ~50K).
-    ///
-    /// When `working_reserve_tokens == 0`, falls back to percentage-based triggering
-    /// via `compression_trigger_percent` for backward compatibility.
+    /// A non-zero value can tighten the dynamically calculated trigger, but
+    /// never postpone a configured percentage or consume reserved output space.
     #[serde(default = "default_working_reserve_tokens")]
     pub working_reserve_tokens: u32,
     /// Fallback percentage trigger when the context window is too small for the fixed
@@ -62,15 +57,15 @@ fn default_safety_margin() -> u32 {
 }
 
 fn default_compression_trigger_percent() -> u8 {
-    85
+    80
 }
 
 fn default_compression_target_percent() -> u8 {
-    40
+    25
 }
 
 fn default_working_reserve_tokens() -> u32 {
-    50_000
+    0
 }
 
 fn default_fallback_trigger_percent() -> u8 {
@@ -95,6 +90,20 @@ fn default_prompt_cache_recent_user_turns() -> u8 {
 
 fn default_prompt_cache_recent_tool_chains() -> u8 {
     2
+}
+
+/// Effective compression range for one resolved model budget.
+///
+/// This is derived runtime data, not a second persisted policy. Targets retain
+/// a whole context-window percentage so retrieval receipts keep their existing
+/// exact arithmetic. A zero trigger/target means no positive range is feasible.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CompressionThresholds {
+    pub input_limit: u32,
+    pub headroom: u32,
+    pub trigger_tokens: u32,
+    pub target_tokens: u32,
+    pub target_usage_percent: u8,
 }
 
 impl TokenBudget {
@@ -153,61 +162,66 @@ impl TokenBudget {
             .saturating_sub(self.safety_margin)
     }
 
-    pub fn compression_trigger_context_tokens(&self) -> u32 {
-        let context_window = self.max_context_tokens;
-        let request_input_limit = self.max_request_input_tokens();
-        if context_window == 0 || request_input_limit == 0 {
-            return 0;
-        }
-
-        // Primary: fixed reserve mode — trigger when (context - reserve) is exceeded.
-        let trigger = if self.working_reserve_tokens > 0
-            && context_window >= self.working_reserve_tokens.saturating_mul(2)
-        {
-            context_window.saturating_sub(self.working_reserve_tokens)
-        } else if self.working_reserve_tokens > 0 {
-            // Fallback 1: small context window — use fallback_trigger_percent.
-            let percent = normalize_trigger_percent(self.fallback_trigger_percent);
-            context_window
-                .saturating_mul(percent)
-                .saturating_div(100)
-                .clamp(1, context_window)
-        } else {
-            // Fallback 2: working_reserve_tokens == 0 — legacy percentage mode.
-            let percent = normalize_trigger_percent(self.compression_trigger_percent);
-            context_window
-                .saturating_mul(percent)
-                .saturating_div(100)
-                .clamp(1, context_window)
+    /// Resolve one range shared by summarization, archival and prompt fitting.
+    ///
+    /// Besides output and tokenizer reserves already removed from the input
+    /// ceiling, leave up to another fifth of that input ceiling for work between
+    /// checks. The reserve scales with the actual output/safety allowances;
+    /// fixed legacy settings may only move the trigger earlier.
+    pub fn compression_thresholds(&self) -> CompressionThresholds {
+        let window = self.max_context_tokens;
+        let input_limit = self.max_request_input_tokens();
+        let headroom = self
+            .max_output_tokens
+            .max(self.safety_margin)
+            .max(1)
+            .min((input_limit / 5).max(1));
+        let unavailable = CompressionThresholds {
+            input_limit,
+            headroom,
+            ..CompressionThresholds::default()
         };
+        if window == 0 || input_limit <= 1 {
+            return unavailable;
+        }
+        let percentage_tokens =
+            |percent: u32| ((u64::from(window) * u64::from(percent)) / 100) as u32;
+        let mut trigger =
+            percentage_tokens(normalize_trigger_percent(self.compression_trigger_percent))
+                .min(input_limit.saturating_sub(headroom));
+        if self.working_reserve_tokens > 0 {
+            let legacy_trigger = if window >= self.working_reserve_tokens.saturating_mul(2) {
+                window.saturating_sub(self.working_reserve_tokens)
+            } else {
+                percentage_tokens(normalize_trigger_percent(self.fallback_trigger_percent))
+            };
+            trigger = trigger.min(legacy_trigger);
+        }
+        if trigger <= 1 {
+            return unavailable;
+        }
+        let largest_target_percent = (u64::from(trigger - 1) * 100 / u64::from(window)) as u32;
+        let target_usage_percent = normalize_target_percent(self.compression_target_percent)
+            .min(largest_target_percent) as u8;
+        let target_tokens = percentage_tokens(u32::from(target_usage_percent));
+        if target_usage_percent == 0 || target_tokens == 0 {
+            return unavailable;
+        }
+        CompressionThresholds {
+            input_limit,
+            headroom,
+            trigger_tokens: trigger,
+            target_tokens,
+            target_usage_percent,
+        }
+    }
 
-        // A configured reserve can be smaller than the provider's maximum
-        // output allowance. Never wait until the prompt itself has consumed
-        // tokens that are required for output or the safety margin.
-        trigger.min(request_input_limit)
+    pub fn compression_trigger_context_tokens(&self) -> u32 {
+        self.compression_thresholds().trigger_tokens
     }
 
     pub fn compression_target_context_tokens(&self) -> u32 {
-        let context_window = self.max_context_tokens;
-        if context_window == 0 {
-            return 0;
-        }
-
-        let trigger = self.compression_trigger_context_tokens();
-        if trigger == 0 {
-            return 0;
-        }
-        let percent = normalize_target_percent(self.compression_target_percent);
-        let mut target = context_window
-            .saturating_mul(percent)
-            .saturating_div(100)
-            .clamp(1, context_window);
-
-        if target >= trigger {
-            target = if trigger > 1 { trigger - 1 } else { 1 };
-        }
-
-        target.clamp(1, context_window)
+        self.compression_thresholds().target_tokens
     }
 
     pub fn for_model(max_context_tokens: u32) -> Self {
@@ -235,11 +249,11 @@ fn normalize_trigger_percent(value: u8) -> u32 {
 
 fn normalize_target_percent(value: u8) -> u32 {
     let raw = match value {
-        0 => 40u32,
+        0 => 25u32,
         1..=100 => value as u32,
-        _ => 40u32,
+        _ => 25u32,
     };
-    raw.clamp(20, 50)
+    raw.clamp(1, 99)
 }
 
 fn calculate_max_output_tokens(max_context_tokens: u32) -> u32 {
@@ -359,8 +373,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn dynamic_compression_range_reserves_real_output_and_scales_with_window() {
+        for (window, output, safety, trigger, target) in [
+            (1_000_000, 32_000, 10_000, 800_000, 250_000),
+            (200_000, 32_000, 2_000, 134_000, 50_000),
+            (32_000, 8_000, 1_000, 18_400, 8_000),
+        ] {
+            let budget =
+                TokenBudget::with_safety_margin(window, output, BudgetStrategy::default(), safety);
+            assert_eq!(budget.compression_trigger_context_tokens(), trigger);
+            assert_eq!(budget.compression_target_context_tokens(), target);
+            assert!(target < trigger);
+            assert!(trigger < budget.max_request_input_tokens());
+        }
+    }
+
+    #[test]
+    fn dynamic_compression_range_never_promotes_a_tight_explicit_trigger() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1_000_000, 32_000, BudgetStrategy::default(), 10_000);
+        budget.compression_trigger_percent = 35;
+        budget.compression_target_percent = 10;
+        budget.working_reserve_tokens = 50_000;
+        assert_eq!(budget.compression_trigger_context_tokens(), 350_000);
+        assert_eq!(budget.compression_target_context_tokens(), 100_000);
+    }
+
+    #[test]
+    fn dynamic_compression_range_retains_a_feasible_higher_explicit_target() {
+        let mut budget =
+            TokenBudget::with_safety_margin(1_000_000, 32_000, BudgetStrategy::default(), 10_000);
+        budget.compression_trigger_percent = 90;
+        budget.compression_target_percent = 75;
+        let thresholds = budget.compression_thresholds();
+        assert_eq!(thresholds.trigger_tokens, 900_000);
+        assert_eq!(thresholds.target_tokens, 750_000);
+        assert_eq!(thresholds.target_usage_percent, 75);
+    }
+
+    #[test]
+    fn dynamic_compression_range_marks_an_unrepresentable_input_ceiling_unavailable() {
+        let budget = TokenBudget::with_safety_margin(1_000, 990, BudgetStrategy::default(), 0);
+        let thresholds = budget.compression_thresholds();
+        assert_eq!(thresholds.input_limit, 10);
+        assert_eq!(thresholds.trigger_tokens, 0);
+        assert_eq!(thresholds.target_tokens, 0);
+        assert_eq!(thresholds.target_usage_percent, 0);
+    }
+
+    #[test]
+    fn dynamic_compression_range_handles_the_full_u32_window_without_overflow() {
+        let budget =
+            TokenBudget::with_safety_margin(u32::MAX, u32::MAX / 2, BudgetStrategy::default(), 1);
+        let thresholds = budget.compression_thresholds();
+        assert!(thresholds.target_tokens > 1_000_000_000);
+        assert!(thresholds.target_tokens < thresholds.trigger_tokens);
+        assert!(thresholds.trigger_tokens < thresholds.input_limit);
+    }
+
+    #[test]
     fn fixed_reserve_trigger_exact_boundary() {
-        // context_window == working_reserve_tokens * 2 → should use fixed reserve
+        // An explicit reserve can tighten the percentage-based dynamic trigger.
         let budget = TokenBudget {
             max_context_tokens: 100_000,
             working_reserve_tokens: 50_000,
@@ -372,12 +445,12 @@ mod tests {
 
     #[test]
     fn fixed_reserve_trigger_just_below_boundary() {
-        // context_window < working_reserve_tokens * 2 → falls back to percentage
+        // The legacy fallback percentage can only tighten the dynamic ceiling.
         let mut budget = TokenBudget::for_model(99_000);
         budget.working_reserve_tokens = 50_000;
         budget.fallback_trigger_percent = 75;
-        // 99K < 100K → fallback: 99K * 75% = 74,250
-        assert_eq!(budget.compression_trigger_context_tokens(), 74_250);
+        // Real output headroom is tighter than either legacy percentage.
+        assert_eq!(budget.compression_trigger_context_tokens(), 65_301);
     }
 
     #[test]
@@ -404,16 +477,16 @@ mod tests {
         let mut budget = TokenBudget::for_model(200_000);
         budget.working_reserve_tokens = 0;
         budget.compression_trigger_percent = 85;
-        // 200K * 85% = 170K
-        assert_eq!(budget.compression_trigger_context_tokens(), 170_000);
+        // Output and safety headroom cap the configured 85% trigger.
+        assert_eq!(budget.compression_trigger_context_tokens(), 165_232);
     }
 
     #[test]
-    fn large_context_window_triggers_very_late_with_fixed_reserve() {
-        // 1M context window, 50K reserve → trigger at 950K (95%)
+    fn legacy_reserve_cannot_postpone_the_dynamic_range() {
+        // A legacy 50K reserve cannot postpone the common 80% trigger.
         let mut budget = TokenBudget::for_model(1_000_000);
         budget.working_reserve_tokens = 50_000;
-        assert_eq!(budget.compression_trigger_context_tokens(), 950_000);
+        assert_eq!(budget.compression_trigger_context_tokens(), 800_000);
     }
 
     #[test]
@@ -454,7 +527,7 @@ mod tests {
         budget.working_reserve_tokens = 50_000;
 
         assert_eq!(budget.max_request_input_tokens(), 115_000);
-        assert_eq!(budget.compression_trigger_context_tokens(), 115_000);
+        assert_eq!(budget.compression_trigger_context_tokens(), 92_000);
     }
 
     #[test]
@@ -486,7 +559,7 @@ mod tests {
         }"#;
         let budget: TokenBudget = serde_json::from_str(json).unwrap();
         // New fields should get defaults
-        assert_eq!(budget.working_reserve_tokens, 50_000);
+        assert_eq!(budget.working_reserve_tokens, 0);
         assert_eq!(budget.fallback_trigger_percent, 75);
     }
 
@@ -540,9 +613,9 @@ mod tests {
 
     #[test]
     fn normalize_target_percent_clamps_to_range() {
-        assert_eq!(normalize_target_percent(10), 20); // below min
+        assert_eq!(normalize_target_percent(10), 10); // explicit lower target
         assert_eq!(normalize_target_percent(40), 40); // in range
-        assert_eq!(normalize_target_percent(80), 50); // above max
+        assert_eq!(normalize_target_percent(80), 80); // explicit higher target
     }
 
     #[test]

@@ -230,6 +230,7 @@ pub struct CompressionCandidatePlan {
     context_window: u32,
     target_limit: u32,
     message_summary_snapshot: Option<Vec<u8>>,
+    summary_budget_clamped: bool,
 }
 
 pub const DEFAULT_SUMMARY_TARGET_RATIO: f64 = 0.20;
@@ -274,6 +275,21 @@ fn target_summary_content_tokens(
             0,
         ),
     }
+}
+
+fn cap_summary_to_context_target(
+    desired_summary_tokens: u32,
+    required_tokens: u32,
+    target_limit: u32,
+) -> Result<u32, CompressionPlanError> {
+    let available = target_limit.saturating_sub(required_tokens);
+    if required_tokens > target_limit || (desired_summary_tokens > 0 && available == 0) {
+        return Err(CompressionPlanError::ProtectedContentExceedsTarget {
+            projected_tokens: required_tokens.saturating_add(u32::from(desired_summary_tokens > 0)),
+            target_tokens: target_limit,
+        });
+    }
+    Ok(desired_summary_tokens.min(available))
 }
 
 fn protected_compression_message_ids(non_system: &[Message]) -> HashSet<String> {
@@ -389,6 +405,17 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
     let system_tokens = counter.count_messages(&system_messages);
     let protected_ids = protected_compression_message_ids(&non_system);
     let segments = crate::segmenter::MessageSegmenter::new().segment(non_system.clone());
+    let protected_tokens = segments
+        .iter()
+        .filter(|segment| {
+            segment
+                .messages
+                .iter()
+                .any(|message| protected_ids.contains(&message.id))
+        })
+        .fold(0u32, |total, segment| {
+            total.saturating_add(counter.count_messages(&segment.messages))
+        });
     let mut remaining_tokens = counter.count_messages(&non_system);
     let mut source_tokens = 0u32;
     let mut selected_messages = Vec::new();
@@ -399,6 +426,7 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
         .saturating_add(remaining_tokens)
         .saturating_add(additional_fixed_tokens);
     let mut target_summary_tokens = 0u32;
+    let mut summary_budget_clamped = false;
     let mut previous_represented_source_tokens = session
         .conversation_summary
         .as_ref()
@@ -422,10 +450,17 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
 
         let (desired, previous_represented) =
             target_summary_content_tokens(session, &counter, source_tokens, ratio);
-        target_summary_tokens = desired;
         previous_represented_source_tokens = previous_represented;
         let recovery_tokens =
             post_compaction_recovery_tokens(&selected_messages, session, &counter);
+        let required_tokens = system_tokens
+            .saturating_add(protected_tokens)
+            .saturating_add(additional_fixed_tokens)
+            .saturating_add(summary_envelope_tokens)
+            .saturating_add(recovery_tokens);
+        target_summary_tokens =
+            cap_summary_to_context_target(desired, required_tokens, target_limit)?;
+        summary_budget_clamped = target_summary_tokens < desired;
         projected_tokens = system_tokens
             .saturating_add(remaining_tokens)
             .saturating_add(additional_fixed_tokens)
@@ -471,14 +506,15 @@ pub fn build_forced_compression_candidate_plan_with_fixed_tokens(
         summary_target_ratio: ratio,
         active_usage_before_percent: exposure.active_usage_percent,
         projected_usage_after_percent,
-        trigger_percent: budget.compression_trigger_percent,
-        target_percent: budget.compression_target_percent,
+        trigger_percent: effective_trigger_percent(budget),
+        target_percent: budget.compression_thresholds().target_usage_percent,
         segments_removed: selected_segment_count,
         trigger_type,
         additional_fixed_tokens,
         context_window,
         target_limit,
         message_summary_snapshot: None,
+        summary_budget_clamped,
     })
 }
 
@@ -662,7 +698,7 @@ pub fn build_message_summary_candidate_plan_with_fixed_tokens(
     let counter = TiktokenTokenCounter::default();
     let source_tokens = counter.count_messages(&messages_to_summarize);
     let ratio = normalized_summary_target_ratio(summary_target_ratio);
-    let (target_summary_tokens, previous_represented_source_tokens) = if merge_existing_summary {
+    let (desired_summary_tokens, previous_represented_source_tokens) = if merge_existing_summary {
         target_summary_content_tokens(session, &counter, source_tokens, ratio)
     } else {
         (((source_tokens as f64) * ratio).ceil() as u32, 0)
@@ -672,24 +708,20 @@ pub fn build_message_summary_candidate_plan_with_fixed_tokens(
         .filter(|message| !archived_ids.contains(message.id.as_str()))
         .cloned()
         .collect::<Vec<_>>();
-    let summary_envelope_tokens = if target_summary_tokens > 0 {
+    let summary_envelope_tokens = if desired_summary_tokens > 0 {
         counter.count_messages(&[compression_summary_message("")])
     } else {
         0
     };
-    let projected_tokens = counter
+    let required_tokens = counter
         .count_messages(&remaining)
         .saturating_add(additional_fixed_tokens)
-        .saturating_add(summary_envelope_tokens)
-        .saturating_add(target_summary_tokens);
+        .saturating_add(summary_envelope_tokens);
     let budget = &exposure.budget;
     let target_limit = budget.compression_target_context_tokens();
-    if projected_tokens > target_limit {
-        return Err(CompressionPlanError::ProtectedContentExceedsTarget {
-            projected_tokens,
-            target_tokens: target_limit,
-        });
-    }
+    let target_summary_tokens =
+        cap_summary_to_context_target(desired_summary_tokens, required_tokens, target_limit)?;
+    let projected_tokens = required_tokens.saturating_add(target_summary_tokens);
     Ok(CompressionCandidatePlan {
         kind: CompressionEventKind::MessageSummary,
         merge_existing_summary,
@@ -705,14 +737,15 @@ pub fn build_message_summary_candidate_plan_with_fixed_tokens(
             projected_tokens,
             budget.max_context_tokens,
         ),
-        trigger_percent: budget.compression_trigger_percent,
-        target_percent: budget.compression_target_percent,
+        trigger_percent: effective_trigger_percent(budget),
+        target_percent: budget.compression_thresholds().target_usage_percent,
         segments_removed: crate::MessageSegmenter::new().segment(archived).len(),
         trigger_type,
         additional_fixed_tokens,
         context_window: budget.max_context_tokens,
         target_limit,
         message_summary_snapshot: Some(message_summary_snapshot(session)?),
+        summary_budget_clamped: target_summary_tokens < desired_summary_tokens,
     })
 }
 
@@ -806,12 +839,22 @@ pub fn finalize_compression_candidate_plan(
         target_summary_tokens: candidate.target_summary_tokens,
         actual_summary_content_tokens,
         summary_target_ratio: candidate.summary_target_ratio,
-        summary_budget_clamped: false,
-        summary_budget_clamp_reason: None,
+        summary_budget_clamped: candidate.summary_budget_clamped,
+        summary_budget_clamp_reason: candidate
+            .summary_budget_clamped
+            .then(|| "context_target_budget".to_owned()),
         summarization_map_calls: 0,
         summarization_reduce_calls: 0,
         summarization_fallback_used: false,
     })
+}
+
+fn effective_trigger_percent(budget: &TokenBudget) -> u8 {
+    if budget.max_context_tokens == 0 {
+        return 0;
+    }
+    ((u64::from(budget.compression_trigger_context_tokens()) * 100)
+        / u64::from(budget.max_context_tokens)) as u8
 }
 
 pub fn context_window_usage_percent(total_tokens: u32, context_window_tokens: u32) -> f64 {
@@ -982,7 +1025,7 @@ fn build_compression_plan_with_summary_internal(
     if require_exposure_gate && !exposure.should_expose_tool {
         return Err(CompressionPlanError::ExposureGateNotMet {
             usage_percent: exposure.active_usage_percent,
-            trigger_percent: exposure.budget.compression_trigger_percent,
+            trigger_percent: effective_trigger_percent(&exposure.budget),
         });
     }
 
@@ -1181,8 +1224,8 @@ fn build_compression_plan_with_summary_internal(
         summary_content,
         active_usage_before_percent: active_before,
         active_usage_after_percent: active_after,
-        trigger_percent: budget.compression_trigger_percent,
-        target_percent: budget.compression_target_percent,
+        trigger_percent: effective_trigger_percent(budget),
+        target_percent: budget.compression_thresholds().target_usage_percent,
         segments_removed,
         trigger_type,
         compression_ratio: 0.0,
