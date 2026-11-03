@@ -1582,6 +1582,20 @@ async fn projected_summary_request_tokens(
     ))
 }
 
+fn summary_prepared_provider_state(session: &Session) -> Result<serde_json::Value, AgentError> {
+    let mut state = serde_json::to_value(session).map_err(|error| {
+        AgentError::Budget(format!("cannot snapshot prepared summary state: {error}"))
+    })?;
+    // These fields record UI/usage bookkeeping; all transcript, authority,
+    // runtime-context and provider replay fields remain in the comparison.
+    if let Some(object) = state.as_object_mut() {
+        for key in ["updated_at", "token_usage", "prompt_snapshot"] {
+            object.remove(key);
+        }
+    }
+    Ok(state)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn maybe_apply_summary_context_compression_with_budget(
     session: &mut Session,
@@ -1683,10 +1697,22 @@ async fn maybe_apply_summary_context_compression_with_budget(
         "Resolved shared dynamic context compression range"
     );
 
+    // Cheap estimates cannot attest a paid legacy rewrite or provider-native
+    // replay. Those paths use the complete staged projection below instead.
+    let cheap_shortcuts = !legacy_vision_images && session.provider_transcript.groups().is_empty();
+    let native_delta = active_messages_for_budget(session)
+        .iter()
+        .fold(0u32, |total, message| {
+            total.saturating_add(
+                provider_prepared_message_tokens(message, &counter)
+                    .saturating_sub(counter.count_message(message)),
+            )
+        });
     // For auto-triggered (non-critical, non-manual) compression, try lightweight
     // prompt section degradation first. If a section can be stripped, skip the
     // expensive LLM summarization pass entirely.
     if !message_summary
+        && cheap_shortcuts
         && host_auto_requested
         && !critical_fallback_requested
         && !manual_requested
@@ -1707,7 +1733,22 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 target_tokens = range.target_tokens,
                 "Pre-summarization degradation checked against shared target"
             );
-            if after.active_tokens <= range.target_tokens {
+            let fixed = summary_boundary_fixed_tokens(
+                session,
+                config,
+                model_name,
+                tool_schemas,
+                llm,
+                budget,
+                &counter,
+            )
+            .await?;
+            if after
+                .active_tokens
+                .saturating_add(native_delta)
+                .saturating_add(fixed)
+                <= range.target_tokens
+            {
                 emit_context_compression_status(event_tx, phase_label, "degraded_sections").await;
                 return Ok(true);
             }
@@ -1718,6 +1759,7 @@ async fn maybe_apply_summary_context_compression_with_budget(
     // Only skip the model when prompt-side compaction reaches the shared target.
     // Merely falling below the trigger would leave the context near capacity.
     if !message_summary
+        && cheap_shortcuts
         && host_auto_requested
         && !critical_fallback_requested
         && !manual_requested
@@ -1736,7 +1778,21 @@ async fn maybe_apply_summary_context_compression_with_budget(
             ledger_usage.tokens,
         );
         if savings > 0 {
-            let projected = exposure.active_tokens.saturating_sub(savings);
+            let fixed = summary_boundary_fixed_tokens(
+                session,
+                config,
+                model_name,
+                tool_schemas,
+                llm,
+                budget,
+                &counter,
+            )
+            .await?;
+            let projected = exposure
+                .active_tokens
+                .saturating_sub(savings)
+                .saturating_add(native_delta)
+                .saturating_add(fixed);
             let projected_pct = if budget.max_context_tokens > 0 {
                 (projected as f64 / budget.max_context_tokens as f64) * 100.0
             } else {
@@ -2223,10 +2279,11 @@ async fn maybe_apply_summary_context_compression_with_budget(
         return Ok(false);
     }
 
-    if let Some(output) = prepared_output {
-        *output = Some(prepared_context);
-    }
     if let Some(persistence) = config.persistence.as_ref().filter(|_| !message_summary) {
+        let expected = prepared_output
+            .as_ref()
+            .map(|_| summary_prepared_provider_state(session))
+            .transpose()?;
         if let Err(error) = persistence.save_runtime_session(session).await {
             tracing::warn!(
                 "[{}] Failed to persist forced context compression result: {}",
@@ -2234,6 +2291,17 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 error
             );
         }
+        if expected.is_some_and(|before| {
+            summary_prepared_provider_state(session).map_or(true, |after| before != after)
+        }) {
+            emit_context_compression_status(event_tx, phase_label,
+                "failed_postcondition:prepared summary became stale during persistence; retry with admitted context").await;
+            return Err(AgentError::Budget(
+                "prepared summary became stale during persistence; adopted context retained, provider request not sent".into()));
+        }
+    }
+    if let Some(output) = prepared_output {
+        *output = Some(prepared_context);
     }
 
     tracing::info!(

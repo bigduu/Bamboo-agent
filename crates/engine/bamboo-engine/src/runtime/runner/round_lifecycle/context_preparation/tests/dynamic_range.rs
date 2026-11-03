@@ -376,7 +376,7 @@ async fn shared_range_reuses_the_only_paid_vision_transform_for_actual_dispatch(
         .unwrap());
         assert_eq!(archive_state(&session), before);
         assert_eq!(vision_calls.load(Ordering::SeqCst), 0);
-        let (tx, _) = mpsc::channel(128);
+        let (tx, _rx) = mpsc::channel(128);
         super::super::super::execute_llm_round(
             &mut session,
             &config,
@@ -452,4 +452,104 @@ async fn shared_range_native_image_cost_cannot_pass_a_text_only_target_check() {
     assert!(session.compression_events.is_empty());
     assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|event| matches!(event,
         AgentEvent::ContextCompressionStatus { status, .. } if status.starts_with("failed_postcondition:"))));
+}
+
+struct AdoptingSummaryPersistence {
+    append_user: bool,
+}
+
+#[async_trait::async_trait]
+impl RuntimeSessionPersistence for AdoptingSummaryPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
+        if self.append_user {
+            session.add_message(Message::user("NEWLY_ADMITTED_USER_REQUIREMENT"));
+        } else {
+            session.updated_at += chrono::Duration::seconds(1);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn shared_range_prepared_reuse_detects_adopted_context_before_main_dispatch() {
+    let _env = isolate_prompt_safe_env_cache();
+    for append_user in [false, true] {
+        let id = format!("shared-range-save-{append_user}");
+        let mut session = bounded_compression_session(&id);
+        session.token_budget = Some(TokenBudget::with_safety_margin(
+            200_000,
+            8_000,
+            BudgetStrategy::default(),
+            2_000,
+        ));
+        session.add_message(Message::user_with_parts(
+            "latest image",
+            vec![ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "https://example.com/latest.png".into(),
+                    detail: None,
+                },
+            }
+            .into()],
+        ));
+        let (summary_provider, _) = prompt_capture_llm();
+        let mut config = bounded_compression_config(summary_provider);
+        config.model_name = Some("test-model".into());
+        config.persistence = Some(Arc::new(AdoptingSummaryPersistence { append_user }));
+        config.image_fallback = Some(ImageFallbackConfig {
+            mode: ImageFallbackMode::Vision,
+            vision_model: Some("vision-single".into()),
+        });
+        let vision_calls = Arc::new(AtomicUsize::new(0));
+        let main_requests = Arc::new(Mutex::new(Vec::new()));
+        let llm: Arc<dyn LLMProvider> = Arc::new(CountingVisionProvider {
+            vision_calls: Arc::clone(&vision_calls),
+            main_requests: Arc::clone(&main_requests),
+            explicit_native: false,
+        });
+        let (tx, _rx) = mpsc::channel(128);
+        if append_user {
+            let result = super::super::super::execute_llm_round(
+                &mut session,
+                &config,
+                &llm,
+                &tx,
+                &tokio_util::sync::CancellationToken::new(),
+                &id,
+                "test-model",
+                &[],
+                None,
+                None,
+            )
+            .await;
+            assert!(result
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("became stale during persistence"));
+            assert!(main_requests.lock().unwrap().is_empty());
+            assert!(session
+                .messages
+                .iter()
+                .any(|message| message.content == "NEWLY_ADMITTED_USER_REQUIREMENT"));
+        } else {
+            // Verify this new summary/persistence handoff independently of the
+            // existing final-dispatch ledger checkpoint/reprepare loop.
+            let prepared = prepare_round_context(
+                &mut session,
+                &config,
+                "test-model",
+                &id,
+                &[],
+                &llm,
+                Some(&tx),
+            )
+            .await
+            .unwrap();
+            assert!(serde_json::to_string(&prepared.prepared_context.messages)
+                .unwrap()
+                .contains("VISION_DESCRIPTION_1"));
+        }
+        assert_eq!(vision_calls.load(Ordering::SeqCst), 1);
+    }
 }

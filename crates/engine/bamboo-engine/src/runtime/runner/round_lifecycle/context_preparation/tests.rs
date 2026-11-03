@@ -2683,10 +2683,10 @@ async fn maybe_apply_host_context_compression_supports_mid_turn_phase() {
     session.token_usage = Some(TokenBudgetUsage {
         system_tokens: 100,
         summary_tokens: 0,
-        window_tokens: 850,
-        total_tokens: 950,
+        window_tokens: 26_500,
+        total_tokens: 26_600,
         max_context_tokens: 32_000,
-        budget_limit: 1000,
+        budget_limit: 32_000,
         truncation_occurred: true,
         segments_removed: 8,
         prompt_cached_tool_outputs: 0,
