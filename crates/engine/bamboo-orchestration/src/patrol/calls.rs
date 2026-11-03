@@ -7,9 +7,10 @@ use bamboo_domain::TokenUsage;
 use tokio::{
     runtime::Handle,
     sync::oneshot,
-    task::AbortHandle,
+    task::JoinHandle,
     time::{timeout, timeout_at, Instant},
 };
+use tokio_util::sync::CancellationToken;
 
 use super::{
     staged::{Reconciled, Submission},
@@ -96,6 +97,7 @@ pub trait CallIo: Send + Sync {
 #[derive(Default)]
 pub struct Calls {
     state: Mutex<State>,
+    shutdown: CancellationToken,
 }
 
 #[derive(Default)]
@@ -107,14 +109,16 @@ struct State {
 struct Entry {
     receipt: Reservation,
     expires: Instant,
-    task: AbortHandle,
+    task: Option<JoinHandle<()>>,
     status: CallStatus,
     checkpoint_ack: bool,
 }
 
 impl Drop for Entry {
     fn drop(&mut self) {
-        self.task.abort();
+        if let Some(task) = &self.task {
+            task.abort();
+        }
     }
 }
 
@@ -180,31 +184,36 @@ impl Calls {
             .ok_or(PortError::Denied)?;
         let runtime = Handle::try_current().map_err(|_| PortError::Unavailable)?;
         let mut state = self.state.lock().map_err(|_| PortError::Unavailable)?;
+        if state.closed {
+            return Err(PortError::Unavailable);
+        }
         let now = Instant::now();
         state.entries.retain(|_, entry| entry.retain(now));
-        if state.closed
-            || state.entries.len() >= MAX_CALLS
-            || state.entries.contains_key(&receipt.operation)
-        {
+        if state.entries.len() >= MAX_CALLS || state.entries.contains_key(&receipt.operation) {
             return Err(PortError::Unavailable);
         }
         let deadline = now + Duration::from_millis(remaining);
         let (send, receive) = oneshot::channel();
         let operation = receipt.operation.clone();
         let exact_receipt = receipt.clone();
+        let shutdown = self.shutdown.clone();
         let task = runtime.spawn(async move {
-            let status = timeout_at(deadline, async {
+            let execute = async {
                 io.admit(&receipt).await?;
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
                     return Err(PortError::Denied);
                 }
                 Ok(io.complete(remaining).await?.status(&receipt.request))
-            })
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or(DiagnosticStatus::OutcomeUnknown);
+            };
+            let status = tokio::select! {
+                biased;
+                _ = shutdown.cancelled() => DiagnosticStatus::OutcomeUnknown,
+                result = timeout_at(deadline, execute) => result
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or(DiagnosticStatus::OutcomeUnknown),
+            };
             let usage = match status {
                 DiagnosticStatus::Finished { usage, .. } | DiagnosticStatus::Failed { usage } => {
                     usage
@@ -224,7 +233,7 @@ impl Calls {
             Entry {
                 receipt: exact_receipt,
                 expires: deadline + ACCOUNTING_TIMEOUT,
-                task: task.abort_handle(),
+                task: Some(task),
                 status: CallStatus::Receiving(receive),
                 checkpoint_ack: false,
             },
@@ -305,10 +314,22 @@ impl Calls {
         Ok(settled)
     }
 
-    pub fn close(&self) {
-        if let Ok(mut state) = self.state.lock() {
+    /// Stop issuing requests, then let all bounded writes finish and publish
+    /// their result. Failed writes stay available for the Host's final drain.
+    pub async fn quiesce(&self) -> Result<(), PortError> {
+        let tasks: Vec<_> = {
+            let mut state = self.state.lock().map_err(|_| PortError::Unavailable)?;
             state.closed = true;
-            state.entries.clear();
+            self.shutdown.cancel();
+            state
+                .entries
+                .values_mut()
+                .filter_map(|entry| entry.task.take())
+                .collect()
+        };
+        for task in tasks {
+            let _ = task.await;
         }
+        Ok(())
     }
 }
