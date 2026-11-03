@@ -227,3 +227,43 @@ fn evidence_project_rules_require_active_resources_and_exact_workspace_declarati
         Err(Error::ResourceBlocked(_))
     ));
 }
+
+#[test]
+fn evidence_overflow_marker_keeps_earlier_partial_content_near_the_aggregate_limit() {
+    let fixture = Fixture::new();
+    let (commit, snapshot) = fixture.service().published().unwrap();
+    let three = context(&snapshot, &fixture.scope, |value| {
+        value.sources = (0..3)
+            .map(|i| (format!("opaque:{i}"), "version".into()))
+            .collect();
+    });
+    let mut plan = Plan::prepare(&three, &fixture.scope, &commit, 0).unwrap();
+    let matched = |length| WorkPatrolSourceOutcome::VersionMatched {
+        reference: "opaque".to_string(),
+        title: "edge".to_string(),
+        content: "x".repeat(length),
+    };
+    plan.record_source(0, matched(7600)).unwrap();
+    plan.record_source(1, matched(0)).unwrap();
+    let base_bytes = serde_json::to_vec(&plan.finish().unwrap()).unwrap().len();
+    // The old budget admitted this body but left too little space to replace
+    // the final Unavailable outcome with an aggregate-overflow marker.
+    let fill = MAX_WORK_PATROL_EVIDENCE_BYTES - 34 - base_bytes;
+    assert!(fill < 8000, "fixture keeps each individual source bounded");
+    plan.record_source(1, matched(fill)).unwrap();
+    plan.record_source(2, matched(7600)).unwrap();
+    let evidence = plan.finish().unwrap();
+    assert!(matches!(
+        &evidence.sources[0].outcome,
+        WorkPatrolSourceOutcome::VersionMatched { content, .. } if content.len() == 7600
+    ));
+    assert!(evidence.sources.iter().any(|source| matches!(
+        source.outcome,
+        WorkPatrolSourceOutcome::Oversized {
+            kind: WorkPatrolEvidenceLimit::AggregateBytes,
+            ..
+        }
+    )));
+    assert!(!evidence.all_sources_matched);
+    assert!(serde_json::to_vec(&evidence).unwrap().len() <= MAX_WORK_PATROL_EVIDENCE_BYTES);
+}

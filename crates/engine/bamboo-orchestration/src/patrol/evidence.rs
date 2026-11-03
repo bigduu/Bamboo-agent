@@ -39,6 +39,27 @@ pub struct UnmeteredWorkPatrolEvidence<R, S> {
     pub sources: Vec<WorkPatrolSourceEvidence<R, S>>,
 }
 
+// Keep room for every slot's largest aggregate-overflow marker. A short
+// Unavailable/Missing outcome must not let earlier content consume that room.
+fn reserved_bytes<R: Serialize, S: Serialize>(
+    evidence: &UnmeteredWorkPatrolEvidence<R, S>,
+) -> Result<usize> {
+    let marker: WorkPatrolSourceOutcome<R, S> = WorkPatrolSourceOutcome::Oversized {
+        kind: WorkPatrolEvidenceLimit::AggregateBytes,
+        required: usize::MAX,
+        limit: MAX_WORK_PATROL_EVIDENCE_BYTES,
+    };
+    let floor = serde_json::to_vec(&marker)?.len();
+    let mut bytes = serde_json::to_vec(evidence)?.len();
+    for source in &evidence.sources {
+        let current = serde_json::to_vec(&source.outcome)?.len();
+        bytes = bytes
+            .checked_add(floor.saturating_sub(current))
+            .ok_or(Error::ContextBudgetExceeded)?;
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct WorkPatrolAdoptedContextEvidence {
     pub project_revision: u64,
@@ -251,7 +272,7 @@ impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
             },
             sources,
         };
-        if serde_json::to_vec(&evidence)?.len() > MAX_WORK_PATROL_EVIDENCE_BYTES {
+        if reserved_bytes(&evidence)? > MAX_WORK_PATROL_EVIDENCE_BYTES {
             return Err(Error::ContextBudgetExceeded);
         }
         Ok(Self {
@@ -281,13 +302,16 @@ impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
             .get_mut(index)
             .ok_or_else(|| Error::ScopeDenied("evidence source index out of range".into()))?;
         source.outcome = bound_source(outcome);
-        let bytes = serde_json::to_vec(&self.evidence)?.len();
+        let bytes = reserved_bytes(&self.evidence)?;
         if bytes > MAX_WORK_PATROL_EVIDENCE_BYTES {
             self.evidence.sources[index].outcome = WorkPatrolSourceOutcome::Oversized {
                 kind: WorkPatrolEvidenceLimit::AggregateBytes,
                 required: bytes,
                 limit: MAX_WORK_PATROL_EVIDENCE_BYTES,
             };
+        }
+        if reserved_bytes(&self.evidence)? > MAX_WORK_PATROL_EVIDENCE_BYTES {
+            return Err(Error::ContextBudgetExceeded);
         }
         Ok(())
     }

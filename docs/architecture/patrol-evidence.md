@@ -15,6 +15,8 @@ The core validates Project resource declarations and bounds source output to
 at most six source selectors). Missing, unsupported, unresolved or oversized
 sources do not report all sources matched; an empty source set also remains
 unmatched. No content is clipped into a misleading exact-version result.
+The aggregate budget reserves each source's overflow-marker metadata on every
+update, so a later oversized source preserves earlier usable partial content.
 
 Native reference/status values are opaque generic data payloads. The core has
 no dependency on Jiandu, MemoryStore, AppState or HTTP and does not duplicate
