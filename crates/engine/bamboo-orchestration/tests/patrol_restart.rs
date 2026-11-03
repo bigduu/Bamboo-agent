@@ -1044,10 +1044,8 @@ fn checkpoint_keeps_original_pending_diagnostic_request_and_budget_receipt_on_re
     assert_eq!(recovered.checkpoint.incident.unwrap().attempts, 1);
 }
 
-#[test]
-fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation() {
+fn configured_budget_request(fixture: &Fixture, limit: u64) -> DiagnosticRequest {
     use bamboo_tickets::WorkTokenLimits;
-    let mut fixture = Fixture::new();
     let owner = fixture.authority(Principal::User {
         user_id: "budget-owner".into(),
     });
@@ -1057,9 +1055,9 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
             &owner,
             0,
             WorkTokenLimits {
-                work_tokens: BTreeMap::from([(fixture.scope.work_id.clone(), 120)]),
-                utc_day_tokens: 120,
-                total_tokens: 120,
+                work_tokens: BTreeMap::from([(fixture.scope.work_id.clone(), limit)]),
+                utc_day_tokens: limit,
+                total_tokens: limit,
             },
         )
         .unwrap();
@@ -1067,7 +1065,7 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         .observation()
         .observation(&fixture.scope, 0)
         .unwrap();
-    let request = DiagnosticRequest {
+    DiagnosticRequest {
         operation: OperationId {
             incident: IncidentId {
                 scope: fixture.scope.clone(),
@@ -1093,7 +1091,13 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
             references: vec![],
             input_tokens: 10,
         },
-    };
+    }
+}
+
+#[test]
+fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation() {
+    let mut fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 120);
     let authority = fixture.runtime();
     let mut budget = budget::TicketBudget {
         service: fixture.service(),
@@ -1101,6 +1105,7 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         clock: &ClockAt(100),
     };
     let receipt = budget.reserve(&request).unwrap();
+    assert_eq!(budget.reserve(&request).unwrap(), receipt);
     budget.settle(&receipt, Usage::Unknown).unwrap();
     drop(budget);
     fixture.reopen();
@@ -1110,7 +1115,7 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         authority: &authority,
         clock: &ClockAt(101),
     };
-    assert_eq!(budget.reserve(&request).unwrap(), receipt);
+    assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
     assert_eq!(
         fixture
             .service()
@@ -1146,6 +1151,20 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
             },
         )
         .unwrap();
+    drop(budget);
+    fixture.reopen();
+    let known_commit = fixture.service().published().unwrap().0;
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(103),
+    };
+    budget.settle(&receipt, Usage::Unknown).unwrap();
+    assert_eq!(fixture.service().published().unwrap().0, known_commit);
+    let mut wrong = receipt.clone();
+    wrong.receipt.push_str("-mismatch");
+    assert!(budget.settle(&wrong, Usage::Unknown).is_err());
     assert_eq!(
         fixture
             .service()
@@ -1159,4 +1178,143 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         fixture.service().published().unwrap().1.tickets[&fixture.scope.work_id].state,
         WorkState::Cancelled
     );
+}
+
+#[test]
+fn real_ticket_budget_port_preserves_over_cap_finding_across_restart() {
+    let mut fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 240);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    let over_cap = Usage::Known {
+        input_tokens: 10,
+        output_tokens: 21,
+    };
+    budget.settle(&receipt, over_cap).unwrap();
+    assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
+    let mut next = request;
+    next.operation.kind = OperationKind::Diagnostic(2);
+    assert_eq!(budget.reserve(&next), Err(BudgetBlock::Unavailable));
+    drop(budget);
+    fixture.reopen();
+    let over_cap_commit = fixture.service().published().unwrap().0;
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(101),
+    };
+    budget.settle(&receipt, over_cap).unwrap();
+    budget.settle(&receipt, Usage::Unknown).unwrap();
+    assert_eq!(fixture.service().published().unwrap().0, over_cap_commit);
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    let reservation = ledger.reservations.values().next().unwrap();
+    assert_eq!(reservation.receipt, receipt.receipt);
+    assert_eq!(reservation.over_cap_usage.unwrap().output_tokens, Some(21));
+    assert_eq!(ledger.reservations.len(), 1);
+    assert_eq!(ledger.total_charged, 120);
+    assert_eq!(ledger.daily_charged, 120);
+    assert_eq!(ledger.work_charged[&fixture.scope.work_id], 120);
+}
+
+#[test]
+fn replay_receipt_that_expires_during_admission_keeps_the_original_charge() {
+    struct AdvancingClock(std::cell::Cell<u64>);
+    impl Clock for AdvancingClock {
+        fn now_ms(&self) -> u64 {
+            self.0.replace(1000)
+        }
+    }
+    let fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 120);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    let commit = fixture.service().published().unwrap().0;
+    let clock = AdvancingClock(std::cell::Cell::new(101));
+    budget.clock = &clock;
+    assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
+    assert_eq!(fixture.service().published().unwrap().0, commit);
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.total_charged, 120);
+    assert_eq!(ledger.reservations.len(), 1);
+    assert_eq!(
+        ledger.reservations.values().next().unwrap().receipt,
+        receipt.receipt
+    );
+}
+
+#[test]
+fn a_concurrent_accounting_halt_fences_an_unsettled_receipt_replay() {
+    struct ClockWithHook<F>(std::cell::Cell<Option<F>>);
+    impl<F: FnOnce()> Clock for ClockWithHook<F> {
+        fn now_ms(&self) -> u64 {
+            if let Some(publish) = self.0.take() {
+                publish();
+            }
+            101
+        }
+    }
+    let fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 360);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let original = budget.reserve(&request).unwrap();
+    let mut other = request.clone();
+    other.operation.kind = OperationKind::Diagnostic(2);
+    let exceeded = budget.reserve(&other).unwrap();
+    let clock = ClockWithHook(std::cell::Cell::new(Some(|| {
+        budget
+            .settle(
+                &exceeded,
+                Usage::Known {
+                    input_tokens: 10,
+                    output_tokens: 21,
+                },
+            )
+            .unwrap();
+    })));
+    let mut replay = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &clock,
+    };
+    assert_eq!(replay.reserve(&request), Err(BudgetBlock::Unavailable));
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.total_charged, 240);
+    assert_eq!(ledger.reservations.len(), 2);
+    assert!(ledger.reservations.values().any(|record| {
+        record.receipt == original.receipt
+            && record.usage.is_none()
+            && record.over_cap_usage.is_none()
+    }));
+    assert!(ledger
+        .reservations
+        .values()
+        .any(|record| { record.receipt == exceeded.receipt && record.over_cap_usage.is_some() }));
 }
