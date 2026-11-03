@@ -10,7 +10,7 @@ use bamboo_tickets::{
 
 use super::{
     DiagnosticInput, ExpectedWait, Observation, ObservationKind, ObservationPort, Policy,
-    PortError, Scope, WaitKind,
+    PortError, Progress, Scope, WaitKind,
 };
 
 /// One read-only Host sample, tied to the exact canonical Ticket snapshot and
@@ -170,8 +170,8 @@ fn yielded_question<'a>(
 }
 
 /// Always projects a bounded authoritative snapshot, so an event gap causes no
-/// replay of cached deltas. There are currently no canonical start/heartbeat/
-/// progress/wait timestamps in Ticket: these stay explicitly unavailable.
+/// replay of cached deltas. Live runtime facts, including progress from a
+/// receipt tied to a current native Task, require the separate Host read.
 pub fn read_observation(
     service: &TicketService,
     authority: &Authority,
@@ -229,6 +229,28 @@ pub fn read_observation_with_runtime_heartbeat(
     heartbeat_at_ms: Option<u64>,
     policy: &Policy,
 ) -> Result<TicketObservation, PortError> {
+    read_observation_with_live_runtime(
+        service,
+        authority,
+        scope,
+        runtime,
+        heartbeat_at_ms,
+        None,
+        policy,
+    )
+}
+
+/// Project qualifying committed workspace progress within the live Task's
+/// observation window. Only the Host may supply the verified Task entry.
+pub fn read_observation_with_live_runtime(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    runtime: &RuntimeFacts,
+    heartbeat_at_ms: Option<u64>,
+    progress_cutoff_ms: Option<u64>,
+    policy: &Policy,
+) -> Result<TicketObservation, PortError> {
     let (commit, snapshot) = checked_snapshot(service, authority, &scope.work_id)?;
     if runtime.scope != *scope || runtime.source_commit != commit {
         return Err(PortError::Conflict);
@@ -247,6 +269,13 @@ pub fn read_observation_with_runtime_heartbeat(
     if !observation.execution_unknown && !observation.terminal {
         observation.started_at_ms = runtime.started_at_ms;
         observation.heartbeat_at_ms = heartbeat_at_ms;
+        observation.progress = runtime
+            .started_at_ms
+            .zip(progress_cutoff_ms)
+            .and_then(|(start, cutoff)| {
+                snapshot.latest_workspace_write_progress(&assignment.id, start, cutoff)
+            })
+            .map(|(sequence, at_ms)| Progress { sequence, at_ms });
         if let Some(wait) = &runtime.wait {
             match wait.kind {
                 WaitKind::User => {
@@ -285,7 +314,7 @@ pub fn read_observation_with_runtime_heartbeat(
                 kind: wait.kind,
                 issued_at_ms: wait.registered_at_ms,
                 until_ms,
-                progress_sequence: 0,
+                progress_sequence: observation.progress.map_or(0, |progress| progress.sequence),
                 evidence_ref: wait.evidence_ref.clone(),
             });
         }
