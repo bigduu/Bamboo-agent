@@ -131,21 +131,32 @@ impl TicketApplication {
         fence.check()?;
         let sources = self.patrol_sources.get().ok_or_else(unavailable)?;
         let endpoint = selection.endpoint.ok_or_else(unavailable)?;
-        let project = current_project_manifest(
-            sources.projects.clone(),
-            self.root.clone(),
-            service,
-            authority,
-            &demand.through.scope,
-            demand.through.source_revision,
-        )
-        .await?;
         let (commit, snapshot) = service.published()?;
+        fence.check_semantic_scope(&snapshot, &demand.through.scope)?;
         if snapshot.seq != demand.through.cursor
             || snapshot.execution_facts_revision() != demand.through.source_revision
         {
             return Err(Error::RevisionConflict);
         }
+        let project = {
+            let service = service.clone();
+            let authority = authority.clone();
+            let projects = sources.projects.clone();
+            let root = self.root.clone();
+            let through = demand.through.clone();
+            tokio::task::spawn_blocking(move || {
+                current_project_manifest(
+                    &projects,
+                    &root,
+                    &service,
+                    &authority,
+                    &through.scope,
+                    through.source_revision,
+                )
+            })
+            .await
+            .map_err(|_| unavailable())??
+        };
         let evidence = EvidenceReader {
             tickets: self,
             config: &self.config,
@@ -238,30 +249,40 @@ impl CallIo for ReadyPatrolIo {
     async fn admit(&self, reservation: &Reservation) -> std::result::Result<(), PortError> {
         self.require_selection()?;
         let authority = self.authority().await?;
-        let manifest = current_project_manifest(
-            self.projects.clone(),
-            self.root.clone(),
-            &self.service,
-            &authority,
-            &reservation.operation.incident.scope,
-            reservation.request.input.source_revision,
-        )
-        .await
-        .map_err(|_| PortError::Conflict)?;
-        if manifest != self.project {
-            return Err(PortError::Conflict);
-        }
-        let authority = self.authority().await?;
         let service = self.service.clone();
+        let projects = self.projects.clone();
+        let root = self.root.clone();
+        let expected_project = self.project.clone();
         let reservation = reservation.clone();
+        let fence = self.fence.clone();
         tokio::task::spawn_blocking(move || {
+            let scope = &reservation.operation.incident.scope;
+            let manifest = current_project_manifest(
+                &projects,
+                &root,
+                &service,
+                &authority,
+                scope,
+                reservation.request.input.source_revision,
+            )
+            .map_err(|_| PortError::Conflict)?;
+            if manifest != expected_project {
+                return Err(PortError::Conflict);
+            }
             let clock = SystemClock::current().map_err(|_| PortError::Unavailable)?;
             TicketBudget {
                 service: &service,
                 authority: &authority,
                 clock: &clock,
             }
-            .confirm_submission(&reservation)
+            .confirm_submission(&reservation)?;
+            let (_, snapshot) = service.published().map_err(|_| PortError::Unavailable)?;
+            if snapshot.execution_facts_revision() != reservation.request.input.source_revision {
+                return Err(PortError::Conflict);
+            }
+            fence
+                .check_semantic_scope(&snapshot, scope)
+                .map_err(|_| PortError::Denied)
         })
         .await
         .map_err(|_| PortError::Unavailable)??;

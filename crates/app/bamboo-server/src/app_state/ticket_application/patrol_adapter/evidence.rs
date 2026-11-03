@@ -488,23 +488,29 @@ async fn read_project(
     root: std::path::PathBuf,
     project: bamboo_domain::ProjectId,
 ) -> Result<ProjectManifest> {
-    tokio::task::spawn_blocking(move || {
-        if projects.paths().data_dir().canonicalize()? != root.canonicalize()? {
-            return Err(Error::ScopeDenied(
-                "Project store is outside the current Host".into(),
-            ));
-        }
-        projects
-            .get_read_only(&project)
-            .map_err(|_| Error::AuthorityUnavailable("Project read-only proof unavailable".into()))
-    })
-    .await
-    .map_err(|_| Error::AuthorityUnavailable("Project evidence reader stopped".into()))?
+    tokio::task::spawn_blocking(move || read_project_manifest(&projects, &root, &project))
+        .await
+        .map_err(|_| Error::AuthorityUnavailable("Project evidence reader stopped".into()))?
 }
 
-pub(super) async fn current_project_manifest(
-    projects: Arc<ProjectStore>,
-    root: std::path::PathBuf,
+fn read_project_manifest(
+    projects: &ProjectStore,
+    root: &std::path::Path,
+    project: &bamboo_domain::ProjectId,
+) -> Result<ProjectManifest> {
+    if projects.paths().data_dir().canonicalize()? != root.canonicalize()? {
+        return Err(Error::ScopeDenied(
+            "Project store is outside the current Host".into(),
+        ));
+    }
+    projects
+        .get_read_only(project)
+        .map_err(|_| Error::AuthorityUnavailable("Project read-only proof unavailable".into()))
+}
+
+pub(super) fn current_project_manifest(
+    projects: &ProjectStore,
+    root: &std::path::Path,
     service: &TicketService,
     authority: &Authority,
     scope: &Scope,
@@ -516,7 +522,7 @@ pub(super) async fn current_project_manifest(
         return Err(Error::RevisionConflict);
     }
     let plan = Plan::prepare(&snapshot, scope, &commit, 0)?;
-    let manifest = read_project(projects, root, plan.context().project_id.clone()).await?;
+    let manifest = read_project_manifest(projects, root, &plan.context().project_id)?;
     plan.validate_project(&manifest)?;
     if service.published()?.1.execution_facts_revision() != source_revision {
         return Err(Error::RevisionConflict);

@@ -658,6 +658,120 @@ fn program_entry_authorizes_all_valid_ready_selections_above_the_inspect_batch_l
     }
 }
 
+#[test]
+fn staged_settlement_does_not_interrupt_the_next_work_in_the_same_pass() {
+    let mut fixture = Fixture::new();
+    let first = fixture.scope.work_id.clone();
+    let project = ProjectId::parse(&fixture.scope.project_id).unwrap();
+    let supervisor = Principal::Supervisor {
+        session_id: "supervisor".into(),
+    };
+    let initial = fixture.service().published().unwrap().1;
+    let contract = initial.tickets[&first].contract.clone();
+    let second = fixture
+        .apply(
+            supervisor.clone(),
+            vec![
+                Operation::Create {
+                    temp_id: "other".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract.clone(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "other".into(),
+                    project_id: project.clone(),
+                },
+            ],
+        )
+        .ids["other"]
+        .clone();
+    let tree = fixture.root.0.join("worktree-two");
+    std::fs::create_dir(&tree).unwrap();
+    let tree = tree.to_string_lossy().into_owned();
+    let mut workspace = initial.assignments[&fixture.scope.assignment_id]
+        .workspace
+        .clone()
+        .unwrap();
+    workspace.branch = "second".into();
+    workspace.worktree = tree.clone();
+    workspace.write_roots = vec![tree.clone()];
+    workspace.claims = BTreeSet::from([format!("worktree:{tree}")]);
+    fixture.apply(
+        supervisor,
+        vec![
+            Operation::SetProjectContext {
+                work_id: second.clone(),
+                context: bamboo_tickets::ProjectContextSnapshot {
+                    project_id: project.clone(),
+                    project_revision: 1,
+                    resource_revision: 1,
+                    workspace_binding: WorkspaceBinding {
+                        path: workspace.repo.clone(),
+                        label: None,
+                        git_common_dir: None,
+                    },
+                    contract_revision: 1,
+                    contract,
+                    sources: BTreeMap::new(),
+                },
+            },
+            Operation::Ready {
+                work_id: second.clone(),
+            },
+            Operation::Start {
+                work_id: second.clone(),
+                temp_id: "attempt".into(),
+                workspace: Some(workspace),
+            },
+        ],
+    );
+
+    let request = configured_budget_request(&fixture, 240);
+    let service = fixture.service();
+    let authority = fixture.runtime();
+    let clock = ClockAt(100);
+    let mut budget = budget::TicketBudget {
+        service,
+        authority: &authority,
+        clock: &clock,
+    };
+    let reservation = budget.reserve(&request).unwrap();
+    let before = service.published().unwrap().1;
+    let work_ids = [first.clone(), second];
+    let mut visited = Vec::new();
+    let checked = program::ProgramPatrol::new(Policy::default())
+        .unwrap()
+        .visit_project_with_observations(
+            service,
+            &authority,
+            &program::ProgramSelection {
+                project_id: &project,
+                work_ids: &work_ids,
+            },
+            &clock,
+            &mut EncodedJournal::default(),
+            &mut |scope| host::read_observation(service, &authority, scope),
+            &mut |scope, _, _, _| {
+                if scope.work_id == first {
+                    budget.settle(&reservation, Usage::Unknown)?;
+                }
+                visited.push(scope.work_id.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+    let after = service.published().unwrap().1;
+    assert_eq!(checked, 2);
+    assert_eq!(visited, work_ids);
+    assert!(after.seq > before.seq);
+    assert_eq!(
+        after.execution_facts_revision(),
+        before.execution_facts_revision()
+    );
+}
+
 struct Probe {
     observed: host::TicketObservation,
     journal: EncodedJournal,

@@ -113,6 +113,7 @@ impl ProgramPatrol {
             return Err(PortError::Denied.into());
         }
         let (commit, snapshot) = service.published().map_err(|_| PortError::Unavailable)?;
+        let health = service.health();
         // Ready permits 64 Works; the canonical inspect API bounds each read
         // to 32. Authorize every chunk against one fixed snapshot before any
         // journal write, without relaxing that API's limit.
@@ -135,7 +136,13 @@ impl ProgramPatrol {
         }
         let mut checked = 0;
         for work_id in selection.work_ids {
-            if service.published().map_err(|_| PortError::Unavailable)?.0 != commit {
+            let (_, current) = service.published().map_err(|_| PortError::Unavailable)?;
+            // Settlement can advance HEAD without changing any execution fact.
+            if current.execution_facts_revision() != snapshot.execution_facts_revision()
+                || current.binding != snapshot.binding
+                || current.seq < snapshot.seq
+                || service.health() != health
+            {
                 return Err(PortError::Conflict.into());
             }
             if snapshot.project.links.get(work_id) != Some(selection.project_id) {

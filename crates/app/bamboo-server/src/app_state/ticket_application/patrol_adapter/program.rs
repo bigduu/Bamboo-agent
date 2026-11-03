@@ -110,6 +110,16 @@ impl TicketApplication {
         selection: &ProgramSelection<'_>,
         fence: &ReadyAdmissionFence,
     ) -> Result<()> {
+        self.reconcile_ready_patrol_with_policy(selection, fence, Policy::default())
+            .await
+    }
+
+    async fn reconcile_ready_patrol_with_policy(
+        &self,
+        selection: &ProgramSelection<'_>,
+        fence: &ReadyAdmissionFence,
+        policy: Policy,
+    ) -> Result<()> {
         fence.check()?;
         let (service, authority) = self.authority(Principal::Runtime).await?;
         self.reconcile_semantic_accounting(&service, &authority)
@@ -142,6 +152,7 @@ impl TicketApplication {
         let live_semantics = model.is_some();
         let calls = self.patrol_calls.clone();
         let run_fence = fence.clone();
+        let resume_policy = policy.clone();
         let (mut journal, demand) =
             tokio::task::spawn_blocking(move || -> Result<(FencedJournal, Option<InputDemand>)> {
                 run_fence.check()?;
@@ -151,6 +162,7 @@ impl TicketApplication {
                     .join("patrol")
                     .join(binding);
                 let store = PatrolCheckpointStore::open(&root).map_err(patrol_error)?;
+                let semantic_fence = run_fence.clone();
                 let mut journal = FencedJournal {
                     store,
                     fence: run_fence,
@@ -159,8 +171,8 @@ impl TicketApplication {
                     scopes: Vec::new(),
                 };
                 journal.current().map_err(patrol_error)?;
-                let policy = Policy::default();
                 let program = ProgramPatrol::new(policy.clone()).map_err(pass_error)?;
+                let reconciliation = Patrol::new(policy.clone(), None).map_err(pass_error)?;
                 let patrol = Patrol::new(policy.clone(), model).map_err(pass_error)?;
                 let clock = SystemClock::current()?;
                 let mut demand = None;
@@ -187,7 +199,11 @@ impl TicketApplication {
                             ),
                         },
                         &mut |scope, checkpoints, observation, existing| {
-                            if !live_semantics && !staged::has_semantic_debt(existing) {
+                            let may_prepare = live_semantics
+                                && semantic_fence
+                                    .check_semantic_scope(&snapshot, scope)
+                                    .is_ok();
+                            if !may_prepare && !staged::has_semantic_debt(existing) {
                                 program.tick(scope, &clock, checkpoints, observation)?;
                                 return Ok(());
                             }
@@ -200,7 +216,12 @@ impl TicketApplication {
                                     clock: &clock,
                                 },
                             };
-                            match patrol.tick_staged(
+                            let driver = if may_prepare {
+                                &patrol
+                            } else {
+                                &reconciliation
+                            };
+                            match driver.tick_staged(
                                 scope,
                                 &clock,
                                 &mut host,
@@ -226,7 +247,7 @@ impl TicketApplication {
             .map_err(|_| Error::AuthorityUnavailable("program patrol worker stopped".into()))??;
         if let (Some(demand), Some(selection)) = (demand, configured) {
             journal = self
-                .resume_ready_semantic(journal, demand, selection)
+                .resume_ready_semantic(journal, demand, selection, resume_policy)
                 .await?;
         }
         // Keep the same exclusive journal lease across the staged Inbox call.
@@ -302,6 +323,7 @@ impl TicketApplication {
         mut journal: FencedJournal,
         demand: InputDemand,
         selection: bamboo_config::PatrolModelConfig,
+        policy: Policy,
     ) -> Result<FencedJournal> {
         let (service, authority) = self.authority(Principal::Runtime).await?;
         if !std::sync::Arc::ptr_eq(&service, &journal.service) {
@@ -340,6 +362,10 @@ impl TicketApplication {
         let config = self.config.clone();
         let (journal, submission) = tokio::task::spawn_blocking(move || -> Result<_> {
             journal.current().map_err(patrol_error)?;
+            let (_, current_snapshot) = service.published()?;
+            journal
+                .fence
+                .check_semantic_scope(&current_snapshot, &scope)?;
             let current = config.try_read().map_err(|_| Error::RevisionConflict)?;
             if current.patrol_model.as_ref() != Some(&selection)
                 || !current.features.ticket_mutation
@@ -349,7 +375,6 @@ impl TicketApplication {
             }
             drop(current);
             let clock = SystemClock::current()?;
-            let policy = Policy::default();
             let mut observation = match runtime {
                 Some(runtime) => runtime.read_observation(
                     &service,
