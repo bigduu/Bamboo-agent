@@ -135,10 +135,12 @@ and diagnostic allowance limit. That limit is a patrol threshold.
 `state: "observed"` means at least one of these facts is available.
 `state: "unknown"` means the current read yielded none. A partial sample can
 have a known heartbeat and unknown progress. `execution_outcome_unknown`
-reports the separate Ticket reconciliation condition. Clients receive
+reports when the ledger cannot establish the execution outcome. Clients receive
 `Cache-Control: no-store` and should render the individual nullable facts.
-Foreign or stale selectors fail closed, and an authority or Ticket commit
-change during the read requires a fresh request.
+Foreign or stale selectors fail closed. The Host checks authority and the
+Ticket commit during source collection, and HTTP rechecks owner access before
+returning the sample. Error responses preserve the status code and use a
+generic message for Host observation errors.
 
 The separate `/patrol/status` route continues to read saved checkpoint
 bookkeeping. Both routes are read-only. A runtime observation uses the same

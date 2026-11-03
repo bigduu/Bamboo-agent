@@ -258,6 +258,63 @@ async fn live_workspace_progress_requires_an_actual_committed_native_write() {
 }
 
 #[tokio::test]
+async fn owner_http_preserves_canonical_outcome_uncertainty_without_measurements() {
+    use actix_web::http::StatusCode;
+    let mut fixture = Fixture::new(1).await;
+    fixture
+        .state
+        .tickets
+        .install_ready_work_policy(fixture.policy(1))
+        .await
+        .unwrap();
+    let held = fixture.next_request().await;
+    let work = &fixture.works[0].id;
+    let assignment = fixture.snapshot().tickets[work]
+        .active_assignment
+        .clone()
+        .unwrap();
+    let scope = sample(&fixture, work, &assignment).await.scope;
+    assert_eq!(
+        sample_http(&fixture, &scope, StatusCode::OK).await["state"],
+        "observed"
+    );
+
+    let (service, authority) = fixture
+        .state
+        .tickets
+        .authority(Principal::Runtime)
+        .await
+        .unwrap();
+    let command = service
+        .prepare_command(
+            &authority,
+            "fixture-uncertain-outcome",
+            vec![Operation::OutcomeUnknown {
+                assignment_id: assignment,
+                reason: "fixture unconfirmed outcome".into(),
+            }],
+        )
+        .unwrap();
+    service.execute(&authority, &command).unwrap();
+    let head = service.published().unwrap().0;
+    let response = sample_http(&fixture, &scope, StatusCode::OK).await;
+    assert_eq!(response["state"], "unknown");
+    assert_eq!(response["execution_outcome_unknown"], true);
+    for field in [
+        "started_at_ms",
+        "heartbeat_at_ms",
+        "progress",
+        "expected_wait",
+    ] {
+        assert!(response[field].is_null(), "{field}: {response}");
+    }
+    assert_eq!(service.published().unwrap().0, head);
+    assert_eq!(fixture.provider.calls.load(Ordering::SeqCst), 1);
+    drop(held);
+    fixture.state.shutdown().await;
+}
+
+#[tokio::test]
 async fn live_start_requires_real_task_entry_and_never_restores_from_stop_or_shutdown() {
     let mut fixture = Fixture::new(3).await;
     fixture

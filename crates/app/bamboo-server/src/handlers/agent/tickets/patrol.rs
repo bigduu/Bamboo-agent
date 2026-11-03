@@ -28,11 +28,17 @@ pub async fn observation(
             &body.work_id,
             &body.assignment_id,
         )
-        .await?;
+        .await;
     user(&state, &req).await?;
-    Ok(HttpResponse::Ok()
-        .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
-        .json(result))
+    Ok(match result {
+        Ok(observation) => HttpResponse::Ok()
+            .insert_header((actix_web::http::header::CACHE_CONTROL, "no-store"))
+            .json(observation),
+        Err(error) => crate::error::json_error(
+            StatusCode::from_u16(error.status_code()).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+            "patrol observation unavailable",
+        ),
+    })
 }
 
 pub async fn status(
