@@ -412,38 +412,38 @@ impl Agent {
         };
         use crate::runtime::config::AgentLoopConfig;
         use crate::runtime::runner::image_fallback;
-        use crate::session_app::provider_model::{
-            schedule_bound_model_ref, session_effective_model_ref,
-        };
+        use crate::session_app::execute::resolve_execution_model;
+        use crate::session_app::types::{ExecuteInput, ExecutionConfigSnapshot};
         use bamboo_agent_core::AgentError;
 
         let config = self.runtime.config.read().await.clone();
-        let scheduled = schedule_bound_model_ref(session).map_err(AgentError::LLM)?;
-        if session.metadata.contains_key("created_by_schedule_id") && scheduled.is_none() {
-            return Err(AgentError::LLM(
-                "Scheduled session has no provider/model target".into(),
-            ));
-        }
-        let bound = scheduled
-            .or_else(|| session.model_ref.clone())
-            .or_else(|| session_effective_model_ref(session));
-        let default_target = config
-            .defaults
-            .as_ref()
-            .filter(|_| config.features.provider_model_ref)
-            .map(|defaults| defaults.chat.clone());
-        let target = match bound.or(default_target) {
+        let default_provider = config.effective_default_provider();
+        let (target, model, _) = resolve_execution_model(
+            session,
+            &ExecuteInput::default(),
+            &ExecutionConfigSnapshot {
+                default_model: get_default_model_for_provider(&config, default_provider).ok(),
+                default_model_ref: config
+                    .defaults
+                    .as_ref()
+                    .map(|defaults| defaults.chat.clone()),
+                provider_model_ref_enabled: config.features.provider_model_ref,
+                ..Default::default()
+            },
+        )
+        .map_err(|error| AgentError::LLM(error.to_string()))?;
+        let target = match target {
             Some(target) => target,
-            None => {
-                let provider = config.effective_default_provider();
-                let model = if session.model.trim().is_empty() || session.model == "unknown" {
-                    get_default_model_for_provider(&config, provider)
-                        .map_err(|error| AgentError::LLM(error.to_string()))?
-                } else {
-                    session.model.clone()
-                };
-                bamboo_domain::ProviderModelRef::new(provider, model)
+            None if session.metadata.contains_key("created_by_schedule_id") => {
+                return Err(AgentError::LLM(
+                    "Scheduled session has no provider/model target".into(),
+                ));
             }
+            None => bamboo_domain::ProviderModelRef::new(
+                default_provider,
+                model
+                    .ok_or_else(|| AgentError::LLM("A model is required for compaction".into()))?,
+            ),
         };
         let selected = try_resolve_primary_model(&config, registry, &target)
             .map_err(|error| AgentError::LLM(error.to_string()))?;

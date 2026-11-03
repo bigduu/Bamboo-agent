@@ -1,6 +1,7 @@
 use actix_web::{web, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{ActorActivationFinish, SessionKind};
+use bamboo_engine::events::RootActorEventPublication;
 use bamboo_engine::execution::{
     reserve_session_preparation, AgentStatus, SessionPreparationReservation,
 };
@@ -84,8 +85,9 @@ async fn compact_owned_session(
     if let Err(error) = owner.bind_root_actor(&state.agent, &observed).await {
         return Ok(conflict(format!("Session ownership changed: {error}")));
     }
+    let writer = owner.root_actor_writer();
     let Some(access) = state
-        .bind_response_writer(owner.root_actor_writer())
+        .bind_response_writer(writer.clone())
         .map_err(|error| {
             json_internal_server_error(format!("Could not bind the Session writer: {error}"))
         })?
@@ -191,15 +193,36 @@ async fn compact_owned_session(
             let budget_event = AgentEvent::TokenBudgetUpdated {
                 usage: usage.clone(),
             };
-            // The idle reservation still owns publication. Replace an old
-            // terminal runner's replay value and notify existing subscribers.
-            if let Some(runner) = state.agent_runners.write().await.get_mut(id) {
-                if !matches!(runner.status, AgentStatus::Pending | AgentStatus::Running) {
-                    runner.last_budget_event = Some(budget_event.clone());
-                }
-            }
-            if let Some(sender) = state.session_event_senders.read().await.get(id) {
-                let _ = sender.send(budget_event);
+            let live_event = budget_event.clone();
+            let sender = state.get_session_event_sender(id).await;
+            let mut runners = state.agent_runners.clone().write_owned().await;
+            let session_id = id.to_owned();
+            // Update replay and broadcast at the same boundary a subscriber
+            // uses to capture its receiver and retained runner.
+            let publication = RootActorEventPublication::new(
+                state.storage.clone(),
+                state.account_sink.clone(),
+                writer.expect("bound Root writer"),
+            );
+            if let Err(error) = publication
+                .publish(
+                    id,
+                    &budget_event,
+                    Box::new(move || {
+                        if let Some(runner) = runners.get_mut(&session_id) {
+                            if matches!(runner.status, AgentStatus::Pending | AgentStatus::Running)
+                            {
+                                return false;
+                            }
+                            runner.last_budget_event = Some(live_event.clone());
+                        }
+                        let _ = sender.send(live_event);
+                        true
+                    }),
+                )
+                .await
+            {
+                tracing::debug!(session_id = id, %error, "Compaction was committed but token event publication was unavailable");
             }
             Ok(HttpResponse::Ok().json(json!({
                 "session_id": id,
