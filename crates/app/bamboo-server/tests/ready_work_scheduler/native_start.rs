@@ -51,7 +51,7 @@ async fn live_workspace_progress_requires_an_actual_committed_native_write() {
         }
     }
     let clock = || FixedClock(chrono::Utc::now().timestamp_millis().try_into().unwrap());
-    let mut fixture = Fixture::with_tools(1, true, &["Read", "Write"]).await;
+    let mut fixture = Fixture::with_tools(1, true, &["Task", "Read", "Write"]).await;
     fixture
         .state
         .tickets
