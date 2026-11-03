@@ -14,6 +14,7 @@
 mod anthropic;
 mod errors;
 pub mod gemini;
+pub mod llama_cpp;
 mod openai;
 
 pub use anthropic::AnthropicProtocol;

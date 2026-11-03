@@ -95,10 +95,42 @@ zero or over-cap count fails preparation. The Host checks current authority,
 Ticket HEAD, Assignment and Project proof again after measurement. Native
 content retains the read-time exact-version semantics of the evidence snapshot.
 
-The prepared input is scoped to the measured model and payload. The future
-provider adapter must submit those same model-visible fields and obtain
-canonical Work budget admission at the provider boundary. Concrete protocol
-meters, configuration and provider execution remain separate from this API.
+### Configured native prompt
+
+The optional `patrol_model` key belongs to the existing Model Policy section.
+An absent selection disables configured preparation. For example, the section
+data can contain:
+
+```json
+{
+  "patrol_model": {
+    "provider": "patrol-local",
+    "model": "gpt-oss-20b",
+    "protocol": "llama_cpp_raw_v1",
+    "max_input_tokens": 4096,
+    "max_output_tokens": 256,
+    "max_evidence_bytes": 16384,
+    "max_evidence_refs": 16
+  }
+}
+```
+
+The provider is an explicit routing identifier for future admission. The
+profile requires the pinned model name and uses the bundled Harmony
+vocabulary. Orchestration renders the read-only instructions, response schema
+and exact summary/reference data. The LLM layer adds the Harmony role framing
+and encodes ordinary text separately from control tokens. The Host meters
+outside the async executor and Ticket locks, rechecks the evidence fences and
+selection, and returns the model, input and immutable numeric prompt together.
+
+A future adapter must verify the actual deployment and submit the numeric
+sequence to llama.cpp's native `/completion` endpoint after canonical Work
+budget admission. The length is the logical input token count for that raw
+contract. Actual usage and billing are separate. The program patrol still
+performs zero model calls.
+
+[Harmony format](https://developers.openai.com/cookbook/articles/openai-harmony) ·
+[llama.cpp raw completion](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-completion-given-a-prompt-it-returns-the-predicted-completion)
 
 ## Validation boundary
 
@@ -112,9 +144,10 @@ Runtime counts belong to the exact tested source, platform and configuration.
 
 The native fixture also exercises metered preparation with a controlled local
 meter, exact payload retention, over-cap refusal and a Ticket HEAD change
-during measurement. Automatic semantic patrol consumption, independent provider
-configuration, concrete protocol meters, usage/Work budget assembly and
-remaining runtime measurements are separate slices under
+during measurement. Configured preparation is also tested with the local native
+profile, exact-cap acceptance, over-cap refusal, and a stale model selection.
+Provider execution, usage/Work budget assembly and remaining runtime
+measurements are separate slices under
 [#2049](https://github.com/bigduu/Bamboo-agent/issues/2049) and
 [#2050](https://github.com/bigduu/Bamboo-agent/issues/2050). No paid-provider or
 installed-application acceptance is implied.
