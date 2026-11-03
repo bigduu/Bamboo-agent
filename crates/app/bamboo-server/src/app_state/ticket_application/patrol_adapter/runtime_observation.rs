@@ -1,18 +1,66 @@
 //! Host proof for exact waits and the Engine's live Task-entry read port.
 //! No ActorDirectory inspect/ensure (which can write),
 //! transcript load, liveness inference, executable grant or runtime mutation.
-use super::super::{Error, Principal, Result, TicketApplication};
+use super::super::{ChildSessionAdapter, Error, Principal, Result, TicketApplication};
 use super::patrol_error;
 use bamboo_domain::{AgentStatusState, Session, SessionKind};
 use bamboo_engine::{
+    execution::spawn::NativeTaskStart,
     project_context::{ProjectContextResolver, SessionProjectIdentity},
     ticket_runtime,
     ticket_worker_plan::{TICKET_LOCAL_PLAN_KEY, TICKET_QUESTION_YIELD_KEY},
 };
-use bamboo_orchestration::patrol::{host, ObservationPort, Scope, WaitKind};
+use bamboo_orchestration::patrol::{host, ObservationPort, Policy, PortError, Scope, WaitKind};
 use bamboo_tickets::{AssignmentState, Authority, RequestStatus, TicketService};
 use serde_json::{json, Value};
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Weak},
+};
+
+pub(super) struct PreparedRuntimeFacts {
+    facts: host::RuntimeFacts,
+    live_start: Option<(Weak<ChildSessionAdapter>, NativeTaskStart)>,
+}
+
+impl PreparedRuntimeFacts {
+    pub(super) fn read_observation(
+        &self,
+        service: &TicketService,
+        authority: &Authority,
+        scope: &Scope,
+        policy: &Policy,
+    ) -> std::result::Result<host::TicketObservation, PortError> {
+        // A batch may await another Scope or journal open after preparation.
+        // Re-read the exact Engine instance at projection, without retaining
+        // the adapter or reviving a stopped owner. Wait is independent of start.
+        let still_live = self.live_start.as_ref().is_some_and(|(adapter, sample)| {
+            adapter
+                .upgrade()
+                .and_then(|adapter| {
+                    adapter.scheduler.native_task_start(
+                        &sample.session_id,
+                        &sample.run_id,
+                        sample.child_birth,
+                    )
+                })
+                .as_ref()
+                == Some(sample)
+        });
+        let without_start =
+            (self.facts.started_at_ms.is_some() && !still_live).then(|| host::RuntimeFacts {
+                started_at_ms: None,
+                ..self.facts.clone()
+            });
+        host::read_observation_with_runtime_facts(
+            service,
+            authority,
+            scope,
+            without_start.as_ref().unwrap_or(&self.facts),
+            policy,
+        )
+    }
+}
 
 fn denied() -> Error {
     Error::ScopeDenied("canonical native patrol wait identity changed".into())
@@ -143,7 +191,7 @@ pub(super) async fn prepare(
     service: &Arc<TicketService>,
     authority: &Authority,
     scope: &Scope,
-) -> Result<Option<host::RuntimeFacts>> {
+) -> Result<Option<PreparedRuntimeFacts>> {
     prepare_inner(app, service, authority, scope, std::future::ready(())).await
 }
 
@@ -153,7 +201,7 @@ async fn prepare_inner(
     authority: &Authority,
     scope: &Scope,
     before_return: impl std::future::Future<Output = ()>,
-) -> Result<Option<host::RuntimeFacts>> {
+) -> Result<Option<PreparedRuntimeFacts>> {
     let mut port = host::read_observation(service, authority, scope).map_err(patrol_error)?;
     let ledger = port.observation(scope, 0).map_err(patrol_error)?;
     if ledger.execution_unknown || ledger.terminal {
@@ -206,8 +254,9 @@ async fn prepare_inner(
     {
         return Err(denied());
     }
+    let adapter = app.adapter.get();
     let native_start = || {
-        app.adapter.get().and_then(|adapter| {
+        adapter.and_then(|adapter| {
             adapter
                 .scheduler
                 .native_task_start(&child.id, &receipt.run_id, child.created_at)
@@ -344,12 +393,19 @@ async fn prepare_inner(
     if native_start() != started {
         return Err(Error::RevisionConflict);
     }
-    Ok(Some(host::RuntimeFacts {
-        scope: scope.clone(),
-        source_commit: commit,
-        receipt: receipt.clone(),
-        started_at_ms,
-        wait,
+    Ok(Some(PreparedRuntimeFacts {
+        facts: host::RuntimeFacts {
+            scope: scope.clone(),
+            source_commit: commit,
+            receipt: receipt.clone(),
+            started_at_ms,
+            wait,
+        },
+        live_start: if started_at_ms.is_some() {
+            adapter.map(Arc::downgrade).zip(started)
+        } else {
+            None
+        },
     }))
 }
 
@@ -360,7 +416,7 @@ pub(super) async fn prepare_with_probe(
     authority: &Authority,
     scope: &Scope,
     before_return: impl std::future::Future<Output = ()>,
-) -> Result<Option<host::RuntimeFacts>> {
+) -> Result<Option<PreparedRuntimeFacts>> {
     prepare_inner(app, service, authority, scope, before_return).await
 }
 
@@ -369,7 +425,7 @@ pub(super) async fn prepare_selection(
     service: &Arc<TicketService>,
     authority: &Authority,
     selection: &bamboo_orchestration::patrol::program::ProgramSelection<'_>,
-) -> Result<BTreeMap<Scope, host::RuntimeFacts>> {
+) -> Result<BTreeMap<Scope, PreparedRuntimeFacts>> {
     if selection.work_ids.len() > bamboo_tickets::CLAIM_CANDIDATE_LIMIT {
         return Err(Error::ContextBudgetExceeded);
     }

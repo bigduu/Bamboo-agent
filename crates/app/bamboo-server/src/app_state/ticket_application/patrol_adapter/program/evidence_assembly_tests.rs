@@ -679,6 +679,7 @@ fn native_staged_evidence_survives_failed_ack_source_change_and_cold_reopen() {
 #[tokio::test]
 async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket_writes() {
     use crate::app_state::ticket_application::patrol_adapter::runtime_observation;
+    use bamboo_orchestration::patrol::ObservationPort;
     let root = tempfile::tempdir().unwrap();
     let root = root.path().canonicalize().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
@@ -711,6 +712,22 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
         .spawn_scheduler
         .native_task_start(&child.id, &receipt.run_id, child.created_at)
         .is_some());
+    let selection = ProgramSelection {
+        project_id: &project,
+        work_ids: std::slice::from_ref(&work),
+    };
+    let prepared =
+        runtime_observation::prepare_selection(&state.tickets, &service, &authority, &selection)
+            .await
+            .unwrap();
+    let runtime = &prepared[&scope];
+    assert!(runtime
+        .read_observation(&service, &authority, &scope, &Policy::default())
+        .unwrap()
+        .observation(&scope, 0)
+        .unwrap()
+        .started_at_ms
+        .is_some());
     let (entered, enter) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     let read = runtime_observation::prepare_with_probe(
@@ -738,6 +755,16 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
         .native_task_start(&child.id, &receipt.run_id, child.created_at)
         .is_none());
     assert_eq!(service.published().unwrap().0, before.0);
+    // This is the same reader the program factory uses after collecting its
+    // batch. The previously valid sample cannot survive a lost live source.
+    let observed = runtime
+        .read_observation(&service, &authority, &scope, &Policy::default())
+        .unwrap()
+        .observation(&scope, 0)
+        .unwrap();
+    assert_eq!(observed.started_at_ms, None);
+    assert_eq!(observed.heartbeat_at_ms, None);
+    assert!(observed.progress.is_none());
     release.send(()).unwrap();
     assert!(matches!(
         futures::poll!(&mut read),

@@ -69,7 +69,10 @@ Orchestration's `RuntimeFacts` projects the start after canonical Scope, commit
 and receipt checks. The original wait-only `RuntimeObservation` API remains
 compatible. Server joins the Engine sample to its existing fresh Project,
 Ticket, parent and Child proof; it rechecks the exact live sample after the last
-asynchronous read. These observations add no execution authority or writer.
+asynchronous read and again when the program factory consumes a prepared batch.
+The batch keeps a weak adapter reference; a vanished or replaced sample clears
+only start, with the independently checked wait and canonical fences preserved.
+These observations add no execution authority or writer.
 
 Queued/preparing tasks have no entry sample. Stop, shutdown and cold reopen
 provide no live sample; files do not restore it or an execution grant. This
@@ -104,9 +107,11 @@ the server default library owns compact identity-helper negatives.
 The existing `ready_work_scheduler` target owns real native capacity/entry,
 repeat-read and wrong-identity controls. The Question scenario additionally
 checks live start and its absence after stop/reopen. The server default library
-owns a controlled shutdown at the last Host read: loss of the real live sample
-must conflict without a Ticket write. Pure `patrol_restart` cases check projection
-fences and wait-only API compatibility; start alone still cannot prove health.
+owns a controlled shutdown at the last Host read and between batch collection
+and projection: the in-flight read must conflict, and the prepared batch must
+project an unknown start, both without a Ticket write. Pure `patrol_restart`
+cases check projection fences and wait-only API compatibility; start alone
+still cannot prove health.
 
 These are controlled-provider/native mechanisms, not paid-model, installed-app,
 all-platform or complete #2049 acceptance. Exact executed results belong in the
