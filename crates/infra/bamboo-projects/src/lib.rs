@@ -27,6 +27,8 @@ const PROJECT_MANIFEST_BACKUP_FILE: &str = "project.json.bak";
 const PROJECT_MANIFEST_REVISION_FILE: &str = "manifest-revision";
 const PROJECT_INDEX_FILE: &str = "index.json";
 
+mod read_only;
+
 #[derive(Debug, Error)]
 pub enum ProjectStoreError {
     #[error("project store I/O failed")]

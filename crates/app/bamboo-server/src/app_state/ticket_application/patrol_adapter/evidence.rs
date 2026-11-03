@@ -1,0 +1,245 @@
+//! Host/native I/O adapter. Pure evidence policy belongs to bamboo-orchestration.
+use super::super::{Error, Principal, Result};
+use super::patrol_error;
+use bamboo_domain::ProjectManifest;
+use bamboo_memory::memory_store::{DurableMemoryStatus, ProjectMemoryRead, ProjectMemoryRef};
+use bamboo_orchestration::patrol::{evidence as core, host, Scope};
+use bamboo_tickets::{Authority, ProjectContextSnapshot, Snapshot, TicketService};
+pub use core::{
+    WorkPatrolAdoptedContextEvidence, WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit,
+    WorkPatrolRequestEvidence, WorkPatrolTicketEvidence, MAX_WORK_PATROL_EVIDENCE_BYTES,
+    MAX_WORK_PATROL_EVIDENCE_REFS,
+};
+use std::{future::Future, sync::Arc};
+pub type UnmeteredWorkPatrolEvidence =
+    core::UnmeteredWorkPatrolEvidence<ProjectMemoryRef, DurableMemoryStatus>;
+pub type WorkPatrolSourceEvidence =
+    core::WorkPatrolSourceEvidence<ProjectMemoryRef, DurableMemoryStatus>;
+pub type WorkPatrolSourceOutcome =
+    core::WorkPatrolSourceOutcome<ProjectMemoryRef, DurableMemoryStatus>;
+type Plan = core::EvidencePlan<ProjectMemoryRef, DurableMemoryStatus>;
+
+fn resolve(
+    expected: &ProjectMemoryRef,
+    read: std::io::Result<ProjectMemoryRead>,
+) -> WorkPatrolSourceOutcome {
+    core::bound_source(match read {
+        Ok(ProjectMemoryRead::VersionMatched {
+            reference,
+            title,
+            content,
+            ..
+        }) if &reference == expected => WorkPatrolSourceOutcome::VersionMatched {
+            reference,
+            title,
+            content,
+        },
+        Ok(ProjectMemoryRead::VersionMismatch { observed })
+            if observed.project_id() == expected.project_id()
+                && observed.memory_id() == expected.memory_id() =>
+        {
+            WorkPatrolSourceOutcome::VersionMismatch {
+                observed_version: observed.content_version().into(),
+            }
+        }
+        Ok(ProjectMemoryRead::Missing) => WorkPatrolSourceOutcome::Missing,
+        Ok(ProjectMemoryRead::Inactive { status }) => WorkPatrolSourceOutcome::Inactive { status },
+        Ok(ProjectMemoryRead::OverBudget {
+            required_chars,
+            max_chars,
+        }) => WorkPatrolSourceOutcome::Oversized {
+            kind: WorkPatrolEvidenceLimit::NativeCharacters,
+            required: required_chars,
+            limit: max_chars,
+        },
+        _ => WorkPatrolSourceOutcome::Unavailable,
+    })
+}
+
+fn native_pins(plan: &Plan) -> Result<Vec<Option<ProjectMemoryRef>>> {
+    plan.sources()
+        .iter()
+        .map(|source| {
+            native_pin(
+                &plan.context().project_id,
+                &source.source_key,
+                &source.expected_version,
+            )
+        })
+        .collect()
+}
+
+fn native_pin(
+    project: &bamboo_domain::ProjectId,
+    key: &str,
+    version: &str,
+) -> Result<Option<ProjectMemoryRef>> {
+    let pin = if key.starts_with("jiandu:") {
+        let prefix = format!("jiandu:project:{project}:memory:");
+        let id = key
+            .strip_prefix(&prefix)
+            .filter(|id| !id.is_empty() && id.len() <= 256)
+            .ok_or_else(|| Error::ScopeDenied("foreign or invalid adopted source".into()))?;
+        let pin: ProjectMemoryRef = serde_json::from_value(
+            serde_json::json!({"project_id":project,"memory_id":id,"content_version":version}),
+        )
+        .map_err(|_| Error::ScopeDenied("invalid adopted Jiandu source".into()))?;
+        if pin.source_key() != key {
+            return Err(Error::ScopeDenied("invalid adopted source key".into()));
+        }
+        Some(pin)
+    } else {
+        None
+    };
+    Ok(pin)
+}
+
+fn authorized(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    expected: &str,
+) -> Result<Snapshot> {
+    let (commit, snapshot) = service.published()?;
+    if commit != expected {
+        return Err(Error::RevisionConflict);
+    }
+    let current = host::scope_for_assignment(
+        service,
+        authority,
+        &scope.project_id,
+        &scope.work_id,
+        &scope.assignment_id,
+    )
+    .map_err(patrol_error)?;
+    if current != *scope
+        || host::current_assignment_id(&snapshot, &scope.work_id)
+            .map_err(patrol_error)?
+            .as_deref()
+            != Some(&scope.assignment_id)
+    {
+        return Err(Error::ScopeDenied(
+            "current patrol evidence scope required".into(),
+        ));
+    }
+    if service.published()?.0 != expected {
+        return Err(Error::RevisionConflict);
+    }
+    Ok(snapshot)
+}
+
+impl crate::app_state::AppState {
+    /// Bounded, unmetered Host read of this Assignment's exact adopted sources.
+    /// No provider activation, token estimate, source discovery or read grant.
+    pub async fn read_work_patrol_evidence(
+        &self,
+        scope: &Scope,
+        expected_ticket_commit: &str,
+        since_cursor: u64,
+    ) -> Result<UnmeteredWorkPatrolEvidence> {
+        let memory = self.memory_store.clone();
+        let project: bamboo_domain::ProjectId = scope
+            .project_id
+            .parse()
+            .map_err(|_| Error::ScopeDenied("invalid Project selector".into()))?;
+        self.read_evidence_with(scope, expected_ticket_commit, since_cursor, move |pin| {
+            let memory = memory.clone();
+            let project = project.clone();
+            async move {
+                memory
+                    .read_project_source_read_only(&project, pin.memory_id(), pin.content_version())
+                    .await
+            }
+        })
+        .await
+    }
+
+    async fn project_evidence_manifest(
+        &self,
+        context: &ProjectContextSnapshot,
+    ) -> Result<ProjectManifest> {
+        let projects = self.project_store.clone();
+        let root = self.tickets.root.clone();
+        let project = context.project_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if projects.paths().data_dir().canonicalize()? != root.canonicalize()? {
+                return Err(Error::ScopeDenied(
+                    "Project store is outside the current Host".into(),
+                ));
+            }
+            projects.get_read_only(&project).map_err(|_| {
+                Error::AuthorityUnavailable("Project read-only proof unavailable".into())
+            })
+        })
+        .await
+        .map_err(|_| Error::AuthorityUnavailable("Project evidence reader stopped".into()))?
+    }
+
+    async fn evidence_fence(
+        &self,
+        service: &Arc<TicketService>,
+        scope: &Scope,
+        expected: &str,
+        plan: &Plan,
+        manifest: &ProjectManifest,
+    ) -> Result<()> {
+        let (fresh, authority) = self.tickets.authority(Principal::Runtime).await?;
+        if !Arc::ptr_eq(&fresh, service) {
+            return Err(Error::RevisionConflict);
+        }
+        authorized(&fresh, &authority, scope, expected)?;
+        let current = self.project_evidence_manifest(plan.context()).await?;
+        plan.validate_project(&current)?;
+        if &current != manifest {
+            return Err(Error::RevisionConflict);
+        }
+        let (fresh, authority) = self.tickets.authority(Principal::Runtime).await?;
+        if !Arc::ptr_eq(&fresh, service) {
+            return Err(Error::RevisionConflict);
+        }
+        authorized(&fresh, &authority, scope, expected)?;
+        Ok(())
+    }
+
+    // Private per-call reader seam: tests may interleave real source reads with
+    // authority changes; no environment hook or production fault capability.
+    async fn read_evidence_with<R, F>(
+        &self,
+        scope: &Scope,
+        expected: &str,
+        since: u64,
+        mut read: R,
+    ) -> Result<UnmeteredWorkPatrolEvidence>
+    where
+        R: FnMut(ProjectMemoryRef) -> F,
+        F: Future<Output = std::io::Result<ProjectMemoryRead>>,
+    {
+        let (service, authority) = self.tickets.authority(Principal::Runtime).await?;
+        let snapshot = authorized(&service, &authority, scope, expected)?;
+        let mut plan = Plan::prepare(&snapshot, scope, expected, since)?;
+        let pins = native_pins(&plan)?;
+        let manifest = self.project_evidence_manifest(plan.context()).await?;
+        plan.validate_project(&manifest)?;
+        self.evidence_fence(&service, scope, expected, &plan, &manifest)
+            .await?;
+        for (index, pin) in pins.into_iter().enumerate() {
+            if let Some(pin) = pin {
+                let outcome = resolve(&pin, read(pin.clone()).await);
+                self.evidence_fence(&service, scope, expected, &plan, &manifest)
+                    .await?;
+                plan.record_source(index, outcome)?;
+            } else {
+                plan.record_source(index, WorkPatrolSourceOutcome::Unsupported)?;
+            }
+        }
+        let evidence = plan.finish()?;
+        self.evidence_fence(&service, scope, expected, &plan, &manifest)
+            .await?;
+        Ok(evidence)
+    }
+}
+
+#[cfg(all(test, unix))]
+mod native_tests;
+#[cfg(test)]
+mod tests;
