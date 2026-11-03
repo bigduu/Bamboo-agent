@@ -43,7 +43,7 @@ impl PreparedRuntimeFacts {
                 .native_task_liveness(&sample.session_id, &sample.run_id, sample.child_birth)
                 .filter(|live| &live.start == sample)
         });
-        let (commit, current) = service.published().map_err(host::ticket_error)?;
+        let (commit, current) = service.published().map_err(|_| PortError::Unavailable)?;
         if current.execution_facts_revision() != self.facts_revision {
             return Err(PortError::Conflict);
         }
