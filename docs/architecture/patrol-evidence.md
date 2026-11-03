@@ -85,8 +85,8 @@ observation, expected Ticket commit, since cursor, selected patrol model and
 trusted local meter. It uses the same native evidence reader. Orchestration
 checks the exact Scope, source revision and cursor window, then builds bounded
 canonical JSON and opaque references for the Ticket snapshot, adopted context
-and selected source pins. Every selected source must have matched its pinned
-version at the read. An empty selection still has the two fixed references.
+and selected source pins. Each selected key must be unique and have matched its
+pinned version at the read. An empty selection still has the two fixed references.
 
 The meter receives the selected model and exact summary and reference payload.
 It accounts for the complete model-visible protocol envelope, including

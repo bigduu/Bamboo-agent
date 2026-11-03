@@ -419,6 +419,21 @@ fn diagnostic_input_rejects_partial_inconsistent_or_overbudget_evidence_before_m
     rejected.sources.push(evidence.sources[0].clone());
     rejected.reference_count += 1;
     assert_eq!(prepare(&rejected, &model), Err(PortError::Denied));
+    rejected.sources[1]
+        .expected_version
+        .push_str("-conflicting");
+    assert_eq!(prepare(&rejected, &model), Err(PortError::Denied));
+    for (key, version) in [
+        (String::new(), "v1".into()),
+        ("source".into(), String::new()),
+        ("k".repeat(513), "v1".into()),
+        ("source".into(), "v".repeat(257)),
+    ] {
+        let mut malformed = evidence.clone();
+        malformed.sources[0].source_key = key;
+        malformed.sources[0].expected_version = version;
+        assert_eq!(prepare(&malformed, &model), Err(PortError::Denied));
+    }
     rejected = evidence.clone();
     rejected.ticket.contract.objective = "界".repeat(MAX_WORK_PATROL_EVIDENCE_BYTES / 3 + 1);
     assert_eq!(prepare(&rejected, &model), Err(PortError::Denied));

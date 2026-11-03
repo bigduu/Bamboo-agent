@@ -1,8 +1,11 @@
 //! Meter the exact evidence selected by a trusted Host for one diagnostic model.
 
+use std::collections::BTreeSet;
+
 use super::{
     evidence::{
-        UnmeteredWorkPatrolEvidence, WorkPatrolEvidenceCoverage, WorkPatrolSourceOutcome,
+        UnmeteredWorkPatrolEvidence, WorkPatrolEvidenceCoverage, WorkPatrolSourceEvidence,
+        WorkPatrolSourceOutcome, MAX_SOURCE_KEY_BYTES, MAX_SOURCE_VERSION_BYTES,
         MAX_WORK_PATROL_EVIDENCE_BYTES, MAX_WORK_PATROL_EVIDENCE_REFS,
     },
     valid_id, valid_input_evidence, valid_input_tokens, valid_model, valid_scope, DiagnosticInput,
@@ -41,12 +44,7 @@ pub fn prepare_diagnostic_input<R: Serialize, S: Serialize>(
         || evidence.reference_count > MAX_WORK_PATROL_EVIDENCE_REFS
         || evidence.reference_count.checked_sub(2) != Some(evidence.sources.len())
         || evidence.all_sources_matched != has_sources
-        || evidence.sources.iter().any(|source| {
-            !matches!(
-                source.outcome,
-                WorkPatrolSourceOutcome::VersionMatched { .. }
-            )
-        })
+        || !valid_source_pins(&evidence.sources)
     {
         return Err(PortError::Denied);
     }
@@ -95,6 +93,23 @@ pub fn prepare_diagnostic_input<R: Serialize, S: Serialize>(
         return Err(PortError::Denied);
     }
     Ok(input)
+}
+
+fn valid_source_pins<R, S>(sources: &[WorkPatrolSourceEvidence<R, S>]) -> bool {
+    let mut keys = BTreeSet::new();
+    sources.iter().all(|source| {
+        let key = source.source_key.as_str();
+        let version = source.expected_version.as_str();
+        !key.is_empty()
+            && key.len() <= MAX_SOURCE_KEY_BYTES
+            && !version.is_empty()
+            && version.len() <= MAX_SOURCE_VERSION_BYTES
+            && keys.insert(key)
+            && matches!(
+                source.outcome,
+                WorkPatrolSourceOutcome::VersionMatched { .. }
+            )
+    })
 }
 
 fn reference(identity: &impl Serialize, revision: u64) -> Result<EvidenceRef, PortError> {
