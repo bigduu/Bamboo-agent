@@ -47,6 +47,10 @@ impl Submission {
     pub fn reservation(&self) -> &Reservation {
         &self.0
     }
+
+    pub(super) fn into_reservation(self) -> Reservation {
+        self.0
+    }
 }
 
 pub(super) struct Stage {

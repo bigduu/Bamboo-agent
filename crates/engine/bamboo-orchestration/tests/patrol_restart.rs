@@ -1318,3 +1318,47 @@ fn a_concurrent_accounting_halt_fences_an_unsettled_receipt_replay() {
         .values()
         .any(|record| { record.receipt == exceeded.receipt && record.over_cap_usage.is_some() }));
 }
+
+#[test]
+fn partial_provider_overrun_halts_the_exact_real_receipt() {
+    let mut fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 240);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    let admission_commit = fixture.service().published().unwrap().0;
+    assert_eq!(budget.confirm_submission(&receipt), Ok(()));
+    let mut wrong = receipt.clone();
+    wrong.receipt.push_str("-mismatch");
+    assert_eq!(budget.confirm_submission(&wrong), Err(PortError::Denied));
+    assert_eq!(fixture.service().published().unwrap().0, admission_commit);
+    let usage = Usage::OverCap {
+        input_tokens: None,
+        output_tokens: Some(21),
+    };
+    budget.settle(&receipt, usage).unwrap();
+    assert_eq!(budget.confirm_submission(&receipt), Err(PortError::Denied));
+    drop(budget);
+    fixture.reopen();
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(101),
+    };
+    budget.settle(&receipt, usage).unwrap();
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    let entry = ledger.reservations.values().next().unwrap();
+    assert_eq!(entry.receipt, receipt.receipt);
+    assert_eq!(entry.over_cap_usage.unwrap().input_tokens, None);
+    assert_eq!(entry.over_cap_usage.unwrap().output_tokens, Some(21));
+    assert_eq!(ledger.total_charged, 120);
+}

@@ -7,6 +7,7 @@
 //! All port calls happen outside Ticket locks. Concrete I/O adapters live in the Host.
 
 pub mod budget;
+pub mod calls;
 pub mod checkpoint;
 pub mod delivery;
 pub mod diagnostic_input;
@@ -225,6 +226,12 @@ pub enum Usage {
     Known {
         input_tokens: u32,
         output_tokens: u32,
+    },
+    /// An independently observed dimension exceeds its reserved ceiling.
+    /// Incomplete or inconsistent sibling counts cannot authorize a refund.
+    OverCap {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
     },
     Unknown,
 }
