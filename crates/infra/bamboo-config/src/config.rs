@@ -57,6 +57,9 @@
 //!   plaintext key in `providers.json`.
 
 use anyhow::{Context, Result};
+use bamboo_domain::patrol_model_limits::{
+    MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+};
 use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1808,6 +1811,17 @@ impl PatrolModelConfig {
                 .any(|ch| ch.is_whitespace() || ch.is_control())
         {
             return Err("patrol_model requires an explicit provider identifier".into());
+        }
+        if self.max_input_tokens.get() > MAX_INPUT_TOKENS
+            || self.max_output_tokens.get() > MAX_OUTPUT_TOKENS
+            || self.max_evidence_bytes.get() > MAX_EVIDENCE_BYTES
+            || self.max_evidence_refs.get() > MAX_EVIDENCE_REFS
+        {
+            return Err(format!(
+                "patrol_model limits must be at most {MAX_INPUT_TOKENS} input tokens, \
+                 {MAX_OUTPUT_TOKENS} output tokens, {MAX_EVIDENCE_BYTES} evidence bytes, \
+                 and {MAX_EVIDENCE_REFS} evidence references"
+            ));
         }
         match self.protocol {
             PatrolModelProtocol::LlamaCppRawV1 if self.model == "gpt-oss-20b" => Ok(()),

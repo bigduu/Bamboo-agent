@@ -7686,10 +7686,10 @@ mod tests {
             "provider": "patrol-local",
             "model": "gpt-oss-20b",
             "protocol": "llama_cpp_raw_v1",
-            "max_input_tokens": 4096,
-            "max_output_tokens": 64,
-            "max_evidence_bytes": 16384,
-            "max_evidence_refs": 16
+            "max_input_tokens": 32_768,
+            "max_output_tokens": 8_192,
+            "max_evidence_bytes": 131_072,
+            "max_evidence_refs": 32
         });
         assert!(Config::default().patrol_model.is_none());
         let root = json!({"provider": "gemini", "patrol_model": patrol});
@@ -7722,6 +7722,30 @@ mod tests {
             .model_policy
             .commit(snapshot.revision, candidate)
             .is_err());
+        for (key, value) in [
+            ("max_input_tokens", 32_769),
+            ("max_output_tokens", 8_193),
+            ("max_evidence_bytes", 131_073),
+            ("max_evidence_refs", 33),
+        ] {
+            let mut invalid = root.clone();
+            invalid["patrol_model"][key] = json!(value);
+            let mut candidate = snapshot.data.as_ref().clone();
+            candidate.patrol_model =
+                Some(serde_json::from_value(invalid["patrol_model"].clone()).unwrap());
+            assert!(
+                serde_json::from_value::<Config>(invalid).is_err(),
+                "loaded patrol_model with {key} above the limit"
+            );
+            assert!(
+                facade
+                    .registry()
+                    .model_policy
+                    .commit(snapshot.revision, candidate)
+                    .is_err(),
+                "committed patrol_model with {key} above the limit"
+            );
+        }
         assert_eq!(
             facade.registry().model_policy.snapshot().data.patrol_model,
             effective.patrol_model,
