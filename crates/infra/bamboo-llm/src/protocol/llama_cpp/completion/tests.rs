@@ -74,10 +74,7 @@ async fn raw_completion_sends_the_preflighted_numeric_prompt_once() {
     );
     let final_json = r#"{"advice":"observe"}"#;
     generated.extend(final_answer(final_json));
-    // llama-server can omit the sampled end-of-generation token from content.
-    let mut reply = answer(&prompt, &generated);
-    generated.pop();
-    reply["tokens"] = json!(generated);
+    let reply = answer(&prompt, &generated);
     completion(&server, ResponseTemplate::new(200).set_body_json(&reply)).await;
 
     let client = GptOssLocalClient::new(*server.address()).unwrap();
@@ -94,9 +91,9 @@ async fn raw_completion_sends_the_preflighted_numeric_prompt_once() {
 
     let result = prepared.complete(TIMEOUT).await.unwrap();
     assert_eq!(result.final_text.as_deref(), Some(final_json));
-    let usage = result.usage.unwrap();
+    let usage = result.usage.known().unwrap();
     assert_eq!(usage.prompt_tokens, prompt.tokens().len() as u64);
-    assert_eq!(usage.completion_tokens, generated.len() as u64 + 1);
+    assert_eq!(usage.completion_tokens, generated.len() as u64);
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 4);
     let payload = requests[3].body_json::<Value>().unwrap();
@@ -166,12 +163,38 @@ async fn advisory_output_and_accounting_are_validated_independently() {
             .complete(TIMEOUT)
             .await
             .unwrap();
-        assert_eq!(result.usage.is_some(), known, "{key}");
+        assert_eq!(result.usage.known().is_some(), known, "{key}");
         assert!(result.final_text.is_none(), "{key}");
         if let Some(count) = expected_count {
-            assert_eq!(result.usage.unwrap().completion_tokens, count);
+            assert_eq!(result.usage.output_tokens, Some(count));
         }
     }
+}
+
+#[tokio::test]
+async fn a_malformed_counter_preserves_the_other_dimension_and_eos_requires_return() {
+    let prompt = GptOssPrompt::encode("Return JSON.", "Work evidence").unwrap();
+    let mut without_return = final_answer("{}");
+    without_return.pop();
+    let server = MockServer::start().await;
+    profile(&server, MODEL, 4096, PROBE_TOKENS).await;
+    let mut reply = answer(&prompt, &without_return);
+    reply["tokens_evaluated"] = json!("malformed");
+    reply["tokens_predicted"] = json!(129);
+    completion(&server, ResponseTemplate::new(200).set_body_json(reply)).await;
+    let client = GptOssLocalClient::new(*server.address()).unwrap();
+    let result = client
+        .prepare(&prompt, 128, TIMEOUT)
+        .await
+        .unwrap()
+        .complete(TIMEOUT)
+        .await
+        .unwrap();
+    assert_eq!(result.usage.input_tokens, None);
+    assert_eq!(result.usage.output_tokens, Some(129));
+    assert!(result.usage.known().is_none());
+    assert!(result.final_text.is_none());
+    assert!(decode_final(&without_return).is_none());
 }
 
 #[tokio::test]

@@ -35,7 +35,25 @@ pub enum CompletionError {
 /// carry no usage proof. Malformed or missing advice can still have known usage.
 pub struct GptOssCompletion {
     pub final_text: Option<String>,
-    pub usage: Option<TokenUsage>,
+    pub usage: CompletionUsage,
+}
+
+/// Independently observed counts. A missing dimension prevents a refund but
+/// cannot erase proof that the other dimension exceeded its ceiling.
+pub struct CompletionUsage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+impl CompletionUsage {
+    pub fn known(&self) -> Option<TokenUsage> {
+        let (prompt_tokens, completion_tokens) = (self.input_tokens?, self.output_tokens?);
+        Some(TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: prompt_tokens.checked_add(completion_tokens)?,
+        })
+    }
 }
 
 /// Dedicated client for an explicitly trusted, single-model loopback server.
@@ -175,32 +193,25 @@ impl PreparedCompletion {
         if completion.model != MODEL || !completion.stop {
             return Err(CompletionError::InvalidResponse);
         }
-        let usage = match (completion.tokens_evaluated, completion.tokens_predicted) {
-            (Some(input), Some(output))
-                if input >= self.input_tokens || output > self.max_output_tokens =>
-            {
-                Some(TokenUsage {
-                    prompt_tokens: u64::from(input),
-                    completion_tokens: u64::from(output),
-                    total_tokens: u64::from(input) + u64::from(output),
-                })
-            }
-            _ => None,
+        let usage = CompletionUsage {
+            input_tokens: completion
+                .tokens_evaluated
+                .as_u64()
+                .filter(|&input| input >= u64::from(self.input_tokens)),
+            output_tokens: completion.tokens_predicted.as_u64(),
         };
-        let final_text = match usage {
-            Some(usage)
-                if usage.prompt_tokens == u64::from(self.input_tokens)
-                    && usage.completion_tokens <= u64::from(self.max_output_tokens)
-                    && completion.stop_type == "eos"
-                    && !completion.truncated =>
+        let final_text = match usage.known() {
+            Some(counts)
+                if counts.prompt_tokens == u64::from(self.input_tokens)
+                    && counts.completion_tokens <= u64::from(self.max_output_tokens)
+                    && completion.stop_type.as_str() == Some("eos")
+                    && completion.truncated.as_bool() == Some(false) =>
             {
                 let tokens: Option<Vec<u32>> = serde_json::from_value(completion.tokens).ok();
                 tokens.and_then(|tokens| {
-                    let omitted = usage.completion_tokens.checked_sub(tokens.len() as u64)?;
-                    if omitted > 1 || (omitted == 1 && tokens.last() == Some(&RETURN)) {
-                        return None;
-                    }
-                    decode_final(&tokens)
+                    (tokens.len() as u64 == counts.completion_tokens)
+                        .then(|| decode_final(&tokens))
+                        .flatten()
                 })
             }
             _ => None,
@@ -223,7 +234,7 @@ fn decode_final(mut tokens: &[u32]) -> Option<String> {
         let (text, tail) = body.split_at(end);
         match tokenizer.decode(channel).ok()?.as_str() {
             "analysis" => tokens = tail.strip_prefix(&[END, START, ASSISTANT])?,
-            "final" if tail.is_empty() || tail == [RETURN] => {
+            "final" if tail == [RETURN] => {
                 return tokenizer.decode(text).ok().filter(|s| !s.is_empty());
             }
             _ => return None,
@@ -296,12 +307,16 @@ struct Tokenized {
 struct WireCompletion {
     model: String,
     stop: bool,
-    stop_type: String,
-    truncated: bool,
+    #[serde(default)]
+    stop_type: Value,
+    #[serde(default)]
+    truncated: Value,
     #[serde(default)]
     tokens: Value,
-    tokens_evaluated: Option<u32>,
-    tokens_predicted: Option<u32>,
+    #[serde(default)]
+    tokens_evaluated: Value,
+    #[serde(default)]
+    tokens_predicted: Value,
 }
 
 #[cfg(test)]
