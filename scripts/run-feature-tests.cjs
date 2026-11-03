@@ -127,7 +127,13 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2503's unconditional evidence exports change the fingerprinted facade only.
 // Host cases stay in server-app-state; Core/Projects stay in packages-3.
 // Existing four additive contexts and twenty selected cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "6c3c41b19a400a97618fa7e632c2780b67ccd805da655c28fb74716a80cf37cb";
+// #2510 changes config.rs inside its existing test-utils-sensitive closure.
+// Shared compression policy/serde regressions are ordinary config/packages-4
+// cases; domain/packages-2, compression/packages-0, engine/packages-3 and
+// skills/packages-1 retain their default owners. Feature declarations, cfg
+// expressions, module edges, four additive contexts and twenty selected cases
+// are unchanged.
+const FEATURE_SOURCE_SHA256 = "d9a51967eb02fbf906211bb1bdd28e1b83dee0f3c23034cf1b1e57fba5ab8402";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
