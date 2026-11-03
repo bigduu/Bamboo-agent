@@ -51,7 +51,12 @@ mod initialization;
 mod memory_sources;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod patrol_adapter;
-pub use patrol_adapter::PatrolCheckpointStore;
+pub use patrol_adapter::{
+    PatrolCheckpointStore, UnmeteredWorkPatrolEvidence, WorkPatrolAdoptedContextEvidence,
+    WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit, WorkPatrolRequestEvidence,
+    WorkPatrolSourceEvidence, WorkPatrolSourceOutcome, WorkPatrolTicketEvidence,
+    MAX_WORK_PATROL_EVIDENCE_BYTES, MAX_WORK_PATROL_EVIDENCE_REFS,
+};
 mod ready_owner;
 mod ready_retry_store;
 mod resolution;
