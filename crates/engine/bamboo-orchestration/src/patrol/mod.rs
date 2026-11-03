@@ -980,10 +980,12 @@ impl Patrol {
             escalate(incident, SupervisorReason::DiagnosticUnavailable, o, now);
             return Ok(());
         }
-        match provider
-            .status(&request.operation)
-            .unwrap_or(DiagnosticStatus::OutcomeUnknown)
-        {
+        let status = match provider.status(&request.operation) {
+            Ok(status) => status,
+            Err(_) if staged_status => DiagnosticStatus::Pending,
+            Err(_) => DiagnosticStatus::OutcomeUnknown,
+        };
+        match status {
             DiagnosticStatus::Pending => {}
             DiagnosticStatus::Finished { diagnosis, usage } => {
                 let usage_valid = matches!(usage, Usage::Known { input_tokens, output_tokens }
@@ -1076,7 +1078,7 @@ fn reconcile_usage_without_advice(
         Some(usage) if usage != Usage::AwaitingProvider => usage,
         None if !matches!(incident.phase, Phase::Diagnosing { .. }) => Usage::Unknown,
         _ if staged_status => match provider.status(&reservation.operation) {
-            Ok(DiagnosticStatus::Pending) => {
+            Ok(DiagnosticStatus::Pending) | Err(_) => {
                 incident.pending_settlement = Some(reservation.clone());
                 incident.pending_settlement_usage = Some(Usage::AwaitingProvider);
                 return;
@@ -1084,7 +1086,7 @@ fn reconcile_usage_without_advice(
             Ok(DiagnosticStatus::Finished { usage, .. } | DiagnosticStatus::Failed { usage }) => {
                 usage
             }
-            _ => Usage::Unknown,
+            Ok(DiagnosticStatus::OutcomeUnknown) => Usage::Unknown,
         },
         _ => Usage::Unknown,
     };

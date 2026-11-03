@@ -117,10 +117,12 @@ pub fn validate_update(previous: &Checkpoint, next: &Checkpoint) -> Result<(), P
             if let (Some(before), Some(after)) = (&old.pending_settlement, &new.pending_settlement)
             {
                 if before != after
-                    || old.pending_settlement_usage.is_some_and(|usage| {
-                        usage != Usage::AwaitingProvider
-                            && new.pending_settlement_usage != Some(usage)
-                    })
+                    || old
+                        .pending_settlement_usage
+                        .is_some_and(|usage| match usage {
+                            Usage::AwaitingProvider => new.pending_settlement_usage.is_none(),
+                            _ => new.pending_settlement_usage != Some(usage),
+                        })
                     || (old.pending_settlement_usage.is_none()
                         && !matches!(old.phase, Phase::Diagnosing { .. })
                         && new

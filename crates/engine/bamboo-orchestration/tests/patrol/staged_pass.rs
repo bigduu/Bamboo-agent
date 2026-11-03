@@ -260,6 +260,21 @@ fn expired_staged_call_retains_the_original_receipt_until_late_usage_is_durable(
         Some(Usage::AwaitingProvider)
     );
     assert_eq!(host.usage(), 120);
+    let mut legacy = awaiting.clone();
+    legacy.incident.as_mut().unwrap().pending_settlement_usage = None;
+    assert_eq!(
+        checkpoint::validate_update(&awaiting, &legacy),
+        Err(PortError::Conflict)
+    );
+    patrol
+        .tick_staged(&scope(), &FakeClock(151), &mut host, None, |_| {
+            Err(PortError::Unavailable)
+        })
+        .unwrap();
+    assert_eq!(
+        host.incident().pending_settlement_usage,
+        Some(Usage::AwaitingProvider)
+    );
     host.fail_settle = true;
     let late = Usage::OverCap {
         input_tokens: None,
@@ -381,7 +396,7 @@ mod calls {
         }
     }
 
-    fn admitted_submission() -> staged::Submission {
+    fn staged_operation() -> (FakeHost, staged::Submission) {
         let mut policy = policy();
         policy.diagnostic_timeout_ms = 5_000;
         let patrol = Patrol::new(policy, Some(model())).unwrap();
@@ -404,7 +419,11 @@ mod calls {
         else {
             panic!("expected live admission");
         };
-        submission
+        (host, submission)
+    }
+
+    fn admitted_submission() -> staged::Submission {
+        staged_operation().1
     }
 
     async fn result(calls: &Calls, operation: &OperationId) -> DiagnosticStatus {
@@ -527,8 +546,9 @@ mod calls {
     #[tokio::test(start_paused = true)]
     async fn elapsed_deadline_does_not_evict_unreconciled_over_cap_evidence() {
         let calls = Calls::default();
-        let submission = admitted_submission();
+        let (mut old_scope, submission) = staged_operation();
         let operation = submission.reservation().operation.clone();
+        let receipt = submission.reservation().clone();
         let control = Arc::new(Controlled::default());
         control.release.notify_one();
         calls
@@ -571,5 +591,17 @@ mod calls {
         );
         assert_eq!(calls.status(&operation).unwrap(), expected);
         assert_eq!(control.sends.load(Ordering::SeqCst), 1);
+        old_scope.denied = true;
+        assert_eq!(calls.reconcile_accounting(&mut old_scope), Ok(1));
+        assert_eq!(calls.reconcile_accounting(&mut old_scope), Ok(0));
+        let state = old_scope.durable.borrow();
+        assert_eq!(state.charges[&operation].reservation, receipt);
+        assert_eq!(
+            state.charges[&operation].settled,
+            Some(Usage::OverCap {
+                input_tokens: None,
+                output_tokens: Some(21)
+            })
+        );
     }
 }

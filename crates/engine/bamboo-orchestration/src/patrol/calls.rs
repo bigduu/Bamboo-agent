@@ -13,7 +13,8 @@ use tokio::{
 
 use super::{
     staged::{Reconciled, Submission},
-    Diagnosis, DiagnosticRequest, DiagnosticStatus, OperationId, PortError, Reservation, Usage,
+    BudgetPort, Diagnosis, DiagnosticRequest, DiagnosticStatus, OperationId, PortError,
+    Reservation, Usage,
 };
 
 const MAX_CALLS: usize = 16;
@@ -104,9 +105,11 @@ struct State {
 }
 
 struct Entry {
+    receipt: Reservation,
     expires: Instant,
     task: AbortHandle,
     status: CallStatus,
+    checkpoint_ack: bool,
 }
 
 impl Drop for Entry {
@@ -123,6 +126,15 @@ enum CallStatus {
 struct Delivery {
     status: DiagnosticStatus,
     accounted: bool,
+}
+
+impl Delivery {
+    fn usage(&self) -> Usage {
+        match self.status {
+            DiagnosticStatus::Finished { usage, .. } | DiagnosticStatus::Failed { usage } => usage,
+            _ => Usage::Unknown,
+        }
+    }
 }
 
 impl Entry {
@@ -145,19 +157,10 @@ impl Entry {
     }
 
     fn retain(&mut self, now: Instant) -> bool {
-        self.expires > now
-            || self.delivery().is_none_or(|delivery| {
-                !delivery.accounted
-                    && matches!(
-                        delivery.status,
-                        DiagnosticStatus::Finished {
-                            usage: Usage::Known { .. } | Usage::OverCap { .. },
-                            ..
-                        } | DiagnosticStatus::Failed {
-                            usage: Usage::Known { .. } | Usage::OverCap { .. }
-                        }
-                    )
-            })
+        let checkpoint_ack = self.checkpoint_ack;
+        let within_deadline = self.expires > now;
+        self.delivery()
+            .is_none_or(|delivery| !delivery.accounted || (!checkpoint_ack && within_deadline))
     }
 }
 
@@ -188,6 +191,7 @@ impl Calls {
         let deadline = now + Duration::from_millis(remaining);
         let (send, receive) = oneshot::channel();
         let operation = receipt.operation.clone();
+        let exact_receipt = receipt.clone();
         let task = runtime.spawn(async move {
             let status = timeout_at(deadline, async {
                 io.admit(&receipt).await?;
@@ -218,9 +222,11 @@ impl Calls {
         state.entries.insert(
             operation,
             Entry {
+                receipt: exact_receipt,
                 expires: deadline + ACCOUNTING_TIMEOUT,
                 task: task.abort_handle(),
                 status: CallStatus::Receiving(receive),
+                checkpoint_ack: false,
             },
         );
         Ok(())
@@ -240,8 +246,53 @@ impl Calls {
 
     pub fn acknowledge(&self, reconciled: Reconciled) {
         if let Ok(mut state) = self.state.lock() {
-            state.entries.remove(&reconciled.0);
+            if let Some(entry) = state.entries.get_mut(&reconciled.0) {
+                entry.checkpoint_ack = true;
+                if entry.delivery().is_some_and(|delivery| delivery.accounted) {
+                    state.entries.remove(&reconciled.0);
+                }
+            }
         }
+    }
+
+    /// Reconcile completed receipts without observing the original Work. A
+    /// fresh Runtime budget port still authorizes the exact accounting write.
+    pub fn reconcile_accounting(&self, budget: &mut dyn BudgetPort) -> Result<usize, PortError> {
+        let due: Vec<_> = self
+            .state
+            .lock()
+            .map_err(|_| PortError::Unavailable)?
+            .entries
+            .values_mut()
+            .filter_map(|entry| {
+                let usage = entry
+                    .delivery()
+                    .filter(|delivery| !delivery.accounted)?
+                    .usage();
+                Some((entry.receipt.clone(), usage))
+            })
+            .collect();
+        let mut settled = 0;
+        for (receipt, usage) in due {
+            if budget.settle(&receipt, usage).is_err() {
+                continue;
+            }
+            settled += 1;
+            let mut state = self.state.lock().map_err(|_| PortError::Unavailable)?;
+            if let Some(entry) = state
+                .entries
+                .get_mut(&receipt.operation)
+                .filter(|entry| entry.receipt == receipt)
+            {
+                if let CallStatus::Complete(delivery) = &mut entry.status {
+                    delivery.accounted = true;
+                }
+                if entry.checkpoint_ack {
+                    state.entries.remove(&receipt.operation);
+                }
+            }
+        }
+        Ok(settled)
     }
 
     pub fn close(&self) {
