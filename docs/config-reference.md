@@ -351,6 +351,13 @@ are feasibility constraints: if they cannot fit the calculated target, Bamboo
 reports that failure instead of treating near-limit safety trimming as a completed
 summary/archive. The hard input fit remains a distinct final safety mechanism.
 
+An idle ordinary chat can be compressed directly with `/compact` in a
+compatible Lotus client or `POST /api/v1/sessions/{session_id}/compact`.
+The command uses the selected strategy and its current target without
+waiting for the automatic trigger or starting an agent reply. It preserves
+the original transcript. The API reports `compacted` with the committed
+usage estimate, or `unchanged` when it makes no change.
+
 To select message summaries:
 
 ```json
