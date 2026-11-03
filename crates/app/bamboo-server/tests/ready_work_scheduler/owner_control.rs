@@ -555,15 +555,107 @@ async fn cached_owner_install_after_expiry_cannot_extend_the_grant() {
         http(&fixture.state, Method::PUT, Some(&request)).await,
         (StatusCode::OK, receipt)
     );
-    assert_eq!(
-        http(&fixture.state, Method::GET, None).await.1["active"],
-        false
-    );
     tokio::time::resume();
+    wait_known_inactive(&fixture).await;
     first.complete();
     let work_id = fixture.works[0].id.clone();
     fixture.wait_submitted(&work_id).await;
     fixture.assert_quiet(1).await;
+    fixture.state.shutdown().await;
+}
+
+async fn wait_known_inactive(fixture: &Fixture) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let (code, status) = http(&fixture.state, Method::GET, None).await;
+            assert_eq!(code, StatusCode::OK, "{status}");
+            match status.get("active") {
+                Some(Value::Bool(false)) => return,
+                Some(Value::Null) => tokio::task::yield_now().await,
+                // A renewed grant must fail immediately, not expire again
+                // while the fixture waits and incorrectly appear inactive.
+                Some(Value::Bool(true)) => {
+                    panic!("cached receipt renewed an expired grant: {status}")
+                }
+                _ => panic!("invalid policy status: {status}"),
+            }
+        }
+    })
+    .await
+    .expect("known inactive status within the original finite wait after resuming time");
+}
+
+#[actix_web::test]
+async fn cached_expiry_behind_real_queue_preserves_unknown_then_known_inactive() {
+    use bamboo_domain::AdmissionCommit;
+    let mut fixture = Fixture::with_explicit_scope(1, true).await;
+    configure_budget(&fixture, 2 * CAP).await;
+    let scheduler = fixture.state.spawn_scheduler.clone();
+    let mut held = Vec::new();
+    for _ in 0..128 {
+        match tokio::time::timeout(WAIT, scheduler.reserve_queue_capacity(None))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            AdmissionCommit::Committed(permit) => held.push(permit),
+            _ => panic!("real native queue capacity must be reserved"),
+        }
+    }
+    let (code, status) = http(&fixture.state, Method::GET, None).await;
+    assert_eq!(code, StatusCode::OK, "{status}");
+    let request = install(&fixture, &status, "queued-expiry", 1, 60);
+    let (code, receipt) = http(&fixture.state, Method::PUT, Some(&request)).await;
+    assert_eq!(code, StatusCode::OK, "{receipt}");
+    let original = tokio::time::timeout(WAIT, async {
+        loop {
+            let snapshot = fixture.snapshot();
+            if let Some(assignment) = snapshot.assignments.values().next() {
+                let child = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
+                if fixture
+                    .state
+                    .storage
+                    .load_runtime_control_plane(&child)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break (assignment.id.clone(), assignment.dispatch_key.clone());
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the original Start/Child is prepared behind real queue capacity");
+    let (code, busy) = http(&fixture.state, Method::GET, None).await;
+    assert_eq!(code, StatusCode::OK, "{busy}");
+    assert_eq!(busy.get("active"), Some(&Value::Null));
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    assert_eq!(
+        http(&fixture.state, Method::PUT, Some(&request)).await,
+        (StatusCode::OK, receipt)
+    );
+    let (code, busy) = http(&fixture.state, Method::GET, None).await;
+    eprintln!(
+        "2511 controlled busy expiry: HTTP={code}, status={busy}, assignment={}, dispatch={}",
+        original.0, original.1
+    );
+    assert_eq!(code, StatusCode::OK, "{busy}");
+    assert_eq!(busy.get("active"), Some(&Value::Null));
+    tokio::time::resume();
+    drop(held);
+    wait_known_inactive(&fixture).await;
+    fixture.assert_quiet(0).await;
+    assert_eq!(fixture.snapshot().assignments.len(), 1);
+    assert_eq!(
+        fixture.snapshot().assignments[&original.0].dispatch_key,
+        original.1
+    );
+    assert!(fixture.snapshot().assignments[&original.0]
+        .runtime
+        .is_none());
     fixture.state.shutdown().await;
 }
 
