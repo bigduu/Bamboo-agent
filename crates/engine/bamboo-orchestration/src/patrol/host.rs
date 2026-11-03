@@ -25,6 +25,18 @@ pub struct RuntimeObservation {
     pub wait: RuntimeWait,
 }
 
+/// Fresh Host facts, not a grant or durable runtime history. A live Task-entry
+/// sample supplies only start time; heartbeat and progress remain independent.
+/// The original wait-only RuntimeObservation API remains source-compatible.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeFacts {
+    pub scope: Scope,
+    pub source_commit: String,
+    pub receipt: bamboo_tickets::RuntimeReceipt,
+    pub started_at_ms: Option<u64>,
+    pub wait: Option<RuntimeWait>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeWait {
     pub kind: WaitKind,
@@ -184,9 +196,34 @@ pub fn read_observation_with_runtime(
     runtime: &RuntimeObservation,
     policy: &Policy,
 ) -> Result<TicketObservation, PortError> {
+    read_observation_with_runtime_facts(
+        service,
+        authority,
+        scope,
+        &RuntimeFacts {
+            scope: runtime.scope.clone(),
+            source_commit: runtime.source_commit.clone(),
+            receipt: runtime.receipt.clone(),
+            started_at_ms: None,
+            wait: Some(runtime.wait.clone()),
+        },
+        policy,
+    )
+}
+
+pub fn read_observation_with_runtime_facts(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    runtime: &RuntimeFacts,
+    policy: &Policy,
+) -> Result<TicketObservation, PortError> {
     let (commit, snapshot) = checked_snapshot(service, authority, &scope.work_id)?;
     if runtime.scope != *scope || runtime.source_commit != commit {
         return Err(PortError::Conflict);
+    }
+    if runtime.started_at_ms == Some(0) {
+        return Err(PortError::Denied);
     }
     let mut observation = project(&snapshot, scope)?;
     let assignment = &snapshot.assignments[&scope.assignment_id];
@@ -194,8 +231,8 @@ pub fn read_observation_with_runtime(
         return Err(PortError::Denied);
     }
     if !observation.execution_unknown && !observation.terminal {
-        {
-            let wait = &runtime.wait;
+        observation.started_at_ms = runtime.started_at_ms;
+        if let Some(wait) = &runtime.wait {
             match wait.kind {
                 WaitKind::User => {
                     let request = wait

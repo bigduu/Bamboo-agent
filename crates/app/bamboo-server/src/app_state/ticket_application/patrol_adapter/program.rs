@@ -143,7 +143,7 @@ impl TicketApplication {
                     &mut journal,
                     &mut |scope| match observations.get(scope) {
                         Some(runtime) => {
-                            bamboo_orchestration::patrol::host::read_observation_with_runtime(
+                            bamboo_orchestration::patrol::host::read_observation_with_runtime_facts(
                                 &service,
                                 &authority,
                                 scope,

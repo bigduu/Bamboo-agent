@@ -2150,6 +2150,8 @@ mod admission;
 #[cfg(unix)]
 #[path = "ready_work_scheduler/journal_readback.rs"]
 mod journal_readback;
+#[path = "ready_work_scheduler/native_start.rs"]
+mod native_start;
 #[path = "ready_work_scheduler/owner_control.rs"]
 mod owner_control;
 #[path = "ready_work_scheduler/start_observation.rs"]

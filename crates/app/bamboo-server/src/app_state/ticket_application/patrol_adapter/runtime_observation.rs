@@ -1,4 +1,5 @@
-//! Exact native wait reads. No ActorDirectory inspect/ensure (which can write),
+//! Host proof for exact waits and the Engine's live Task-entry read port.
+//! No ActorDirectory inspect/ensure (which can write),
 //! transcript load, liveness inference, executable grant or runtime mutation.
 use super::super::{Error, Principal, Result, TicketApplication};
 use super::patrol_error;
@@ -142,7 +143,7 @@ pub(super) async fn prepare(
     service: &Arc<TicketService>,
     authority: &Authority,
     scope: &Scope,
-) -> Result<Option<host::RuntimeObservation>> {
+) -> Result<Option<host::RuntimeFacts>> {
     let mut port = host::read_observation(service, authority, scope).map_err(patrol_error)?;
     let ledger = port.observation(scope, 0).map_err(patrol_error)?;
     if ledger.execution_unknown || ledger.terminal {
@@ -195,103 +196,117 @@ pub(super) async fn prepare(
     {
         return Err(denied());
     }
-    let runtime = child.agent_runtime_state.as_ref().unwrap();
-    let evidence_ref = format!("patrol-native-wait-{}", fingerprint(&child)?);
-    let native_state = child
-        .metadata
-        .get("runtime.local_task.state")
-        .map(String::as_str);
-    let wait = if let Some(request_id) = assignment.awaiting_request.as_ref() {
-        let Some(request) = snapshot.requests.get(request_id) else {
-            return Err(denied());
-        };
-        if request.status != RequestStatus::Open
-            || assignment.state != AssignmentState::Blocked
-            || !assignment.process_stopped
-            || native_state != Some("stopped")
-            || child.last_run_status().as_deref() != Some("completed")
-            || child
-                .metadata
-                .get("runtime.completion_reason")
-                .map(String::as_str)
-                != Some("ticket_question_yield")
-        {
-            return Ok(None);
-        }
-        let Some(raw) = child
+    let native_start = || {
+        app.adapter.get().and_then(|adapter| {
+            adapter
+                .scheduler
+                .native_task_start(&child.id, &receipt.run_id, child.created_at)
+        })
+    };
+    let started = native_start();
+    let started_at_ms = started.as_ref().and_then(|sample| sample.started_at_ms());
+    let wait = (|| -> Result<Option<host::RuntimeWait>> {
+        let runtime = child.agent_runtime_state.as_ref().unwrap();
+        let evidence_ref = format!("patrol-native-wait-{}", fingerprint(&child)?);
+        let native_state = child
             .metadata
-            .get(TICKET_QUESTION_YIELD_KEY)
-            .filter(|raw| raw.len() <= 65_536)
-        else {
-            return Ok(None);
-        };
-        let original: bamboo_tickets::PendingRequest = serde_json::from_str(raw)?;
-        if serde_json::to_value(&original)? != serde_json::to_value(request)? {
-            return Err(denied());
-        }
-        host::RuntimeWait {
-            kind: WaitKind::User,
-            // Stable owned-stop observation anchors a PATROL DIAGNOSTIC
-            // allowance. The Question has no business deadline and stays Open.
-            registered_at_ms: stopped_at(&child, receipt)?,
-            timeout_at_ms: None,
-            request_id: Some(request_id.clone()),
-            evidence_ref,
-        }
-    } else {
-        if runtime.status != AgentStatusState::Suspended
-            || !runtime
+            .get("runtime.local_task.state")
+            .map(String::as_str);
+        let wait = if let Some(request_id) = assignment.awaiting_request.as_ref() {
+            let Some(request) = snapshot.requests.get(request_id) else {
+                return Err(denied());
+            };
+            if request.status != RequestStatus::Open
+                || assignment.state != AssignmentState::Blocked
+                || !assignment.process_stopped
+                || native_state != Some("stopped")
+                || child.last_run_status().as_deref() != Some("completed")
+                || child
+                    .metadata
+                    .get("runtime.completion_reason")
+                    .map(String::as_str)
+                    != Some("ticket_question_yield")
+            {
+                return Ok(None);
+            }
+            let Some(raw) = child
+                .metadata
+                .get(TICKET_QUESTION_YIELD_KEY)
+                .filter(|raw| raw.len() <= 65_536)
+            else {
+                return Ok(None);
+            };
+            let original: bamboo_tickets::PendingRequest = serde_json::from_str(raw)?;
+            if serde_json::to_value(&original)? != serde_json::to_value(request)? {
+                return Err(denied());
+            }
+            host::RuntimeWait {
+                kind: WaitKind::User,
+                // Stable owned-stop observation anchors a PATROL DIAGNOSTIC
+                // allowance. The Question has no business deadline and stays Open.
+                registered_at_ms: stopped_at(&child, receipt)?,
+                timeout_at_ms: None,
+                request_id: Some(request_id.clone()),
+                evidence_ref,
+            }
+        } else {
+            if runtime.status != AgentStatusState::Suspended
+                || !runtime
+                    .suspension
+                    .as_ref()
+                    .is_some_and(|state| state.resumable)
+                || !matches!(native_state, Some("running" | "stopped"))
+                || child.pending_question.is_some()
+                || runtime.plan_mode.as_ref().is_some_and(|plan| {
+                    plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval
+                })
+            {
+                return Ok(None);
+            }
+            if native_state == Some("stopped") {
+                let _ = stopped_at(&child, receipt)?;
+            }
+            let reason = runtime
                 .suspension
                 .as_ref()
-                .is_some_and(|state| state.resumable)
-            || !matches!(native_state, Some("running" | "stopped"))
-            || child.pending_question.is_some()
-            || runtime
-                .plan_mode
-                .as_ref()
-                .is_some_and(|plan| plan.status == bamboo_domain::PlanModeStatus::AwaitingApproval)
-        {
+                .map(|state| state.reason.as_str());
+            match (&runtime.waiting_for_children, &runtime.waiting_for_bash) {
+                (Some(wait), None)
+                    if reason == Some("waiting_for_children")
+                        && !wait.child_session_ids.is_empty()
+                        && wait.child_session_ids.len() <= 256 =>
+                {
+                    host::RuntimeWait {
+                        kind: WaitKind::Dependency,
+                        registered_at_ms: millis(wait.registered_at)?,
+                        timeout_at_ms: wait.timeout_at.map(millis).transpose()?,
+                        request_id: None,
+                        evidence_ref,
+                    }
+                }
+                (None, Some(wait))
+                    if reason == Some("waiting_for_bash")
+                        && !wait.bash_ids.is_empty()
+                        && wait.bash_ids.len() <= 256 =>
+                {
+                    host::RuntimeWait {
+                        kind: WaitKind::RunningTool,
+                        registered_at_ms: millis(wait.registered_at)?,
+                        timeout_at_ms: wait.timeout_at.map(millis).transpose()?,
+                        request_id: None,
+                        evidence_ref,
+                    }
+                }
+                _ => return Ok(None),
+            }
+        };
+        let now = millis(chrono::Utc::now())?;
+        if !valid_anchor(&wait, millis(child.created_at)?, now) {
             return Ok(None);
         }
-        if native_state == Some("stopped") {
-            let _ = stopped_at(&child, receipt)?;
-        }
-        let reason = runtime
-            .suspension
-            .as_ref()
-            .map(|state| state.reason.as_str());
-        match (&runtime.waiting_for_children, &runtime.waiting_for_bash) {
-            (Some(wait), None)
-                if reason == Some("waiting_for_children")
-                    && !wait.child_session_ids.is_empty()
-                    && wait.child_session_ids.len() <= 256 =>
-            {
-                host::RuntimeWait {
-                    kind: WaitKind::Dependency,
-                    registered_at_ms: millis(wait.registered_at)?,
-                    timeout_at_ms: wait.timeout_at.map(millis).transpose()?,
-                    request_id: None,
-                    evidence_ref,
-                }
-            }
-            (None, Some(wait))
-                if reason == Some("waiting_for_bash")
-                    && !wait.bash_ids.is_empty()
-                    && wait.bash_ids.len() <= 256 =>
-            {
-                host::RuntimeWait {
-                    kind: WaitKind::RunningTool,
-                    registered_at_ms: millis(wait.registered_at)?,
-                    timeout_at_ms: wait.timeout_at.map(millis).transpose()?,
-                    request_id: None,
-                    evidence_ref,
-                }
-            }
-            _ => return Ok(None),
-        }
-    };
-    let now = millis(chrono::Utc::now())?;
-    if !valid_anchor(&wait, millis(child.created_at)?, now) {
+        Ok(Some(wait))
+    })()?;
+    if wait.is_none() && started_at_ms.is_none() {
         return Ok(None);
     }
     // A second compact control-plane read catches run replacement/answer/wait
@@ -300,6 +315,9 @@ pub(super) async fn prepare(
         return Err(Error::RevisionConflict);
     };
     if fingerprint(&current)? != fingerprint(&child)? {
+        return Err(Error::RevisionConflict);
+    }
+    if native_start() != started {
         return Err(Error::RevisionConflict);
     }
     let (fresh, _) = app.authority(Principal::Runtime).await?;
@@ -313,10 +331,11 @@ pub(super) async fn prepare(
     )
     .await?;
     lineage(&current, &fresh_parent, &assignment.id)?;
-    Ok(Some(host::RuntimeObservation {
+    Ok(Some(host::RuntimeFacts {
         scope: scope.clone(),
         source_commit: commit,
         receipt: receipt.clone(),
+        started_at_ms,
         wait,
     }))
 }
@@ -326,7 +345,7 @@ pub(super) async fn prepare_selection(
     service: &Arc<TicketService>,
     authority: &Authority,
     selection: &bamboo_orchestration::patrol::program::ProgramSelection<'_>,
-) -> Result<BTreeMap<Scope, host::RuntimeObservation>> {
+) -> Result<BTreeMap<Scope, host::RuntimeFacts>> {
     if selection.work_ids.len() > bamboo_tickets::CLAIM_CANDIDATE_LIMIT {
         return Err(Error::ContextBudgetExceeded);
     }

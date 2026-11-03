@@ -21,7 +21,7 @@ impl TicketApplication {
         if let Some(runtime) =
             runtime_observation::prepare(self, &service, &authority, scope).await?
         {
-            return host::read_observation_with_runtime(
+            return host::read_observation_with_runtime_facts(
                 &service,
                 &authority,
                 scope,

@@ -18,7 +18,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -95,6 +95,7 @@ struct Execution {
     persistence: Arc<dyn RuntimeSessionPersistence>,
     cancel: CancellationToken,
     resources: bamboo_tools::LocalTaskResources,
+    entered_at: Arc<OnceLock<chrono::DateTime<chrono::Utc>>>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<ExecutionOutput>>>,
     stop: Mutex<Option<ConfirmedTaskStop>>,
     finalized: AtomicBool,
@@ -426,6 +427,34 @@ impl LocalTaskChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for LocalTaskChildRunner {
+    fn native_task_start(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::execution::spawn::NativeTaskStart> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let execution = lock(&self.executions).get(session_id)?.clone();
+        if execution.owner.fence.run_id != run_id
+            || execution.owner.created_at != child_birth
+            || execution.owner.fence.actor_id != session_id
+            || execution.cancel.is_cancelled()
+            || *lock(&execution.launch) != LaunchState::Running
+            || lock(&execution.slot).is_none()
+        {
+            return None;
+        }
+        Some(crate::execution::spawn::NativeTaskStart {
+            session_id: session_id.into(),
+            child_birth,
+            run_id: run_id.into(),
+            instance_id: execution.resources.identity().owner_id,
+            entered_at: *execution.entered_at.get()?,
+        })
+    }
+
     fn supports_native_ticket_budget(&self) -> bool {
         true
     }
@@ -670,6 +699,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
             owner,
             persistence: persistence.clone(),
             cancel,
+            entered_at: Arc::new(OnceLock::new()),
             resources: bamboo_tools::LocalTaskResources::new(
                 &session.id,
                 run_id,
@@ -854,6 +884,7 @@ impl ExternalChildRunner for LocalTaskChildRunner {
         let (event_store, event_observer) = { let bindings=lock(&self.bindings); (bindings.store.clone().expect("prepared store"), bindings.observer.clone()) };
         let event_owner = execution.owner.clone();
         let event_cancel = cancel_token.clone();
+        let entered_at = execution.entered_at.clone();
         let task = tokio::spawn(async move {
             let forward = tokio::spawn(events::forward(event_store, event_owner, event_observer, local_event_rx, event_tx, event_cancel));
             let result = std::panic::AssertUnwindSafe(
@@ -867,6 +898,10 @@ impl ExternalChildRunner for LocalTaskChildRunner {
                     // answer/retry handoff markers are not future pending work.
                     // Do not consume them while queued or during preparation.
                     crate::session_app::execute::consume_pending_clarification_resume(&mut owned_session);
+                    // This physical Task has reached Agent execution with its
+                    // native slot and exact owner. Preparation/Actor start is
+                    // earlier and cannot set this once-only, non-persisted fact.
+                    let _ = entered_at.set(chrono::Utc::now());
                     agent.execute(&mut owned_session, request.build()).await
                 })),
             )
