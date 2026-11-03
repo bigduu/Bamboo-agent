@@ -84,13 +84,6 @@ impl BudgetPort for TicketBudget<'_> {
             .as_ref()
             .ok_or(BudgetBlock::Unavailable)?;
         if let Some(record) = budget.reservations.get(&request.operation_id) {
-            if budget
-                .reservations
-                .values()
-                .any(|r| r.over_cap_usage.is_some())
-            {
-                return Err(BudgetBlock::Unavailable);
-            }
             request.observed_seq = record.request.observed_seq;
         }
         match self
@@ -101,6 +94,26 @@ impl BudgetPort for TicketBudget<'_> {
             WorkTokenAdmission::Reserved(record)
                 if record.usage.is_none() && record.over_cap_usage.is_none() =>
             {
+                // The ledger can return an existing accounting receipt before
+                // its new-reservation admission checks. Recheck one publication
+                // after that readback, including halts from other receipts.
+                let current = self
+                    .service
+                    .published()
+                    .map_err(|_| BudgetBlock::Unavailable)?
+                    .1;
+                if current.execution_facts_revision() != diagnostic.input.source_revision
+                    || current.execution_budget.as_ref().is_none_or(|budget| {
+                        budget.reservations.get(&request.operation_id) != Some(record.as_ref())
+                            || budget
+                                .reservations
+                                .values()
+                                .any(|r| r.over_cap_usage.is_some())
+                    })
+                    || self.clock.now_ms() >= diagnostic.deadline_ms
+                {
+                    return Err(BudgetBlock::Unavailable);
+                }
                 Ok(Reservation {
                     operation: diagnostic.operation.clone(),
                     request: Box::new(diagnostic.clone()),

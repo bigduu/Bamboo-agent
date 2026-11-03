@@ -1225,3 +1225,37 @@ fn real_ticket_budget_port_preserves_over_cap_finding_across_restart() {
     assert_eq!(ledger.daily_charged, 120);
     assert_eq!(ledger.work_charged[&fixture.scope.work_id], 120);
 }
+
+#[test]
+fn replay_receipt_that_expires_during_admission_keeps_the_original_charge() {
+    struct AdvancingClock(std::cell::Cell<u64>);
+    impl Clock for AdvancingClock {
+        fn now_ms(&self) -> u64 {
+            self.0.replace(1000)
+        }
+    }
+    let fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 120);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    let commit = fixture.service().published().unwrap().0;
+    budget.clock = &AdvancingClock(std::cell::Cell::new(101));
+    assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
+    assert_eq!(fixture.service().published().unwrap().0, commit);
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.total_charged, 120);
+    assert_eq!(ledger.reservations.len(), 1);
+    assert_eq!(
+        ledger.reservations.values().next().unwrap().receipt,
+        receipt.receipt
+    );
+}
