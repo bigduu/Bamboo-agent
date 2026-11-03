@@ -1,4 +1,4 @@
-//! Host-only patrol adapters. No worker action or provider call.
+//! Concrete Host adapters for scoped observations and staged patrol effects.
 
 mod checkpoint_record;
 mod checkpoint_store;
@@ -8,6 +8,7 @@ pub use evidence::*;
 mod notice_evidence;
 mod program;
 mod runtime_observation;
+mod semantic;
 mod status;
 pub use checkpoint_store::PatrolCheckpointStore;
 
@@ -16,6 +17,16 @@ use bamboo_orchestration::patrol::{host, Scope};
 use super::{Error, Principal, Result, TicketApplication};
 
 impl TicketApplication {
+    pub(in crate::app_state) fn bind_patrol_sources(
+        &self,
+        memory: bamboo_memory::memory_store::MemoryStore,
+        projects: std::sync::Arc<bamboo_projects::ProjectStore>,
+    ) {
+        let _ = self
+            .patrol_sources
+            .set(EvidenceSources { memory, projects });
+    }
+
     /// Prepare exactly one program observation after the existing live Host
     /// authority check. IDs/previous checkpoints cannot recreate a grant.
     pub async fn patrol_observation(&self, scope: &Scope) -> Result<host::TicketObservation> {

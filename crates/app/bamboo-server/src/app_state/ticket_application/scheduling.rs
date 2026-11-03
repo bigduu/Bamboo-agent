@@ -29,6 +29,20 @@ impl TicketApplication {
 
     pub(in crate::app_state) async fn shutdown_ready_worker(&self) {
         self.ready_scheduler.shutdown().await;
+        if let Err(error) = self.patrol_calls.quiesce().await {
+            tracing::warn!(?error, "Patrol calls did not quiesce");
+        }
+        if self.patrol_calls.needs_accounting() {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (service, authority) = self.authority(Principal::Runtime).await?;
+                self.reconcile_semantic_accounting(&service, &authority)
+                    .await
+            })
+            .await;
+        }
+        if self.patrol_calls.needs_accounting() {
+            tracing::warn!("Patrol shutdown left unsettled Work token reservations");
+        }
     }
 }
 

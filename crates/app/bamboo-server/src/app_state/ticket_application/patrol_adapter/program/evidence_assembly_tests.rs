@@ -30,6 +30,7 @@ struct Provider {
     calls: AtomicUsize,
     limit: usize,
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    write_path: Option<PathBuf>,
 }
 #[async_trait]
 impl LLMProvider for Provider {
@@ -43,17 +44,31 @@ impl LLMProvider for Provider {
         assert_eq!(model, "patrol-evidence-local");
         let call = self.calls.fetch_add(1, Ordering::SeqCst);
         assert!(call < self.limit, "observer cannot activate provider");
-        if let Some(gate) = &self.gate {
-            gate.acquire()
-                .await
-                .expect("controlled provider gate")
-                .forget();
+        if self.write_path.is_none() || call >= 2 {
+            if let Some(gate) = &self.gate {
+                gate.acquire()
+                    .await
+                    .expect("controlled provider gate")
+                    .forget();
+            }
         }
         assert!(tools.iter().any(|tool| tool.function.name == "Task"));
         let chunk = if call == 0 {
             LLMChunk::ToolCalls(vec![ToolCall { id:"evidence-task".into(),tool_type:"function".into(),function:FunctionCall {
             name:"Task".into(),arguments:json!({"tasks":[{"id":"bounded-result","content":"Produce one bounded result","status":"completed"}]}).to_string()
         }}])
+        } else if let Some(write_path) = self.write_path.as_ref().filter(|_| call == 1) {
+            assert!(tools.iter().any(|tool| tool.function.name == "Write"));
+            LLMChunk::ToolCalls(vec![ToolCall {
+                id: "evidence-write".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "Write".into(),
+                    arguments:
+                        json!({"file_path": write_path, "content": "verified native result"})
+                            .to_string(),
+                },
+            }])
         } else {
             LLMChunk::Token("The bounded native result awaits owner review.".into())
         };
@@ -65,17 +80,19 @@ impl LLMProvider for Provider {
 }
 
 async fn host(root: &Path, limit: usize) -> (crate::AppState, Arc<Provider>) {
-    host_with_gate(root, limit, None).await
+    host_with_gate(root, limit, None, None).await
 }
 async fn host_with_gate(
     root: &Path,
     limit: usize,
     gate: Option<Arc<tokio::sync::Semaphore>>,
+    write_path: Option<PathBuf>,
 ) -> (crate::AppState, Arc<Provider>) {
     let provider = Arc::new(Provider {
         calls: AtomicUsize::new(0),
         limit,
         gate,
+        write_path,
     });
     let mut config:Config=serde_json::from_value(json!({"provider":"openai","features":{"ticket_mutation":true,"ticket_dispatch":true},
         "providers":{"openai":{"api_key":"unused-controlled-fixture","model":"patrol-evidence-local"}},"run_budget":{"max_rounds":4},"subagents":{"max_concurrent":1}})).unwrap();
@@ -323,6 +340,7 @@ fn assert_source_negatives(
 async fn start_work(
     state: &crate::AppState,
     execution: bamboo_tickets::ExecutionWorkspace,
+    allowed_tools: BTreeSet<String>,
 ) -> (String, ProjectId) {
     let project = state.project_store.create("Evidence", None).unwrap();
     let project = state
@@ -344,7 +362,7 @@ async fn start_work(
         constraints: vec![],
         acceptance: vec!["Owner review".into()],
         user_acceptance_required: true,
-        allowed_tools: BTreeSet::from(["Task".into()]),
+        allowed_tools,
     };
     let create = service
         .prepare_command(
@@ -407,11 +425,333 @@ async fn start_work(
     );
     (work, project.id)
 }
+
+#[tokio::test]
+async fn ready_semantic_patrol_settles_native_workspace_progress() {
+    Box::pin(ready_semantic_fixture(SemanticCase::Known)).await;
+}
+
+#[tokio::test]
+async fn ready_semantic_patrol_keeps_unknown_charge_if_project_changes_before_send() {
+    Box::pin(ready_semantic_fixture(SemanticCase::ProjectChanged)).await;
+}
+
+#[tokio::test]
+async fn ready_semantic_patrol_retries_late_usage_against_the_original_receipt() {
+    Box::pin(ready_semantic_fixture(SemanticCase::LateUsage)).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SemanticCase {
+    Known,
+    ProjectChanged,
+    LateUsage,
+}
+
+async fn ready_semantic_fixture(case: SemanticCase) {
+    use bamboo_orchestration::{
+        patrol::ObservationPort, ReadyDispatch, ReadyWorkHost, ReadyWorkScheduler,
+    };
+    use bamboo_tickets::{
+        Authority, Command, DispatchSpec, ExecutionTokenUsage, FaultPoint, TicketService,
+        WorkTokenLimits,
+    };
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, Request, ResponseTemplate,
+    };
+
+    struct Host<'a>(&'a TicketApplication);
+    #[async_trait]
+    impl ReadyWorkHost for Host<'_> {
+        async fn authority(&self) -> Result<(Arc<TicketService>, Authority)> {
+            ReadyWorkHost::authority(self.0).await
+        }
+        async fn check_budget(&self, max_rounds: u32) -> Result<()> {
+            self.0.check_budget(max_rounds).await
+        }
+        async fn reconcile_program_patrol(
+            &self,
+            selection: &ProgramSelection<'_>,
+            fence: &ReadyAdmissionFence,
+        ) -> Result<()> {
+            Box::pin(self.0.reconcile_ready_patrol_with_policy(
+                selection,
+                fence,
+                Policy {
+                    // Exercise the production pass without a ten-minute wait
+                    // after the actual native Write and its success receipt.
+                    progress_timeout_ms: 1,
+                    check_interval_ms: 1,
+                    ..Policy::default()
+                },
+            ))
+            .await
+        }
+        async fn preflight(&self, command: &Command) -> Result<()> {
+            self.0.preflight(command).await
+        }
+        async fn ensure(
+            &self,
+            key: &str,
+            spec: &DispatchSpec,
+            rounds: u32,
+        ) -> Result<ReadyDispatch> {
+            ReadyWorkHost::ensure(self.0, key, spec, rounds).await
+        }
+        async fn dispatch(&self, command: &Command, rounds: u32) -> Result<ReadyDispatch> {
+            ReadyWorkHost::dispatch(self.0, command, rounds).await
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().canonicalize().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let result_path = data.join("worktree/native-result.txt");
+    let (state, agent) = Box::pin(host_with_gate(
+        &data,
+        3,
+        Some(gate.clone()),
+        Some(result_path.clone()),
+    ))
+    .await;
+    let (work, project) = Box::pin(start_work(
+        &state,
+        workspace(&data),
+        BTreeSet::from(["Task".into(), "Write".into()]),
+    ))
+    .await;
+    tokio::time::timeout(WAIT, async {
+        while agent.calls.load(Ordering::SeqCst) != 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&result_path).unwrap(),
+        "verified native result",
+    );
+
+    let (service, owner) = state.tickets.authority(owner()).await.unwrap();
+    service
+        .configure_work_token_budget(
+            &owner,
+            0,
+            WorkTokenLimits {
+                work_tokens: BTreeMap::from([(work.clone(), 8192)]),
+                utc_day_tokens: 8192,
+                total_tokens: 8192,
+            },
+        )
+        .unwrap();
+    let (_, runtime) = state.tickets.authority(Principal::Runtime).await.unwrap();
+    let snapshot = service.published().unwrap().1;
+    let assignment = snapshot.tickets[&work].active_assignment.as_ref().unwrap();
+    let scope = state
+        .tickets
+        .patrol_scope(project.as_str(), &work, assignment)
+        .await
+        .unwrap();
+    let observed = state
+        .tickets
+        .patrol_observation(&scope)
+        .await
+        .unwrap()
+        .observation(&scope, 0)
+        .unwrap();
+    assert!(observed.progress.is_some());
+    assert!(!observed.repeated_errors);
+
+    let provider = MockServer::start().await;
+    for (route, body) in [
+        (
+            "/v1/models",
+            json!({"data":[{"id":"gpt-oss-20b","owned_by":"llamacpp","meta":{"n_vocab":201088,"n_embd":2880,"n_params":20914790400u64}}]}),
+        ),
+        (
+            "/props",
+            json!({"model_alias":"gpt-oss-20b","default_generation_settings":{"n_ctx":8192}}),
+        ),
+    ] {
+        Mock::given(method("GET"))
+            .and(path(route))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&provider)
+            .await;
+    }
+    let projects = state.project_store.clone();
+    let change_project = case == SemanticCase::ProjectChanged;
+    Mock::given(method("POST"))
+        .and(path("/tokenize"))
+        .respond_with(move |_: &Request| {
+            if change_project {
+                let revision = projects.get_read_only(&project).unwrap().revision;
+                projects
+                    .update(&project, revision, |manifest| {
+                        manifest.name = "Changed while preparing the model call".into();
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"tokens":[200006,173781,200005,17196,200008,200002]}))
+        })
+        .expect(1)
+        .mount(&provider)
+        .await;
+
+    let generated = bamboo_llm::protocol::llama_cpp::GptOssPrompt::encode(
+        "",
+        r#"{"advice":"observe","evidence":[],"uncertain":true,"note":"Controlled result."}"#,
+    )
+    .unwrap();
+    let ids = generated.tokens();
+    let body = ids.iter().rposition(|&id| id == 200008).unwrap() + 1;
+    let end = ids.iter().rposition(|&id| id == 200007).unwrap();
+    let mut response = vec![200005, 17196, 200008];
+    response.extend_from_slice(&ids[body..end]);
+    response.push(200002);
+    let response_tokens = response.len() as u64;
+    let ledger_at_send = service.clone();
+    let runtime_at_send = runtime.clone();
+    let failed_publications = Arc::new(AtomicUsize::new(0));
+    let failure_probe = failed_publications.clone();
+    Mock::given(method("POST"))
+        .and(path("/completion"))
+        .respond_with(move |req: &Request| {
+            let ledger = ledger_at_send
+                .work_token_budget(&runtime_at_send)
+                .unwrap()
+                .unwrap();
+            assert_eq!(ledger.total_charged, 4224);
+            assert_eq!(ledger.reservations.len(), 1);
+            let original = ledger.reservations.values().next().unwrap();
+            assert!(original.usage.is_none());
+            if case == SemanticCase::LateUsage {
+                // Record the conservative outcome while the reply is in flight.
+                ledger_at_send
+                    .settle_work_tokens(
+                        &runtime_at_send,
+                        &original.request.operation_id,
+                        &original.request.request_hash,
+                        &original.receipt,
+                        ExecutionTokenUsage::Unknown,
+                    )
+                    .unwrap();
+                let failure_probe = failure_probe.clone();
+                ledger_at_send.set_publication_fault(Some(Arc::new(move |point| {
+                    if point == FaultPoint::BeforeHeadRename {
+                        failure_probe.fetch_add(1, Ordering::SeqCst);
+                        return Err(std::io::Error::other("controlled settlement write failure"));
+                    }
+                    Ok(())
+                })));
+            }
+            let body: Value = serde_json::from_slice(&req.body).unwrap();
+            let prompt = body["prompt"].as_array().unwrap();
+            assert!(prompt.iter().all(Value::is_u64));
+            ResponseTemplate::new(200).set_body_json(json!({
+                "model":"gpt-oss-20b","stop":true,"stop_type":"eos","truncated":false,
+                "tokens_evaluated":prompt.len(),"tokens_predicted":response.len(),"tokens":response
+            }))
+        })
+        .expect(u64::from(!change_project))
+        .mount(&provider)
+        .await;
+    let selection = serde_json::from_value(json!({
+        "provider": "patrol-local", "model": "gpt-oss-20b", "protocol": "llama_cpp_raw_v1",
+        "endpoint": provider.address().to_string(), "max_input_tokens":4096,"max_output_tokens":128,
+        "max_evidence_bytes":16384,"max_evidence_refs":8
+    }))
+    .unwrap();
+    state.config.write().await.patrol_model = Some(selection);
+    let host = Host(&state.tickets);
+    let scheduler = ReadyWorkScheduler::default();
+    let granted = policy(&snapshot, &scope);
+    let mut stale = granted.clone();
+    stale.grants[0].context_hash = "0".repeat(64);
+    scheduler.install(&host, stale).await.unwrap();
+    Box::pin(scheduler.reconcile(&host)).await.unwrap();
+    assert!(provider.received_requests().await.unwrap().is_empty());
+    assert!(service
+        .work_token_budget(&runtime)
+        .unwrap()
+        .unwrap()
+        .reservations
+        .is_empty());
+    scheduler.revoke().await;
+
+    scheduler.install(&host, granted).await.unwrap();
+    let mut ledger = tokio::time::timeout(WAIT, async {
+        loop {
+            Box::pin(scheduler.reconcile(&host)).await.unwrap();
+            let ledger = service.work_token_budget(&runtime).unwrap().unwrap();
+            let ready = match case {
+                SemanticCase::LateUsage => state.tickets.patrol_calls.needs_accounting(),
+                _ => ledger
+                    .reservations
+                    .values()
+                    .any(|record| record.usage.is_some()),
+            };
+            if ready {
+                break ledger;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if case == SemanticCase::LateUsage {
+        assert_eq!(ledger.total_charged, 4224);
+        assert_eq!(ledger.reservations.len(), 1);
+        assert!(failed_publications.load(Ordering::SeqCst) > 0);
+        let original = ledger.reservations.values().next().unwrap().clone();
+        assert_eq!(original.usage, Some(ExecutionTokenUsage::Unknown));
+        // The next Ready pass can finish accounting after model selection is
+        // removed, using the exact original receipt and no provider request.
+        state.config.write().await.patrol_model = None;
+        service.set_publication_fault(None);
+        Box::pin(scheduler.reconcile(&host)).await.unwrap();
+        assert!(!state.tickets.patrol_calls.needs_accounting());
+        ledger = service.work_token_budget(&runtime).unwrap().unwrap();
+        assert_eq!(ledger.reservations.len(), 1);
+        let reconciled = ledger.reservations.values().next().unwrap();
+        assert_eq!(reconciled.receipt, original.receipt);
+        assert_eq!(reconciled.request, original.request);
+    }
+    scheduler.revoke().await;
+    assert_eq!(ledger.reservations.len(), 1);
+    let receipt = ledger.reservations.values().next().unwrap();
+    assert_eq!(receipt.request.work_id, work);
+    let requests = provider.received_requests().await.unwrap();
+    if change_project {
+        assert_eq!(requests.len(), 3);
+        assert_eq!(ledger.total_charged, 4224);
+        assert_eq!(receipt.usage, Some(ExecutionTokenUsage::Unknown));
+    } else {
+        assert_eq!(requests.len(), 4);
+        let body: Value = serde_json::from_slice(&requests[3].body).unwrap();
+        let prompt_tokens = body["prompt"].as_array().unwrap().len() as u64;
+        assert_eq!(ledger.total_charged, prompt_tokens + response_tokens);
+        assert_eq!(
+            receipt.usage,
+            Some(ExecutionTokenUsage::Known {
+                input_tokens: prompt_tokens,
+                output_tokens: response_tokens,
+            })
+        );
+    }
+    assert_eq!(agent.calls.load(Ordering::SeqCst), 3);
+    gate.add_permits(1);
+    state.shutdown().await;
+}
+
 async fn seed(root: &Path) {
     let execution = workspace(root);
     let (state, provider) = host(root, 2).await;
-    let (work, project) = start_work(&state, execution).await;
-    let (service, authority) = state.tickets.authority(owner()).await.unwrap();
+    let (work, project) = start_work(&state, execution, BTreeSet::from(["Task".into()])).await;
+    let (service, _) = state.tickets.authority(owner()).await.unwrap();
     let snapshot = tokio::time::timeout(WAIT, async {
         loop {
             let snapshot = service.published().unwrap().1;
@@ -684,8 +1024,8 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
     let root = root.path().canonicalize().unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
     let execution = workspace(&root);
-    let (state, provider) = host_with_gate(&root, 1, Some(gate.clone())).await;
-    let (work, project) = start_work(&state, execution).await;
+    let (state, provider) = host_with_gate(&root, 1, Some(gate.clone()), None).await;
+    let (work, project) = start_work(&state, execution, BTreeSet::from(["Task".into()])).await;
     tokio::time::timeout(WAIT, async {
         while provider.calls.load(Ordering::SeqCst) != 1 {
             tokio::task::yield_now().await;

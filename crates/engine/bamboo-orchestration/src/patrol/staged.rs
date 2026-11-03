@@ -3,8 +3,18 @@
 
 use super::{
     Clock, DiagnosticInput, DiagnosticRequest, DiagnosticStatus, Error, Host, Model, Observation,
-    OperationId, Patrol, PortError, ReadOnlyDiagnosticProvider, Report, Reservation, Scope,
+    OperationId, Patrol, Phase, PortError, ReadOnlyDiagnosticProvider, Report, Reservation, Scope,
+    StoredCheckpoint,
 };
+
+pub fn has_semantic_debt(stored: Option<&StoredCheckpoint>) -> bool {
+    stored
+        .and_then(|stored| stored.checkpoint.incident.as_ref())
+        .is_some_and(|incident| {
+            matches!(incident.phase, Phase::Diagnosing { .. })
+                || incident.pending_settlement.is_some()
+        })
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputDemand {
@@ -36,6 +46,7 @@ pub enum Outcome {
     Complete {
         report: Report,
         submission: Option<Submission>,
+        reconciled: Option<Reconciled>,
     },
 }
 
@@ -43,9 +54,16 @@ pub enum Outcome {
 /// construct it. The outer transport consumes it after fresh Host admission.
 pub struct Submission(Reservation);
 
+/// The checkpoint or ledger now owns the observed usage for this operation.
+pub struct Reconciled(pub(super) OperationId);
+
 impl Submission {
     pub fn reservation(&self) -> &Reservation {
         &self.0
+    }
+
+    pub(super) fn into_reservation(self) -> Reservation {
+        self.0
     }
 }
 
@@ -100,6 +118,7 @@ impl Patrol {
         let mut provider = StatusOnly {
             model: self.model.as_ref(),
             status,
+            reconciled: None,
         };
         let report = self.tick_inner(scope, clock, host, &mut provider, Some(&mut stage))?;
         Ok(match stage.demand {
@@ -107,6 +126,7 @@ impl Patrol {
             None => Outcome::Complete {
                 report,
                 submission: stage.submission.map(Submission),
+                reconciled: provider.reconciled,
             },
         })
     }
@@ -115,6 +135,7 @@ impl Patrol {
 struct StatusOnly<'a, F> {
     model: Option<&'a Model>,
     status: F,
+    reconciled: Option<Reconciled>,
 }
 
 impl<F: FnMut(&OperationId) -> Result<DiagnosticStatus, PortError>> ReadOnlyDiagnosticProvider
@@ -130,6 +151,13 @@ impl<F: FnMut(&OperationId) -> Result<DiagnosticStatus, PortError>> ReadOnlyDiag
     }
 
     fn status(&mut self, operation: &OperationId) -> Result<DiagnosticStatus, PortError> {
-        (self.status)(operation)
+        let status = (self.status)(operation)?;
+        if matches!(
+            status,
+            DiagnosticStatus::Finished { .. } | DiagnosticStatus::Failed { .. }
+        ) {
+            self.reconciled = Some(Reconciled(operation.clone()));
+        }
+        Ok(status)
     }
 }

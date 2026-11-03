@@ -7,6 +7,7 @@
 //! All port calls happen outside Ticket locks. Concrete I/O adapters live in the Host.
 
 pub mod budget;
+pub mod calls;
 pub mod checkpoint;
 pub mod delivery;
 pub mod diagnostic_input;
@@ -226,7 +227,31 @@ pub enum Usage {
         input_tokens: u32,
         output_tokens: u32,
     },
+    /// An independently observed dimension exceeds its reserved ceiling.
+    /// Incomplete or inconsistent sibling counts cannot authorize a refund.
+    OverCap {
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    },
+    /// Checkpoint marker for the original live call. It is never ledger usage.
+    AwaitingProvider,
     Unknown,
+}
+
+impl Usage {
+    fn valid_for(&self, model: &Model) -> bool {
+        match *self {
+            Self::OverCap {
+                input_tokens,
+                output_tokens,
+            } => {
+                input_tokens.is_some_and(|input| input > u64::from(model.max_input_tokens))
+                    || output_tokens
+                        .is_some_and(|output| output > u64::from(model.max_output_tokens))
+            }
+            _ => true,
+        }
+    }
 }
 
 /// No wallet in patrol: this port uses the authoritative cumulative Work ledger.
@@ -530,14 +555,20 @@ impl Patrol {
         }
         cp.cursor = observation.cursor;
         cp.source_revision = observation.source_revision;
+        let staged_status = stage.is_some();
         // An active diagnosis has a reservation but no completed usage yet.
         // Only drain completed/legacy debt here, once per pass and with the
         // original receipt. A retry never authorizes another provider call.
         let retried_settlement = if let Some(incident) = cp.incident.as_mut() {
             if !matches!(incident.phase, Phase::Diagnosing { .. }) {
                 if let Some(reservation) = incident.pending_settlement.clone() {
-                    let usage = incident.pending_settlement_usage.unwrap_or(Usage::Unknown);
-                    settle_usage(incident, &reservation, usage, host);
+                    reconcile_usage_without_advice(
+                        incident,
+                        &reservation,
+                        host,
+                        provider,
+                        staged_status,
+                    );
                     true
                 } else {
                     false
@@ -559,7 +590,13 @@ impl Patrol {
                 // A late diagnostic can never change current Ticket facts. Unknown
                 // pending usage remains charged even when execution has recovered.
                 if let Phase::Diagnosing { reservation, .. } = incident.phase.clone() {
-                    settle_usage(incident, &reservation, Usage::Unknown, host);
+                    reconcile_usage_without_advice(
+                        incident,
+                        &reservation,
+                        host,
+                        provider,
+                        staged_status,
+                    );
                 }
                 incident.phase = Phase::Resolved {
                     at_ms: now,
@@ -633,7 +670,13 @@ impl Patrol {
         // regardless of an earlier semantic diagnosis or expected wait.
         if observation.execution_unknown && incident.escalation.is_none() {
             if let Phase::Diagnosing { reservation, .. } = incident.phase.clone() {
-                settle_usage(&mut incident, &reservation, Usage::Unknown, host);
+                reconcile_usage_without_advice(
+                    &mut incident,
+                    &reservation,
+                    host,
+                    provider,
+                    staged_status,
+                );
             }
             incident.phase = Phase::Blocked(Block::UnknownUsage);
             escalate(
@@ -646,7 +689,14 @@ impl Patrol {
         if !retried_settlement && incident.escalation.is_none() {
             match incident.phase.clone() {
                 Phase::Diagnosing { .. } => {
-                    self.reconcile_diagnostic(&mut incident, &observation, now, host, provider)?;
+                    self.reconcile_diagnostic(
+                        &mut incident,
+                        &observation,
+                        now,
+                        host,
+                        provider,
+                        staged_status,
+                    )?;
                 }
                 Phase::Blocked(_) | Phase::Resolved { .. } => {}
                 Phase::Cooldown { until_ms } if now < until_ms => {}
@@ -903,6 +953,7 @@ impl Patrol {
         now: u64,
         host: &mut dyn Host,
         provider: &mut dyn ReadOnlyDiagnosticProvider,
+        staged_status: bool,
     ) -> Result<(), Error> {
         let Phase::Diagnosing {
             request,
@@ -912,7 +963,7 @@ impl Patrol {
             return Err(Error::InvalidCheckpoint);
         };
         if now >= request.deadline_ms {
-            settle_usage(incident, &reservation, Usage::Unknown, host);
+            reconcile_usage_without_advice(incident, &reservation, host, provider, staged_status);
             incident.phase = Phase::Blocked(Block::SessionTimeout);
             escalate(incident, SupervisorReason::DiagnosticTimeout, o, now);
             return Ok(());
@@ -924,15 +975,17 @@ impl Patrol {
                     request.model.model.as_str(),
                 )
         {
-            settle_usage(incident, &reservation, Usage::Unknown, host);
+            reconcile_usage_without_advice(incident, &reservation, host, provider, staged_status);
             incident.phase = Phase::Blocked(Block::Provider);
             escalate(incident, SupervisorReason::DiagnosticUnavailable, o, now);
             return Ok(());
         }
-        match provider
-            .status(&request.operation)
-            .unwrap_or(DiagnosticStatus::OutcomeUnknown)
-        {
+        let status = match provider.status(&request.operation) {
+            Ok(status) => status,
+            Err(_) if staged_status => DiagnosticStatus::Pending,
+            Err(_) => DiagnosticStatus::OutcomeUnknown,
+        };
+        match status {
             DiagnosticStatus::Pending => {}
             DiagnosticStatus::Finished { diagnosis, usage } => {
                 let usage_valid = matches!(usage, Usage::Known { input_tokens, output_tokens }
@@ -1001,10 +1054,43 @@ fn settle_usage(
     usage: Usage,
     host: &mut dyn Host,
 ) -> bool {
+    let usage = if usage == Usage::AwaitingProvider || !usage.valid_for(&reservation.request.model)
+    {
+        Usage::Unknown
+    } else {
+        usage
+    };
     let settled = host.settle(reservation, usage).is_ok();
     incident.pending_settlement = (!settled).then(|| reservation.clone());
     incident.pending_settlement_usage = (!settled).then_some(usage);
     settled
+}
+
+fn reconcile_usage_without_advice(
+    incident: &mut Incident,
+    reservation: &Reservation,
+    host: &mut dyn Host,
+    provider: &mut dyn ReadOnlyDiagnosticProvider,
+    staged_status: bool,
+) {
+    let usage = match incident.pending_settlement_usage {
+        Some(Usage::AwaitingProvider) if !staged_status => return,
+        Some(usage) if usage != Usage::AwaitingProvider => usage,
+        None if !matches!(incident.phase, Phase::Diagnosing { .. }) => Usage::Unknown,
+        _ if staged_status => match provider.status(&reservation.operation) {
+            Ok(DiagnosticStatus::Pending) | Err(_) => {
+                incident.pending_settlement = Some(reservation.clone());
+                incident.pending_settlement_usage = Some(Usage::AwaitingProvider);
+                return;
+            }
+            Ok(DiagnosticStatus::Finished { usage, .. } | DiagnosticStatus::Failed { usage }) => {
+                usage
+            }
+            Ok(DiagnosticStatus::OutcomeUnknown) => Usage::Unknown,
+        },
+        _ => Usage::Unknown,
+    };
+    settle_usage(incident, reservation, usage, host);
 }
 fn valid_scope(scope: &Scope) -> bool {
     valid_id(&scope.project_id)
@@ -1039,8 +1125,12 @@ fn validate_checkpoint(cp: &Checkpoint, scope: &Scope) -> Result<(), Error> {
                 || r.request.input.scope != *scope
                 || !valid_id(&r.receipt)
         })
-        || (i.pending_settlement_usage.is_some()
-            && (i.pending_settlement.is_none() || matches!(i.phase, Phase::Diagnosing { .. })))
+        || i.pending_settlement_usage.is_some_and(|usage| {
+            matches!(i.phase, Phase::Diagnosing { .. })
+                || i.pending_settlement
+                    .as_ref()
+                    .is_none_or(|r| !usage.valid_for(&r.request.model))
+        })
         || i.last_diagnosis.as_ref().is_some_and(|r| {
             !diagnostic_operation(&r.operation)
                 || r.source_revision > cp.source_revision
