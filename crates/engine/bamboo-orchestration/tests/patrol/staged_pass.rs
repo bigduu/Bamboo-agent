@@ -69,13 +69,16 @@ fn staged_input_is_deferred_and_fenced_before_reservation() {
     assert_eq!(host.usage(), 0);
 
     let input = prepared(&mut host, current);
+    // Renewal alone can change while Host I/O runs. It carries no new
+    // evidence revision and does not invalidate the exact prepared input.
+    host.observation.heartbeat_at_ms = Some(102);
     let Outcome::Complete {
         report,
         submission: Some(submission),
     } = patrol
         .tick_staged(
             &scope(),
-            &FakeClock(101),
+            &FakeClock(102),
             &mut host,
             Some(input),
             no_prior_call,
@@ -102,7 +105,7 @@ fn staged_input_is_deferred_and_fenced_before_reservation() {
         .ends_with(&["observe", "reserve", "save", "save"]));
 
     let Outcome::Complete { report, submission } = patrol
-        .tick_staged(&scope(), &FakeClock(102), &mut host, None, |operation| {
+        .tick_staged(&scope(), &FakeClock(103), &mut host, None, |operation| {
             assert_eq!(operation, &reservation.operation);
             Ok(DiagnosticStatus::Finished {
                 diagnosis: Diagnosis {

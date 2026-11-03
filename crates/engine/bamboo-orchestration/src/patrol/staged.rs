@@ -13,6 +13,17 @@ pub struct InputDemand {
     pub since_cursor: u64,
 }
 
+impl InputDemand {
+    fn same_evidence(&self, current: &Self) -> bool {
+        self.model == current.model
+            && self.since_cursor == current.since_cursor
+            && self.through.scope == current.through.scope
+            && self.through.cursor == current.through.cursor
+            && self.through.source_revision == current.through.source_revision
+            && self.through.evidence_revision == current.through.evidence_revision
+    }
+}
+
 /// Input or definite failure bound to a specific previous demand. A mismatched
 /// demand is discarded before the budget or journal can be touched.
 pub struct PreparedInput {
@@ -57,7 +68,7 @@ impl Stage {
             since_cursor,
         };
         match self.prepared.take() {
-            Some(prepared) if prepared.demand == demand => Some(prepared.result),
+            Some(prepared) if prepared.demand.same_evidence(&demand) => Some(prepared.result),
             _ => {
                 self.demand = Some(demand);
                 None
