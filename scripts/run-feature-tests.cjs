@@ -136,7 +136,8 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2522 keeps patrol prompt and tokenizer tests in their existing default
 // owners. The Model Policy projection and Host evidence fixture use the
 // config and server-app-state owners. All additive cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "0da664351f1a7d5cf24f2d5c0ba679b3c13efe26c0e5f95b66a556d7068ecb6a";
+// Its patrol bounds regression extends the existing config/packages-4 case.
+const FEATURE_SOURCE_SHA256 = "0aaad8128d2df8464509f1601fb3b830eb906ab2949d11dc14ab3a5c9471371d";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
