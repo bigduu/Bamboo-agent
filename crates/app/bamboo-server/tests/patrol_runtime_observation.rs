@@ -222,13 +222,29 @@ async fn seed(root: &Path) {
         .patrol_scope(project.id.as_str(), &work, &assignment)
         .await
         .unwrap();
+    let receipt = snapshot.assignments[&assignment].runtime.as_ref().unwrap();
+    let child = state
+        .storage
+        .load_runtime_control_plane(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        while state
+            .spawn_scheduler
+            .native_task_liveness(&child.id, &receipt.run_id, child.created_at)
+            .and_then(|live| live.heartbeat_at_ms())
+            .is_none()
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the held provider allows a real native renewal before yielding the Question");
     let mut live = state.tickets.patrol_observation(&scope).await.unwrap();
     let entered = live.observation(&scope, 0).unwrap();
-    assert!(
-        entered.started_at_ms.is_some(),
-        "actual provider gate has a live Engine entry witness"
-    );
-    assert_eq!(entered.heartbeat_at_ms, None);
+    assert!(entered.started_at_ms.is_some());
+    assert!(entered.heartbeat_at_ms.is_some());
     assert_eq!(entered.progress, None);
     let mut checkpoints = state.tickets.open_patrol_checkpoints(&scope).await.unwrap();
     let program = ProgramPatrol::new(Policy::default()).unwrap();

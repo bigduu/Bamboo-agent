@@ -75,6 +75,25 @@ fn live_runtime_facts_require_current_scope_receipt_and_preserve_wait_api() {
     assert_eq!(observed.started_at_ms, Some(5));
     assert_eq!(observed.heartbeat_at_ms, None);
     assert_eq!(observed.progress, None);
+    let read_heartbeat = |facts: &host::RuntimeFacts, at| {
+        host::read_observation_with_runtime_heartbeat(
+            fixture.service(),
+            &fixture.runtime(),
+            &fixture.scope,
+            facts,
+            Some(at),
+            &Policy::default(),
+        )
+    };
+    let heartbeat = read_heartbeat(&facts, 6)
+        .unwrap()
+        .observation(&fixture.scope, 0)
+        .unwrap();
+    assert_eq!(heartbeat.heartbeat_at_ms, Some(6));
+    assert_eq!(heartbeat.progress, None);
+    assert!(matches!(read_heartbeat(&facts, 4), Err(PortError::Denied)));
+    facts.started_at_ms = None;
+    assert!(matches!(read_heartbeat(&facts, 6), Err(PortError::Denied)));
     facts.started_at_ms = Some(0);
     assert!(matches!(read(&facts), Err(PortError::Denied)));
     facts.started_at_ms = Some(5);

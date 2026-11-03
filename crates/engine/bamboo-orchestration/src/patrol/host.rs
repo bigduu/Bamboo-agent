@@ -25,9 +25,8 @@ pub struct RuntimeObservation {
     pub wait: RuntimeWait,
 }
 
-/// Fresh Host facts, not a grant or durable runtime history. A live Task-entry
-/// sample supplies only start time; heartbeat and progress remain independent.
-/// The original wait-only RuntimeObservation API remains source-compatible.
+/// Fresh Host start and wait facts. Heartbeat is supplied separately by callers
+/// that can prove a successful native renewal. These facts carry no grant.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeFacts {
     pub scope: Scope,
@@ -187,8 +186,7 @@ pub fn read_observation(
     })
 }
 
-/// Join a verified runtime sample to fresh ledger authority. Missing heartbeat
-/// and meaningful-progress producers deliberately remain None.
+/// Join a verified wait to fresh ledger authority.
 pub fn read_observation_with_runtime(
     service: &TicketService,
     authority: &Authority,
@@ -218,11 +216,27 @@ pub fn read_observation_with_runtime_facts(
     runtime: &RuntimeFacts,
     policy: &Policy,
 ) -> Result<TicketObservation, PortError> {
+    read_observation_with_runtime_heartbeat(service, authority, scope, runtime, None, policy)
+}
+
+/// Join a confirmed native heartbeat to the same current Scope and receipt as
+/// the Task entry. A heartbeat supplies no meaningful-progress measurement.
+pub fn read_observation_with_runtime_heartbeat(
+    service: &TicketService,
+    authority: &Authority,
+    scope: &Scope,
+    runtime: &RuntimeFacts,
+    heartbeat_at_ms: Option<u64>,
+    policy: &Policy,
+) -> Result<TicketObservation, PortError> {
     let (commit, snapshot) = checked_snapshot(service, authority, &scope.work_id)?;
     if runtime.scope != *scope || runtime.source_commit != commit {
         return Err(PortError::Conflict);
     }
-    if runtime.started_at_ms == Some(0) {
+    if runtime.started_at_ms == Some(0)
+        || heartbeat_at_ms
+            .is_some_and(|heartbeat| runtime.started_at_ms.is_none_or(|start| heartbeat < start))
+    {
         return Err(PortError::Denied);
     }
     let mut observation = project(&snapshot, scope)?;
@@ -232,6 +246,7 @@ pub fn read_observation_with_runtime_facts(
     }
     if !observation.execution_unknown && !observation.terminal {
         observation.started_at_ms = runtime.started_at_ms;
+        observation.heartbeat_at_ms = heartbeat_at_ms;
         if let Some(wait) = &runtime.wait {
             match wait.kind {
                 WaitKind::User => {

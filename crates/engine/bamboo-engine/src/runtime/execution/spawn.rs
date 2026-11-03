@@ -209,6 +209,24 @@ impl NativeTaskStart {
     }
 }
 
+/// A heartbeat is a successful renewal attempted after this exact Task entered.
+/// It measures owner liveness independently of the Task's progress.
+#[derive(Clone, Debug)]
+pub struct NativeTaskLiveness {
+    pub start: NativeTaskStart,
+    pub renewal_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl NativeTaskLiveness {
+    pub fn heartbeat_at_ms(&self) -> Option<u64> {
+        let at = self.renewal_started_at?;
+        if at < self.start.entered_at || at > chrono::Utc::now() {
+            return None;
+        }
+        at.timestamp_millis().try_into().ok()
+    }
+}
+
 /// External child session runtimes emit events and respect the cancel token.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
@@ -221,6 +239,20 @@ pub trait ExternalChildRunner: Send + Sync {
         _child_birth: chrono::DateTime<chrono::Utc>,
     ) -> Option<NativeTaskStart> {
         None
+    }
+
+    /// Read the current native owner and its last acknowledged renewal.
+    fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskLiveness> {
+        self.native_task_start(session_id, run_id, child_birth)
+            .map(|start| NativeTaskLiveness {
+                start,
+                renewal_started_at: None,
+            })
     }
 
     /// Capability of the actually assembled backend, independent of hot config.
@@ -439,6 +471,17 @@ impl SpawnScheduler {
         self.ctx
             .external_child_runner
             .native_task_start(session_id, run_id, child_birth)
+    }
+
+    pub fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskLiveness> {
+        self.ctx
+            .external_child_runner
+            .native_task_liveness(session_id, run_id, child_birth)
     }
 
     pub fn supports_native_ticket_budget(&self) -> bool {
