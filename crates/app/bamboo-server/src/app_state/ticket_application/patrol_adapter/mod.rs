@@ -3,6 +3,8 @@
 mod checkpoint_record;
 mod checkpoint_store;
 mod delivery;
+mod evidence;
+pub use evidence::*;
 mod notice_evidence;
 mod program;
 mod runtime_observation;
