@@ -59,13 +59,11 @@ impl BudgetPort for TicketBudget<'_> {
         let observation = source
             .observation(scope, 0)
             .map_err(|_| BudgetBlock::Unavailable)?;
-        let now = self.clock.now_ms();
         if observation.terminal
             || observation.execution_unknown
             || diagnostic.input.source_revision != observation.source_revision
             || diagnostic.input.through_cursor > observation.cursor
             || diagnostic.input.since_cursor > diagnostic.input.through_cursor
-            || now >= diagnostic.deadline_ms
         {
             return Err(BudgetBlock::Unavailable);
         }
@@ -74,7 +72,10 @@ impl BudgetPort for TicketBudget<'_> {
             .published()
             .map_err(|_| BudgetBlock::Unavailable)?
             .1;
-        if snapshot.execution_facts_revision() != diagnostic.input.source_revision {
+        let now = self.clock.now_ms();
+        if snapshot.execution_facts_revision() != diagnostic.input.source_revision
+            || now >= diagnostic.deadline_ms
+        {
             return Err(BudgetBlock::Unavailable);
         }
         let mut request =

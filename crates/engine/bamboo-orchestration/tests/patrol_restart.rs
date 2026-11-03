@@ -1244,7 +1244,8 @@ fn replay_receipt_that_expires_during_admission_keeps_the_original_charge() {
     };
     let receipt = budget.reserve(&request).unwrap();
     let commit = fixture.service().published().unwrap().0;
-    budget.clock = &AdvancingClock(std::cell::Cell::new(101));
+    let clock = AdvancingClock(std::cell::Cell::new(101));
+    budget.clock = &clock;
     assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
     assert_eq!(fixture.service().published().unwrap().0, commit);
     let ledger = fixture
@@ -1258,4 +1259,62 @@ fn replay_receipt_that_expires_during_admission_keeps_the_original_charge() {
         ledger.reservations.values().next().unwrap().receipt,
         receipt.receipt
     );
+}
+
+#[test]
+fn a_concurrent_accounting_halt_fences_an_unsettled_receipt_replay() {
+    struct ClockWithHook<F>(std::cell::Cell<Option<F>>);
+    impl<F: FnOnce()> Clock for ClockWithHook<F> {
+        fn now_ms(&self) -> u64 {
+            if let Some(publish) = self.0.take() {
+                publish();
+            }
+            101
+        }
+    }
+    let fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 360);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let original = budget.reserve(&request).unwrap();
+    let mut other = request.clone();
+    other.operation.kind = OperationKind::Diagnostic(2);
+    let exceeded = budget.reserve(&other).unwrap();
+    let clock = ClockWithHook(std::cell::Cell::new(Some(|| {
+        budget
+            .settle(
+                &exceeded,
+                Usage::Known {
+                    input_tokens: 10,
+                    output_tokens: 21,
+                },
+            )
+            .unwrap();
+    })));
+    let mut replay = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &clock,
+    };
+    assert_eq!(replay.reserve(&request), Err(BudgetBlock::Unavailable));
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.total_charged, 240);
+    assert_eq!(ledger.reservations.len(), 2);
+    assert!(ledger.reservations.values().any(|record| {
+        record.receipt == original.receipt
+            && record.usage.is_none()
+            && record.over_cap_usage.is_none()
+    }));
+    assert!(ledger
+        .reservations
+        .values()
+        .any(|record| { record.receipt == exceeded.receipt && record.over_cap_usage.is_some() }));
 }
