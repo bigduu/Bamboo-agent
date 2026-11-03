@@ -30,6 +30,7 @@ impl PreparedRuntimeFacts {
         authority: &Authority,
         scope: &Scope,
         policy: &Policy,
+        heartbeat_cutoff_ms: Option<u64>,
     ) -> std::result::Result<host::TicketObservation, PortError> {
         // A batch may await another Scope or journal open after preparation.
         // Re-read the same Task instance at projection. Heartbeat can advance
@@ -46,12 +47,15 @@ impl PreparedRuntimeFacts {
                 started_at_ms: None,
                 ..self.facts.clone()
             });
+        let heartbeat_at_ms = live
+            .and_then(|live| live.heartbeat_at_ms())
+            .filter(|at| heartbeat_cutoff_ms.is_none_or(|cutoff| *at <= cutoff));
         host::read_observation_with_runtime_heartbeat(
             service,
             authority,
             scope,
             without_start.as_ref().unwrap_or(&self.facts),
-            live.and_then(|live| live.heartbeat_at_ms()),
+            heartbeat_at_ms,
             policy,
         )
     }

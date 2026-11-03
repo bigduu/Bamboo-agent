@@ -20,6 +20,45 @@ const WAIT: Duration = Duration::from_secs(15);
 mod owned_bash_publication;
 mod writer_lifecycle;
 
+#[tokio::test]
+async fn renewal_crossing_entry_and_failed_renewal_do_not_publish_heartbeat() {
+    let signals = LiveTaskSignals::default();
+    let (acknowledge, acknowledged) = oneshot::channel();
+    let queued = signals.observe_renewal(|_| async {
+        acknowledged.await.unwrap();
+        Ok(())
+    });
+    tokio::pin!(queued);
+    assert!(futures::poll!(&mut queued).is_pending());
+    signals.entered_at.set(chrono::Utc::now()).unwrap();
+    acknowledge.send(()).unwrap();
+    queued.await.unwrap();
+    assert!(lock(&signals.renewal_started_at).is_none());
+
+    let failed = || {
+        signals.observe_renewal(|_| async {
+            Err::<(), _>(ActorDirectoryError::Storage(
+                "controlled renewal failure".into(),
+            ))
+        })
+    };
+    assert!(matches!(
+        failed().await,
+        Err(ActorDirectoryError::Storage(_))
+    ));
+    assert!(lock(&signals.renewal_started_at).is_none());
+    let confirmed = signals
+        .observe_renewal(|now| async move { Ok(now) })
+        .await
+        .unwrap();
+    assert_eq!(*lock(&signals.renewal_started_at), Some(confirmed));
+    assert!(matches!(
+        failed().await,
+        Err(ActorDirectoryError::Storage(_))
+    ));
+    assert_eq!(*lock(&signals.renewal_started_at), Some(confirmed));
+}
+
 struct EmptyTools;
 #[async_trait]
 impl ToolExecutor for EmptyTools {

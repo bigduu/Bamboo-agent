@@ -29,6 +29,7 @@ impl TicketApplication {
                     &authority,
                     scope,
                     &bamboo_orchestration::patrol::Policy::default(),
+                    None,
                 )
                 .map_err(patrol_error);
         }

@@ -92,8 +92,10 @@ execution instance. Reopening a Host cannot reconstruct it from a lease.
 
 Host preparation fences the immutable Task entry. At projection the program
 re-reads the heartbeat of the same instance, so an intervening renewal can
-advance the sample. Closure or replacement clears live start and heartbeat
-while preserving independent wait evidence and the original Ticket fences.
+advance the sample. The Ready pass has a fixed clock. A heartbeat later than
+that pass's cutoff is unavailable for that pass. Closure or replacement clears
+live start and heartbeat while preserving independent wait evidence and the
+original Ticket fences.
 
 Meaningful progress remains `None`. A fresh heartbeat with unknown progress
 still yields `EvidenceUnknown`. A measured stale heartbeat can yield
