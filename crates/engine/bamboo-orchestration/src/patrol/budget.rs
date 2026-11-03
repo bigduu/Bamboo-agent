@@ -3,7 +3,8 @@
 //! each pass; an Authority value cached across a revoke is not a live grant.
 use bamboo_tickets::{
     Authority, ExecutionBudgetPurpose, ExecutionTokenOverCapUsage, ExecutionTokenUsage, Health,
-    TicketService, WorkTokenAdmission, WorkTokenAttempt, WorkTokenBlock, WorkTokenRequest,
+    Principal, TicketService, WorkTokenAdmission, WorkTokenAttempt, WorkTokenBlock,
+    WorkTokenRequest,
 };
 
 use super::{
@@ -15,6 +16,75 @@ pub struct TicketBudget<'a> {
     pub service: &'a TicketService,
     pub authority: &'a Authority,
     pub clock: &'a dyn Clock,
+}
+
+impl TicketBudget<'_> {
+    /// Fresh, read-only fence immediately before an external submit. It never
+    /// creates another reservation and does not treat a stored receipt as a
+    /// grant. The caller also owns its live Host policy/configuration fence.
+    pub fn confirm_submission(&self, reservation: &Reservation) -> Result<(), PortError> {
+        let diagnostic = &reservation.request;
+        if !matches!(self.authority.principal(), Principal::Runtime)
+            || reservation.operation != diagnostic.operation
+        {
+            return Err(PortError::Denied);
+        }
+        let scope = &reservation.operation.incident.scope;
+        let observation =
+            host::read_observation(self.service, self.authority, scope)?.observation(scope, 0)?;
+        if observation.execution_unknown
+            || observation.terminal
+            || diagnostic.input.source_revision != observation.source_revision
+            || diagnostic.input.through_cursor > observation.cursor
+            || diagnostic.input.since_cursor > diagnostic.input.through_cursor
+        {
+            return Err(PortError::Denied);
+        }
+        let identity = request(diagnostic, 0)?;
+        let (_, current) = self.service.published().map_err(host::ticket_error)?;
+        let ledger = current.execution_budget.as_ref().ok_or(PortError::Denied)?;
+        let record = ledger
+            .reservations
+            .get(&identity.operation_id)
+            .ok_or(PortError::Denied)?;
+        if current.execution_facts_revision() != diagnostic.input.source_revision
+            || record.request != request(diagnostic, record.request.observed_seq)?
+            || record.receipt != reservation.receipt
+            || record.usage.is_some()
+            || ledger
+                .reservations
+                .values()
+                .any(|record| record.over_cap_usage.is_some())
+            || self.clock.now_ms() >= diagnostic.deadline_ms
+            || self.service.health() != Health::Writable
+        {
+            return Err(PortError::Denied);
+        }
+        Ok(())
+    }
+
+    fn report_over_cap(
+        &self,
+        reservation: &Reservation,
+        request: &WorkTokenRequest,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> Result<(), PortError> {
+        self.service
+            .report_work_token_over_cap(
+                self.authority,
+                &request.operation_id,
+                &request.request_hash,
+                &reservation.receipt,
+                ExecutionTokenOverCapUsage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: None,
+                },
+            )
+            .map(|_| ())
+            .map_err(host::ticket_error)
+    }
 }
 
 fn request(request: &DiagnosticRequest, observed_seq: u64) -> Result<WorkTokenRequest, PortError> {
@@ -159,6 +229,12 @@ impl BudgetPort for TicketBudget<'_> {
         // for this binding may settle its old receipt after restart/Submitted/
         // generation changes, without granting another provider admission.
         let usage = match usage {
+            Usage::OverCap {
+                input_tokens,
+                output_tokens,
+            } => {
+                return self.report_over_cap(reservation, &request, input_tokens, output_tokens);
+            }
             Usage::Known {
                 input_tokens,
                 output_tokens,
@@ -167,21 +243,12 @@ impl BudgetPort for TicketBudget<'_> {
                 .model
                 .exceeds_token_caps(input_tokens, output_tokens) =>
             {
-                return self
-                    .service
-                    .report_work_token_over_cap(
-                        self.authority,
-                        &request.operation_id,
-                        &request.request_hash,
-                        &reservation.receipt,
-                        ExecutionTokenOverCapUsage {
-                            input_tokens: Some(u64::from(input_tokens)),
-                            output_tokens: Some(u64::from(output_tokens)),
-                            total_tokens: None,
-                        },
-                    )
-                    .map(|_| ())
-                    .map_err(host::ticket_error);
+                return self.report_over_cap(
+                    reservation,
+                    &request,
+                    Some(u64::from(input_tokens)),
+                    Some(u64::from(output_tokens)),
+                );
             }
             Usage::Known {
                 input_tokens,
@@ -191,6 +258,7 @@ impl BudgetPort for TicketBudget<'_> {
                 output_tokens: u64::from(output_tokens),
             },
             Usage::Unknown => ExecutionTokenUsage::Unknown,
+            Usage::AwaitingProvider => return Err(PortError::Denied),
         };
         self.service
             .settle_work_tokens(
