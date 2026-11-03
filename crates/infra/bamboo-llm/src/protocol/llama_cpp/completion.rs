@@ -44,10 +44,14 @@ pub struct GptOssCompletion {
 pub struct CompletionUsage {
     pub input_tokens: Option<u64>,
     pub output_tokens: Option<u64>,
+    output_exact: bool,
 }
 
 impl CompletionUsage {
     pub fn known(&self) -> Option<TokenUsage> {
+        if !self.output_exact {
+            return None;
+        }
         let (prompt_tokens, completion_tokens) = (self.input_tokens?, self.output_tokens?);
         Some(TokenUsage {
             prompt_tokens,
@@ -195,12 +199,24 @@ impl PreparedCompletion {
         if completion.model != MODEL || !completion.stop {
             return Err(CompletionError::InvalidResponse);
         }
+        let tokens: Option<Vec<u32>> = serde_json::from_value(completion.tokens).ok();
+        let emitted = tokens.as_ref().map(|tokens| tokens.len() as u64);
+        let reported = completion.tokens_predicted.as_u64();
+        let exact_output =
+            reported.filter(|&reported| emitted.is_none_or(|emitted| emitted == reported));
         let usage = CompletionUsage {
             input_tokens: completion
                 .tokens_evaluated
                 .as_u64()
                 .filter(|&input| input >= u64::from(self.input_tokens)),
-            output_tokens: completion.tokens_predicted.as_u64(),
+            output_tokens: exact_output.or_else(|| {
+                reported
+                    .into_iter()
+                    .chain(emitted)
+                    .max()
+                    .filter(|&count| count > u64::from(self.max_output_tokens))
+            }),
+            output_exact: exact_output.is_some(),
         };
         let final_text = match usage.known() {
             Some(counts)
@@ -209,10 +225,7 @@ impl PreparedCompletion {
                     && completion.stop_type.as_str() == Some("eos")
                     && completion.truncated.as_bool() == Some(false) =>
             {
-                let tokens: Option<Vec<u32>> = serde_json::from_value(completion.tokens).ok();
-                tokens
-                    .filter(|tokens| tokens.len() as u64 == counts.completion_tokens)
-                    .and_then(|tokens| decode_final(&tokens))
+                tokens.and_then(|tokens| decode_final(&tokens))
             }
             _ => None,
         };

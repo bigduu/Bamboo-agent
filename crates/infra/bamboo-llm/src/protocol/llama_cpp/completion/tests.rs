@@ -155,17 +155,15 @@ async fn unbounded_duration_is_rejected_before_network_submission() {
 async fn advisory_output_and_accounting_are_validated_independently() {
     let prompt = GptOssPrompt::encode("Return JSON.", "Work evidence").unwrap();
     let normal = answer(&prompt, &final_answer("{}"));
+    let mut tool_attempt = final_answer("{}");
+    *tool_attempt.last_mut().unwrap() = 200_012;
     for (key, value, known, expected_count) in [
         ("tokens", json!("invalid frame"), true, None),
-        (
-            "tokens",
-            json!([CHANNEL, 17_196, MESSAGE, 200_012]),
-            true,
-            None,
-        ),
+        ("tokens", json!(tool_attempt), true, None),
         ("tokens_predicted", Value::Null, false, None),
+        ("tokens_predicted", json!(0), false, None),
         ("tokens_evaluated", json!(1), false, None),
-        ("tokens_predicted", json!(129), true, Some(129)),
+        ("tokens_predicted", json!(129), false, Some(129)),
         ("truncated", json!(true), true, None),
         ("stop_type", json!("limit"), true, None),
     ] {
