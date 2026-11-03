@@ -516,6 +516,11 @@ impl Agent {
                 data_dir.clone(),
                 provider_name.clone(),
             )),
+            hook_runner: Arc::new(
+                self.runtime
+                    .hook_runner
+                    .with_lifecycle_config(&config.lifecycle_hooks, data_dir.clone()),
+            ),
             app_data_dir: data_dir,
             ..Default::default()
         };

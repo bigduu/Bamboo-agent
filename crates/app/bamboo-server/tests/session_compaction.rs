@@ -19,6 +19,7 @@ const PROVIDER: &str = "compact-fixture";
 const CHAT: &str = "compact-chat";
 const SUMMARY: &str = "compact-summary";
 const WINDOW: u32 = 256_000;
+const HOOK_INSTRUCTION: &str = "Retain the synthetic compaction fixture marker";
 const ID: &str = "compact-ordinary";
 const ENDPOINT: &str = "/api/v1/sessions/compact-ordinary/compact";
 
@@ -26,6 +27,7 @@ const ENDPOINT: &str = "/api/v1/sessions/compact-ordinary/compact";
 struct SummaryOnly {
     summaries: AtomicUsize,
     chat_turns: AtomicUsize,
+    hook_instruction_seen: AtomicBool,
     fail_once: AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
@@ -35,7 +37,7 @@ struct SummaryOnly {
 impl LLMProvider for SummaryOnly {
     async fn chat_stream(
         &self,
-        _messages: &[Message],
+        messages: &[Message],
         _tools: &[ToolSchema],
         _max_tokens: Option<u32>,
         model: &str,
@@ -45,6 +47,12 @@ impl LLMProvider for SummaryOnly {
             return Err(LLMError::Api("Unexpected ordinary model turn".into()));
         }
         self.summaries.fetch_add(1, Ordering::SeqCst);
+        if messages
+            .iter()
+            .any(|message| message.content.contains(HOOK_INSTRUCTION))
+        {
+            self.hook_instruction_seen.store(true, Ordering::SeqCst);
+        }
         if self.fail_once.swap(false, Ordering::SeqCst) {
             self.entered.notify_one();
             self.release.notified().await;
@@ -82,6 +90,21 @@ async fn fixture(
         .context_management
         .retrieval_window
         .min_recent_user_turns = 2;
+    if cfg!(unix) {
+        config.lifecycle_hooks = bamboo_config::LifecycleHooksConfig {
+            enabled: true,
+            pre_compact: vec![bamboo_config::LifecycleHookGroup {
+                hooks: vec![bamboo_config::LifecycleHookHandler::Command {
+                    command: format!(
+                        r#"printf '%s' '{{"additional_context":"{HOOK_INSTRUCTION}"}}'"#
+                    ),
+                    timeout_ms: 1_000,
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+    }
     std::fs::write(home.path().join("model_limits.json"), json!([
         {"model_pattern": CHAT, "max_context_tokens": WINDOW, "max_output_tokens": 4_096, "safety_margin": 1_000},
         {"model_pattern": SUMMARY, "max_context_tokens": WINDOW, "max_output_tokens": 4_096, "safety_margin": 1_000},
@@ -192,6 +215,13 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
             summary_calls > 0,
             strategy != ContextManagementStrategy::RetrievalWindow
         );
+        if cfg!(unix) {
+            assert_eq!(
+                probe.hook_instruction_seen.load(Ordering::SeqCst),
+                strategy == ContextManagementStrategy::Summary,
+                "only the summary strategy uses the configured hook instructions",
+            );
+        }
         assert!(state.agent_runners.read().await.is_empty());
         assert!(state
             .session_activation_router
