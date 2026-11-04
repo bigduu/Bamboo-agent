@@ -363,20 +363,12 @@ impl TicketApplication {
         let runtime = runtime_observation::prepare(self, &service, &authority, &scope).await?;
         let calls = self.patrol_calls.clone();
         let config = self.config.clone();
-        let (journal, submission) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let (journal, submission, io) = tokio::task::spawn_blocking(move || -> Result<_> {
             journal.current().map_err(patrol_error)?;
             let (_, current_snapshot) = service.published()?;
             journal
                 .fence
                 .check_semantic_scope(&current_snapshot, &scope)?;
-            let current = config.try_read().map_err(|_| Error::RevisionConflict)?;
-            if current.patrol_model.as_ref() != Some(&selection)
-                || !current.features.ticket_mutation
-                || !current.features.ticket_dispatch
-            {
-                return Ok((journal, None));
-            }
-            drop(current);
             let clock = SystemClock::current()?;
             let mut observation = match runtime {
                 Some(runtime) => runtime.read_observation(
@@ -391,6 +383,16 @@ impl TicketApplication {
                 ),
             }
             .map_err(patrol_error)?;
+            let current = config.try_read().map_err(|_| Error::RevisionConflict)?;
+            if current.patrol_model.as_ref() != Some(&selection)
+                || !current.features.ticket_mutation
+                || !current.features.ticket_dispatch
+                || io
+                    .as_ref()
+                    .is_some_and(|io| io.check_prepared_route(&current).is_err())
+            {
+                return Ok((journal, None, io));
+            }
             let mut host = semantic::Ports {
                 journal: &mut journal,
                 observation: &mut observation,
@@ -420,7 +422,7 @@ impl TicketApplication {
                 }
                 Outcome::InputRequired(_) => None,
             };
-            Ok((journal, submission))
+            Ok((journal, submission, io))
         })
         .await
         .map_err(|_| Error::AuthorityUnavailable("semantic patrol worker stopped".into()))??;

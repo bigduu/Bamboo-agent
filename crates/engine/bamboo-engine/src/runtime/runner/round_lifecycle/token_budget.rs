@@ -255,12 +255,7 @@ async fn resolve_configured_model_limit(
     let mut dedicated_registry = ModelLimitsRegistry::with_config_path(model_limits_path);
     let loaded = if let Some(section) = &config.model_limits_section {
         let snapshot = section.snapshot();
-        serde_json::from_value::<Vec<ModelLimit>>(serde_json::Value::Array(snapshot.data.0.clone()))
-            .map(|limits| {
-                for limit in limits {
-                    dedicated_registry.add_limit(limit);
-                }
-            })
+        apply_model_limits_section(&mut dedicated_registry, &snapshot.data)
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
     } else {
         dedicated_registry.load_user_config().await
@@ -303,9 +298,41 @@ async fn resolve_configured_model_limit(
     // loop-config build time. Do not re-read Config::new() here: that would
     // diverge from the server's live config and clobber the global env cache
     // (#38).
-    let mut legacy_registry = ModelLimitsRegistry::new();
-    apply_legacy_model_limits(&mut legacy_registry, config.legacy_model_limits.as_ref());
-    legacy_registry.get(model_name)
+    legacy_model_limit(config.legacy_model_limits.as_ref(), model_name)
+}
+
+pub(crate) fn configured_model_ceilings(
+    section: Option<&bamboo_config::ModelLimitsSection>,
+    legacy: Option<&serde_json::Value>,
+    model: &str,
+) -> Option<(u32, u32)> {
+    let mut registry = ModelLimitsRegistry::new();
+    if let Some(section) = section {
+        apply_model_limits_section(&mut registry, section).ok()?;
+    }
+    let limit = registry
+        .get(model)
+        .or_else(|| legacy_model_limit(legacy, model))?;
+    let output = limit.max_output_tokens?;
+    (limit.max_context_tokens > 0 && output > 0).then_some((limit.max_context_tokens, output))
+}
+
+fn apply_model_limits_section(
+    registry: &mut ModelLimitsRegistry,
+    section: &bamboo_config::ModelLimitsSection,
+) -> serde_json::Result<()> {
+    for limit in
+        serde_json::from_value::<Vec<ModelLimit>>(serde_json::Value::Array(section.0.clone()))?
+    {
+        registry.add_limit(limit);
+    }
+    Ok(())
+}
+
+fn legacy_model_limit(legacy: Option<&serde_json::Value>, model: &str) -> Option<ModelLimit> {
+    let mut registry = ModelLimitsRegistry::new();
+    apply_legacy_model_limits(&mut registry, legacy);
+    registry.get(model)
 }
 
 /// Apply the legacy `config.json` `model_limits` value (snapshotted from the

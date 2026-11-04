@@ -103,7 +103,11 @@ impl ProviderReply {
 #[async_trait::async_trait]
 pub trait CallIo: Send + Sync {
     async fn admit(&self, reservation: &Reservation) -> Result<(), PortError>;
-    async fn complete(&mut self, remaining: Duration) -> Result<ProviderReply, PortError>;
+    async fn complete(
+        &mut self,
+        reservation: &Reservation,
+        remaining: Duration,
+    ) -> Result<ProviderReply, PortError>;
     async fn settle(&self, reservation: &Reservation, usage: Usage) -> Result<(), PortError>;
 }
 
@@ -218,7 +222,10 @@ impl Calls {
                 if remaining.is_zero() {
                     return Err(PortError::Denied);
                 }
-                Ok(io.complete(remaining).await?.status(&receipt.request))
+                Ok(io
+                    .complete(&receipt, remaining)
+                    .await?
+                    .status(&receipt.request))
             };
             let status = tokio::select! {
                 biased;

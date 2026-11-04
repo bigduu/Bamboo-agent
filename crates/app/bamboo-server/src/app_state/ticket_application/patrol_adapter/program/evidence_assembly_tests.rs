@@ -446,12 +446,18 @@ async fn ready_semantic_patrol_uses_the_configured_provider_without_a_local_prof
     Box::pin(ready_semantic_fixture(SemanticCase::Registered)).await;
 }
 
+#[tokio::test]
+async fn ready_semantic_patrol_keeps_the_reserved_charge_when_the_provider_omits_usage() {
+    Box::pin(ready_semantic_fixture(SemanticCase::RegisteredMissingUsage)).await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SemanticCase {
     Known,
     ProjectChanged,
     LateUsage,
     Registered,
+    RegisteredMissingUsage,
 }
 
 async fn ready_semantic_fixture(case: SemanticCase) {
@@ -570,7 +576,10 @@ async fn ready_semantic_fixture(case: SemanticCase) {
     assert!(!observed.repeated_errors);
 
     let provider = MockServer::start().await;
-    let registered = case == SemanticCase::Registered;
+    let registered = matches!(
+        case,
+        SemanticCase::Registered | SemanticCase::RegisteredMissingUsage | SemanticCase::LateUsage
+    );
     for (route, body) in [
         (
             "/v1/models",
@@ -670,6 +679,12 @@ async fn ready_semantic_fixture(case: SemanticCase) {
                 assert!(
                     body["tools"].is_null() || body["tools"].as_array().is_some_and(Vec::is_empty)
                 );
+                if case == SemanticCase::RegisteredMissingUsage {
+                    return ResponseTemplate::new(200).set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    );
+                }
                 return ResponseTemplate::new(200).set_body_raw(
                     concat!(
                         "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\n",
@@ -788,6 +803,10 @@ async fn ready_semantic_fixture(case: SemanticCase) {
     let requests = provider.received_requests().await.unwrap();
     if change_project {
         assert_eq!(requests.len(), 3);
+        assert_eq!(ledger.total_charged, 4224);
+        assert_eq!(receipt.usage, Some(ExecutionTokenUsage::Unknown));
+    } else if case == SemanticCase::RegisteredMissingUsage {
+        assert_eq!(requests.len(), 1);
         assert_eq!(ledger.total_charged, 4224);
         assert_eq!(receipt.usage, Some(ExecutionTokenUsage::Unknown));
     } else if registered {

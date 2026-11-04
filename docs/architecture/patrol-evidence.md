@@ -101,8 +101,8 @@ The `registered_provider_v1` Model Policy profile selects a provider ID and
 model already admitted by Bamboo's provider registry. It uses the account,
 endpoint, and protocol from that registry. Set the patrol input cap at or
 above the trusted model ceiling and its output cap within the model's known
-limit. The existing Native Work ceiling resolver uses configured Model Limits
-or provider metadata. An unavailable ceiling or an insufficient Work budget
+limit. The Host reads the live Model Limits configuration before reservation.
+An unavailable ceiling or an insufficient Work budget
 blocks semantic submission. The provider receives system instructions and
 scoped evidence as a text-only request under the original Work receipt.
 Trusted usage settles the receipt. Unknown usage retains the reserved caps.

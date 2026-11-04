@@ -379,7 +379,11 @@ mod calls {
             }
         }
 
-        async fn complete(&mut self, _: Duration) -> Result<ProviderReply, PortError> {
+        async fn complete(
+            &mut self,
+            _: &Reservation,
+            _: Duration,
+        ) -> Result<ProviderReply, PortError> {
             self.control.sends.fetch_add(1, Ordering::SeqCst);
             self.control.started.notify_one();
             self.control.release.notified().await;
