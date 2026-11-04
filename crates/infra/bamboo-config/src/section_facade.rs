@@ -7770,6 +7770,19 @@ mod tests {
                 .endpoint,
             Some("127.0.0.1:8080".parse().unwrap())
         );
+
+        let mut registered = root;
+        registered["patrol_model"]["provider"] = json!("existing-account");
+        registered["patrol_model"]["model"] = json!("configured-model");
+        registered["patrol_model"]["protocol"] = json!("registered_provider_v1");
+        registered["patrol_model"]["max_input_tokens"] = json!(131_072);
+        let parsed = serde_json::from_value::<Config>(registered.clone()).unwrap();
+        assert_eq!(
+            parsed.to_compatibility_value().unwrap()["patrol_model"],
+            registered["patrol_model"]
+        );
+        registered["patrol_model"]["endpoint"] = json!("127.0.0.1:8080");
+        assert!(serde_json::from_value::<Config>(registered).is_err());
     }
 
     #[test]

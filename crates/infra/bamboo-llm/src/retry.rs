@@ -209,7 +209,14 @@ where
     } else {
         *config
     };
-    send_managed_request(&retry, provider, limits, build).await
+    let response = send_managed_request(&retry, provider, limits, build).await?;
+    if crate::work_text::active() && !response.status().is_success() {
+        return Err(LLMError::Api(format!(
+            "Work text request returned {}",
+            response.status()
+        )));
+    }
+    Ok(response)
 }
 
 // The timeout owns only the headers future, never the successful SSE body.
@@ -241,7 +248,7 @@ where
             let attempt_deadline = deadline
                 .map(|deadline| deadline.min(started + limits.attempt_timeout))
                 .unwrap_or(started + limits.attempt_timeout);
-            match tokio::time::timeout_at(attempt_deadline, build().send()).await {
+            match tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await {
                 Ok(Ok(response)) => RetryAttempt {
                     retry: is_retryable_status(response.status()),
                     status: Some(response.status()),
@@ -251,12 +258,12 @@ where
                     result: Ok(response),
                 },
                 Ok(Err(error)) => RetryAttempt {
-                    retry: is_retryable_reqwest_error(&error),
+                    retry: matches!(&error, LLMError::Http(error) if is_retryable_reqwest_error(error)),
                     status: None,
                     retry_after: None,
                     deadline,
                     observation: None,
-                    result: Err(LLMError::Http(error)),
+                    result: Err(error),
                 },
                 Err(_) => RetryAttempt {
                     retry: true,
@@ -1087,7 +1094,8 @@ where
                     .deadline
                     .min(attempt_started + budget.attempt_timeout)
             };
-            let sent = tokio::time::timeout_at(attempt_deadline, build().send()).await;
+            let sent =
+                tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await;
             let mut response = match sent {
                 Err(_) => {
                     budget.record_live_candidate(None);
@@ -1103,15 +1111,20 @@ where
                     );
                 }
                 Ok(Err(error)) => {
-                    let retry = is_retryable_reqwest_error(&error);
-                    let kind = crate::providers::common::http_error_kind(&error);
+                    let (retry, kind) = match &error {
+                        LLMError::Http(error) => (
+                            is_retryable_reqwest_error(error),
+                            crate::providers::common::http_error_kind(error),
+                        ),
+                        _ => (false, "local admission"),
+                    };
                     let mut outcome = budget.failure(
                         budget.observation(attempt_started, "send_headers", kind, None),
                         (!retry).then_some(RequestStopReason::NonRetryableTransport),
                         None,
                     );
                     if !retry {
-                        outcome.result = Err(LLMError::Http(error));
+                        outcome.result = Err(error);
                     }
                     return outcome;
                 }

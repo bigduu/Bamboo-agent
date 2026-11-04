@@ -9,6 +9,19 @@ use crate::ticket_runtime::{self, TicketDispatchBinding};
 
 mod provider;
 
+/// Resolve a ceiling using only the model limits captured by the Host.
+pub fn configured_model_ceilings(
+    model_limits: Option<&bamboo_config::ModelLimitsSection>,
+    legacy_model_limits: Option<&serde_json::Value>,
+    model: &str,
+) -> Option<(u32, u32)> {
+    crate::runtime::runner::round_lifecycle::configured_model_ceilings(
+        model_limits,
+        legacy_model_limits,
+        model,
+    )
+}
+
 #[derive(Clone)]
 struct SessionStamp {
     id: String,

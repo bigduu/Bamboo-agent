@@ -14,8 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use super::{
     staged::{Reconciled, Submission},
-    BudgetPort, Diagnosis, DiagnosticRequest, DiagnosticStatus, OperationId, PortError,
-    Reservation, Usage,
+    BudgetPort, Diagnosis, DiagnosticRequest, DiagnosticStatus, InputTokenBasis, OperationId,
+    PortError, Reservation, Usage,
 };
 
 const MAX_CALLS: usize = 16;
@@ -31,6 +31,7 @@ pub struct ProviderReply {
     pub exact_usage: Option<TokenUsage>,
     pub observed_input_tokens: Option<u64>,
     pub observed_output_tokens: Option<u64>,
+    pub observed_total_tokens: Option<u64>,
 }
 
 impl ProviderReply {
@@ -45,21 +46,34 @@ impl ProviderReply {
             .into_iter()
             .chain(self.exact_usage.map(|usage| usage.completion_tokens))
             .max();
+        let total_tokens = self.observed_total_tokens;
         if input_tokens.is_some_and(|input| input > u64::from(request.model.max_input_tokens))
             || output_tokens
                 .is_some_and(|output| output > u64::from(request.model.max_output_tokens))
+            || total_tokens.is_some_and(|total| {
+                total
+                    > u64::from(request.model.max_input_tokens)
+                        + u64::from(request.model.max_output_tokens)
+            })
         {
             return DiagnosticStatus::Failed {
                 usage: Usage::OverCap {
                     input_tokens,
                     output_tokens,
+                    total_tokens,
                 },
             };
         }
         let Some(exact) = self.exact_usage.filter(|usage| {
+            let prepared = u64::from(request.input.input_tokens);
+            let valid_input = match request.input.input_token_basis {
+                InputTokenBasis::Exact => usage.prompt_tokens >= prepared,
+                InputTokenBasis::ProviderCeiling => (1..=prepared).contains(&usage.prompt_tokens),
+            };
             input_tokens == Some(usage.prompt_tokens)
                 && output_tokens == Some(usage.completion_tokens)
-                && usage.prompt_tokens >= u64::from(request.input.input_tokens)
+                && total_tokens.is_none_or(|total| total == usage.total_tokens)
+                && valid_input
                 && usage.prompt_tokens.checked_add(usage.completion_tokens)
                     == Some(usage.total_tokens)
         }) else {
@@ -89,7 +103,11 @@ impl ProviderReply {
 #[async_trait::async_trait]
 pub trait CallIo: Send + Sync {
     async fn admit(&self, reservation: &Reservation) -> Result<(), PortError>;
-    async fn complete(&mut self, remaining: Duration) -> Result<ProviderReply, PortError>;
+    async fn complete(
+        &mut self,
+        reservation: &Reservation,
+        remaining: Duration,
+    ) -> Result<ProviderReply, PortError>;
     async fn settle(&self, reservation: &Reservation, usage: Usage) -> Result<(), PortError>;
 }
 
@@ -204,7 +222,10 @@ impl Calls {
                 if remaining.is_zero() {
                     return Err(PortError::Denied);
                 }
-                Ok(io.complete(remaining).await?.status(&receipt.request))
+                Ok(io
+                    .complete(&receipt, remaining)
+                    .await?
+                    .status(&receipt.request))
             };
             let status = tokio::select! {
                 biased;

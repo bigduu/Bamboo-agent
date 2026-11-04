@@ -6,9 +6,18 @@ use std::{
     time::Duration,
 };
 
-use bamboo_config::{Config, PatrolModelConfig};
-use bamboo_domain::{ProjectManifest, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
+use bamboo_config::{
+    config_store::SectionSnapshot, Config, LiveSection, ModelLimitsSection, PatrolModelConfig,
+    PatrolModelProtocol,
+};
+use bamboo_domain::{
+    Message, ProjectManifest, ProviderModelRef, Storage, DEFAULT_SUPERVISOR_SESSION_ID,
+};
 use bamboo_llm::protocol::llama_cpp::{GptOssLocalClient, PreparedCompletion};
+use bamboo_llm::{
+    work_text::{self, WorkTextClient, WorkTextReply},
+    LLMProvider, ProviderRegistry,
+};
 use bamboo_orchestration::{
     patrol::{
         budget::TicketBudget,
@@ -22,10 +31,10 @@ use bamboo_orchestration::{
 };
 use bamboo_projects::ProjectStore;
 use bamboo_tickets::{Authority, Principal, TicketService};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::{
-    evidence::{current_project_manifest, read_project_manifest, EvidenceReader},
+    evidence::{current_project_manifest, read_project_manifest, EvidenceReader, EvidenceSources},
     patrol_error,
     program::SystemClock,
     Error, Result, TicketApplication,
@@ -35,6 +44,7 @@ pub(super) struct Ports<'a> {
     pub(super) journal: &'a mut dyn CheckpointPort,
     pub(super) observation: &'a mut dyn ObservationPort,
     pub(super) budget: TicketBudget<'a>,
+    pub(super) prepared: Option<&'a ReadyPatrolIo>,
 }
 
 impl CheckpointPort for Ports<'_> {
@@ -73,6 +83,23 @@ impl BudgetPort for Ports<'_> {
         &mut self,
         request: &DiagnosticRequest,
     ) -> std::result::Result<Reservation, BudgetBlock> {
+        if let Some(io) = self.prepared.filter(|io| io.proof.registered.is_some()) {
+            let proof = &io.proof;
+            // Serialize the exact check and ledger write with live route
+            // and Model Limits publication. This port never waits for a writer.
+            let _io = proof
+                .config_io_lock
+                .try_lock()
+                .map_err(|_| BudgetBlock::Unavailable)?;
+            let config = proof
+                .config
+                .try_read()
+                .map_err(|_| BudgetBlock::Unavailable)?;
+            proof
+                .check_selection(&config)
+                .map_err(|_| BudgetBlock::Unavailable)?;
+            return self.budget.reserve(request);
+        }
         self.budget.reserve(request)
     }
     fn settle(
@@ -94,6 +121,90 @@ impl EscalationPort for Ports<'_> {
 pub(super) struct PreparedCall {
     pub(super) input: PreparedInput,
     pub(super) io: ReadyPatrolIo,
+}
+
+enum Completion {
+    Raw(Option<Box<PreparedCompletion>>),
+    Registered(Option<Box<[Message; 2]>>),
+}
+
+struct RegisteredRoute {
+    registry: Arc<ProviderRegistry>,
+    provider: Arc<dyn LLMProvider>,
+    transport: WorkTextClient,
+    target: ProviderModelRef,
+    model_limits: Option<Arc<LiveSection<ModelLimitsSection>>>,
+    model_limits_snapshot: Option<Arc<SectionSnapshot<ModelLimitsSection>>>,
+    legacy_model_limits: Option<serde_json::Value>,
+    input_ceiling: u32,
+}
+
+impl RegisteredRoute {
+    fn capture(
+        sources: &EvidenceSources,
+        config: &Config,
+        selection: &PatrolModelConfig,
+    ) -> Result<Self> {
+        let target = ProviderModelRef::new(&selection.provider, &selection.model);
+        let (provider, managed) = sources
+            .providers
+            .provider_for_configured_model_with_origin(config, &target)
+            .map_err(|_| unavailable())?;
+        if !managed || provider.known_pre_dispatch_error().is_some() {
+            return Err(unavailable());
+        }
+        let model_limits = sources.model_limits.clone();
+        let limits = model_limits.as_ref().map(|section| section.snapshot());
+        let legacy_model_limits = config.extra.get("model_limits").cloned();
+        let (input_ceiling, output_ceiling) =
+            bamboo_engine::ticket_token_budget::configured_model_ceilings(
+                limits.as_ref().map(|snapshot| snapshot.data.as_ref()),
+                legacy_model_limits.as_ref(),
+                &target.model,
+            )
+            .ok_or_else(unavailable)?;
+        if input_ceiling > selection.max_input_tokens.get()
+            || output_ceiling < selection.max_output_tokens.get()
+        {
+            return Err(Error::ResourceBlocked(
+                "registered patrol model exceeds the configured token ceilings".into(),
+            ));
+        }
+        Ok(Self {
+            registry: sources.providers.clone(),
+            provider,
+            transport: WorkTextClient::from_config(config).map_err(|_| unavailable())?,
+            target,
+            model_limits,
+            model_limits_snapshot: limits,
+            legacy_model_limits,
+            input_ceiling,
+        })
+    }
+
+    fn check(&self, config: &Config) -> std::result::Result<(), PortError> {
+        let (current, managed) = self
+            .registry
+            .provider_for_configured_model_with_origin(config, &self.target)
+            .map_err(|_| PortError::Denied)?;
+        if !managed
+            || !Arc::ptr_eq(&current, &self.provider)
+            || self
+                .model_limits
+                .as_ref()
+                .zip(self.model_limits_snapshot.as_ref())
+                .is_some_and(|(section, captured)| {
+                    let live = section.snapshot();
+                    live.revision != captured.revision
+                        || (!Arc::ptr_eq(&live.data, &captured.data)
+                            && live.data.0 != captured.data.0)
+                })
+            || config.extra.get("model_limits") != self.legacy_model_limits.as_ref()
+        {
+            return Err(PortError::Conflict);
+        }
+        Ok(())
+    }
 }
 
 impl TicketApplication {
@@ -134,7 +245,7 @@ impl TicketApplication {
     ) -> Result<PreparedCall> {
         fence.check()?;
         let sources = self.patrol_sources.get().ok_or_else(unavailable)?;
-        let endpoint = selection.endpoint.ok_or_else(unavailable)?;
+        selection.validate().map_err(Error::AuthorityUnavailable)?;
         let (commit, snapshot) = service.published()?;
         fence.check_semantic_scope(&snapshot, &demand.through.scope)?;
         if snapshot.seq != demand.through.cursor
@@ -161,47 +272,92 @@ impl TicketApplication {
             .await
             .map_err(|_| unavailable())??
         };
-        let evidence = EvidenceReader {
+        let reader = EvidenceReader {
             tickets: self,
             config: &self.config,
             memory_store: &sources.memory,
             project_store: &sources.projects,
-        }
-        .read_patrol_diagnostic_for_selection(
-            &demand.through,
-            &commit,
-            demand.since_cursor,
-            selection.clone(),
-        )
-        .await?;
-        if evidence.model() != &demand.model {
-            return Err(Error::RevisionConflict);
-        }
-        let completion = GptOssLocalClient::new(endpoint)
-            .map_err(|_| unavailable())?
-            .prepare(
-                evidence.prompt(),
-                demand.model.max_output_tokens,
-                Duration::from_secs(2),
-            )
-            .await
-            .map_err(|_| unavailable())?;
+        };
+        let (input, completion, registered) = match selection.protocol {
+            PatrolModelProtocol::LlamaCppRawV1 => {
+                let endpoint = selection.endpoint.ok_or_else(unavailable)?;
+                let evidence = reader
+                    .read_patrol_diagnostic_for_selection(
+                        &demand.through,
+                        &commit,
+                        demand.since_cursor,
+                        selection.clone(),
+                    )
+                    .await?;
+                if evidence.model() != &demand.model {
+                    return Err(Error::RevisionConflict);
+                }
+                let completion = GptOssLocalClient::new(endpoint)
+                    .map_err(|_| unavailable())?
+                    .prepare(
+                        evidence.prompt(),
+                        demand.model.max_output_tokens,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .map_err(|_| unavailable())?;
+                (
+                    evidence.input().clone(),
+                    Completion::Raw(Some(Box::new(completion))),
+                    None,
+                )
+            }
+            PatrolModelProtocol::RegisteredProviderV1 => {
+                let route = {
+                    let config = self.config.read().await;
+                    if config.patrol_model.as_ref() != Some(&selection) {
+                        return Err(Error::RevisionConflict);
+                    }
+                    RegisteredRoute::capture(sources, &config, &selection)?
+                };
+                let (input, messages) = reader
+                    .read_registered_diagnostic(
+                        &demand.through,
+                        &commit,
+                        demand.since_cursor,
+                        &demand.model,
+                        route.input_ceiling,
+                    )
+                    .await?;
+                {
+                    let config = self
+                        .config
+                        .try_read()
+                        .map_err(|_| Error::RevisionConflict)?;
+                    route.check(&config).map_err(patrol_error)?;
+                }
+                (
+                    input,
+                    Completion::Registered(Some(Box::new(messages))),
+                    Some(route),
+                )
+            }
+        };
         fence.check()?;
         Ok(PreparedCall {
             input: PreparedInput {
                 demand,
-                result: Ok(evidence.input().clone()),
+                result: Ok(input),
             },
             io: ReadyPatrolIo {
-                service: service.clone(),
-                storage: self.storage.clone(),
-                config: self.config.clone(),
-                projects: sources.projects.clone(),
-                root: self.root.clone(),
-                selection,
-                project,
-                fence,
-                completion: Some(completion),
+                proof: Arc::new(ReadyPatrolProof {
+                    service: service.clone(),
+                    storage: self.storage.clone(),
+                    config: self.config.clone(),
+                    config_io_lock: sources.config_io_lock.clone(),
+                    projects: sources.projects.clone(),
+                    root: self.root.clone(),
+                    selection,
+                    project,
+                    fence,
+                    registered,
+                }),
+                completion,
             },
         })
     }
@@ -212,18 +368,24 @@ fn unavailable() -> Error {
 }
 
 pub(super) struct ReadyPatrolIo {
+    proof: Arc<ReadyPatrolProof>,
+    completion: Completion,
+}
+
+struct ReadyPatrolProof {
     service: Arc<TicketService>,
     storage: Arc<dyn Storage>,
     config: Arc<RwLock<Config>>,
+    config_io_lock: Arc<Mutex<()>>,
     projects: Arc<ProjectStore>,
     root: PathBuf,
     selection: PatrolModelConfig,
     project: ProjectManifest,
     fence: ReadyAdmissionFence,
-    completion: Option<PreparedCompletion>,
+    registered: Option<RegisteredRoute>,
 }
 
-impl ReadyPatrolIo {
+impl ReadyPatrolProof {
     async fn authority(&self) -> std::result::Result<Authority, PortError> {
         let (binding, _) = bamboo_engine::ticket_runtime::verified_scope_binding_for_service(
             self.storage.as_ref(),
@@ -236,13 +398,20 @@ impl ReadyPatrolIo {
     }
 
     fn require_selection(&self) -> std::result::Result<(), PortError> {
-        self.fence.check().map_err(|_| PortError::Denied)?;
         let current = self.config.try_read().map_err(|_| PortError::Conflict)?;
+        self.check_selection(&current)
+    }
+
+    fn check_selection(&self, current: &Config) -> std::result::Result<(), PortError> {
+        self.fence.check().map_err(|_| PortError::Denied)?;
         if !current.features.ticket_mutation || !current.features.ticket_dispatch {
             return Err(PortError::Denied);
         }
         if current.patrol_model.as_ref() != Some(&self.selection) {
             return Err(PortError::Conflict);
+        }
+        if let Some(route) = &self.registered {
+            route.check(current)?;
         }
         Ok(())
     }
@@ -263,8 +432,7 @@ fn check_project_after_ticket_proof(
     Ok(())
 }
 
-#[async_trait::async_trait]
-impl CallIo for ReadyPatrolIo {
+impl ReadyPatrolProof {
     async fn admit(&self, reservation: &Reservation) -> std::result::Result<(), PortError> {
         self.require_selection()?;
         let authority = self.authority().await?;
@@ -310,25 +478,89 @@ impl CallIo for ReadyPatrolIo {
         .map_err(|_| PortError::Unavailable)??;
         self.require_selection()
     }
+}
+
+#[async_trait::async_trait]
+impl CallIo for ReadyPatrolIo {
+    async fn admit(&self, reservation: &Reservation) -> std::result::Result<(), PortError> {
+        self.proof.admit(reservation).await
+    }
 
     async fn complete(
         &mut self,
+        reservation: &Reservation,
         remaining: Duration,
     ) -> std::result::Result<ProviderReply, PortError> {
-        self.require_selection()?;
-        let reply = self
-            .completion
-            .take()
-            .ok_or(PortError::Denied)?
-            .complete(remaining.min(Duration::from_secs(60)))
-            .await
-            .map_err(|_| PortError::OutcomeUnknown)?;
-        Ok(ProviderReply {
-            diagnosis: self.require_selection().ok().and(reply.final_text),
-            exact_usage: reply.usage.known(),
-            observed_input_tokens: reply.usage.input_tokens,
-            observed_output_tokens: reply.usage.output_tokens,
-        })
+        self.proof.require_selection()?;
+        let remaining = remaining.min(Duration::from_secs(60));
+        let mut reply = match &mut self.completion {
+            Completion::Raw(completion) => {
+                let reply = completion
+                    .take()
+                    .ok_or(PortError::Denied)?
+                    .complete(remaining)
+                    .await
+                    .map_err(|_| PortError::OutcomeUnknown)?;
+                ProviderReply {
+                    diagnosis: reply.final_text,
+                    exact_usage: reply.usage.known(),
+                    observed_input_tokens: reply.usage.input_tokens,
+                    observed_output_tokens: reply.usage.output_tokens,
+                    observed_total_tokens: None,
+                }
+            }
+            Completion::Registered(messages) => {
+                let messages = messages.take().ok_or(PortError::Denied)?;
+                let route = self.proof.registered.as_ref().ok_or(PortError::Denied)?;
+                let proof = self.proof.clone();
+                let receipt = reservation.clone();
+                let admit: work_text::Admission = Arc::new(move || {
+                    let proof = proof.clone();
+                    let receipt = receipt.clone();
+                    Box::pin(async move {
+                        proof.admit(&receipt).await.map_err(|_| {
+                            bamboo_llm::LLMError::RequestFailed(
+                                "patrol admission changed before provider send".into(),
+                            )
+                        })
+                    })
+                });
+                match work_text::complete(
+                    &route.transport,
+                    route.provider.as_ref(),
+                    work_text::Request {
+                        model: &route.target.model,
+                        messages: messages.as_ref(),
+                        input_cap: reservation.request.model.max_input_tokens,
+                        output_cap: reservation.request.model.max_output_tokens,
+                        remaining,
+                    },
+                    admit,
+                )
+                .await
+                {
+                    WorkTextReply::Complete { text, exact_usage } => ProviderReply {
+                        diagnosis: text,
+                        exact_usage,
+                        observed_input_tokens: None,
+                        observed_output_tokens: None,
+                        observed_total_tokens: None,
+                    },
+                    WorkTextReply::OverCap(usage) => ProviderReply {
+                        diagnosis: None,
+                        exact_usage: None,
+                        observed_input_tokens: usage.input_tokens,
+                        observed_output_tokens: usage.output_tokens,
+                        observed_total_tokens: usage.total_tokens,
+                    },
+                    WorkTextReply::Unknown => return Err(PortError::OutcomeUnknown),
+                }
+            }
+        };
+        if self.proof.require_selection().is_err() {
+            reply.diagnosis = None;
+        }
+        Ok(reply)
     }
 
     async fn settle(
@@ -336,8 +568,8 @@ impl CallIo for ReadyPatrolIo {
         reservation: &Reservation,
         usage: Usage,
     ) -> std::result::Result<(), PortError> {
-        let authority = self.authority().await?;
-        let service = self.service.clone();
+        let authority = self.proof.authority().await?;
+        let service = self.proof.service.clone();
         let reservation = reservation.clone();
         tokio::task::spawn_blocking(move || {
             let clock = SystemClock::current().map_err(|_| PortError::Unavailable)?;

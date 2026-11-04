@@ -16,7 +16,7 @@ use bamboo_compression::{
     build_forced_compression_candidate_plan_with_input_costs,
     build_message_summary_candidate_plan_with_input_costs,
     build_retrieval_window_candidate_plan_with_token_accounting,
-    build_retrieval_window_critical_overflow_plan_with_token_accounting,
+    build_retrieval_window_full_archive_plan_with_token_accounting,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
     prepare_hybrid_context_with_fixed_tokens, CompressionPlan, CompressionPlanError,
@@ -937,6 +937,7 @@ fn late_bound_tool_schema_reserve(
 struct RetrievalWindowAccountingFrame {
     accounting: RetrievalWindowTokenAccounting,
     active_tokens_without_boundary: u32,
+    current_ledger_rendered_bytes: usize,
     #[cfg(test)]
     existing_history_boundary_tokens: u32,
     #[cfg(test)]
@@ -1149,6 +1150,7 @@ async fn build_retrieval_window_accounting_frame(
     Ok(RetrievalWindowAccountingFrame {
         accounting,
         active_tokens_without_boundary,
+        current_ledger_rendered_bytes: current_projected.ledger_rendered_bytes,
         #[cfg(test)]
         existing_history_boundary_tokens: post_boundary_projected.history_boundary_input_tokens,
         #[cfg(test)]
@@ -1239,7 +1241,8 @@ async fn maybe_prepare_retrieval_window_context(
     let counter = TiktokenTokenCounter::default();
     let trigger_tokens = retrieval_window_trigger_tokens(config, budget);
     let target_tokens = range.target_tokens;
-    let forced = trigger_type != CompressionTriggerType::Auto;
+    let automatic = trigger_type == CompressionTriggerType::Auto;
+    let best_effort = automatic || stage_only;
     let critical_overflow = matches!(&trigger_type, CompressionTriggerType::CriticalOverflow);
     let preflight = retrieval_window_preflight(
         session,
@@ -1253,7 +1256,7 @@ async fn maybe_prepare_retrieval_window_context(
     .await?;
     let below_boundary = if critical_overflow {
         false
-    } else if forced {
+    } else if !automatic {
         preflight.active_tokens <= target_tokens
     } else {
         preflight.active_tokens < trigger_tokens
@@ -1300,7 +1303,7 @@ async fn maybe_prepare_retrieval_window_context(
         .await?;
         let below_boundary = if critical_overflow {
             false
-        } else if forced {
+        } else if !automatic {
             frame.active_tokens_without_boundary <= target_tokens
         } else {
             frame.active_tokens_without_boundary < trigger_tokens
@@ -1327,7 +1330,7 @@ async fn maybe_prepare_retrieval_window_context(
         let expected_base = candidate_base;
         let mut staged = expected_base.clone();
         let plan_result = if critical_overflow {
-            build_retrieval_window_critical_overflow_plan_with_token_accounting(
+            build_retrieval_window_full_archive_plan_with_token_accounting(
                 &staged,
                 budget,
                 policy,
@@ -1341,8 +1344,32 @@ async fn maybe_prepare_retrieval_window_context(
                 &frame.accounting,
             )
         };
+        let plan_result = match plan_result {
+            // The user command and automatic compaction can still archive safe
+            // history when the desired target is below the protected footprint.
+            Err(RetrievalWindowPlanError::ProtectedContentExceedsTarget { .. }) if best_effort => {
+                build_retrieval_window_full_archive_plan_with_token_accounting(
+                    &staged,
+                    budget,
+                    policy,
+                    &frame.accounting,
+                )
+            }
+            result => result,
+        };
         let plan = match plan_result {
             Ok(plan) => plan,
+            Err(RetrievalWindowPlanError::NothingToArchive {
+                incomplete_protocol_group_count: 0,
+                ..
+            }) if best_effort
+                && frame.active_tokens_without_boundary <= budget.max_request_input_tokens()
+                && frame.current_ledger_rendered_bytes <= MAX_MODEL_CONTEXT_RENDERED_BYTES =>
+            {
+                // A prior archive may leave only protected content. Keep the
+                // intact window if it fits and avoid a second checkpoint.
+                return Ok(RetrievalWindowPreparationOutcome::NotNeeded);
+            }
             Err(error)
                 if manual_archive_request.is_some()
                     && matches!(

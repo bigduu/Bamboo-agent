@@ -67,8 +67,7 @@ impl TicketBudget<'_> {
         &self,
         reservation: &Reservation,
         request: &WorkTokenRequest,
-        input_tokens: Option<u64>,
-        output_tokens: Option<u64>,
+        usage: ExecutionTokenOverCapUsage,
     ) -> Result<(), PortError> {
         self.service
             .report_work_token_over_cap(
@@ -76,11 +75,7 @@ impl TicketBudget<'_> {
                 &request.operation_id,
                 &request.request_hash,
                 &reservation.receipt,
-                ExecutionTokenOverCapUsage {
-                    input_tokens,
-                    output_tokens,
-                    total_tokens: None,
-                },
+                usage,
             )
             .map(|_| ())
             .map_err(host::ticket_error)
@@ -232,8 +227,17 @@ impl BudgetPort for TicketBudget<'_> {
             Usage::OverCap {
                 input_tokens,
                 output_tokens,
+                total_tokens,
             } => {
-                return self.report_over_cap(reservation, &request, input_tokens, output_tokens);
+                return self.report_over_cap(
+                    reservation,
+                    &request,
+                    ExecutionTokenOverCapUsage {
+                        input_tokens,
+                        output_tokens,
+                        total_tokens,
+                    },
+                );
             }
             Usage::Known {
                 input_tokens,
@@ -246,8 +250,11 @@ impl BudgetPort for TicketBudget<'_> {
                 return self.report_over_cap(
                     reservation,
                     &request,
-                    Some(u64::from(input_tokens)),
-                    Some(u64::from(output_tokens)),
+                    ExecutionTokenOverCapUsage {
+                        input_tokens: Some(u64::from(input_tokens)),
+                        output_tokens: Some(u64::from(output_tokens)),
+                        total_tokens: None,
+                    },
                 );
             }
             Usage::Known {
