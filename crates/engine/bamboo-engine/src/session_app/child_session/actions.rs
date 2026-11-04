@@ -156,21 +156,23 @@ async fn create_child_action_inner(
         && input
             .runtime_metadata
             .contains_key(super::named_profile::PROFILE_EXPLICIT_MODEL_KEY)
-        && (profile.is_some()
-            || input
-                .runtime_metadata
-                .get("external.protocol")
-                .map(String::as_str)
-                != Some("actor")
+    {
+        if profile.is_some()
             || input
                 .runtime_metadata
                 .get("external.agent_id")
                 .map(String::as_str)
-                != Some(crate::external_agents::config::LOCAL_ACTOR_AGENT_ID))
-    {
-        return Err(ChildSessionError::ModelNotAdmitted(
-            "compact model selection requires an unprofiled built-in Bamboo route".into(),
-        ));
+                != Some(crate::external_agents::config::LOCAL_ACTOR_AGENT_ID)
+        {
+            return Err(ChildSessionError::ModelNotAdmitted(
+                "compact model selection requires an unprofiled built-in Bamboo route".into(),
+            ));
+        }
+        // The local-actor label alone can also select a legacy executor.
+        // Required context already preflights the actual built-in Bamboo route.
+        port.validate_required_child_context_route(&input.runtime_metadata, &input.subagent_type)
+            .await
+            .map_err(|error| ChildSessionError::ModelNotAdmitted(error.to_string()))?;
     }
     if let Some(profile) = &profile {
         if input.lifecycle.as_deref() == Some("resident")

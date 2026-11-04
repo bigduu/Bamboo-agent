@@ -846,6 +846,7 @@ async fn build_test_harness_with_hook(
 struct WaitOrderPort {
     inner: Arc<ChildSessionAdapter>,
     storage: Arc<dyn Storage>,
+    reject_builtin_route: AtomicBool,
     fail_launch: AtomicBool,
     checked_launches: AtomicUsize,
     hold_first_enqueue: AtomicBool,
@@ -878,6 +879,7 @@ impl WaitOrderPort {
         Self {
             inner,
             storage,
+            reject_builtin_route: AtomicBool::new(false),
             fail_launch: AtomicBool::new(false),
             checked_launches: AtomicUsize::new(0),
             hold_first_enqueue: AtomicBool::new(false),
@@ -959,6 +961,11 @@ impl ChildSessionPort for WaitOrderPort {
         runtime_metadata: &HashMap<String, String>,
         subagent_type: &str,
     ) -> Result<(), ChildSessionError> {
+        if self.reject_builtin_route.load(Ordering::SeqCst) {
+            return Err(ChildSessionError::Execution(
+                "selected route lacks built-in support".into(),
+            ));
+        }
         self.inner
             .validate_required_child_context_route(runtime_metadata, subagent_type)
             .await
@@ -7745,13 +7752,22 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
     )
     .await
     .unwrap();
-    for route in ["named-profile", "external"] {
+    for route in ["named-profile", "external", "unsupported-local-executor"] {
         if route == "external" {
             tokio::fs::remove_file(&profile).await.unwrap();
             h.adapter.config.write().await.extra.insert(
                 "subagentRouting".into(),
                 json!({"worker":{"runtime":"external","agent_id":"remote-worker"}}),
             );
+        }
+        if route == "unsupported-local-executor" {
+            h.adapter
+                .config
+                .write()
+                .await
+                .extra
+                .remove("subagentRouting");
+            port.reject_builtin_route.store(true, Ordering::SeqCst);
         }
         let rejected = invoke_completed(
             &tool,
