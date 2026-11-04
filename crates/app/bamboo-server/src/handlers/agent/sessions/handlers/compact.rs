@@ -82,7 +82,10 @@ async fn compact_owned_session(
             "Direct compression requires an ordinary chat Session",
         ));
     }
-    if let Err(error) = owner.bind_root_actor(&state.agent, &observed).await {
+    if let Err(error) = owner
+        .bind_root_actor_compaction(&state.agent, &observed)
+        .await
+    {
         return Ok(conflict(format!("Session ownership changed: {error}")));
     }
     let writer = owner.root_actor_writer();

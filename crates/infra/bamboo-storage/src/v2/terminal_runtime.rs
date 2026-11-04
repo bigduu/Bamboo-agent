@@ -4,7 +4,9 @@
 
 use super::*;
 use crate::v2::DefaultWriterGuards;
-use bamboo_domain::{AgentRuntimeState, AgentStatusState, SessionKind};
+use bamboo_domain::{
+    is_root_compaction_lease_owner, AgentRuntimeState, AgentStatusState, SessionKind,
+};
 
 const HOST_PRIOR_ACTIVATION: &str = "runtime.host_prior_activation_fence";
 
@@ -207,6 +209,9 @@ impl SessionStoreV2 {
         let Some(activation) = entry.activation.as_ref() else {
             return Ok(());
         };
+        if is_root_compaction_lease_owner(&activation.lease_owner) {
+            return Ok(());
+        }
         let Some(status) = terminal_status(activation.status) else {
             return Ok(());
         };
@@ -798,7 +803,11 @@ impl SessionStoreV2 {
             }
         }
         if incoming.kind == bamboo_domain::SessionKind::Root {
-            if let Some(proof) = guards.root_actor.as_ref() {
+            if let Some(proof) = guards
+                .root_actor
+                .as_ref()
+                .filter(|proof| !is_root_compaction_lease_owner(&proof.owner().fence.lease_owner))
+            {
                 super::root_terminal_runtime::stamp_owned_observation(
                     &mut observed_incoming,
                     proof.owner(),
@@ -935,7 +944,8 @@ impl SessionStoreV2 {
                     ));
                 }
             }
-            if !candidate.has_runtime_wait()
+            if !is_root_compaction_lease_owner(&activation.lease_owner)
+                && !candidate.has_runtime_wait()
                 && !pending_delivery(&candidate)
                 && !latest.as_ref().is_some_and(|latest| {
                     activation.status == ActorActivationStatus::Succeeded

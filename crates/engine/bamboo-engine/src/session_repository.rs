@@ -178,10 +178,31 @@ impl SessionRepository {
         }
     }
 
-    async fn bind_root_actor_execution_inner(
+    async fn bind_root_actor(
         &self,
         session: &Session,
         run_id: &str,
+        for_compaction: bool,
+    ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
+        let repository = self.clone();
+        let session = session.clone();
+        let run_id = run_id.to_string();
+        // The complete claim/start handoff owns its state if the adapter stops
+        // waiting. An unobserved returned binding drops its exact-fence cleanup.
+        tokio::spawn(async move {
+            repository
+                .bind_root_actor_inner(&session, &run_id, for_compaction)
+                .await
+        })
+        .await
+        .map_err(|error| root_actor_binding_error(format!("Root binding task failed: {error}")))?
+    }
+
+    async fn bind_root_actor_inner(
+        &self,
+        session: &Session,
+        run_id: &str,
+        for_compaction: bool,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
         if session.kind != bamboo_domain::SessionKind::Root
             || !session.authority_identity.is_ordinary()
@@ -229,7 +250,11 @@ impl SessionRepository {
                 &bamboo_domain::ActorActivationClaim {
                     actor_id: session.id.clone(),
                     run_id: run_id.to_string(),
-                    lease_owner: format!("root-execution-{}", uuid::Uuid::new_v4()),
+                    lease_owner: if for_compaction {
+                        bamboo_domain::new_root_compaction_lease_owner()
+                    } else {
+                        format!("root-execution-{}", uuid::Uuid::new_v4())
+                    },
                     lease_expires_at: now + lease_seconds,
                     inbox_generation: session
                         .session_inbox_admission()
@@ -291,8 +316,10 @@ impl SessionRepository {
             .map_err(root_actor_binding_error)?;
         // Keep only a weak route to this exact execution's capability. Host
         // parent-outcome adapters never reconstruct an owner from observation.
-        self.root_actor_writers
-            .insert(session.id.clone(), Arc::downgrade(&live_owner));
+        if !for_compaction {
+            self.root_actor_writers
+                .insert(session.id.clone(), Arc::downgrade(&live_owner));
+        }
         Ok(Some(binding))
     }
 
@@ -764,18 +791,15 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         session: &Session,
         run_id: &str,
     ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
-        let repository = self.clone();
-        let session = session.clone();
-        let run_id = run_id.to_string();
-        // The complete claim/start handoff owns its state if the adapter stops
-        // waiting. An unobserved returned binding drops its exact-fence cleanup.
-        tokio::spawn(async move {
-            repository
-                .bind_root_actor_execution_inner(&session, &run_id)
-                .await
-        })
-        .await
-        .map_err(|error| root_actor_binding_error(format!("Root binding task failed: {error}")))?
+        self.bind_root_actor(session, run_id, false).await
+    }
+
+    async fn bind_root_actor_compaction(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> std::io::Result<Option<bamboo_domain::RootActorExecutionBinding>> {
+        self.bind_root_actor(session, run_id, true).await
     }
 
     async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {

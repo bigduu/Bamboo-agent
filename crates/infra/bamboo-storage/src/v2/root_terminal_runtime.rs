@@ -1,8 +1,8 @@
 //! Root logical terminal repair. No lease or cache observation proves Worker stop.
 use super::*;
 use bamboo_domain::{
-    AgentRuntimeState, AgentStatusState, RootActorRuntimeWrite, SessionKind,
-    SupervisedRootOutcomeResult,
+    is_root_compaction_lease_owner, AgentRuntimeState, AgentStatusState, RootActorRuntimeWrite,
+    SessionKind, SupervisedRootOutcomeResult,
 };
 use sha2::{Digest, Sha256};
 
@@ -270,9 +270,12 @@ impl SessionStoreV2 {
             .as_ref()
             .filter(|a| a.matches_fence(fence))
             .ok_or(ActorDirectoryError::StaleFence)?;
-        let main = self
-            .confirmed_root_main_outcome(entry, rel, fence, guards)
-            .await?;
+        let main = if is_root_compaction_lease_owner(&activation.lease_owner) {
+            None
+        } else {
+            self.confirmed_root_main_outcome(entry, rel, fence, guards)
+                .await?
+        };
         let selected = match main.as_ref() {
             Some(
                 SupervisedRootOutcomeResult::Completed | SupervisedRootOutcomeResult::Suspended,
@@ -429,6 +432,14 @@ impl SessionStoreV2 {
             .await?
             .ok_or(ActorDirectoryError::StaleFence)?;
         validate_projection_identity(&entry, &initial)?;
+        if is_root_compaction_lease_owner(&fence.lease_owner) {
+            // Compaction owns this exact fence and can close it even if its
+            // HTTP waiter was dropped. It has no chat outcome to project.
+            let (finished, _) = self
+                .settle_root_entry(&mut entry, &rel, &path, fence, Some(outcome), now, &guards)
+                .await?;
+            return Ok(finished);
+        }
         let active = entry
             .activation
             .as_ref()
@@ -537,6 +548,11 @@ impl SessionStoreV2 {
             let Some(activation) = entry.activation.as_ref() else {
                 return Ok(None);
             };
+            if is_root_compaction_lease_owner(&activation.lease_owner) {
+                // A previous compaction, including one interrupted by a crash,
+                // supplies no evidence about the preceding chat run.
+                return Ok(None);
+            }
             let fence = activation.fence();
             let attributed = matches_observation(&latest, &fence)?;
             if (!attributed
