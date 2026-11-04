@@ -195,7 +195,9 @@ impl RegisteredRoute {
                 .zip(self.model_limits_snapshot.as_ref())
                 .is_some_and(|(section, captured)| {
                     let live = section.snapshot();
-                    live.revision != captured.revision || live.data != captured.data
+                    live.revision != captured.revision
+                        || (!Arc::ptr_eq(&live.data, &captured.data)
+                            && live.data.0 != captured.data.0)
                 })
             || config.extra.get("model_limits") != self.legacy_model_limits.as_ref()
         {
