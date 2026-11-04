@@ -1,9 +1,9 @@
 //! Bounded text completion through the existing managed provider transport.
 
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use bamboo_domain::{Message, TokenUsage};
-use futures::StreamExt;
+use futures::{future::BoxFuture, StreamExt};
 use reqwest::{Client, RequestBuilder, Response};
 use tokio::time::{timeout, timeout_at, Instant};
 
@@ -19,17 +19,29 @@ pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_TIME: Duration = Duration::from_secs(60);
 
 tokio::task_local! {
-    static WORK_TEXT: Client;
+    static WORK_TEXT: Dispatch;
+}
+
+pub type Admission = Arc<dyn Fn() -> BoxFuture<'static, crate::provider::Result<()>> + Send + Sync>;
+
+#[derive(Clone)]
+struct Dispatch {
+    client: Client,
+    admit: Admission,
 }
 
 pub(crate) fn active() -> bool {
     WORK_TEXT.try_with(|_| ()).is_ok()
 }
 
-pub(crate) async fn send(request: RequestBuilder) -> reqwest::Result<Response> {
+pub(crate) async fn send(request: RequestBuilder) -> crate::provider::Result<Response> {
     match WORK_TEXT.try_with(Clone::clone) {
-        Ok(client) => client.execute(request.build()?).await,
-        Err(_) => request.send().await,
+        Ok(dispatch) => {
+            let request = request.build()?;
+            (dispatch.admit)().await?;
+            Ok(dispatch.client.execute(request).await?)
+        }
+        Err(_) => Ok(request.send().await?),
     }
 }
 
@@ -43,6 +55,14 @@ impl WorkTextClient {
     }
 }
 
+pub struct Request<'a> {
+    pub model: &'a str,
+    pub messages: &'a [Message],
+    pub input_cap: u32,
+    pub output_cap: u32,
+    pub remaining: Duration,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum WorkTextReply {
     Complete {
@@ -54,17 +74,21 @@ pub enum WorkTextReply {
 }
 
 /// Consume one already admitted text-only request through a Host-managed
-/// provider. The Host supplies the limits for the original reservation and
-/// owns route, scope, and receipt checks before calling this function.
+/// provider. Run the Host's exact admission proof at the physical send
+/// boundary, including after asynchronous provider bootstrap.
 pub async fn complete(
     client: &WorkTextClient,
     provider: &dyn LLMProvider,
-    model: &str,
-    messages: &[Message],
-    input_cap: u32,
-    output_cap: u32,
-    remaining: Duration,
+    request: Request<'_>,
+    admit: Admission,
 ) -> WorkTextReply {
+    let Request {
+        model,
+        messages,
+        input_cap,
+        output_cap,
+        remaining,
+    } = request;
     if input_cap == 0 || output_cap == 0 || remaining.is_zero() {
         return WorkTextReply::Unknown;
     }
@@ -72,7 +96,10 @@ pub async fn complete(
     timeout(
         remaining.min(MAX_REQUEST_TIME),
         WORK_TEXT.scope(
-            client.0.clone(),
+            Dispatch {
+                client: client.0.clone(),
+                admit,
+            },
             transport.scope(async {
                 let options = LLMRequestOptions {
                     request_purpose: Some("semantic_patrol".into()),
@@ -158,6 +185,10 @@ mod tests {
         Mock, MockServer, ResponseTemplate,
     };
 
+    fn allow() -> Admission {
+        Arc::new(|| Box::pin(async { Ok(()) }))
+    }
+
     async fn run(server: &MockServer, input_cap: u32) -> WorkTextReply {
         let client = build_http_client(&Config::default()).unwrap();
         let provider = OpenAIProvider::new("controlled-key")
@@ -166,11 +197,14 @@ mod tests {
         complete(
             &WorkTextClient::from_config(&Config::default()).unwrap(),
             &provider,
-            "configured-model",
-            &[Message::user("Evidence")],
-            input_cap,
-            64,
-            Duration::from_secs(5),
+            Request {
+                model: "configured-model",
+                messages: &[Message::user("Evidence")],
+                input_cap,
+                output_cap: 64,
+                remaining: Duration::from_secs(5),
+            },
+            allow(),
         )
         .await
     }
@@ -268,14 +302,87 @@ mod tests {
             complete(
                 &WorkTextClient::from_config(&Config::default()).unwrap(),
                 &Idle,
-                "idle",
-                &[],
-                100,
-                10,
-                remaining,
+                Request {
+                    model: "idle",
+                    messages: &[],
+                    input_cap: 100,
+                    output_cap: 10,
+                    remaining,
+                },
+                allow(),
             ),
         )
         .await;
         assert_eq!(result.unwrap(), WorkTextReply::Unknown);
+    }
+
+    #[tokio::test]
+    async fn authorization_revoked_during_provider_bootstrap_blocks_the_physical_send() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use tokio::sync::Notify;
+
+        struct Bootstrap<'a> {
+            inner: OpenAIProvider,
+            entered: &'a Notify,
+            resume: &'a Notify,
+        }
+
+        #[async_trait::async_trait]
+        impl LLMProvider for Bootstrap<'_> {
+            async fn chat_stream(
+                &self,
+                messages: &[Message],
+                tools: &[bamboo_domain::ToolSchema],
+                output: Option<u32>,
+                model: &str,
+            ) -> crate::provider::Result<crate::LLMStream> {
+                self.entered.notify_one();
+                self.resume.notified().await;
+                self.inner.chat_stream(messages, tools, output, model).await
+            }
+        }
+
+        let server = MockServer::start().await;
+        let entered = Notify::new();
+        let resume = Notify::new();
+        let provider = Bootstrap {
+            inner: OpenAIProvider::new("controlled-key").with_base_url(server.uri()),
+            entered: &entered,
+            resume: &resume,
+        };
+        let revoked = Arc::new(AtomicBool::new(false));
+        let proof = revoked.clone();
+        let guard: Admission = Arc::new(move || {
+            let proof = proof.clone();
+            Box::pin(async move {
+                if proof.load(Ordering::SeqCst) {
+                    return Err(crate::LLMError::RequestFailed("revoked".into()));
+                }
+                Ok(())
+            })
+        });
+        let client = WorkTextClient::from_config(&Config::default()).unwrap();
+        let messages = [Message::user("Scoped evidence")];
+        let (result, ()) = tokio::join!(
+            complete(
+                &client,
+                &provider,
+                Request {
+                    model: "configured-model",
+                    messages: &messages,
+                    input_cap: 100,
+                    output_cap: 10,
+                    remaining: Duration::from_secs(3),
+                },
+                guard
+            ),
+            async {
+                entered.notified().await;
+                revoked.store(true, Ordering::SeqCst);
+                resume.notify_one();
+            },
+        );
+        assert_eq!(result, WorkTextReply::Unknown);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 }
