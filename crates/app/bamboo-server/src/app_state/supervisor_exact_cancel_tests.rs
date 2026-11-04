@@ -83,6 +83,63 @@ fn args(action: &str, target: &SupervisorCurrentUserTarget, run: Option<&str>) -
 }
 
 #[actix_web::test]
+async fn supervisor_wait_wakes_only_after_the_observed_run_finalizes() {
+    use std::time::Duration;
+    let fixture = Box::pin(Fixture::new()).await;
+    let target = current_target(&fixture).await;
+    let mut runner = crate::app_state::AgentRunner::new();
+    runner.status = crate::app_state::AgentStatus::Running;
+    let run_id = runner.run_id.clone();
+    let token = runner.cancel_token.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &run_id)
+        .await
+        .unwrap();
+    let runners = &fixture.state.agent_runners;
+    runners.write().await.insert(TARGET.into(), runner);
+
+    let wait = args("wait_run", &target, Some(&run_id));
+    assert_eq!(
+        invoke(&fixture, wait.clone()).await.unwrap()["reason"],
+        "run_not_observed"
+    );
+    assert_eq!(
+        invoke(&fixture, args("observe_run", &target, None))
+            .await
+            .unwrap()["run_id"],
+        run_id
+    );
+    let mut waiter = Box::pin(invoke(&fixture, wait));
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+        .await
+        .is_err());
+
+    // A nonmatching owner cannot wake the waiter, and waiting cannot cancel the run.
+    assert!(
+        !bamboo_engine::execution::finalize_runner_exact(runners, TARGET, "different-run", &Ok(()))
+            .await
+    );
+    assert!(!token.is_cancelled());
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+        .await
+        .is_err());
+    assert!(
+        bamboo_engine::execution::finalize_runner_exact(runners, TARGET, &run_id, &Ok(())).await
+    );
+
+    let observed = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed["status"], "already_finished");
+    assert_eq!(observed["run_id"], run_id);
+    assert_eq!(observed["completion_verified"], false);
+    owner.finish(0).await.unwrap();
+}
+
+#[actix_web::test]
 async fn supervisor_exact_cancel_reports_request_then_finalization_and_fences_successor() {
     let fixture = Box::pin(Fixture::new()).await;
     grant_cancel(&fixture);

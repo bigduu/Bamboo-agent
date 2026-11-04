@@ -16,6 +16,15 @@ pub trait SupervisedRootRunPort: Send + Sync {
         target: &SupervisorCurrentUserTarget,
     ) -> Result<ToolResult, ToolError>;
 
+    async fn wait_run(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &SupervisorCurrentUserTarget,
+        _expected_run_id: &str,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Execution("managed_root_wait_unavailable".into()))
+    }
+
     async fn cancel_run(
         &self,
         caller: &SessionCallerReference,
