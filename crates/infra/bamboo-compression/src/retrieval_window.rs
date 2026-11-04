@@ -311,18 +311,13 @@ pub fn build_retrieval_window_candidate_plan_with_token_accounting(
     )
 }
 
-/// Build an emergency plan after the provider has already rejected the
-/// request for overflowing its context window.
+/// Archive every eligible old group while retaining the protected footprint.
 ///
-/// Provider tokenization and hidden request overhead make that rejection
-/// authoritative regardless of Bamboo's local projection. Archive every
-/// otherwise-eligible old group in one bounded pass: the provider/local
-/// accounting gap is unknown after a real rejection, so stopping at the normal
-/// target could make the sole retry overflow again even though more safe
-/// history was available. The configured percentage is still recorded for
-/// observability; `target_tokens` records the minimum active footprint allowed
-/// by the recent-turn floor.
-pub fn build_retrieval_window_critical_overflow_plan_with_token_accounting(
+/// Used when the desired target cannot be reached or when a provider rejected
+/// the locally estimated context size. The protected footprint must still fit
+/// the effective provider input limit. The plan records both that footprint
+/// and the configured target percentage.
+pub fn build_retrieval_window_full_archive_plan_with_token_accounting(
     session: &Session,
     budget: &TokenBudget,
     policy: RetrievalWindowPolicy,
@@ -343,7 +338,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
     budget: &TokenBudget,
     policy: RetrievalWindowPolicy,
     accounting: &RetrievalWindowTokenAccounting,
-    force_archive_after_provider_overflow: bool,
+    archive_all_eligible: bool,
     counter: &impl TokenCounter,
 ) -> Result<RetrievalWindowCandidatePlan, RetrievalWindowPlanError> {
     validate_inputs(budget, policy)?;
@@ -386,9 +381,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
         .fixed_prompt_tokens
         .checked_add(protected_active_tokens)
         .ok_or(RetrievalWindowPlanError::TokenAccountingOverflow)?;
-    if force_archive_after_provider_overflow
-        && minimum_projected_active_tokens > budget.max_request_input_tokens()
-    {
+    if archive_all_eligible && minimum_projected_active_tokens > budget.max_request_input_tokens() {
         return Err(RetrievalWindowPlanError::ProtectedContentExceedsTarget {
             projected_tokens: minimum_projected_active_tokens,
             target_tokens: budget.max_request_input_tokens(),
@@ -397,7 +390,7 @@ fn build_retrieval_window_candidate_plan_with_counter(
             incomplete_protocol_group_count,
         });
     }
-    let target_tokens = if force_archive_after_provider_overflow {
+    let target_tokens = if archive_all_eligible {
         minimum_projected_active_tokens
     } else {
         configured_target_tokens
@@ -758,19 +751,17 @@ fn validate_apply_plan_arithmetic(
         plan.request_input_limit_tokens,
         plan.target_usage_percent,
     );
-    // Critical provider-overflow recovery seals its one-shot target at the
-    // minimum protected footprint. That floor can exceed the configured target
-    // when recent protected content is already large, but a successful plan
-    // must still remove every otherwise-eligible group and land exactly on the
-    // protected floor. Ordinary plans may never relax the configured target.
+    // A full archive can exceed the configured target only by removing
+    // every eligible group and landing on the protected footprint within the
+    // effective provider input limit.
     let protected_with_fixed = plan
         .fixed_prompt_tokens
         .checked_add(plan.protected_active_tokens)
         .ok_or(RetrievalWindowApplyError::TokenAccountingOverflow)?;
-    let sealed_provider_overflow_plan = protected_with_fixed <= plan.request_input_limit_tokens
+    let sealed_full_archive_plan = protected_with_fixed <= plan.request_input_limit_tokens
         && plan.target_tokens == protected_with_fixed
         && plan.projected_active_tokens_after == protected_with_fixed;
-    if plan.target_tokens > expected_target && !sealed_provider_overflow_plan {
+    if plan.target_tokens > expected_target && !sealed_full_archive_plan {
         return Err(RetrievalWindowApplyError::InconsistentPlan {
             field: "target_tokens",
         });
