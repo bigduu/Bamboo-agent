@@ -258,12 +258,12 @@ where
                     result: Ok(response),
                 },
                 Ok(Err(error)) => RetryAttempt {
-                    retry: is_retryable_reqwest_error(&error),
+                    retry: matches!(&error, LLMError::Http(error) if is_retryable_reqwest_error(error)),
                     status: None,
                     retry_after: None,
                     deadline,
                     observation: None,
-                    result: Err(LLMError::Http(error)),
+                    result: Err(error),
                 },
                 Err(_) => RetryAttempt {
                     retry: true,
@@ -1111,15 +1111,20 @@ where
                     );
                 }
                 Ok(Err(error)) => {
-                    let retry = is_retryable_reqwest_error(&error);
-                    let kind = crate::providers::common::http_error_kind(&error);
+                    let (retry, kind) = match &error {
+                        LLMError::Http(error) => (
+                            is_retryable_reqwest_error(error),
+                            crate::providers::common::http_error_kind(error),
+                        ),
+                        _ => (false, "local admission"),
+                    };
                     let mut outcome = budget.failure(
                         budget.observation(attempt_started, "send_headers", kind, None),
                         (!retry).then_some(RequestStopReason::NonRetryableTransport),
                         None,
                     );
                     if !retry {
-                        outcome.result = Err(LLMError::Http(error));
+                        outcome.result = Err(error);
                     }
                     return outcome;
                 }
