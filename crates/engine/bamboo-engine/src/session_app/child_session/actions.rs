@@ -474,7 +474,14 @@ async fn create_child_action_inner(
 
     // Profile selection and runtime metadata now contain the final model
     // authority. Reject it before publishing workspace or persisting a child.
-    port.validate_child_model(&child).await?;
+    port.validate_child_model(&child)
+        .await
+        .map_err(|error| match error {
+            ChildSessionError::InvalidArguments(detail) => {
+                ChildSessionError::ModelNotAdmitted(detail)
+            }
+            other => other,
+        })?;
 
     // Publish the path that already passed the host's confinement and Project
     // ownership checks without applying process-global policy a second time.

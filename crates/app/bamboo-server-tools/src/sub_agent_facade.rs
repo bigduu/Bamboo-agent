@@ -3,8 +3,8 @@
 
 use bamboo_agent_core::tools::{ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::{
-    is_matching_session_message, ActorSession, Message, ParentRequest, Session, SessionKind,
-    SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    is_matching_session_message, ActorSession, Message, ParentRequest, ReasoningEffort, Session,
+    SessionKind, SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
     SessionMessageSource,
 };
 use bamboo_engine::session_app::child_session::{self, ChildSessionPort};
@@ -24,6 +24,8 @@ use uuid::Uuid;
 const MAX_RESULT_BYTES: usize = child_session::MAX_CHILD_RESULT_BYTES;
 pub(super) const OBSERVATION_LIMIT_ERROR: &str =
     "SubAgent observation exceeds its limit; request a smaller history slice";
+pub(super) const MODEL_NOT_ADMITTED_ERROR: &str =
+    "The SubAgent model route is not admitted. Check the configured provider and model before retrying.";
 #[cfg(test)]
 const MAX_TREE_NODES: usize = 32;
 #[cfg(test)]
@@ -72,6 +74,8 @@ struct FacadeArgs {
     intent: Intent,
     target: Option<String>,
     role: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<ReasoningEffort>,
     message: Option<String>,
     reply_to: Option<String>,
 }
@@ -95,14 +99,16 @@ pub(super) fn parameters_schema() -> Value {
             "intent": {"type":"string", "enum":["chat","inspect","control","ask_parent"], "description":"Defaults to chat. ask_parent is Child-only and uses message as a bounded clarification question; it suspends until the canonical direct parent replies."},
             "target": {"type":"string", "description":"Logical Child ActorId returned by this tool. Omit for chat to create a durable child, or inspect to request a tree scoped to this session. Root sees its full tree; an active Child with a Host canonical tree route sees only its owned subtree. The forced permission audit remains Root-only."},
             "role": {"type":"string", "description":"Only chat without target: select a named profile. Defaults include explorer (read-only exploration), implementer (bounded implementation), and reviewer (independent read-only review). Project overrides Global, then the builtin default. Omit for worker; no builtin role is implicitly selected. Invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture; the child uses only the tools the runtime exposes to the child. Role cannot change an existing target."},
-            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, diagnostics, messages, message, result, error, or a JSON query for pagination. Pass next_cursor unchanged with the same view; do not decode or edit it. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Control: cancel or retry. No host, worker, model, or mailbox parameters."},
+            "model": {"type":"string", "maxLength":256, "description":"Only chat creating a new Worker without target, role or reply_to. Select an admitted provider:model or a model on the parent provider. An unavailable selection fails before launch."},
+            "reasoning_effort": {"type":"string", "enum":["none","low","medium","high","xhigh","max"], "description":"Optional reasoning effort for a new Worker with an explicit model."},
+            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, diagnostics, messages, message, result, error, or a JSON query for pagination. Pass next_cursor unchanged with the same view; do not decode or edit it. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Control: cancel or retry. No host, physical worker, or mailbox identifiers."},
             "reply_to": {"type":"string", "description":"Exact pending direct-parent ParentRequest id. For forced permission use message exactly approve_once or deny; for a clarification use message as a bounded answer. Omit target and role. The Host checks the canonical request kind and deadline."}
         }
     })
 }
 
 pub(super) fn description() -> &'static str {
-    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
+    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. A fresh Worker with no role may select model=provider:model or a model on the parent provider, and optional reasoning_effort. Do not drop an explicitly requested model after a route rejection. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
 }
 
 /// Must run before launch-owner classification. Only legacy calls retain the
@@ -130,7 +136,7 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
     // choosing a route; non-empty identifiers still require canonical checks.
     // Keep the legacy/compact conflict check above on the original input.
     let object = args.as_object_mut().expect("object checked above");
-    for field in ["target", "role", "reply_to"] {
+    for field in ["target", "role", "reply_to", "model", "reasoning_effort"] {
         if object
             .get(field)
             .is_some_and(|value| value.is_null() || value.as_str() == Some(""))
@@ -143,6 +149,24 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
     let has_reply_to = args.get("reply_to").is_some();
     let parsed: FacadeArgs =
         serde_json::from_value(args).map_err(|_| invalid("Invalid compact SubAgent arguments"))?;
+    if parsed.model.is_some() || parsed.reasoning_effort.is_some() {
+        if parsed.intent != Intent::Chat || has_target || has_role || has_reply_to {
+            return Err(invalid(
+                "model selection is only available for a fresh Worker with no role",
+            ));
+        }
+        let model = parsed
+            .model
+            .as_deref()
+            .ok_or_else(|| invalid("reasoning_effort requires model"))?;
+        if model.trim().is_empty()
+            || model.trim() != model
+            || model.len() > 256
+            || model.chars().any(char::is_control)
+        {
+            return Err(invalid("model must be a bounded non-empty model reference"));
+        }
+    }
     if has_reply_to {
         if parsed.intent != Intent::Chat || has_target || has_role {
             return Err(invalid(
@@ -216,9 +240,16 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
                     .chars()
                     .take(80)
                     .collect();
-                json!({"action":"create", "title":title,
+                let mut create = json!({"action":"create", "title":title,
                     "responsibility":"Carry out the delegated task in the complete message.",
-                    "prompt":message, "subagent_type":parsed.role.unwrap_or_else(|| "worker".into())})
+                    "prompt":message, "subagent_type":parsed.role.unwrap_or_else(|| "worker".into())});
+                if let Some(model) = parsed.model {
+                    create["model"] = json!(model);
+                }
+                if let Some(effort) = parsed.reasoning_effort {
+                    create["reasoning_effort"] = json!(effort);
+                }
+                create
             };
             (args, Projection::Chat)
         }
@@ -833,11 +864,12 @@ pub(super) fn finish(
             bounded_result(result, project(projection, &value))
         }
         Ok(_) => Err(ToolError::Execution("Unexpected SubAgent operation disposition".into())),
-        // This bounded, caller-actionable error contains no internal state.
+        // These bounded, caller-actionable errors contain no internal state.
         // Keep all other argument failures redacted at the facade boundary.
         Err(ToolError::InvalidArguments(message))
             if projection == Projection::Chat
-                && message == bamboo_domain::ChildContextPacketError::Budget.to_string() =>
+                && (message == MODEL_NOT_ADMITTED_ERROR
+                    || message == bamboo_domain::ChildContextPacketError::Budget.to_string()) =>
         {
             Err(ToolError::InvalidArguments(message))
         }
@@ -1122,6 +1154,30 @@ mod tests {
     }
 
     #[test]
+    fn compact_worker_keeps_explicit_model_and_effort_on_create_only() {
+        let model = "configured:deepseek-flash";
+        let request = normalize(json!({
+            "intent":"chat", "message":"Inspect an issue", "model":model, "reasoning_effort":"max"
+        }))
+        .unwrap();
+        assert_eq!(request.args["action"], "create");
+        assert_eq!(request.args["subagent_type"], "worker");
+        assert_eq!(request.args["model"], model);
+        assert_eq!(request.args["reasoning_effort"], "max");
+
+        for invalid in [
+            json!({"message":"task", "model":model, "role":"reviewer"}),
+            json!({"message":"task", "model":model, "target":"existing"}),
+            json!({"message":"task", "model":model, "reply_to":"request_123"}),
+            json!({"intent":"inspect", "model":model}),
+            json!({"message":"task", "reasoning_effort":"max"}),
+            json!({"message":"task", "model":"bad\nmodel"}),
+        ] {
+            assert!(normalize(invalid).is_err());
+        }
+    }
+
+    #[test]
     fn legacy_calls_are_unchanged_and_compact_runtime_parameters_are_rejected() {
         for args in [
             json!({"action":"list"}),
@@ -1133,7 +1189,7 @@ mod tests {
             assert_eq!(normalized.projection, None);
         }
         for args in [
-            json!({"message":"task", "model":"physical"}),
+            json!({"message":"task", "host":"physical"}),
             json!({"message":"task", "reply_to":"unsafe/request"}),
             json!({"action":"create", "intent":"chat"}),
             json!({"target":" child ", "message":"task"}),

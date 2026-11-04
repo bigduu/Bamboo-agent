@@ -7638,6 +7638,7 @@ fn child_report_fixture() -> serde_json::Value {
 #[tokio::test]
 async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
     let h = build_test_harness_with_storage(None, None, true).await;
+    configure_test_runtime_models(&h, &["gpt-5", "private/custom-child"]).await;
     let mut parent = h
         .storage
         .load_session(&h.parent_session_id)
@@ -7654,9 +7655,29 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
     port.skip_successful_enqueue.store(true, Ordering::SeqCst);
     let tool = SubAgentTool::new(port.clone(), h.adapter.clone());
     let message = "  Analyze this complete task 🪷\n\nPreserve every instruction and the trailing whitespace.  ";
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    let rejected = invoke_completed(
+        &tool,
+        json!({"message":message, "model":"relay:upstream-only"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-rejected-model"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        rejected.to_string().contains("model route is not admitted"),
+        "{rejected}"
+    );
+    assert!(!rejected.to_string().contains("upstream-only"));
+    assert_eq!(
+        h.adapter.session_store.list_index_entries().await.len(),
+        before
+    );
+    assert!(port.last_admit_child_id.read().unwrap().is_none());
+
     for (index, args) in [
         json!({"message":message}),
         json!({"intent":"chat", "role":"explorer", "target":"", "reply_to":"", "message":message}),
+        json!({"message":message, "model":"relay:private/custom-child", "reasoning_effort":"max"}),
     ]
     .into_iter()
     .enumerate()
@@ -7683,10 +7704,10 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
         assert_eq!(child.metadata["assignment_prompt"], message);
         // Named roles encode the complete task as JSON in their protected
         // context packet; the generic worker keeps the literal assignment.
-        let visible_assignment = if index == 0 {
-            message.to_owned()
-        } else {
+        let visible_assignment = if index == 1 {
             serde_json::to_string(message).unwrap()
+        } else {
+            message.to_owned()
         };
         assert!(child
             .messages
@@ -7697,6 +7718,14 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
             assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
             assert!(child_session::named_profile::has_named_profile(&child));
             child_session::named_profile::validate_named_profile(&child).unwrap();
+        }
+        if index == 2 {
+            assert_eq!(child.model, "private/custom-child");
+            assert_eq!(child.model_ref.unwrap().provider, "relay");
+            assert_eq!(
+                child.reasoning_effort,
+                Some(bamboo_domain::ReasoningEffort::Max)
+            );
         }
         assert_eq!(
             child.workspace.as_deref(),
