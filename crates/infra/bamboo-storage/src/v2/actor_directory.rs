@@ -1059,6 +1059,16 @@ impl ActorDirectoryPort for SessionStoreV2 {
         {
             return Err(ActorDirectoryError::InvalidIdentity);
         }
+        if bamboo_domain::is_root_compaction_lease_owner(&claim.lease_owner)
+            && (matches!(
+                current.last_run_status().as_deref(),
+                Some("pending" | "running" | "suspended")
+            ) || bamboo_domain::conversation_compaction_pending_rejection(&current).is_some())
+        {
+            // Preserve the preceding Actor's recovery authority when its
+            // conversation still needs a live or pending Run.
+            return Err(ActorDirectoryError::Busy);
+        }
         let mut entry = self
             .read_or_create_actor_entry(&claim.actor_id, &rel, &path, &guards)
             .await?;

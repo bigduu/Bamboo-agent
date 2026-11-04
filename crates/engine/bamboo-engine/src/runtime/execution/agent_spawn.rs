@@ -167,6 +167,15 @@ impl SessionExecutionReservation {
         agent: &Agent,
         session: &Session,
     ) -> std::io::Result<()> {
+        self.bind_root_actor_inner(agent, session, false).await
+    }
+
+    async fn bind_root_actor_inner(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+        for_compaction: bool,
+    ) -> std::io::Result<()> {
         if self.root_actor.is_none() {
             if self.session_id != session.id {
                 return Err(std::io::Error::new(
@@ -174,11 +183,17 @@ impl SessionExecutionReservation {
                     "Root binding target mismatch",
                 ));
             }
-            if let Some(binding) = agent
-                .persistence()
-                .bind_root_actor_execution(session, &self.run_id)
-                .await?
-            {
+            let persistence = agent.persistence();
+            let binding = if for_compaction {
+                persistence
+                    .bind_root_actor_compaction(session, &self.run_id)
+                    .await?
+            } else {
+                persistence
+                    .bind_root_actor_execution(session, &self.run_id)
+                    .await?
+            };
+            if let Some(binding) = binding {
                 self.root_actor = Some(Box::new(RootActorExecution::start(binding)));
             }
         }
@@ -612,6 +627,18 @@ impl SessionPreparationReservation {
             .as_mut()
             .expect("live preparation")
             .bind_root_actor(agent, session)
+            .await
+    }
+
+    pub async fn bind_root_actor_compaction(
+        &mut self,
+        agent: &Agent,
+        session: &Session,
+    ) -> std::io::Result<()> {
+        self.reservation
+            .as_mut()
+            .expect("live preparation")
+            .bind_root_actor_inner(agent, session, true)
             .await
     }
 

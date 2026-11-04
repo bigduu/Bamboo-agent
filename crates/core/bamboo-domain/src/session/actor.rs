@@ -12,6 +12,21 @@ use crate::ProjectId;
 
 pub const ACTOR_DIRECTORY_SCHEMA_VERSION: u32 = 2;
 
+// Keep the maintenance purpose in the persisted, exact lease identity so a
+// restart can distinguish it from chat without changing the Actor schema.
+const ROOT_COMPACTION_LEASE_OWNER_PREFIX: &str = "root-compaction-";
+
+pub fn new_root_compaction_lease_owner() -> String {
+    format!(
+        "{ROOT_COMPACTION_LEASE_OWNER_PREFIX}{}",
+        uuid::Uuid::new_v4()
+    )
+}
+
+pub fn is_root_compaction_lease_owner(owner: &str) -> bool {
+    owner.starts_with(ROOT_COMPACTION_LEASE_OWNER_PREFIX)
+}
+
 /// A stable logical address. It is always exactly Session.id.
 pub type ActorId = String;
 

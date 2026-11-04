@@ -245,6 +245,16 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
+    /// Claim the same fenced Root writer for direct compaction without
+    /// attributing its writes or completion to a chat run.
+    async fn bind_root_actor_compaction(
+        &self,
+        _session: &Session,
+        _run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        Ok(None)
+    }
+
     /// Persist the session, merging any newer authoritative metadata from disk.
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()>;
 
@@ -779,6 +789,15 @@ impl<T: RuntimeSessionPersistence + ?Sized> RuntimeSessionPersistence for Arc<T>
     ) -> io::Result<Option<RootActorExecutionBinding>> {
         (**self).bind_root_actor_execution(session, run_id).await
     }
+
+    async fn bind_root_actor_compaction(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<Option<RootActorExecutionBinding>> {
+        (**self).bind_root_actor_compaction(session, run_id).await
+    }
+
     async fn save_runtime_session(&self, session: &mut Session) -> io::Result<()> {
         (**self).save_runtime_session(session).await
     }

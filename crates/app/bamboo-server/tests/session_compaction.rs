@@ -150,21 +150,31 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
             .with_test_writer()
             .finish(),
     );
-    for (strategy, kind) in [
+    for (strategy, kind, prior_status) in [
         (
             ContextManagementStrategy::Summary,
             CompressionEventKind::Summary,
+            "error",
         ),
         (
             ContextManagementStrategy::MessageSummary,
             CompressionEventKind::MessageSummary,
+            "cancelled",
         ),
         (
             ContextManagementStrategy::RetrievalWindow,
             CompressionEventKind::RetrievalWindow,
+            "completed",
         ),
     ] {
-        let (_home, state, probe, before) = fixture(strategy).await;
+        let (_home, state, probe, mut before) = fixture(strategy).await;
+        before.set_last_run_status(prior_status);
+        if prior_status != "completed" {
+            before.set_last_run_error("Previous chat diagnostic");
+        }
+        before.synchronize_terminal_runtime_status();
+        state.storage.save_session(&before).await.unwrap();
+        let before = state.storage.load_session(ID).await.unwrap().unwrap();
         let mut events = state.get_session_event_sender(ID).await.subscribe();
         let app =
             test::init_service(App::new().app_data(state.clone()).configure(agent_routes)).await;
@@ -180,7 +190,7 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
         assert!(after > 0.0 && after <= 25.0, "{strategy:?}: {body}");
         assert_eq!(body["token_usage"]["max_context_tokens"], WINDOW);
         let durable = state.storage.load_session(ID).await.unwrap().unwrap();
-        assert_eq!(durable.last_run_status(), before.last_run_status());
+        assert_previous_run(&durable, &before);
         let [event] = durable.compression_events.as_slice() else {
             panic!("expected one durable compression event");
         };
@@ -193,7 +203,7 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
             panic!("expected the committed budget event");
         };
         assert_eq!(json!(usage), body["token_usage"]);
-        for original in before.messages {
+        for original in &before.messages {
             let saved = durable
                 .messages
                 .iter()
@@ -236,6 +246,8 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
         .await;
         assert_eq!(response["status"], "unchanged", "{strategy:?}: {response}");
         assert_eq!(probe.summaries.load(Ordering::SeqCst), summary_calls);
+        let unchanged = state.storage.load_session(ID).await.unwrap().unwrap();
+        assert_previous_run(&unchanged, &durable);
     }
 }
 
@@ -249,6 +261,7 @@ async fn compact_session_refuses_pending_work_before_calling_a_model() {
         test::call_service(&app, test::TestRequest::post().uri(ENDPOINT).to_request()).await;
     assert_eq!(response.status(), StatusCode::CONFLICT);
     let stored = state.storage.load_session(ID).await.unwrap().unwrap();
+    assert_eq!(stored.last_run_status().as_deref(), Some("pending"));
     assert!(stored.compression_events.is_empty());
     assert!(stored.messages.iter().all(|message| !message.compressed));
     assert_eq!(probe.summaries.load(Ordering::SeqCst), 0);
@@ -263,6 +276,7 @@ async fn compact_session_refuses_pending_work_before_calling_a_model() {
 #[actix_web::test]
 async fn compact_session_fences_duplicate_requests_and_leaves_failed_summary_unpublished() {
     let (_home, state, probe, _) = fixture(ContextManagementStrategy::Summary).await;
+    let before = state.storage.load_session(ID).await.unwrap().unwrap();
     probe.fail_once.store(true, Ordering::SeqCst);
     let app = test::init_service(App::new().app_data(state.clone()).configure(agent_routes)).await;
     let first = test::call_service(&app, test::TestRequest::post().uri(ENDPOINT).to_request());
@@ -278,6 +292,8 @@ async fn compact_session_fences_duplicate_requests_and_leaves_failed_summary_unp
     let (failed, ()) = tokio::join!(first, during);
     assert_eq!(failed.status(), StatusCode::UNPROCESSABLE_ENTITY);
     let stored = state.storage.load_session(ID).await.unwrap().unwrap();
+    assert_previous_run(&stored, &before);
+    assert_eq!(stored.agent_runtime_state, before.agent_runtime_state);
     assert!(stored.compression_events.is_empty());
     assert!(stored.messages.iter().all(|message| !message.compressed));
     assert!(stored.conversation_summary.is_none());
@@ -288,4 +304,85 @@ async fn compact_session_fences_duplicate_requests_and_leaves_failed_summary_unp
         .current_run_id(ID)
         .await
         .is_none());
+}
+
+fn assert_previous_run(current: &Session, before: &Session) {
+    assert_eq!(current.last_run_status(), before.last_run_status());
+    assert_eq!(current.last_run_error(), before.last_run_error());
+    let mut current_runtime = current.agent_runtime_state.clone();
+    if let (Some(current), Some(before)) = (&mut current_runtime, &before.agent_runtime_state) {
+        // A successful compaction can append its own hook checkpoint.
+        let added = current
+            .checkpoints
+            .strip_prefix(before.checkpoints.as_slice())
+            .expect("prior hook checkpoints are retained");
+        assert!(added
+            .iter()
+            .all(|checkpoint| checkpoint.hook_point == "BeforeCompression"));
+        current.checkpoints.truncate(before.checkpoints.len());
+    }
+    assert_eq!(current_runtime, before.agent_runtime_state);
+    for key in [
+        "runtime.root_writer_observation_v1",
+        "runtime.reconciled_activation_fence",
+    ] {
+        assert_eq!(current.metadata.get(key), before.metadata.get(key), "{key}");
+    }
+}
+
+#[actix_web::test]
+async fn dropping_compaction_preserves_the_run_and_releases_its_writer() {
+    let (_home, state, probe, _) = fixture(ContextManagementStrategy::Summary).await;
+    let before = state.storage.load_session(ID).await.unwrap().unwrap();
+    probe.fail_once.store(true, Ordering::SeqCst);
+    let app = test::init_service(App::new().app_data(state.clone()).configure(agent_routes)).await;
+    let mut request = Box::pin(test::call_service(
+        &app,
+        test::TestRequest::post().uri(ENDPOINT).to_request(),
+    ));
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        tokio::select! {
+            _ = &mut request => panic!("compaction finished before the provider blocked"),
+            _ = probe.entered.notified() => {}
+        }
+    })
+    .await
+    .expect("compaction reached its summary provider");
+    drop(request);
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while state
+            .session_activation_router
+            .current_run_id(ID)
+            .await
+            .is_some()
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("detached cleanup released the logical owner");
+    let after_drop = state.storage.load_session(ID).await.unwrap().unwrap();
+    assert_previous_run(&after_drop, &before);
+    assert_eq!(after_drop.agent_runtime_state, before.agent_runtime_state);
+    assert!(after_drop.compression_events.is_empty());
+
+    let recovered = state
+        .storage
+        .reconcile_session_runtime(
+            &after_drop,
+            chrono::Utc::now(),
+            None,
+            Arc::new(|_| panic!("compaction is not a chat outcome")),
+        )
+        .await
+        .unwrap();
+    assert!(recovered.is_none());
+    let retry: Value =
+        test::call_and_read_body_json(&app, test::TestRequest::post().uri(ENDPOINT).to_request())
+            .await;
+    assert_eq!(retry["status"], "compacted", "{retry}");
+    let durable = state.storage.load_session(ID).await.unwrap().unwrap();
+    assert_previous_run(&durable, &before);
+    assert_eq!(probe.chat_turns.load(Ordering::SeqCst), 0);
 }
