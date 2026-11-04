@@ -69,13 +69,36 @@ impl Fixture {
     }
 
     async fn bind(&self, store: Arc<SessionStoreV2>, run_id: &str) -> RootActorExecutionBinding {
+        self.bind_with_lease(store, run_id, None).await
+    }
+
+    async fn bind_expiring(
+        &self,
+        store: Arc<SessionStoreV2>,
+        run_id: &str,
+    ) -> RootActorExecutionBinding {
+        self.bind_with_lease(store, run_id, Some(Duration::from_secs(1)))
+            .await
+    }
+
+    async fn bind_with_lease(
+        &self,
+        store: Arc<SessionStoreV2>,
+        run_id: &str,
+        short_lease: Option<Duration>,
+    ) -> RootActorExecutionBinding {
         let repository = SessionRepository::new(
             Arc::default(),
             store.clone(),
             Arc::new(LockedSessionStore::new(store.clone())),
         )
-        .with_root_actor_directory(store)
-        .with_root_lease_override(Duration::from_secs(1));
+        .with_root_actor_directory(store);
+        // Current owners need the real repository default throughout publication.
+        // Only explicit expiry controls opt into the original short test lease.
+        let repository = match short_lease {
+            Some(duration) => repository.with_root_lease_override(duration),
+            None => repository,
+        };
         tokio::time::timeout(
             WAIT,
             repository.bind_root_actor_execution(&self.root, run_id),
@@ -284,7 +307,7 @@ async fn bound_generic_started_critical_and_history_wait_for_actual_account_rece
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_legacy_fallback() {
     let fixture = Fixture::new().await;
-    let a = fixture.bind(fixture.a.clone(), "run-a").await;
+    let a = fixture.bind_expiring(fixture.a.clone(), "run-a").await;
     let mut live = fixture.sink.subscribe();
     // Independent forwarders isolate the two rejection branches while using
     // the same real A capability; neither is a replacement production claim.
@@ -306,8 +329,11 @@ async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_l
     assert!(b.owner.fence.attempt > a.owner.fence.attempt);
     assert!(b.owner.fence.lease_epoch > a.owner.fence.lease_epoch);
     let mut successor = Forwarder::new(&fixture, fixture.b.clone(), &b, "run-b");
-    assert!(matches!(session_event(&mut successor.session).await,
-        AgentEvent::ExecutionStarted { run_id, .. } if run_id == "run-b"));
+    let started = session_event(&mut successor.session).await;
+    assert!(
+        matches!(&started, AgentEvent::ExecutionStarted { run_id, .. } if run_id == "run-b"),
+        "current successor must publish its original Started frame, got {started:?}"
+    );
     assert_eq!(account_event(&mut live).await.seq, 3);
 
     critical
@@ -413,6 +439,48 @@ async fn reclaimed_generic_root_rejects_critical_cache_and_history_ack_without_l
         .await
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_current_root_rejects_started_without_account_or_legacy_publication() {
+    let fixture = Fixture::new().await;
+    let binding = fixture
+        .bind_expiring(fixture.a.clone(), "run-expired")
+        .await;
+    let mut live = fixture.sink.subscribe();
+    fixture.expire(&binding).await;
+    let actual = fixture
+        .a
+        .inspect_actor(ROOT)
+        .await
+        .unwrap()
+        .activation
+        .unwrap();
+    assert!(actual.fence() == binding.owner.fence);
+    assert!(actual.lease_expires_at <= Utc::now());
+
+    let mut forwarder = Forwarder::new(&fixture, fixture.a.clone(), &binding, "run-expired");
+    assert_root_interruption(&session_event(&mut forwarder.session).await);
+    tokio::time::timeout(WAIT, forwarder.task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        forwarder.session.try_recv(),
+        Err(TryRecvError::Empty)
+    ));
+    assert!(matches!(live.try_recv(), Err(TryRecvError::Empty)));
+    assert!(matches!(
+        forwarder.legacy.try_recv(),
+        Err(mpsc::error::TryRecvError::Disconnected)
+    ));
+    assert!(journal::read_since(fixture.sink.events_dir(), 0)
+        .unwrap()
+        .is_empty());
+    let runners = forwarder.runners.read().await;
+    let runner = runners.get(ROOT).unwrap();
+    assert!(runner.last_critical_events.is_empty());
+    assert!(runner.last_event_at.is_none());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

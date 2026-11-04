@@ -16,8 +16,8 @@ use std::{
 use async_trait::async_trait;
 use bamboo_tickets::{
     AssignmentState, Authority, ClaimCandidate, ClaimDecision, Command, DispatchSpec, EffectState,
-    Error, ExecutionWorkspace, Operation, Result, ScopeBinding, SnapshotRef, TicketService,
-    WorkState, CLAIM_CANDIDATE_LIMIT,
+    Error, ExecutionWorkspace, Operation, Result, ScopeBinding, Snapshot, SnapshotRef,
+    TicketService, WorkState, CLAIM_CANDIDATE_LIMIT,
 };
 use tokio::{sync::Notify, task::JoinHandle, time::Instant};
 use tokio_util::sync::CancellationToken;
@@ -105,6 +105,7 @@ pub struct ReadyAdmissionFence {
     expires: Instant,
     retry: Option<ready_recovery::RetryDeadline>,
     revoked: CancellationToken,
+    patrol_policy: Option<Arc<ReadyWorkPolicy>>,
 }
 
 impl std::fmt::Debug for ReadyAdmissionFence {
@@ -116,6 +117,38 @@ impl std::fmt::Debug for ReadyAdmissionFence {
 }
 
 impl ReadyAdmissionFence {
+    /// Match the currently adopted execution to the original Ready decision
+    /// before preparing or releasing semantic evidence.
+    pub fn check_semantic_scope(&self, snapshot: &Snapshot, scope: &patrol::Scope) -> Result<()> {
+        self.check()?;
+        let denied = || Error::ScopeDenied("Semantic patrol differs from the Ready grant".into());
+        let policy = self.patrol_policy.as_ref().ok_or_else(denied)?;
+        let grant = policy
+            .grants
+            .iter()
+            .find(|grant| grant.work_id == scope.work_id)
+            .ok_or_else(denied)?;
+        let work = snapshot.tickets.get(&scope.work_id).ok_or_else(denied)?;
+        let assignment = snapshot
+            .assignments
+            .get(&scope.assignment_id)
+            .ok_or_else(denied)?;
+        if scope.project_id != policy.project_id.as_str()
+            || snapshot.project.links.get(&work.id) != Some(&policy.project_id)
+            || work.active_assignment.as_ref() != Some(&assignment.id)
+            || work.contract_revision != grant.contract_revision
+            || assignment.work_id != work.id
+            || assignment.contract_revision != grant.contract_revision
+            || assignment.generation != scope.generation
+            || assignment.authority_epoch != scope.authority_epoch
+            || assignment.workspace.as_ref() != Some(&grant.workspace)
+            || snapshot.project.assignment_contexts.get(&assignment.id) != Some(&grant.context_hash)
+        {
+            return Err(denied());
+        }
+        Ok(())
+    }
+
     /// A staged program notice has no retry admission or model permission.
     /// Its caller must cancel this gate on drop; the Inbox checks its deadline
     /// under the actual synchronous publication mutex, including late disk jobs.
@@ -156,8 +189,9 @@ pub trait ReadyWorkHost: Send + Sync {
     async fn authority(&self) -> Result<(Arc<TicketService>, Authority)>;
     async fn check_budget(&self, max_rounds: u32) -> Result<()>;
     /// Observe only the Works selected by this already installed Host policy.
-    /// This creates no grant, diagnostic model call or recovery action. The
-    /// Host may stage a bounded decision notice without granting activation.
+    /// The Host may stage a bounded decision notice or a diagnostic under
+    /// this live fence and the canonical Work budget. The pass grants no
+    /// additional execution authority.
     async fn reconcile_program_patrol(
         &self,
         _selection: &patrol::program::ProgramSelection<'_>,
@@ -242,6 +276,16 @@ pub struct ReadyWorkScheduler {
 }
 
 impl ReadyWorkScheduler {
+    /// Permission observation only; it proves no execution or progress. Never
+    /// wait behind queue backpressure: an owner must still be able to revoke.
+    pub fn policy_is_active(&self) -> Option<bool> {
+        self.state.try_lock().ok().map(|state| {
+            state.as_ref().is_some_and(|installed| {
+                !installed.revoked.is_cancelled() && Instant::now() < installed.expires
+            })
+        })
+    }
+
     /// Host-only retry metadata; installing this store does not install a policy.
     pub fn with_recovery(
         store: Arc<dyn ready_recovery::ReadyRetryStore>,
@@ -430,14 +474,15 @@ impl ReadyWorkScheduler {
         host: &dyn ReadyWorkHost,
         installed: &mut InstalledPolicy,
     ) -> Result<ReadyReconcile> {
-        let policy = installed.policy.clone();
+        let policy = Arc::new(installed.policy.clone());
         host.check_budget(policy.max_rounds).await?;
         let (service, authority) = host.authority().await?;
-        let (commit, snapshot) = service.published()?;
+        let (_, snapshot) = service.published()?;
         if snapshot.binding != installed.binding || snapshot.authority_epoch != installed.epoch {
             return Ok(ReadyReconcile::Disabled);
         }
-        let patrol_fence = self.admission_fence(installed, None);
+        let mut patrol_fence = self.admission_fence(installed, None);
+        patrol_fence.patrol_policy = Some(policy.clone());
         let work_ids: Vec<_> = policy
             .grants
             .iter()
@@ -453,9 +498,15 @@ impl ReadyWorkScheduler {
         {
             // A degraded observer never changes Work facts or blocks otherwise
             // legal dispatch. Keep the actual error visible for the next pass.
-            tracing::warn!(%error, "Ready Work program patrol remains unavailable");
+            tracing::warn!(%error, "Ready Work patrol remains unavailable");
         }
         patrol_fence.check()?;
+        // Patrol accounting may advance HEAD while preserving the execution
+        // facts. Any later Start or retry still uses a fresh canonical view.
+        let (commit, snapshot) = service.published()?;
+        if snapshot.binding != installed.binding || snapshot.authority_epoch != installed.epoch {
+            return Ok(ReadyReconcile::Disabled);
+        }
         let mut candidates = Vec::new();
         let mut retry_permits = BTreeMap::new();
         let mut blocked = None;
@@ -801,6 +852,7 @@ impl ReadyWorkScheduler {
         ReadyAdmissionFence {
             expires: installed.expires,
             revoked: installed.revoked.clone(),
+            patrol_policy: None,
             retry: self
                 .recovery
                 .as_ref()

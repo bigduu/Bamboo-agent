@@ -188,7 +188,7 @@ pub async fn prepare_execute(
     })
 }
 
-fn resolve_execution_model(
+pub(crate) fn resolve_execution_model(
     session: &Session,
     input: &ExecuteInput,
     config: &ExecutionConfigSnapshot,

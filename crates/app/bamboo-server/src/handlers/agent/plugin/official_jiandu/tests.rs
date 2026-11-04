@@ -7,7 +7,7 @@ fn digest(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-async fn isolated_state(data_dir: PathBuf, memory_root: PathBuf) -> web::Data<AppState> {
+pub(super) async fn isolated_state(data_dir: PathBuf, memory_root: PathBuf) -> web::Data<AppState> {
     let mut state = AppState::new_with_memory_store(
         data_dir,
         bamboo_memory::memory_store::MemoryStore::new(memory_root),
@@ -88,7 +88,7 @@ async fn save(state: &AppState, entry: InstalledPlugin) {
     .await
     .unwrap();
 }
-fn mac() -> Host {
+pub(super) fn mac() -> Host {
     Host::for_platform("macos", "aarch64", None)
 }
 
@@ -158,6 +158,7 @@ async fn passive_http_metadata_and_official_action_reject_caller_sources() {
     // Removing publisher trust blocks the official action even in generic manual Off mode.
     {
         let mut config = state.config.write().await;
+        config.plugin_trust.publisher_mode = bamboo_config::PublisherMode::Explicit;
         config.plugin_trust.trusted_keys.clear();
         config.plugin_trust.enforcement = PluginTrustEnforcement::Off;
     }
@@ -243,7 +244,12 @@ async fn incomplete_untrusted_foreign_or_unsigned_provenance_never_exports_a_com
             .is_none());
     }
     save(&state, original).await;
-    state.config.write().await.plugin_trust.trusted_keys.clear();
+    state
+        .config
+        .write()
+        .await
+        .plugin_trust
+        .revoke_official_publisher("jiandu");
     assert!(setup(&state, mac(), Some(release.clone()))
         .await
         .unwrap()

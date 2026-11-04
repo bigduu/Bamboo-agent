@@ -38,6 +38,7 @@ const MAX_ROUNDS: u32 = 4;
 enum Reply {
     Task,
     LoopTask(u32),
+    File(ToolCall),
     Complete,
 }
 
@@ -133,6 +134,7 @@ impl LLMProvider for ControlledProvider {
                     .to_string(),
                 },
             }]),
+            Reply::File(call) => LLMChunk::ToolCalls(vec![call]),
             Reply::Complete => LLMChunk::Token(RESULT.into()),
         };
         Ok(Box::pin(futures::stream::iter([
@@ -219,7 +221,7 @@ impl Work {
 }
 
 struct Fixture {
-    state: AppState,
+    state: actix_web::web::Data<AppState>,
     requests: mpsc::UnboundedReceiver<Request>,
     provider: Arc<ControlledProvider>,
     project: ProjectId,
@@ -290,11 +292,27 @@ fn workspace(root: &Path, index: usize) -> ExecutionWorkspace {
 
 impl Fixture {
     async fn new(work_count: usize) -> Self {
+        Self::with_explicit_scope(work_count, false).await
+    }
+
+    async fn with_explicit_scope(work_count: usize, explicit: bool) -> Self {
+        Self::with_tools(work_count, explicit, &["Task"]).await
+    }
+
+    async fn with_tools(work_count: usize, explicit: bool, allowed_tools: &[&str]) -> Self {
         let root = tempfile::tempdir().unwrap();
         // The named-profile reader opens the physical home without following
         // symlinks. macOS TempDir may use /var; pass its canonical directory to
         // every Host adapter, as the same-root lifecycle fixture already does.
         let physical_root = root.path().canonicalize().unwrap();
+        if explicit {
+            use bamboo_domain::Storage;
+            let storage = SessionStoreV2::new(physical_root.clone()).await.unwrap();
+            storage
+                .get_or_create_default_supervisor(MODEL)
+                .await
+                .unwrap();
+        }
         let (send, requests) = mpsc::unbounded_channel();
         let provider = Arc::new(ControlledProvider {
             requests: send,
@@ -312,19 +330,44 @@ impl Fixture {
             .memory_mut()
             .get_or_insert_with(Default::default)
             .auto_dream_enabled = false;
-        let state = AppState::new_with_provider_and_memory_store(
-            physical_root.clone(),
-            config,
-            provider.clone(),
-            bamboo_memory::memory_store::MemoryStore::new(physical_root.join("jiandu")),
-        )
-        .await
-        .unwrap();
+        let state = actix_web::web::Data::new(
+            Box::pin(AppState::new_with_provider_and_memory_store(
+                physical_root.clone(),
+                config,
+                provider.clone(),
+                bamboo_memory::memory_store::MemoryStore::new(physical_root.join("jiandu")),
+            ))
+            .await
+            .unwrap(),
+        );
         // Keep the shared registry Arc already held by the assembled runner.
         state.provider_registry.replace_with(ProviderRegistry::new(
             HashMap::from([(PROVIDER.into(), provider.clone() as Arc<dyn LLMProvider>)]),
             PROVIDER.into(),
         ));
+        if explicit {
+            use actix_web::{test, App};
+            let before = state.tickets.status().await;
+            assert_eq!(before["available"], false);
+            assert_eq!(before["can_initialize"], true);
+            assert!(state.tickets.service().is_err());
+            let app = test::init_service(
+                App::new()
+                    .app_data(state.clone())
+                    .configure(bamboo_server::routes::configure_routes),
+            )
+            .await;
+            let request = test::TestRequest::post()
+                .uri("/api/v1/tickets/initialize")
+                .peer_addr("127.0.0.1:43210".parse().unwrap())
+                .set_json(&before["initialization"])
+                .to_request();
+            let response = test::call_service(&app, request).await;
+            assert!(response.status().is_success());
+            let initialized: serde_json::Value = test::read_body_json(response).await;
+            assert_eq!(initialized["created"], true);
+            assert_eq!(initialized["scope"]["available"], true);
+        }
         {
             let assembled_config = state.config.read().await;
             assert!(assembled_config.subagents().broker.is_none());
@@ -364,7 +407,7 @@ impl Fixture {
                 constraints: vec!["Use only the granted local plan".into()],
                 acceptance: vec!["A human reviews the submitted result".into()],
                 user_acceptance_required: true,
-                allowed_tools: BTreeSet::from(["Task".into()]),
+                allowed_tools: allowed_tools.iter().map(|tool| (*tool).into()).collect(),
             };
             let create = service
                 .prepare_command(
@@ -677,10 +720,7 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
         .unwrap();
     #[cfg(unix)]
     {
-        let mut journal = fixture
-            .state
-            .tickets
-            .open_patrol_checkpoints(&scope)
+        let mut journal = journal_readback::open(&fixture.state.tickets, &scope)
             .await
             .unwrap();
         use bamboo_orchestration::patrol::CheckpointPort;
@@ -719,21 +759,23 @@ async fn policy_wake_runs_real_child_task_and_submits_once_without_auto_acceptan
             loop {
                 fixture.state.tickets.wake_ready_work();
                 fixture.state.tickets.reconcile_ready_work().await.unwrap();
-                if let Ok(mut journal) = fixture.state.tickets.open_patrol_checkpoints(&scope).await
-                {
-                    let stored = journal
+                let stored = {
+                    let mut journal = journal_readback::open(&fixture.state.tickets, &scope)
+                        .await
+                        .unwrap();
+                    journal
                         .load(&scope)
                         .unwrap()
-                        .expect("existing Ready observation has a canonical checkpoint");
-                    if stored
-                        .checkpoint
-                        .incident
-                        .as_ref()
-                        .and_then(|incident| incident.escalation.as_ref())
-                        .is_some_and(|escalation| escalation.queued)
-                    {
-                        break stored;
-                    }
+                        .expect("existing Ready observation has a canonical checkpoint")
+                };
+                if stored
+                    .checkpoint
+                    .incident
+                    .as_ref()
+                    .and_then(|incident| incident.escalation.as_ref())
+                    .is_some_and(|escalation| escalation.queued)
+                {
+                    break stored;
                 }
                 tokio::task::yield_now().await;
             }
@@ -1709,22 +1751,10 @@ async fn queued_child_keeps_host_round_ceiling_after_global_budget_is_relaxed() 
             .install_ready_work_policy(fixture.policy(3))
             .await
             .unwrap();
-        // Each pass commits at most one Start. The real native backend has only
+        // Observe the actual managed worker's canonical Starts independently
+        // of a reconcile call's completion. The real native backend has only
         // two concurrent slots, so the third durable Child remains queued.
-        tokio::time::timeout(WAIT, async {
-            while fixture.snapshot().assignments.len() < 3 {
-                match fixture.state.tickets.reconcile_ready_work().await {
-                    Ok(_) | Err(bamboo_tickets::Error::RevisionConflict) => {}
-                    Err(error) => panic!("queued admission failed: {error}"),
-                }
-                // Runtime admission can advance the same scope while a Host
-                // pass is checking eligibility. A CAS loss needs a full fresh
-                // read and selection, just as the managed reconciler performs.
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("three exact Start receipts survive concurrent runtime ACKs");
+        start_observation::wait(&fixture).await;
         let first = fixture.next_request().await;
         let second = fixture.next_request().await;
         // A scope-CAS loss can defer an earlier Work while another eligible
@@ -2123,3 +2153,12 @@ async fn reopening_the_ticket_writer_advances_epoch_without_restoring_host_polic
 
 #[path = "ready_work_scheduler/admission.rs"]
 mod admission;
+#[cfg(unix)]
+#[path = "ready_work_scheduler/journal_readback.rs"]
+mod journal_readback;
+#[path = "ready_work_scheduler/native_start.rs"]
+mod native_start;
+#[path = "ready_work_scheduler/owner_control.rs"]
+mod owner_control;
+#[path = "ready_work_scheduler/start_observation.rs"]
+mod start_observation;

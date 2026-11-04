@@ -57,6 +57,9 @@
 //!   plaintext key in `providers.json`.
 
 use anyhow::{Context, Result};
+use bamboo_domain::patrol_model_limits::{
+    MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+};
 use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1426,120 +1429,13 @@ pub struct TrustedKey {
 pub const JIANDU_PLUGIN_PUBLIC_KEY: &str =
     "bba9d0e5553401125f939bc3d844e891706d579a611fea9215545771d5306676";
 
-/// The official plugin-signing keys trusted by default, so an out-of-the-box
-/// `bamboo plugin install <official release url>` needs no `--allow-unsigned`
-/// for a bundle those repos' release CI signed. One entry per first-party
-/// plugin publisher; each repo commits its public half as
-/// `packaging/plugin/signing-key.pub` (nova) / `plugin/signing-key.pub`
-/// (magpie and jiandu) for cross-checking.
-fn default_trusted_keys() -> Vec<TrustedKey> {
-    vec![
-        TrustedKey {
-            label: "jiandu (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: JIANDU_PLUGIN_PUBLIC_KEY.to_string(),
-        },
-        TrustedKey {
-            label: "nova (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: "e3c429e1be50098b12c6f45737abf457189b668535875b5b3e2b4349be86ea59"
-                .to_string(),
-        },
-        TrustedKey {
-            label: "magpie (bigduu official)".to_string(),
-            algorithm: "ed25519".to_string(),
-            public_key: "47e971c39cd93adb18cff50e097cb387df49e9c4d33b0ed62f693eabbe7fc66e"
-                .to_string(),
-        },
-    ]
-}
-
 /// Default trusted host+path prefix: the `bigduu` GitHub org/user's own repos
 /// (e.g. `github.com/bigduu/Nova/releases/...`).
-fn default_trusted_hosts() -> Vec<String> {
+pub(crate) fn default_trusted_hosts() -> Vec<String> {
     vec!["github.com/bigduu/".to_string()]
 }
 
-/// Plugin URL-install source-trust policy: a host allowlist (is the SOURCE
-/// authorized?) plus ed25519 publisher keys (is the PUBLISHER authentic?).
-/// This stacks on top of the checksum layer already enforced in
-/// `bamboo_plugin::registry::PluginSource::Url` (are the BYTES what the
-/// caller expected?) — see `bamboo-server`'s `plugin_source.rs` for where all
-/// three layers are enforced together. A pasted checksum alone cannot
-/// establish source trust (an attacker who controls the page a checksum was
-/// copied from can just publish a checksum for their own tampered bundle);
-/// the host allowlist and signature checks close that gap.
-///
-/// Both fields are user-editable (`config.json`, or the config-set HTTP/CLI
-/// path) so an operator can add their own trusted hosts/keys. Additive/
-/// back-compat: an absent `plugin_trust` key deserializes to
-/// [`PluginTrustConfig::default`] (the built-in defaults below), not an empty
-/// policy — so a fresh install can trust the official nova plugin out of the
-/// box.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct PluginTrustConfig {
-    /// Host+path prefixes a `url` plugin source may be fetched from without
-    /// `--allow-untrusted-host`, e.g. `"github.com/bigduu/"` (a bare host
-    /// with no `/`, e.g. `"example.com"`, matches any path on that exact
-    /// host). Each entry is split into a host component and a path-prefix
-    /// component and matched on PARSED URL components — whole-host equality
-    /// plus a `/`-boundary path-prefix check, never a raw string
-    /// `starts_with` — see [`is_host_trusted`] for the precise rule and why
-    /// (it closes a domain-gluing bypass like `example.com` matching
-    /// `example.com.evil.com`, and a sibling-path bypass like
-    /// `github.com/bigduu` matching `github.com/bigduu-evil/x`).
-    #[serde(default = "default_trusted_hosts")]
-    pub trusted_hosts: Vec<String>,
-    /// Publisher keys a bundle's `.sig` signature may verify against without
-    /// `--allow-unsigned`.
-    #[serde(default = "default_trusted_keys")]
-    pub trusted_keys: Vec<TrustedKey>,
-    /// Persistent, config-level escape hatch for the whole three-layer
-    /// policy above: `Off` makes every `url` plugin install/update behave as
-    /// if `--insecure` (equivalently, `--allow-untrusted-host
-    /// --allow-unsigned --allow-unverified`) were passed, WITHOUT needing the
-    /// per-install flag every time — the "I run a private/dev bamboo and
-    /// don't want to pass flags on every install" customization. Defaults to
-    /// [`PluginTrustEnforcement::Strict`] — a fresh config, or one with no
-    /// `plugin_trust.enforcement` key at all, is secure by default; relaxing
-    /// it is always an explicit, user-initiated edit
-    /// (`bamboo config set plugin_trust.enforcement off`), never a silent
-    /// weakening. See `bamboo-server`'s `plugin_source.rs` for where this is
-    /// enforced, and `AppState::new` for the loud startup warning emitted
-    /// whenever a server boots with this set to `Off`.
-    #[serde(default)]
-    pub enforcement: PluginTrustEnforcement,
-}
-
-impl Default for PluginTrustConfig {
-    fn default() -> Self {
-        Self {
-            trusted_hosts: default_trusted_hosts(),
-            trusted_keys: default_trusted_keys(),
-            enforcement: PluginTrustEnforcement::default(),
-        }
-    }
-}
-
-impl PluginTrustConfig {
-    /// True when `url` is `https` and its host+path match one of
-    /// `trusted_hosts` on parsed URL components (host compared
-    /// case-insensitively as a WHOLE string, path matched on a `/` boundary
-    /// — see the free function [`is_host_trusted`] for the precise rule; an
-    /// unparseable URL or a non-`https` scheme is never trusted).
-    pub fn is_host_trusted(&self, url: &str) -> bool {
-        is_host_trusted(url, &self.trusted_hosts)
-    }
-
-    /// True when `enforcement` is [`PluginTrustEnforcement::Off`] — every
-    /// `url` plugin install/update should skip the host allowlist, signature,
-    /// and checksum-requirement layers, exactly as if `--insecure` were
-    /// passed to that individual install. See the field's doc comment for
-    /// the full rationale.
-    pub fn enforcement_is_off(&self) -> bool {
-        matches!(self.enforcement, PluginTrustEnforcement::Off)
-    }
-}
+pub use crate::plugin_trust::{PluginTrustConfig, PublisherMode};
 
 /// `plugin_trust.enforcement`: the persistent, config-level form of the
 /// `--insecure` escape hatch (see [`PluginTrustConfig::enforcement`]).
@@ -1714,6 +1610,14 @@ fn default_retrieval_window_min_recent_user_turns() -> usize {
     3
 }
 
+fn default_context_trigger_usage_ratio() -> f64 {
+    0.80
+}
+
+fn default_context_target_usage_ratio() -> f64 {
+    0.25
+}
+
 fn default_retrieval_window_trigger_usage_ratio() -> f64 {
     0.80
 }
@@ -1758,6 +1662,11 @@ impl Default for RetrievalWindowContextConfig {
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct ContextManagementConfig {
     pub strategy: ContextManagementStrategy,
+    /// Shared upper bound for proactive compression across every strategy.
+    /// The effective token boundary can be earlier after output/safety reserves.
+    pub trigger_usage_ratio: f64,
+    /// Shared post-compression target relative to the model's complete window.
+    pub target_usage_ratio: f64,
     pub retrieval_window: RetrievalWindowContextConfig,
 }
 
@@ -1765,6 +1674,8 @@ impl Default for ContextManagementConfig {
     fn default() -> Self {
         Self {
             strategy: ContextManagementStrategy::Summary,
+            trigger_usage_ratio: default_context_trigger_usage_ratio(),
+            target_usage_ratio: default_context_target_usage_ratio(),
             retrieval_window: RetrievalWindowContextConfig::default(),
         }
     }
@@ -1776,6 +1687,19 @@ impl ContextManagementConfig {
     }
 
     pub fn validate(&self) -> std::result::Result<(), String> {
+        if !self.target_usage_ratio.is_finite()
+            || !self.trigger_usage_ratio.is_finite()
+            || self.target_usage_ratio < 0.01
+            || self.target_usage_ratio >= self.trigger_usage_ratio
+            || self.trigger_usage_ratio > 1.0
+            || (self.target_usage_ratio * 100.0).floor()
+                >= (self.trigger_usage_ratio * 100.0).floor()
+        {
+            return Err(
+                "context_management ratios must satisfy 0.01 <= target_usage_ratio < trigger_usage_ratio <= 1 with distinct whole-percent boundaries"
+                    .to_string(),
+            );
+        }
         let policy = &self.retrieval_window;
         if policy.min_recent_user_turns == 0 {
             return Err(
@@ -1804,12 +1728,22 @@ impl ContextManagementConfig {
         Ok(())
     }
 
-    /// Planner policy is intentionally percent-based in the domain primitive.
-    /// Flooring keeps fractional configuration conservative rather than
-    /// archiving less history than the configured target permits. The planner's
-    /// minimum representable positive target is one percent.
+    /// Resolve the common policy onto a runtime-only budget snapshot. Provider
+    /// limits and durable session overrides remain unchanged; only maintenance
+    /// ratios are shared, independent of the selected history representation.
+    pub fn apply_compression_policy(
+        &self,
+        mut budget: bamboo_domain::TokenBudget,
+    ) -> bamboo_domain::TokenBudget {
+        budget.compression_trigger_percent = (self.trigger_usage_ratio * 100.0).floor() as u8;
+        budget.compression_target_percent = (self.target_usage_ratio * 100.0).floor() as u8;
+        budget
+    }
+
+    /// Compatibility accessor. New runtime paths use the dynamically resolved
+    /// budget's target percentage, also for retrieval archive receipts.
     pub fn retrieval_target_usage_percent(&self) -> u8 {
-        ((self.retrieval_window.target_usage_ratio * 100.0).floor() as u8).max(1)
+        ((self.target_usage_ratio * 100.0).floor() as u8).max(1)
     }
 }
 
@@ -1818,30 +1752,95 @@ impl<'de> Deserialize<'de> for ContextManagementConfig {
     where
         D: serde::Deserializer<'de>,
     {
-        #[derive(Deserialize)]
+        #[derive(Default, Deserialize)]
         #[serde(default)]
         struct Wire {
             strategy: ContextManagementStrategy,
-            retrieval_window: RetrievalWindowContextConfig,
-        }
-
-        impl Default for Wire {
-            fn default() -> Self {
-                let defaults = ContextManagementConfig::default();
-                Self {
-                    strategy: defaults.strategy,
-                    retrieval_window: defaults.retrieval_window,
-                }
-            }
+            trigger_usage_ratio: Option<f64>,
+            target_usage_ratio: Option<f64>,
+            retrieval_window: Option<RetrievalWindowContextConfig>,
         }
 
         let wire = Wire::deserialize(deserializer)?;
+        let retrieval_window = wire.retrieval_window.unwrap_or_default();
+        // Older clients stored ratios under retrieval_window. Preserve stricter
+        // settings as common limits, while the old default 80/60 adopts 80/25.
+        // Explicit common fields take precedence on subsequent saves.
         let config = Self {
             strategy: wire.strategy,
-            retrieval_window: wire.retrieval_window,
+            trigger_usage_ratio: wire.trigger_usage_ratio.unwrap_or_else(|| {
+                default_context_trigger_usage_ratio().min(retrieval_window.trigger_usage_ratio)
+            }),
+            target_usage_ratio: wire.target_usage_ratio.unwrap_or_else(|| {
+                default_context_target_usage_ratio().min(retrieval_window.target_usage_ratio)
+            }),
+            retrieval_window,
         };
         config.validate().map_err(serde::de::Error::custom)?;
         Ok(config)
+    }
+}
+
+/// Protocol whose model-visible input can be metered locally.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PatrolModelProtocol {
+    LlamaCppRawV1,
+}
+
+/// Independent selection for semantic patrol preparation. Absent disables it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatrolModelConfig {
+    pub provider: String,
+    pub model: String,
+    pub protocol: PatrolModelProtocol,
+    /// Explicit local provider activation. Omitted keeps prompt preparation
+    /// available without enabling outbound model calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<std::net::SocketAddr>,
+    pub max_input_tokens: std::num::NonZeroU32,
+    pub max_output_tokens: std::num::NonZeroU32,
+    pub max_evidence_bytes: std::num::NonZeroUsize,
+    pub max_evidence_refs: std::num::NonZeroUsize,
+}
+
+impl PatrolModelConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.provider.is_empty()
+            || self.provider.len() > 256
+            || self
+                .provider
+                .chars()
+                .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err("patrol_model requires an explicit provider identifier".into());
+        }
+        if self.max_input_tokens.get() > MAX_INPUT_TOKENS
+            || self.max_output_tokens.get() > MAX_OUTPUT_TOKENS
+            || self.max_evidence_bytes.get() > MAX_EVIDENCE_BYTES
+            || self.max_evidence_refs.get() > MAX_EVIDENCE_REFS
+        {
+            return Err(format!(
+                "patrol_model limits must be at most {MAX_INPUT_TOKENS} input tokens, \
+                 {MAX_OUTPUT_TOKENS} output tokens, {MAX_EVIDENCE_BYTES} evidence bytes, \
+                 and {MAX_EVIDENCE_REFS} evidence references"
+            ));
+        }
+        if self
+            .endpoint
+            .is_some_and(|endpoint| !endpoint.ip().is_loopback() || endpoint.port() == 0)
+        {
+            return Err(
+                "patrol_model endpoint requires a numeric loopback address and port".into(),
+            );
+        }
+        match self.protocol {
+            PatrolModelProtocol::LlamaCppRawV1 if self.model == "gpt-oss-20b" => Ok(()),
+            PatrolModelProtocol::LlamaCppRawV1 => {
+                Err("llama_cpp_raw_v1 requires the gpt-oss-20b patrol model".into())
+            }
+        }
     }
 }
 
@@ -1917,6 +1916,10 @@ pub struct ConfigValues {
     /// Previously persisted in `gemini-model-mapping.json` (now unified into `config.json`).
     #[serde(default)]
     pub gemini_model_mapping: GeminiModelMapping,
+
+    /// Explicit model selection for offline semantic patrol input preparation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patrol_model: Option<PatrolModelConfig>,
 
     /// Request preflight hooks.
     ///
@@ -2059,6 +2062,7 @@ impl Default for ConfigValues {
             keyword_masking: KeywordMaskingConfig::default(),
             anthropic_model_mapping: AnthropicModelMapping::default(),
             gemini_model_mapping: GeminiModelMapping::default(),
+            patrol_model: None,
             hooks: HooksConfig::default(),
             lifecycle_hooks: LifecycleHooksConfig::default(),
             tools: ToolsConfig::default(),
@@ -2129,6 +2133,8 @@ struct ModelBehaviorConfigSection {
     anthropic_model_mapping: AnthropicModelMapping,
     #[serde(default)]
     gemini_model_mapping: GeminiModelMapping,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    patrol_model: Option<PatrolModelConfig>,
     #[serde(default)]
     hooks: HooksConfig,
     #[serde(default, skip_serializing_if = "LifecycleHooksConfig::is_empty")]
@@ -2271,6 +2277,7 @@ impl From<ConfigValues> for ConfigRoot {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
             tools,
@@ -2312,6 +2319,7 @@ impl From<ConfigValues> for ConfigRoot {
                 keyword_masking,
                 anthropic_model_mapping,
                 gemini_model_mapping,
+                patrol_model,
                 hooks,
                 lifecycle_hooks,
             },
@@ -2374,6 +2382,7 @@ impl From<ConfigRoot> for ConfigValues {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
         } = model_behavior;
@@ -2413,6 +2422,7 @@ impl From<ConfigRoot> for ConfigValues {
             keyword_masking,
             anthropic_model_mapping,
             gemini_model_mapping,
+            patrol_model,
             hooks,
             lifecycle_hooks,
             tools,
@@ -2531,6 +2541,9 @@ impl<'de> Deserialize<'de> for Config {
             .map_err(D::Error::custom)?
             .unwrap_or_default();
         let root: ConfigRoot = serde_json::from_value(value).map_err(D::Error::custom)?;
+        if let Some(model) = &root.model_behavior.patrol_model {
+            model.validate().map_err(D::Error::custom)?;
+        }
 
         Ok(Self::from_parts(root.into(), memory, subagents, providers))
     }
@@ -4961,6 +4974,7 @@ impl Config {
                 keyword_masking: KeywordMaskingConfig::default(),
                 anthropic_model_mapping: AnthropicModelMapping::default(),
                 gemini_model_mapping: GeminiModelMapping::default(),
+                patrol_model: None,
                 hooks: HooksConfig::default(),
                 lifecycle_hooks: LifecycleHooksConfig::default(),
                 tools: ToolsConfig::default(),
@@ -6142,7 +6156,7 @@ mod tests {
         );
         assert_eq!(
             config.context_management.retrieval_target_usage_percent(),
-            60
+            25
         );
         let json = serde_json::to_value(&config).unwrap();
         assert!(json.get("context_management").is_none());
@@ -6216,6 +6230,52 @@ mod tests {
             ContextManagementConfig::default().strategy,
             ContextManagementStrategy::Summary
         );
+    }
+
+    #[test]
+    fn context_management_uses_one_explicit_policy_for_every_strategy() {
+        for strategy in ["summary", "message_summary", "retrieval_window"] {
+            let policy: ContextManagementConfig = serde_json::from_value(serde_json::json!({
+                "strategy": strategy,
+                "trigger_usage_ratio": 0.72,
+                "target_usage_ratio": 0.20,
+                "retrieval_window": {"trigger_usage_ratio": 0.9, "target_usage_ratio": 0.6}
+            }))
+            .unwrap();
+            let budget =
+                policy.apply_compression_policy(bamboo_domain::TokenBudget::for_model(200_000));
+            assert_eq!(budget.compression_trigger_percent, 72);
+            assert_eq!(budget.compression_target_percent, 20);
+            let saved = serde_json::to_value(&policy).unwrap();
+            let restored: ContextManagementConfig = serde_json::from_value(saved).unwrap();
+            assert_eq!(restored, policy);
+        }
+    }
+
+    #[test]
+    fn context_management_migrates_stricter_legacy_ratios_without_preserving_old_sixty_percent_target(
+    ) {
+        for strategy in ["summary", "message_summary", "retrieval_window"] {
+            for (trigger, target, expected_trigger, expected_target) in
+                [(0.80, 0.60, 0.80, 0.25), (0.65, 0.15, 0.65, 0.15)]
+            {
+                let policy: ContextManagementConfig = serde_json::from_value(serde_json::json!({
+                    "strategy": strategy,
+                    "retrieval_window": {"trigger_usage_ratio": trigger, "target_usage_ratio": target}
+                })).unwrap();
+                assert_eq!(policy.trigger_usage_ratio, expected_trigger);
+                assert_eq!(policy.target_usage_ratio, expected_target);
+            }
+        }
+    }
+
+    #[test]
+    fn context_management_rejects_unrepresentable_shared_range() {
+        for (trigger, target) in [(0.80, 0.80), (1.01, 0.25), (0.015, 0.01), (0.80, 0.005)] {
+            let value =
+                serde_json::json!({"trigger_usage_ratio": trigger, "target_usage_ratio": target});
+            assert!(serde_json::from_value::<ContextManagementConfig>(value).is_err());
+        }
     }
 
     #[test]

@@ -120,6 +120,30 @@ pub fn entries() -> Vec<Entry> {
     entries.push(Entry { key: "context_management.strategy", kind: "enum", example: json!("retrieval_window"),
         meaning: "Context strategy; retrieval-window validation and history-tool requirements still apply.",
         aliases: &[], read: |c| json!(c.context_management.strategy), required_when: None });
+    entries.push(Entry { key: "context_management.trigger_usage_ratio", kind: "f64", example: json!(0.70),
+        meaning: "Shared proactive trigger upper bound for every context strategy; runtime output/safety headroom can move the effective token boundary earlier.",
+        aliases: &[], read: |c| json!(c.context_management.trigger_usage_ratio), required_when: None });
+    entries.push(Entry { key: "context_management.target_usage_ratio", kind: "f64", example: json!(0.20),
+        meaning: "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
+        aliases: &[], read: |c| json!(c.context_management.target_usage_ratio), required_when: None });
+    entries.push(Entry {
+        key: "patrol_model",
+        kind: "option<object>",
+        example: json!({
+            "provider": "patrol-local",
+            "model": "gpt-oss-20b",
+            "protocol": "llama_cpp_raw_v1",
+            "endpoint": "127.0.0.1:8080",
+            "max_input_tokens": 4096,
+            "max_output_tokens": 256,
+            "max_evidence_bytes": 16384,
+            "max_evidence_refs": 16
+        }),
+        meaning: "Independent patrol model selection. The optional numeric loopback endpoint enables semantic calls after Work budget and Host admission. The raw profile pins gpt-oss-20b.",
+        aliases: &[],
+        read: |c| json!(c.patrol_model),
+        required_when: None,
+    });
     entries.sort_by_key(|entry| entry.key);
     entries
 }

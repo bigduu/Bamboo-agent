@@ -12,6 +12,21 @@ use crate::ProjectId;
 
 pub const ACTOR_DIRECTORY_SCHEMA_VERSION: u32 = 2;
 
+// Keep the maintenance purpose in the persisted, exact lease identity so a
+// restart can distinguish it from chat without changing the Actor schema.
+const ROOT_COMPACTION_LEASE_OWNER_PREFIX: &str = "root-compaction-";
+
+pub fn new_root_compaction_lease_owner() -> String {
+    format!(
+        "{ROOT_COMPACTION_LEASE_OWNER_PREFIX}{}",
+        uuid::Uuid::new_v4()
+    )
+}
+
+pub fn is_root_compaction_lease_owner(owner: &str) -> bool {
+    owner.starts_with(ROOT_COMPACTION_LEASE_OWNER_PREFIX)
+}
+
 /// A stable logical address. It is always exactly Session.id.
 pub type ActorId = String;
 
@@ -438,6 +453,8 @@ pub enum ActorDirectoryError {
     CounterOverflow,
     #[error("actor authority storage failed: {0}")]
     Storage(String),
+    #[error("activation committed; runtime projection failed: {0}")]
+    RuntimeProjection(String),
 }
 
 /// Narrow storage/runtime port. Implementations must serialize each mutation
@@ -465,6 +482,16 @@ pub trait ActorDirectoryPort: Send + Sync {
         &self,
         claim: &ActorActivationClaim,
     ) -> Result<ActorActivation, ActorDirectoryError>;
+    /// Ordinary Root admission checks the original caller's complete lifetime
+    /// in the same physical transaction as claim. Unsupported adapters must not
+    /// fall back to the selector-only claim or refresh the caller observation.
+    async fn claim_root_activation_observed(
+        &self,
+        _claim: &ActorActivationClaim,
+        _expected: &super::Session,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        Err(ActorDirectoryError::InvalidTransition)
+    }
     async fn start_activation(
         &self,
         fence: &ActorActivationFence,
@@ -488,6 +515,46 @@ pub trait ActorDirectoryPort: Send + Sync {
         now: DateTime<Utc>,
         outcome: ActorActivationFinish,
     ) -> Result<ActorActivation, ActorDirectoryError>;
+    /// Resolve an uncertain finish write using the exact committed authority.
+    /// A read-model projection error must not relabel a confirmed Run outcome.
+    async fn finish_activation_observed(
+        &self,
+        fence: &ActorActivationFence,
+        now: DateTime<Utc>,
+        outcome: ActorActivationFinish,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        let result = self.finish_activation(fence, now, outcome).await;
+        if !matches!(result, Err(ActorDirectoryError::RuntimeProjection(_))) {
+            return result;
+        }
+        let expected = match outcome {
+            ActorActivationFinish::Succeeded => ActorActivationStatus::Succeeded,
+            ActorActivationFinish::Failed => ActorActivationStatus::Failed,
+            ActorActivationFinish::Cancelled => ActorActivationStatus::Cancelled,
+        };
+        if let Ok(entry) = self.inspect_actor(&fence.actor_id).await {
+            if let Some(activation) = entry.activation {
+                if activation.matches_fence(fence) && activation.status == expected {
+                    return Ok(activation);
+                }
+            }
+        }
+        result
+    }
+    /// Root final-save can fail after its immutable Main result was written.
+    /// An owning backend may confirm that exact Main commit under the same
+    /// Actor guards and prefer it over the caller's persistence diagnostic.
+    /// This never proves Worker stop or turns an old attempt live again.
+    async fn finish_root_activation_observed(
+        &self,
+        _owner: &crate::RootActorRuntimeWrite,
+        _now: DateTime<Utc>,
+        _outcome: ActorActivationFinish,
+        _publish: Option<crate::storage::RootActorRuntimePublisher>,
+    ) -> Result<ActorActivation, ActorDirectoryError> {
+        Err(ActorDirectoryError::InvalidTransition)
+    }
+
     async fn retire_actor(
         &self,
         actor_id: &str,

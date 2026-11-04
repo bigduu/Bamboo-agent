@@ -1,6 +1,96 @@
 use super::*;
 use bamboo_domain::{FunctionCall, Role, ToolCall};
 
+#[test]
+fn dynamic_message_summary_caps_cumulative_source_to_available_context() {
+    let mut session = Session::new("dynamic-message-summary", "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(Message::user("past request"));
+    session.add_message(Message::assistant("past answer", None));
+    session.add_message(Message::user("current request"));
+    let mut summary = ConversationSummary::new("short existing summary", 100, 4);
+    summary.represented_source_tokens = 500_000;
+    session.conversation_summary = Some(summary);
+    session
+        .compression_events
+        .push(event(CompressionEventKind::MessageSummary));
+
+    let candidate = candidate(&session).expect("old history must fit by shortening its summary");
+    assert!(candidate.target_summary_tokens > 0);
+    assert!(candidate.target_summary_tokens < 100_000);
+    assert!(candidate.projected_usage_after_percent <= 40.0);
+    assert!(candidate.represented_source_tokens > 500_000);
+    let plan = finalize_compression_candidate_plan(&session, candidate, "bounded summary".into())
+        .expect("a small generated summary remains within the candidate budget");
+    assert!(plan.summary_budget_clamped);
+    assert!(plan.summary_budget_clamp_reason.is_some());
+}
+
+#[test]
+fn dynamic_summary_caps_cumulative_source_and_preserves_represented_history() {
+    let mut session = Session::new("dynamic-summary", "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(Message::user("past request"));
+    session.add_message(Message::assistant("past detail", None));
+    session.add_message(Message::assistant("another past detail", None));
+    session.add_message(Message::user("current request"));
+    let mut summary = ConversationSummary::new("short existing summary", 100, 4);
+    summary.represented_source_tokens = 500_000;
+    session.conversation_summary = Some(summary);
+
+    let candidate = build_forced_compression_candidate_plan_with_fixed_tokens(
+        &session,
+        "test-model",
+        Some(&budget()),
+        0.20,
+        CompressionTriggerType::Auto,
+        0,
+    )
+    .expect("a cumulative source budget is capped before invoking the model");
+    assert!(candidate.target_summary_tokens > 0);
+    assert!(candidate.target_summary_tokens < 100_000);
+    assert!(candidate.projected_usage_after_percent <= 40.0);
+    let represented = candidate.represented_source_tokens;
+    assert_eq!(represented, 500_000 + candidate.source_tokens);
+    let plan =
+        finalize_compression_candidate_plan(&session, candidate, "bounded summary".into()).unwrap();
+    assert!(plan.summary_budget_clamped);
+    apply_compression_plan(&mut session, plan);
+    let summary = session.conversation_summary.as_ref().unwrap();
+    assert_eq!(summary.represented_source_tokens, represented);
+    assert!(summary.budget_clamped);
+}
+
+#[test]
+fn dynamic_summary_modes_reject_required_content_that_exceeds_target() {
+    let mut session = Session::new("dynamic-required-floor", "test-model");
+    session.add_message(Message::system("system"));
+    session.add_message(Message::user("past request"));
+    session.add_message(Message::assistant("past detail", None));
+    session.add_message(Message::user("current request"));
+    let fixed_tokens = budget().compression_target_context_tokens();
+    for build in [
+        build_forced_compression_candidate_plan_with_fixed_tokens,
+        build_message_summary_candidate_plan_with_fixed_tokens,
+    ] {
+        let error = build(
+            &session,
+            "test-model",
+            Some(&budget()),
+            0.20,
+            CompressionTriggerType::Auto,
+            fixed_tokens,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            CompressionPlanError::ProtectedContentExceedsTarget { .. }
+        ));
+    }
+    assert!(session.messages.iter().all(|message| !message.compressed));
+    assert!(session.compression_events.is_empty());
+}
+
 fn budget() -> TokenBudget {
     let mut budget = TokenBudget::for_model(16_000);
     budget.compression_target_percent = 40;

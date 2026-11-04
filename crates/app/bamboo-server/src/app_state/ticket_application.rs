@@ -27,6 +27,9 @@ pub struct TicketApplication {
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
     ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
+    ready_owner: tokio::sync::Mutex<ready_owner::ReadyOwnerControl>,
+    patrol_sources: OnceLock<patrol_adapter::EvidenceSources>,
+    patrol_calls: Arc<bamboo_orchestration::patrol::calls::Calls>,
     // Registration and close share a short, synchronous gate. TaskTracker's
     // close alone does not prevent a new task from retaining the writer.
     cancellation_tasks: parking_lot::Mutex<tokio_util::task::TaskTracker>,
@@ -50,13 +53,24 @@ mod initialization;
 mod memory_sources;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod patrol_adapter;
-pub use patrol_adapter::PatrolCheckpointStore;
+pub use patrol_adapter::{
+    PatrolCheckpointStore, PreparedPatrolDiagnostic, UnmeteredWorkPatrolEvidence,
+    WorkPatrolAdoptedContextEvidence, WorkPatrolEvidenceCoverage, WorkPatrolEvidenceLimit,
+    WorkPatrolRequestEvidence, WorkPatrolSourceEvidence, WorkPatrolSourceOutcome,
+    WorkPatrolTicketEvidence, MAX_WORK_PATROL_EVIDENCE_BYTES, MAX_WORK_PATROL_EVIDENCE_REFS,
+};
+mod ready_owner;
 mod ready_retry_store;
 mod resolution;
 mod scheduling;
+pub use ready_owner::{
+    ReadyPolicyAction, ReadyPolicyGrant, ReadyPolicyInstall, ReadyPolicyRequest,
+};
 mod sprints;
+mod token_budget;
 pub use bamboo_orchestration::{ReadyBlockKind, ReadyReconcile, ReadyWorkGrant, ReadyWorkPolicy};
 pub use ready_retry_store::{FileReadyRetryStore, ReadyRetryFilePhase, ReadyRetryPublicationFault};
+pub use token_budget::WorkTokenBudgetSetup;
 #[cfg(test)]
 mod tests;
 
@@ -86,6 +100,9 @@ impl TicketApplication {
                 Arc::new(FileReadyRetryStore::new(root)),
                 Arc::new(bamboo_orchestration::ready_recovery::SystemReadyRetryClock),
             )),
+            ready_owner: tokio::sync::Mutex::new(ready_owner::ReadyOwnerControl::default()),
+            patrol_sources: OnceLock::new(),
+            patrol_calls: Arc::default(),
             cancellation_tasks: parking_lot::Mutex::new(tokio_util::task::TaskTracker::new()),
             #[cfg(test)]
             cancellation_probe: parking_lot::Mutex::new(CancellationProbe::default()),

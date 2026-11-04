@@ -11,6 +11,9 @@ use bamboo_tickets::{
     TicketService, WorkState,
 };
 
+#[path = "patrol/evidence.rs"]
+mod evidence;
+
 struct Root(PathBuf);
 impl Root {
     fn new() -> Self {
@@ -44,6 +47,88 @@ struct Fixture {
     scope: Scope,
     receipt: RuntimeReceipt,
     serial: u64,
+}
+
+#[test]
+fn live_runtime_facts_require_current_scope_receipt_and_preserve_wait_api() {
+    let fixture = Fixture::new();
+    let mut facts = host::RuntimeFacts {
+        scope: fixture.scope.clone(),
+        source_commit: fixture.service().published().unwrap().0,
+        receipt: fixture.receipt.clone(),
+        started_at_ms: Some(5),
+        wait: None,
+    };
+    let read = |facts: &host::RuntimeFacts| {
+        host::read_observation_with_runtime_facts(
+            fixture.service(),
+            &fixture.runtime(),
+            &fixture.scope,
+            facts,
+            &Policy::default(),
+        )
+    };
+    let observed = read(&facts)
+        .unwrap()
+        .observation(&fixture.scope, 0)
+        .unwrap();
+    assert_eq!(observed.started_at_ms, Some(5));
+    assert_eq!(observed.heartbeat_at_ms, None);
+    assert_eq!(observed.progress, None);
+    let read_heartbeat = |facts: &host::RuntimeFacts, at| {
+        host::read_observation_with_runtime_heartbeat(
+            fixture.service(),
+            &fixture.runtime(),
+            &fixture.scope,
+            facts,
+            Some(at),
+            &Policy::default(),
+        )
+    };
+    let heartbeat = read_heartbeat(&facts, 6)
+        .unwrap()
+        .observation(&fixture.scope, 0)
+        .unwrap();
+    assert_eq!(heartbeat.heartbeat_at_ms, Some(6));
+    assert_eq!(heartbeat.progress, None);
+    assert!(matches!(read_heartbeat(&facts, 4), Err(PortError::Denied)));
+    facts.started_at_ms = None;
+    assert!(matches!(read_heartbeat(&facts, 6), Err(PortError::Denied)));
+    facts.started_at_ms = Some(0);
+    assert!(matches!(read(&facts), Err(PortError::Denied)));
+    facts.started_at_ms = Some(5);
+    facts.receipt.run_id = "foreign-run".into();
+    assert!(matches!(read(&facts), Err(PortError::Denied)));
+    facts.receipt = fixture.receipt.clone();
+    facts.scope.generation += 1;
+    assert!(matches!(read(&facts), Err(PortError::Conflict)));
+    facts.scope = fixture.scope.clone();
+    facts.source_commit = "0".repeat(64);
+    assert!(matches!(read(&facts), Err(PortError::Conflict)));
+    let original = host::RuntimeObservation {
+        scope: fixture.scope.clone(),
+        source_commit: fixture.service().published().unwrap().0,
+        receipt: fixture.receipt.clone(),
+        wait: host::RuntimeWait {
+            kind: WaitKind::Dependency,
+            registered_at_ms: 5,
+            timeout_at_ms: None,
+            request_id: None,
+            evidence_ref: "original-wait".into(),
+        },
+    };
+    let observed = host::read_observation_with_runtime(
+        fixture.service(),
+        &fixture.runtime(),
+        &fixture.scope,
+        &original,
+        &Policy::default(),
+    )
+    .unwrap()
+    .observation(&fixture.scope, 0)
+    .unwrap();
+    assert_eq!(observed.started_at_ms, None);
+    assert_eq!(observed.expected_wait.unwrap().kind, WaitKind::Dependency);
 }
 
 impl Fixture {
@@ -573,6 +658,120 @@ fn program_entry_authorizes_all_valid_ready_selections_above_the_inspect_batch_l
     }
 }
 
+#[test]
+fn staged_settlement_does_not_interrupt_the_next_work_in_the_same_pass() {
+    let mut fixture = Fixture::new();
+    let first = fixture.scope.work_id.clone();
+    let project = ProjectId::parse(&fixture.scope.project_id).unwrap();
+    let supervisor = Principal::Supervisor {
+        session_id: "supervisor".into(),
+    };
+    let initial = fixture.service().published().unwrap().1;
+    let contract = initial.tickets[&first].contract.clone();
+    let second = fixture
+        .apply(
+            supervisor.clone(),
+            vec![
+                Operation::Create {
+                    temp_id: "other".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    contract: contract.clone(),
+                    depends_on: BTreeSet::new(),
+                },
+                Operation::AssociateProject {
+                    ticket_id: "other".into(),
+                    project_id: project.clone(),
+                },
+            ],
+        )
+        .ids["other"]
+        .clone();
+    let tree = fixture.root.0.join("worktree-two");
+    std::fs::create_dir(&tree).unwrap();
+    let tree = tree.to_string_lossy().into_owned();
+    let mut workspace = initial.assignments[&fixture.scope.assignment_id]
+        .workspace
+        .clone()
+        .unwrap();
+    workspace.branch = "second".into();
+    workspace.worktree = tree.clone();
+    workspace.write_roots = vec![tree.clone()];
+    workspace.claims = BTreeSet::from([format!("worktree:{tree}")]);
+    fixture.apply(
+        supervisor,
+        vec![
+            Operation::SetProjectContext {
+                work_id: second.clone(),
+                context: bamboo_tickets::ProjectContextSnapshot {
+                    project_id: project.clone(),
+                    project_revision: 1,
+                    resource_revision: 1,
+                    workspace_binding: WorkspaceBinding {
+                        path: workspace.repo.clone(),
+                        label: None,
+                        git_common_dir: None,
+                    },
+                    contract_revision: 1,
+                    contract,
+                    sources: BTreeMap::new(),
+                },
+            },
+            Operation::Ready {
+                work_id: second.clone(),
+            },
+            Operation::Start {
+                work_id: second.clone(),
+                temp_id: "attempt".into(),
+                workspace: Some(workspace),
+            },
+        ],
+    );
+
+    let request = configured_budget_request(&fixture, 240);
+    let service = fixture.service();
+    let authority = fixture.runtime();
+    let clock = ClockAt(100);
+    let mut budget = budget::TicketBudget {
+        service,
+        authority: &authority,
+        clock: &clock,
+    };
+    let reservation = budget.reserve(&request).unwrap();
+    let before = service.published().unwrap().1;
+    let work_ids = [first.clone(), second];
+    let mut visited = Vec::new();
+    let checked = program::ProgramPatrol::new(Policy::default())
+        .unwrap()
+        .visit_project_with_observations(
+            service,
+            &authority,
+            &program::ProgramSelection {
+                project_id: &project,
+                work_ids: &work_ids,
+            },
+            &clock,
+            &mut EncodedJournal::default(),
+            &mut |scope| host::read_observation(service, &authority, scope),
+            &mut |scope, _, _, _| {
+                if scope.work_id == first {
+                    budget.settle(&reservation, Usage::Unknown)?;
+                }
+                visited.push(scope.work_id.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+    let after = service.published().unwrap().1;
+    assert_eq!(checked, 2);
+    assert_eq!(visited, work_ids);
+    assert!(after.seq > before.seq);
+    assert_eq!(
+        after.execution_facts_revision(),
+        before.execution_facts_revision()
+    );
+}
+
 struct Probe {
     observed: host::TicketObservation,
     journal: EncodedJournal,
@@ -959,10 +1158,8 @@ fn checkpoint_keeps_original_pending_diagnostic_request_and_budget_receipt_on_re
     assert_eq!(recovered.checkpoint.incident.unwrap().attempts, 1);
 }
 
-#[test]
-fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation() {
+fn configured_budget_request(fixture: &Fixture, limit: u64) -> DiagnosticRequest {
     use bamboo_tickets::WorkTokenLimits;
-    let mut fixture = Fixture::new();
     let owner = fixture.authority(Principal::User {
         user_id: "budget-owner".into(),
     });
@@ -972,9 +1169,9 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
             &owner,
             0,
             WorkTokenLimits {
-                work_tokens: BTreeMap::from([(fixture.scope.work_id.clone(), 120)]),
-                utc_day_tokens: 120,
-                total_tokens: 120,
+                work_tokens: BTreeMap::from([(fixture.scope.work_id.clone(), limit)]),
+                utc_day_tokens: limit,
+                total_tokens: limit,
             },
         )
         .unwrap();
@@ -982,7 +1179,7 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         .observation()
         .observation(&fixture.scope, 0)
         .unwrap();
-    let request = DiagnosticRequest {
+    DiagnosticRequest {
         operation: OperationId {
             incident: IncidentId {
                 scope: fixture.scope.clone(),
@@ -1008,7 +1205,13 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
             references: vec![],
             input_tokens: 10,
         },
-    };
+    }
+}
+
+#[test]
+fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation() {
+    let mut fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 120);
     let authority = fixture.runtime();
     let mut budget = budget::TicketBudget {
         service: fixture.service(),
@@ -1016,6 +1219,7 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         clock: &ClockAt(100),
     };
     let receipt = budget.reserve(&request).unwrap();
+    assert_eq!(budget.reserve(&request).unwrap(), receipt);
     budget.settle(&receipt, Usage::Unknown).unwrap();
     drop(budget);
     fixture.reopen();
@@ -1025,7 +1229,7 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         authority: &authority,
         clock: &ClockAt(101),
     };
-    assert_eq!(budget.reserve(&request).unwrap(), receipt);
+    assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
     assert_eq!(
         fixture
             .service()
@@ -1061,6 +1265,20 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
             },
         )
         .unwrap();
+    drop(budget);
+    fixture.reopen();
+    let known_commit = fixture.service().published().unwrap().0;
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(103),
+    };
+    budget.settle(&receipt, Usage::Unknown).unwrap();
+    assert_eq!(fixture.service().published().unwrap().0, known_commit);
+    let mut wrong = receipt.clone();
+    wrong.receipt.push_str("-mismatch");
+    assert!(budget.settle(&wrong, Usage::Unknown).is_err());
     assert_eq!(
         fixture
             .service()
@@ -1074,4 +1292,199 @@ fn real_ticket_budget_port_reopens_unknown_charge_and_settles_after_cancellation
         fixture.service().published().unwrap().1.tickets[&fixture.scope.work_id].state,
         WorkState::Cancelled
     );
+}
+
+#[test]
+fn real_ticket_budget_port_preserves_over_cap_finding_across_restart() {
+    let mut fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 240);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    let over_cap = Usage::Known {
+        input_tokens: 10,
+        output_tokens: 21,
+    };
+    budget.settle(&receipt, over_cap).unwrap();
+    assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
+    let mut next = request;
+    next.operation.kind = OperationKind::Diagnostic(2);
+    assert_eq!(budget.reserve(&next), Err(BudgetBlock::Unavailable));
+    drop(budget);
+    fixture.reopen();
+    let over_cap_commit = fixture.service().published().unwrap().0;
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(101),
+    };
+    budget.settle(&receipt, over_cap).unwrap();
+    budget.settle(&receipt, Usage::Unknown).unwrap();
+    assert_eq!(fixture.service().published().unwrap().0, over_cap_commit);
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    let reservation = ledger.reservations.values().next().unwrap();
+    assert_eq!(reservation.receipt, receipt.receipt);
+    assert_eq!(reservation.over_cap_usage.unwrap().output_tokens, Some(21));
+    assert_eq!(ledger.reservations.len(), 1);
+    assert_eq!(ledger.total_charged, 120);
+    assert_eq!(ledger.daily_charged, 120);
+    assert_eq!(ledger.work_charged[&fixture.scope.work_id], 120);
+}
+
+#[test]
+fn replay_receipt_that_expires_during_admission_keeps_the_original_charge() {
+    struct AdvancingClock(std::cell::Cell<u64>);
+    impl Clock for AdvancingClock {
+        fn now_ms(&self) -> u64 {
+            self.0.replace(1000)
+        }
+    }
+    let fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 120);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    let commit = fixture.service().published().unwrap().0;
+    let clock = AdvancingClock(std::cell::Cell::new(101));
+    budget.clock = &clock;
+    assert_eq!(budget.reserve(&request), Err(BudgetBlock::Unavailable));
+    assert_eq!(fixture.service().published().unwrap().0, commit);
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.total_charged, 120);
+    assert_eq!(ledger.reservations.len(), 1);
+    assert_eq!(
+        ledger.reservations.values().next().unwrap().receipt,
+        receipt.receipt
+    );
+}
+
+#[test]
+fn a_concurrent_accounting_halt_fences_an_unsettled_receipt_replay() {
+    struct ClockWithHook<F>(std::cell::Cell<Option<F>>);
+    impl<F: FnOnce()> Clock for ClockWithHook<F> {
+        fn now_ms(&self) -> u64 {
+            if let Some(publish) = self.0.take() {
+                publish();
+            }
+            101
+        }
+    }
+    let fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 360);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let original = budget.reserve(&request).unwrap();
+    let mut other = request.clone();
+    other.operation.kind = OperationKind::Diagnostic(2);
+    let exceeded = budget.reserve(&other).unwrap();
+    let clock = ClockWithHook(std::cell::Cell::new(Some(|| {
+        budget
+            .settle(
+                &exceeded,
+                Usage::Known {
+                    input_tokens: 10,
+                    output_tokens: 21,
+                },
+            )
+            .unwrap();
+    })));
+    let mut replay = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &clock,
+    };
+    assert_eq!(replay.reserve(&request), Err(BudgetBlock::Unavailable));
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ledger.total_charged, 240);
+    assert_eq!(ledger.reservations.len(), 2);
+    assert!(ledger.reservations.values().any(|record| {
+        record.receipt == original.receipt
+            && record.usage.is_none()
+            && record.over_cap_usage.is_none()
+    }));
+    assert!(ledger
+        .reservations
+        .values()
+        .any(|record| { record.receipt == exceeded.receipt && record.over_cap_usage.is_some() }));
+}
+
+#[test]
+fn partial_provider_overrun_halts_the_exact_real_receipt() {
+    let mut fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 240);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    let admission_commit = fixture.service().published().unwrap().0;
+    assert_eq!(budget.confirm_submission(&receipt), Ok(()));
+    let supervisor = fixture.authority(Principal::Supervisor {
+        session_id: "supervisor".into(),
+    });
+    let supervisor_budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &supervisor,
+        clock: &ClockAt(100),
+    };
+    assert_eq!(
+        supervisor_budget.confirm_submission(&receipt),
+        Err(PortError::Denied)
+    );
+    let mut wrong = receipt.clone();
+    wrong.receipt.push_str("-mismatch");
+    assert_eq!(budget.confirm_submission(&wrong), Err(PortError::Denied));
+    assert_eq!(fixture.service().published().unwrap().0, admission_commit);
+    let usage = Usage::OverCap {
+        input_tokens: None,
+        output_tokens: Some(21),
+    };
+    budget.settle(&receipt, usage).unwrap();
+    assert_eq!(budget.confirm_submission(&receipt), Err(PortError::Denied));
+    drop(budget);
+    fixture.reopen();
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(101),
+    };
+    budget.settle(&receipt, usage).unwrap();
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    let entry = ledger.reservations.values().next().unwrap();
+    assert_eq!(entry.receipt, receipt.receipt);
+    assert_eq!(entry.over_cap_usage.unwrap().input_tokens, None);
+    assert_eq!(entry.over_cap_usage.unwrap().output_tokens, Some(21));
+    assert_eq!(ledger.total_charged, 120);
 }

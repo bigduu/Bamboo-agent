@@ -147,6 +147,30 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    fn native_task_start(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::execution::spawn::NativeTaskStart> {
+        if !self.supports_native_ticket_budget() {
+            return None;
+        }
+        self.runners[0].native_task_start(session_id, run_id, child_birth)
+    }
+
+    fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<crate::execution::spawn::NativeTaskLiveness> {
+        if !self.supports_native_ticket_budget() {
+            return None;
+        }
+        self.runners[0].native_task_liveness(session_id, run_id, child_birth)
+    }
+
     fn supports_native_ticket_budget(&self) -> bool {
         // Deliberately conservative for this native-only first slice. Mixed
         // process/remote routers retain their existing explicit dispatch path.

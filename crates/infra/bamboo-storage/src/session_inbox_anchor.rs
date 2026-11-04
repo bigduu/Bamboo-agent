@@ -125,6 +125,22 @@ impl InboxAnchor {
         let parent = self.parent_handle(&parts.parents, false)?;
         platform::exists(&parent, &parts.name)
     }
+
+    /// Read an existing regular file relative to the retained Inbox, without
+    /// following a link at any component. Returns `None` when the name is absent.
+    pub(super) fn read_existing(
+        &self,
+        path: &Path,
+        limit: usize,
+    ) -> std::io::Result<Option<Vec<u8>>> {
+        let parts = self.parts(path)?;
+        let parent = self.parent_handle(&parts.parents, false)?;
+        match platform::read_file(&parent, &parts.name, limit) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -274,6 +290,34 @@ mod platform {
             ErrorKind::NotFound => Ok(false),
             _ => Err(error),
         }
+    }
+
+    pub(super) fn read_file(parent: &File, name: &OsStr, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let file = open_child_file(
+            parent.as_raw_fd(),
+            &c_name(name)?,
+            libc::O_RDONLY | libc::O_NONBLOCK,
+        )?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(invalid("Inbox anchor read target is not a regular file"));
+        }
+        if metadata.len() > limit as u64 {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Inbox anchor read target exceeds byte limit",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(std::io::Error::new(
+                ErrorKind::InvalidData,
+                "Inbox anchor read target exceeds byte limit",
+            ));
+        }
+        Ok(bytes)
     }
 }
 
@@ -704,6 +748,29 @@ mod platform {
             Err(error) => Err(error),
         }
     }
+
+    /// Read an existing regular file without following a reparse point. The
+    /// relative open already validates the object is a non-reparse disk file.
+    pub(super) fn read_file(parent: &File, name: &OsStr, limit: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Read;
+        let file = open_relative(
+            parent,
+            name,
+            false,
+            FILE_OPEN,
+            FILE_READ_DATA | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )?;
+        let metadata = file.metadata()?;
+        if metadata.len() > limit as u64 {
+            return Err(rejected("Inbox anchor read target exceeds byte limit"));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > limit {
+            return Err(rejected("Inbox anchor read target exceeds byte limit"));
+        }
+        Ok(bytes)
+    }
 }
 
 #[cfg(windows)]
@@ -792,6 +859,10 @@ impl InboxAnchor {
     }
 
     pub(super) fn entry_exists(&self, _: &Path) -> std::io::Result<bool> {
+        Err(unsupported())
+    }
+
+    pub(super) fn read_existing(&self, _: &Path, _: usize) -> std::io::Result<Option<Vec<u8>>> {
         Err(unsupported())
     }
 }

@@ -102,6 +102,7 @@ pub struct PreparedChatTurn {
 // ---- Execute types ----
 
 /// Input for the execute preparation use case.
+#[derive(Default)]
 pub struct ExecuteInput {
     pub session_id: String,
     pub request_model: Option<String>,

@@ -42,7 +42,19 @@ pub(crate) fn plugin_scope() -> impl HttpServiceFactory {
     web::scope("/plugins")
         .route("", web::get().to(agent::plugin::list_plugins))
         .route("/install", web::post().to(agent::plugin::install_plugin))
+        .route(
+            "/publishers",
+            web::get().to(agent::plugin::publisher_policy),
+        )
+        .route(
+            "/publishers",
+            web::post().to(agent::plugin::change_publisher_policy),
+        )
         .route("/jiandu/setup", web::get().to(agent::plugin::jiandu_setup))
+        .route(
+            "/official/jiandu/trust",
+            web::post().to(agent::plugin::trust_official_jiandu),
+        )
         .route("/nova/app", web::get().to(agent::plugin::nova_app))
         .route(
             "/nova/app/install",
@@ -127,7 +139,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         )
         .service(
             web::scope("/tickets")
+                .configure(agent::tickets::patrol::configure)
+                .configure(agent::tickets::ready_policy::configure)
                 .configure(agent::tickets::sprints::configure)
+                .configure(agent::tickets::token_budget::configure)
                 .route("/scope", web::get().to(agent::tickets::scope))
                 .route("/initialize", web::post().to(agent::tickets::initialize))
                 .route("/overview", web::get().to(agent::tickets::overview))
@@ -379,6 +394,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
         .route(
             "/sessions/{session_id}/clear",
             web::post().to(agent::sessions::clear_session),
+        )
+        .route(
+            "/sessions/{session_id}/compact",
+            web::post().to(agent::sessions::compact_session),
         )
         .route(
             "/sessions/{session_id}/project-dream/run",

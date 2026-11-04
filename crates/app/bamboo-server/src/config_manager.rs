@@ -183,8 +183,15 @@ fn core_proxy_patch_error() -> AppError {
 
 pub fn build_merged_config(
     current: &Config,
-    patch_obj: Map<String, Value>,
+    mut patch_obj: Map<String, Value>,
 ) -> Result<Config, AppError> {
+    if let Some(policy) = patch_obj.get_mut("plugin_trust") {
+        current
+            .plugin_trust
+            .prepare_update(policy)
+            .map_err(|error| AppError::BadRequest(format!("Invalid publisher policy: {error}")))?;
+    }
+    let publisher_policy = patch_obj.get("plugin_trust").cloned();
     // Captured before the merge consumes the patch: which providers/instances
     // this patch explicitly sets or clears — those must NOT get their dropped
     // key carried forward below (#516).
@@ -200,6 +207,9 @@ pub fn build_merged_config(
         .map_err(|e| AppError::InternalError(anyhow::anyhow!("Failed to serialize config: {e}")))?;
 
     deep_merge_json(&mut merged, Value::Object(patch_obj));
+    if let Some(policy) = publisher_policy {
+        merged["plugin_trust"] = policy;
+    }
 
     let mut new_config: Config = serde_json::from_value(merged)
         .map_err(|e| AppError::BadRequest(format!("Invalid configuration JSON: {e}")))?;
@@ -252,6 +262,35 @@ pub fn build_merged_config(
 mod tests {
     use super::*;
     use bamboo_config::{credential_ref, OpenAIConfig, ProxyAuth};
+
+    #[test]
+    fn publisher_compatibility_patches_keep_revocations_and_explicit_empty_lists() {
+        let mut current = Config::default();
+        current.plugin_trust.revoke_official_publisher("jiandu");
+        for patch in [
+            serde_json::json!({"plugin_trust":{"trusted_keys":[]}}),
+            serde_json::json!({"plugin_trust":{"enforcement":"strict"}}),
+            serde_json::json!({"server":{"port":9563}}),
+        ] {
+            let result = build_merged_config(&current, patch.as_object().unwrap().clone()).unwrap();
+            assert_eq!(
+                result.plugin_trust.revoked_publishers,
+                current.plugin_trust.revoked_publishers
+            );
+            assert!(!result
+                .plugin_trust
+                .effective_trusted_keys()
+                .iter()
+                .any(|key| key.public_key == bamboo_config::JIANDU_PLUGIN_PUBLIC_KEY));
+            if patch["plugin_trust"].get("trusted_keys").is_some() {
+                assert_eq!(
+                    result.plugin_trust.publisher_mode,
+                    bamboo_config::PublisherMode::Explicit
+                );
+                assert!(result.plugin_trust.effective_trusted_keys().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn unrelated_root_patch_preserves_store_hydrated_proxy_auth() {

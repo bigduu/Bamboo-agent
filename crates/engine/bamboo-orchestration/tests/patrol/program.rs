@@ -93,6 +93,92 @@ fn missing_measurements_keep_one_pending_undelivered_incident() {
 }
 
 #[test]
+fn start_without_heartbeat_or_progress_remains_unknown_at_all_timeouts() {
+    let mut checkpoints = FakeHost::new();
+    let mut observations = FakeHost::new();
+    observations.observation.started_at_ms = Some(1);
+    observations.observation.heartbeat_at_ms = None;
+    observations.observation.progress = None;
+    for now in [100, 1_000, 10_000] {
+        pass(&mut checkpoints, &mut observations, now);
+        assert_eq!(checkpoints.incident().reason, Reason::EvidenceUnknown);
+    }
+    only_program_calls(&checkpoints, &observations);
+}
+
+#[test]
+fn known_heartbeat_does_not_fill_an_unavailable_progress_measurement() {
+    let mut checkpoints = FakeHost::new();
+    let mut observations = FakeHost::new();
+    observations.observation.started_at_ms = Some(1);
+    observations.observation.heartbeat_at_ms = Some(100);
+    observations.observation.progress = None;
+    pass(&mut checkpoints, &mut observations, 100);
+    assert_eq!(checkpoints.incident().reason, Reason::EvidenceUnknown);
+    let incident = checkpoints.incident().id;
+    pass(
+        &mut checkpoints,
+        &mut observations,
+        100 + policy().heartbeat_timeout_ms,
+    );
+    assert_eq!(checkpoints.incident().reason, Reason::MissingHeartbeat);
+    assert_eq!(checkpoints.incident().id, incident);
+    only_program_calls(&checkpoints, &observations);
+}
+
+#[test]
+fn exact_wait_can_be_expected_without_inventing_runtime_measurements() {
+    let mut checkpoints = FakeHost::new();
+    let mut observations = FakeHost::new();
+    observations.observation.started_at_ms = None;
+    observations.observation.heartbeat_at_ms = None;
+    observations.observation.progress = None;
+    observations.observation.expected_wait = Some(ExpectedWait {
+        kind: WaitKind::User,
+        issued_at_ms: 90,
+        until_ms: 105,
+        progress_sequence: 0,
+        evidence_ref: "exact-stopped-question-patrol-allowance".into(),
+    });
+    assert_eq!(
+        pass(&mut checkpoints, &mut observations, 100).status,
+        Status::ExpectedWait
+    );
+    pass(&mut checkpoints, &mut observations, 105);
+    assert_eq!(checkpoints.incident().reason, Reason::WaitExpired);
+    only_program_calls(&checkpoints, &observations);
+}
+
+#[test]
+fn current_wait_preserves_the_original_unknown_incident_and_escalation() {
+    let mut checkpoints = FakeHost::new();
+    let mut observations = FakeHost::new();
+    observations.observation.started_at_ms = None;
+    observations.observation.heartbeat_at_ms = None;
+    observations.observation.progress = None;
+    pass(&mut checkpoints, &mut observations, 100);
+    pass(&mut checkpoints, &mut observations, 101);
+    let original = checkpoints.incident();
+    observations.observation.expected_wait = Some(ExpectedWait {
+        kind: WaitKind::User,
+        issued_at_ms: 102,
+        until_ms: 110,
+        progress_sequence: 0,
+        evidence_ref: "exact-yielded-question".into(),
+    });
+    assert_eq!(
+        pass(&mut checkpoints, &mut observations, 103).status,
+        Status::ExpectedWait
+    );
+    assert_eq!(checkpoints.incident(), original);
+    assert!(!matches!(
+        checkpoints.incident().phase,
+        Phase::Resolved { .. }
+    ));
+    only_program_calls(&checkpoints, &observations);
+}
+
+#[test]
 fn fresh_heartbeat_does_not_count_as_progress_or_recovery_ack() {
     let mut checkpoints = FakeHost::new();
     let mut observations = FakeHost::new();

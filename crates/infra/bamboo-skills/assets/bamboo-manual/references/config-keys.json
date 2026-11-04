@@ -24,6 +24,24 @@
     },
     {
       "aliases": [],
+      "default": 0.25,
+      "example": 0.2,
+      "key": "context_management.target_usage_ratio",
+      "meaning": "Shared post-compression window target for every context strategy; mandatory content must fit and does not silently raise the target.",
+      "section": "core",
+      "type": "f64"
+    },
+    {
+      "aliases": [],
+      "default": 0.8,
+      "example": 0.7,
+      "key": "context_management.trigger_usage_ratio",
+      "meaning": "Shared proactive trigger upper bound for every context strategy; runtime output/safety headroom can move the effective token boundary earlier.",
+      "section": "core",
+      "type": "f64"
+    },
+    {
+      "aliases": [],
       "default": false,
       "example": true,
       "key": "lifecycle_hooks.enabled",
@@ -275,6 +293,24 @@
     },
     {
       "aliases": [],
+      "default": null,
+      "example": {
+        "endpoint": "127.0.0.1:8080",
+        "max_evidence_bytes": 16384,
+        "max_evidence_refs": 16,
+        "max_input_tokens": 4096,
+        "max_output_tokens": 256,
+        "model": "gpt-oss-20b",
+        "protocol": "llama_cpp_raw_v1",
+        "provider": "patrol-local"
+      },
+      "key": "patrol_model",
+      "meaning": "Independent patrol model selection. The optional numeric loopback endpoint enables semantic calls after Work budget and Host admission. The raw profile pins gpt-oss-20b.",
+      "section": "model-policy",
+      "type": "option<object>"
+    },
+    {
+      "aliases": [],
       "default": "127.0.0.1",
       "example": "0.0.0.0",
       "key": "server.bind",
@@ -452,7 +488,7 @@
     },
     {
       "coverage": "selected_fields",
-      "documented_entries": 1,
+      "documented_entries": 3,
       "kind": "compatibility_dto_field",
       "root": "context_management",
       "section": "core"
@@ -567,6 +603,13 @@
       "kind": "compatibility_dto_field",
       "root": "notifications",
       "section": "notifications"
+    },
+    {
+      "coverage": "selected_fields",
+      "documented_entries": 1,
+      "kind": "compatibility_dto_field",
+      "root": "patrol_model",
+      "section": "model-policy"
     },
     {
       "coverage": "not_documented",

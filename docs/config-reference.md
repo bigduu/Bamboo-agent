@@ -298,9 +298,11 @@ not recommended.
 
 ## Context management
 
-`context_management` defaults to `{"strategy":"summary"}`. Missing
-configuration therefore keeps the existing model-generated conversation
-summary behavior. The `message_summary` strategy summarizes historical user and
+`context_management` defaults to the `summary` strategy with shared trigger/target
+ratios of `0.80` and `0.25`. All three strategies calculate their effective token
+boundaries from the current model window, output allowance and safety margin;
+changing the history representation does not change that maintenance range.
+The `message_summary` strategy summarizes historical user and
 assistant prose while discarding completed tool exchanges from the next model
 context. The `retrieval_window` strategy keeps exact raw
 messages in the Session store, removes eligible older complete turns only from
@@ -311,10 +313,10 @@ the active provider window, and directs the model to
 {
   "context_management": {
     "strategy": "retrieval_window",
+    "trigger_usage_ratio": 0.8,
+    "target_usage_ratio": 0.25,
     "retrieval_window": {
       "min_recent_user_turns": 3,
-      "trigger_usage_ratio": 0.8,
-      "target_usage_ratio": 0.6,
       "history_tool_required": true,
       "fallback_strategy": "none"
     }
@@ -325,11 +327,36 @@ the active provider window, and directs the model to
 | Field | Default | What it does |
 |---|---|---|
 | `strategy` | `summary` | `summary` preserves the current summarizer path; `message_summary` summarizes historical user/assistant prose and removes completed tool exchanges from the active model view; `retrieval_window` enables exact-history archival at the ordinary pre-turn pressure boundary. |
+| `trigger_usage_ratio` | `0.80` | Shared proactive compression upper bound relative to the total model window. Output/safety headroom can move the effective trigger earlier. |
+| `target_usage_ratio` | `0.25` | Shared post-compression target relative to the total model window. The effective target is rounded down to whole percentages and remains below the trigger. Required content must fit; the target is not silently raised. |
 | `retrieval_window.min_recent_user_turns` | `3` | Minimum newest complete user-anchored turns that remain active. Must be greater than zero. |
-| `retrieval_window.trigger_usage_ratio` | `0.80` | Provider-prepared input ratio that starts automatic archival. |
-| `retrieval_window.target_usage_ratio` | `0.60` | Post-archive target ratio. Validation requires `0.01 <= target < trigger <= 1` because the planner uses whole percentages. |
+| `retrieval_window.trigger_usage_ratio` | `0.80` (legacy) | Compatibility input only. When the shared field is absent, a stricter legacy value migrates to the common trigger for every strategy. Explicit shared fields take precedence. |
+| `retrieval_window.target_usage_ratio` | `0.60` (legacy) | Compatibility input only. The former default adopts the shared `0.25` target; a stricter legacy value is retained as the common target. Historical archive receipts retain their original targets. |
 | `retrieval_window.history_tool_required` | `true` | Must remain `true` in this release. Bamboo fails before archival unless the effective callable catalog contains `session_history_current`. |
 | `retrieval_window.fallback_strategy` | `none` | `none` fails closed when retrieval archival is unavailable. `summary` explicitly opts into the legacy summarizer fallback. |
+
+For a total window `W`, the input hard limit is `H = W - max_output_tokens -
+safety_margin`. The common calculator reserves additional maintenance headroom
+based on the output allowance and safety margin, bounded by one fifth of `H`.
+The effective trigger is the earlier of the configured window ratio and the
+remaining safe input boundary. This avoids the previous fixed-50K behavior that
+waited until 95% on a 1M window. Execution/verification task status does not delay
+compression past that boundary; incomplete tool protocols still wait for their
+matching results. Provider prefix-cache hits do not disable maintenance.
+
+For the ordinary default limits, a 1M window with 32K output and 10K safety
+triggers at 800K with a 250K target. Smaller windows or larger output reservations
+can trigger earlier. Fixed prompts, current user requests and protected content
+are feasibility constraints: if they cannot fit the calculated target, Bamboo
+reports that failure instead of treating near-limit safety trimming as a completed
+summary/archive. The hard input fit remains a distinct final safety mechanism.
+
+An idle ordinary chat can be compressed directly with `/compact` in a
+compatible Lotus client or `POST /api/v1/sessions/{session_id}/compact`.
+The command uses the selected strategy and its current target without
+waiting for the automatic trigger or starting an agent reply. It preserves
+the original transcript. The API reports `compacted` with the committed
+usage estimate, or `unchanged` when it makes no change.
 
 To select message summaries:
 
@@ -395,7 +422,7 @@ the shipped defaults, so an empty `{}` is already reasonable:
 | Field | Default | What it does |
 |---|---|---|
 | `background_model` | `None` | Model used for memory extraction/consolidation background work; falls back to the primary model. |
-| `summary_target_ratio` | `0.20` | Desired durable conversation-summary size relative to the raw source tokens represented by it. Hierarchical reducers retain this global ratio instead of applying it again at every level. |
+| `summary_target_ratio` | `0.20` | Desired durable conversation-summary size relative to the raw source tokens represented by it. The shared context target also bounds the available summary space, so an existing summary can be reduced again instead of growing without limit. |
 | `summary_safe_window_percent` | `80` | Maximum share of the summarization model's total context window used by each fully rendered map/reduce request, including requested output and the tokenizer safety margin. |
 | `auto_dream_enabled` | `true` | Distill conversation stretches into candidate memories + notebook entries as the session runs. |
 | `auto_dream_interval_secs` | `1800` | How often the dream pass runs. |
@@ -419,7 +446,8 @@ the shipped defaults, so an empty `{}` is already reasonable:
 Automatic conversation compression always maps bounded source chunks and then
 reduces their summaries, even when the selected source would fit in one model
 request. Large terminal results are reduced into bounded multipart sections;
-the persisted summary keeps the single overall `summary_target_ratio` budget.
+the persisted summary keeps one overall source-derived budget, capped by the
+space remaining under the shared context target after mandatory content.
 
 `project_prompt_injection` / `relevant_recall` / `relevant_recall_rerank` /
 `project_first_dream` can also be flipped via env vars — see

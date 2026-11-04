@@ -186,12 +186,75 @@ pub struct SessionInboxRuntimeBinding {
     pub parent_question_lock: Option<Arc<bamboo_storage::LockedSessionStore>>,
 }
 
-/// Trait for external child session runtimes (e.g. A2A, CLI adapters).
-///
-/// Implementors are responsible for emitting AgentEvents via `event_tx`
-/// and respecting the `cancel_token`.
+/// A live native owner's once-only Agent execution entry, never persisted or
+/// reconstructed from Actor/Session timestamps. It proves no heartbeat or progress.
+/// Engine owns this physical fact; Orchestration decides its meaning. Server
+/// adapters only join it to current Ticket/Host authority. Stop, shutdown and
+/// restart provide no live sample and cannot recover execution permission.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NativeTaskStart {
+    pub session_id: String,
+    pub child_birth: chrono::DateTime<chrono::Utc>,
+    pub run_id: String,
+    pub instance_id: uuid::Uuid,
+    pub entered_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl NativeTaskStart {
+    pub fn started_at_ms(&self) -> Option<u64> {
+        if self.entered_at < self.child_birth || self.entered_at > chrono::Utc::now() {
+            return None;
+        }
+        self.entered_at.timestamp_millis().try_into().ok()
+    }
+}
+
+/// A heartbeat is a successful renewal attempted after this exact Task entered.
+/// It measures owner liveness independently of the Task's progress.
+#[derive(Clone, Debug)]
+pub struct NativeTaskLiveness {
+    pub start: NativeTaskStart,
+    pub renewal_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl NativeTaskLiveness {
+    pub fn heartbeat_at_ms(&self) -> Option<u64> {
+        let at = self.renewal_started_at?;
+        if at < self.start.entered_at || at > chrono::Utc::now() {
+            return None;
+        }
+        at.timestamp_millis().try_into().ok()
+    }
+}
+
+/// External child session runtimes emit events and respect the cancel token.
 #[async_trait::async_trait]
 pub trait ExternalChildRunner: Send + Sync {
+    /// Live Host evidence only. Queue/preparation, persisted Actor timestamps
+    /// and absent/non-native owners cannot supply a Task-entry witness.
+    fn native_task_start(
+        &self,
+        _session_id: &str,
+        _run_id: &str,
+        _child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskStart> {
+        None
+    }
+
+    /// Read the current native owner and its last acknowledged renewal.
+    fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskLiveness> {
+        self.native_task_start(session_id, run_id, child_birth)
+            .map(|start| NativeTaskLiveness {
+                start,
+                renewal_started_at: None,
+            })
+    }
+
     /// Capability of the actually assembled backend, independent of hot config.
     /// Only the in-process backend consumes canonical Ticket request ceilings.
     fn supports_native_ticket_budget(&self) -> bool {
@@ -399,6 +462,28 @@ pub struct SpawnScheduler {
 }
 
 impl SpawnScheduler {
+    pub fn native_task_start(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskStart> {
+        self.ctx
+            .external_child_runner
+            .native_task_start(session_id, run_id, child_birth)
+    }
+
+    pub fn native_task_liveness(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> Option<NativeTaskLiveness> {
+        self.ctx
+            .external_child_runner
+            .native_task_liveness(session_id, run_id, child_birth)
+    }
+
     pub fn supports_native_ticket_budget(&self) -> bool {
         self.ctx
             .external_child_runner
@@ -1086,9 +1171,7 @@ async fn queued_launch_state(
     }
     match child.last_run_status().as_deref() {
         Some("pending") => Ok(QueuedLaunchState::Eligible),
-        Some("running" | "completed" | "error" | "timeout" | "skipped" | "suspended") => {
-            Ok(QueuedLaunchState::AlreadyStarted)
-        }
+        Some("running" | "suspended") => Ok(QueuedLaunchState::AlreadyStarted),
         _ => Ok(QueuedLaunchState::Stale),
     }
 }

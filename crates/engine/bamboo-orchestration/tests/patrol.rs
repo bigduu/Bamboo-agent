@@ -2,6 +2,9 @@ use std::{cell::RefCell, collections::BTreeMap, rc::Rc};
 
 use bamboo_orchestration::patrol::*;
 
+#[path = "patrol/staged_pass.rs"]
+mod staged_pass;
+
 struct FakeClock(u64);
 impl Clock for FakeClock {
     fn now_ms(&self) -> u64 {
@@ -128,7 +131,11 @@ impl FakeHost {
                 Some(Usage::Known {
                     input_tokens,
                     output_tokens,
-                }) => u64::from(input_tokens + output_tokens),
+                }) if input_tokens <= charge.reservation.request.model.max_input_tokens
+                    && output_tokens <= charge.reservation.request.model.max_output_tokens =>
+                {
+                    u64::from(input_tokens) + u64::from(output_tokens)
+                }
                 _ => charge.cap,
             })
             .sum()
@@ -458,12 +465,42 @@ fn heartbeat_does_not_reset_progress_or_duplicate_incident_or_diagnostic() {
 }
 
 #[test]
-fn initial_missing_heartbeat_has_a_finite_startup_grace_period() {
+fn unavailable_heartbeat_is_not_a_measured_startup_timeout() {
     let patrol = configured();
     let mut host = FakeHost::new();
     let mut provider = ControlledProvider::new(&host);
     host.observation.heartbeat_at_ms = None;
     host.observation.progress = None;
+    assert_eq!(
+        tick(&patrol, &mut host, &mut provider, 29).status,
+        Status::Incident
+    );
+    assert_eq!(
+        tick(&patrol, &mut host, &mut provider, 30).status,
+        Status::NeedsSupervisor
+    );
+    assert_eq!(host.incident().reason, Reason::EvidenceUnknown);
+    assert_eq!(
+        tick(&patrol, &mut host, &mut provider, 30).status,
+        Status::NeedsSupervisor
+    );
+    assert_eq!(
+        host.durable.borrow().queue.values().next().unwrap().reason,
+        SupervisorReason::DeterministicAnomaly
+    );
+    assert!(provider.submits.is_empty());
+}
+
+#[test]
+fn measured_heartbeat_expiry_retains_the_original_exact_timeout() {
+    let patrol = configured();
+    let mut host = FakeHost::new();
+    let mut provider = ControlledProvider::new(&host);
+    host.observation.heartbeat_at_ms = Some(0);
+    host.observation.progress = Some(Progress {
+        sequence: 1,
+        at_ms: 0,
+    });
     assert_eq!(
         tick(&patrol, &mut host, &mut provider, 29).status,
         Status::Healthy
@@ -473,14 +510,6 @@ fn initial_missing_heartbeat_has_a_finite_startup_grace_period() {
         Status::Incident
     );
     assert_eq!(host.incident().reason, Reason::MissingHeartbeat);
-    assert_eq!(
-        tick(&patrol, &mut host, &mut provider, 30).status,
-        Status::NeedsSupervisor
-    );
-    assert_eq!(
-        host.durable.borrow().queue.values().next().unwrap().reason,
-        SupervisorReason::ReconcileReceipt
-    );
     assert!(provider.submits.is_empty());
 }
 
@@ -1148,29 +1177,87 @@ fn corrupt_recovered_operation_fails_before_provider_status_or_new_credit() {
 
 #[test]
 fn over_cap_usage_keeps_the_full_reservation_and_requests_host_reconciliation() {
-    let patrol = configured();
-    let mut host = FakeHost::new();
-    let mut provider = ControlledProvider::new(&host);
-    start_diagnosis(&patrol, &mut host, &mut provider);
-    provider.status = DiagnosticStatus::Finished {
+    let usage = Usage::Known {
+        input_tokens: 40,
+        output_tokens: 21,
+    };
+    let finished = DiagnosticStatus::Finished {
         diagnosis: Diagnosis {
             advice: Advice::Observe,
             evidence: vec!["last-tool-receipt".into()],
             uncertain: false,
             note: "bounded".into(),
         },
-        usage: Usage::Known {
-            input_tokens: 100,
-            output_tokens: 21,
-        },
+        usage,
     };
+    for (status, block, reason) in [
+        (
+            finished,
+            Block::UnknownUsage,
+            SupervisorReason::InvalidDiagnostic,
+        ),
+        (
+            DiagnosticStatus::Failed { usage },
+            Block::Provider,
+            SupervisorReason::DiagnosticUnavailable,
+        ),
+    ] {
+        let patrol = configured();
+        let mut host = FakeHost::new();
+        let mut provider = ControlledProvider::new(&host);
+        start_diagnosis(&patrol, &mut host, &mut provider);
+        provider.status = status;
+        tick(&patrol, &mut host, &mut provider, 101);
+        assert_eq!(host.usage(), 120);
+        assert_eq!(
+            host.durable
+                .borrow()
+                .charges
+                .values()
+                .next()
+                .unwrap()
+                .settled,
+            Some(usage)
+        );
+        assert_eq!(host.incident().phase, Phase::Blocked(block));
+        assert!(host.incident().last_diagnosis.is_none());
+        assert_eq!(host.incident().escalation.unwrap().reason, reason);
+        assert_eq!(provider.submits.len(), 1);
+    }
+}
+
+#[test]
+fn over_cap_evidence_survives_accounting_outage_and_checkpoint_reload() {
+    let patrol = configured();
+    let mut host = FakeHost::new();
+    let mut provider = ControlledProvider::new(&host);
+    start_diagnosis(&patrol, &mut host, &mut provider);
+    let usage = Usage::Known {
+        input_tokens: 40,
+        output_tokens: 21,
+    };
+    provider.status = DiagnosticStatus::Failed { usage };
+    host.fail_settle = true;
     tick(&patrol, &mut host, &mut provider, 101);
+    let stored = host.load(&scope()).unwrap().unwrap();
+    let encoded = checkpoint::encode(stored.version, &stored.checkpoint).unwrap();
+    let recovered = checkpoint::decode(&scope(), &encoded).unwrap();
+    let pending = recovered.checkpoint.incident.as_ref().unwrap();
+    assert_eq!(pending.pending_settlement_usage, Some(usage));
+    let original = pending.pending_settlement.as_ref().unwrap().clone();
+    host.durable
+        .borrow_mut()
+        .checkpoints
+        .insert(scope(), recovered);
+    host.fail_settle = false;
+    tick(&patrol, &mut host, &mut provider, 102);
+    let state = host.durable.borrow();
+    let charge = &state.charges[&original.operation];
+    assert_eq!(charge.reservation, original);
+    assert_eq!(charge.settled, Some(usage));
+    drop(state);
+    assert!(host.incident().pending_settlement.is_none());
     assert_eq!(host.usage(), 120);
-    assert_eq!(host.incident().phase, Phase::Blocked(Block::UnknownUsage));
-    assert_eq!(
-        host.incident().escalation.unwrap().reason,
-        SupervisorReason::InvalidDiagnostic
-    );
     assert_eq!(provider.submits.len(), 1);
 }
 

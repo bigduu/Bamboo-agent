@@ -179,6 +179,14 @@ pub trait Storage: Send + Sync {
         self.save_session(session).await
     }
 
+    /// Return the exact candidate committed by the title transaction, including
+    /// backend-owned bookkeeping. Confirmation must still validate this value.
+    /// Backends which normalize the candidate must override this method.
+    async fn save_manual_title_committed(&self, session: &Session) -> std::io::Result<Session> {
+        self.save_manual_title(session).await?;
+        Ok(session.clone())
+    }
+
     /// Validate a manual title before reporting success, including a no-op.
     /// Backends with Actor metadata observations must reread canonical state
     /// under their writer guards and reject stale or incomplete observations.
@@ -1008,6 +1016,61 @@ pub trait Storage: Send + Sync {
     ) -> std::io::Result<Vec<(String, Option<String>)>> {
         let _ = status;
         Ok(Vec::new())
+    }
+
+    /// Bind a reserved Host run before executing it. Implementations with
+    /// durable runtime state must CAS the old Host identity under their physical
+    /// Session lock; ordinary final-save cannot replace this identity.
+    async fn begin_host_run(&self, expected: &Session, run_id: &str) -> std::io::Result<()> {
+        let _ = (expected, run_id);
+        Ok(())
+    }
+
+    /// The owner has not entered Child execution. Close only that reserved
+    /// Host run after startup publication fails, comparing birth, generation
+    /// and the original input/control identity under the physical writer lock.
+    /// A successor or an already executing/finalized run must be left alone.
+    /// The callback is synchronous cache publication, never a Worker stop proof.
+    async fn fail_child_host_startup(
+        &self,
+        expected: &Session,
+        run_id: &str,
+        error: &str,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, run_id, error, publish);
+        Ok(None)
+    }
+
+    /// Reconcile a selected Child snapshot under the physical Session/Actor
+    /// locks. Return None when superseded, waiting, still leased or lacking a
+    /// trusted terminal fact. The error describes a newly expired Actor only;
+    /// callers cannot supply a terminal outcome. A terminal return proves
+    /// logical closure, never physical Worker termination.
+    async fn reconcile_child_runtime(
+        &self,
+        expected: &Session,
+        before: chrono::DateTime<chrono::Utc>,
+        error: Option<&str>,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, before, error);
+        Ok(None)
+    }
+
+    /// Targeted logical terminal repair. The backend compares the complete
+    /// expected control snapshot and publishes only after a durable repair,
+    /// while the same physical Session/Actor/tree guards are retained. The
+    /// callback must be a synchronous cache publication, never execution or IO.
+    /// Unsupported backends remain unknown. This grants no Worker stop proof.
+    async fn reconcile_session_runtime(
+        &self,
+        expected: &Session,
+        before: chrono::DateTime<chrono::Utc>,
+        error: Option<&str>,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<Option<Session>> {
+        let _ = (expected, before, error, publish);
+        Ok(None)
     }
 
     /// Append one analysis record — a single JSON line — to the session's

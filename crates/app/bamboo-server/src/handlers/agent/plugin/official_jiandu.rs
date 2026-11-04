@@ -20,6 +20,10 @@ use crate::plugin_source::{
     install_server_plugin_from_source_with_event_sink_grants, PluginSourceInput,
 };
 
+mod publisher_trust;
+pub use publisher_trust::{change_publisher_policy, publisher_policy, trust_official_jiandu};
+use publisher_trust::{observe_trust, PublisherTrustAction};
+
 #[derive(Clone, Deserialize, Serialize)]
 struct Release {
     version: String,
@@ -131,13 +135,14 @@ struct Setup {
     host: Host,
     release: Option<Release>,
     trust: Trust,
+    trust_action: Option<PublisherTrustAction>,
     install: Availability,
     installed: Installed,
     external_client: Option<ExternalClient>,
 }
 
 fn trust_reason(trust: &PluginTrustConfig, release: Option<&Release>) -> Option<&'static str> {
-    if !trust.trusted_keys.iter().any(|key| {
+    if !trust.effective_trusted_keys().iter().any(|key| {
         key.algorithm.eq_ignore_ascii_case("ed25519")
             && key
                 .public_key
@@ -167,7 +172,14 @@ async fn setup(
     let memory_reason = installer
         .jiandu_memory_path_reason(&state.app_data_dir.join("plugins/jiandu"))
         .await;
-    let trust = state.config.read().await.plugin_trust.clone();
+    let (trust, trust_action) = observe_trust(
+        state,
+        &host,
+        release.as_ref(),
+        memory_reason,
+        entry.is_some_and(|entry| entry.status == PluginInstallStatus::Installing),
+    )
+    .await;
     let trust_reason = trust_reason(&trust, release.as_ref());
     let mut installed = Installed {
         state: "missing",
@@ -235,6 +247,7 @@ async fn setup(
             trusted: trust_reason.is_none(),
             reason: trust_reason,
         },
+        trust_action,
         install: Availability {
             available: unavailable.is_none(),
             reason: unavailable,
@@ -387,6 +400,8 @@ pub async fn install_official_jiandu(
         );
     }
     trust.enforcement = PluginTrustEnforcement::Strict;
+    trust.trusted_keys = trust.effective_trusted_keys();
+    trust.publisher_mode = bamboo_config::PublisherMode::Explicit;
     trust.trusted_keys.retain(|key| {
         key.algorithm.eq_ignore_ascii_case("ed25519")
             && key

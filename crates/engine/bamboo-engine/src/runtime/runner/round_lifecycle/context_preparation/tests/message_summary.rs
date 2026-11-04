@@ -70,6 +70,7 @@ async fn run_message_summary(
         None,
         "pre-turn",
         None,
+        None,
     )
     .await
 }

@@ -4,7 +4,7 @@ use bamboo_agent_core::storage::AttachmentReader;
 use bamboo_agent_core::MessagePart;
 use bamboo_agent_core::{AgentError, Message};
 
-pub(super) fn parse_bamboo_attachment_url(url: &str) -> Option<(&str, &str)> {
+pub(crate) fn parse_bamboo_attachment_url(url: &str) -> Option<(&str, &str)> {
     let trimmed = url.trim();
     let rest = trimmed.strip_prefix("bamboo-attachment://")?;
     let (session_id, attachment_id) = rest.split_once('/')?;
