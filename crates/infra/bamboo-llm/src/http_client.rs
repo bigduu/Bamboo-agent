@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::provider::LLMError;
 use bamboo_config::Config;
-use reqwest::{Client, NoProxy, Proxy};
+use reqwest::{redirect::Policy, Client, NoProxy, Proxy};
 
 pub fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
     let http_proxy = config.http_proxy.trim();
@@ -44,7 +44,16 @@ pub fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     // stream for minutes). Mid-stream stalls — where the connection stays open
     // but no chunks arrive — are instead bounded by the inter-chunk idle
     // timeout in `consume_llm_stream_internal` (issue #28).
-    let mut builder = Client::builder().connect_timeout(Duration::from_secs(30));
+    let redirects = Policy::default();
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .redirect(Policy::custom(move |attempt| {
+            if crate::retry::work_request_budget_active() {
+                attempt.stop()
+            } else {
+                redirects.redirect(attempt)
+            }
+        }));
     if let Some(proxy) = build_proxy(config)? {
         builder = builder.proxy(proxy);
     }

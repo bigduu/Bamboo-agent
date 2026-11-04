@@ -20,6 +20,8 @@ pub mod resolved_model;
 pub mod retry;
 pub mod router;
 pub mod types;
+pub mod work_text;
+pub mod work_usage;
 
 pub mod api {
     pub mod models {
