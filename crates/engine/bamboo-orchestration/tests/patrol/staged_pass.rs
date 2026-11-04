@@ -613,7 +613,8 @@ mod calls {
             state.charges[&operation].settled,
             Some(Usage::OverCap {
                 input_tokens: None,
-                output_tokens: Some(21)
+                output_tokens: Some(21),
+                total_tokens: None,
             })
         );
     }

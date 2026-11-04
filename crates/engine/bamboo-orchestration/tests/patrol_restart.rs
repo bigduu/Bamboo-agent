@@ -1491,3 +1491,36 @@ fn partial_provider_overrun_halts_the_exact_real_receipt() {
     assert_eq!(entry.over_cap_usage.unwrap().output_tokens, Some(21));
     assert_eq!(ledger.total_charged, 120);
 }
+
+#[test]
+fn total_only_provider_overrun_halts_the_original_work_receipt() {
+    let fixture = Fixture::new();
+    let request = configured_budget_request(&fixture, 240);
+    let authority = fixture.runtime();
+    let mut budget = budget::TicketBudget {
+        service: fixture.service(),
+        authority: &authority,
+        clock: &ClockAt(100),
+    };
+    let receipt = budget.reserve(&request).unwrap();
+    budget
+        .settle(
+            &receipt,
+            Usage::OverCap {
+                input_tokens: None,
+                output_tokens: None,
+                total_tokens: Some(121),
+            },
+        )
+        .unwrap();
+    assert_eq!(budget.confirm_submission(&receipt), Err(PortError::Denied));
+    let ledger = fixture
+        .service()
+        .work_token_budget(&authority)
+        .unwrap()
+        .unwrap();
+    let entry = ledger.reservations.values().next().unwrap();
+    assert_eq!(entry.receipt, receipt.receipt);
+    assert_eq!(entry.over_cap_usage.unwrap().total_tokens, Some(121));
+    assert_eq!(ledger.total_charged, 120);
+}
