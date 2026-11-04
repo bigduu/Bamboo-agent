@@ -252,6 +252,68 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
 }
 
 #[actix_web::test]
+async fn compact_retrieval_window_archives_above_target_only_when_the_input_fits() {
+    for (protected_tokens, expected_status) in [
+        (115_000, StatusCode::OK),
+        (253_000, StatusCode::UNPROCESSABLE_ENTITY),
+    ] {
+        let (_home, state, probe, mut session) =
+            fixture(ContextManagementStrategy::RetrievalWindow).await;
+        session.messages.last_mut().unwrap().content = " context".repeat(protected_tokens);
+        state.storage.save_session(&session).await.unwrap();
+        let app =
+            test::init_service(App::new().app_data(state.clone()).configure(agent_routes)).await;
+
+        let response =
+            test::call_service(&app, test::TestRequest::post().uri(ENDPOINT).to_request()).await;
+        let status = response.status();
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(status, expected_status, "{body}");
+        let durable = state.storage.load_session(ID).await.unwrap().unwrap();
+        assert_eq!(durable.last_run_status(), session.last_run_status());
+        assert_eq!(durable.messages.len(), session.messages.len());
+        for (actual, original) in durable.messages.iter().zip(&session.messages) {
+            assert_eq!(actual.id, original.id);
+            assert_eq!(actual.content, original.content);
+        }
+        assert!(durable.conversation_summary.is_none());
+        assert_eq!(probe.chat_turns.load(Ordering::SeqCst), 0);
+        assert_eq!(probe.summaries.load(Ordering::SeqCst), 0);
+
+        if expected_status == StatusCode::OK {
+            assert_eq!(body["status"], "compacted");
+            assert_eq!(durable.compression_events.len(), 1);
+            let event = &durable.compression_events[0];
+            assert_eq!(event.trigger_type, CompressionTriggerType::Manual);
+            let desired_target = WINDOW * u32::from(event.retrieval_target_usage_percent) / 100;
+            assert!(
+                body["token_usage"]["total_tokens"].as_u64().unwrap() > u64::from(desired_target)
+            );
+            assert!(
+                event.retrieval_active_tokens_after <= event.retrieval_request_input_limit_tokens
+            );
+            assert!(
+                body["usage_after_percent"].as_f64().unwrap()
+                    < body["usage_before_percent"].as_f64().unwrap()
+            );
+            assert!(durable.messages[..16]
+                .iter()
+                .all(|message| message.compressed));
+            assert!(durable.messages[16..]
+                .iter()
+                .all(|message| !message.compressed));
+        } else {
+            assert!(body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("protected active content"));
+            assert!(durable.compression_events.is_empty());
+            assert!(durable.messages.iter().all(|message| !message.compressed));
+        }
+    }
+}
+
+#[actix_web::test]
 async fn compact_session_refuses_pending_work_before_calling_a_model() {
     let (_home, state, probe, mut session) = fixture(ContextManagementStrategy::Summary).await;
     session.set_last_run_status("pending");

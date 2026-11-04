@@ -3596,6 +3596,76 @@ async fn retrieval_window_rejects_a_preexisting_summary_before_pressure_or_side_
 }
 
 #[tokio::test]
+async fn automatic_retrieval_window_keeps_protected_content_above_target_when_it_fits() {
+    let id = "retrieval-protected-above-target";
+    let mut session = retrieval_window_session(id);
+    let call_id = "protected-tool-call";
+    let mut call = Message::assistant("", None);
+    call.tool_calls = Some(vec![ToolCall {
+        id: call_id.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Read".into(),
+            arguments: "{}".into(),
+        },
+    }]);
+    let call_message_id = call.id.clone();
+    session.add_message(call);
+    let tool_result = Message::tool_result(call_id, " evidence".repeat(16_000));
+    let result_message_id = tool_result.id.clone();
+    session.add_message(tool_result);
+
+    let (persistence, checkpoints) = RetrievalCheckpointPersistence::succeeding();
+    let config = retrieval_window_config(persistence);
+    let tools = [retrieval_history_tool_schema()];
+    let (llm, model_calls) = recording_llm();
+    for _ in 0..2 {
+        let context =
+            prepare_round_context(&mut session, &config, "test-model", id, &tools, &llm, None)
+                .await
+                .expect("protected content fits the request input limit");
+        assert!(!context.prepared_context.truncation_occurred);
+        for protected_id in [&call_message_id, &result_message_id] {
+            assert!(context
+                .prepared_context
+                .messages
+                .iter()
+                .any(|message| &message.id == protected_id));
+            assert!(session
+                .messages
+                .iter()
+                .any(|message| &message.id == protected_id && !message.compressed));
+        }
+        assert_eq!(session.compression_events.len(), 1);
+        assert_eq!(checkpoints.lock().unwrap().len(), 1);
+        session = serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+    }
+
+    let event = &session.compression_events[0];
+    assert_eq!(event.trigger_type, CompressionTriggerType::Auto);
+    assert_eq!(event.retrieval_archived_user_turn_count, 8);
+    assert!(event.retrieval_active_tokens_after > 9_600);
+    assert!(event.retrieval_active_tokens_after <= event.retrieval_request_input_limit_tokens);
+    assert!(session.conversation_summary.is_none());
+    assert!(model_calls.lock().unwrap().is_empty());
+
+    session
+        .messages
+        .last_mut()
+        .unwrap()
+        .content
+        .push_str(&" overflow".repeat(12_000));
+    let before = serde_json::to_vec(&session).unwrap();
+    assert!(
+        prepare_round_context(&mut session, &config, "test-model", id, &tools, &llm, None)
+            .await
+            .is_err()
+    );
+    assert_eq!(serde_json::to_vec(&session).unwrap(), before);
+    assert_eq!(checkpoints.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn retrieval_window_missing_history_capability_fails_without_mutating_or_checkpointing() {
     let mut session = retrieval_window_session("retrieval-missing-history");
     let before = serde_json::to_vec(&session).unwrap();
