@@ -14,7 +14,7 @@ use bamboo_domain::{
 };
 use bamboo_llm::protocol::llama_cpp::{GptOssLocalClient, PreparedCompletion};
 use bamboo_llm::{
-    work_text::{self, WorkTextReply},
+    work_text::{self, WorkTextClient, WorkTextReply},
     LLMProvider, ProviderRegistry,
 };
 use bamboo_orchestration::{
@@ -117,6 +117,7 @@ struct RegisteredCompletion {
 struct RegisteredRoute {
     registry: Arc<ProviderRegistry>,
     provider: Arc<dyn LLMProvider>,
+    transport: WorkTextClient,
     target: ProviderModelRef,
     model_limits: Option<Arc<LiveSection<ModelLimitsSection>>>,
     model_limits_revision: Option<u64>,
@@ -144,6 +145,7 @@ impl RegisteredRoute {
         Ok(Self {
             registry: sources.providers.clone(),
             provider,
+            transport: WorkTextClient::from_config(config).map_err(|_| unavailable())?,
             target,
             model_limits,
             model_limits_revision,
@@ -470,6 +472,7 @@ impl CallIo for ReadyPatrolIo {
             Completion::Registered(completion) => {
                 let messages = completion.messages.take().ok_or(PortError::Denied)?;
                 match work_text::complete(
+                    &completion.route.transport,
                     completion.route.provider.as_ref(),
                     &completion.route.target.model,
                     &messages,
