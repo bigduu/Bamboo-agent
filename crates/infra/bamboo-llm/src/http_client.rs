@@ -47,6 +47,9 @@ pub fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     let redirects = Policy::default();
     let mut builder = Client::builder()
         .connect_timeout(Duration::from_secs(30))
+        // Bamboo's transport policy owns retries. Avoid a hidden HTTP/2
+        // replay underneath the Work reservation's physical-send guard.
+        .retry(reqwest::retry::never())
         .redirect(Policy::custom(move |attempt| {
             if crate::retry::work_request_budget_active() {
                 attempt.stop()

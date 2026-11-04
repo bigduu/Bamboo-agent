@@ -209,7 +209,14 @@ where
     } else {
         *config
     };
-    send_managed_request(&retry, provider, limits, build).await
+    let response = send_managed_request(&retry, provider, limits, build).await?;
+    if crate::work_text::active() && !response.status().is_success() {
+        return Err(LLMError::Api(format!(
+            "Work text request returned {}",
+            response.status()
+        )));
+    }
+    Ok(response)
 }
 
 // The timeout owns only the headers future, never the successful SSE body.

@@ -88,11 +88,18 @@ where
     // one marker and cannot build an unbounded side queue.
     let raw_body_activity = Arc::new(AtomicBool::new(false));
     let observed_activity = Arc::clone(&raw_body_activity);
+    let mut remaining = crate::work_text::active().then_some(crate::work_text::MAX_BODY_BYTES);
     let observed_body = response.bytes_stream().map(move |result| {
-        if result.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
+        let bytes = result.map_err(std::io::Error::other)?;
+        if let Some(remaining) = &mut remaining {
+            *remaining = remaining.checked_sub(bytes.len()).ok_or_else(|| {
+                std::io::Error::other("Work text response exceeded its byte limit")
+            })?;
+        }
+        if !bytes.is_empty() {
             observed_activity.store(true, Ordering::Relaxed);
         }
-        result
+        Ok::<_, std::io::Error>(bytes)
     });
 
     let mut parsed = Box::pin(
