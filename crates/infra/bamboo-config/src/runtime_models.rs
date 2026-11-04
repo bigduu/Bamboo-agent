@@ -173,6 +173,7 @@ fn default_refs(
         .chain(defaults.planning.iter())
         .chain(defaults.search.iter())
         .chain(defaults.code_review.iter())
+        .chain(defaults.work_review.iter())
         .chain(defaults.sub_agent.iter())
         .chain(defaults.subagent_models.values())
 }
