@@ -2223,16 +2223,17 @@ mod tests {
             .collect();
         assert_eq!(
             actual,
-            std::collections::BTreeSet::from(["intent", "target", "role", "message", "reply_to",])
+            std::collections::BTreeSet::from([
+                "intent",
+                "target",
+                "role",
+                "model",
+                "reasoning_effort",
+                "message",
+                "reply_to",
+            ])
         );
-        for physical_or_runtime in [
-            "model",
-            "workspace",
-            "worker_bin",
-            "endpoint",
-            "action",
-            "auto_run",
-        ] {
+        for physical_or_runtime in ["workspace", "worker_bin", "endpoint", "action", "auto_run"] {
             assert!(schema["properties"].get(physical_or_runtime).is_none());
         }
     }
