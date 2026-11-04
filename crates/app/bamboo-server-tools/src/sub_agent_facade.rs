@@ -99,7 +99,7 @@ pub(super) fn parameters_schema() -> Value {
             "intent": {"type":"string", "enum":["chat","inspect","control","ask_parent"], "description":"Defaults to chat. ask_parent is Child-only and uses message as a bounded clarification question; it suspends until the canonical direct parent replies."},
             "target": {"type":"string", "description":"Logical Child ActorId returned by this tool. Omit for chat to create a durable child, or inspect to request a tree scoped to this session. Root sees its full tree; an active Child with a Host canonical tree route sees only its owned subtree. The forced permission audit remains Root-only."},
             "role": {"type":"string", "description":"Only chat without target: select a named profile. Defaults include explorer (read-only exploration), implementer (bounded implementation), and reviewer (independent read-only review). Project overrides Global, then the builtin default. Omit for worker; no builtin role is implicitly selected. Invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture; the child uses only the tools the runtime exposes to the child. Role cannot change an existing target."},
-            "model": {"type":"string", "maxLength":256, "description":"Only chat creating a new Worker without target, role or reply_to. Select an admitted provider:model or a model on the parent provider. An unavailable selection fails before launch."},
+            "model": {"type":"string", "maxLength":256, "description":"Only chat creating a new Worker on the built-in Bamboo runtime, without target, role or reply_to. Use an exact configured provider:model. Unavailable and profile-managed routes fail before launch."},
             "reasoning_effort": {"type":"string", "enum":["none","low","medium","high","xhigh","max"], "description":"Optional reasoning effort for a new Worker with an explicit model."},
             "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, diagnostics, messages, message, result, error, or a JSON query for pagination. Pass next_cursor unchanged with the same view; do not decode or edit it. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Control: cancel or retry. No host, physical worker, or mailbox identifiers."},
             "reply_to": {"type":"string", "description":"Exact pending direct-parent ParentRequest id. For forced permission use message exactly approve_once or deny; for a clarification use message as a bounded answer. Omit target and role. The Host checks the canonical request kind and deadline."}
@@ -108,7 +108,7 @@ pub(super) fn parameters_schema() -> Value {
 }
 
 pub(super) fn description() -> &'static str {
-    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. A fresh Worker with no role may select model=provider:model or a model on the parent provider, and optional reasoning_effort. Do not drop an explicitly requested model after a route rejection. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
+    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. A fresh Worker on the built-in Bamboo runtime with no named profile may select an exact model=provider:model and optional reasoning_effort. Do not drop an explicitly requested model after a route rejection. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
 }
 
 /// Must run before launch-owner classification. Only legacy calls retain the
@@ -159,12 +159,16 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
             .model
             .as_deref()
             .ok_or_else(|| invalid("reasoning_effort requires model"))?;
-        if model.trim().is_empty()
-            || model.trim() != model
-            || model.len() > 256
+        if model.len() > 256
             || model.chars().any(char::is_control)
+            || !model.split_once(':').is_some_and(|(provider, model)| {
+                !provider.is_empty()
+                    && provider.trim() == provider
+                    && !model.is_empty()
+                    && model.trim() == model
+            })
         {
-            return Err(invalid("model must be a bounded non-empty model reference"));
+            return Err(invalid("model must be an exact provider:model reference"));
         }
     }
     if has_reply_to {
@@ -1171,6 +1175,7 @@ mod tests {
             json!({"message":"task", "model":model, "reply_to":"request_123"}),
             json!({"intent":"inspect", "model":model}),
             json!({"message":"task", "reasoning_effort":"max"}),
+            json!({"message":"task", "model":"bare-model"}),
             json!({"message":"task", "model":"bad\nmodel"}),
         ] {
             assert!(normalize(invalid).is_err());

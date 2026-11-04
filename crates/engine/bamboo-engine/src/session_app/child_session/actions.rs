@@ -152,6 +152,26 @@ async fn create_child_action_inner(
                 .await?
         }
     };
+    if shared_workspace
+        && input
+            .runtime_metadata
+            .contains_key(super::named_profile::PROFILE_EXPLICIT_MODEL_KEY)
+        && (profile.is_some()
+            || input
+                .runtime_metadata
+                .get("external.protocol")
+                .map(String::as_str)
+                != Some("actor")
+            || input
+                .runtime_metadata
+                .get("external.agent_id")
+                .map(String::as_str)
+                != Some(crate::external_agents::config::LOCAL_ACTOR_AGENT_ID))
+    {
+        return Err(ChildSessionError::ModelNotAdmitted(
+            "compact model selection requires an unprofiled built-in Bamboo route".into(),
+        ));
+    }
     if let Some(profile) = &profile {
         if input.lifecycle.as_deref() == Some("resident")
             || input.resident_name.is_some()

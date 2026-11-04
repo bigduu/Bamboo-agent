@@ -7735,8 +7735,44 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
         assert!(payload.get("child_session_id").is_none());
         assert!(payload.get("runtime_kind").is_none());
     }
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    let agents = h.adapter.session_store.bamboo_home_dir().join("agents");
+    tokio::fs::create_dir_all(&agents).await.unwrap();
+    let profile = agents.join("worker.md");
+    tokio::fs::write(
+        &profile,
+        "---\nschema_version: 1\nname: worker\ndescription: Pinned Worker\nmodel_hint: relay:gpt-5\n---\nFollow the Worker profile.\n",
+    )
+    .await
+    .unwrap();
+    for route in ["named-profile", "external"] {
+        if route == "external" {
+            tokio::fs::remove_file(&profile).await.unwrap();
+            h.adapter.config.write().await.extra.insert(
+                "subagentRouting".into(),
+                json!({"worker":{"runtime":"external","agent_id":"remote-worker"}}),
+            );
+        }
+        let rejected = invoke_completed(
+            &tool,
+            json!({"message":message, "model":"relay:private/custom-child"}),
+            subagent_test_ctx(&h.parent_session_id, route),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejected.to_string().contains("model route is not admitted"),
+            "{route}: {rejected}"
+        );
+        assert_eq!(
+            h.adapter.session_store.list_index_entries().await.len(),
+            before
+        );
+    }
     let schema = tool.parameters_schema();
-    assert_eq!(schema["properties"].as_object().unwrap().len(), 5);
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 7);
+    assert!(schema["properties"].get("model").is_some());
+    assert!(schema["properties"].get("reasoning_effort").is_some());
     assert!(schema["properties"].get("action").is_none());
 }
 
