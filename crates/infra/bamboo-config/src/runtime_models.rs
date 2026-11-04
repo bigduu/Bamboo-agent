@@ -173,7 +173,6 @@ fn default_refs(
         .chain(defaults.planning.iter())
         .chain(defaults.search.iter())
         .chain(defaults.code_review.iter())
-        .chain(defaults.work_review.iter())
         .chain(defaults.sub_agent.iter())
         .chain(defaults.subagent_models.values())
 }
@@ -230,6 +229,15 @@ fn configured_models_from_inputs(
             {
                 models.insert(reference.model.trim().to_string());
             }
+        }
+        // Work Review resolves the exact saved account. Provider type aliases
+        // must not seed admission under a different account.
+        if let Some(reference) = defaults.work_review.as_ref().filter(|reference| {
+            reference.provider == id
+                && !reference.model.is_empty()
+                && reference.model.trim() == reference.model
+        }) {
+            models.insert(reference.model.clone());
         }
     }
     models.into_iter().collect()
@@ -544,6 +552,38 @@ mod tests {
             provider_runtime_models(&config(), "relay").unwrap(),
             ["chat", "child", "fast", "vision"]
         );
+    }
+
+    #[test]
+    fn work_review_seeds_admission_only_on_its_exact_provider_account() {
+        let mut config = config();
+        config.default_provider_instance = Some("relay".into());
+        config.provider_instances.insert(
+            "other-relay".into(),
+            serde_json::from_value(json!({"provider_type":"openai"})).unwrap(),
+        );
+        let work_model = "private/work-review";
+        config.defaults.as_mut().unwrap().work_review =
+            Some(bamboo_domain::ProviderModelRef::new("openai", work_model));
+        for account in ["relay", "other-relay"] {
+            assert!(!provider_runtime_models(&config, account)
+                .unwrap()
+                .iter()
+                .any(|model| model == work_model));
+        }
+
+        config.defaults.as_mut().unwrap().work_review = Some(bamboo_domain::ProviderModelRef::new(
+            "other-relay",
+            work_model,
+        ));
+        assert_eq!(
+            provider_runtime_models(&config, "other-relay").unwrap(),
+            [work_model]
+        );
+        assert!(!provider_runtime_models(&config, "relay")
+            .unwrap()
+            .iter()
+            .any(|model| model == work_model));
     }
 
     #[test]
