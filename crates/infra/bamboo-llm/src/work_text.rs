@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use bamboo_domain::{Message, TokenUsage};
 use futures::StreamExt;
+use reqwest::{Client, RequestBuilder, Response};
 use tokio::time::{timeout, timeout_at, Instant};
 
 use crate::{
@@ -18,11 +19,28 @@ pub(crate) const MAX_BODY_BYTES: usize = 1024 * 1024;
 const MAX_REQUEST_TIME: Duration = Duration::from_secs(60);
 
 tokio::task_local! {
-    static WORK_TEXT: ();
+    static WORK_TEXT: Client;
 }
 
 pub(crate) fn active() -> bool {
     WORK_TEXT.try_with(|_| ()).is_ok()
+}
+
+pub(crate) async fn send(request: RequestBuilder) -> reqwest::Result<Response> {
+    match WORK_TEXT.try_with(Clone::clone) {
+        Ok(client) => client.execute(request.build()?).await,
+        Err(_) => request.send().await,
+    }
+}
+
+/// A separate HTTP pool for reserved text calls. The configured provider
+/// continues to build the request and parse its native reply.
+pub struct WorkTextClient(Client);
+
+impl WorkTextClient {
+    pub fn from_config(config: &crate::Config) -> crate::provider::Result<Self> {
+        Ok(Self(crate::http_client::build_work_text_client(config)?))
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -39,6 +57,7 @@ pub enum WorkTextReply {
 /// provider. The Host supplies the limits for the original reservation and
 /// owns route, scope, and receipt checks before calling this function.
 pub async fn complete(
+    client: &WorkTextClient,
     provider: &dyn LLMProvider,
     model: &str,
     messages: &[Message],
@@ -53,7 +72,7 @@ pub async fn complete(
     timeout(
         remaining.min(MAX_REQUEST_TIME),
         WORK_TEXT.scope(
-            (),
+            client.0.clone(),
             transport.scope(async {
                 let options = LLMRequestOptions {
                     request_purpose: Some("semantic_patrol".into()),
@@ -145,6 +164,7 @@ mod tests {
             .with_client(client)
             .with_base_url(server.uri());
         complete(
+            &WorkTextClient::from_config(&Config::default()).unwrap(),
             &provider,
             "configured-model",
             &[Message::user("Evidence")],
@@ -245,7 +265,15 @@ mod tests {
         let remaining = Duration::from_millis(20);
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            complete(&Idle, "idle", &[], 100, 10, remaining),
+            complete(
+                &WorkTextClient::from_config(&Config::default()).unwrap(),
+                &Idle,
+                "idle",
+                &[],
+                100,
+                10,
+                remaining,
+            ),
         )
         .await;
         assert_eq!(result.unwrap(), WorkTextReply::Unknown);

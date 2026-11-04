@@ -248,7 +248,7 @@ where
             let attempt_deadline = deadline
                 .map(|deadline| deadline.min(started + limits.attempt_timeout))
                 .unwrap_or(started + limits.attempt_timeout);
-            match tokio::time::timeout_at(attempt_deadline, build().send()).await {
+            match tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await {
                 Ok(Ok(response)) => RetryAttempt {
                     retry: is_retryable_status(response.status()),
                     status: Some(response.status()),
@@ -1094,7 +1094,8 @@ where
                     .deadline
                     .min(attempt_started + budget.attempt_timeout)
             };
-            let sent = tokio::time::timeout_at(attempt_deadline, build().send()).await;
+            let sent =
+                tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await;
             let mut response = match sent {
                 Err(_) => {
                     budget.record_live_candidate(None);
