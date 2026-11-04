@@ -21,10 +21,19 @@ impl TicketApplication {
         &self,
         memory: bamboo_memory::memory_store::MemoryStore,
         projects: std::sync::Arc<bamboo_projects::ProjectStore>,
+        providers: std::sync::Arc<bamboo_llm::ProviderRegistry>,
+        config_io_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+        model_limits: Option<
+            std::sync::Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
+        >,
     ) {
-        let _ = self
-            .patrol_sources
-            .set(EvidenceSources { memory, projects });
+        let _ = self.patrol_sources.set(EvidenceSources {
+            memory,
+            projects,
+            providers,
+            config_io_lock,
+            model_limits,
+        });
     }
 
     /// Prepare exactly one program observation after the existing live Host

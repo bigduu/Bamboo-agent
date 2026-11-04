@@ -1,14 +1,18 @@
 //! Host/native I/O adapter. Pure evidence policy belongs to bamboo-orchestration.
 use super::super::{Error, Principal, Result, TicketApplication};
 use super::patrol_error;
-use bamboo_config::{Config, PatrolModelConfig, PatrolModelProtocol};
-use bamboo_domain::ProjectManifest;
+use bamboo_config::{
+    Config, LiveSection, ModelLimitsSection, PatrolModelConfig, PatrolModelProtocol,
+};
+use bamboo_domain::{Message, ProjectManifest};
 use bamboo_llm::protocol::llama_cpp::GptOssPrompt;
 use bamboo_memory::memory_store::{
     DurableMemoryStatus, MemoryStore, ProjectMemoryRead, ProjectMemoryRef,
 };
 use bamboo_orchestration::patrol::{
-    diagnostic_input::{diagnostic_prompt, prepare_diagnostic_input},
+    diagnostic_input::{
+        diagnostic_prompt, prepare_diagnostic_input, prepare_diagnostic_input_with_ceiling,
+    },
     evidence as core, host, DiagnosticInput, EvidenceRef, Model, Observation, PortError, Scope,
 };
 use bamboo_projects::ProjectStore;
@@ -58,6 +62,9 @@ impl PreparedPatrolDiagnostic {
 pub(in crate::app_state::ticket_application) struct EvidenceSources {
     pub(super) memory: MemoryStore,
     pub(super) projects: Arc<ProjectStore>,
+    pub(super) providers: Arc<bamboo_llm::ProviderRegistry>,
+    pub(super) config_io_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(super) model_limits: Option<Arc<LiveSection<ModelLimitsSection>>>,
 }
 
 pub(super) struct EvidenceReader<'a> {
@@ -84,12 +91,8 @@ fn prepare_configured_diagnostic(
         &model,
         |_, summary, references| {
             let (instructions, evidence) = diagnostic_prompt(summary, references)?;
-            let encoded = match selection.protocol {
-                PatrolModelProtocol::LlamaCppRawV1 => {
-                    GptOssPrompt::encode(&instructions, &evidence)
-                        .map_err(|_| PortError::Unavailable)?
-                }
-            };
+            let encoded = GptOssPrompt::encode(&instructions, &evidence)
+                .map_err(|_| PortError::Unavailable)?;
             let tokens = u32::try_from(encoded.tokens().len()).map_err(|_| PortError::Denied)?;
             prompt = Some(encoded);
             Ok(tokens)
@@ -308,7 +311,9 @@ impl EvidenceReader<'_> {
         since_cursor: u64,
     ) -> Result<Option<PreparedPatrolDiagnostic>> {
         let selection = self.config.read().await.patrol_model.clone();
-        let Some(selection) = selection else {
+        let Some(selection) =
+            selection.filter(|selection| selection.protocol == PatrolModelProtocol::LlamaCppRawV1)
+        else {
             return Ok(None);
         };
         self.read_patrol_diagnostic_for_selection(
@@ -329,6 +334,9 @@ impl EvidenceReader<'_> {
         selection: PatrolModelConfig,
     ) -> Result<PreparedPatrolDiagnostic> {
         selection.validate().map_err(Error::AuthorityUnavailable)?;
+        if selection.protocol != PatrolModelProtocol::LlamaCppRawV1 {
+            return Err(patrol_error(PortError::Denied));
+        }
         let prepared = self
             .with_work_patrol_evidence(
                 &through.scope,
@@ -366,6 +374,36 @@ impl EvidenceReader<'_> {
             return Err(Error::RevisionConflict);
         }
         Ok(prepared)
+    }
+
+    pub(super) async fn read_registered_diagnostic(
+        &self,
+        through: &Observation,
+        expected_commit: &str,
+        since_cursor: u64,
+        model: &Model,
+        input_ceiling: u32,
+    ) -> Result<(DiagnosticInput, [Message; 2])> {
+        self.with_work_patrol_evidence(&through.scope, expected_commit, since_cursor, |evidence| {
+            ready((|| {
+                let input = prepare_diagnostic_input_with_ceiling(
+                    &evidence,
+                    expected_commit,
+                    since_cursor,
+                    through,
+                    model,
+                    input_ceiling,
+                )
+                .map_err(patrol_error)?;
+                let (instructions, evidence) =
+                    diagnostic_prompt(&input.summary, &input.references).map_err(patrol_error)?;
+                Ok((
+                    input,
+                    [Message::system(instructions), Message::user(evidence)],
+                ))
+            })())
+        })
+        .await
     }
 
     async fn with_work_patrol_evidence<T, F>(

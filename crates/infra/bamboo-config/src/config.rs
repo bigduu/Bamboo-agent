@@ -59,6 +59,7 @@
 use anyhow::{Context, Result};
 use bamboo_domain::patrol_model_limits::{
     MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+    MAX_PROVIDER_INPUT_TOKENS,
 };
 use bamboo_domain::poison::PoisonRecover;
 use serde::{Deserialize, Serialize};
@@ -1781,11 +1782,12 @@ impl<'de> Deserialize<'de> for ContextManagementConfig {
     }
 }
 
-/// Protocol whose model-visible input can be metered locally.
+/// The provider route and pre-call input proof for semantic patrol.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PatrolModelProtocol {
     LlamaCppRawV1,
+    RegisteredProviderV1,
 }
 
 /// Independent selection for semantic patrol preparation. Absent disables it.
@@ -1795,8 +1797,8 @@ pub struct PatrolModelConfig {
     pub provider: String,
     pub model: String,
     pub protocol: PatrolModelProtocol,
-    /// Explicit local provider activation. Omitted keeps prompt preparation
-    /// available without enabling outbound model calls.
+    /// Numeric loopback activation for the raw profile. Registered providers
+    /// use the endpoint of the configured instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<std::net::SocketAddr>,
     pub max_input_tokens: std::num::NonZeroU32,
@@ -1816,13 +1818,17 @@ impl PatrolModelConfig {
         {
             return Err("patrol_model requires an explicit provider identifier".into());
         }
-        if self.max_input_tokens.get() > MAX_INPUT_TOKENS
+        let input_limit = match self.protocol {
+            PatrolModelProtocol::LlamaCppRawV1 => MAX_INPUT_TOKENS,
+            PatrolModelProtocol::RegisteredProviderV1 => MAX_PROVIDER_INPUT_TOKENS,
+        };
+        if self.max_input_tokens.get() > input_limit
             || self.max_output_tokens.get() > MAX_OUTPUT_TOKENS
             || self.max_evidence_bytes.get() > MAX_EVIDENCE_BYTES
             || self.max_evidence_refs.get() > MAX_EVIDENCE_REFS
         {
             return Err(format!(
-                "patrol_model limits must be at most {MAX_INPUT_TOKENS} input tokens, \
+                "patrol_model limits must be at most {input_limit} input tokens, \
                  {MAX_OUTPUT_TOKENS} output tokens, {MAX_EVIDENCE_BYTES} evidence bytes, \
                  and {MAX_EVIDENCE_REFS} evidence references"
             ));
@@ -1840,6 +1846,17 @@ impl PatrolModelConfig {
             PatrolModelProtocol::LlamaCppRawV1 => {
                 Err("llama_cpp_raw_v1 requires the gpt-oss-20b patrol model".into())
             }
+            PatrolModelProtocol::RegisteredProviderV1
+                if self.endpoint.is_none()
+                    && !self.model.is_empty()
+                    && self.model.len() <= 256
+                    && !self.model.chars().any(|ch| ch.is_whitespace() || ch.is_control()) =>
+            {
+                Ok(())
+            }
+            PatrolModelProtocol::RegisteredProviderV1 => Err(
+                "registered_provider_v1 requires a named model and uses the configured provider endpoint".into(),
+            ),
         }
     }
 }

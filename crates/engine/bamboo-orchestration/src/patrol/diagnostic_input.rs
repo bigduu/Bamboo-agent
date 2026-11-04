@@ -9,7 +9,7 @@ use super::{
         MAX_WORK_PATROL_EVIDENCE_BYTES, MAX_WORK_PATROL_EVIDENCE_REFS,
     },
     valid_id, valid_input_evidence, valid_input_tokens, valid_model, valid_scope, DiagnosticInput,
-    EvidenceRef, Model, Observation, PortError, SupervisorReason,
+    EvidenceRef, InputTokenBasis, Model, Observation, PortError, SupervisorReason,
 };
 use bamboo_tickets::{canonical_bytes, content_hash};
 use serde::Serialize;
@@ -148,6 +148,7 @@ pub fn prepare_diagnostic_input<R: Serialize, S: Serialize>(
         summary,
         references,
         input_tokens: 0,
+        input_token_basis: InputTokenBasis::Exact,
     };
     if !valid_input_evidence(&input, model, through, since_cursor) {
         return Err(PortError::Denied);
@@ -156,6 +157,28 @@ pub fn prepare_diagnostic_input<R: Serialize, S: Serialize>(
     if !valid_input_tokens(input.input_tokens, model) {
         return Err(PortError::Denied);
     }
+    Ok(input)
+}
+
+/// Prepare the same evidence with the Host's verified upper bound for the
+/// selected registered provider. The bound must fit the configured Work cap.
+pub fn prepare_diagnostic_input_with_ceiling<R: Serialize, S: Serialize>(
+    evidence: &UnmeteredWorkPatrolEvidence<R, S>,
+    expected_commit: &str,
+    since_cursor: u64,
+    through: &Observation,
+    model: &Model,
+    input_ceiling: u32,
+) -> Result<DiagnosticInput, PortError> {
+    let mut input = prepare_diagnostic_input(
+        evidence,
+        expected_commit,
+        since_cursor,
+        through,
+        model,
+        |_, _, _| Ok(input_ceiling),
+    )?;
+    input.input_token_basis = InputTokenBasis::ProviderCeiling;
     Ok(input)
 }
 

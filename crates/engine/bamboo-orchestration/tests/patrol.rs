@@ -170,6 +170,7 @@ impl ObservationPort for FakeHost {
             through_cursor: through.cursor,
             summary: "x".repeat(self.input_bytes),
             input_tokens: self.input_tokens,
+            input_token_basis: Default::default(),
             references: vec![EvidenceRef {
                 id: "last-tool-receipt".into(),
                 revision: 2,

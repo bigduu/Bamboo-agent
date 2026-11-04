@@ -441,11 +441,23 @@ async fn ready_semantic_patrol_retries_late_usage_against_the_original_receipt()
     Box::pin(ready_semantic_fixture(SemanticCase::LateUsage)).await;
 }
 
+#[tokio::test]
+async fn ready_semantic_patrol_uses_the_configured_provider_without_a_local_profile() {
+    Box::pin(ready_semantic_fixture(SemanticCase::Registered)).await;
+}
+
+#[tokio::test]
+async fn ready_semantic_patrol_keeps_the_reserved_charge_when_the_provider_omits_usage() {
+    Box::pin(ready_semantic_fixture(SemanticCase::RegisteredMissingUsage)).await;
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SemanticCase {
     Known,
     ProjectChanged,
     LateUsage,
+    Registered,
+    RegisteredMissingUsage,
 }
 
 async fn ready_semantic_fixture(case: SemanticCase) {
@@ -564,6 +576,10 @@ async fn ready_semantic_fixture(case: SemanticCase) {
     assert!(!observed.repeated_errors);
 
     let provider = MockServer::start().await;
+    let registered = matches!(
+        case,
+        SemanticCase::Registered | SemanticCase::RegisteredMissingUsage | SemanticCase::LateUsage
+    );
     for (route, body) in [
         (
             "/v1/models",
@@ -573,7 +589,7 @@ async fn ready_semantic_fixture(case: SemanticCase) {
             "/props",
             json!({"model_alias":"gpt-oss-20b","default_generation_settings":{"n_ctx":8192}}),
         ),
-    ] {
+    ].into_iter().filter(|_| !registered) {
         Mock::given(method("GET"))
             .and(path(route))
             .respond_with(ResponseTemplate::new(200).set_body_json(body))
@@ -582,24 +598,26 @@ async fn ready_semantic_fixture(case: SemanticCase) {
     }
     let projects = state.project_store.clone();
     let change_project = case == SemanticCase::ProjectChanged;
-    Mock::given(method("POST"))
-        .and(path("/tokenize"))
-        .respond_with(move |_: &Request| {
-            if change_project {
-                let revision = projects.get_read_only(&project).unwrap().revision;
-                projects
-                    .update(&project, revision, |manifest| {
-                        manifest.name = "Changed while preparing the model call".into();
-                        Ok(())
-                    })
-                    .unwrap();
-            }
-            ResponseTemplate::new(200)
-                .set_body_json(json!({"tokens":[200006,173781,200005,17196,200008,200002]}))
-        })
-        .expect(1)
-        .mount(&provider)
-        .await;
+    if !registered {
+        Mock::given(method("POST"))
+            .and(path("/tokenize"))
+            .respond_with(move |_: &Request| {
+                if change_project {
+                    let revision = projects.get_read_only(&project).unwrap().revision;
+                    projects
+                        .update(&project, revision, |manifest| {
+                            manifest.name = "Changed while preparing the model call".into();
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"tokens":[200006,173781,200005,17196,200008,200002]}))
+            })
+            .expect(1)
+            .mount(&provider)
+            .await;
+    }
 
     let generated = bamboo_llm::protocol::llama_cpp::GptOssPrompt::encode(
         "",
@@ -618,7 +636,11 @@ async fn ready_semantic_fixture(case: SemanticCase) {
     let failed_publications = Arc::new(AtomicUsize::new(0));
     let failure_probe = failed_publications.clone();
     Mock::given(method("POST"))
-        .and(path("/completion"))
+        .and(path(if registered {
+            "/chat/completions"
+        } else {
+            "/completion"
+        }))
         .respond_with(move |req: &Request| {
             let ledger = ledger_at_send
                 .work_token_budget(&runtime_at_send)
@@ -649,6 +671,30 @@ async fn ready_semantic_fixture(case: SemanticCase) {
                 })));
             }
             let body: Value = serde_json::from_slice(&req.body).unwrap();
+            if registered {
+                assert_eq!(body["model"], "registered-patrol-model");
+                assert_eq!(body["max_tokens"], 128);
+                assert_eq!(body["messages"][0]["role"], "system");
+                assert_eq!(body["messages"][1]["role"], "user");
+                assert!(
+                    body["tools"].is_null() || body["tools"].as_array().is_some_and(Vec::is_empty)
+                );
+                if case == SemanticCase::RegisteredMissingUsage {
+                    return ResponseTemplate::new(200).set_body_raw(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\ndata: [DONE]\n\n",
+                        "text/event-stream",
+                    );
+                }
+                return ResponseTemplate::new(200).set_body_raw(
+                    concat!(
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"{}\"}}]}\n\n",
+                        "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,",
+                        "\"completion_tokens\":4,\"total_tokens\":44}}\n\n",
+                        "data: [DONE]\n\n",
+                    ),
+                    "text/event-stream",
+                );
+            }
             let prompt = body["prompt"].as_array().unwrap();
             assert!(prompt.iter().all(Value::is_u64));
             ResponseTemplate::new(200).set_body_json(json!({
@@ -659,13 +705,43 @@ async fn ready_semantic_fixture(case: SemanticCase) {
         .expect(u64::from(!change_project))
         .mount(&provider)
         .await;
-    let selection = serde_json::from_value(json!({
+    let mut selection = json!({
         "provider": "patrol-local", "model": "gpt-oss-20b", "protocol": "llama_cpp_raw_v1",
         "endpoint": provider.address().to_string(), "max_input_tokens":4096,"max_output_tokens":128,
         "max_evidence_bytes":16384,"max_evidence_refs":8
-    }))
-    .unwrap();
-    state.config.write().await.patrol_model = Some(selection);
+    });
+    if registered {
+        selection["provider"] = json!("patrol-existing");
+        selection["model"] = json!("registered-patrol-model");
+        selection["protocol"] = json!("registered_provider_v1");
+        selection.as_object_mut().unwrap().remove("endpoint");
+        let config = {
+            let mut config = state.config.write().await;
+            config.provider_instances.insert(
+                "patrol-existing".into(),
+                serde_json::from_value(json!({
+                    "provider_type":"openai", "enabled":true, "api_key":"controlled-registry-key",
+                    "base_url":provider.uri(), "model":"registered-patrol-model",
+                    "runtime_models":["registered-patrol-model"]
+                }))
+                .unwrap(),
+            );
+            config.extra.insert(
+                "model_limits".into(),
+                json!([{
+                    "model_pattern":"registered-patrol-model", "max_context_tokens":4096,
+                    "max_output_tokens":128, "safety_margin":0
+                }]),
+            );
+            config.clone()
+        };
+        state.provider_registry.replace_with(
+            ProviderRegistry::from_config(&config, data.clone())
+                .await
+                .unwrap(),
+        );
+    }
+    state.config.write().await.patrol_model = Some(serde_json::from_value(selection).unwrap());
     let host = Host(&state.tickets);
     let scheduler = ReadyWorkScheduler::default();
     let granted = policy(&snapshot, &scope);
@@ -729,6 +805,20 @@ async fn ready_semantic_fixture(case: SemanticCase) {
         assert_eq!(requests.len(), 3);
         assert_eq!(ledger.total_charged, 4224);
         assert_eq!(receipt.usage, Some(ExecutionTokenUsage::Unknown));
+    } else if case == SemanticCase::RegisteredMissingUsage {
+        assert_eq!(requests.len(), 1);
+        assert_eq!(ledger.total_charged, 4224);
+        assert_eq!(receipt.usage, Some(ExecutionTokenUsage::Unknown));
+    } else if registered {
+        assert_eq!(requests.len(), 1);
+        assert_eq!(ledger.total_charged, 44);
+        assert_eq!(
+            receipt.usage,
+            Some(ExecutionTokenUsage::Known {
+                input_tokens: 40,
+                output_tokens: 4,
+            })
+        );
     } else {
         assert_eq!(requests.len(), 4);
         let body: Value = serde_json::from_slice(&requests[3].body).unwrap();

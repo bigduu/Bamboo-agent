@@ -17,7 +17,7 @@ pub mod program;
 pub mod staged;
 
 use bamboo_domain::patrol_model_limits::{
-    MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_INPUT_TOKENS, MAX_OUTPUT_TOKENS,
+    MAX_EVIDENCE_BYTES, MAX_EVIDENCE_REFS, MAX_OUTPUT_TOKENS, MAX_PROVIDER_INPUT_TOKENS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -188,8 +188,24 @@ pub struct DiagnosticInput {
     pub through_cursor: u64,
     pub summary: String,
     pub references: Vec<EvidenceRef>,
-    /// Model-specific input metering by the trusted adapter, including its envelope.
+    /// Exact prompt tokens or the verified provider ceiling for this input.
     pub input_tokens: u32,
+    #[serde(default, skip_serializing_if = "InputTokenBasis::is_exact")]
+    pub input_token_basis: InputTokenBasis,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InputTokenBasis {
+    #[default]
+    Exact,
+    ProviderCeiling,
+}
+
+impl InputTokenBasis {
+    fn is_exact(&self) -> bool {
+        *self == Self::Exact
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -232,6 +248,8 @@ pub enum Usage {
     OverCap {
         input_tokens: Option<u64>,
         output_tokens: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        total_tokens: Option<u64>,
     },
     /// Checkpoint marker for the original live call. It is never ledger usage.
     AwaitingProvider,
@@ -244,10 +262,15 @@ impl Usage {
             Self::OverCap {
                 input_tokens,
                 output_tokens,
+                total_tokens,
             } => {
                 input_tokens.is_some_and(|input| input > u64::from(model.max_input_tokens))
                     || output_tokens
                         .is_some_and(|output| output > u64::from(model.max_output_tokens))
+                    || total_tokens.is_some_and(|total| {
+                        total
+                            > u64::from(model.max_input_tokens) + u64::from(model.max_output_tokens)
+                    })
             }
             _ => true,
         }
@@ -1194,7 +1217,7 @@ fn validate_observation(o: &Observation, scope: &Scope, now: u64) -> Result<(), 
 fn valid_model(model: &Model) -> bool {
     valid_id(&model.provider)
         && valid_id(&model.model)
-        && (1..=MAX_INPUT_TOKENS).contains(&model.max_input_tokens)
+        && (1..=MAX_PROVIDER_INPUT_TOKENS).contains(&model.max_input_tokens)
         && (1..=MAX_OUTPUT_TOKENS).contains(&model.max_output_tokens)
         && (1..=MAX_EVIDENCE_BYTES).contains(&model.max_evidence_bytes)
         && (1..=MAX_EVIDENCE_REFS).contains(&model.max_evidence_refs)

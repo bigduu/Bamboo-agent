@@ -120,6 +120,7 @@ fn diagnosing_phase_is_a_label_without_request_or_reservation_serialization() {
             summary: "PRIVATE_REQUEST".into(),
             references: vec![],
             input_tokens: 1,
+            input_token_basis: Default::default(),
         },
         deadline_ms: 150,
     };
