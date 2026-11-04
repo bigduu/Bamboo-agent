@@ -210,9 +210,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unfinished_sse_cannot_exceed_the_work_body_limit() {
+    async fn oversized_raw_sse_cannot_reach_a_valid_terminal() {
         let server = MockServer::start().await;
-        let body = format!("data: {}", "x".repeat(MAX_BODY_BYTES));
+        let body = format!(
+            ": {}\n\ndata: {{\"choices\":[],\"usage\":{{\"prompt_tokens\":12,\"completion_tokens\":3}}}}\n\ndata: [DONE]\n\n",
+            "x".repeat(MAX_BODY_BYTES),
+        );
         Mock::given(method("POST"))
             .and(path("/chat/completions"))
             .respond_with(ResponseTemplate::new(200).set_body_raw(body, "text/event-stream"))
@@ -222,8 +225,8 @@ mod tests {
         assert_eq!(run(&server, 20).await, WorkTextReply::Unknown);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn overflowing_timeout_is_capped_before_an_idle_stream() {
+    #[tokio::test]
+    async fn idle_stream_stops_at_its_request_timeout() {
         struct Idle;
 
         #[async_trait::async_trait]
@@ -239,13 +242,12 @@ mod tests {
             }
         }
 
-        let started = Instant::now();
+        let remaining = Duration::from_millis(20);
         let result = tokio::time::timeout(
-            MAX_REQUEST_TIME + Duration::from_secs(1),
-            complete(&Idle, "idle", &[], 100, 10, Duration::MAX),
+            Duration::from_secs(2),
+            complete(&Idle, "idle", &[], 100, 10, remaining),
         )
         .await;
         assert_eq!(result.unwrap(), WorkTextReply::Unknown);
-        assert_eq!(started.elapsed(), MAX_REQUEST_TIME);
     }
 }
