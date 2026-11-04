@@ -124,8 +124,8 @@ pub(super) struct PreparedCall {
 }
 
 enum Completion {
-    Raw(Option<PreparedCompletion>),
-    Registered(Box<Option<[Message; 2]>>),
+    Raw(Option<Box<PreparedCompletion>>),
+    Registered(Option<Box<[Message; 2]>>),
 }
 
 struct RegisteredRoute {
@@ -303,7 +303,7 @@ impl TicketApplication {
                     .map_err(|_| unavailable())?;
                 (
                     evidence.input().clone(),
-                    Completion::Raw(Some(completion)),
+                    Completion::Raw(Some(Box::new(completion))),
                     None,
                 )
             }
@@ -333,7 +333,7 @@ impl TicketApplication {
                 }
                 (
                     input,
-                    Completion::Registered(Box::new(Some(messages))),
+                    Completion::Registered(Some(Box::new(messages))),
                     Some(route),
                 )
             }
@@ -530,7 +530,7 @@ impl CallIo for ReadyPatrolIo {
                     route.provider.as_ref(),
                     work_text::Request {
                         model: &route.target.model,
-                        messages: &messages,
+                        messages: messages.as_ref(),
                         input_cap: reservation.request.model.max_input_tokens,
                         output_cap: reservation.request.model.max_output_tokens,
                         remaining,
