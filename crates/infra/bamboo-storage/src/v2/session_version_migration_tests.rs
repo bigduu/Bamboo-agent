@@ -323,7 +323,11 @@ pub(super) async fn cleanup_loss_regression() {
     // Namespace fault model, not a native power-loss claim: resurrect exactly
     // the name and bytes left by production cleanup after a later legal save.
     fs::write(&cleanup, &journal).await.unwrap();
-    let reopened = SessionStoreV2::new(home.path().into()).await.unwrap();
+    // Snapshot readers open the storage root without following symlinks.
+    // On macOS the default TempDir path can start with /var -> /private/var.
+    let reopened = SessionStoreV2::new(home.path().canonicalize().unwrap())
+        .await
+        .unwrap();
     assert!(!is_published_migration_journal(&cleanup));
     assert_eq!(pair(home.path(), &original.id).await, committed);
     assert_eq!(
