@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::provider::LLMError;
 use bamboo_config::Config;
-use reqwest::{redirect::Policy, Client, NoProxy, Proxy};
+use reqwest::{Client, ClientBuilder, NoProxy, Proxy};
 
 pub fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
     let http_proxy = config.http_proxy.trim();
@@ -36,6 +36,17 @@ pub fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
 }
 
 pub fn build_http_client(config: &Config) -> Result<Client, LLMError> {
+    Ok(client_builder(config)?.build()?)
+}
+
+pub(crate) fn build_work_text_client(config: &Config) -> Result<Client, LLMError> {
+    Ok(client_builder(config)?
+        .redirect(reqwest::redirect::Policy::none())
+        .retry(reqwest::retry::never())
+        .build()?)
+}
+
+fn client_builder(config: &Config) -> Result<ClientBuilder, LLMError> {
     // `connect_timeout` bounds only TCP/TLS connection establishment. That is
     // safe for streaming: it never kills an in-flight streaming response. We
     // deliberately do NOT set an overall `.timeout()` here — this client is
@@ -44,23 +55,11 @@ pub fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     // stream for minutes). Mid-stream stalls — where the connection stays open
     // but no chunks arrive — are instead bounded by the inter-chunk idle
     // timeout in `consume_llm_stream_internal` (issue #28).
-    let redirects = Policy::default();
-    let mut builder = Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        // Bamboo's transport policy owns retries. Avoid a hidden HTTP/2
-        // replay underneath the Work reservation's physical-send guard.
-        .retry(reqwest::retry::never())
-        .redirect(Policy::custom(move |attempt| {
-            if crate::retry::work_request_budget_active() {
-                attempt.stop()
-            } else {
-                redirects.redirect(attempt)
-            }
-        }));
+    let mut builder = Client::builder().connect_timeout(Duration::from_secs(30));
     if let Some(proxy) = build_proxy(config)? {
         builder = builder.proxy(proxy);
     }
-    Ok(builder.build()?)
+    Ok(builder)
 }
 
 #[cfg(test)]
