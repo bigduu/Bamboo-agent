@@ -302,6 +302,16 @@ async fn compact_retrieval_window_archives_above_target_only_when_the_input_fits
             assert!(durable.messages[16..]
                 .iter()
                 .all(|message| !message.compressed));
+
+            let repeated =
+                test::call_service(&app, test::TestRequest::post().uri(ENDPOINT).to_request())
+                    .await;
+            assert_eq!(repeated.status(), StatusCode::OK);
+            let body: Value = test::read_body_json(repeated).await;
+            assert_eq!(body["status"], "unchanged");
+            let reloaded = state.storage.load_session(ID).await.unwrap().unwrap();
+            assert_eq!(reloaded.compression_events.len(), 1);
+            assert_eq!(reloaded.compression_events[0].id, event.id);
         } else {
             assert!(body["error"]["message"]
                 .as_str()

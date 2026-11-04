@@ -1242,6 +1242,7 @@ async fn maybe_prepare_retrieval_window_context(
     let trigger_tokens = retrieval_window_trigger_tokens(config, budget);
     let target_tokens = range.target_tokens;
     let automatic = trigger_type == CompressionTriggerType::Auto;
+    let best_effort = automatic || stage_only;
     let critical_overflow = matches!(&trigger_type, CompressionTriggerType::CriticalOverflow);
     let preflight = retrieval_window_preflight(
         session,
@@ -1346,9 +1347,7 @@ async fn maybe_prepare_retrieval_window_context(
         let plan_result = match plan_result {
             // The user command and automatic compaction can still archive safe
             // history when the desired target is below the protected footprint.
-            Err(RetrievalWindowPlanError::ProtectedContentExceedsTarget { .. })
-                if automatic || stage_only =>
-            {
+            Err(RetrievalWindowPlanError::ProtectedContentExceedsTarget { .. }) if best_effort => {
                 build_retrieval_window_full_archive_plan_with_token_accounting(
                     &staged,
                     budget,
@@ -1363,12 +1362,12 @@ async fn maybe_prepare_retrieval_window_context(
             Err(RetrievalWindowPlanError::NothingToArchive {
                 incomplete_protocol_group_count: 0,
                 ..
-            }) if automatic
+            }) if best_effort
                 && frame.active_tokens_without_boundary <= budget.max_request_input_tokens()
                 && frame.current_ledger_rendered_bytes <= MAX_MODEL_CONTEXT_RENDERED_BYTES =>
             {
-                // A prior archive may have left only protected content above
-                // the trigger. Continue with the intact window when it fits.
+                // A prior archive may leave only protected content. Keep the
+                // intact window if it fits and avoid a second checkpoint.
                 return Ok(RetrievalWindowPreparationOutcome::NotNeeded);
             }
             Err(error)
