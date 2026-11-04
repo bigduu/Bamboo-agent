@@ -513,7 +513,7 @@ impl CallIo for ReadyPatrolIo {
                     work_text::Request {
                         model: &route.target.model,
                         messages: &messages,
-                        input_cap: reservation.request.input.input_tokens,
+                        input_cap: reservation.request.model.max_input_tokens,
                         output_cap: reservation.request.model.max_output_tokens,
                         remaining,
                     },
