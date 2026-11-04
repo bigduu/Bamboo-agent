@@ -7,7 +7,8 @@ use std::{
 };
 
 use bamboo_config::{
-    Config, LiveSection, ModelLimitsSection, PatrolModelConfig, PatrolModelProtocol,
+    config_store::SectionSnapshot, Config, LiveSection, ModelLimitsSection, PatrolModelConfig,
+    PatrolModelProtocol,
 };
 use bamboo_domain::{
     Message, ProjectManifest, ProviderModelRef, Storage, DEFAULT_SUPERVISOR_SESSION_ID,
@@ -30,7 +31,7 @@ use bamboo_orchestration::{
 };
 use bamboo_projects::ProjectStore;
 use bamboo_tickets::{Authority, Principal, TicketService};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 
 use super::{
     evidence::{current_project_manifest, read_project_manifest, EvidenceReader, EvidenceSources},
@@ -43,6 +44,7 @@ pub(super) struct Ports<'a> {
     pub(super) journal: &'a mut dyn CheckpointPort,
     pub(super) observation: &'a mut dyn ObservationPort,
     pub(super) budget: TicketBudget<'a>,
+    pub(super) prepared: Option<&'a ReadyPatrolIo>,
 }
 
 impl CheckpointPort for Ports<'_> {
@@ -81,6 +83,23 @@ impl BudgetPort for Ports<'_> {
         &mut self,
         request: &DiagnosticRequest,
     ) -> std::result::Result<Reservation, BudgetBlock> {
+        if let Some(io) = self.prepared.filter(|io| io.proof.registered.is_some()) {
+            let proof = &io.proof;
+            // Serialize the exact check and ledger write with live route
+            // and Model Limits publication. This port never waits for a writer.
+            let _io = proof
+                .config_io_lock
+                .try_lock()
+                .map_err(|_| BudgetBlock::Unavailable)?;
+            let config = proof
+                .config
+                .try_read()
+                .map_err(|_| BudgetBlock::Unavailable)?;
+            proof
+                .check_selection(&config)
+                .map_err(|_| BudgetBlock::Unavailable)?;
+            return self.budget.reserve(request);
+        }
         self.budget.reserve(request)
     }
     fn settle(
@@ -115,7 +134,7 @@ struct RegisteredRoute {
     transport: WorkTextClient,
     target: ProviderModelRef,
     model_limits: Option<Arc<LiveSection<ModelLimitsSection>>>,
-    model_limits_revision: Option<u64>,
+    model_limits_snapshot: Option<Arc<SectionSnapshot<ModelLimitsSection>>>,
     legacy_model_limits: Option<serde_json::Value>,
     input_ceiling: u32,
 }
@@ -139,7 +158,7 @@ impl RegisteredRoute {
         let legacy_model_limits = config.extra.get("model_limits").cloned();
         let (input_ceiling, output_ceiling) =
             bamboo_engine::ticket_token_budget::configured_model_ceilings(
-                limits.as_ref().map(|snapshot| &snapshot.data),
+                limits.as_ref().map(|snapshot| snapshot.data.as_ref()),
                 legacy_model_limits.as_ref(),
                 &target.model,
             )
@@ -157,7 +176,7 @@ impl RegisteredRoute {
             transport: WorkTextClient::from_config(config).map_err(|_| unavailable())?,
             target,
             model_limits,
-            model_limits_revision: limits.as_ref().map(|snapshot| snapshot.revision),
+            model_limits_snapshot: limits,
             legacy_model_limits,
             input_ceiling,
         })
@@ -173,8 +192,11 @@ impl RegisteredRoute {
             || self
                 .model_limits
                 .as_ref()
-                .map(|section| section.snapshot().revision)
-                != self.model_limits_revision
+                .zip(self.model_limits_snapshot.as_ref())
+                .is_some_and(|(section, captured)| {
+                    let live = section.snapshot();
+                    live.revision != captured.revision || live.data != captured.data
+                })
             || config.extra.get("model_limits") != self.legacy_model_limits.as_ref()
         {
             return Err(PortError::Conflict);
@@ -325,6 +347,7 @@ impl TicketApplication {
                     service: service.clone(),
                     storage: self.storage.clone(),
                     config: self.config.clone(),
+                    config_io_lock: sources.config_io_lock.clone(),
                     projects: sources.projects.clone(),
                     root: self.root.clone(),
                     selection,
@@ -347,22 +370,11 @@ pub(super) struct ReadyPatrolIo {
     completion: Completion,
 }
 
-impl ReadyPatrolIo {
-    pub(super) fn check_prepared_route(
-        &self,
-        config: &Config,
-    ) -> std::result::Result<(), PortError> {
-        if let Some(route) = &self.proof.registered {
-            route.check(config)?;
-        }
-        Ok(())
-    }
-}
-
 struct ReadyPatrolProof {
     service: Arc<TicketService>,
     storage: Arc<dyn Storage>,
     config: Arc<RwLock<Config>>,
+    config_io_lock: Arc<Mutex<()>>,
     projects: Arc<ProjectStore>,
     root: PathBuf,
     selection: PatrolModelConfig,
@@ -384,8 +396,12 @@ impl ReadyPatrolProof {
     }
 
     fn require_selection(&self) -> std::result::Result<(), PortError> {
-        self.fence.check().map_err(|_| PortError::Denied)?;
         let current = self.config.try_read().map_err(|_| PortError::Conflict)?;
+        self.check_selection(&current)
+    }
+
+    fn check_selection(&self, current: &Config) -> std::result::Result<(), PortError> {
+        self.fence.check().map_err(|_| PortError::Denied)?;
         if !current.features.ticket_mutation || !current.features.ticket_dispatch {
             return Err(PortError::Denied);
         }
@@ -393,7 +409,7 @@ impl ReadyPatrolProof {
             return Err(PortError::Conflict);
         }
         if let Some(route) = &self.registered {
-            route.check(&current)?;
+            route.check(current)?;
         }
         Ok(())
     }

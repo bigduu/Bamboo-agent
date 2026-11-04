@@ -63,6 +63,7 @@ pub(in crate::app_state::ticket_application) struct EvidenceSources {
     pub(super) memory: MemoryStore,
     pub(super) projects: Arc<ProjectStore>,
     pub(super) providers: Arc<bamboo_llm::ProviderRegistry>,
+    pub(super) config_io_lock: Arc<tokio::sync::Mutex<()>>,
     pub(super) model_limits: Option<Arc<LiveSection<ModelLimitsSection>>>,
 }
 

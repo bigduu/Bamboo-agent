@@ -218,6 +218,7 @@ impl TicketApplication {
                                     authority: &authority,
                                     clock: &clock,
                                 },
+                                prepared: None,
                             };
                             let driver = if may_prepare {
                                 &patrol
@@ -387,12 +388,10 @@ impl TicketApplication {
             if current.patrol_model.as_ref() != Some(&selection)
                 || !current.features.ticket_mutation
                 || !current.features.ticket_dispatch
-                || io
-                    .as_ref()
-                    .is_some_and(|io| io.check_prepared_route(&current).is_err())
             {
                 return Ok((journal, None, io));
             }
+            drop(current);
             let mut host = semantic::Ports {
                 journal: &mut journal,
                 observation: &mut observation,
@@ -401,6 +400,7 @@ impl TicketApplication {
                     authority: &authority,
                     clock: &clock,
                 },
+                prepared: io.as_ref(),
             };
             let patrol =
                 Patrol::new(policy, Some(configured_model(&selection))).map_err(pass_error)?;

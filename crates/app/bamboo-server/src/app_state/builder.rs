@@ -1432,6 +1432,7 @@ impl AppState {
             memory_store.clone(),
             project_store.clone(),
             provider_registry.clone(),
+            config_io_lock.clone(),
             config_facade
                 .as_ref()
                 .map(|facade| facade.registry().model_limits.clone()),

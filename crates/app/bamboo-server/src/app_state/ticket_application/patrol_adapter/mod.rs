@@ -22,6 +22,7 @@ impl TicketApplication {
         memory: bamboo_memory::memory_store::MemoryStore,
         projects: std::sync::Arc<bamboo_projects::ProjectStore>,
         providers: std::sync::Arc<bamboo_llm::ProviderRegistry>,
+        config_io_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
         model_limits: Option<
             std::sync::Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
         >,
@@ -30,6 +31,7 @@ impl TicketApplication {
             memory,
             projects,
             providers,
+            config_io_lock,
             model_limits,
         });
     }
