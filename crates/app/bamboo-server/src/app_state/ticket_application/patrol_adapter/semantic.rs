@@ -6,9 +6,17 @@ use std::{
     time::Duration,
 };
 
-use bamboo_config::{Config, PatrolModelConfig};
-use bamboo_domain::{ProjectManifest, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
+use bamboo_config::{
+    Config, LiveSection, ModelLimitsSection, PatrolModelConfig, PatrolModelProtocol,
+};
+use bamboo_domain::{
+    Message, ProjectManifest, ProviderModelRef, Storage, DEFAULT_SUPERVISOR_SESSION_ID,
+};
 use bamboo_llm::protocol::llama_cpp::{GptOssLocalClient, PreparedCompletion};
+use bamboo_llm::{
+    work_text::{self, WorkTextReply},
+    LLMProvider, ProviderRegistry,
+};
 use bamboo_orchestration::{
     patrol::{
         budget::TicketBudget,
@@ -25,7 +33,7 @@ use bamboo_tickets::{Authority, Principal, TicketService};
 use tokio::sync::RwLock;
 
 use super::{
-    evidence::{current_project_manifest, read_project_manifest, EvidenceReader},
+    evidence::{current_project_manifest, read_project_manifest, EvidenceReader, EvidenceSources},
     patrol_error,
     program::SystemClock,
     Error, Result, TicketApplication,
@@ -96,6 +104,73 @@ pub(super) struct PreparedCall {
     pub(super) io: ReadyPatrolIo,
 }
 
+enum Completion {
+    Raw(Option<PreparedCompletion>),
+    Registered(Box<RegisteredCompletion>),
+}
+
+struct RegisteredCompletion {
+    route: RegisteredRoute,
+    messages: Option<[Message; 2]>,
+}
+
+struct RegisteredRoute {
+    registry: Arc<ProviderRegistry>,
+    provider: Arc<dyn LLMProvider>,
+    target: ProviderModelRef,
+    model_limits: Option<Arc<LiveSection<ModelLimitsSection>>>,
+    model_limits_revision: Option<u64>,
+    legacy_model_limits: Option<serde_json::Value>,
+}
+
+impl RegisteredRoute {
+    fn capture(
+        sources: &EvidenceSources,
+        config: &Config,
+        selection: &PatrolModelConfig,
+    ) -> Result<Self> {
+        let target = ProviderModelRef::new(&selection.provider, &selection.model);
+        let (provider, managed) = sources
+            .providers
+            .provider_for_configured_model_with_origin(config, &target)
+            .map_err(|_| unavailable())?;
+        if !managed || provider.known_pre_dispatch_error().is_some() {
+            return Err(unavailable());
+        }
+        let model_limits = sources.model_limits.clone();
+        let model_limits_revision = model_limits
+            .as_ref()
+            .map(|section| section.snapshot().revision);
+        Ok(Self {
+            registry: sources.providers.clone(),
+            provider,
+            target,
+            model_limits,
+            model_limits_revision,
+            legacy_model_limits: config.extra.get("model_limits").cloned(),
+        })
+    }
+
+    fn check(&self, config: &Config) -> std::result::Result<(), PortError> {
+        let (current, managed) = self
+            .registry
+            .provider_for_configured_model_with_origin(config, &self.target)
+            .map_err(|_| PortError::Denied)?;
+        if !managed
+            || !Arc::ptr_eq(&current, &self.provider)
+            || self
+                .model_limits
+                .as_ref()
+                .map(|section| section.snapshot().revision)
+                != self.model_limits_revision
+            || config.extra.get("model_limits") != self.legacy_model_limits.as_ref()
+        {
+            return Err(PortError::Conflict);
+        }
+        Ok(())
+    }
+}
+
 impl TicketApplication {
     pub(in crate::app_state::ticket_application) async fn reconcile_semantic_accounting(
         &self,
@@ -134,7 +209,7 @@ impl TicketApplication {
     ) -> Result<PreparedCall> {
         fence.check()?;
         let sources = self.patrol_sources.get().ok_or_else(unavailable)?;
-        let endpoint = selection.endpoint.ok_or_else(unavailable)?;
+        selection.validate().map_err(Error::AuthorityUnavailable)?;
         let (commit, snapshot) = service.published()?;
         fence.check_semantic_scope(&snapshot, &demand.through.scope)?;
         if snapshot.seq != demand.through.cursor
@@ -161,36 +236,92 @@ impl TicketApplication {
             .await
             .map_err(|_| unavailable())??
         };
-        let evidence = EvidenceReader {
+        let reader = EvidenceReader {
             tickets: self,
             config: &self.config,
             memory_store: &sources.memory,
             project_store: &sources.projects,
-        }
-        .read_patrol_diagnostic_for_selection(
-            &demand.through,
-            &commit,
-            demand.since_cursor,
-            selection.clone(),
-        )
-        .await?;
-        if evidence.model() != &demand.model {
-            return Err(Error::RevisionConflict);
-        }
-        let completion = GptOssLocalClient::new(endpoint)
-            .map_err(|_| unavailable())?
-            .prepare(
-                evidence.prompt(),
-                demand.model.max_output_tokens,
-                Duration::from_secs(2),
-            )
-            .await
-            .map_err(|_| unavailable())?;
+        };
+        let (input, completion) = match selection.protocol {
+            PatrolModelProtocol::LlamaCppRawV1 => {
+                let endpoint = selection.endpoint.ok_or_else(unavailable)?;
+                let evidence = reader
+                    .read_patrol_diagnostic_for_selection(
+                        &demand.through,
+                        &commit,
+                        demand.since_cursor,
+                        selection.clone(),
+                    )
+                    .await?;
+                if evidence.model() != &demand.model {
+                    return Err(Error::RevisionConflict);
+                }
+                let completion = GptOssLocalClient::new(endpoint)
+                    .map_err(|_| unavailable())?
+                    .prepare(
+                        evidence.prompt(),
+                        demand.model.max_output_tokens,
+                        Duration::from_secs(2),
+                    )
+                    .await
+                    .map_err(|_| unavailable())?;
+                (evidence.input().clone(), Completion::Raw(Some(completion)))
+            }
+            PatrolModelProtocol::RegisteredProviderV1 => {
+                let route = {
+                    let config = self.config.read().await;
+                    if config.patrol_model.as_ref() != Some(&selection) {
+                        return Err(Error::RevisionConflict);
+                    }
+                    RegisteredRoute::capture(sources, &config, &selection)?
+                };
+                let (input_ceiling, output_ceiling) =
+                    bamboo_engine::ticket_token_budget::known_model_ceilings(
+                        &self.root,
+                        route.model_limits.clone(),
+                        route.legacy_model_limits.clone(),
+                        &route.target.model,
+                        route.provider.as_ref(),
+                    )
+                    .await
+                    .ok_or_else(unavailable)?;
+                if input_ceiling > demand.model.max_input_tokens
+                    || output_ceiling < demand.model.max_output_tokens
+                {
+                    return Err(Error::ResourceBlocked(
+                        "registered patrol model exceeds the configured token ceilings".into(),
+                    ));
+                }
+                let (input, messages) = reader
+                    .read_registered_diagnostic(
+                        &demand.through,
+                        &commit,
+                        demand.since_cursor,
+                        &demand.model,
+                        input_ceiling,
+                    )
+                    .await?;
+                {
+                    let config = self
+                        .config
+                        .try_read()
+                        .map_err(|_| Error::RevisionConflict)?;
+                    route.check(&config).map_err(patrol_error)?;
+                }
+                (
+                    input,
+                    Completion::Registered(Box::new(RegisteredCompletion {
+                        route,
+                        messages: Some(messages),
+                    })),
+                )
+            }
+        };
         fence.check()?;
         Ok(PreparedCall {
             input: PreparedInput {
                 demand,
-                result: Ok(evidence.input().clone()),
+                result: Ok(input),
             },
             io: ReadyPatrolIo {
                 service: service.clone(),
@@ -201,7 +332,7 @@ impl TicketApplication {
                 selection,
                 project,
                 fence,
-                completion: Some(completion),
+                completion,
             },
         })
     }
@@ -220,7 +351,7 @@ pub(super) struct ReadyPatrolIo {
     selection: PatrolModelConfig,
     project: ProjectManifest,
     fence: ReadyAdmissionFence,
-    completion: Option<PreparedCompletion>,
+    completion: Completion,
 }
 
 impl ReadyPatrolIo {
@@ -243,6 +374,9 @@ impl ReadyPatrolIo {
         }
         if current.patrol_model.as_ref() != Some(&self.selection) {
             return Err(PortError::Conflict);
+        }
+        if let Completion::Registered(completion) = &self.completion {
+            completion.route.check(&current)?;
         }
         Ok(())
     }
@@ -316,19 +450,57 @@ impl CallIo for ReadyPatrolIo {
         remaining: Duration,
     ) -> std::result::Result<ProviderReply, PortError> {
         self.require_selection()?;
-        let reply = self
-            .completion
-            .take()
-            .ok_or(PortError::Denied)?
-            .complete(remaining.min(Duration::from_secs(60)))
-            .await
-            .map_err(|_| PortError::OutcomeUnknown)?;
-        Ok(ProviderReply {
-            diagnosis: self.require_selection().ok().and(reply.final_text),
-            exact_usage: reply.usage.known(),
-            observed_input_tokens: reply.usage.input_tokens,
-            observed_output_tokens: reply.usage.output_tokens,
-        })
+        let remaining = remaining.min(Duration::from_secs(60));
+        let mut reply = match &mut self.completion {
+            Completion::Raw(completion) => {
+                let reply = completion
+                    .take()
+                    .ok_or(PortError::Denied)?
+                    .complete(remaining)
+                    .await
+                    .map_err(|_| PortError::OutcomeUnknown)?;
+                ProviderReply {
+                    diagnosis: reply.final_text,
+                    exact_usage: reply.usage.known(),
+                    observed_input_tokens: reply.usage.input_tokens,
+                    observed_output_tokens: reply.usage.output_tokens,
+                    observed_total_tokens: None,
+                }
+            }
+            Completion::Registered(completion) => {
+                let messages = completion.messages.take().ok_or(PortError::Denied)?;
+                match work_text::complete(
+                    completion.route.provider.as_ref(),
+                    &completion.route.target.model,
+                    &messages,
+                    self.selection.max_input_tokens.get(),
+                    self.selection.max_output_tokens.get(),
+                    remaining,
+                )
+                .await
+                {
+                    WorkTextReply::Complete { text, exact_usage } => ProviderReply {
+                        diagnosis: text,
+                        exact_usage,
+                        observed_input_tokens: None,
+                        observed_output_tokens: None,
+                        observed_total_tokens: None,
+                    },
+                    WorkTextReply::OverCap(usage) => ProviderReply {
+                        diagnosis: None,
+                        exact_usage: None,
+                        observed_input_tokens: usage.input_tokens,
+                        observed_output_tokens: usage.output_tokens,
+                        observed_total_tokens: usage.total_tokens,
+                    },
+                    WorkTextReply::Unknown => return Err(PortError::OutcomeUnknown),
+                }
+            }
+        };
+        if self.require_selection().is_err() {
+            reply.diagnosis = None;
+        }
+        Ok(reply)
     }
 
     async fn settle(

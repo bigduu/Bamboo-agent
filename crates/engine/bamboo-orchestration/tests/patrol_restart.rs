@@ -1139,6 +1139,7 @@ fn checkpoint_keeps_original_pending_diagnostic_request_and_budget_receipt_on_re
                 revision: 1,
             }],
             input_tokens: 50,
+            input_token_basis: Default::default(),
         },
     };
     let reservation = Reservation {
@@ -1204,6 +1205,7 @@ fn configured_budget_request(fixture: &Fixture, limit: u64) -> DiagnosticRequest
             summary: "Authoritative scoped facts".into(),
             references: vec![],
             input_tokens: 10,
+            input_token_basis: Default::default(),
         },
     }
 }
@@ -1465,6 +1467,7 @@ fn partial_provider_overrun_halts_the_exact_real_receipt() {
     let usage = Usage::OverCap {
         input_tokens: None,
         output_tokens: Some(21),
+        total_tokens: None,
     };
     budget.settle(&receipt, usage).unwrap();
     assert_eq!(budget.confirm_submission(&receipt), Err(PortError::Denied));

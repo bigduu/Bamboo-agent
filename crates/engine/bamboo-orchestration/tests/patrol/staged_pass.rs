@@ -279,6 +279,7 @@ fn expired_staged_call_retains_the_original_receipt_until_late_usage_is_durable(
     let late = Usage::OverCap {
         input_tokens: None,
         output_tokens: Some(21),
+        total_tokens: None,
     };
     assert!(matches!(
         patrol
@@ -314,6 +315,7 @@ fn expired_staged_call_retains_the_original_receipt_until_late_usage_is_durable(
         .pending_settlement_usage = Some(Usage::OverCap {
         input_tokens: None,
         output_tokens: Some(1),
+        total_tokens: None,
     });
     assert_eq!(
         checkpoint::encode(100, &malformed),
@@ -475,6 +477,7 @@ mod calls {
                         }),
                         observed_input_tokens: Some(40),
                         observed_output_tokens: Some(4),
+                        observed_total_tokens: None,
                     }),
                 },
             )
@@ -513,6 +516,7 @@ mod calls {
                 Usage::OverCap {
                     input_tokens: None,
                     output_tokens: Some(21),
+                    total_tokens: None,
                 },
             ),
         ] {
@@ -534,6 +538,7 @@ mod calls {
                             exact_usage: None,
                             observed_input_tokens: None,
                             observed_output_tokens: Some(output),
+                            observed_total_tokens: None,
                         }),
                     },
                 )
@@ -570,6 +575,7 @@ mod calls {
                         exact_usage: None,
                         observed_input_tokens: None,
                         observed_output_tokens: Some(21),
+                        observed_total_tokens: None,
                     }),
                 },
             )
@@ -578,6 +584,7 @@ mod calls {
             usage: Usage::OverCap {
                 input_tokens: None,
                 output_tokens: Some(21),
+                total_tokens: None,
             },
         };
         assert_eq!(result(&calls, &operation).await, expected);
@@ -632,6 +639,7 @@ mod calls {
                         exact_usage: None,
                         observed_input_tokens: None,
                         observed_output_tokens: Some(21),
+                        observed_total_tokens: None,
                     }),
                 },
             )
@@ -647,6 +655,7 @@ mod calls {
             Some(Usage::OverCap {
                 input_tokens: None,
                 output_tokens: Some(21),
+                total_tokens: None,
             })
         );
         assert_eq!(control.sends.load(Ordering::SeqCst), 1);

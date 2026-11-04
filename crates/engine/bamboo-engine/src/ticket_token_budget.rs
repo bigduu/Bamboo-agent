@@ -1,6 +1,6 @@
 //! Host-installed Native Work attribution. The canonical Ticket ledger is the
 //! only wallet; canonical Session ancestry and dispatch receipts supply scope.
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use bamboo_domain::{Session, SessionKind, Storage};
 use bamboo_tickets::{Authority, Error, Principal, Result, TicketService};
@@ -8,6 +8,27 @@ use bamboo_tickets::{Authority, Error, Principal, Result, TicketService};
 use crate::ticket_runtime::{self, TicketDispatchBinding};
 
 mod provider;
+
+/// Resolve the same configured or provider-reported ceilings used by Native
+/// Work before admitting a reserved request.
+pub async fn known_model_ceilings(
+    root: &Path,
+    model_limits_section: Option<
+        Arc<bamboo_config::LiveSection<bamboo_config::ModelLimitsSection>>,
+    >,
+    legacy_model_limits: Option<serde_json::Value>,
+    model: &str,
+    provider: &dyn bamboo_llm::LLMProvider,
+) -> Option<(u32, u32)> {
+    let limits = crate::runtime::config::AgentLoopConfig {
+        app_data_dir: Some(root.to_owned()),
+        model_limits_section,
+        legacy_model_limits,
+        ..Default::default()
+    };
+    crate::runtime::runner::round_lifecycle::resolve_known_token_ceilings(&limits, model, provider)
+        .await
+}
 
 #[derive(Clone)]
 struct SessionStamp {

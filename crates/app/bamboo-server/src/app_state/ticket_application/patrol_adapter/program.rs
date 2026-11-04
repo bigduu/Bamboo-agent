@@ -146,7 +146,10 @@ impl TicketApplication {
             .patrol_model
             .clone()
             .filter(|selection| {
-                selection.endpoint.is_some() && self.patrol_sources.get().is_some()
+                (selection.endpoint.is_some()
+                    || selection.protocol
+                        == bamboo_config::PatrolModelProtocol::RegisteredProviderV1)
+                    && self.patrol_sources.get().is_some()
             });
         let model = configured.as_ref().map(configured_model);
         let live_semantics = model.is_some();
