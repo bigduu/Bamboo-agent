@@ -62,6 +62,32 @@ async fn invoke(tool: &TicketTool, args: Value, ctx: ToolCtx) -> (bool, Value) {
 }
 
 #[tokio::test]
+async fn work_review_refuses_missing_caller_and_plan_mode_before_accounting() {
+    let fixture = Fixture::new().await;
+    let tool = fixture.tool("work_review");
+    let args = json!({
+        "project_id":"project", "work_id":"work", "assignment_id":"assignment",
+        "operation_id":"126c8257-7631-4540-997d-6fe532c774d0"
+    });
+    let service = fixture.app.service().unwrap();
+    let before = service.published().unwrap().0;
+    assert!(matches!(
+        tool.call(args.clone(), &fixture.ctx()).await,
+        Err(Error::ScopeDenied(reason)) if reason.contains("original Work Review caller missing")
+    ));
+    let mut ctx = fixture.ctx();
+    ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+        &fixture.session,
+    )));
+    ctx.plan_read_only = true;
+    assert!(matches!(
+        tool.call(args, &ctx).await,
+        Err(Error::ScopeDenied(reason)) if reason.contains("Plan mode is read-only")
+    ));
+    assert_eq!(service.published().unwrap().0, before);
+}
+
+#[tokio::test]
 async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
     let fixture = Fixture::new().await;
     let tools: Vec<_> = NAMES.iter().map(|&name| fixture.tool(name)).collect();
@@ -170,7 +196,7 @@ async fn ticket_model_update_replays_exact_receipt_and_cannot_write_ingress_or_u
 
 #[test]
 fn six_ticket_schemas_remain_bounded_and_host_fields_are_absent() {
-    for name in NAMES {
+    for &name in NAMES {
         let schema = schema::parameters(name);
         assert_eq!(schema["additionalProperties"], false);
         for forbidden in ["authority", "principal", "source", "approved", "binding"] {
@@ -509,6 +535,8 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
         "work_changes".to_string(),
         "work_update".to_string(),
         "work_dispatch".to_string(),
+        #[cfg(unix)]
+        "work_review".to_string(),
     ]);
     assert_eq!(names(), expected_names);
     assert!(app.service().is_err());
@@ -522,7 +550,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     let config_before = serde_json::to_value(&*config.read().await).unwrap();
     let mut ordinary = Session::new("ordinary-ultra", "model");
     ordinary.set_root_orchestration_only(true).unwrap();
-    for name in NAMES {
+    for &name in NAMES {
         // Even a canonical executing Supervisor cannot create a scope by
         // calling a resident definition, including the two mutation tools.
         let (ok, denied) = execute_overlay(tools.as_ref(), name, Some(&session)).await;
@@ -566,7 +594,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     assert!(ok);
     assert_eq!(result["data"]["work_count"], 0);
     let before = app.service().unwrap().published().unwrap().0;
-    for name in NAMES {
+    for &name in NAMES {
         for caller in [None, Some(&ordinary)] {
             let (ok, denied) = execute_overlay(tools.as_ref(), name, caller).await;
             assert!(!ok, "unauthorized initialized {name} succeeded");

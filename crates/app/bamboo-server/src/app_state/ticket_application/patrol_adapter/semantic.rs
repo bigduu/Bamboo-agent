@@ -128,15 +128,15 @@ enum Completion {
     Registered(Option<Box<[Message; 2]>>),
 }
 
-struct RegisteredRoute {
+pub(super) struct RegisteredRoute {
     registry: Arc<ProviderRegistry>,
-    provider: Arc<dyn LLMProvider>,
-    transport: WorkTextClient,
-    target: ProviderModelRef,
+    pub(super) provider: Arc<dyn LLMProvider>,
+    pub(super) transport: WorkTextClient,
+    pub(super) target: ProviderModelRef,
     model_limits: Option<Arc<LiveSection<ModelLimitsSection>>>,
     model_limits_snapshot: Option<Arc<SectionSnapshot<ModelLimitsSection>>>,
     legacy_model_limits: Option<serde_json::Value>,
-    input_ceiling: u32,
+    pub(super) model_ceilings: Option<(u32, u32)>,
 }
 
 impl RegisteredRoute {
@@ -146,6 +146,23 @@ impl RegisteredRoute {
         selection: &PatrolModelConfig,
     ) -> Result<Self> {
         let target = ProviderModelRef::new(&selection.provider, &selection.model);
+        let route = Self::capture_configured(sources, config, target)?;
+        let (input_ceiling, output_ceiling) = route.model_ceilings.ok_or_else(unavailable)?;
+        if input_ceiling > selection.max_input_tokens.get()
+            || output_ceiling < selection.max_output_tokens.get()
+        {
+            return Err(Error::ResourceBlocked(
+                "registered patrol model exceeds the configured token ceilings".into(),
+            ));
+        }
+        Ok(route)
+    }
+
+    pub(super) fn capture_configured(
+        sources: &EvidenceSources,
+        config: &Config,
+        target: ProviderModelRef,
+    ) -> Result<Self> {
         let (provider, managed) = sources
             .providers
             .provider_for_configured_model_with_origin(config, &target)
@@ -156,20 +173,11 @@ impl RegisteredRoute {
         let model_limits = sources.model_limits.clone();
         let limits = model_limits.as_ref().map(|section| section.snapshot());
         let legacy_model_limits = config.extra.get("model_limits").cloned();
-        let (input_ceiling, output_ceiling) =
-            bamboo_engine::ticket_token_budget::configured_model_ceilings(
-                limits.as_ref().map(|snapshot| snapshot.data.as_ref()),
-                legacy_model_limits.as_ref(),
-                &target.model,
-            )
-            .ok_or_else(unavailable)?;
-        if input_ceiling > selection.max_input_tokens.get()
-            || output_ceiling < selection.max_output_tokens.get()
-        {
-            return Err(Error::ResourceBlocked(
-                "registered patrol model exceeds the configured token ceilings".into(),
-            ));
-        }
+        let model_ceilings = bamboo_engine::ticket_token_budget::configured_model_ceilings(
+            limits.as_ref().map(|snapshot| snapshot.data.as_ref()),
+            legacy_model_limits.as_ref(),
+            &target.model,
+        );
         Ok(Self {
             registry: sources.providers.clone(),
             provider,
@@ -178,11 +186,11 @@ impl RegisteredRoute {
             model_limits,
             model_limits_snapshot: limits,
             legacy_model_limits,
-            input_ceiling,
+            model_ceilings,
         })
     }
 
-    fn check(&self, config: &Config) -> std::result::Result<(), PortError> {
+    pub(super) fn check(&self, config: &Config) -> std::result::Result<(), PortError> {
         let (current, managed) = self
             .registry
             .provider_for_configured_model_with_origin(config, &self.target)
@@ -213,13 +221,14 @@ impl TicketApplication {
         service: &Arc<TicketService>,
         authority: &Authority,
     ) -> Result<()> {
+        let review_result = self.work_reviews.reconcile_accounting(service, authority);
         if !self.patrol_calls.needs_accounting() {
-            return Ok(());
+            return review_result;
         }
         let calls = self.patrol_calls.clone();
         let service = service.clone();
         let authority = authority.clone();
-        tokio::task::spawn_blocking(move || {
+        let patrol_result = tokio::task::spawn_blocking(move || {
             let clock = SystemClock::current()?;
             let mut budget = TicketBudget {
                 service: &service,
@@ -232,7 +241,8 @@ impl TicketApplication {
                 .map_err(patrol_error)
         })
         .await
-        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?;
+        patrol_result.and(review_result)
     }
 
     pub(super) async fn prepare_semantic_call(
@@ -321,7 +331,7 @@ impl TicketApplication {
                         &commit,
                         demand.since_cursor,
                         &demand.model,
-                        route.input_ceiling,
+                        route.model_ceilings.ok_or_else(unavailable)?.0,
                     )
                     .await?;
                 {
@@ -417,7 +427,7 @@ impl ReadyPatrolProof {
     }
 }
 
-fn check_project_after_ticket_proof(
+pub(super) fn check_project_after_ticket_proof(
     projects: &ProjectStore,
     root: &Path,
     expected: &ProjectManifest,
@@ -553,7 +563,9 @@ impl CallIo for ReadyPatrolIo {
                         observed_output_tokens: usage.output_tokens,
                         observed_total_tokens: usage.total_tokens,
                     },
-                    WorkTextReply::Unknown => return Err(PortError::OutcomeUnknown),
+                    WorkTextReply::NotSent | WorkTextReply::Unknown => {
+                        return Err(PortError::OutcomeUnknown);
+                    }
                 }
             }
         };

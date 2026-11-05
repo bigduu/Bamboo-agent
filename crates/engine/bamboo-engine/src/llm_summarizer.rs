@@ -25,7 +25,7 @@ use bamboo_domain::{
     SessionMessageKind, SessionMessageSource,
 };
 use bamboo_llm::LLMChunk;
-use bamboo_llm::{LLMProvider, LLMRequestOptions};
+use bamboo_llm::{LLMError, LLMProvider, LLMRequestOptions};
 use serde::Deserialize;
 
 const COMPATIBILITY_CONTEXT_WINDOW_TOKENS: u32 = 32_000;
@@ -1009,22 +1009,33 @@ impl LlmSummarizer {
             model = %self.model,
             "Executing bounded summarization request"
         );
-        let content = self
-            .collect_stream_response(messages, requested_output_tokens)
-            .await
-            .map_err(|error| {
-                bamboo_compression::types::BudgetError::TokenCountError(format!(
-                    "{stage} stage {stage_index}/{stage_count} failed: {error}"
-                ))
-            })?;
-        if content.trim().is_empty() {
-            return Err(bamboo_compression::types::BudgetError::TokenCountError(
-                format!(
-                    "{stage} stage {stage_index}/{stage_count} returned an empty completed response"
-                ),
-            ));
+        for effort in [ReasoningEffort::Low, ReasoningEffort::Disabled] {
+            if effort == ReasoningEffort::Disabled {
+                tracing::warn!(
+                    stage,
+                    stage_index,
+                    stage_count,
+                    "Retrying an empty completed summary with reasoning disabled"
+                );
+            }
+            let content = self
+                .collect_stream_response(messages, requested_output_tokens, effort)
+                .await
+                .map_err(|error| {
+                    bamboo_compression::types::BudgetError::SummaryGenerationError(format!(
+                        "{stage} stage {stage_index}/{stage_count} failed at reasoning effort {}: {error}",
+                        effort.as_str()
+                    ))
+                })?;
+            if !content.trim().is_empty() {
+                return Ok(content);
+            }
         }
-        Ok(content)
+        Err(bamboo_compression::types::BudgetError::SummaryGenerationError(
+            format!(
+                "{stage} stage {stage_index}/{stage_count} returned an empty completed response after one retry"
+            ),
+        ))
     }
 
     async fn build_bounded_shared_context_capsule(
@@ -1430,13 +1441,12 @@ impl LlmSummarizer {
         &self,
         messages: &[Message],
         max_output_tokens: u32,
-    ) -> Result<String, bamboo_compression::types::BudgetError> {
-        // Compression calls need most of their output allowance for the summary
-        // itself. Low reasoning keeps dynamic, potentially small output budgets
-        // useful across both reasoning and non-reasoning models.
+        effort: ReasoningEffort,
+    ) -> Result<String, LLMError> {
+        // Compression calls reserve most of their output allowance for summary text.
         let options = LLMRequestOptions {
             session_id: None,
-            reasoning_effort: Some(ReasoningEffort::Low),
+            reasoning_effort: Some(effort),
             parallel_tool_calls: None,
             required_tool: None,
             responses: None,
@@ -1452,41 +1462,21 @@ impl LlmSummarizer {
                 &self.model,
                 Some(&options),
             )
-            .await
-            .map_err(|e| {
-                bamboo_compression::types::BudgetError::TokenCountError(format!(
-                    "LLM summarization call failed: {}",
-                    e
-                ))
-            })?;
+            .await?;
 
         let mut content = String::new();
         let mut stream = stream;
-        let mut terminal_done = false;
-
         while let Some(chunk_result) = stream.next().await {
-            match chunk_result {
-                Ok(LLMChunk::Token(text)) => content.push_str(&text),
-                Ok(LLMChunk::Done) => {
-                    terminal_done = true;
-                    break;
-                }
-                Ok(_) => {} // Ignore reasoning tokens, tool calls, etc.
-                Err(e) => {
-                    tracing::warn!("LLM summarization stream error: {}", e);
-                    return Err(bamboo_compression::types::BudgetError::TokenCountError(
-                        format!("LLM summarization stream failed: {}", e),
-                    ));
-                }
+            match chunk_result? {
+                LLMChunk::Token(text) => content.push_str(&text),
+                LLMChunk::Done => return Ok(content),
+                _ => {} // Ignore reasoning tokens, tool calls, etc.
             }
         }
 
-        if !terminal_done && !content.is_empty() {
-            return Err(bamboo_compression::types::BudgetError::TokenCountError(
-                "LLM summarization stream ended without terminal completion".to_string(),
-            ));
-        }
-        Ok(content)
+        Err(LLMError::Stream(
+            "LLM summarization stream ended without terminal completion".to_string(),
+        ))
     }
 }
 
@@ -1878,6 +1868,8 @@ mod tests {
     #[derive(Default)]
     struct ReasoningCaptureProvider {
         captured_reasoning: Mutex<Vec<Option<ReasoningEffort>>>,
+        responses_without_text: usize,
+        complete_empty_response: bool,
     }
 
     #[async_trait]
@@ -1903,10 +1895,20 @@ mod tests {
             model: &str,
             options: Option<&LLMRequestOptions>,
         ) -> Result<LLMStream, LLMError> {
-            self.captured_reasoning
-                .lock()
-                .expect("captured reasoning lock should not be poisoned")
-                .push(options.and_then(|o| o.reasoning_effort));
+            let attempt = {
+                let mut captured = self.captured_reasoning.lock().unwrap();
+                captured.push(options.and_then(|options| options.reasoning_effort));
+                captured.len()
+            };
+            if attempt <= self.responses_without_text {
+                let mut chunks = vec![Ok(LLMChunk::ReasoningToken(
+                    "private reasoning".to_string(),
+                ))];
+                if self.complete_empty_response {
+                    chunks.push(Ok(LLMChunk::Done));
+                }
+                return Ok(Box::pin(stream::iter(chunks)));
+            }
             self.chat_stream(messages, tools, max_output_tokens, model)
                 .await
         }
@@ -1941,6 +1943,77 @@ mod tests {
             [Some(ReasoningEffort::Low), Some(ReasoningEffort::Low)],
             "compatibility callers must use one map request followed by one reduce request"
         );
+    }
+
+    #[tokio::test]
+    async fn empty_completed_map_stage_recovers_once_during_a_multipass_summary() {
+        let provider = Arc::new(ReasoningCaptureProvider {
+            responses_without_text: 1,
+            complete_empty_response: true,
+            ..Default::default()
+        });
+        let summarizer = LlmSummarizer::new(provider.clone(), "model".to_string(), None, None)
+            .with_request_budget(bounded_budget(3_000, 600, 100, 400));
+        let messages: Vec<_> = (0..12)
+            .map(|index| Message::user(format!("turn {index} {}", "saved progress ".repeat(240))))
+            .collect();
+
+        let report = summarizer.summarize_with_report(&messages).await.unwrap();
+
+        assert!(report.map_calls > 1);
+        assert_eq!(report.content, "captured summary");
+        assert!(!report.fallback_used);
+        let efforts = provider.captured_reasoning.lock().unwrap();
+        assert_eq!(
+            efforts[..2],
+            [Some(ReasoningEffort::Low), Some(ReasoningEffort::Disabled)]
+        );
+        assert!(efforts[2..]
+            .iter()
+            .all(|effort| *effort == Some(ReasoningEffort::Low)));
+    }
+
+    #[tokio::test]
+    async fn repeated_empty_completion_is_a_summary_generation_error() {
+        let provider = Arc::new(ReasoningCaptureProvider {
+            responses_without_text: 2,
+            complete_empty_response: true,
+            ..Default::default()
+        });
+        let summarizer = LlmSummarizer::new(provider.clone(), "model".to_string(), None, None)
+            .with_request_budget(bounded_budget(10_000, 2_000, 100, 400));
+
+        let error = summarizer
+            .summarize_with_report(&summary_messages())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, bamboo_compression::BudgetError::SummaryGenerationError(ref detail)
+            if detail.contains("map stage 1/1") && detail.contains("after one retry"))
+        );
+        assert_eq!(provider.captured_reasoning.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_stream_without_done_is_a_summary_generation_error_without_retry() {
+        let provider = Arc::new(ReasoningCaptureProvider {
+            responses_without_text: 1,
+            ..Default::default()
+        });
+        let summarizer = LlmSummarizer::new(provider.clone(), "model".to_string(), None, None)
+            .with_request_budget(bounded_budget(10_000, 2_000, 100, 400));
+
+        let error = summarizer
+            .summarize_with_report(&summary_messages())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, bamboo_compression::BudgetError::SummaryGenerationError(ref detail)
+            if detail.contains("without terminal completion"))
+        );
+        assert_eq!(provider.captured_reasoning.lock().unwrap().len(), 1);
     }
 
     /// Provider that captures both `reasoning_effort` and `max_output_tokens`.

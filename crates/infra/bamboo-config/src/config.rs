@@ -2693,6 +2693,9 @@ pub struct DefaultsConfig {
     /// Falls back to `fast`, then `chat`, when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code_review: Option<bamboo_domain::ProviderModelRef>,
+    /// Model for reviewing Work records. An absent role uses the configured Fast model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_review: Option<bamboo_domain::ProviderModelRef>,
     /// Default model for child SubAgent runs.
     /// Falls back to `fast`, then `chat` when unset.
     #[serde(
@@ -10532,6 +10535,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10569,6 +10573,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10609,6 +10614,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10652,6 +10658,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10678,6 +10685,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10724,6 +10732,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10753,6 +10762,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });
@@ -10799,6 +10809,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });

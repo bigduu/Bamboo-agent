@@ -514,6 +514,14 @@ pub fn try_resolve_primary_model(
     }
     let mut target = requested.clone();
     target.provider = resolve_provider_routing_key(config, &target.provider, registry)?;
+    try_admit_primary_target(config, registry, target)
+}
+
+fn try_admit_primary_target(
+    config: &Config,
+    registry: &Arc<ProviderRegistry>,
+    target: bamboo_domain::ProviderModelRef,
+) -> Result<ResolvedPrimaryModel, LLMError> {
     // Primary reasoning is carried by the run request; using a role wrapper
     // here would hide the selected registry Arc from managed Gold admission.
     let mut raw_target = target.clone();
@@ -926,6 +934,20 @@ pub fn resolve_code_review_model(
         );
     }
     resolve_fast_model(config, provider_name, provider_registry)
+}
+
+/// Select Work review from its saved role or the explicitly configured Fast
+/// role. Admission errors on a selected reference remain visible to callers.
+pub fn try_resolve_work_review_model(
+    config: &Config,
+    provider_registry: &Arc<ProviderRegistry>,
+) -> Result<Option<ResolvedPrimaryModel>, LLMError> {
+    config
+        .defaults
+        .as_ref()
+        .and_then(|defaults| defaults.work_review.as_ref().or(defaults.fast.as_ref()))
+        .map(|target| try_admit_primary_target(config, provider_registry, target.clone()))
+        .transpose()
 }
 
 /// Resolve the provider+model reference for a specific subagent type.
@@ -1709,6 +1731,40 @@ mod tests {
     }
 
     #[test]
+    fn work_review_prefers_its_role_and_uses_only_configured_fast_as_fallback() {
+        let registry = test_registry();
+        let mut config = Config::default();
+        config.defaults = Some(
+            serde_json::from_value(serde_json::json!({
+                "chat": {"provider":"openai","model":"chat"},
+                "fast": {"provider":"openai","model":"fast"},
+                "work_review": {"provider":"openai","model":"review","reasoning_effort":"low"}
+            }))
+            .unwrap(),
+        );
+        let resolve = |config: &Config| try_resolve_work_review_model(config, &registry);
+        let selected = resolve(&config).unwrap().unwrap().target;
+        assert_eq!(selected.provider, "openai");
+        assert_eq!(selected.model, "review");
+        assert_eq!(
+            selected.reasoning_effort,
+            Some(bamboo_domain::ReasoningEffort::Low)
+        );
+
+        let defaults = config.defaults.as_mut().unwrap();
+        defaults.work_review = Some(ProviderModelRef::new("missing-provider", "review"));
+        assert!(resolve(&config).is_err());
+
+        config.defaults.as_mut().unwrap().work_review = None;
+        assert_eq!(resolve(&config).unwrap().unwrap().target.model, "fast");
+
+        config.defaults.as_mut().unwrap().fast = None;
+        assert!(resolve(&config).unwrap().is_none());
+        let serialized = serde_json::to_value(config.defaults.as_ref().unwrap()).unwrap();
+        assert!(serialized.get("work_review").is_none());
+    }
+
+    #[test]
     fn test_get_schedule_model_from_config_prefers_defaults_fast_over_chat() {
         let config = test_config! {
             provider: "openai".to_string(),
@@ -1725,6 +1781,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
@@ -1780,6 +1837,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub-agent")),
                 subagent_models: HashMap::new(),
             }),
@@ -1808,6 +1866,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
@@ -1836,6 +1895,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
@@ -1875,6 +1935,7 @@ mod tests {
                 planning: None,
                 search: None,
                 code_review: None,
+                work_review: None,
                 sub_agent: None,
                 subagent_models: HashMap::new(),
             }),
