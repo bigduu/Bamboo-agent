@@ -1470,6 +1470,37 @@ struct SessionWriteGuard {
     metrics: Arc<SessionPersistenceMetrics>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum SessionLockWait {
+    Wait,
+    Try,
+}
+
+impl SessionLockWait {
+    fn lock_exclusive(self, file: &std::fs::File) -> io::Result<()> {
+        match self {
+            Self::Wait => FileExt::lock_exclusive(file),
+            Self::Try => FileExt::try_lock_exclusive(file).map_err(|error| {
+                let contended = error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error().is_some_and(|code| {
+                        Some(code) == fs2::lock_contended_error().raw_os_error()
+                    });
+                if contended {
+                    io::Error::new(io::ErrorKind::WouldBlock, "Session proof I/O is busy")
+                } else {
+                    error
+                }
+            }),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MaterialNotificationStamps {
+    pub main: (u64, std::time::SystemTime),
+    pub runtime: (u64, std::time::SystemTime),
+}
+
 #[derive(Debug)]
 struct WaitingSaveCounter {
     metrics: Arc<SessionPersistenceMetrics>,
@@ -2647,19 +2678,38 @@ impl SessionStoreV2 {
         session_id: &str,
         kind: SaveKind,
     ) -> io::Result<SessionWriteGuard> {
-        self.acquire_session_lock(session_id, Some(kind)).await
+        self.acquire_session_lock(session_id, Some(kind), SessionLockWait::Wait)
+            .await
     }
 
     async fn acquire_session_maintenance_lock(
         &self,
         session_id: &str,
     ) -> io::Result<SessionWriteGuard> {
-        self.acquire_session_lock(session_id, None).await
+        self.acquire_session_lock(session_id, None, SessionLockWait::Wait)
+            .await
+    }
+
+    async fn try_acquire_session_maintenance_lock(
+        &self,
+        session_id: &str,
+    ) -> io::Result<SessionWriteGuard> {
+        self.acquire_session_lock(session_id, None, SessionLockWait::Try)
+            .await
     }
 
     async fn acquire_actor_tree_write_guard(
         &self,
         root_id: &str,
+    ) -> io::Result<ActorTreeWriteGuard> {
+        self.acquire_actor_tree_write_guard_with_wait(root_id, SessionLockWait::Wait)
+            .await
+    }
+
+    async fn acquire_actor_tree_write_guard_with_wait(
+        &self,
+        root_id: &str,
+        wait: SessionLockWait,
     ) -> io::Result<ActorTreeWriteGuard> {
         validate_session_id(root_id)?;
         let mut hash = Sha256::new();
@@ -2674,7 +2724,7 @@ impl SessionStoreV2 {
                 .read(true)
                 .write(true)
                 .open(path)?;
-            FileExt::lock_exclusive(&file)?;
+            wait.lock_exclusive(&file)?;
             Ok::<_, io::Error>(file)
         })
         .await
@@ -2810,7 +2860,10 @@ impl SessionStoreV2 {
         durable_atomic_write(&directory.join(ACTOR_TREE_REVISION_FILE), &bytes).await
     }
 
-    async fn open_session_write_lock_file_at(path: PathBuf) -> io::Result<std::fs::File> {
+    async fn open_session_write_lock_file_at(
+        path: PathBuf,
+        wait: SessionLockWait,
+    ) -> io::Result<std::fs::File> {
         tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -2818,20 +2871,24 @@ impl SessionStoreV2 {
                 .read(true)
                 .write(true)
                 .open(path)?;
-            FileExt::lock_exclusive(&file)?;
+            wait.lock_exclusive(&file)?;
             Ok(file)
         })
         .await
         .map_err(|error| other_io_error(format!("join session write-lock task: {error}")))?
     }
 
-    async fn open_session_write_lock_file(&self, session_id: &str) -> io::Result<std::fs::File> {
+    async fn open_session_write_lock_file(
+        &self,
+        session_id: &str,
+        wait: SessionLockWait,
+    ) -> io::Result<std::fs::File> {
         let path = self.session_write_lock_path(session_id);
-        match Self::open_session_write_lock_file_at(path.clone()).await {
+        match Self::open_session_write_lock_file_at(path.clone(), wait).await {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.ensure_session_write_lock_dir().await?;
-                Self::open_session_write_lock_file_at(path).await
+                Self::open_session_write_lock_file_at(path, wait).await
             }
             Err(error) => Err(error),
         }
@@ -2841,6 +2898,7 @@ impl SessionStoreV2 {
         &self,
         session_id: &str,
         kind: Option<SaveKind>,
+        wait: SessionLockWait,
     ) -> io::Result<SessionWriteGuard> {
         validate_session_id(session_id)?;
         let waiting = kind.map(|_| {
@@ -2867,8 +2925,13 @@ impl SessionStoreV2 {
             acquired: Instant::now(),
             metrics: self.persistence_metrics.clone(),
         };
-        session_guard.guard = Some(lock.lock_owned().await);
-        let file = self.open_session_write_lock_file(session_id).await?;
+        session_guard.guard = Some(match wait {
+            SessionLockWait::Wait => lock.lock_owned().await,
+            SessionLockWait::Try => lock.try_lock_owned().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "Session proof I/O is busy")
+            })?,
+        });
+        let file = self.open_session_write_lock_file(session_id, wait).await?;
         session_guard.file = Some(file);
         drop(waiting);
         if let Some(kind) = kind {
@@ -3389,10 +3452,10 @@ impl SessionStoreV2 {
     }
 
     /// File metadata is a cache hint. Physical notification admission reads Main.
-    pub async fn material_notification_main_stamp(
+    pub async fn material_notification_stamps(
         &self,
         session_id: &str,
-    ) -> io::Result<(u64, std::time::SystemTime)> {
+    ) -> io::Result<MaterialNotificationStamps> {
         validate_session_id(session_id)?;
         let directory = self.sessions_dir.join(session_id);
         if !fs::symlink_metadata(&directory).await?.file_type().is_dir() {
@@ -3412,7 +3475,23 @@ impl SessionStoreV2 {
                 "material notification Main is not a regular file",
             ));
         }
-        Ok((metadata.len(), metadata.modified()?))
+        Ok(MaterialNotificationStamps {
+            main: (metadata.len(), metadata.modified()?),
+            runtime: (runtime.len(), runtime.modified()?),
+        })
+    }
+
+    /// A notification may retry later while an ordinary writer owns this Root.
+    /// Preserve canonical snapshot validation without waiting on its lock.
+    pub async fn try_load_material_notification_source(
+        &self,
+        id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.try_acquire_session_maintenance_lock(id).await?;
+        self.load_execution_admission_unchecked(id).await
     }
 
     /// Recover a root session by its deterministic authoritative directory,
@@ -10573,6 +10652,55 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn material_notification_proof_does_not_wait_for_another_roots_writer() -> io::Result<()>
+    {
+        let (store, home) = create_temp_storage().await?;
+        for id in ["notification-busy", "notification-ready"] {
+            store
+                .save_session(&session_with_history(id, 2, "original-run"))
+                .await?;
+        }
+        let peer = SessionStoreV2::new(home.path().to_owned()).await?;
+        let held = store
+            .acquire_session_maintenance_lock("notification-busy")
+            .await?;
+        for reader in [&store, &peer] {
+            let busy = tokio::time::timeout(
+                Duration::from_secs(2),
+                reader.try_load_material_notification_source("notification-busy"),
+            )
+            .await
+            .expect("proof acquisition must return while the Root remains locked");
+            assert_eq!(busy.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert!(reader
+                .try_load_material_notification_source("notification-ready")
+                .await?
+                .is_some());
+        }
+        drop(held);
+        assert!(store
+            .try_load_material_notification_source("notification-busy")
+            .await?
+            .is_some());
+        let tree = store
+            .acquire_actor_tree_write_guard("notification-busy")
+            .await?;
+        assert_eq!(
+            peer.acquire_actor_tree_write_guard_with_wait(
+                "notification-busy",
+                SessionLockWait::Try
+            )
+            .await
+            .err()
+            .expect("a retained tree proof must refuse nonblocking acquisition")
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(tree);
         Ok(())
     }
 

@@ -1268,7 +1268,7 @@ impl FileSessionInbox {
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         let mut authority = self
             .sessions
-            .lock_current_user_target(&supervisor, &selected.target.session_id)
+            .try_lock_current_user_target(&supervisor, &selected.target.session_id)
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         if !selected.caller.matches_session(&authority.source)

@@ -76,17 +76,6 @@ pub fn notification_source_settled(session: &Session, hint: &str) -> bool {
     else {
         return false;
     };
-    if !session.agent_runtime_state.as_ref().is_some_and(|runtime| {
-        matches!(
-            runtime.status,
-            bamboo_domain::AgentStatusState::Completed
-                | bamboo_domain::AgentStatusState::Failed
-                | bamboo_domain::AgentStatusState::Cancelled
-                | bamboo_domain::AgentStatusState::Suspended
-        )
-    }) {
-        return false;
-    }
     let mut found_hint = false;
     for fact in &outcomes.facts {
         let inputs: Vec<_> = fact

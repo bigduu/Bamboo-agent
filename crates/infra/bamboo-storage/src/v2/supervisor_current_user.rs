@@ -147,6 +147,25 @@ impl SessionStoreV2 {
         reference: &SupervisorReference,
         target_id: &str,
     ) -> io::Result<CurrentUserTargetGuard> {
+        self.lock_current_user_target_with_wait(reference, target_id, super::SessionLockWait::Wait)
+            .await
+    }
+
+    pub(crate) async fn try_lock_current_user_target(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+    ) -> io::Result<CurrentUserTargetGuard> {
+        self.lock_current_user_target_with_wait(reference, target_id, super::SessionLockWait::Try)
+            .await
+    }
+
+    async fn lock_current_user_target_with_wait(
+        &self,
+        reference: &SupervisorReference,
+        target_id: &str,
+        wait: super::SessionLockWait,
+    ) -> io::Result<CurrentUserTargetGuard> {
         reference_is_valid(reference)?;
         target_id_is_valid(target_id)?;
         let proof = self
@@ -180,7 +199,7 @@ impl SessionStoreV2 {
                 )
             })?;
         let authority = self
-            .lock_host_scope_control_observations(&[caller, target.clone()])
+            .lock_host_scope_control_observations(&[caller, target.clone()], wait)
             .await?;
         // Re-read protected proof while the same source/target/ancestry guards
         // are held. Copying serialized observations never creates authority.

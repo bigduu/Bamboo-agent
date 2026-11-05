@@ -15,7 +15,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     sync::Arc,
-    time::{Instant, SystemTime},
+    time::Instant,
 };
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -39,18 +39,10 @@ struct PublishedViewSelector {
     root_outcome: Option<bamboo_domain::ObserverRootOutcomeCursor>,
 }
 
-#[derive(PartialEq, Eq)]
-struct MaterialSourceKey {
-    hint: String,
-    caller: SessionCallerReference,
-    run_id: Option<String>,
-    status: bamboo_domain::AgentStatusState,
-    blocker_cursor: Option<(String, u64)>,
-}
-
 struct CachedMaterialSource {
-    key: MaterialSourceKey,
-    main_stamp: (u64, SystemTime),
+    hint: String,
+    created_at: DateTime<Utc>,
+    stamps: bamboo_storage::v2::MaterialNotificationStamps,
     candidates: Vec<bamboo_domain::ManagedRootNotification>,
     delivered: Vec<bamboo_domain::ManagedRootNotification>,
     settled: bool,
@@ -470,54 +462,17 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
             .await
             .and_then(|entry| entry.material_notification_hint)
             .ok_or_else(|| "managed notification hint is unavailable".to_string())?;
-        let main_stamp = self
+        let stamps = self
             .store
-            .material_notification_main_stamp(source)
+            .material_notification_stamps(source)
             .await
             .map_err(|error| error.to_string())?;
-        let side = self
-            .store
-            .load_runtime_control_plane(source)
-            .await
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "managed notification source is unavailable".to_string())?;
-        let status = side
-            .agent_runtime_state
-            .as_ref()
-            .map(|runtime| runtime.status.clone())
-            .unwrap_or_default();
-        let blocker_cursor = side
-            .runtime_metadata
-            .as_ref()
-            .and_then(|metadata| metadata.managed_task_blocker.as_ref())
-            .map(|blocker| (blocker.run_id.clone(), blocker.cursor));
-        let terminal = matches!(
-            status,
-            bamboo_domain::AgentStatusState::Completed
-                | bamboo_domain::AgentStatusState::Failed
-                | bamboo_domain::AgentStatusState::Cancelled
-                | bamboo_domain::AgentStatusState::Suspended
-        );
-        if blocker_cursor.is_none() && !terminal {
-            return Ok(Vec::new());
-        }
-        let key = MaterialSourceKey {
-            hint,
-            caller: SessionCallerReference::from(&side),
-            run_id: side.host_run_id().map(str::to_owned),
-            status,
-            blocker_cursor,
-        };
         {
             let mut cache = self.material_cache.lock().await;
-            if let Some(cached) = cache.get_mut(source).filter(|cached| {
-                cached.key == key
-                    // Runtime can finish before Main publishes its final fact.
-                    // Revisit that checkpoint when Main changes, even if the
-                    // previous blocker remains a valid selected candidate.
-                    && ((!cached.candidates.is_empty() && (cached.settled || !terminal))
-                        || cached.main_stamp == main_stamp)
-            }) {
+            if let Some(cached) = cache
+                .get_mut(source)
+                .filter(|cached| cached.hint == hint && cached.stamps == stamps)
+            {
                 cached.last_used = Instant::now();
                 return Ok(cached.candidates.clone());
             }
@@ -533,18 +488,19 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
             let _permit = permit;
             let result = (|| {
                 let session = runtime
-                    .block_on(store.load_execution_admission_snapshot(&source_id))
+                    .block_on(store.try_load_material_notification_source(&source_id))
                     .map_err(|error| error.to_string())?
                     .ok_or_else(|| "managed notification source is unavailable".to_string())?;
                 let candidates =
                     bamboo_orchestration::managed_session::notification_candidates(&session)
                         .map_err(str::to_owned)?;
                 let settled = bamboo_orchestration::managed_session::notification_source_settled(
-                    &session, &key.hint,
+                    &session, &hint,
                 );
                 Ok(Box::new(CachedMaterialSource {
-                    key,
-                    main_stamp,
+                    hint,
+                    created_at: session.created_at,
+                    stamps,
                     candidates,
                     delivered: Vec::new(),
                     settled,
@@ -604,7 +560,7 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
                         .iter()
                         .all(|candidate| cached.delivered.contains(candidate))
             })
-            .map(|cached| (cached.key.caller.created_at, cached.key.hint.clone()));
+            .map(|cached| (cached.created_at, cached.hint.clone()));
         if let Some((birth, hint)) = retired_hint {
             self.store
                 .clear_material_notification_hint(&selected.target.session_id, birth, &hint)

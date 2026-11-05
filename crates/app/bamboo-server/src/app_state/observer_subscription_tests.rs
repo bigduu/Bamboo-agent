@@ -1306,9 +1306,7 @@ async fn drive_material_notices(f: &Fixture, expected_calls: usize) {
             .map(|(id, cached)| {
                 (
                     id,
-                    &cached.key.run_id,
-                    &cached.key.status,
-                    &cached.key.blocker_cursor,
+                    &cached.hint,
                     cached.candidates.len(),
                     cached.delivered.len(),
                     cached.settled,
@@ -1318,6 +1316,23 @@ async fn drive_material_notices(f: &Fixture, expected_calls: usize) {
         panic!("checked notice expected {expected_calls} Supervisor calls, observed {}, last error {last_error:?}, hints {hints:?}, cache {cached:?}", f.probe.parent_calls.load(Ordering::SeqCst));
     }
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
+}
+
+async fn settle_material_notices(f: &Fixture) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            match f.state.observer_subscriptions.material_tick().await {
+                Ok(()) => break,
+                Err(error) => assert!(
+                    error.contains("pending") || error.contains("busy"),
+                    "{error}"
+                ),
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("unchanged sources must finish their finite proof I/O");
 }
 
 pub(in crate::app_state) async fn exercise_material_root_notifications() {
@@ -1396,6 +1411,12 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
     .await
     .expect("the Supervisor's real tool calls must start both Roots");
     drive_material_notices(&f, 2).await;
+    settle_material_notices(&f).await;
+    let unchanged_reads = f
+        .state
+        .observer_subscriptions
+        .material_main_reads
+        .load(Ordering::SeqCst);
     let first_run = f
         .state
         .session_activation_router
@@ -1445,7 +1466,7 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
             .observer_subscriptions
             .material_main_reads
             .load(Ordering::SeqCst),
-        0,
+        unchanged_reads,
         "unchanged running records must keep Main transcripts unread"
     );
     assert_eq!(
@@ -1520,6 +1541,7 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
     tokio::time::timeout(WAIT, f.probe.task_rewritten.notified())
         .await
         .unwrap();
+    settle_material_notices(&f).await;
     let reads = f
         .state
         .observer_subscriptions
@@ -1575,10 +1597,78 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
         .await
         .is_err());
 
-    f.probe.finish_blocker.notify_one();
-    drive_material_notices(&f, 4).await;
+    // Evict the in-memory delivery acknowledgement while a real Root writer
+    // owns A. B must still report its prior run during a successor execution.
+    let (write_reached, write_release) = f
+        .state
+        .session_store
+        .pause_full_save_before_filesystem_commit_for_test(ROOT_A);
+    let store = Arc::clone(&f.state.session_store);
+    let save = tokio::spawn(async move { store.save_session(&root).await });
+    tokio::time::timeout(WAIT, write_reached.wait())
+        .await
+        .unwrap();
+    f.state
+        .observer_subscriptions
+        .material_cache
+        .lock()
+        .await
+        .get_mut(ROOT_A)
+        .unwrap()
+        .delivered
+        .clear();
     f.probe.source_release[1].notify_one();
+    tokio::time::timeout(WAIT, async {
+        while f
+            .state
+            .session_activation_router
+            .current_run_id(ROOT_B)
+            .await
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    f.state
+        .session_messenger
+        .send(bamboo_domain::SessionMessageEnvelope::user_input(
+            ROOT_B,
+            "managed wait second successor",
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, f.probe.source_entered[1].notified())
+        .await
+        .unwrap();
+    let successor = f
+        .state
+        .session_activation_router
+        .current_run_id(ROOT_B)
+        .await
+        .unwrap();
+    assert_ne!(successor, second_run);
+    drive_material_notices(&f, 4).await;
+    assert_eq!(
+        f.state
+            .session_activation_router
+            .current_run_id(ROOT_B)
+            .await,
+        Some(successor)
+    );
+    let last = f.probe.parent_inputs.lock().unwrap();
+    assert!(last
+        .last()
+        .unwrap()
+        .iter()
+        .any(|message| message.content.contains(&second_run)));
+    drop(last);
+    write_release.wait().await;
+    save.await.unwrap().unwrap();
+    f.probe.finish_blocker.notify_one();
     drive_material_notices(&f, 5).await;
+    f.probe.source_release[1].notify_one();
     tokio::time::timeout(WAIT, async {
         while f
             .state
