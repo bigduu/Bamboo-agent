@@ -251,6 +251,9 @@ pub(crate) async fn execute_llm_round(
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
+    // Scope prepared image descriptions to this request. A configuration reused
+    // across rounds must never serve a description produced for another request.
+    config.vision_description_reuse.clear();
     let request_tool_schemas =
         context_tool_schemas_for_session(session, llm, model_name, tool_schemas).await;
     let tool_schemas = request_tool_schemas.as_ref();
