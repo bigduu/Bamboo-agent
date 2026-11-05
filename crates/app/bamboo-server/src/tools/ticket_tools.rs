@@ -18,13 +18,15 @@ pub mod semantic_schema;
 #[cfg(test)]
 mod tests;
 
-pub const NAMES: [&str; 7] = [
+pub const NAMES: &[&str] = &[
     "work_overview",
     "work_search",
     "work_inspect",
     "work_changes",
     "work_update",
     "work_dispatch",
+    // Work Review needs the Host read-only Project identity proof.
+    #[cfg(unix)]
     "work_review",
 ];
 
@@ -40,7 +42,7 @@ pub fn overlay(
     // Install the guarded definitions before explicit initialization so an
     // already-built runtime can use the scope as soon as the owner creates it.
     // Every invocation still validates the original Supervisor and live binding.
-    for name in NAMES {
+    for &name in NAMES {
         base = Arc::new(super::OverlayToolExecutor::new(
             base,
             Arc::new(TicketTool {

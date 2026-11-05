@@ -375,12 +375,14 @@ pub trait WorkReviewIo: Send + Sync {
         &self,
         prepared: &PreparedWorkReview,
         now_ms: u64,
+        admission: &WorkReviewAdmission,
     ) -> Result<WorkTokenSubmission>;
 
     async fn complete(
         &self,
         prepared: &PreparedWorkReview,
         receipt: &WorkTokenReservation,
+        admission: &WorkReviewAdmission,
     ) -> WorkReviewProviderReply;
 
     async fn accounting_authority(&self) -> Result<Authority>;
@@ -407,12 +409,36 @@ pub enum WorkReviewExecution {
     },
 }
 
+/// Serialize shutdown with the last synchronous Host admission effect.
+#[derive(Clone, Default)]
+pub struct WorkReviewAdmission {
+    gate: Arc<std::sync::Mutex<()>>,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl WorkReviewAdmission {
+    pub fn while_open<T>(&self, effect: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _guard = self.gate.lock().map_err(|_| Error::RevisionConflict)?;
+        if self.shutdown.is_cancelled() {
+            return Err(Error::AuthorityUnavailable(
+                "Work Review admission closed".into(),
+            ));
+        }
+        effect()
+    }
+
+    fn stop(&self) {
+        let _guard = self.gate.lock().unwrap_or_else(|error| error.into_inner());
+        self.shutdown.cancel();
+    }
+}
+
 /// Retain one measured reply until its original receipt can be settled. The
 /// explicit Supervisor tool is serial. This slot does not govern Worker runs.
 #[derive(Default)]
 pub struct WorkReviews {
     pending: Arc<tokio::sync::Mutex<Option<PendingAccounting>>>,
-    shutdown: tokio_util::sync::CancellationToken,
+    admission: WorkReviewAdmission,
 }
 
 struct PendingAccounting {
@@ -422,7 +448,7 @@ struct PendingAccounting {
 
 impl WorkReviews {
     pub fn stop_admission(&self) {
-        self.shutdown.cancel();
+        self.admission.stop();
     }
 
     pub fn reconcile_accounting(
@@ -483,7 +509,7 @@ impl WorkReviews {
     ) -> Result<WorkReviewExecution> {
         use bamboo_tickets::WorkTokenBlock;
         let mut pending = self.pending.clone().lock_owned().await;
-        if self.shutdown.is_cancelled() {
+        if self.admission.shutdown.is_cancelled() {
             return Ok(WorkReviewExecution::BudgetBlocked { reason: "shutdown" });
         }
         if pending.is_some() {
@@ -494,7 +520,7 @@ impl WorkReviews {
                 });
             }
         }
-        let receipt = match io.reserve(&prepared, now_ms).await {
+        let receipt = match io.reserve(&prepared, now_ms, &self.admission).await {
             Ok(WorkTokenSubmission::New(receipt)) => receipt,
             Ok(WorkTokenSubmission::Existing(accounting)) => {
                 return Ok(WorkReviewExecution::ExistingReceipt { accounting });
@@ -519,15 +545,22 @@ impl WorkReviews {
         // Once admitted, a cancelled tool waiter cannot drop the receipt or
         // its measured response. Shutdown stops the model wait, then settles.
         let original = receipt.clone();
-        let shutdown = self.shutdown.clone();
+        let admission = self.admission.clone();
         let execution = tokio::spawn(async move {
-            let reply = tokio::select! {
-                biased;
-                reply = io.complete(&prepared, &receipt) => reply,
-                _ = shutdown.cancelled() => WorkReviewProviderReply {
+            let reply = if admission.shutdown.is_cancelled() {
+                WorkReviewProviderReply {
                     text: None,
-                    usage: WorkReviewUsage::Unknown,
-                },
+                    usage: WorkReviewUsage::NotSent,
+                }
+            } else {
+                tokio::select! {
+                    biased;
+                    reply = io.complete(&prepared, &receipt, &admission) => reply,
+                    _ = admission.shutdown.cancelled() => WorkReviewProviderReply {
+                        text: None,
+                        usage: WorkReviewUsage::Unknown,
+                    },
+                }
             };
             *pending = Some(PendingAccounting {
                 receipt: receipt.clone(),
@@ -613,4 +646,26 @@ pub fn settle_review(
         })
         .flatten();
     Ok((accounting, review))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn review_shutdown_refuses_a_reserve_that_was_awaiting_host_proof() {
+        let admission = WorkReviewAdmission::default();
+        let held = admission.clone();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        let reserve = tokio::spawn(async move {
+            wait.await.unwrap();
+            held.while_open::<()>(|| panic!("stopped Review must leave the ledger untouched"))
+        });
+        admission.stop();
+        resume.send(()).unwrap();
+        assert!(matches!(
+            reserve.await.unwrap(),
+            Err(Error::AuthorityUnavailable(_))
+        ));
+    }
 }

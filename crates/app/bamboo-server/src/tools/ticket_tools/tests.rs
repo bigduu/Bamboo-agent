@@ -196,7 +196,7 @@ async fn ticket_model_update_replays_exact_receipt_and_cannot_write_ingress_or_u
 
 #[test]
 fn six_ticket_schemas_remain_bounded_and_host_fields_are_absent() {
-    for name in NAMES {
+    for &name in NAMES {
         let schema = schema::parameters(name);
         assert_eq!(schema["additionalProperties"], false);
         for forbidden in ["authority", "principal", "source", "approved", "binding"] {
@@ -535,6 +535,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
         "work_changes".to_string(),
         "work_update".to_string(),
         "work_dispatch".to_string(),
+        #[cfg(unix)]
         "work_review".to_string(),
     ]);
     assert_eq!(names(), expected_names);
@@ -549,7 +550,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     let config_before = serde_json::to_value(&*config.read().await).unwrap();
     let mut ordinary = Session::new("ordinary-ultra", "model");
     ordinary.set_root_orchestration_only(true).unwrap();
-    for name in NAMES {
+    for &name in NAMES {
         // Even a canonical executing Supervisor cannot create a scope by
         // calling a resident definition, including the two mutation tools.
         let (ok, denied) = execute_overlay(tools.as_ref(), name, Some(&session)).await;
@@ -593,7 +594,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
     assert!(ok);
     assert_eq!(result["data"]["work_count"], 0);
     let before = app.service().unwrap().published().unwrap().0;
-    for name in NAMES {
+    for &name in NAMES {
         for caller in [None, Some(&ordinary)] {
             let (ok, denied) = execute_overlay(tools.as_ref(), name, caller).await;
             assert!(!ok, "unauthorized initialized {name} succeeded");

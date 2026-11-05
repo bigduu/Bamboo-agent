@@ -9,8 +9,8 @@ use bamboo_domain::{
 use bamboo_engine::{model_config_helper::try_resolve_work_review_model, ticket_runtime};
 use bamboo_llm::{work_text, LLMError, ProviderRegistry};
 use bamboo_orchestration::work_review::{
-    PreparedWorkReview, WorkReviewEvidence, WorkReviewIo, WorkReviewProviderReply,
-    WorkReviewSessionObservation, WorkReviewUsage,
+    PreparedWorkReview, WorkReviewAdmission, WorkReviewEvidence, WorkReviewIo,
+    WorkReviewProviderReply, WorkReviewSessionObservation, WorkReviewUsage,
 };
 use bamboo_tickets::{
     Authority, ExecutionTokenOverCapUsage, TicketService, WorkTokenReservation, WorkTokenSubmission,
@@ -18,8 +18,9 @@ use bamboo_tickets::{
 use serde_json::{json, Value};
 
 use super::{
-    evidence::current_project_manifest, semantic::RegisteredRoute, Error, Principal, Result,
-    TicketApplication,
+    evidence::current_project_manifest,
+    semantic::{check_project_after_ticket_proof, RegisteredRoute},
+    Error, Principal, Result, TicketApplication,
 };
 
 fn review_target(config: &Config, registry: &Arc<ProviderRegistry>) -> Option<ProviderModelRef> {
@@ -46,10 +47,10 @@ impl ReviewHost {
     async fn with_live_route<T>(
         &self,
         prepared: &PreparedWorkReview,
+        admission: &WorkReviewAdmission,
         effect: impl FnOnce(&Authority) -> Result<T> + Send,
     ) -> Result<T> {
         let authority = self.accounting_authority().await?;
-        self.app.verify_review_caller(&self.original).await?;
         if self
             .app
             .review_session_observation(&self.service, &prepared.evidence)
@@ -71,6 +72,7 @@ impl ReviewHost {
         {
             return Err(Error::RevisionConflict);
         }
+        self.app.verify_review_caller(&self.original).await?;
         let project = current_project_manifest(
             &sources.projects,
             &self.app.root,
@@ -82,7 +84,7 @@ impl ReviewHost {
         if project != self.project {
             return Err(Error::RevisionConflict);
         }
-        effect(&authority)
+        admission.while_open(|| effect(&authority))
     }
 }
 
@@ -92,8 +94,9 @@ impl WorkReviewIo for ReviewHost {
         &self,
         prepared: &PreparedWorkReview,
         now_ms: u64,
+        admission: &WorkReviewAdmission,
     ) -> Result<WorkTokenSubmission> {
-        self.with_live_route(prepared, |authority| {
+        self.with_live_route(prepared, admission, |authority| {
             prepared.reserve(&self.service, authority, now_ms)
         })
         .await
@@ -103,18 +106,36 @@ impl WorkReviewIo for ReviewHost {
         &self,
         prepared: &PreparedWorkReview,
         receipt: &WorkTokenReservation,
+        admission: &WorkReviewAdmission,
     ) -> WorkReviewProviderReply {
         let admission: work_text::Admission = {
             let host = self.clone();
             let prepared = prepared.clone();
             let receipt = receipt.clone();
+            let gate = admission.clone();
             Arc::new(move || {
                 let host = host.clone();
                 let prepared = prepared.clone();
                 let receipt = receipt.clone();
+                let gate = gate.clone();
                 Box::pin(async move {
-                    host.with_live_route(&prepared, |authority| {
-                        prepared.confirm_submission(&host.service, authority, &receipt)
+                    host.with_live_route(&prepared, &gate, |authority| {
+                        let sources = host
+                            .app
+                            .patrol_sources
+                            .get()
+                            .ok_or(Error::RevisionConflict)?;
+                        check_project_after_ticket_proof(
+                            &sources.projects,
+                            &host.app.root,
+                            &host.project,
+                            || {
+                                prepared
+                                    .confirm_submission(&host.service, authority, &receipt)
+                                    .map_err(|_| bamboo_orchestration::patrol::PortError::Conflict)
+                            },
+                        )
+                        .map_err(|_| Error::RevisionConflict)
                     })
                     .await
                     .map_err(|_| LLMError::Auth("Work review admission changed".into()))

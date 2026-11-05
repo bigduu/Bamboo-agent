@@ -221,14 +221,14 @@ impl TicketApplication {
         service: &Arc<TicketService>,
         authority: &Authority,
     ) -> Result<()> {
-        self.work_reviews.reconcile_accounting(service, authority)?;
+        let review_result = self.work_reviews.reconcile_accounting(service, authority);
         if !self.patrol_calls.needs_accounting() {
-            return Ok(());
+            return review_result;
         }
         let calls = self.patrol_calls.clone();
         let service = service.clone();
         let authority = authority.clone();
-        tokio::task::spawn_blocking(move || {
+        let patrol_result = tokio::task::spawn_blocking(move || {
             let clock = SystemClock::current()?;
             let mut budget = TicketBudget {
                 service: &service,
@@ -241,7 +241,8 @@ impl TicketApplication {
                 .map_err(patrol_error)
         })
         .await
-        .map_err(|_| unavailable())?
+        .map_err(|_| unavailable())?;
+        patrol_result.and(review_result)
     }
 
     pub(super) async fn prepare_semantic_call(
@@ -426,7 +427,7 @@ impl ReadyPatrolProof {
     }
 }
 
-fn check_project_after_ticket_proof(
+pub(super) fn check_project_after_ticket_proof(
     projects: &ProjectStore,
     root: &Path,
     expected: &ProjectManifest,
