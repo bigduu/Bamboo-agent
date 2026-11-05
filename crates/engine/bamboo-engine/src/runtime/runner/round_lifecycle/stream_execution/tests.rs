@@ -5989,3 +5989,441 @@ async fn unmanaged_response_body_error_after_headers_is_terminal() {
         "response body failure must stop: {error:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2513: an unchanged final-request checkpoint must not repeat paid Legacy
+// Vision description requests for the same retained image.
+// ---------------------------------------------------------------------------
+
+/// Counts paid Legacy Vision description requests separately from the main
+/// dispatch, and captures what the main request actually contained.
+struct CountingVisionRoundProvider {
+    vision_calls: Arc<std::sync::atomic::AtomicUsize>,
+    main_requests: Arc<Mutex<Vec<Vec<Message>>>>,
+}
+
+#[async_trait]
+impl LLMProvider for CountingVisionRoundProvider {
+    async fn chat_stream(
+        &self,
+        _messages: &[Message],
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        model: &str,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        if model == "vision-single" {
+            let call = self
+                .vision_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            return Ok(Box::pin(stream::iter(vec![
+                Ok(LLMChunk::Token(format!("VISION_DESCRIPTION_{call}"))),
+                Ok(LLMChunk::Done),
+            ])));
+        }
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("main answer".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+
+    async fn chat_stream_ir(
+        &self,
+        ir: &bamboo_llm::PromptIR,
+        _tools: &[ToolSchema],
+        _max_output_tokens: Option<u32>,
+        _model: &str,
+        _options: Option<&LLMRequestOptions>,
+    ) -> bamboo_llm::provider::Result<LLMStream> {
+        let messages = if ir.continuation.is_some() {
+            ir.continuation_delta()
+        } else {
+            ir.flatten()
+        };
+        self.main_requests
+            .lock()
+            .expect("main requests lock")
+            .push(messages);
+        Ok(Box::pin(stream::iter(vec![
+            Ok(LLMChunk::Token("main answer".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+/// Representative adopting persistence: the default `checkpoint_runtime_session`
+/// path that loads the durable Session, appends missing messages and saves.
+struct AdoptingRoundPersistence {
+    durable: Mutex<Session>,
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl bamboo_domain::RuntimeSessionPersistence for AdoptingRoundPersistence {
+    async fn save_runtime_session(&self, session: &mut Session) -> std::io::Result<()> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        *self.durable.lock().expect("durable lock") = session.clone();
+        Ok(())
+    }
+
+    async fn load_runtime_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+        Ok(Some(self.durable.lock().expect("durable lock").clone()))
+    }
+}
+
+fn retained_image_message(text: &str) -> Message {
+    Message::user_with_parts(
+        text,
+        vec![
+            bamboo_domain::MessagePart::Text {
+                text: text.to_string(),
+            },
+            bamboo_domain::MessagePart::ImageUrl {
+                image_url: bamboo_domain::ImageUrlRef {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                    detail: None,
+                },
+            },
+        ],
+    )
+}
+
+fn vision_round_config(
+    persistence: Arc<AdoptingRoundPersistence>,
+    provider: &Arc<dyn LLMProvider>,
+) -> crate::runtime::config::AgentLoopConfig {
+    let mut config = test_config("system");
+    config.persistence = Some(persistence);
+    config.image_fallback = Some(crate::runtime::config::ImageFallbackConfig {
+        mode: crate::runtime::config::ImageFallbackMode::Vision,
+        vision_model: None,
+    });
+    let provider = provider.clone();
+    config.legacy_vision_model_resolver = Some(Arc::new(move || {
+        let provider = provider.clone();
+        Box::pin(async move {
+            Ok::<_, AgentError>(bamboo_llm::ResolvedModel::new(provider, "vision-single"))
+        })
+    }));
+    config
+}
+
+async fn run_vision_round(
+    session: &mut Session,
+    config: &crate::runtime::config::AgentLoopConfig,
+    llm: &Arc<dyn LLMProvider>,
+    session_id: &str,
+    hint: Option<&str>,
+) -> Result<(), AgentError> {
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(64);
+    super::super::execute_llm_round(
+        session,
+        config,
+        llm,
+        &event_tx,
+        &CancellationToken::new(),
+        session_id,
+        "test-model",
+        &[],
+        hint,
+        None,
+    )
+    .await
+    .map(|_| ())
+}
+
+#[tokio::test]
+async fn bookkeeping_only_checkpoint_does_not_repeat_the_vision_description() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-unchanged-checkpoint";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    // The durable Session already equals the live one, so an adopting checkpoint
+    // has nothing to append: it is bookkeeping only.
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(session.clone()),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    run_vision_round(
+        &mut session,
+        &config,
+        &llm_dyn,
+        session_id,
+        Some("request-only observation advice"),
+    )
+    .await
+    .expect("a bookkeeping-only checkpoint must not fail the round");
+
+    assert_eq!(
+        llm.vision_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one retained image must be described once, not once per bookkeeping checkpoint"
+    );
+    assert!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+        "the final request must still be checkpointed before provider dispatch"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_that_adopts_new_input_reprepares_with_one_extra_vision_call() {
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-adopting-checkpoint";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    // Durable state carries a concurrent message the runner has not seen, so the
+    // checkpoint must adopt it and the request must be rebuilt with it.
+    let concurrent = Message::user("concurrent child completion");
+    let mut durable = session.clone();
+    durable.add_message(concurrent.clone());
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(durable),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    run_vision_round(&mut session, &config, &llm_dyn, session_id, None)
+        .await
+        .expect("adopted input must be dispatched");
+
+    let requests = llm.main_requests.lock().expect("main requests lock");
+    let dispatched = requests.last().expect("one dispatched request");
+    let flattened = serde_json::to_string(dispatched).expect("serialize request");
+    assert!(
+        dispatched.iter().any(|message| message.id == concurrent.id),
+        "the adopted concurrent message must reach the provider"
+    );
+    // A changed input genuinely reprepares, so the rebuilt request carries the
+    // description produced for it — and the image is never dropped or reduced to
+    // the legacy "omitted" degradation.
+    assert!(
+        flattened.contains("VISION_DESCRIPTION_2"),
+        "the rebuilt request must carry the description prepared for it; dispatched={flattened}"
+    );
+    assert!(
+        !flattened.contains("omitted (vision failed)"),
+        "the accepted image must not degrade to an omission placeholder"
+    );
+    assert!(
+        !flattened.contains("image_url"),
+        "the raw image URL must not be sent to a non-Vision main model"
+    );
+    assert_eq!(
+        llm.vision_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "one initial description plus exactly one reprepare after the adoption"
+    );
+}
+
+/// Persistence whose adopting checkpoint refuses on authority grounds.
+struct RefusingRoundPersistence {
+    saves: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl bamboo_domain::RuntimeSessionPersistence for RefusingRoundPersistence {
+    async fn save_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        self.saves.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    async fn load_runtime_session(&self, _session_id: &str) -> std::io::Result<Option<Session>> {
+        Ok(None)
+    }
+
+    async fn checkpoint_runtime_session(&self, _session: &mut Session) -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict("generation moved".to_string()),
+        ))
+    }
+}
+
+#[tokio::test]
+async fn refused_checkpoint_still_rejects_before_dispatch() {
+    // #2513 authority guard: reusing a validated request must never bypass the
+    // authority decision. A checkpoint that refuses still fails the round and
+    // sends nothing, even with an image in flight.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-authority-refused";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    let persistence = Arc::new(RefusingRoundPersistence {
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let mut config = test_config("system");
+    config.persistence = Some(persistence.clone());
+    config.image_fallback = Some(crate::runtime::config::ImageFallbackConfig {
+        mode: crate::runtime::config::ImageFallbackMode::Vision,
+        vision_model: None,
+    });
+    let resolver_provider = llm_dyn.clone();
+    config.legacy_vision_model_resolver = Some(Arc::new(move || {
+        let provider = resolver_provider.clone();
+        Box::pin(async move {
+            Ok::<_, AgentError>(bamboo_llm::ResolvedModel::new(provider, "vision-single"))
+        })
+    }));
+
+    let error = run_vision_round(&mut session, &config, &llm_dyn, session_id, None)
+        .await
+        .expect_err("a refused checkpoint must fail closed");
+
+    assert!(
+        error
+            .to_string()
+            .contains("checkpoint failed before provider dispatch"),
+        "authority rejection must surface as a checkpoint failure: {error}"
+    );
+    assert!(
+        llm.main_requests
+            .lock()
+            .expect("main requests lock")
+            .is_empty(),
+        "no request may be dispatched after a refused checkpoint"
+    );
+}
+
+#[tokio::test]
+async fn unchanged_checkpoint_still_persists_the_final_request() {
+    // #2513 durability guard: skipping the rebuild must not skip persistence.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-durability";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(session.clone()),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    run_vision_round(&mut session, &config, &llm_dyn, session_id, None)
+        .await
+        .expect("an unchanged checkpoint must still complete the round");
+
+    assert_eq!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the reconciled request must be checkpointed exactly once before dispatch"
+    );
+    let durable = persistence.durable.lock().expect("durable lock");
+    assert_eq!(
+        durable.messages.len(),
+        session.messages.len(),
+        "the durable transcript must keep every accepted message"
+    );
+    assert_eq!(
+        serde_json::to_value(&durable.messages).unwrap(),
+        serde_json::to_value(&session.messages).unwrap(),
+        "the durable transcript must equal the live transcript"
+    );
+    assert!(
+        durable.model_context_state.is_some(),
+        "the committed model-context ledger must be durable"
+    );
+}
+
+#[tokio::test]
+async fn over_budget_vision_request_still_rejects_before_dispatch() {
+    // #2513 input-budget guard: reusing a validated request must not relax the
+    // final input-budget rejection that runs before any checkpoint.
+    let _env_lock = isolate_prompt_safe_env_cache();
+    let session_id = "vision-over-budget";
+    let mut session = Session::new(session_id, "test-model");
+    session.add_message(retained_image_message("what is in this screenshot?"));
+
+    let persistence = Arc::new(AdoptingRoundPersistence {
+        durable: Mutex::new(session.clone()),
+        saves: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let llm = Arc::new(CountingVisionRoundProvider {
+        vision_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        main_requests: Arc::new(Mutex::new(Vec::new())),
+    });
+    let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
+    let config = vision_round_config(persistence.clone(), &llm_dyn);
+
+    let (event_tx, _event_rx) = mpsc::channel::<AgentEvent>(64);
+    let prepared_context = PreparedContext {
+        messages: session.messages.clone(),
+        token_usage: usage(0, 22),
+        truncation_occurred: false,
+        segments_removed: 0,
+        compressed_message_ids: Vec::new(),
+        prompt_cached_tool_outputs: 0,
+        prompt_cached_tool_tokens_saved: 0,
+    };
+    let error = execute_llm_stream(
+        &mut session,
+        &config,
+        &llm_dyn,
+        &prepared_context,
+        &[],
+        &LlmStreamFrame {
+            event_tx: &event_tx,
+            cancel_token: &CancellationToken::new(),
+            session_id,
+            model: "test-model",
+            provider_name: None,
+            provider_type: None,
+            reasoning_effort: None,
+            // Deliberately below the rendered request so the pre-dispatch
+            // budget rejection is what stops this round.
+            max_context_tokens: 16,
+            max_output_tokens: 8,
+            observation_progress_hint: None,
+            prompt_memory_exposure: None,
+        },
+    )
+    .await
+    .map(|_| ())
+    .expect_err("a request above the ledger-safe input budget must be rejected");
+
+    assert!(
+        matches!(error, AgentError::Budget(_)),
+        "the input-budget contract must still fail closed: {error:?}"
+    );
+    assert!(
+        llm.main_requests
+            .lock()
+            .expect("main requests lock")
+            .is_empty(),
+        "an over-budget request must never reach the provider"
+    );
+    assert_eq!(
+        persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an over-budget request must be rejected before any checkpoint"
+    );
+    assert_eq!(
+        llm.vision_calls.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "an over-budget request must be rejected before any paid Vision call"
+    );
+}
