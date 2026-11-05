@@ -943,8 +943,7 @@ async fn admit_native_source(
     receipt
 }
 
-#[actix_web::test]
-async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_after_restart() {
+pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
     let f = Fixture::new_with_native_source(true).await;
