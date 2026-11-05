@@ -123,6 +123,14 @@ pub enum WorkTokenAdmission {
     Blocked(WorkTokenBlock),
 }
 
+/// The accounting record and the one-time right to submit are separate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkTokenSubmission {
+    New(Box<WorkTokenReservation>),
+    Existing(Box<WorkTokenReservation>),
+    Blocked(WorkTokenBlock),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkTokenBudget {
@@ -205,6 +213,29 @@ fn current_attempt(snapshot: &Snapshot, request: &WorkTokenRequest) -> Result<()
         .as_ref()
         .and_then(|id| snapshot.submissions.get(id))
         .is_some_and(|submission| submission.assignment_id == assignment.id);
+    // Snapshot validation already binds awaiting_request to this assignment,
+    // generation, contract, and yielded Worker question.
+    let yielded_for_input = |assignment: &crate::Assignment| {
+        assignment.state == crate::AssignmentState::Blocked
+            && assignment.process_stopped
+            && assignment
+                .awaiting_request
+                .as_ref()
+                .and_then(|id| snapshot.requests.get(id))
+                .is_some_and(|request| request.status == crate::RequestStatus::Open)
+    };
+    let current_yielded_review = request.purpose == ExecutionBudgetPurpose::SupervisorDecision
+        && work.state == crate::WorkState::Blocked
+        && work.active_assignment.is_none()
+        && work.current_submission.is_none()
+        && yielded_for_input(assignment)
+        && !snapshot.assignments.values().any(|other| {
+            other.id != assignment.id
+                && other.work_id == work.id
+                && other.generation == work.generation
+                && other.contract_revision == work.contract_revision
+                && yielded_for_input(other)
+        });
     if assignment.work_id != work.id
         || work.generation != attempt.generation
         || assignment.generation != attempt.generation
@@ -219,7 +250,9 @@ fn current_attempt(snapshot: &Snapshot, request: &WorkTokenRequest) -> Result<()
         || intent.immutable_spec.binding != snapshot.binding
         || intent.spec_hash != content_hash(&canonical_bytes(&intent.immutable_spec)?)
         || assignment.runtime != intent.receipt
-        || (work.active_assignment.as_ref() != Some(&assignment.id) && !current_submission)
+        || (work.active_assignment.as_ref() != Some(&assignment.id)
+            && !current_submission
+            && !current_yielded_review)
         || matches!(
             work.state,
             crate::WorkState::Accepted | crate::WorkState::Cancelled
@@ -529,6 +562,24 @@ impl TicketService {
         request: &WorkTokenRequest,
         now_ms: u64,
     ) -> Result<WorkTokenAdmission> {
+        Ok(
+            match self.reserve_work_token_submission(authority, request, now_ms)? {
+                WorkTokenSubmission::New(record) | WorkTokenSubmission::Existing(record) => {
+                    WorkTokenAdmission::Reserved(record)
+                }
+                WorkTokenSubmission::Blocked(block) => WorkTokenAdmission::Blocked(block),
+            },
+        )
+    }
+
+    /// Reserve and report whether this invocation owns a fresh submission.
+    /// Retries can read the original receipt but must not repeat provider I/O.
+    pub fn reserve_work_token_submission(
+        &self,
+        authority: &Authority,
+        request: &WorkTokenRequest,
+        now_ms: u64,
+    ) -> Result<WorkTokenSubmission> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
             .published
@@ -559,7 +610,7 @@ impl TicketService {
             .ok_or_else(|| Error::ResourceBlocked("Work token limits are not configured".into()))?;
         if let Some(record) = budget.reservations.get(&request.operation_id) {
             return if record.request == *request {
-                Ok(WorkTokenAdmission::Reserved(Box::new(record.clone())))
+                Ok(WorkTokenSubmission::Existing(Box::new(record.clone())))
             } else {
                 Err(Error::IdempotencyConflict)
             };
@@ -576,10 +627,10 @@ impl TicketService {
             .values()
             .any(|record| record.over_cap_usage.is_some())
         {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Accounting));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Accounting));
         }
         if budget.reservations.len() >= MAX_RECORDS {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Capacity));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Capacity));
         }
         let tokens = u64::from(request.input_cap) + u64::from(request.output_cap);
         let used = budget
@@ -593,7 +644,7 @@ impl TicketService {
             .get(&request.work_id)
             .is_none_or(|limit| tokens > limit.saturating_sub(used))
         {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Work));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Work));
         }
         let day = now_ms / DAY_MS;
         let daily = if Some(day) == budget.current_utc_day {
@@ -602,7 +653,7 @@ impl TicketService {
             0
         };
         if tokens > budget.limits.utc_day_tokens.saturating_sub(daily) {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Daily));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Daily));
         }
         if tokens
             > budget
@@ -610,7 +661,7 @@ impl TicketService {
                 .total_tokens
                 .saturating_sub(budget.total_charged)
         {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Total));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Total));
         }
         let record = WorkTokenReservation {
             request: request.clone(),
@@ -643,7 +694,7 @@ impl TicketService {
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
         crate::service::validate_snapshot(&next)?;
         store.publish_accounting(next)?;
-        Ok(WorkTokenAdmission::Reserved(Box::new(record)))
+        Ok(WorkTokenSubmission::New(Box::new(record)))
     }
 
     /// Reconcile only the original receipt. Unknown usage retains all caps;

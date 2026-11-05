@@ -32,6 +32,11 @@ pub fn parameters(name: &str) -> Value {
             "budget_bytes":{"type":"integer","minimum":128,"maximum":65536},"fixed_commit":nullable_id}),
             &["ids", "sections", "depth", "budget_bytes", "fixed_commit"],
         ),
+        "work_review" => object(
+            json!({"project_id":id, "work_id":id, "assignment_id":id,
+                "operation_id":{"type":"string","format":"uuid","description":"Stable for this explicit review, including retry."}}),
+            &["project_id", "work_id", "assignment_id", "operation_id"],
+        ),
         "work_changes" => object(
             json!({"since_seq":{"type":"integer","minimum":0},"limit":limit,"cursor":cursor}),
             &["since_seq", "limit", "cursor"],

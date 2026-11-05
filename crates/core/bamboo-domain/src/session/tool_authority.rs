@@ -83,7 +83,7 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 /// These are delegation or bounded business views, never raw workspace/file,
 /// process, Skill, Workflow or external-provider execution. Concrete Session
 /// ports still require their live Host instance proof; names grant nothing.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 15] = [
     "SubAgent",
     "spawn_session",
     "Plan",
@@ -98,6 +98,7 @@ pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
     "work_changes",
     "work_update",
     "work_dispatch",
+    "work_review",
 ];
 
 pub fn orchestration_only_allows_execution_name_for_supervisor(

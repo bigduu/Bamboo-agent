@@ -6,6 +6,7 @@
 //! uses a narrow Host storage port, never a second Task/lease or recovered grant.
 pub mod managed_session;
 pub mod patrol;
+pub mod work_review;
 
 use std::{
     collections::{BTreeMap, BTreeSet},
