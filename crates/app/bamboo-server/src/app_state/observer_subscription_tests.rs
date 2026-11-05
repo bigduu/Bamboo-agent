@@ -1087,6 +1087,48 @@ async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_afte
     )
     .await;
     assert_eq!(consumed, json!({"status":"outcome_unknown"}));
+    let mut stale_first = request(0, 0);
+    stale_first["outcome_targets"][0]["target_ref"]["created_at"] = json!("2000-01-01T00:00:00Z");
+    let sibling =
+        invoke_managed_control(&cold, &reference, "managed-wait-stale-sibling", stale_first).await;
+    assert_eq!(sibling["outcome"]["run_id"], second_run);
+
+    // Temporarily withhold only the genuine ACK in this isolated fixture.
+    // The Main result already exists and the cold Host has no runner signal.
+    let inbox = home
+        .path()
+        .join("sessions")
+        .join(ROOT_B)
+        .join("inbox")
+        .join("admitted");
+    let receipts: Vec<_> = std::fs::read_dir(inbox)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(receipts.len(), 1);
+    let parked = home.path().join("parked-ack");
+    std::fs::rename(&receipts[0], &parked).unwrap();
+    let pending = invoke_managed_control(
+        &cold,
+        &reference,
+        "managed-wait-pending-ack",
+        request(first_cursor, 0),
+    );
+    tokio::pin!(pending);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut pending)
+            .await
+            .is_err()
+    );
+    std::fs::rename(&parked, &receipts[0]).unwrap();
+    let verified = tokio::time::timeout(WAIT, pending)
+        .await
+        .expect("restored ACK wakes the wait");
+    assert_eq!(verified["outcome"]["run_id"], second_run);
+    assert_eq!(
+        verified["outcome"]["inputs"][0]["receipt_id"],
+        second_input["receipt_id"]
+    );
 }
 
 async fn run_native_source(

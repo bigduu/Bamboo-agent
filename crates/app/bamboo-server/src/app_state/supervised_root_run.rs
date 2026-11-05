@@ -4,12 +4,12 @@
 //! blocking job retains the Router owner. The runner table is only tried while
 //! those fences are held, so no async wait or lock-order inversion is added.
 
-use std::{collections::HashMap, future::Future, io, sync::Arc};
+use std::{collections::HashMap, io, sync::Arc};
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
 use bamboo_domain::{
-    AdmissionCommit, AdmissionGate, ObserverSupervisedRootOutcome, SessionActivationPort,
+    AdmissionCommit, AdmissionGate, ObserverRootOutcomeRead, SessionActivationPort,
     SessionAuthorityIdentity, SessionCallerReference, SupervisorCurrentUserTarget,
     SupervisorReference,
 };
@@ -225,7 +225,7 @@ impl SupervisedRootRunController {
         caller: &SessionCallerReference,
         supervisor: &SupervisorReference,
         target: &ManagedOutcomeTarget,
-    ) -> Result<Option<ObserverSupervisedRootOutcome>, ToolError> {
+    ) -> Result<ObserverRootOutcomeRead, ToolError> {
         self.inbox
             .read_managed_root_outcome(
                 caller,
@@ -239,20 +239,6 @@ impl SupervisedRootRunController {
                 tracing::debug!(%error, "Managed Root outcome evidence unavailable");
                 ToolError::Execution("managed_root_outcome_evidence_unavailable".into())
             })
-    }
-
-    async fn outcome_after_signal(
-        &self,
-        caller: &SessionCallerReference,
-        supervisor: &SupervisorReference,
-        target: &ManagedOutcomeTarget,
-        signal: Option<impl Future<Output = ()>>,
-    ) -> Result<Option<ObserverSupervisedRootOutcome>, ToolError> {
-        let Some(signal) = signal else {
-            return Ok(None);
-        };
-        signal.await;
-        self.read_outcome(caller, supervisor, target).await
     }
 
     async fn control(
@@ -378,15 +364,16 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
             })
         };
         let [first, second] = targets;
-        let outcome = bamboo_orchestration::managed_session::wait_for_outcome(
-            async {
-                tokio::try_join!(
-                    self.read_outcome(caller, &supervisor, first),
-                    self.read_outcome(caller, &supervisor, second),
-                )
-            },
-            self.outcome_after_signal(caller, &supervisor, first, first_signal),
-            self.outcome_after_signal(caller, &supervisor, second, second_signal),
+        use bamboo_orchestration::managed_session::{read_when_verified, wait_for_outcome};
+        let outcome = wait_for_outcome(
+            read_when_verified(
+                || self.read_outcome(caller, &supervisor, first),
+                first_signal,
+            ),
+            read_when_verified(
+                || self.read_outcome(caller, &supervisor, second),
+                second_signal,
+            ),
         )
         .await?;
         let response = match outcome {
