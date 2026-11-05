@@ -402,6 +402,8 @@ struct TaskControlPlaneUndo {
     task_list: Option<TaskList>,
     task_list_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_task_blocker: Option<bamboo_domain::ManagedTaskBlocker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_witness: Option<TaskConversationWitness>,
 }
 
@@ -1934,6 +1936,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
         runtime.last_run_error = None;
         runtime.pending_injected_messages = None;
         runtime.task_list_version = None;
+        runtime.managed_task_blocker = None;
         runtime.todo_list_version = None;
         runtime.session_inbox_admission = None;
         runtime.supervised_root_outcomes = None;
@@ -4235,6 +4238,11 @@ impl SessionStoreV2 {
         }
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
+        current
+            .runtime_metadata
+            .as_mut()
+            .expect("Task metadata was set")
+            .managed_task_blocker = undo.managed_task_blocker.clone();
         self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
             .await?;
         Ok((abs_dir, current))
@@ -4897,13 +4905,7 @@ impl SessionStoreV2 {
         {
             return Ok(false);
         }
-        let mut committed = current;
-        committed.task_list = updated.task_list.clone();
-        committed.set_task_list_version_meta(
-            updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
+        let committed = Self::apply_unowned_task_update(&current, updated)?;
         self.write_existing_runtime_sidecar_durable_unchecked(
             &committed,
             RuntimeTaskDurabilityEvent::SingleUpdatedSidecarPublished,
@@ -5021,20 +5023,8 @@ impl SessionStoreV2 {
         // metadata writes from another store. Build the physical writes from
         // the just-revalidated durable snapshots and patch only Task-owned
         // fields, so the transaction remains narrowly targeted.
-        let mut first_commit = current_first.clone();
-        first_commit.task_list = first_updated.task_list.clone();
-        first_commit.set_task_list_version_meta(
-            first_updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
-        let mut second_commit = current_second.clone();
-        second_commit.task_list = second_updated.task_list.clone();
-        second_commit.set_task_list_version_meta(
-            second_updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
+        let first_commit = Self::apply_unowned_task_update(&current_first, first_updated)?;
+        let second_commit = Self::apply_unowned_task_update(&current_second, second_updated)?;
 
         let transaction_id = Uuid::new_v4().to_string();
         let journal = RuntimeTaskTransactionJournal {
@@ -5045,12 +5035,20 @@ impl SessionStoreV2 {
                 conversation_witness: Some(TaskConversationWitness::capture(&current_first)?),
                 task_list: current_first.task_list.clone(),
                 task_list_version: first_version,
+                managed_task_blocker: current_first
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.clone()),
             },
             second: TaskControlPlaneUndo {
                 session_id: current_second.id.clone(),
                 conversation_witness: Some(TaskConversationWitness::capture(&current_second)?),
                 task_list: current_second.task_list.clone(),
                 task_list_version: second_version,
+                managed_task_blocker: current_second
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.clone()),
             },
         };
         let journal_path = self.write_runtime_task_journal(&journal).await?;
@@ -5135,6 +5133,22 @@ impl SessionStoreV2 {
         Ok(true)
     }
 
+    fn apply_unowned_task_update(current: &Session, updated: &Session) -> io::Result<Session> {
+        let mut committed = current.clone();
+        committed.task_list = updated.task_list.clone();
+        committed.set_task_list_version_meta(
+            updated
+                .task_list_version_meta()
+                .expect("validated updated Task generation"),
+        );
+        if !Self::runtime_task_owned_snapshot_matches(current, updated)? {
+            if let Some(metadata) = committed.runtime_metadata.as_mut() {
+                metadata.managed_task_blocker = None;
+            }
+        }
+        Ok(committed)
+    }
+
     fn runtime_task_owned_snapshot_matches(
         current: &Session,
         expected: &Session,
@@ -5207,6 +5221,90 @@ impl SessionStoreV2 {
             }
         }
         Ok(())
+    }
+
+    /// Recompute provenance under the same physical guard as the Task write.
+    /// The caller's snapshot never grants itself attribution, and a full save
+    /// may only carry forward a matching sidecar revision.
+    fn adopt_managed_task_blocker(
+        snapshot: &mut Session,
+        previous: Option<&Session>,
+        writer: Option<&root_actor_runtime::RootActorWriteProof>,
+    ) {
+        let blocker = previous
+            .filter(|previous| {
+                snapshot.kind == SessionKind::Root && snapshot.created_at == previous.created_at
+            })
+            .and_then(|previous| {
+                let version: u64 = snapshot.task_list_version_meta()?.parse().ok()?;
+                let tasks = snapshot
+                    .task_list
+                    .as_ref()
+                    .filter(|tasks| tasks.session_id == snapshot.id)?;
+                let previous_version = match previous.task_list_version_meta() {
+                    Some(value) => value.parse::<u64>().ok()?,
+                    None => 0,
+                };
+                let previous_tasks = previous.task_list.as_ref();
+                let previous_blocker = previous
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.as_ref())
+                    .filter(|blocker| {
+                        previous_tasks
+                            .is_some_and(|tasks| blocker.matches_revision(previous_version, tasks))
+                    });
+                if version == previous_version {
+                    return previous_blocker
+                        .filter(|blocker| blocker.matches_revision(version, tasks))
+                        .cloned();
+                }
+                let owner = writer.filter(|_| version > previous_version)?.owner();
+                let blocked = |task: &&bamboo_domain::TaskItem| {
+                    task.status == bamboo_domain::TaskItemStatus::Blocked
+                        && !task.id.is_empty()
+                        && task.id.len() <= 128
+                };
+                let mut blocked_tasks = tasks.items.iter().filter(blocked);
+                let new_blocker = blocked_tasks.find(|task| {
+                    !previous_tasks.is_some_and(|previous| {
+                        previous.items.iter().any(|item| {
+                            item.id == task.id
+                                && item.status == task.status
+                                && item.description == task.description
+                                && item.blockers == task.blockers
+                        })
+                    })
+                });
+                let (cursor, task_id) = match new_blocker {
+                    Some(task) => (version, task.id.clone()),
+                    None => {
+                        let retained = previous_blocker.filter(|blocker| {
+                            blocker.run_id == owner.fence.run_id
+                                && tasks
+                                    .items
+                                    .iter()
+                                    .filter(blocked)
+                                    .any(|task| task.id == blocker.task_id)
+                        })?;
+                        (retained.cursor, retained.task_id.clone())
+                    }
+                };
+                bamboo_domain::ManagedTaskBlocker::from_committed_revision(
+                    owner.fence.run_id.clone(),
+                    cursor,
+                    version,
+                    task_id,
+                    tasks,
+                )
+                .ok()
+            });
+        if blocker.is_some() || snapshot.runtime_metadata.is_some() {
+            snapshot
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .managed_task_blocker = blocker;
+        }
     }
 
     fn runtime_task_non_task_snapshot(session: &Session) -> io::Result<serde_json::Value> {
@@ -7109,14 +7207,14 @@ impl SessionStoreV2 {
             reject_incompatible_session_write(&durable)?;
             reject_conversation_generation_change(session, &durable)?;
         }
-        if let Some(previous) = Self::read_runtime_sidecar_at(
+        let previous = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
             &session.id,
         )
-        .await?
-        {
-            reject_incompatible_session_write(&previous)?;
-            reject_conversation_generation_change(session, &previous)?;
+        .await?;
+        if let Some(previous) = previous.as_ref() {
+            reject_incompatible_session_write(previous)?;
+            reject_conversation_generation_change(session, previous)?;
             // Runtime does not own Main's stamp. Legacy absence and v1 have
             // identical semantics; never turn this compatible pair into a
             // false conflict or rewrite Main from the runtime-only path.
@@ -7126,7 +7224,7 @@ impl SessionStoreV2 {
                     previous.session_version,
                 )
             {
-                reject_session_version_change(session, &previous)?;
+                reject_session_version_change(session, previous)?;
             }
         }
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
@@ -7165,7 +7263,12 @@ impl SessionStoreV2 {
         let abs_dir = self.abs_path_from_rel(rel);
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
-        let runtime_snapshot = runtime_sidecar_snapshot(session);
+        let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+        Self::adopt_managed_task_blocker(
+            &mut runtime_snapshot,
+            previous.as_ref(),
+            guards.root_actor.as_ref(),
+        );
         let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
@@ -7334,6 +7437,7 @@ impl SessionStoreV2 {
         // save must still be able to repair an interrupted creation whose Main
         // is missing.
         let current_main = self.abs_path_from_rel(&intended_rel).join("session.json");
+        let mut previous_sidecar = None;
         let previous_main = match fs::read_to_string(&current_main).await {
             Ok(raw) => {
                 compact_main::validate_full_main(raw.as_bytes())?;
@@ -7352,6 +7456,7 @@ impl SessionStoreV2 {
                 {
                     previous_runtime.observe_main_session_version(durable.session_version);
                     reject_incompatible_session_write(&previous_runtime)?;
+                    previous_sidecar = Some(previous_runtime);
                 } else {
                     reject_incompatible_session_write(&durable)?;
                 }
@@ -7507,7 +7612,9 @@ impl SessionStoreV2 {
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
         let mut session_bytes = compact_main::serialize_main(session)?;
-        let mut runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
+        let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+        Self::adopt_managed_task_blocker(&mut runtime_snapshot, previous_sidecar.as_ref(), None);
+        let mut runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
         let mut serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
@@ -7543,7 +7650,13 @@ impl SessionStoreV2 {
             // both actual files must publish that same canonical candidate.
             let started = Instant::now();
             session_bytes = compact_main::serialize_main(session)?;
-            runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))?;
+            let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+            Self::adopt_managed_task_blocker(
+                &mut runtime_snapshot,
+                previous_sidecar.as_ref(),
+                None,
+            );
+            runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)?;
             serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
             stages.serialization += started.elapsed();
         }
@@ -8918,8 +9031,30 @@ mod tests {
     #[tokio::test]
     async fn paired_task_commit_marker_removal_failure_rolls_back_before_error() -> io::Result<()> {
         let (storage, _temp) = create_temp_storage().await?;
-        let (child_original, child_updated, root_original, root_updated) =
+        let (child_original, child_updated, mut root_original, mut root_updated) =
             seed_runtime_task_transaction_pair(&storage).await?;
+        // Seed the sidecar as it would look after an exact Root Task write.
+        let tasks = root_original.task_list.as_mut().unwrap();
+        tasks.items[0].status = TaskItemStatus::Blocked;
+        let proof = bamboo_domain::ManagedTaskBlocker::from_committed_revision(
+            "recorded-run".into(),
+            1,
+            1,
+            tasks.items[0].id.clone(),
+            tasks,
+        )?;
+        for snapshot in [&mut root_original, &mut root_updated] {
+            snapshot
+                .runtime_metadata
+                .as_mut()
+                .unwrap()
+                .managed_task_blocker = Some(proof.clone());
+        }
+        fs::write(
+            storage.runtime_json_path(&root_original.id).await?.unwrap(),
+            serde_json::to_vec(&runtime_sidecar_snapshot(&root_original))?,
+        )
+        .await?;
         storage.inject_runtime_task_transaction_fault(RuntimeTaskTransactionFault::JournalRemove);
 
         let error = storage
@@ -8933,6 +9068,14 @@ mod tests {
             .expect_err("journal removal failure cannot publish success");
         assert!(error.to_string().contains("rolled back"), "{error}");
         assert_original_runtime_task_pair(&storage).await?;
+        let restored = storage
+            .load_runtime_control_plane(&root_original.id)
+            .await?
+            .unwrap();
+        assert_eq!(
+            restored.runtime_metadata.unwrap().managed_task_blocker,
+            Some(proof)
+        );
         assert!(storage.runtime_task_journal_paths().await?.is_empty());
         Ok(())
     }
@@ -9306,6 +9449,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id,
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9316,6 +9460,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9538,6 +9683,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9548,6 +9694,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9609,6 +9756,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9619,6 +9767,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9677,6 +9826,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9687,6 +9837,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),

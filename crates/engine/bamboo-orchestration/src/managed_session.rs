@@ -1,5 +1,6 @@
 //! Bounded waits on an existing, exact managed Session run.
-use bamboo_domain::{ObserverRootOutcomeRead, ObserverSupervisedRootOutcome};
+use async_trait::async_trait;
+use bamboo_domain::{ManagedRootEvent, ManagedRootEventRead};
 use std::{future::Future, time::Duration};
 
 const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
@@ -14,30 +15,45 @@ pub async fn wait_for_finalization(signal: impl Future<Output = ()>) -> bool {
         .is_ok()
 }
 
+/// A process-local prompt to reread durable evidence.
+pub enum ManagedRunHint {
+    TaskChanged,
+    Finalized,
+}
+
+#[async_trait]
+pub trait ManagedRunSignals: Send {
+    async fn next_hint(&mut self) -> ManagedRunHint;
+}
+
 /// One candidate for the bounded two-run wait. While the run has no recorded
-/// outcome, wait for the Host signal. A committed outcome with a missing ACK
+/// event, wait for a Host hint. A committed event with a missing ACK
 /// can become verifiable independently, so recheck only that pending proof.
 pub async fn read_when_verified<E, F, Read>(
     mut read: F,
-    mut signal: Option<impl Future<Output = ()> + Send>,
-) -> Result<Option<ObserverSupervisedRootOutcome>, E>
+    mut signals: Option<impl ManagedRunSignals>,
+) -> Result<Option<ManagedRootEvent>, E>
 where
     F: FnMut() -> Read + Send,
-    Read: Future<Output = Result<ObserverRootOutcomeRead, E>> + Send,
+    Read: Future<Output = Result<ManagedRootEventRead, E>> + Send,
 {
     let mut ack_delay = FIRST_ACK_RECHECK;
+    let mut signal_closed = false;
     loop {
         match read().await? {
-            ObserverRootOutcomeRead::Next(outcome) => return Ok(Some(outcome)),
-            ObserverRootOutcomeRead::PendingSource => {
+            ManagedRootEventRead::Next(outcome) => return Ok(Some(outcome)),
+            ManagedRootEventRead::PendingSource => {
                 tokio::time::sleep(ack_delay).await;
                 ack_delay = (ack_delay * 2).min(MAX_ACK_RECHECK);
             }
-            ObserverRootOutcomeRead::CaughtUp | ObserverRootOutcomeRead::LegacySnapshot => {
-                let Some(signal) = signal.take() else {
+            ManagedRootEventRead::CaughtUp => {
+                if signal_closed {
+                    return Ok(None);
+                }
+                let Some(signals) = signals.as_mut() else {
                     return Ok(None);
                 };
-                signal.await;
+                signal_closed = matches!(signals.next_hint().await, ManagedRunHint::Finalized);
             }
         }
     }
@@ -78,6 +94,15 @@ async fn prefer_verified_outcome<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Finalization;
+
+    #[async_trait]
+    impl ManagedRunSignals for Finalization {
+        async fn next_hint(&mut self) -> ManagedRunHint {
+            ManagedRunHint::Finalized
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn finalization_wakes_early_and_absent_signal_times_out() {
@@ -125,27 +150,27 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_pending_ack_is_rechecked_without_another_run_signal() {
-        let expected = ObserverSupervisedRootOutcome {
+        let expected = ManagedRootEvent::Outcome(bamboo_domain::ObserverSupervisedRootOutcome {
             target_session_id: "root".into(),
             target_created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
             sequence: 1,
             run_id: "exact-run".into(),
             status: bamboo_domain::SupervisedRootOutcomeResult::Completed,
             inputs: vec![],
-        };
+        });
         let start = tokio::time::Instant::now();
         let mut reads = 0;
         let selected = read_when_verified(
             || {
                 reads += 1;
                 let state = if reads == 1 {
-                    ObserverRootOutcomeRead::PendingSource
+                    ManagedRootEventRead::PendingSource
                 } else {
-                    ObserverRootOutcomeRead::Next(expected.clone())
+                    ManagedRootEventRead::Next(expected.clone())
                 };
                 std::future::ready(Ok::<_, ()>(state))
             },
-            None::<std::future::Pending<()>>,
+            None::<Finalization>,
         )
         .await;
         assert_eq!(selected, Ok(Some(expected)));
