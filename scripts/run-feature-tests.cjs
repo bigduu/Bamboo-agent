@@ -144,7 +144,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2534 adds patrol endpoint configuration and the Ready Host adapter.
 // The existing config and server-app-state owners cover those regressions.
 // #2547 extends the same Model Policy and server-app-state test owners.
-const FEATURE_SOURCE_SHA256 = "8d7f793e5bba92ec8740d293344ff4629a12c4c40051c4a024723ba3b53bf074";
+// #2582 changes the complete V2 writer source covered by its existing
+// test-utils fingerprint. Presentation-metadata regressions remain ordinary
+// storage/packages-0 and metadata-service/server-other cases. No feature
+// declaration, module gate, additive context or selected additive case changes;
+// the existing four contexts still own the same twenty feature-only cases.
+const FEATURE_SOURCE_SHA256 = "6c787f8e8c2c80dd2da0ae43d205f9b9d0b4bdd1d5454361ffa67f0e89fa4356";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
