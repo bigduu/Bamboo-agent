@@ -273,27 +273,33 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
                 .configure(bamboo_server::configure_routes),
         )
         .await;
-        let pa = state.project_store.create("Project A", None).unwrap();
+        let pa = state
+            .project_store
+            .create_with_project_path("Project A", None, &wa.repo, Vec::new())
+            .unwrap();
         let pa = state
             .project_store
             .bind_workspace(
                 &pa.id,
                 pa.revision,
                 WorkspaceBinding {
-                    path: wa.repo.clone(),
+                    path: wa.worktree.clone(),
                     label: None,
                     git_common_dir: None,
                 },
             )
             .unwrap();
-        let pb = state.project_store.create("Project B", None).unwrap();
+        let pb = state
+            .project_store
+            .create_with_project_path("Project B", None, &wb.repo, Vec::new())
+            .unwrap();
         let pb = state
             .project_store
             .bind_workspace(
                 &pb.id,
                 pb.revision,
                 WorkspaceBinding {
-                    path: wb.repo.clone(),
+                    path: wb.worktree.clone(),
                     label: None,
                     git_common_dir: None,
                 },
