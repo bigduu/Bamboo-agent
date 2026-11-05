@@ -72,8 +72,11 @@ pub async fn create_ticket_child_action(
             "Ticket child requires fresh one-shot, exact Supervisor and explicit dispatch".into(),
         ));
     }
-    input.assignment_prompt =
-        serde_json::to_string(&packet).map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    // Required human text keeps its per-line and aggregate bounds. Preserve
+    // the complete Host packet without making all of its fields one line.
+    let packet_text = serde_json::to_string_pretty(&packet)
+        .map_err(|e| ChildSessionError::Execution(e.to_string()))?;
+    input.assignment_prompt = packet_text.clone();
     input.runtime_metadata.insert(
         crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY.into(),
         assignment_id.into(),
@@ -93,8 +96,7 @@ pub async fn create_ticket_child_action(
             "Do not change the Work contract, Supervisor TaskList or any sibling plan".into(),
         ],
         necessary_user_instructions: Vec::new(),
-        recorded_decisions: vec![serde_json::to_string(&packet)
-            .map_err(|e| ChildSessionError::Execution(e.to_string()))?],
+        recorded_decisions: vec![packet_text],
         source_user_message_ids: Vec::new(),
         background_message_ids: Vec::new(),
     };
