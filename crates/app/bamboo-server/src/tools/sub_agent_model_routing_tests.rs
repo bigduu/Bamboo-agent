@@ -77,6 +77,48 @@ fn create_args(harness: &TestHarness) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn routing_contract_compact_model_catalog_is_read_only_and_uses_runtime_admission() {
+    let harness = routing_harness(None).await;
+    let tool = SubAgentTool::new(harness.adapter.clone(), harness.adapter.clone())
+        .with_model_catalog(Arc::new(
+            crate::tools::model_catalog::RegistryModelCatalog::new(routing_registry()),
+        ));
+    let before = harness
+        .adapter
+        .session_store
+        .list_index_entries()
+        .await
+        .len();
+    let result = invoke_completed(
+        &tool,
+        json!({"intent":"inspect", "message":"models"}),
+        subagent_test_ctx(&harness.parent_session_id, "compact-model-catalog"),
+    )
+    .await
+    .unwrap();
+    let observed: serde_json::Value = serde_json::from_str(&result.result).unwrap();
+    assert_eq!(observed["default_provider"], "chat-a");
+    assert_eq!(
+        observed["providers"],
+        json!([
+            {"provider":"chat-a", "models":["explicit-child", "gpt-5"], "has_listing_error":false},
+            {"provider":"child-c", "models":["child-model"], "has_listing_error":false},
+            {"provider":"fast-b", "models":["cheap-b"], "has_listing_error":false}
+        ])
+    );
+    assert_eq!(
+        harness
+            .adapter
+            .session_store
+            .list_index_entries()
+            .await
+            .len(),
+        before
+    );
+    assert!(harness.agent_runners.read().await.is_empty());
+}
+
+#[tokio::test]
 async fn routing_contract_subagent_and_plan_reject_explicit_bad_roles_before_persist_or_launch() {
     for flag in [None, Some(false), Some(true)] {
         for bad in ["unknown", "disabled", "unadmitted"] {

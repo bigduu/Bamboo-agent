@@ -1,4 +1,4 @@
-//! A title commit advances existing observations, never Actor authority.
+//! Title and pinned commits advance existing observations, never Actor authority.
 //! All reads/preflight and publication use the caller's existing Root tree
 //! writer scope. No descendant Session lock, ensure_actor, marker or repair.
 
@@ -25,23 +25,38 @@ fn value(session: &Session) -> io::Result<serde_json::Value> {
 }
 
 /// A complete canonical comparison, not a metadata-version permission grant.
-fn validate_manual_title_change(previous: &Session, incoming: &Session) -> io::Result<()> {
+fn validate_presentation_change(
+    previous: &Session,
+    incoming: &Session,
+    mutation: SessionPresentationMutation,
+) -> io::Result<()> {
     let mut comparison = incoming.clone();
-    comparison.title = previous.title.clone();
-    comparison.title_generated = previous.title_generated;
-    comparison.title_version = previous.title_version;
+    match mutation {
+        SessionPresentationMutation::Title => {
+            comparison.title = previous.title.clone();
+            comparison.title_generated = previous.title_generated;
+            comparison.title_version = previous.title_version;
+            if previous.title_version.checked_add(1) != Some(incoming.title_version) {
+                return Err(conflict("title commit requires exactly one title revision"));
+            }
+        }
+        SessionPresentationMutation::Pinned => {
+            comparison.pinned = previous.pinned;
+            if previous.pinned == incoming.pinned {
+                return Err(conflict("pinned commit requires a changed pinned value"));
+            }
+        }
+    }
     comparison.metadata_version = previous.metadata_version;
     comparison.updated_at = previous.updated_at;
     if value(previous)? != value(&comparison)? {
         return Err(conflict(
-            "canonical non-title Session fields changed before title commit",
+            "canonical non-presentation Session fields changed before metadata commit",
         ));
     }
-    if previous.title_version.checked_add(1) != Some(incoming.title_version)
-        || previous.metadata_version.checked_add(1) != Some(incoming.metadata_version)
-    {
+    if previous.metadata_version.checked_add(1) != Some(incoming.metadata_version) {
         return Err(conflict(
-            "manual title commit requires exactly one metadata revision",
+            "presentation commit requires exactly one metadata revision",
         ));
     }
     Ok(())
@@ -192,15 +207,16 @@ impl SessionStoreV2 {
         Ok(rows)
     }
 
-    pub(super) async fn prepare_title_observations(
+    pub(super) async fn prepare_presentation_observations(
         &self,
         incoming: &mut Session,
+        mutation: SessionPresentationMutation,
     ) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
         let previous = self.title_canonical_session(incoming).await?;
         if !self.ordinary_title_tree(&previous).await? {
             return Ok(Vec::new());
         }
-        validate_manual_title_change(&previous, incoming)?;
+        validate_presentation_change(&previous, incoming, mutation)?;
         let mut writes = Vec::new();
         // Validate the complete initialized set before serializing any write.
         for (path, mut row) in self
@@ -209,9 +225,9 @@ impl SessionStoreV2 {
         {
             let mut changed = false;
             if row.actor.actor_id == previous.id {
-                // The whole title-only change and complete current Actor set
+                // The whole presentation-only change and current Actor set
                 // were validated above, under the same physical tree guards.
-                Self::advance_root_title_observation(&previous, incoming, &row)?;
+                Self::advance_root_presentation_observation(&previous, incoming, &row)?;
                 row.actor.observed_metadata_version = incoming.metadata_version;
                 changed = true;
             }

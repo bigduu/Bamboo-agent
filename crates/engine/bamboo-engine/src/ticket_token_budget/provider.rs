@@ -193,7 +193,8 @@ impl BudgetedProvider {
             .map_err(denied)?
             .1
             .execution_budget
-            .is_none()
+            .as_ref()
+            .is_none_or(|budget| budget.limits.is_none())
         {
             return Ok(None);
         }

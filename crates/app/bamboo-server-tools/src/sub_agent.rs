@@ -1396,7 +1396,7 @@ impl SubAgentTool {
                     None => None,
                 };
 
-                let (child_session_id, child_model, reused, child_reasoning_effort, should_wait) =
+                let (child_session_id, child_model, child_model_ref, reused, child_reasoning_effort, should_wait) =
                     if let Some(existing_id) = existing_resident {
                         // A resident is stable Project identity. A root may
                         // have been explicitly reassigned since this resident
@@ -1612,13 +1612,13 @@ impl SubAgentTool {
                             }
                             requested_wait
                         };
-                        let (model, child_reasoning_effort) = self
+                        let (model, model_ref, child_reasoning_effort) = self
                             .sessions
                             .load_child_for_parent(&parent.id, &existing_id)
                             .await
-                            .map(|child| (child.model, child.reasoning_effort))
+                            .map(|child| (child.model, child.model_ref, child.reasoning_effort))
                             .unwrap_or_default();
-                        (existing_id, model, true, child_reasoning_effort, wait_armed)
+                        (existing_id, model, model_ref, true, child_reasoning_effort, wait_armed)
                     } else {
                         let child_id = Uuid::new_v4().to_string();
                         // Model precedence: explicit `model` arg > per-subagent_type
@@ -1689,7 +1689,7 @@ impl SubAgentTool {
                                 .await
                                 .map_err(tool_error_from_child_session)
                         }?;
-                        {
+                        let (child_model, child_model_ref, child_reasoning_effort) = {
                             let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
                                 .await.map_err(tool_error_from_child_session)?;
                             if let Some(binding) = bamboo_domain::ChildContextBinding::from_session(&child)
@@ -1698,7 +1698,8 @@ impl SubAgentTool {
                                 "background_omitted": binding.payload.background_omitted,
                                 "child_created_at":child.created_at,"assignment_sha256":binding.assignment_sha256}));
                             }
-                        }
+                            (child.model, child.model_ref, child.reasoning_effort)
+                        };
                         // In the synchronous path, make the child visible to
                         // completion reconciliation before it can be launched.
                         self.sessions.ensure_child_indexed(&result.child_session_id).await;
@@ -1722,9 +1723,10 @@ impl SubAgentTool {
                         }
                         (
                             result.child_session_id,
-                            result.model,
+                            child_model,
+                            child_model_ref,
                             false,
-                            effective_reasoning_effort,
+                            child_reasoning_effort,
                             requested_wait,
                         )
                     };
@@ -1767,6 +1769,7 @@ impl SubAgentTool {
                     "child_session_id": child_session_id,
                     "parent_session_id": parent_session_id,
                     "model": child_model,
+                    "model_ref": child_model_ref,
                     "reasoning_effort": child_reasoning_effort.map(|effort| effort.as_str()),
                     "status": status,
                     "lifecycle": resident_name.as_ref().map(|_| "resident"),

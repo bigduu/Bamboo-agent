@@ -144,7 +144,25 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2534 adds patrol endpoint configuration and the Ready Host adapter.
 // The existing config and server-app-state owners cover those regressions.
 // #2547 extends the same Model Policy and server-app-state test owners.
-const FEATURE_SOURCE_SHA256 = "8d7f793e5bba92ec8740d293344ff4629a12c4c40051c4a024723ba3b53bf074";
+// #2513 changes the final-request checkpoint reprepare path in engine
+// stream_execution/image_fallback so a bookkeeping-only checkpoint no longer
+// repeats the paid Legacy Vision description. Its regression cases are ordinary
+// default bamboo-engine library tests in packages-3; stream_execution/tests.rs
+// carries no feature cfg expression and is not feature-sensitive at all. Only
+// stream_execution.rs is fingerprinted, through its pre-existing
+// `cfg!(feature = "token-usage-log")` observation line, and its whole-file
+// source hash moves with the new helper. No feature declaration, cfg
+// expression, required-features target, owner, additive context or explicit
+// case changes; engine tests are not part of any additive feature owner.
+// #2583 adds compact model catalog and canonical Child selection observations
+// to the existing default Engine, Server Tools and Server owners. No feature
+// declaration, additive context or explicitly selected case changes.
+// #2582 changes the complete V2 writer source covered by its existing
+// test-utils fingerprint. Presentation-metadata regressions remain ordinary
+// storage/packages-0 and metadata-service/server-other cases. No feature
+// declaration, module gate, additive context or selected additive case changes;
+// the existing four contexts still own the same twenty feature-only cases.
+const FEATURE_SOURCE_SHA256 = "05a44d1ecc06833e69d1c08746e3fe2580c55f0a7d8a37c6f636ce5f9c047b30";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

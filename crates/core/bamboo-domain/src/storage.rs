@@ -163,6 +163,14 @@ pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sy
 pub type RootActorRuntimeEventPublisher =
     Box<dyn FnOnce(&dyn Fn() -> std::io::Result<()>) -> std::io::Result<()> + Send>;
 
+/// Explicit presentation-only intent. This is not authority to change other
+/// Session fields or to refresh an already-stale Actor observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionPresentationMutation {
+    Title,
+    Pinned,
+}
+
 /// Trait for session storage backends.
 ///
 /// Provides an abstract interface for persisting and retrieving session data.
@@ -170,6 +178,35 @@ pub type RootActorRuntimeEventPublisher =
 /// (e.g., JSONL files, databases, cloud storage).
 #[async_trait::async_trait]
 pub trait Storage: Send + Sync {
+    /// Commit one title (manual, automatic or fallback) or pinned mutation.
+    /// Actor-aware backends compare the complete candidate with canonical
+    /// state under their writer guards, require exact revision advances, and
+    /// propagate only already-current observations. Return the exact committed
+    /// snapshot, including backend-owned bookkeeping.
+    async fn save_presentation_metadata_committed(
+        &self,
+        session: &Session,
+        mutation: SessionPresentationMutation,
+    ) -> std::io::Result<Session> {
+        match mutation {
+            SessionPresentationMutation::Title => self.save_manual_title_committed(session).await,
+            SessionPresentationMutation::Pinned => {
+                self.save_session(session).await?;
+                Ok(session.clone())
+            }
+        }
+    }
+
+    /// Confirm committed presentation metadata, including a no-op. The legacy
+    /// title port already validates the complete canonical Session and Actor
+    /// observations, so existing adapters retain their validation behavior.
+    async fn validate_presentation_metadata_observations(
+        &self,
+        expected: &Session,
+    ) -> std::io::Result<()> {
+        self.validate_title_observations(expected).await
+    }
+
     /// Persist an explicit manual-title mutation. Actor-aware backends must
     /// compare it with current canonical state under the full writer guards,
     /// allowing only the title fields and exact version advances. Generic

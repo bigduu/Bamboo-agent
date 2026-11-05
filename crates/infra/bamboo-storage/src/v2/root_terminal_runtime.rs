@@ -150,9 +150,9 @@ fn finish_status(finish: ActorActivationFinish) -> ActorActivationStatus {
     }
 }
 impl SessionStoreV2 {
-    /// Only the existing, fully validated manual-title transaction calls this.
+    /// Only the fully validated title/pinned transaction calls this.
     /// Advance a matching observation; never create one or change its fence.
-    pub(in crate::v2) fn advance_root_title_observation(
+    pub(in crate::v2) fn advance_root_presentation_observation(
         previous: &Session,
         incoming: &mut Session,
         entry: &ActorDirectoryEntry,

@@ -25,6 +25,7 @@ pub(super) async fn apply_image_fallback_to_llm_messages(
     llm: Option<&Arc<dyn LLMProvider>>,
     failure_policy: VisionFailurePolicy,
     focus: Option<&str>,
+    reuse: Option<&super::VisionDescriptionReuse>,
 ) -> std::result::Result<(), AgentError> {
     #[cfg(not(windows))]
     let _ = attachment_reader;
@@ -58,6 +59,7 @@ pub(super) async fn apply_image_fallback_to_llm_messages(
             llm,
             failure_policy,
             focus,
+            reuse,
         )
         .await?;
     }
@@ -80,6 +82,7 @@ async fn apply_fallback_to_message(
     llm: Option<&Arc<dyn LLMProvider>>,
     failure_policy: VisionFailurePolicy,
     focus: Option<&str>,
+    reuse: Option<&super::VisionDescriptionReuse>,
 ) -> std::result::Result<(), AgentError> {
     #[cfg(not(windows))]
     let _ = attachment_reader;
@@ -126,7 +129,9 @@ async fn apply_fallback_to_message(
                 .filter(|model| !model.is_empty())
                 .ok_or_else(|| AgentError::LLM(super::VISION_CONFIGURATION_ERROR.into()))?;
 
-            let rewritten = rewrite_parts_via_vision(llm, vision_model, parts, failure_policy, focus).await?;
+            let rewritten =
+                rewrite_parts_via_vision(llm, vision_model, parts, failure_policy, focus, reuse)
+                    .await?;
             message.content = rewritten;
             message.content_parts = None;
             Ok(())
@@ -142,6 +147,7 @@ async fn rewrite_parts_via_vision(
     parts: &[MessagePart],
     failure_policy: VisionFailurePolicy,
     focus: Option<&str>,
+    reuse: Option<&super::VisionDescriptionReuse>,
 ) -> std::result::Result<String, AgentError> {
     let mut out = String::new();
     let mut image_index = 0usize;
@@ -169,14 +175,35 @@ async fn rewrite_parts_via_vision(
                         }.into(),
                     ]),
                 ];
-                let description = match tokio::time::timeout(
-                    super::VISION_TIMEOUT,
-                    describe_image_via_llm(llm, vision_model, &vision_messages),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(super::VISION_TIMEOUT_MESSAGE.into()),
+                // A description already prepared for this exact image, target and
+                // focus within this request is reused instead of paying for a
+                // second nondeterministic call. Only a genuinely new source asks
+                // the Vision model.
+                let reuse_key = super::VisionDescriptionKey {
+                    vision_model: vision_model.to_string(),
+                    image_url: image_url.url.clone(),
+                    detail: image_url.detail.clone(),
+                    focus: focus
+                        .filter(|focus| !focus.trim().is_empty())
+                        .map(str::to_string),
+                };
+                let description = match reuse.and_then(|reuse| reuse.get(&reuse_key)) {
+                    Some(description) => Ok(description),
+                    None => {
+                        let fresh = match tokio::time::timeout(
+                            super::VISION_TIMEOUT,
+                            describe_image_via_llm(llm, vision_model, &vision_messages),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(super::VISION_TIMEOUT_MESSAGE.into()),
+                        };
+                        if let (Ok(description), Some(reuse)) = (fresh.as_ref(), reuse) {
+                            reuse.insert(reuse_key, description.clone());
+                        }
+                        fresh
+                    }
                 };
                 let description = match description {
                     Ok(description) => description,

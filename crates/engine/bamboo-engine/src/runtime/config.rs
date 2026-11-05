@@ -1059,6 +1059,14 @@ pub struct AgentLoopConfig {
     /// Explicit legacy conversation conversion has a separate target port.
     pub(crate) legacy_vision_model_resolver:
         Option<super::runner::image_fallback::LegacyVisionModelResolver>,
+    /// Descriptions already prepared for this round's retained images.
+    ///
+    /// Request-scoped only: it never persists, never crosses rounds, and is
+    /// cleared whenever provider-relevant source state changes. A final-request
+    /// checkpoint that changes nothing the provider is asked must not pay for the
+    /// same nondeterministic Legacy Vision description again.
+    pub(crate) vision_description_reuse:
+        std::sync::Arc<super::runner::image_fallback::VisionDescriptionReuse>,
     /// Feature flags controlling prompt-time memory injection behavior.
     pub(crate) prompt_memory_flags: PromptMemoryFlags,
     /// Maximum tool calls allowed per round (default: 80).
@@ -1220,6 +1228,7 @@ impl Default for AgentLoopConfig {
             image_fallback: None,
             vision_model_resolver: None,
             legacy_vision_model_resolver: None,
+            vision_description_reuse: Default::default(),
             prompt_memory_flags: PromptMemoryFlags::default(),
             max_tool_calls_per_round: 80,
             max_consecutive_failures_per_tool: 3,

@@ -1,5 +1,7 @@
 //! Owner budget HTTP over the actual FileStore/Inbox/native Host.
 use super::*;
+#[path = "accounting_only.rs"]
+mod accounting_only;
 use actix_web::http::Method;
 use bamboo_server::AppState;
 use bamboo_tickets::{ExecutionTokenUsage, ExecutionWorkspace, TicketService};
@@ -61,6 +63,10 @@ struct Fixture {
 
 impl Fixture {
     async fn new(metered: bool) -> Self {
+        Self::with_objective(metered, "Native Task with explicit finite owner limits").await
+    }
+
+    async fn with_objective(metered: bool, objective: &str) -> Self {
         let home = tempfile::tempdir().unwrap();
         let root = home.path().canonicalize().unwrap();
         // A pre-existing empty canonical Supervisor requires explicit Ticket init.
@@ -126,7 +132,7 @@ impl Fixture {
         let (service, authority) = state.tickets.authority(owner()).await.unwrap();
         let contract = Contract {
             title: "HTTP budget Work".into(),
-            objective: "Native Task with explicit finite owner limits".into(),
+            objective: objective.into(),
             constraints: vec![],
             acceptance: vec!["Exact owner review".into()],
             user_acceptance_required: true,
@@ -396,12 +402,19 @@ async fn budget_owner_http_replay_conflict_capacity_and_auth_never_call_a_model(
 
 #[actix_web::test]
 async fn budget_owner_http_funds_real_ready_worker_known_usage_and_exact_user_acceptance() {
-    let mut fixture = Fixture::new(true).await;
+    let objective =
+        "Review the accepted source; cite exact lines and preserve evidence boundaries. ".repeat(9);
+    assert!(objective.len() < 2048);
+    let mut fixture = Fixture::with_objective(true, &objective).await;
     let setup = fixture.setup(CAP + 1000).await;
     let (code, receipt) = http(&fixture.state, Method::PUT, URI, Some(&setup)).await;
     assert_eq!(code, StatusCode::OK, "{receipt}");
     fixture.policy().await;
     let first = fixture.next().await;
+    assert!(first
+        .messages
+        .iter()
+        .any(|message| message.content.contains(&objective)));
     let (_, status) = http(&fixture.state, Method::GET, URI, None).await;
     assert_eq!(status["accounting"]["total_charged"], CAP);
     assert_eq!(status["accounting"]["reservations"]["pending_usage"], 1);
