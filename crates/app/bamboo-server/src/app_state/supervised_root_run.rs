@@ -4,16 +4,17 @@
 //! blocking job retains the Router owner. The runner table is only tried while
 //! those fences are held, so no async wait or lock-order inversion is added.
 
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, future::Future, io, sync::Arc};
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
 use bamboo_domain::{
-    AdmissionCommit, AdmissionGate, SessionActivationPort, SessionAuthorityIdentity,
-    SessionCallerReference, SupervisorCurrentUserTarget, SupervisorReference,
+    AdmissionCommit, AdmissionGate, ObserverSupervisedRootOutcome, SessionActivationPort,
+    SessionAuthorityIdentity, SessionCallerReference, SupervisorCurrentUserTarget,
+    SupervisorReference,
 };
-use bamboo_server_tools::session_control::root_run::SupervisedRootRunPort;
-use bamboo_storage::SessionStoreV2;
+use bamboo_server_tools::session_control::root_run::{ManagedOutcomeTarget, SupervisedRootRunPort};
+use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -21,6 +22,7 @@ use super::{fresh_sync::FreshSyncRegistry, live_retry::LiveRetryBridge, AgentRun
 
 pub(super) struct SupervisedRootRunController {
     pub(super) store: Arc<SessionStoreV2>,
+    pub(super) inbox: Arc<FileSessionInbox>,
     pub(super) router: Arc<bamboo_engine::SessionActivationRouter>,
     pub(super) runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(super) live_retry: Arc<LiveRetryBridge>,
@@ -218,6 +220,41 @@ fn run_control(
 }
 
 impl SupervisedRootRunController {
+    async fn read_outcome(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &ManagedOutcomeTarget,
+    ) -> Result<Option<ObserverSupervisedRootOutcome>, ToolError> {
+        self.inbox
+            .read_managed_root_outcome(
+                caller,
+                supervisor,
+                &target.target_ref,
+                &target.expected_run_id,
+                target.after_sequence,
+            )
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "Managed Root outcome evidence unavailable");
+                ToolError::Execution("managed_root_outcome_evidence_unavailable".into())
+            })
+    }
+
+    async fn outcome_after_signal(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &ManagedOutcomeTarget,
+        signal: Option<impl Future<Output = ()>>,
+    ) -> Result<Option<ObserverSupervisedRootOutcome>, ToolError> {
+        let Some(signal) = signal else {
+            return Ok(None);
+        };
+        signal.await;
+        self.read_outcome(caller, supervisor, target).await
+    }
+
     async fn control(
         &self,
         caller: &SessionCallerReference,
@@ -314,6 +351,49 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
             })
             .to_string(),
         ))
+    }
+
+    async fn wait_outcomes(
+        &self,
+        caller: &SessionCallerReference,
+        targets: &[ManagedOutcomeTarget; 2],
+    ) -> Result<ToolResult, ToolError> {
+        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
+        else {
+            return Err(ToolError::Execution("original Supervisor required".into()));
+        };
+        let supervisor = SupervisorReference {
+            session_id: caller.session_id.clone(),
+            incarnation_id: *incarnation_id,
+        };
+        // Subscribe before inspecting Main to cover completion during the read.
+        // A signal is only a hint. The read revalidates the exact authority and ACK.
+        let [first_signal, second_signal] = {
+            let runners = self.runners.read().await;
+            targets.each_ref().map(|target| {
+                runners
+                    .get(&target.target_ref.session_id)
+                    .filter(|runner| runner.run_id == target.expected_run_id)
+                    .map(AgentRunner::wait_for_exact_finalization)
+            })
+        };
+        let [first, second] = targets;
+        let outcome = bamboo_orchestration::managed_session::wait_for_outcome(
+            async {
+                tokio::try_join!(
+                    self.read_outcome(caller, &supervisor, first),
+                    self.read_outcome(caller, &supervisor, second),
+                )
+            },
+            self.outcome_after_signal(caller, &supervisor, first, first_signal),
+            self.outcome_after_signal(caller, &supervisor, second, second_signal),
+        )
+        .await?;
+        let response = match outcome {
+            Some(outcome) => json!({"status":"recorded_outcome", "outcome":outcome}),
+            None => json!({"status":"outcome_unknown"}),
+        };
+        Ok(ToolResult::text(true, response.to_string()))
     }
 
     async fn cancel_run(
