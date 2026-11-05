@@ -35,6 +35,14 @@ fn grant_cancel(fixture: &Fixture) {
 }
 
 async fn invoke(fixture: &Fixture, arguments: Value) -> Result<Value, ToolError> {
+    invoke_in_mode(fixture, arguments, false).await
+}
+
+async fn invoke_in_mode(
+    fixture: &Fixture,
+    arguments: Value,
+    plan_read_only: bool,
+) -> Result<Value, ToolError> {
     let supervisor = fixture
         .state
         .storage
@@ -51,6 +59,7 @@ async fn invoke(fixture: &Fixture, arguments: Value) -> Result<Value, ToolError>
         },
     };
     let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.plan_read_only = plan_read_only;
     ctx.session_id = Some(&supervisor.id);
     ctx.root_session_id = Some(&supervisor.id);
     ctx = ctx.with_executing_supervisor(
@@ -111,7 +120,7 @@ async fn supervisor_wait_wakes_only_after_the_observed_run_finalizes() {
             .unwrap()["run_id"],
         run_id
     );
-    let mut waiter = Box::pin(invoke(&fixture, wait));
+    let mut waiter = Box::pin(invoke_in_mode(&fixture, wait, true));
     assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter)
         .await
         .is_err());
