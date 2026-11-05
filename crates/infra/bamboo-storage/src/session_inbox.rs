@@ -992,18 +992,21 @@ impl FileSessionInbox {
         }))
     }
 
-    /// Read one exact Root outcome under the original Supervisor's authority.
-    /// Main and an owned input ACK are required. This neither delivers an
+    /// Read one exact Root event under the original Supervisor's authority.
+    /// Canonical evidence and an owned input ACK are required. This neither delivers an
     /// Inbox message nor consumes the caller's evidence cursor.
-    pub async fn read_managed_root_outcome(
+    pub async fn read_managed_root_event(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
         supervisor: &bamboo_domain::SupervisorReference,
         target: &bamboo_domain::SupervisorCurrentUserTarget,
         run_id: &str,
         after_sequence: u64,
-    ) -> Result<bamboo_domain::ObserverRootOutcomeRead, SessionInboxError> {
-        use bamboo_domain::ObserverRootOutcomeRead as Read;
+        after_blocker_cursor: Option<u64>,
+    ) -> Result<bamboo_domain::ManagedRootEventRead, SessionInboxError> {
+        use bamboo_domain::{
+            ManagedRootBlockerEvidence, ManagedRootEvent, ManagedRootEventRead as Read,
+        };
         let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
         let authority = Arc::new(
             self.sessions
@@ -1044,11 +1047,26 @@ impl FileSessionInbox {
         {
             return Ok(Read::CaughtUp);
         }
-        let Some(result) = fact.result.as_ref().filter(|result| {
+        let result = fact.result.as_ref().filter(|result| {
             **result != bamboo_domain::SupervisedRootOutcomeResult::InterruptedUnknown
-        }) else {
+        });
+        let blocker = after_blocker_cursor.and_then(|cursor| {
+            let blocker = root
+                .runtime_metadata
+                .as_ref()?
+                .managed_task_blocker
+                .as_ref()?;
+            let version = root.task_list_version_meta()?.parse::<u64>().ok()?;
+            (blocker.run_id == run_id
+                && blocker.cursor > cursor
+                && root.task_list.as_ref().is_some_and(|tasks| {
+                    tasks.session_id == root.id && blocker.matches_revision(version, tasks)
+                }))
+            .then_some(blocker)
+        });
+        if result.is_none() && blocker.is_none() {
             return Ok(Read::CaughtUp);
-        };
+        }
         let guarded = GuardedSupervisorRoot::from_sessions(&authority.source, &authority.target)
             .ok_or_else(|| invalid("Root outcome authority is not canonical"))?;
         let inputs: Vec<_> = fact
@@ -1096,14 +1114,27 @@ impl FileSessionInbox {
                 .await
             {
                 Ok(input) => {
-                    return Ok(Read::Next(bamboo_domain::ObserverSupervisedRootOutcome {
-                        target_session_id: root.id.clone(),
-                        target_created_at: root.created_at,
-                        sequence: fact.sequence,
-                        run_id: fact.run_id.clone(),
-                        status: result.clone(),
-                        inputs: vec![input],
-                    }))
+                    let event = if let Some(result) = result {
+                        ManagedRootEvent::Outcome(bamboo_domain::ObserverSupervisedRootOutcome {
+                            target_session_id: root.id.clone(),
+                            target_created_at: root.created_at,
+                            sequence: fact.sequence,
+                            run_id: fact.run_id.clone(),
+                            status: result.clone(),
+                            inputs: vec![input],
+                        })
+                    } else {
+                        let blocker = blocker.expect("filtered blocker");
+                        ManagedRootEvent::Blocker(ManagedRootBlockerEvidence {
+                            target_session_id: root.id.clone(),
+                            target_created_at: root.created_at,
+                            run_id: fact.run_id.clone(),
+                            cursor: blocker.cursor,
+                            task_version: blocker.task_version,
+                            task_id: blocker.task_id.clone(),
+                        })
+                    };
+                    return Ok(Read::Next(event));
                 }
                 Err(error) => {
                     invalid_ack.get_or_insert(error);

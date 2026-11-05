@@ -4,19 +4,25 @@
 //! blocking job retains the Router owner. The runner table is only tried while
 //! those fences are held, so no async wait or lock-order inversion is added.
 
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, future::Future, io, sync::Arc};
 
 use async_trait::async_trait;
-use bamboo_agent_core::tools::{ToolError, ToolResult};
+use bamboo_agent_core::{
+    tools::{ToolError, ToolResult},
+    AgentEvent,
+};
 use bamboo_domain::{
-    AdmissionCommit, AdmissionGate, ObserverRootOutcomeRead, SessionActivationPort,
+    AdmissionCommit, AdmissionGate, ManagedRootEvent, ManagedRootEventRead, SessionActivationPort,
     SessionAuthorityIdentity, SessionCallerReference, SupervisorCurrentUserTarget,
     SupervisorReference,
+};
+use bamboo_orchestration::managed_session::{
+    read_when_verified, wait_for_outcome, ManagedRunHint, ManagedRunSignals,
 };
 use bamboo_server_tools::session_control::root_run::{ManagedOutcomeTarget, SupervisedRootRunPort};
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 use super::{fresh_sync::FreshSyncRegistry, live_retry::LiveRetryBridge, AgentRunner, AgentStatus};
 
@@ -219,20 +225,51 @@ fn run_control(
     }
 }
 
+struct RootRunSignals<F> {
+    finalized: F,
+    task_events: Option<broadcast::Receiver<AgentEvent>>,
+}
+
+#[async_trait]
+impl<F: Future<Output = ()> + Unpin + Send> ManagedRunSignals for RootRunSignals<F> {
+    async fn next_hint(&mut self) -> ManagedRunHint {
+        let Some(task_events) = self.task_events.as_mut() else {
+            (&mut self.finalized).await;
+            return ManagedRunHint::Finalized;
+        };
+        loop {
+            tokio::select! {
+                () = &mut self.finalized => return ManagedRunHint::Finalized,
+                event = task_events.recv() => match event {
+                    Ok(AgentEvent::TaskListUpdated { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        return ManagedRunHint::TaskChanged;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        (&mut self.finalized).await;
+                        return ManagedRunHint::Finalized;
+                    }
+                    Ok(_) => {}
+                },
+            }
+        }
+    }
+}
+
 impl SupervisedRootRunController {
-    async fn read_outcome(
+    async fn read_event(
         &self,
         caller: &SessionCallerReference,
         supervisor: &SupervisorReference,
         target: &ManagedOutcomeTarget,
-    ) -> Result<ObserverRootOutcomeRead, ToolError> {
+    ) -> Result<ManagedRootEventRead, ToolError> {
         self.inbox
-            .read_managed_root_outcome(
+            .read_managed_root_event(
                 caller,
                 supervisor,
                 &target.target_ref,
                 &target.expected_run_id,
                 target.after_sequence,
+                target.after_blocker_cursor,
             )
             .await
             .map_err(|error| {
@@ -354,30 +391,39 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         };
         // Subscribe before inspecting Main to cover completion during the read.
         // A signal is only a hint. The read revalidates the exact authority and ACK.
-        let [first_signal, second_signal] = {
+        let [first_signals, second_signals] = {
             let runners = self.runners.read().await;
             targets.each_ref().map(|target| {
                 runners
                     .get(&target.target_ref.session_id)
                     .filter(|runner| runner.run_id == target.expected_run_id)
-                    .map(AgentRunner::wait_for_exact_finalization)
+                    .map(|runner| RootRunSignals {
+                        finalized: Box::pin(runner.wait_for_exact_finalization()),
+                        task_events: target
+                            .after_blocker_cursor
+                            .map(|_| runner.event_sender.subscribe()),
+                    })
             })
         };
         let [first, second] = targets;
-        use bamboo_orchestration::managed_session::{read_when_verified, wait_for_outcome};
         let outcome = wait_for_outcome(
             read_when_verified(
-                || self.read_outcome(caller, &supervisor, first),
-                first_signal,
+                || self.read_event(caller, &supervisor, first),
+                first_signals,
             ),
             read_when_verified(
-                || self.read_outcome(caller, &supervisor, second),
-                second_signal,
+                || self.read_event(caller, &supervisor, second),
+                second_signals,
             ),
         )
         .await?;
         let response = match outcome {
-            Some(outcome) => json!({"status":"recorded_outcome", "outcome":outcome}),
+            Some(ManagedRootEvent::Outcome(outcome)) => {
+                json!({"status":"recorded_outcome", "outcome":outcome})
+            }
+            Some(ManagedRootEvent::Blocker(blocker)) => {
+                json!({"status":"recorded_blocker", "blocker":blocker})
+            }
             None => json!({"status":"outcome_unknown"}),
         };
         Ok(ToolResult::text(true, response.to_string()))
