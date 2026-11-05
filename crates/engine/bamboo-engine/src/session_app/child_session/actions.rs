@@ -830,6 +830,8 @@ pub async fn get_child_action(
         "child_session_id": child.id,
         "title": title,
         "model": model,
+        "model_ref": child.model_ref,
+        "reasoning_effort": child.reasoning_effort,
         "pinned": child.pinned,
         "message_count": child.messages.len(),
         "is_running": port.is_child_running(&child.id).await,

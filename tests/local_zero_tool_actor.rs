@@ -2932,11 +2932,18 @@ async fn message_only_provider(
             let result: Value =
                 serde_json::from_str(results[0]["content"].as_str().unwrap()).unwrap();
             assert_eq!(result["observed_status"], "running_in_background");
-            assert_eq!(result.as_object().unwrap().len(), 2);
+            assert_eq!(result.as_object().unwrap().len(), 5);
             let child_id = result["actor_id"].as_str().unwrap();
             assert!(!child_id.is_empty() && child_id != "plain-root");
             let store = SessionStoreV2::new(probe.data.clone()).await.unwrap();
             let root = store.load_session("plain-root").await.unwrap().unwrap();
+            let selected_child = store.load_session(child_id).await.unwrap().unwrap();
+            assert_eq!(result["model"], json!(selected_child.model));
+            assert_eq!(result["model_ref"], json!(selected_child.model_ref));
+            assert_eq!(
+                result["reasoning_effort"],
+                json!(selected_child.reasoning_effort)
+            );
             let provider_outcomes = message_only_child_outcome(&root).map_or(0, |(message, _)| {
                 body["messages"]
                     .as_array()
@@ -3084,7 +3091,7 @@ fn message_only_root_result(root: &bamboo_domain::Session, completed: bool) -> V
     assert_eq!(results[0].tool_success, Some(true));
     let result: Value = serde_json::from_str(&results[0].content).unwrap();
     assert_eq!(result["observed_status"], "running_in_background");
-    assert_eq!(result.as_object().unwrap().len(), 2);
+    assert_eq!(result.as_object().unwrap().len(), 5);
     assert!(result["actor_id"]
         .as_str()
         .is_some_and(|id| !id.is_empty() && id != root.id));
@@ -3394,6 +3401,9 @@ async fn message_only_fixture(
     drop(store);
     let store = SessionStoreV2::new(data.clone()).await.unwrap();
     let before = store.load_session(&id).await.unwrap().unwrap();
+    assert_eq!(result["model"], json!(before.model));
+    assert_eq!(result["model_ref"], json!(before.model_ref));
+    assert_eq!(result["reasoning_effort"], json!(before.reasoning_effort));
     assert_eq!(before.parent_session_id.as_deref(), Some("plain-root"));
     assert_eq!(before.root_session_id, "plain-root");
     assert_eq!(before.spawn_depth, 1);
