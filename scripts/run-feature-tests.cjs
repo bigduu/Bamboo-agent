@@ -144,7 +144,20 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2534 adds patrol endpoint configuration and the Ready Host adapter.
 // The existing config and server-app-state owners cover those regressions.
 // #2547 extends the same Model Policy and server-app-state test owners.
-const FEATURE_SOURCE_SHA256 = "9d2f17137c3300c40f834696cd2696a8542bb860e397a7753a668911b02dedb7";
+// #2513 changes the final-request checkpoint reprepare path in engine
+// stream_execution/image_fallback so a bookkeeping-only checkpoint no longer
+// repeats the paid Legacy Vision description. Its regression cases are ordinary
+// default bamboo-engine library tests in packages-3; stream_execution/tests.rs
+// carries no feature cfg expression and is not feature-sensitive at all. Only
+// stream_execution.rs is fingerprinted, through its pre-existing
+// `cfg!(feature = "token-usage-log")` observation line, and its whole-file
+// source hash moves with the new helper. No feature declaration, cfg
+// expression, required-features target, owner, additive context or explicit
+// case changes; engine tests are not part of any additive feature owner.
+// #2583 adds compact model catalog and canonical Child selection observations
+// to the existing default Engine, Server Tools and Server owners. No feature
+// declaration, additive context or explicitly selected case changes.
+const FEATURE_SOURCE_SHA256 = "243c9f8b7fad3f62598e5a181dfc38ebf74b2d4256e25d83a1b1cbe518163c97";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

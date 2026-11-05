@@ -9,6 +9,8 @@ use bamboo_llm::{LLMProvider, ResolvedModel};
 
 mod attachment_urls;
 pub(crate) use attachment_urls::parse_bamboo_attachment_url;
+mod vision_reuse;
+pub(crate) use vision_reuse::{VisionDescriptionKey, VisionDescriptionReuse};
 mod input_references;
 #[cfg(test)]
 pub(crate) use input_references::conversation_image_reference;
@@ -52,6 +54,19 @@ pub async fn apply_image_fallback_to_llm_messages(
     attachment_reader: Option<&dyn AttachmentReader>,
     llm: Option<&Arc<dyn LLMProvider>>,
 ) -> std::result::Result<(), AgentError> {
+    apply_image_fallback_to_llm_messages_reusing(messages, fallback, attachment_reader, llm, None)
+        .await
+}
+
+/// Legacy conversation conversion that may reuse a description this request
+/// already prepared for the same source.
+pub(crate) async fn apply_image_fallback_to_llm_messages_reusing(
+    messages: &mut [Message],
+    fallback: ImageFallbackConfig,
+    attachment_reader: Option<&dyn AttachmentReader>,
+    llm: Option<&Arc<dyn LLMProvider>>,
+    reuse: Option<&VisionDescriptionReuse>,
+) -> std::result::Result<(), AgentError> {
     if fallback.mode == crate::runtime::config::ImageFallbackMode::Vision {
         bamboo_llm::validate_tool_image_budget(messages.iter()).map_err(AgentError::LLM)?;
     }
@@ -62,6 +77,7 @@ pub async fn apply_image_fallback_to_llm_messages(
         llm,
         rewrite::VisionFailurePolicy::OmitImage,
         None,
+        reuse,
     )
     .await
 }
@@ -85,6 +101,9 @@ async fn apply_strict_image_fallback_to_llm_messages(
             llm,
             rewrite::VisionFailurePolicy::Error,
             focus,
+            // A fresh ViewImage tool result is a new paid request by contract; it
+            // never reuses a conversation-history description.
+            None,
         ),
     )
     .await
