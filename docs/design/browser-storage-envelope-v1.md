@@ -99,8 +99,8 @@ cannot blindly replay the operation. A ready record binds the backing inode and
 volume UUID. After a normal reboot, only that same registered file may be
 reattached; a missing/replaced file is never recreated as an empty account.
 An existing unregistered image is refused rather than silently adopted. A
-crash with an unfinished launch or disk mutation retains its fence; this is
-clean-restart recovery, not an automatic repair of an unconfirmed old writer.
+crash with an unfinished launch or disk mutation retains its fence. Browser
+reopen after Bamboo's death requires the completed-close evidence below.
 Read-only OS inspection rejects an image attached elsewhere, duplicate
 attachments, additional APFS volumes, sparse/segmented backing and wrong quota.
 Existing role directories are validated, not repaired or replaced. Only a
@@ -123,13 +123,20 @@ component compilation and lifecycle tests do not replace that acceptance. No
 test needs production deployment or removal of an old failure fence.
 
 Before spawning a native writer, the account owner now writes and syncs a
-bounded launch UUID fence outside quota. A new process refuses any old active
-fence even after all previous flock descriptors have disappeared. The host
-requires that exact generation and a private, bounded marker. The UUID is
-lifecycle correlation, not authentication or proof of writer exit. Only the
-same lease may clear it after the native close barrier. Normal completion also
-requires the managed process group to be absent; EPERM, live members or an
-unknown group retain quarantine. This does not prove escaped descendants.
+bounded launch UUID fence outside quota. The host requires that exact
+generation and a private marker. When the bounded Mac host completes the
+normal profile checkpoint, browser close, captured-root wait and RPC drain,
+it appends and syncs its managed process group to the same launch marker.
+Bamboo can die before waiting for the host, while the host can still finish
+this close after pipe EOF.
+
+A subsequent shared opener can recover that launch while holding the same
+account and reset locks, after independently confirming that the recorded
+managed group is absent. Legacy active markers, incomplete close records,
+explicit writer quarantine and groups whose exit cannot be confirmed keep
+the fence. Recovery uses the same clean-close boundary as ordinary shutdown.
+An exit record does not prove arbitrary detached descendants have stopped or
+authorize profile reset, erasure or forced unmount.
 
 ## Explicit reset source candidate
 
