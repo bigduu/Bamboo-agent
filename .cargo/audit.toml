@@ -35,4 +35,15 @@ ignore = [
     # Recheck every lock update/new fxhash path, upstream release/advisory change,
     # and before #1537; remove both ignores when an accepted release drops fxhash.
     "RUSTSEC-2025-0057",
+
+    # RUSTSEC-2026-0441 records archived maintenance of pin-utils. The locked
+    # graph reaches pin-utils 0.1.0 only through reqwest-retry 0.9.1's wasm32
+    # dependency wasmtimer 0.4.3. Both are the latest published compatible
+    # releases and retain this path. Reviewed 2026-11-05 (#2578).
+    # https://github.com/RustSec/advisory-db/blob/main/crates/pin-utils/RUSTSEC-2026-0441.md
+    # This ID-wide exception is not dependency-path-enforced. Recheck every
+    # lock update, new pin-utils path, advisory change and before wasm32
+    # delivery. Remove both tracked ignores when an accepted dependency
+    # release replaces pin-utils with maintained pinning primitives.
+    "RUSTSEC-2026-0441",
 ]
