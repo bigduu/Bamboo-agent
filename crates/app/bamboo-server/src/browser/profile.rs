@@ -38,6 +38,17 @@ pub(super) struct Lease {
     _reset_gate: std::fs::File,
 }
 
+impl Drop for Lease {
+    fn drop(&mut self) {
+        drop(self.storage.take());
+        // A concurrent fork can retain these open file descriptions until exec.
+        // End this owner's locks explicitly after its storage teardown.
+        let _ = fs2::FileExt::unlock(&self._lock);
+        let _ = fs2::FileExt::unlock(&self._lifecycle_lock);
+        let _ = fs2::FileExt::unlock(&self._reset_gate);
+    }
+}
+
 /// Serializes a canonical chat's generations without creating a site-data
 /// directory. Its stable inode also carries the terminal deletion fence.
 pub(super) struct ChatLease {
