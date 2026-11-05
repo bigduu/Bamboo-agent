@@ -38,6 +38,7 @@ use uuid::Uuid;
 
 use bamboo_domain::ProviderModelRef;
 use bamboo_domain::ReasoningEffort;
+use bamboo_domain::SessionPresentationMutation;
 use bamboo_domain::{
     is_matching_session_message, Message, MessagePart, ParentQuestion, ParentQuestionResolution,
     ParentRequest, ParentResolution, ProjectId, Role, RootModeOperationAction,
@@ -7561,24 +7562,24 @@ impl SessionStoreV2 {
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
     ) -> io::Result<()> {
-        self.save_session_after_lock_with_title_intent(
+        self.save_session_after_lock_with_presentation_intent(
             session,
             total_started,
             guards,
             answer_permit,
-            false,
+            None,
         )
         .await
         .map(|_| ())
     }
 
-    async fn save_session_after_lock_with_title_intent(
+    async fn save_session_after_lock_with_presentation_intent(
         &self,
         session: &Session,
         total_started: Instant,
         guards: &Arc<DefaultWriterGuards>,
         answer_permit: Option<&ParentQuestion>,
-        manual_title: bool,
+        mutation: Option<SessionPresentationMutation>,
     ) -> io::Result<Option<Session>> {
         reject_incompatible_session_write(session)?;
         if session
@@ -7817,16 +7818,19 @@ impl SessionStoreV2 {
             let tree = self.acquire_actor_tree_write_guard(root_id).await?;
             guards.hold_tree(tree);
         }
-        let mut title_candidate = manual_title.then(|| session.clone());
-        let title_observations = if let Some(candidate) = title_candidate.as_mut() {
-            self.prepare_title_observations(candidate).await?
+        let mut presentation_candidate = mutation.map(|_| session.clone());
+        let presentation_observations = if let (Some(candidate), Some(mutation)) =
+            (presentation_candidate.as_mut(), mutation)
+        {
+            self.prepare_presentation_observations(candidate, mutation)
+                .await?
         } else {
             Vec::new()
         };
-        let session = title_candidate.as_ref().unwrap_or(session);
-        if manual_title {
+        let session = presentation_candidate.as_ref().unwrap_or(session);
+        if mutation.is_some() {
             // Initial buffers preflighted before directory preparation. Only
-            // the validated title lane can normalize an existing observation;
+            // the validated presentation lane can advance an existing observation;
             // both actual files must publish that same canonical candidate.
             let started = Instant::now();
             session_bytes = compact_main::serialize_main(session)?;
@@ -7907,8 +7911,8 @@ impl SessionStoreV2 {
         }
         // Observations must never lead canonical metadata: an ahead row
         // could conceal a later Project A→B→A revision. A failed refresh
-        // remains stale/fail-closed; the manual no-op path validates it too.
-        for (path, bytes) in title_observations {
+        // remains stale/fail-closed; presentation no-ops validate it too.
+        for (path, bytes) in presentation_observations {
             self.write_default_bytes(&path, bytes, guards).await?;
         }
         let (revision_path, revision) = self
@@ -7947,7 +7951,7 @@ impl SessionStoreV2 {
             total_ms = total.as_millis() as u64,
             "session durable commit completed; search indexing deferred"
         );
-        Ok(manual_title.then(|| session.clone()))
+        Ok(mutation.map(|_| session.clone()))
     }
 }
 
@@ -8034,12 +8038,21 @@ impl Storage for SessionStoreV2 {
     }
 
     async fn save_manual_title_committed(&self, session: &Session) -> io::Result<Session> {
+        self.save_presentation_metadata_committed(session, SessionPresentationMutation::Title)
+            .await
+    }
+
+    async fn save_presentation_metadata_committed(
+        &self,
+        session: &Session,
+        mutation: SessionPresentationMutation,
+    ) -> io::Result<Session> {
         let total_started = Instant::now();
         let lifecycle = self.lock_default_writer_lifecycle().await?;
         if session.kind == SessionKind::Root && !self.root_has_birth_files(&session.id).await? {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                "manual title target has no canonical Root source",
+                "presentation metadata target has no canonical Root source",
             ));
         }
         let runtime_task = self.lock_runtime_task_sidecar_shared().await?;
@@ -8048,9 +8061,15 @@ impl Storage for SessionStoreV2 {
             .await?;
         let guards = DefaultWriterGuards::shared(lifecycle, runtime_task, session_write);
         let committed = self
-            .save_session_after_lock_with_title_intent(session, total_started, &guards, None, true)
+            .save_session_after_lock_with_presentation_intent(
+                session,
+                total_started,
+                &guards,
+                None,
+                Some(mutation),
+            )
             .await?;
-        Ok(committed.expect("manual-title transaction returns its committed candidate"))
+        Ok(committed.expect("presentation transaction returns its committed candidate"))
     }
 
     async fn validate_title_observations(&self, expected: &Session) -> io::Result<()> {

@@ -476,7 +476,7 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
     use bamboo_agent_core::tools::{FunctionCall, ToolCall};
     use bamboo_domain::{
         ActorActivationClaim, ActorActivationFinish, ActorActivationStatus, ActorDirectoryEntry,
-        ActorDirectoryPort, RootActorRuntimeWrite, RuntimeSessionPersistence, Storage,
+        ActorDirectoryPort, RootActorRuntimeWrite, RuntimeSessionPersistence,
     };
     use std::sync::Arc;
 
@@ -539,7 +539,11 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
                     .unwrap();
             }
             SessionMetadataService::apply_generated_title(
-                &state, &root.id, "Generated title", source, false,
+                &state,
+                &root.id,
+                "Generated title",
+                source,
+                false,
             )
             .await
             .unwrap()
@@ -552,7 +556,7 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
             }
 
             runtime.add_message(bamboo_domain::Message::assistant_with_reasoning(
-                "checking".into(),
+                "checking",
                 Some(vec![ToolCall {
                     id: "metadata-tool-call".into(),
                     tool_type: "function".into(),
@@ -576,7 +580,11 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
                 .unwrap()
                 .unwrap();
             SessionMetadataService::apply_generated_title(
-                &state, &root.id, "Regenerated title", source, true,
+                &state,
+                &root.id,
+                "Regenerated title",
+                source,
+                true,
             )
             .await
             .unwrap()
@@ -609,11 +617,17 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
 
             runtime.set_last_run_status("error");
             runtime.synchronize_terminal_runtime_status();
-            writer.save_finalized_runtime_session(&mut runtime).await.unwrap();
+            writer
+                .save_finalized_runtime_session(&mut runtime)
+                .await
+                .unwrap();
             let finished = state
                 .session_store
                 .finish_root_activation_observed(
-                    &owner, chrono::Utc::now(), ActorActivationFinish::Failed, None,
+                    &owner,
+                    chrono::Utc::now(),
+                    ActorActivationFinish::Failed,
+                    None,
                 )
                 .await
                 .unwrap();
@@ -632,5 +646,82 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
                 .is_some());
             reopened.flush_search_index().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn generated_title_and_pinned_noops_reject_stale_actor_observations() {
+    use bamboo_domain::ActorDirectoryPort;
+
+    for title_noop in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let state = AppState::new(home.path().to_path_buf()).await.unwrap();
+        let root = seed_session(&state, "metadata-noop", "Existing title").await;
+        state.session_store.ensure_actor(&root.id).await.unwrap();
+        let directory = home.path().join("sessions").join(&root.id);
+        let row_path = directory.join("actor-authority.json");
+        let mut row: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(&row_path).await.unwrap()).unwrap();
+        row["actor"]["observed_metadata_version"] = 1.into();
+        tokio::fs::write(&row_path, serde_json::to_vec(&row).unwrap())
+            .await
+            .unwrap();
+        let before = tokio::fs::read(directory.join("runtime.json"))
+            .await
+            .unwrap();
+        let result = if title_noop {
+            SessionMetadataService::apply_generated_title(
+                &state,
+                &root.id,
+                &root.title,
+                TitleSource::Auto,
+                true,
+            )
+            .await
+            .map(|_| ())
+        } else {
+            SessionMetadataService::set_pinned(&state, &root.id, false, None)
+                .await
+                .map(|_| ())
+        };
+        assert!(matches!(result, Err(MetadataError::Storage(_))));
+        assert_eq!(
+            tokio::fs::read(directory.join("runtime.json"))
+                .await
+                .unwrap(),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn generated_title_and_pinned_reject_revision_overflow_without_publication() {
+    for title in [false, true] {
+        let state = make_state().await;
+        let mut root = seed_pending_session(&state, "metadata-overflow", "New Session").await;
+        root.metadata_version = u64::MAX;
+        state.storage.save_session(&root).await.unwrap();
+        let before = state.storage.load_session(&root.id).await.unwrap().unwrap();
+        let result = if title {
+            SessionMetadataService::apply_generated_title(
+                &state,
+                &root.id,
+                "Generated title",
+                TitleSource::Auto,
+                false,
+            )
+            .await
+            .map(|_| ())
+        } else {
+            SessionMetadataService::set_pinned(&state, &root.id, true, None)
+                .await
+                .map(|_| ())
+        };
+        assert!(matches!(result, Err(MetadataError::Storage(_))));
+        let after = state.storage.load_session(&root.id).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::to_value(after).unwrap(),
+            serde_json::to_value(before).unwrap()
+        );
     }
 }
