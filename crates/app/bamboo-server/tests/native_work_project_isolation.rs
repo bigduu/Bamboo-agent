@@ -91,7 +91,12 @@ macro_rules! prepare_work {
                             project_id: $project.id.clone(),
                             project_revision: $project.revision,
                             resource_revision: $project.resource_revision,
-                            workspace_binding: $project.workspace_bindings[0].clone(),
+                            workspace_binding: $project
+                                .workspace_bindings
+                                .iter()
+                                .find(|binding| binding.path == $workspace.repo)
+                                .expect("adopt the execution repository binding")
+                                .clone(),
                             contract_revision: snap.tickets[&id].contract_revision,
                             contract,
                             sources: BTreeMap::new(),
@@ -283,6 +288,18 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
                 &pa.id,
                 pa.revision,
                 WorkspaceBinding {
+                    path: wa.repo.clone(),
+                    label: None,
+                    git_common_dir: None,
+                },
+            )
+            .unwrap();
+        let pa = state
+            .project_store
+            .bind_workspace(
+                &pa.id,
+                pa.revision,
+                WorkspaceBinding {
                     path: wa.worktree.clone(),
                     label: None,
                     git_common_dir: None,
@@ -299,6 +316,18 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
                 &pb.id,
                 pb.revision,
                 WorkspaceBinding {
+                    path: wb.repo.clone(),
+                    label: None,
+                    git_common_dir: None,
+                },
+            )
+            .unwrap();
+        let pb = state
+            .project_store
+            .bind_workspace(
+                &pb.id,
+                pb.revision,
+                WorkspaceBinding {
                     path: wb.worktree.clone(),
                     label: None,
                     git_common_dir: None,
@@ -306,6 +335,17 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
             )
             .unwrap();
         assert_ne!(pa.id, pb.id);
+        for (workspace, project) in [(&wa, &pa), (&wb, &pb)] {
+            assert_eq!(
+                state
+                    .project_store
+                    .find_workspace_owner_for_path(&workspace.worktree)
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                project.id
+            );
+        }
         let a = prepare_work!(app, state, wa, pa, "a", marker_a);
         let b = prepare_work!(app, state, wb, pb, "b", marker_b);
         let probe = prepare_work!(app, state, wa, pa, "denied-probe", marker_a);
