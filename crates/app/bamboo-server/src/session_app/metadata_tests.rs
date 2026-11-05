@@ -476,7 +476,7 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
     use bamboo_agent_core::tools::{FunctionCall, ToolCall};
     use bamboo_domain::{
         ActorActivationClaim, ActorActivationFinish, ActorActivationStatus, ActorDirectoryEntry,
-        ActorDirectoryPort, RootActorRuntimeWrite, RuntimeSessionPersistence,
+        ActorDirectoryPort, RootActorRuntimeWrite, RuntimeSessionPersistence, Storage,
     };
     use std::sync::Arc;
 
@@ -486,7 +486,6 @@ async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_
             let home = tempfile::tempdir().unwrap();
             let state = AppState::new(home.path().to_path_buf()).await.unwrap();
             let mut root = seed_pending_session(&state, "metadata-root", "New Session").await;
-            root.session_version = None;
             root.set_last_run_status("running");
             root.add_message(bamboo_domain::Message::user("original input"));
             state.storage.save_session(&root).await.unwrap();
