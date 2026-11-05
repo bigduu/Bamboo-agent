@@ -7704,6 +7704,29 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
             Some(child_id)
         );
         let child = h.storage.load_session(child_id).await.unwrap().unwrap();
+        assert_eq!(payload["model"], child.model);
+        assert_eq!(
+            payload["model_ref"],
+            serde_json::to_value(&child.model_ref).unwrap()
+        );
+        assert_eq!(
+            payload["reasoning_effort"],
+            serde_json::to_value(child.reasoning_effort).unwrap()
+        );
+        let overview = invoke_completed(
+            &tool,
+            json!({"intent":"inspect", "target":child_id}),
+            subagent_test_ctx(
+                &h.parent_session_id,
+                &format!("compact-model-observation-{index}"),
+            ),
+        )
+        .await
+        .unwrap();
+        let overview: serde_json::Value = serde_json::from_str(&overview.result).unwrap();
+        assert_eq!(overview["model"], payload["model"]);
+        assert_eq!(overview["model_ref"], payload["model_ref"]);
+        assert_eq!(overview["reasoning_effort"], payload["reasoning_effort"]);
         assert_eq!(
             child.parent_session_id.as_deref(),
             Some(h.parent_session_id.as_str())
