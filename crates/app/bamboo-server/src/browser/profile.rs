@@ -38,6 +38,17 @@ pub(super) struct Lease {
     _reset_gate: std::fs::File,
 }
 
+impl Drop for Lease {
+    fn drop(&mut self) {
+        drop(self.storage.take());
+        // A concurrent fork can retain these open file descriptions until exec.
+        // End this owner's locks explicitly after its storage teardown.
+        let _ = fs2::FileExt::unlock(&self._lock);
+        let _ = fs2::FileExt::unlock(&self._lifecycle_lock);
+        let _ = fs2::FileExt::unlock(&self._reset_gate);
+    }
+}
+
 /// Serializes a canonical chat's generations without creating a site-data
 /// directory. Its stable inode also carries the terminal deletion fence.
 pub(super) struct ChatLease {
@@ -705,6 +716,28 @@ pub(super) fn purge_all(root: &Path) -> Result<(), BrowserError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn dropped_profile_lease_releases_inherited_descriptors_and_preserves_sibling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let lease = acquire(&root, "chat-a").unwrap();
+        let sibling = acquire(&root, "chat-b").unwrap();
+        // A concurrent fork retains these open file descriptions until exec.
+        let inherited = [
+            lease._lock.try_clone().unwrap(),
+            lease._lifecycle_lock.try_clone().unwrap(),
+            lease._reset_gate.try_clone().unwrap(),
+        ];
+        drop(lease);
+        drop(acquire(&root, "chat-a").expect("the original owner has released its profile"));
+        assert!(acquire(&root, "chat-b").is_err());
+        assert!(begin_reset(&root).is_err());
+        drop(sibling);
+        assert!(begin_reset(&root).is_ok());
+        drop(inherited);
+    }
 
     #[test]
     fn active_launch_survives_lost_locks_and_blocks_reopen_delete_and_reset() {
