@@ -1350,6 +1350,7 @@ impl AppState {
             ),
         );
         if start_inbox_reconciler {
+            observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;
             // Reconcile exact Inbox wake readiness before serving, then pace
             // runtime recovery for due leases and missed activation handoffs.

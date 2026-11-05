@@ -56,6 +56,9 @@ pub enum SupervisedRootOutcomeInputOrigin {
         /// None is historical uncertainty, not permission to replay.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requires_host_scope: Option<bool>,
+        /// Explicit request captured by the original physical Inbox writer.
+        #[serde(default, skip_serializing_if = "is_false")]
+        notify_on_material_event: bool,
         target: SupervisorCurrentUserTarget,
         operation_id: SessionMessageId,
     },
@@ -71,7 +74,40 @@ pub enum SupervisedRootOutcomeInputOrigin {
     },
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// A reconciliation selector derived from a recorded opted-in input.
+/// The Inbox writer revalidates its source and authority before delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedRootNotification {
+    pub caller: crate::SessionCallerReference,
+    pub target: SupervisorCurrentUserTarget,
+    pub run_id: String,
+    pub after_sequence: u64,
+    pub input_receipt_id: SessionMessageId,
+    pub blocker_cursor: Option<u64>,
+}
+
 impl SupervisedRootOutcomeInputOrigin {
+    pub fn material_notifications_requested(&self) -> bool {
+        matches!(
+            self,
+            Self::CurrentUser {
+                notify_on_material_event: true,
+                ..
+            }
+        )
+    }
+
+    pub fn current_user_target(&self) -> Option<&SupervisorCurrentUserTarget> {
+        match self {
+            Self::CurrentUser { target, .. } => Some(target),
+            Self::LegacyOrCreatedRoot { .. } => None,
+        }
+    }
+
     /// Historical evidence is not a grant. Storage separately retains and
     /// validates current authority; an originally finite source cannot be
     /// widened merely because a restarted registry has no installation.
@@ -233,6 +269,7 @@ impl SupervisedRootOutcomeInputOrigin {
                     supervisor_created_at: left_birth,
                     caller: _,
                     requires_host_scope: _,
+                    notify_on_material_event: left_notify,
                     target: left_target,
                     operation_id: left_operation,
                 },
@@ -241,6 +278,7 @@ impl SupervisedRootOutcomeInputOrigin {
                     supervisor_created_at: right_birth,
                     caller: _,
                     requires_host_scope: _,
+                    notify_on_material_event: right_notify,
                     target: right_target,
                     operation_id: right_operation,
                 },
@@ -251,6 +289,7 @@ impl SupervisedRootOutcomeInputOrigin {
                     && left_target.created_at == right_target.created_at
                     && left_target.kind == right_target.kind
                     && left_operation == right_operation
+                    && left_notify == right_notify
             }
             (
                 Self::LegacyOrCreatedRoot {
@@ -1663,6 +1702,7 @@ mod tests {
             supervisor_created_at: Utc::now(),
             caller: None,
             requires_host_scope: None,
+            notify_on_material_event: false,
             target: target.clone(),
             operation_id: operation.clone(),
         };
@@ -1690,6 +1730,20 @@ mod tests {
         assert!(default_current_user.permits_scope_replay(true));
         assert!(origin.same_operation(&finite));
         assert!(finite.same_operation(&default_current_user));
+        let encoded = serde_json::to_value(&origin).unwrap();
+        assert!(encoded.get("notify_on_material_event").is_none());
+        let decoded: SupervisedRootOutcomeInputOrigin = serde_json::from_value(encoded).unwrap();
+        assert!(!decoded.material_notifications_requested());
+        let mut notifying = origin.clone();
+        if let SupervisedRootOutcomeInputOrigin::CurrentUser {
+            notify_on_material_event,
+            ..
+        } = &mut notifying
+        {
+            *notify_on_material_event = true;
+        }
+        assert!(notifying.material_notifications_requested());
+        assert!(!origin.same_operation(&notifying));
         let owned_input = SupervisedRootOutcomeInput {
             receipt_id: receipt.clone(),
             generation: 1,
