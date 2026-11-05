@@ -43,7 +43,8 @@ impl ResolvedModel {
 /// consumer of a resolved role model (including legacy `chat_stream` callers)
 /// observes the same setting without duplicating effort plumbing throughout
 /// the runtime. Explicit call-site values remain the fallback when the role
-/// does not specify an effort.
+/// does not specify an effort. An explicit Disabled request suppresses reasoning
+/// even when the role specifies a different preference.
 pub(crate) fn provider_with_reasoning_effort(
     provider: Arc<dyn LLMProvider>,
     reasoning_effort: Option<ReasoningEffort>,
@@ -65,7 +66,9 @@ struct RoleReasoningProvider {
 impl RoleReasoningProvider {
     fn options(&self, options: Option<&LLMRequestOptions>) -> LLMRequestOptions {
         let mut effective = options.cloned().unwrap_or_default();
-        effective.reasoning_effort = Some(self.reasoning_effort);
+        if effective.reasoning_effort != Some(ReasoningEffort::Disabled) {
+            effective.reasoning_effort = Some(self.reasoning_effort);
+        }
         effective
     }
 }
