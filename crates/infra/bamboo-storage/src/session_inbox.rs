@@ -992,6 +992,130 @@ impl FileSessionInbox {
         }))
     }
 
+    /// Read one exact Root outcome under the original Supervisor's authority.
+    /// Main and an owned input ACK are required. This neither delivers an
+    /// Inbox message nor consumes the caller's evidence cursor.
+    pub async fn read_managed_root_outcome(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        run_id: &str,
+        after_sequence: u64,
+    ) -> Result<bamboo_domain::ObserverRootOutcomeRead, SessionInboxError> {
+        use bamboo_domain::ObserverRootOutcomeRead as Read;
+        let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
+        let authority = Arc::new(
+            self.sessions
+                .lock_unscoped_supervisor_root(caller, supervisor, target)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?,
+        );
+        let root = self
+            .sessions
+            .load_execution_admission_unchecked(&target.session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            .ok_or_else(|| invalid("Root outcome source disappeared"))?;
+        let Some(outcomes) = root
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        else {
+            return Ok(Read::CaughtUp);
+        };
+        outcomes.validate().map_err(invalid)?;
+        if outcomes.root_session_id != target.session_id
+            || outcomes.root_created_at != target.created_at
+        {
+            return Err(invalid("Root outcome source lifetime differs"));
+        }
+        let Some(fact) = outcomes
+            .facts
+            .iter()
+            .find(|fact| fact.run_id == run_id && fact.sequence > after_sequence)
+        else {
+            return Ok(Read::CaughtUp);
+        };
+        if root
+            .conversation_reset_sha256()
+            .map_err(|_| invalid("Root outcome conversation generation is invalid"))?
+            != fact.conversation_reset_sha256
+        {
+            return Ok(Read::CaughtUp);
+        }
+        let Some(result) = fact.result.as_ref().filter(|result| {
+            **result != bamboo_domain::SupervisedRootOutcomeResult::InterruptedUnknown
+        }) else {
+            return Ok(Read::CaughtUp);
+        };
+        let guarded = GuardedSupervisorRoot::from_sessions(&authority.source, &authority.target)
+            .ok_or_else(|| invalid("Root outcome authority is not canonical"))?;
+        let inputs: Vec<_> = fact
+            .inputs
+            .iter()
+            .filter(|input| {
+                input.supervisor_origin.as_ref().is_some_and(|origin| {
+                    origin.original_caller() == Some(caller)
+                        && origin.permits_scope_replay(false)
+                        && guarded.owns_recorded_origin(origin, &input.receipt_id)
+                })
+            })
+            .cloned()
+            .collect();
+        if inputs.is_empty() {
+            return Ok(Read::CaughtUp);
+        }
+        let (inbox, filesystem) = self
+            .filesystem_with_authority(
+                &target.session_id,
+                InboxAuthority::SupervisedRootOutcome {
+                    inbox_dir: authority.inbox_dir.clone(),
+                    _guard: authority.clone(),
+                },
+            )
+            .await?;
+        let mut invalid_ack = None;
+        let mut pending_ack = false;
+        for input in &inputs {
+            match tokio::fs::symlink_metadata(Self::admitted_path(&inbox, &input.receipt_id)).await
+            {
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    pending_ack = true;
+                    continue;
+                }
+                Err(error) => {
+                    invalid_ack
+                        .get_or_insert_with(|| SessionInboxError::Storage(error.to_string()));
+                    continue;
+                }
+                Ok(_) => {}
+            }
+            match self
+                .verify_supervised_root_input_ack(&root, &guarded, input, &inbox, &filesystem)
+                .await
+            {
+                Ok(input) => {
+                    return Ok(Read::Next(bamboo_domain::ObserverSupervisedRootOutcome {
+                        target_session_id: root.id.clone(),
+                        target_created_at: root.created_at,
+                        sequence: fact.sequence,
+                        run_id: fact.run_id.clone(),
+                        status: result.clone(),
+                        inputs: vec![input],
+                    }))
+                }
+                Err(error) => {
+                    invalid_ack.get_or_insert(error);
+                }
+            }
+        }
+        if pending_ack {
+            return Ok(Read::PendingSource);
+        }
+        invalid_ack.map_or(Ok(Read::CaughtUp), Err)
+    }
+
     /// Publish one immutable Root result through the existing Supervisor
     /// Inbox. The caller supplies selectors only; current authority, Main,
     /// the original input ACK and the final event are all re-read under the

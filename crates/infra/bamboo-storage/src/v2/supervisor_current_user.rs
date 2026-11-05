@@ -38,6 +38,27 @@ impl SessionStoreV2 {
         T: Send + 'static,
         F: FnOnce(Option<&str>) -> io::Result<T> + Send + 'static,
     {
+        let authority = self
+            .lock_unscoped_supervisor_root(caller, supervisor, target)
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let workspace_path = authority.target.workspace_path_meta();
+            let result = effect(workspace_path.as_deref());
+            // Capture the entire guard so aborting the async waiter cannot
+            // release its locks while the blocking effect is still running.
+            drop(authority);
+            result
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
+    }
+
+    pub(crate) async fn lock_unscoped_supervisor_root(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &SupervisorCurrentUserTarget,
+    ) -> io::Result<CurrentUserTargetGuard> {
         if caller.session_id != supervisor.session_id
             || caller.authority_identity
                 != (SessionAuthorityIdentity::Supervisor {
@@ -54,20 +75,16 @@ impl SessionStoreV2 {
             .host_scope_registry
             .retain_never_installed(&caller.session_id)
             .await?;
-        let authority = self
+        let mut authority = self
             .lock_current_user_target(supervisor, &target.session_id)
             .await?;
         if !caller.matches_session(&authority.source) || *target != authority.reference {
             return Err(denied("Supervisor caller or Root target changed"));
         }
-        tokio::task::spawn_blocking(move || {
-            let _scope = scope;
-            let _authority = authority;
-            let workspace_path = _authority.target.workspace_path_meta();
-            effect(workspace_path.as_deref())
-        })
-        .await
-        .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
+        authority._send_scope = Some(
+            super::host_session_scope::CurrentUserSendScope::NeverInstalled { _absence: scope },
+        );
+        Ok(authority)
     }
 
     pub(crate) async fn current_user_supervisor_scope(
