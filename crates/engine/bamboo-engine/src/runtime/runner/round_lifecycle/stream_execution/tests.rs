@@ -6350,9 +6350,24 @@ async fn unchanged_checkpoint_still_persists_the_final_request() {
 }
 
 #[tokio::test]
-async fn over_budget_vision_request_still_rejects_before_dispatch() {
-    // #2513 input-budget guard: reusing a validated request must not relax the
-    // final input-budget rejection that runs before any checkpoint.
+async fn prepared_main_stream_over_budget_request_rejects_before_checkpoint_and_dispatch() {
+    // #2513 input-budget guard, deliberately narrow in scope.
+    //
+    // This case supplies an already-built `PreparedContext` straight to
+    // `execute_llm_stream`, so it never enters `execute_llm_round` ->
+    // `prepare_round_context` -> Legacy Vision fallback. It therefore proves
+    // only the main-stream contract for an already-prepared context:
+    //
+    //   1. the final input-budget check still fails closed with
+    //      `AgentError::Budget`;
+    //   2. no checkpoint is taken before that rejection;
+    //   3. the main provider is never dispatched.
+    //
+    // It says nothing about paid Vision calls on the preparation path and must
+    // not be cited for that. Preparation-path Vision coverage lives in
+    // `bookkeeping_only_checkpoint_does_not_repeat_the_vision_description` and
+    // `checkpoint_that_adopts_new_input_reprepares_with_one_extra_vision_call`,
+    // which both go through `execute_llm_round`.
     let _env_lock = isolate_prompt_safe_env_cache();
     let session_id = "vision-over-budget";
     let mut session = Session::new(session_id, "test-model");
@@ -6414,16 +6429,11 @@ async fn over_budget_vision_request_still_rejects_before_dispatch() {
             .lock()
             .expect("main requests lock")
             .is_empty(),
-        "an over-budget request must never reach the provider"
+        "an over-budget prepared request must never reach the provider"
     );
     assert_eq!(
         persistence.saves.load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "an over-budget request must be rejected before any checkpoint"
-    );
-    assert_eq!(
-        llm.vision_calls.load(std::sync::atomic::Ordering::SeqCst),
-        0,
-        "an over-budget request must be rejected before any paid Vision call"
+        "an over-budget prepared request must be rejected before any checkpoint"
     );
 }
