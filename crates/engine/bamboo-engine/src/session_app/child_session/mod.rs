@@ -59,6 +59,8 @@ pub enum ChildSessionError {
     #[error("{0}")]
     InvalidArguments(String),
     #[error("{0}")]
+    ModelNotAdmitted(String),
+    #[error("{0}")]
     Execution(String),
 }
 

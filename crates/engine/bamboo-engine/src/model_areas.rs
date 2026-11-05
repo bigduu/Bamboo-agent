@@ -339,6 +339,7 @@ mod tests {
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: Some(ProviderModelRef::new("openai", "gpt-sub")),
             subagent_models: HashMap::new(),
         }

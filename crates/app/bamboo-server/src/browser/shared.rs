@@ -153,6 +153,8 @@ impl SharedRuntime {
         // retains the dev temporary-directory/reaper ownership path.
         let lease = if lifecycle.ephemeral_clean {
             None
+        } else if lifecycle.bounded_storage {
+            Some(profile::acquire_recoverable_shared(root)?)
         } else {
             Some(profile::acquire_shared(root)?)
         };

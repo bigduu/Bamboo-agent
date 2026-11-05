@@ -540,10 +540,20 @@ enum SessionControlArgs {
         target_ref: Option<bamboo_domain::SupervisorCurrentUserTarget>,
         operation_id: String,
         message: String,
+        #[serde(default)]
+        notify_on_material_event: bool,
     },
     ObserveRun {
         target_session_id: String,
         target_ref: bamboo_domain::SupervisorCurrentUserTarget,
+    },
+    WaitRun {
+        target_session_id: String,
+        target_ref: bamboo_domain::SupervisorCurrentUserTarget,
+        expected_run_id: String,
+    },
+    WaitOutcomes {
+        outcome_targets: [root_run::ManagedOutcomeTarget; 2],
     },
     Cancel {
         target_session_id: String,
@@ -614,10 +624,10 @@ impl Tool for SessionControlTool {
 
     fn description(&self) -> &str {
         if self.root_run.is_some() && self.root_creator.is_some() {
-            return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. directory (when the Host installs its port) returns a paginated read-only observation of sessions in scope: supervisor-created roots and user-opened sessions, each with origin, live-link state, persisted progress and the last canonical Human UI engagement mark; it grants no control and is never completion evidence. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. For an ordinary Root, observe_run uses that same target_ref and returns its current exact run_id and status; pending means execution has not started. cancel requires the unchanged target_ref and observed expected_run_id. cancel_requested only signals that owner: wait for actual finalization before claiming it stopped. A stale target or run must never be redirected to a successor. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
+            return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. directory (when the Host installs its port) returns a paginated read-only observation of sessions in scope: supervisor-created roots and user-opened sessions, each with origin, live-link state, persisted progress and the last canonical Human UI engagement mark; it grants no control and is never completion evidence. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. For an ordinary Root, observe_run uses that same target_ref and returns its current exact run_id and status; pending means execution has not started. wait_run awaits the observed expected_run_id for a bounded interval without repeated history reads. A wait timeout means no finalization was confirmed. wait_outcomes yields for either of two exact runs and returns a persisted outcome and evidence sequence when available. Set after_blocker_cursor to 0 on first wait to also wake for a recorded blocker. Inspect the referenced Task and pass its returned cursor as that run's after_blocker_cursor after handling it. A recorded outcome still requires review of the actual deliverable. cancel requires the unchanged target_ref and observed expected_run_id. cancel_requested only signals that owner: wait for actual finalization before claiming it stopped. A stale target or run must never be redirected to a successor. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
         }
         if self.root_run.is_some() {
-            return "Supervisor followup and exact Root run control preserve the current user's original Session context. Copy current_user_target from session_history. observe_run returns the current Root run_id and status; pending means execution has not started. cancel requires that same target_ref and exact expected_run_id. cancel_requested signals only that owner and does not prove final termination. A stale target or run must never redirect to a successor. Existing work Sessions keep their permissions. loop remains separately Host-granted; do not answer approvals or use direct file/shell tools.";
+            return "Supervisor followup and exact Root run control preserve the current user's original Session context. Copy current_user_target from session_history. observe_run returns the current Root run_id and status; pending means execution has not started. wait_run awaits the same target_ref and observed expected_run_id for a bounded interval. wait_outcomes awaits the first recorded outcome of two exact runs. Include after_blocker_cursor (0 initially) to also wake for a recorded blocker. Inspect its referenced Task and pass its returned cursor as that run's after_blocker_cursor after handling it. cancel requires that same target_ref and exact expected_run_id. cancel_requested signals only that owner and does not prove final termination. A stale target or run must never redirect to a successor. Existing work Sessions keep their permissions. loop remains separately Host-granted; do not answer approvals or use direct file/shell tools.";
         }
         if self.root_creator.is_some() {
             return "Supervisor management covers all Projects and Sessions in this application's current-user domain by default. scope returns Projects, canonical Supervisor identity and state_revision; legacy allowed_projects/links are compatibility metadata, not a permission gate. create requires that revision, an existing Project/workspace, stable operation UUID and first instruction; it creates one independent Standard Ordinary Root with its own unchanged work permissions. It does not attach an ACL, create Ticket/Work or make a worktree. Prefer continuing an existing Session: obtain current_user_target from session_history list/inspect, then followup with that unchanged target_ref, stable operation_id and identical message on retry. Receipts describe creation/admission/activation, never completion. No Supervisor history, prompt, model or permissions are inherited. SubAgent creates a bounded Child. loop retains its separate active-owner grant, finite opt-in and exact CAS; default management never grants that capability. Do not answer approvals, change permissions, substitute shell execution or create overlapping workers when blocked.";
@@ -652,7 +662,7 @@ impl Tool for SessionControlTool {
                         "expected_link_revision": false,
                         "receipt_operation_id": false
                     },
-                    "required": ["operation_id", "message", "target_ref"]
+                    "required": ["target_session_id", "operation_id", "message", "target_ref"]
                 },
                 {
                     "properties": {
@@ -661,7 +671,7 @@ impl Tool for SessionControlTool {
                         "target_ref": false,
                         "message": false
                     },
-                    "required": ["command"],
+                    "required": ["target_session_id", "command"],
                     "oneOf": [
                         {
                             "properties": {
@@ -698,10 +708,6 @@ impl Tool for SessionControlTool {
                 variant["properties"]["query"] = Value::Bool(false);
                 variant["properties"]["limit"] = Value::Bool(false);
                 variant["properties"]["cursor"] = Value::Bool(false);
-                variant["required"]
-                    .as_array_mut()
-                    .unwrap()
-                    .push(json!("target_session_id"));
             }
             let forbidden = [
                 "target_session_id",
@@ -777,18 +783,36 @@ impl Tool for SessionControlTool {
             }));
         }
         if self.root_run.is_some() {
+            schema["required"] = json!(["action"]);
             let actions = schema["properties"]["action"]["enum"]
                 .as_array_mut()
                 .expect("action enumeration");
             actions.push(json!("observe_run"));
+            actions.push(json!("wait_run"));
+            actions.push(json!("wait_outcomes"));
             actions.push(json!("cancel"));
             schema["properties"]["expected_run_id"] = json!({
                 "type":"string", "minLength":1, "maxLength":128,
-                "description":"cancel only: copy the exact run_id from observe_run; never infer or refresh it during an uncertain retry."
+                "description":"wait_run or cancel only: copy the exact run_id from observe_run; never infer or refresh it during an uncertain retry."
             });
             schema["properties"]["target_ref"]["description"] = json!(
                 "Copy the unchanged current_user_target from session_history. It selects the exact target birth/generation; it is never a grant."
             );
+            let target_schema = schema["properties"]["target_ref"].clone();
+            schema["properties"]["outcome_targets"] = json!({
+                "type":"array", "minItems":2, "maxItems":2,
+                "description":"wait_outcomes only. Await the first recorded result or opted-in Task blocker of two distinct managed Root runs.",
+                "items":{
+                    "type":"object", "additionalProperties":false,
+                    "required":["target_ref","expected_run_id","after_sequence"],
+                    "properties":{
+                        "target_ref":target_schema,
+                        "expected_run_id":{"type":"string","minLength":1,"maxLength":128},
+                        "after_sequence":{"type":"integer","minimum":0,"description":"Use 0 initially and advance only on a handled outcome."},
+                        "after_blocker_cursor":{"type":"integer","minimum":0,"description":"Include to wake for a newer Task blocker. Use 0 initially and then the cursor of a handled blocker."}
+                    }
+                }
+            });
             let variants = schema["oneOf"].as_array_mut().expect("action variants");
             for variant in variants.iter_mut() {
                 variant["properties"]["expected_run_id"] = Value::Bool(false);
@@ -819,16 +843,55 @@ impl Tool for SessionControlTool {
                 "properties":{"action":{"const":"observe_run"}, "expected_run_id":false},
                 "required":["target_session_id", "target_ref"]
             });
+            let mut wait = json!({
+                "properties":{"action":{"const":"wait_run"}},
+                "required":["target_session_id", "target_ref", "expected_run_id"]
+            });
             let mut cancel = json!({
                 "properties":{"action":{"const":"cancel"}},
                 "required":["target_session_id", "target_ref", "expected_run_id"]
             });
             for field in forbidden {
                 observe["properties"][field] = Value::Bool(false);
+                wait["properties"][field] = Value::Bool(false);
                 cancel["properties"][field] = Value::Bool(false);
             }
             variants.push(observe);
+            variants.push(wait);
             variants.push(cancel);
+            for variant in variants.iter_mut() {
+                variant["properties"]["outcome_targets"] = Value::Bool(false);
+            }
+            let mut wait_outcomes = json!({
+                "properties":{"action":{"const":"wait_outcomes"}},
+                "required":["outcome_targets"]
+            });
+            for field in [
+                "target_session_id",
+                "target_ref",
+                "expected_run_id",
+                "operation_id",
+                "message",
+                "expected_link_revision",
+                "command",
+                "receipt_operation_id",
+                "request",
+                "query",
+                "limit",
+                "cursor",
+            ] {
+                wait_outcomes["properties"][field] = Value::Bool(false);
+            }
+            variants.push(wait_outcomes);
+        }
+        schema["properties"]["notify_on_material_event"] = json!({
+            "type":"boolean",
+            "description":"followup only, for an independent Root. Request durable notices for a recorded blocker or handoff from the admitted input's exact run. After dispatch, finish the short coordinating response while task Sessions continue. A notice returns through this Supervisor's Inbox when evidence changes. Preserve this flag with every retry."
+        });
+        for variant in schema["oneOf"].as_array_mut().expect("action variants") {
+            if variant["properties"]["action"]["const"] != "followup" {
+                variant["properties"]["notify_on_material_event"] = Value::Bool(false);
+            }
         }
         schema
     }
@@ -837,6 +900,8 @@ impl Tool for SessionControlTool {
         if args["action"] == "scope"
             || args["action"] == "directory"
             || args["action"] == "observe_run"
+            || args["action"] == "wait_run"
+            || args["action"] == "wait_outcomes"
         {
             ToolClass::READONLY_PARALLEL
         } else {
@@ -868,10 +933,7 @@ impl Tool for SessionControlTool {
         let original = ctx.executing_caller_for(caller).ok_or_else(|| {
             ToolError::Execution("session_control requires its original complete caller".into())
         })?;
-        let (target_session_id, target_ref, operation_id, message) = match serde_json::from_value(
-            args,
-        )
-        .map_err(|error| {
+        let followup = match serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
         })? {
             SessionControlArgs::Scope => {
@@ -933,6 +995,54 @@ impl Tool for SessionControlTool {
                     .await
                     .map(ToolOutcome::Completed);
             }
+            SessionControlArgs::WaitRun {
+                target_session_id,
+                target_ref,
+                expected_run_id,
+            } => {
+                validate_root_run_caller(original, &supervisor)?;
+                validate_root_run_target(&target_session_id, &target_ref)?;
+                if !bamboo_domain::valid_session_run_id(&expected_run_id) {
+                    return Err(ToolError::InvalidArguments(
+                        "invalid expected_run_id".into(),
+                    ));
+                }
+                let port = self.root_run.as_ref().ok_or_else(|| {
+                    ToolError::Execution("supervised_root_run_unavailable".into())
+                })?;
+                return port
+                    .wait_run(original, &target_ref, &expected_run_id)
+                    .await
+                    .map(ToolOutcome::Completed);
+            }
+            SessionControlArgs::WaitOutcomes { outcome_targets } => {
+                validate_root_run_caller(original, &supervisor)?;
+                for selection in &outcome_targets {
+                    validate_root_run_target(
+                        &selection.target_ref.session_id,
+                        &selection.target_ref,
+                    )?;
+                    if !bamboo_domain::valid_session_run_id(&selection.expected_run_id) {
+                        return Err(ToolError::InvalidArguments(
+                            "invalid expected_run_id".into(),
+                        ));
+                    }
+                }
+                if outcome_targets[0].target_ref.session_id
+                    == outcome_targets[1].target_ref.session_id
+                {
+                    return Err(ToolError::InvalidArguments(
+                        "wait_outcomes requires two distinct Root Sessions".into(),
+                    ));
+                }
+                let port = self.root_run.as_ref().ok_or_else(|| {
+                    ToolError::Execution("supervised_root_run_unavailable".into())
+                })?;
+                return port
+                    .wait_outcomes(original, &outcome_targets)
+                    .await
+                    .map(ToolOutcome::Completed);
+            }
             SessionControlArgs::Cancel {
                 target_session_id,
                 target_ref,
@@ -960,7 +1070,14 @@ impl Tool for SessionControlTool {
                 target_ref,
                 operation_id,
                 message,
-            } => (target_session_id, target_ref, operation_id, message),
+                notify_on_material_event,
+            } => (
+                target_session_id,
+                target_ref,
+                operation_id,
+                message,
+                notify_on_material_event,
+            ),
             SessionControlArgs::Loop {
                 target_session_id,
                 expected_link_revision,
@@ -998,18 +1115,26 @@ impl Tool for SessionControlTool {
                 )));
             }
         };
+        let (target_session_id, target_ref, operation_id, message, notify_on_material_event) =
+            followup;
         let target_ref = target_ref.filter(|target| target.session_id == target_session_id)
             .ok_or_else(|| ToolError::InvalidArguments(
                 "followup requires the exact current_user_target from session_history list/inspect; no Project grant or attachment is needed".into()
             ))?;
+        if notify_on_material_event && target_ref.kind != bamboo_domain::SessionKind::Root {
+            return Err(ToolError::InvalidArguments(
+                "material notifications require an independent Root".into(),
+            ));
+        }
         let result = self
             .messenger
-            .supervisor_current_user_followup(
+            .supervisor_followup_with_material_notifications(
                 original,
                 &supervisor,
                 &target_ref,
                 &operation_id,
                 &message,
+                notify_on_material_event,
             )
             .await;
         let (delivery, activation, detail) = match result {
@@ -1034,13 +1159,23 @@ impl Tool for SessionControlTool {
             Err(error) => return Err(ToolError::Execution(error.to_string())),
         };
         let activation_retry_required = activation == "activation_retry_required";
-        Ok(ToolOutcome::Completed(ToolResult::text(!activation_retry_required, json!({
-            "action": "followup", "target_session_id": target_session_id,
-            "operation_id": operation_id, "admitted": true,
-            "receipt_id": delivery.id, "generation": delivery.generation,
-            "activation": activation, "activation_error": detail,
-            "note": "Admission is durable; this is not completion. A waiting target remains waiting. Retry with the same operation_id and message if activation needs recovery; read results with session_history.read_messages."
-        }).to_string())))
+        let note = if notify_on_material_event {
+            "Material notices return through this Supervisor's Inbox. Finish this short decision turn while task Sessions continue. Inspect each cited record and independently review the actual delivery when a notice arrives."
+        } else {
+            "Admission is durable; this is not completion. A waiting target remains waiting. Retry with the same operation_id and message if activation needs recovery; read results with session_history.read_messages."
+        };
+        Ok(ToolOutcome::Completed(ToolResult::text(
+            !activation_retry_required,
+            json!({
+                "action": "followup", "target_session_id": target_session_id,
+                "operation_id": operation_id, "admitted": true,
+                "receipt_id": delivery.id, "generation": delivery.generation,
+                "activation": activation, "activation_error": detail,
+                "notify_on_material_event": notify_on_material_event,
+                "note": note
+            })
+            .to_string(),
+        )))
     }
 }
 

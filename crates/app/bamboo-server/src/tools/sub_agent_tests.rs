@@ -846,6 +846,7 @@ async fn build_test_harness_with_hook(
 struct WaitOrderPort {
     inner: Arc<ChildSessionAdapter>,
     storage: Arc<dyn Storage>,
+    reject_builtin_route: AtomicBool,
     fail_launch: AtomicBool,
     checked_launches: AtomicUsize,
     hold_first_enqueue: AtomicBool,
@@ -878,6 +879,7 @@ impl WaitOrderPort {
         Self {
             inner,
             storage,
+            reject_builtin_route: AtomicBool::new(false),
             fail_launch: AtomicBool::new(false),
             checked_launches: AtomicUsize::new(0),
             hold_first_enqueue: AtomicBool::new(false),
@@ -959,6 +961,11 @@ impl ChildSessionPort for WaitOrderPort {
         runtime_metadata: &HashMap<String, String>,
         subagent_type: &str,
     ) -> Result<(), ChildSessionError> {
+        if self.reject_builtin_route.load(Ordering::SeqCst) {
+            return Err(ChildSessionError::Execution(
+                "selected route lacks built-in support".into(),
+            ));
+        }
         self.inner
             .validate_required_child_context_route(runtime_metadata, subagent_type)
             .await
@@ -7638,6 +7645,7 @@ fn child_report_fixture() -> serde_json::Value {
 #[tokio::test]
 async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
     let h = build_test_harness_with_storage(None, None, true).await;
+    configure_test_runtime_models(&h, &["gpt-5", "private/custom-child"]).await;
     let mut parent = h
         .storage
         .load_session(&h.parent_session_id)
@@ -7654,9 +7662,29 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
     port.skip_successful_enqueue.store(true, Ordering::SeqCst);
     let tool = SubAgentTool::new(port.clone(), h.adapter.clone());
     let message = "  Analyze this complete task 🪷\n\nPreserve every instruction and the trailing whitespace.  ";
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    let rejected = invoke_completed(
+        &tool,
+        json!({"message":message, "model":"relay:upstream-only"}),
+        subagent_test_ctx(&h.parent_session_id, "compact-rejected-model"),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        rejected.to_string().contains("model route is not admitted"),
+        "{rejected}"
+    );
+    assert!(!rejected.to_string().contains("upstream-only"));
+    assert_eq!(
+        h.adapter.session_store.list_index_entries().await.len(),
+        before
+    );
+    assert!(port.last_admit_child_id.read().unwrap().is_none());
+
     for (index, args) in [
         json!({"message":message}),
         json!({"intent":"chat", "role":"explorer", "target":"", "reply_to":"", "message":message}),
+        json!({"message":message, "model":"relay:private/custom-child", "reasoning_effort":"max"}),
     ]
     .into_iter()
     .enumerate()
@@ -7683,10 +7711,10 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
         assert_eq!(child.metadata["assignment_prompt"], message);
         // Named roles encode the complete task as JSON in their protected
         // context packet; the generic worker keeps the literal assignment.
-        let visible_assignment = if index == 0 {
-            message.to_owned()
-        } else {
+        let visible_assignment = if index == 1 {
             serde_json::to_string(message).unwrap()
+        } else {
+            message.to_owned()
         };
         assert!(child
             .messages
@@ -7698,6 +7726,14 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
             assert!(child_session::named_profile::has_named_profile(&child));
             child_session::named_profile::validate_named_profile(&child).unwrap();
         }
+        if index == 2 {
+            assert_eq!(child.model, "private/custom-child");
+            assert_eq!(child.model_ref.unwrap().provider, "relay");
+            assert_eq!(
+                child.reasoning_effort,
+                Some(bamboo_domain::ReasoningEffort::Max)
+            );
+        }
         assert_eq!(
             child.workspace.as_deref(),
             Some(h.workspace_path.to_str().unwrap())
@@ -7706,8 +7742,53 @@ async fn compact_chat_creates_a_durable_child_with_the_complete_message() {
         assert!(payload.get("child_session_id").is_none());
         assert!(payload.get("runtime_kind").is_none());
     }
+    let before = h.adapter.session_store.list_index_entries().await.len();
+    let agents = h.adapter.session_store.bamboo_home_dir().join("agents");
+    tokio::fs::create_dir_all(&agents).await.unwrap();
+    let profile = agents.join("worker.md");
+    tokio::fs::write(
+        &profile,
+        "---\nschema_version: 1\nname: worker\ndescription: Pinned Worker\nmodel_hint: relay:gpt-5\n---\nFollow the Worker profile.\n",
+    )
+    .await
+    .unwrap();
+    for route in ["named-profile", "external", "unsupported-local-executor"] {
+        if route == "external" {
+            tokio::fs::remove_file(&profile).await.unwrap();
+            h.adapter.config.write().await.extra.insert(
+                "subagentRouting".into(),
+                json!({"worker":{"runtime":"external","agent_id":"remote-worker"}}),
+            );
+        }
+        if route == "unsupported-local-executor" {
+            h.adapter
+                .config
+                .write()
+                .await
+                .extra
+                .remove("subagentRouting");
+            port.reject_builtin_route.store(true, Ordering::SeqCst);
+        }
+        let rejected = invoke_completed(
+            &tool,
+            json!({"message":message, "model":"relay:private/custom-child"}),
+            subagent_test_ctx(&h.parent_session_id, route),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            rejected.to_string().contains("model route is not admitted"),
+            "{route}: {rejected}"
+        );
+        assert_eq!(
+            h.adapter.session_store.list_index_entries().await.len(),
+            before
+        );
+    }
     let schema = tool.parameters_schema();
-    assert_eq!(schema["properties"].as_object().unwrap().len(), 5);
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 7);
+    assert!(schema["properties"].get("model").is_some());
+    assert!(schema["properties"].get("reasoning_effort").is_some());
     assert!(schema["properties"].get("action").is_none());
 }
 

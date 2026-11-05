@@ -4,23 +4,31 @@
 //! blocking job retains the Router owner. The runner table is only tried while
 //! those fences are held, so no async wait or lock-order inversion is added.
 
-use std::{collections::HashMap, io, sync::Arc};
+use std::{collections::HashMap, future::Future, io, sync::Arc};
 
 use async_trait::async_trait;
-use bamboo_agent_core::tools::{ToolError, ToolResult};
-use bamboo_domain::{
-    AdmissionCommit, AdmissionGate, SessionActivationPort, SessionAuthorityIdentity,
-    SessionCallerReference, SupervisorCurrentUserTarget, SupervisorReference,
+use bamboo_agent_core::{
+    tools::{ToolError, ToolResult},
+    AgentEvent,
 };
-use bamboo_server_tools::session_control::root_run::SupervisedRootRunPort;
-use bamboo_storage::SessionStoreV2;
+use bamboo_domain::{
+    AdmissionCommit, AdmissionGate, ManagedRootEvent, ManagedRootEventRead, SessionActivationPort,
+    SessionAuthorityIdentity, SessionCallerReference, SupervisorCurrentUserTarget,
+    SupervisorReference,
+};
+use bamboo_orchestration::managed_session::{
+    read_when_verified, wait_for_outcome, ManagedRunHint, ManagedRunSignals,
+};
+use bamboo_server_tools::session_control::root_run::{ManagedOutcomeTarget, SupervisedRootRunPort};
+use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tokio::sync::{broadcast, RwLock};
 
 use super::{fresh_sync::FreshSyncRegistry, live_retry::LiveRetryBridge, AgentRunner, AgentStatus};
 
 pub(super) struct SupervisedRootRunController {
     pub(super) store: Arc<SessionStoreV2>,
+    pub(super) inbox: Arc<FileSessionInbox>,
     pub(super) router: Arc<bamboo_engine::SessionActivationRouter>,
     pub(super) runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(super) live_retry: Arc<LiveRetryBridge>,
@@ -170,10 +178,15 @@ fn run_control(
             "terminal_unconfirmed",
         ));
     }
-    if expected.is_some() {
+    if expected.is_some()
+        && gate.is_none()
+        && runner.supervisor_run_observation_matches(target, workspace_path) != Some(true)
+    {
+        return Ok(conflict(&target.session_id, expected, "run_not_observed"));
+    }
+    if let Some(gate) = gate {
         // This is the existing exact Retry/runner cancellation signal. Do not
         // set a terminal status or discard any pending Inbox input here.
-        let gate = gate.ok_or_else(|| io::Error::other("missing Root cancel admission"))?;
         match gate.commit(|| {
             runner.bind_supervisor_run_target(target, workspace_path);
             live_retry.cancel_and_token(&target.session_id, &candidate, &runner.cancel_token);
@@ -212,7 +225,59 @@ fn run_control(
     }
 }
 
+struct RootRunSignals<F> {
+    finalized: F,
+    task_events: Option<broadcast::Receiver<AgentEvent>>,
+}
+
+#[async_trait]
+impl<F: Future<Output = ()> + Unpin + Send> ManagedRunSignals for RootRunSignals<F> {
+    async fn next_hint(&mut self) -> ManagedRunHint {
+        let Some(task_events) = self.task_events.as_mut() else {
+            (&mut self.finalized).await;
+            return ManagedRunHint::Finalized;
+        };
+        loop {
+            tokio::select! {
+                () = &mut self.finalized => return ManagedRunHint::Finalized,
+                event = task_events.recv() => match event {
+                    Ok(AgentEvent::TaskListUpdated { .. }) | Err(broadcast::error::RecvError::Lagged(_)) => {
+                        return ManagedRunHint::TaskChanged;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => {
+                        (&mut self.finalized).await;
+                        return ManagedRunHint::Finalized;
+                    }
+                    Ok(_) => {}
+                },
+            }
+        }
+    }
+}
+
 impl SupervisedRootRunController {
+    async fn read_event(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &ManagedOutcomeTarget,
+    ) -> Result<ManagedRootEventRead, ToolError> {
+        self.inbox
+            .read_managed_root_event(
+                caller,
+                supervisor,
+                &target.target_ref,
+                &target.expected_run_id,
+                target.after_sequence,
+                target.after_blocker_cursor,
+            )
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "Managed Root outcome evidence unavailable");
+                ToolError::Execution("managed_root_outcome_evidence_unavailable".into())
+            })
+    }
+
     async fn control(
         &self,
         caller: &SessionCallerReference,
@@ -265,6 +330,105 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         self.control(caller, target, None, None).await
     }
 
+    async fn wait_run(
+        &self,
+        caller: &SessionCallerReference,
+        target: &SupervisorCurrentUserTarget,
+        expected_run_id: &str,
+    ) -> Result<ToolResult, ToolError> {
+        let expected = Some(expected_run_id);
+        let initial = self.control(caller, target, expected, None).await?;
+        let initial_status: Value = serde_json::from_str(&initial.result)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if !initial.success || initial_status["status"] == "already_finished" {
+            return Ok(initial);
+        }
+
+        let signal = self
+            .runners
+            .read()
+            .await
+            .get(&target.session_id)
+            .filter(|runner| runner.run_id == expected_run_id)
+            .map(AgentRunner::wait_for_exact_finalization);
+        if let Some(signal) = signal {
+            bamboo_orchestration::managed_session::wait_for_finalization(signal).await;
+        }
+
+        // The signal alone cannot authorize a read or name an outcome. Recheck
+        // the canonical target and the exact run, even on timeout or replacement.
+        let final_observation = self.control(caller, target, expected, None).await?;
+        let final_status: Value = serde_json::from_str(&final_observation.result)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if !final_observation.success || final_status["status"] == "already_finished" {
+            return Ok(final_observation);
+        }
+
+        Ok(ToolResult::text(
+            true,
+            json!({
+                "status": "wait_timeout",
+                "target_session_id": target.session_id,
+                "run_id": expected_run_id,
+                "completion_verified": false
+            })
+            .to_string(),
+        ))
+    }
+
+    async fn wait_outcomes(
+        &self,
+        caller: &SessionCallerReference,
+        targets: &[ManagedOutcomeTarget; 2],
+    ) -> Result<ToolResult, ToolError> {
+        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
+        else {
+            return Err(ToolError::Execution("original Supervisor required".into()));
+        };
+        let supervisor = SupervisorReference {
+            session_id: caller.session_id.clone(),
+            incarnation_id: *incarnation_id,
+        };
+        // Subscribe before inspecting Main to cover completion during the read.
+        // A signal is only a hint. The read revalidates the exact authority and ACK.
+        let [first_signals, second_signals] = {
+            let runners = self.runners.read().await;
+            targets.each_ref().map(|target| {
+                runners
+                    .get(&target.target_ref.session_id)
+                    .filter(|runner| runner.run_id == target.expected_run_id)
+                    .map(|runner| RootRunSignals {
+                        finalized: Box::pin(runner.wait_for_exact_finalization()),
+                        task_events: target
+                            .after_blocker_cursor
+                            .map(|_| runner.event_sender.subscribe()),
+                    })
+            })
+        };
+        let [first, second] = targets;
+        let outcome = wait_for_outcome(
+            read_when_verified(
+                || self.read_event(caller, &supervisor, first),
+                first_signals,
+            ),
+            read_when_verified(
+                || self.read_event(caller, &supervisor, second),
+                second_signals,
+            ),
+        )
+        .await?;
+        let response = match outcome {
+            Some(ManagedRootEvent::Outcome(outcome)) => {
+                json!({"status":"recorded_outcome", "outcome":outcome})
+            }
+            Some(ManagedRootEvent::Blocker(blocker)) => {
+                json!({"status":"recorded_blocker", "blocker":blocker})
+            }
+            None => json!({"status":"outcome_unknown"}),
+        };
+        Ok(ToolResult::text(true, response.to_string()))
+    }
+
     async fn cancel_run(
         &self,
         caller: &SessionCallerReference,
@@ -274,5 +438,32 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
     ) -> Result<ToolResult, ToolError> {
         self.control(caller, target, Some(expected_run_id), Some(gate))
             .await
+    }
+}
+
+// Reuse the native fixture without enrolling a managed-Root case in the
+// Observer feature's fixed historical subscription catalog.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    #[actix_web::test]
+    async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
+        super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
+    }
+
+    #[actix_web::test]
+    async fn material_notices_deliver_older_sources_beyond_the_process_cache() {
+        super::super::observer_subscriptions::tests::exercise_material_notification_cache_fairness(
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn managed_wait_wakes_on_the_exact_durable_task_blocker_before_root_finishes() {
+        super::super::observer_subscriptions::tests::exercise_managed_wait_blocker().await;
+    }
+
+    #[actix_web::test]
+    async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_after_restart() {
+        super::super::observer_subscriptions::tests::exercise_managed_wait_outcomes().await;
     }
 }

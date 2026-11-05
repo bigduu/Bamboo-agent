@@ -1,4 +1,4 @@
-//! Six bounded model tools over the same application service as HTTP.
+//! Bounded model tools over the same application service as HTTP.
 //! The original executing Supervisor observation is required on every call.
 use crate::{
     app_state::ticket_application::TicketApplication,
@@ -18,13 +18,16 @@ pub mod semantic_schema;
 #[cfg(test)]
 mod tests;
 
-pub const NAMES: [&str; 6] = [
+pub const NAMES: &[&str] = &[
     "work_overview",
     "work_search",
     "work_inspect",
     "work_changes",
     "work_update",
     "work_dispatch",
+    // Work Review needs the Host read-only Project identity proof.
+    #[cfg(unix)]
+    "work_review",
 ];
 
 /// Production definition reused by opt-in proposal-only live model evaluation.
@@ -39,7 +42,7 @@ pub fn overlay(
     // Install the guarded definitions before explicit initialization so an
     // already-built runtime can use the scope as soon as the owner creates it.
     // Every invocation still validates the original Supervisor and live binding.
-    for name in NAMES {
+    for &name in NAMES {
         base = Arc::new(super::OverlayToolExecutor::new(
             base,
             Arc::new(TicketTool {
@@ -68,6 +71,15 @@ struct Mutation {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct Review {
+    project_id: String,
+    work_id: String,
+    assignment_id: String,
+    operation_id: uuid::Uuid,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SemanticMutation {
     message_id: String,
     proposal: MessageProposal,
@@ -75,7 +87,7 @@ struct SemanticMutation {
 
 impl TicketTool {
     fn mutating(&self) -> bool {
-        matches!(self.name, "work_update" | "work_dispatch")
+        matches!(self.name, "work_update" | "work_dispatch" | "work_review")
     }
 
     async fn call(&self, args: Value, ctx: &ToolCtx) -> Result<Value> {
@@ -148,6 +160,21 @@ impl TicketTool {
                     request.limit,
                     request.cursor.as_ref(),
                 )?)?)
+            }
+            "work_review" => {
+                let request: Review = decode(args)?;
+                let original = ctx.executing_caller_for(caller).cloned().ok_or_else(|| {
+                    Error::ScopeDenied("original Work Review caller missing".into())
+                })?;
+                app.review_work(
+                    reference,
+                    original,
+                    &request.project_id,
+                    &request.work_id,
+                    &request.assignment_id,
+                    request.operation_id,
+                )
+                .await
             }
             "work_update" | "work_dispatch" => {
                 if self.name == "work_update" && args.get("message_id").is_some() {
@@ -225,6 +252,7 @@ impl Tool for TicketTool {
             "work_search" => "Search authoritative work summaries by lexical text/ID, kind, state, updated seq or archive status. Reuse the fixed commit/cursor across pages; report coverage/truncation.",
             "work_inspect" => "Inspect up to 32 scope IDs, selected sections, bounded containment depth and byte budget. Ticket contract is always present; sections declares what history was requested. Read revisions, requests and submissions before changing or accepting them.",
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",
+            "work_review" => "Explicitly request one metered advisory review of a current Work and Assignment. Use a stable operation UUID for retries and read the cited Work and Session evidence. The configured Work Review or Fast role summarizes purpose, progress, waits and outputs. Review does not dispatch or accept the delivery.",
             "work_update" => semantic_schema::RESOLUTION_GUIDANCE,
             _ => "Commit start/steer/pause/cancel/retry intents through the existing Runtime. Explicit pause stays blocked after stop; ready resumes a stopped pause. Reopen/start creates a fresh attempt only after confirmed stop and reconciled effects. Returns accepted_for_dispatch with receipt immediately, not completion or acceptance.",
         }

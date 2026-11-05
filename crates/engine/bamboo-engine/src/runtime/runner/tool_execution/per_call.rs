@@ -52,6 +52,7 @@ fn parse_warning_log_details<'a>(
             "work_changes",
             "work_update",
             "work_dispatch",
+            "work_review",
         ]
         .iter()
         .any(|name| execution_name.eq_ignore_ascii_case(name))

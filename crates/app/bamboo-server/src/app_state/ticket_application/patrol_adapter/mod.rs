@@ -10,6 +10,7 @@ mod program;
 mod runtime_observation;
 mod semantic;
 mod status;
+mod work_review;
 pub use checkpoint_store::PatrolCheckpointStore;
 
 use bamboo_orchestration::patrol::{host, Scope};

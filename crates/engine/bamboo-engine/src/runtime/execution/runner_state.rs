@@ -88,7 +88,7 @@ pub struct AgentRunner {
     // Only the exact-run finalizer sets this. Legacy HTTP Stop also sets the
     // visible status/completed_at when it signals, which is not finalization;
     // an unqualified finalizer cannot prove which run it finalized.
-    pub(super) execution_finalized: bool,
+    pub(super) execution_finalized: CancellationToken,
     // A Host may retain an observation only after exact Router ownership or
     // the retained FreshSync owner has been checked. It is not an authority.
     supervisor_run_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
@@ -171,7 +171,14 @@ impl AgentRunner {
 
     /// This bit is set only by finalization of the matching run ID.
     pub fn exact_execution_finalized(&self) -> bool {
-        self.execution_finalized
+        self.execution_finalized.is_cancelled()
+    }
+
+    /// Subscribe to the exact run's finalizer without granting the caller a way to signal it.
+    pub fn wait_for_exact_finalization(
+        &self,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
+        self.execution_finalized.clone().cancelled_owned()
     }
 
     /// Compare an existing Host observation without treating it as a grant.
@@ -199,7 +206,7 @@ impl AgentRunner {
         target: &bamboo_domain::SupervisorCurrentUserTarget,
         workspace_path: Option<&str>,
     ) -> bool {
-        self.execution_finalized
+        self.execution_finalized.is_cancelled()
             && self.supervisor_run_observation_matches(target, workspace_path) == Some(true)
     }
     /// Broadcast channel capacity for agent events.
@@ -227,7 +234,7 @@ impl AgentRunner {
             status: AgentStatus::Pending,
             started_at: Utc::now(),
             completed_at: None,
-            execution_finalized: false,
+            execution_finalized: CancellationToken::new(),
             supervisor_run_target: None,
             supervisor_run_workspace: None,
             last_budget_event: None,

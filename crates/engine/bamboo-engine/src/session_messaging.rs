@@ -1152,6 +1152,26 @@ impl SessionMessenger {
         operation_id: &str,
         message: &str,
     ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
+        self.supervisor_followup_with_material_notifications(
+            caller,
+            supervisor,
+            target,
+            operation_id,
+            message,
+            false,
+        )
+        .await
+    }
+
+    pub async fn supervisor_followup_with_material_notifications(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        operation_id: &str,
+        message: &str,
+        notify_on_material_event: bool,
+    ) -> Result<SessionMessengerReceipt, SessionMessengerError> {
         Self::validate_peer_input(operation_id, message)?;
         let envelope = SessionMessageEnvelope {
             id: bamboo_domain::supervisor_current_user_message_id(supervisor, target, operation_id),
@@ -1170,7 +1190,13 @@ impl SessionMessenger {
         let started = Instant::now();
         let delivery = self
             .inbox
-            .deliver_supervisor_current_user_followup(caller, supervisor, target, &envelope)
+            .deliver_supervisor_followup_with_material_notifications(
+                caller,
+                supervisor,
+                target,
+                &envelope,
+                notify_on_material_event,
+            )
             .await
             .map_err(SessionMessengerError::Inbox)?;
         let admission = self.record_admission(envelope, delivery, started);

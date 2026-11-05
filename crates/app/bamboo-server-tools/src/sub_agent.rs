@@ -524,7 +524,9 @@ fn tool_error_from_child_session(error: ChildSessionError) -> ToolError {
         ChildSessionError::NotRootSession(id) => {
             ToolError::Execution(format!("session is not a root session: {id}"))
         }
-        ChildSessionError::InvalidArguments(msg) => ToolError::InvalidArguments(msg),
+        ChildSessionError::InvalidArguments(msg) | ChildSessionError::ModelNotAdmitted(msg) => {
+            ToolError::InvalidArguments(msg)
+        }
         ChildSessionError::Execution(msg) => ToolError::Execution(msg),
         other => ToolError::Execution(other.to_string()),
     }
@@ -1675,10 +1677,18 @@ impl SubAgentTool {
                                 context_fork: fork_last_messages.filter(|n| *n > 0),
                             };
                         let result = if compact {
-                            Box::pin(child_session::create_shared_child_action(self.sessions.as_ref(), input)).await
+                            Box::pin(child_session::create_shared_child_action(self.sessions.as_ref(), input))
+                                .await
+                                .map_err(|error| match error {
+                                    ChildSessionError::ModelNotAdmitted(_) =>
+                                        ToolError::InvalidArguments(facade::MODEL_NOT_ADMITTED_ERROR.into()),
+                                    other => tool_error_from_child_session(other),
+                                })
                         } else {
-                            Box::pin(child_session::create_child_action(self.sessions.as_ref(), input)).await
-                        }.map_err(tool_error_from_child_session)?;
+                            Box::pin(child_session::create_child_action(self.sessions.as_ref(), input))
+                                .await
+                                .map_err(tool_error_from_child_session)
+                        }?;
                         {
                             let child = self.sessions.load_child_for_parent(&parent.id, &result.child_session_id)
                                 .await.map_err(tool_error_from_child_session)?;
@@ -2213,16 +2223,17 @@ mod tests {
             .collect();
         assert_eq!(
             actual,
-            std::collections::BTreeSet::from(["intent", "target", "role", "message", "reply_to",])
+            std::collections::BTreeSet::from([
+                "intent",
+                "target",
+                "role",
+                "model",
+                "reasoning_effort",
+                "message",
+                "reply_to",
+            ])
         );
-        for physical_or_runtime in [
-            "model",
-            "workspace",
-            "worker_bin",
-            "endpoint",
-            "action",
-            "auto_run",
-        ] {
+        for physical_or_runtime in ["workspace", "worker_bin", "endpoint", "action", "auto_run"] {
             assert!(schema["properties"].get(physical_or_runtime).is_none());
         }
     }

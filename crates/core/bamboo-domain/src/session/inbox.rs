@@ -2007,6 +2007,23 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    async fn deliver_supervisor_followup_with_material_notifications(
+        &self,
+        caller: &crate::SessionCallerReference,
+        supervisor: &crate::SupervisorReference,
+        target: &crate::SupervisorCurrentUserTarget,
+        envelope: &SessionMessageEnvelope,
+        notify_on_material_event: bool,
+    ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if notify_on_material_event {
+            return Err(SessionInboxError::Storage(
+                "managed Session material notifications are unsupported".into(),
+            ));
+        }
+        self.deliver_supervisor_current_user_followup(caller, supervisor, target, envelope)
+            .await
+    }
+
     /// Admit one typed Supervisor peer message while retaining canonical
     /// incarnation, relationship, Project and target lifetime authority locks
     /// through the inbox receipt. The original target birth is required even
@@ -3269,6 +3286,7 @@ mod tests {
             supervisor_created_at: Utc::now(),
             caller: None,
             requires_host_scope: None,
+            notify_on_material_event: false,
             target: crate::SupervisorCurrentUserTarget::capture(&target_session).unwrap(),
             operation_id: SessionMessageId::parse("origin-operation").unwrap(),
         };

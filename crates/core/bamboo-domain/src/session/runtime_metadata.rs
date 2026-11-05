@@ -105,6 +105,9 @@ pub struct SessionRuntimeMetadata {
     /// Monotonic task-list version, stored as its decimal string form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_list_version: Option<String>,
+    /// Sidecar-owned observation of the current Task revision's exact writer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_task_blocker: Option<super::ManagedTaskBlocker>,
     /// Legacy alias of the task-list version (`todo_list_version`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub todo_list_version: Option<String>,

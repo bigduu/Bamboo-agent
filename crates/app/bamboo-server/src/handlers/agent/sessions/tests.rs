@@ -8,6 +8,7 @@ use chrono::Utc;
 #[test]
 fn session_summary_from_entry_includes_last_run_fields() {
     let entry = SessionIndexEntry {
+        material_notification_hint: None,
         id: "child-1".to_string(),
         // Simulate a pre-#770 index row: the compatibility boolean is present
         // but the newly added typed field deserializes to its default.
@@ -75,6 +76,7 @@ fn session_summary_from_entry_includes_last_run_fields() {
 #[test]
 fn session_summary_from_entry_propagates_subagent_type() {
     let entry = SessionIndexEntry {
+        material_notification_hint: None,
         id: "child-2".to_string(),
         bypass_permissions: false,
         permission_mode: bamboo_domain::SessionPermissionMode::Default,

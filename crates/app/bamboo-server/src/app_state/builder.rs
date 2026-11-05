@@ -1221,6 +1221,7 @@ impl AppState {
         let fresh_sync = Arc::new(super::fresh_sync::FreshSyncRegistry::default());
         let root_run = Arc::new(super::supervised_root_run::SupervisedRootRunController {
             store: session_store.clone(),
+            inbox: file_session_inbox.clone(),
             router: session_activation_router.clone(),
             runners: agent_runners.clone(),
             live_retry: live_retry.clone(),
@@ -1349,6 +1350,7 @@ impl AppState {
             ),
         );
         if start_inbox_reconciler {
+            observer_subscriptions.spawn_material_notifications(mcp_proxy_shutdown.clone());
             observer_subscriptions.tick(chrono::Utc::now()).await;
             // Reconcile exact Inbox wake readiness before serving, then pace
             // runtime recovery for due leases and missed activation handoffs.

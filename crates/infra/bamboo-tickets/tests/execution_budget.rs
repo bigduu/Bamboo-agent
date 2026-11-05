@@ -550,6 +550,48 @@ fn concurrent_same_operation_consumes_one_persistent_charge() {
 }
 
 #[test]
+fn work_token_submission_has_one_winner_and_reopen_only_recovers_the_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = open(dir.path());
+    let work = create(&service);
+    configure(&service, &work, 100, 100, 100);
+    let input = input_request(&service, &work, "work-review/one");
+    let barrier = Arc::new(Barrier::new(2));
+    let submissions: Vec<_> = (0..2)
+        .map(|_| {
+            let service = service.clone();
+            let input = input.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                service
+                    .reserve_work_token_submission(&runtime(), &input, 1)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .map(|worker| worker.join().unwrap())
+        .collect();
+    let winner = submissions
+        .iter()
+        .find_map(|admission| match admission {
+            WorkTokenSubmission::New(record) => Some(record),
+            _ => None,
+        })
+        .unwrap();
+    assert!(submissions.contains(&WorkTokenSubmission::Existing(winner.clone())));
+    drop(service);
+    let service = open(dir.path());
+    assert_eq!(
+        service
+            .reserve_work_token_submission(&runtime(), &input, 2)
+            .unwrap(),
+        WorkTokenSubmission::Existing(winner.clone())
+    );
+}
+
+#[test]
 fn head_swap_without_ack_reopens_the_original_charge() {
     let dir = tempfile::tempdir().unwrap();
     let service = open(dir.path());

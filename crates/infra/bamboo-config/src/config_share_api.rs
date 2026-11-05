@@ -740,6 +740,7 @@ fn merge_scenarios(current: &mut Config, plan: &ShareBundle) -> Result<(), Share
             planning: None,
             search: None,
             code_review: None,
+            work_review: None,
             sub_agent: None,
             subagent_models: Default::default(),
         });

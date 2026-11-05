@@ -152,6 +152,28 @@ async fn create_child_action_inner(
                 .await?
         }
     };
+    if shared_workspace
+        && input
+            .runtime_metadata
+            .contains_key(super::named_profile::PROFILE_EXPLICIT_MODEL_KEY)
+    {
+        if profile.is_some()
+            || input
+                .runtime_metadata
+                .get("external.agent_id")
+                .map(String::as_str)
+                != Some(crate::external_agents::config::LOCAL_ACTOR_AGENT_ID)
+        {
+            return Err(ChildSessionError::ModelNotAdmitted(
+                "compact model selection requires an unprofiled built-in Bamboo route".into(),
+            ));
+        }
+        // The local-actor label alone can also select a legacy executor.
+        // Required context already preflights the actual built-in Bamboo route.
+        port.validate_required_child_context_route(&input.runtime_metadata, &input.subagent_type)
+            .await
+            .map_err(|error| ChildSessionError::ModelNotAdmitted(error.to_string()))?;
+    }
     if let Some(profile) = &profile {
         if input.lifecycle.as_deref() == Some("resident")
             || input.resident_name.is_some()
@@ -474,7 +496,14 @@ async fn create_child_action_inner(
 
     // Profile selection and runtime metadata now contain the final model
     // authority. Reject it before publishing workspace or persisting a child.
-    port.validate_child_model(&child).await?;
+    port.validate_child_model(&child)
+        .await
+        .map_err(|error| match error {
+            ChildSessionError::InvalidArguments(detail) => {
+                ChildSessionError::ModelNotAdmitted(detail)
+            }
+            other => other,
+        })?;
 
     // Publish the path that already passed the host's confinement and Project
     // ownership checks without applying process-global policy a second time.

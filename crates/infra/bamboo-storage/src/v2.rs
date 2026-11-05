@@ -402,6 +402,8 @@ struct TaskControlPlaneUndo {
     task_list: Option<TaskList>,
     task_list_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_task_blocker: Option<bamboo_domain::ManagedTaskBlocker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     conversation_witness: Option<TaskConversationWitness>,
 }
 
@@ -1063,6 +1065,9 @@ pub struct SessionPlacement {
 pub struct SessionIndexEntry {
     pub id: String,
     pub kind: SessionKind,
+    /// Derived discovery hint. Main and the original Inbox receipt own the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_notification_hint: Option<String>,
     /// Path relative to `bamboo_home_dir` (e.g. "sessions/<id>" or "sessions/<root>/children/<id>").
     pub rel_path: String,
     pub title: String,
@@ -1463,6 +1468,37 @@ struct SessionWriteGuard {
     kind: Option<SaveKind>,
     acquired: Instant,
     metrics: Arc<SessionPersistenceMetrics>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum SessionLockWait {
+    Wait,
+    Try,
+}
+
+impl SessionLockWait {
+    pub(crate) fn lock_exclusive(self, file: &std::fs::File) -> io::Result<()> {
+        match self {
+            Self::Wait => FileExt::lock_exclusive(file),
+            Self::Try => FileExt::try_lock_exclusive(file).map_err(|error| {
+                let contended = error.kind() == io::ErrorKind::WouldBlock
+                    || error.raw_os_error().is_some_and(|code| {
+                        Some(code) == fs2::lock_contended_error().raw_os_error()
+                    });
+                if contended {
+                    io::Error::new(io::ErrorKind::WouldBlock, "Session proof I/O is busy")
+                } else {
+                    error
+                }
+            }),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct MaterialNotificationStamps {
+    pub main: (u64, std::time::SystemTime),
+    pub runtime: (u64, std::time::SystemTime),
 }
 
 #[derive(Debug)]
@@ -1934,6 +1970,7 @@ fn copied_session_snapshot(source: &Session, new_id: &str) -> Session {
         runtime.last_run_error = None;
         runtime.pending_injected_messages = None;
         runtime.task_list_version = None;
+        runtime.managed_task_blocker = None;
         runtime.todo_list_version = None;
         runtime.session_inbox_admission = None;
         runtime.supervised_root_outcomes = None;
@@ -2641,19 +2678,38 @@ impl SessionStoreV2 {
         session_id: &str,
         kind: SaveKind,
     ) -> io::Result<SessionWriteGuard> {
-        self.acquire_session_lock(session_id, Some(kind)).await
+        self.acquire_session_lock(session_id, Some(kind), SessionLockWait::Wait)
+            .await
     }
 
     async fn acquire_session_maintenance_lock(
         &self,
         session_id: &str,
     ) -> io::Result<SessionWriteGuard> {
-        self.acquire_session_lock(session_id, None).await
+        self.acquire_session_lock(session_id, None, SessionLockWait::Wait)
+            .await
+    }
+
+    async fn try_acquire_session_maintenance_lock(
+        &self,
+        session_id: &str,
+    ) -> io::Result<SessionWriteGuard> {
+        self.acquire_session_lock(session_id, None, SessionLockWait::Try)
+            .await
     }
 
     async fn acquire_actor_tree_write_guard(
         &self,
         root_id: &str,
+    ) -> io::Result<ActorTreeWriteGuard> {
+        self.acquire_actor_tree_write_guard_with_wait(root_id, SessionLockWait::Wait)
+            .await
+    }
+
+    async fn acquire_actor_tree_write_guard_with_wait(
+        &self,
+        root_id: &str,
+        wait: SessionLockWait,
     ) -> io::Result<ActorTreeWriteGuard> {
         validate_session_id(root_id)?;
         let mut hash = Sha256::new();
@@ -2668,7 +2724,7 @@ impl SessionStoreV2 {
                 .read(true)
                 .write(true)
                 .open(path)?;
-            FileExt::lock_exclusive(&file)?;
+            wait.lock_exclusive(&file)?;
             Ok::<_, io::Error>(file)
         })
         .await
@@ -2804,7 +2860,10 @@ impl SessionStoreV2 {
         durable_atomic_write(&directory.join(ACTOR_TREE_REVISION_FILE), &bytes).await
     }
 
-    async fn open_session_write_lock_file_at(path: PathBuf) -> io::Result<std::fs::File> {
+    async fn open_session_write_lock_file_at(
+        path: PathBuf,
+        wait: SessionLockWait,
+    ) -> io::Result<std::fs::File> {
         tokio::task::spawn_blocking(move || {
             let file = std::fs::OpenOptions::new()
                 .create(true)
@@ -2812,20 +2871,24 @@ impl SessionStoreV2 {
                 .read(true)
                 .write(true)
                 .open(path)?;
-            FileExt::lock_exclusive(&file)?;
+            wait.lock_exclusive(&file)?;
             Ok(file)
         })
         .await
         .map_err(|error| other_io_error(format!("join session write-lock task: {error}")))?
     }
 
-    async fn open_session_write_lock_file(&self, session_id: &str) -> io::Result<std::fs::File> {
+    async fn open_session_write_lock_file(
+        &self,
+        session_id: &str,
+        wait: SessionLockWait,
+    ) -> io::Result<std::fs::File> {
         let path = self.session_write_lock_path(session_id);
-        match Self::open_session_write_lock_file_at(path.clone()).await {
+        match Self::open_session_write_lock_file_at(path.clone(), wait).await {
             Ok(file) => Ok(file),
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
                 self.ensure_session_write_lock_dir().await?;
-                Self::open_session_write_lock_file_at(path).await
+                Self::open_session_write_lock_file_at(path, wait).await
             }
             Err(error) => Err(error),
         }
@@ -2835,6 +2898,7 @@ impl SessionStoreV2 {
         &self,
         session_id: &str,
         kind: Option<SaveKind>,
+        wait: SessionLockWait,
     ) -> io::Result<SessionWriteGuard> {
         validate_session_id(session_id)?;
         let waiting = kind.map(|_| {
@@ -2861,8 +2925,13 @@ impl SessionStoreV2 {
             acquired: Instant::now(),
             metrics: self.persistence_metrics.clone(),
         };
-        session_guard.guard = Some(lock.lock_owned().await);
-        let file = self.open_session_write_lock_file(session_id).await?;
+        session_guard.guard = Some(match wait {
+            SessionLockWait::Wait => lock.lock_owned().await,
+            SessionLockWait::Try => lock.try_lock_owned().map_err(|_| {
+                io::Error::new(io::ErrorKind::WouldBlock, "Session proof I/O is busy")
+            })?,
+        });
+        let file = self.open_session_write_lock_file(session_id, wait).await?;
         session_guard.file = Some(file);
         drop(waiting);
         if let Some(kind) = kind {
@@ -3335,6 +3404,94 @@ impl SessionStoreV2 {
     pub async fn get_index_entry(&self, session_id: &str) -> Option<SessionIndexEntry> {
         let index = self.index.read().await;
         index.sessions.get(session_id).cloned()
+    }
+
+    pub(crate) async fn mark_material_notification_hint(
+        &self,
+        session_id: &str,
+        created_at: DateTime<Utc>,
+        receipt_id: &str,
+    ) -> io::Result<()> {
+        validate_session_id(session_id)?;
+        let session_id = session_id.to_owned();
+        let receipt_id = receipt_id.to_owned();
+        self.update_index(move |index| {
+            let entry = index
+                .sessions
+                .get_mut(&session_id)
+                .filter(|entry| entry.created_at == created_at)
+                .ok_or_else(|| {
+                    io::Error::other("material notification source index is unavailable")
+                })?;
+            entry.material_notification_hint = Some(receipt_id);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Retire a derived hint only if a newer request has not replaced it.
+    pub async fn clear_material_notification_hint(
+        &self,
+        session_id: &str,
+        created_at: DateTime<Utc>,
+        expected_hint: &str,
+    ) -> io::Result<()> {
+        validate_session_id(session_id)?;
+        let session_id = session_id.to_owned();
+        let expected_hint = expected_hint.to_owned();
+        self.update_index(move |index| {
+            if let Some(entry) = index.sessions.get_mut(&session_id).filter(|entry| {
+                entry.created_at == created_at
+                    && entry.material_notification_hint.as_deref() == Some(expected_hint.as_str())
+            }) {
+                entry.material_notification_hint = None;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// File metadata is a cache hint. Physical notification admission reads Main.
+    pub async fn material_notification_stamps(
+        &self,
+        session_id: &str,
+    ) -> io::Result<MaterialNotificationStamps> {
+        validate_session_id(session_id)?;
+        let directory = self.sessions_dir.join(session_id);
+        if !fs::symlink_metadata(&directory).await?.file_type().is_dir() {
+            return Err(io::Error::other(
+                "material notification source is unavailable",
+            ));
+        }
+        let runtime = fs::symlink_metadata(directory.join(RUNTIME_SIDECAR_FILE)).await?;
+        if !runtime.file_type().is_file() {
+            return Err(io::Error::other(
+                "material notification runtime is unavailable",
+            ));
+        }
+        let metadata = fs::symlink_metadata(directory.join("session.json")).await?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(
+                "material notification Main is not a regular file",
+            ));
+        }
+        Ok(MaterialNotificationStamps {
+            main: (metadata.len(), metadata.modified()?),
+            runtime: (runtime.len(), runtime.modified()?),
+        })
+    }
+
+    /// A notification may retry later while an ordinary writer owns this Root.
+    /// Preserve canonical snapshot validation without waiting on its lock.
+    pub async fn try_load_material_notification_source(
+        &self,
+        id: &str,
+    ) -> io::Result<Option<Session>> {
+        validate_session_id(id)?;
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        let _session = self.try_acquire_session_maintenance_lock(id).await?;
+        self.load_execution_admission_unchecked(id).await
     }
 
     /// Recover a root session by its deterministic authoritative directory,
@@ -4235,6 +4392,11 @@ impl SessionStoreV2 {
         }
         current.task_list = undo.task_list.clone();
         current.set_task_list_version_meta(undo.task_list_version.clone());
+        current
+            .runtime_metadata
+            .as_mut()
+            .expect("Task metadata was set")
+            .managed_task_blocker = undo.managed_task_blocker.clone();
         self.validate_runtime_task_recovery_write_target(&abs_dir, &current)
             .await?;
         Ok((abs_dir, current))
@@ -4897,13 +5059,7 @@ impl SessionStoreV2 {
         {
             return Ok(false);
         }
-        let mut committed = current;
-        committed.task_list = updated.task_list.clone();
-        committed.set_task_list_version_meta(
-            updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
+        let committed = Self::apply_unowned_task_update(&current, updated)?;
         self.write_existing_runtime_sidecar_durable_unchecked(
             &committed,
             RuntimeTaskDurabilityEvent::SingleUpdatedSidecarPublished,
@@ -5021,20 +5177,8 @@ impl SessionStoreV2 {
         // metadata writes from another store. Build the physical writes from
         // the just-revalidated durable snapshots and patch only Task-owned
         // fields, so the transaction remains narrowly targeted.
-        let mut first_commit = current_first.clone();
-        first_commit.task_list = first_updated.task_list.clone();
-        first_commit.set_task_list_version_meta(
-            first_updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
-        let mut second_commit = current_second.clone();
-        second_commit.task_list = second_updated.task_list.clone();
-        second_commit.set_task_list_version_meta(
-            second_updated
-                .task_list_version_meta()
-                .expect("validated updated Task generation"),
-        );
+        let first_commit = Self::apply_unowned_task_update(&current_first, first_updated)?;
+        let second_commit = Self::apply_unowned_task_update(&current_second, second_updated)?;
 
         let transaction_id = Uuid::new_v4().to_string();
         let journal = RuntimeTaskTransactionJournal {
@@ -5045,12 +5189,20 @@ impl SessionStoreV2 {
                 conversation_witness: Some(TaskConversationWitness::capture(&current_first)?),
                 task_list: current_first.task_list.clone(),
                 task_list_version: first_version,
+                managed_task_blocker: current_first
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.clone()),
             },
             second: TaskControlPlaneUndo {
                 session_id: current_second.id.clone(),
                 conversation_witness: Some(TaskConversationWitness::capture(&current_second)?),
                 task_list: current_second.task_list.clone(),
                 task_list_version: second_version,
+                managed_task_blocker: current_second
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.clone()),
             },
         };
         let journal_path = self.write_runtime_task_journal(&journal).await?;
@@ -5135,6 +5287,22 @@ impl SessionStoreV2 {
         Ok(true)
     }
 
+    fn apply_unowned_task_update(current: &Session, updated: &Session) -> io::Result<Session> {
+        let mut committed = current.clone();
+        committed.task_list = updated.task_list.clone();
+        committed.set_task_list_version_meta(
+            updated
+                .task_list_version_meta()
+                .expect("validated updated Task generation"),
+        );
+        if !Self::runtime_task_owned_snapshot_matches(current, updated)? {
+            if let Some(metadata) = committed.runtime_metadata.as_mut() {
+                metadata.managed_task_blocker = None;
+            }
+        }
+        Ok(committed)
+    }
+
     fn runtime_task_owned_snapshot_matches(
         current: &Session,
         expected: &Session,
@@ -5207,6 +5375,90 @@ impl SessionStoreV2 {
             }
         }
         Ok(())
+    }
+
+    /// Recompute provenance under the same physical guard as the Task write.
+    /// The caller's snapshot never grants itself attribution, and a full save
+    /// may only carry forward a matching sidecar revision.
+    fn adopt_managed_task_blocker(
+        snapshot: &mut Session,
+        previous: Option<&Session>,
+        writer: Option<&root_actor_runtime::RootActorWriteProof>,
+    ) {
+        let blocker = previous
+            .filter(|previous| {
+                snapshot.kind == SessionKind::Root && snapshot.created_at == previous.created_at
+            })
+            .and_then(|previous| {
+                let version: u64 = snapshot.task_list_version_meta()?.parse().ok()?;
+                let tasks = snapshot
+                    .task_list
+                    .as_ref()
+                    .filter(|tasks| tasks.session_id == snapshot.id)?;
+                let previous_version = match previous.task_list_version_meta() {
+                    Some(value) => value.parse::<u64>().ok()?,
+                    None => 0,
+                };
+                let previous_tasks = previous.task_list.as_ref();
+                let previous_blocker = previous
+                    .runtime_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.managed_task_blocker.as_ref())
+                    .filter(|blocker| {
+                        previous_tasks
+                            .is_some_and(|tasks| blocker.matches_revision(previous_version, tasks))
+                    });
+                if version == previous_version {
+                    return previous_blocker
+                        .filter(|blocker| blocker.matches_revision(version, tasks))
+                        .cloned();
+                }
+                let owner = writer.filter(|_| version > previous_version)?.owner();
+                let blocked = |task: &&bamboo_domain::TaskItem| {
+                    task.status == bamboo_domain::TaskItemStatus::Blocked
+                        && !task.id.is_empty()
+                        && task.id.len() <= 128
+                };
+                let mut blocked_tasks = tasks.items.iter().filter(blocked);
+                let new_blocker = blocked_tasks.find(|task| {
+                    !previous_tasks.is_some_and(|previous| {
+                        previous.items.iter().any(|item| {
+                            item.id == task.id
+                                && item.status == task.status
+                                && item.description == task.description
+                                && item.blockers == task.blockers
+                        })
+                    })
+                });
+                let (cursor, task_id) = match new_blocker {
+                    Some(task) => (version, task.id.clone()),
+                    None => {
+                        let retained = previous_blocker.filter(|blocker| {
+                            blocker.run_id == owner.fence.run_id
+                                && tasks
+                                    .items
+                                    .iter()
+                                    .filter(blocked)
+                                    .any(|task| task.id == blocker.task_id)
+                        })?;
+                        (retained.cursor, retained.task_id.clone())
+                    }
+                };
+                bamboo_domain::ManagedTaskBlocker::from_committed_revision(
+                    owner.fence.run_id.clone(),
+                    cursor,
+                    version,
+                    task_id,
+                    tasks,
+                )
+                .ok()
+            });
+        if blocker.is_some() || snapshot.runtime_metadata.is_some() {
+            snapshot
+                .runtime_metadata
+                .get_or_insert_with(Default::default)
+                .managed_task_blocker = blocker;
+        }
     }
 
     fn runtime_task_non_task_snapshot(session: &Session) -> io::Result<serde_json::Value> {
@@ -5595,9 +5847,28 @@ impl SessionStoreV2 {
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
         let session_id = session.id.clone();
-        let entry = SessionIndexEntry {
+        let material_notification_hint = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+            .and_then(|outcomes| {
+                outcomes
+                    .facts
+                    .iter()
+                    .rev()
+                    .flat_map(|fact| fact.inputs.iter().rev())
+                    .find(|input| {
+                        input
+                            .supervisor_origin
+                            .as_ref()
+                            .is_some_and(|origin| origin.material_notifications_requested())
+                    })
+            })
+            .map(|input| input.receipt_id.to_string());
+        let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
+            material_notification_hint,
             rel_path,
             title: session.title.clone(),
             title_version: session.title_version,
@@ -5634,6 +5905,13 @@ impl SessionStoreV2 {
             placement,
         };
         self.update_index(move |index: &mut SessionsIndex| {
+            if entry.material_notification_hint.is_none() {
+                entry.material_notification_hint = index
+                    .sessions
+                    .get(&session_id)
+                    .filter(|previous| previous.created_at == entry.created_at)
+                    .and_then(|previous| previous.material_notification_hint.clone());
+            }
             if preserve_newer {
                 if let Some(existing) = index.sessions.get_mut(&session_id) {
                     if existing.updated_at > entry.updated_at {
@@ -7109,14 +7387,14 @@ impl SessionStoreV2 {
             reject_incompatible_session_write(&durable)?;
             reject_conversation_generation_change(session, &durable)?;
         }
-        if let Some(previous) = Self::read_runtime_sidecar_at(
+        let previous = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
             &session.id,
         )
-        .await?
-        {
-            reject_incompatible_session_write(&previous)?;
-            reject_conversation_generation_change(session, &previous)?;
+        .await?;
+        if let Some(previous) = previous.as_ref() {
+            reject_incompatible_session_write(previous)?;
+            reject_conversation_generation_change(session, previous)?;
             // Runtime does not own Main's stamp. Legacy absence and v1 have
             // identical semantics; never turn this compatible pair into a
             // false conflict or rewrite Main from the runtime-only path.
@@ -7126,7 +7404,7 @@ impl SessionStoreV2 {
                     previous.session_version,
                 )
             {
-                reject_session_version_change(session, &previous)?;
+                reject_session_version_change(session, previous)?;
             }
         }
         if session.kind == SessionKind::Root && self.get_index_entry(&session.id).await.is_none() {
@@ -7165,7 +7443,12 @@ impl SessionStoreV2 {
         let abs_dir = self.abs_path_from_rel(rel);
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
-        let runtime_snapshot = runtime_sidecar_snapshot(session);
+        let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+        Self::adopt_managed_task_blocker(
+            &mut runtime_snapshot,
+            previous.as_ref(),
+            guards.root_actor.as_ref(),
+        );
         let runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
@@ -7334,6 +7617,7 @@ impl SessionStoreV2 {
         // save must still be able to repair an interrupted creation whose Main
         // is missing.
         let current_main = self.abs_path_from_rel(&intended_rel).join("session.json");
+        let mut previous_sidecar = None;
         let previous_main = match fs::read_to_string(&current_main).await {
             Ok(raw) => {
                 compact_main::validate_full_main(raw.as_bytes())?;
@@ -7352,6 +7636,7 @@ impl SessionStoreV2 {
                 {
                     previous_runtime.observe_main_session_version(durable.session_version);
                     reject_incompatible_session_write(&previous_runtime)?;
+                    previous_sidecar = Some(previous_runtime);
                 } else {
                     reject_incompatible_session_write(&durable)?;
                 }
@@ -7507,7 +7792,9 @@ impl SessionStoreV2 {
         let mut stages = SaveStageDurations::default();
         let serialization_started = Instant::now();
         let mut session_bytes = compact_main::serialize_main(session)?;
-        let mut runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))
+        let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+        Self::adopt_managed_task_blocker(&mut runtime_snapshot, previous_sidecar.as_ref(), None);
+        let mut runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)
             .map_err(|error| other_io_error(error.to_string()))?;
         stages.serialization = serialization_started.elapsed();
         let mut serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
@@ -7543,7 +7830,13 @@ impl SessionStoreV2 {
             // both actual files must publish that same canonical candidate.
             let started = Instant::now();
             session_bytes = compact_main::serialize_main(session)?;
-            runtime_bytes = serde_json::to_vec_pretty(&runtime_sidecar_snapshot(session))?;
+            let mut runtime_snapshot = runtime_sidecar_snapshot(session);
+            Self::adopt_managed_task_blocker(
+                &mut runtime_snapshot,
+                previous_sidecar.as_ref(),
+                None,
+            );
+            runtime_bytes = serde_json::to_vec_pretty(&runtime_snapshot)?;
             serialized_bytes = runtime_bytes.len().saturating_add(session_bytes.len());
             stages.serialization += started.elapsed();
         }
@@ -8918,8 +9211,30 @@ mod tests {
     #[tokio::test]
     async fn paired_task_commit_marker_removal_failure_rolls_back_before_error() -> io::Result<()> {
         let (storage, _temp) = create_temp_storage().await?;
-        let (child_original, child_updated, root_original, root_updated) =
+        let (child_original, child_updated, mut root_original, mut root_updated) =
             seed_runtime_task_transaction_pair(&storage).await?;
+        // Seed the sidecar as it would look after an exact Root Task write.
+        let tasks = root_original.task_list.as_mut().unwrap();
+        tasks.items[0].status = TaskItemStatus::Blocked;
+        let proof = bamboo_domain::ManagedTaskBlocker::from_committed_revision(
+            "recorded-run".into(),
+            1,
+            1,
+            tasks.items[0].id.clone(),
+            tasks,
+        )?;
+        for snapshot in [&mut root_original, &mut root_updated] {
+            snapshot
+                .runtime_metadata
+                .as_mut()
+                .unwrap()
+                .managed_task_blocker = Some(proof.clone());
+        }
+        fs::write(
+            storage.runtime_json_path(&root_original.id).await?.unwrap(),
+            serde_json::to_vec(&runtime_sidecar_snapshot(&root_original))?,
+        )
+        .await?;
         storage.inject_runtime_task_transaction_fault(RuntimeTaskTransactionFault::JournalRemove);
 
         let error = storage
@@ -8933,6 +9248,14 @@ mod tests {
             .expect_err("journal removal failure cannot publish success");
         assert!(error.to_string().contains("rolled back"), "{error}");
         assert_original_runtime_task_pair(&storage).await?;
+        let restored = storage
+            .load_runtime_control_plane(&root_original.id)
+            .await?
+            .unwrap();
+        assert_eq!(
+            restored.runtime_metadata.unwrap().managed_task_blocker,
+            Some(proof)
+        );
         assert!(storage.runtime_task_journal_paths().await?.is_empty());
         Ok(())
     }
@@ -9306,6 +9629,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id,
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9316,6 +9640,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9538,6 +9863,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9548,6 +9874,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9609,6 +9936,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9619,6 +9947,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -9677,6 +10006,7 @@ mod tests {
             version: RUNTIME_TASK_TRANSACTION_VERSION,
             transaction_id: Uuid::new_v4().to_string(),
             first: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: child_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&child_original).unwrap(),
@@ -9687,6 +10017,7 @@ mod tests {
                     .expect("child generation"),
             },
             second: TaskControlPlaneUndo {
+                managed_task_blocker: None,
                 session_id: root_original.id.clone(),
                 conversation_witness: Some(
                     TaskConversationWitness::capture(&root_original).unwrap(),
@@ -10321,6 +10652,55 @@ mod tests {
                 .load(Ordering::Relaxed),
             0
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn material_notification_proof_does_not_wait_for_another_roots_writer() -> io::Result<()>
+    {
+        let (store, home) = create_temp_storage().await?;
+        for id in ["notification-busy", "notification-ready"] {
+            store
+                .save_session(&session_with_history(id, 2, "original-run"))
+                .await?;
+        }
+        let peer = SessionStoreV2::new(home.path().to_owned()).await?;
+        let held = store
+            .acquire_session_maintenance_lock("notification-busy")
+            .await?;
+        for reader in [&store, &peer] {
+            let busy = tokio::time::timeout(
+                Duration::from_secs(2),
+                reader.try_load_material_notification_source("notification-busy"),
+            )
+            .await
+            .expect("proof acquisition must return while the Root remains locked");
+            assert_eq!(busy.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+            assert!(reader
+                .try_load_material_notification_source("notification-ready")
+                .await?
+                .is_some());
+        }
+        drop(held);
+        assert!(store
+            .try_load_material_notification_source("notification-busy")
+            .await?
+            .is_some());
+        let tree = store
+            .acquire_actor_tree_write_guard("notification-busy")
+            .await?;
+        assert_eq!(
+            peer.acquire_actor_tree_write_guard_with_wait(
+                "notification-busy",
+                SessionLockWait::Try
+            )
+            .await
+            .err()
+            .expect("a retained tree proof must refuse nonblocking acquisition")
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(tree);
         Ok(())
     }
 

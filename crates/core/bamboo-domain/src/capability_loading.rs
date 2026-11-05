@@ -44,7 +44,7 @@ pub enum CapabilityLoadingMode {
 /// Core guarantees exact current-Session recall after older activation traces
 /// leave the active context without making the broad Root `session_history`
 /// viewer Core.
-pub const CORE_TOOL_NAMES: [&str; 13] = [
+pub const CORE_TOOL_NAMES: [&str; 14] = [
     "exec_command",
     "write_stdin",
     "Read",
@@ -59,6 +59,7 @@ pub const CORE_TOOL_NAMES: [&str; 13] = [
     "work_changes",
     "work_update",
     "work_dispatch",
+    "work_review",
 ];
 
 /// Host protocol helpers that must not enter model catalogs or discovery.
@@ -479,6 +480,7 @@ mod tests {
                 "work_changes",
                 "work_update",
                 "work_dispatch",
+                "work_review",
             ]
         );
         for name in CORE_TOOL_NAMES {

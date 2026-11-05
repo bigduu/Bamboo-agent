@@ -28,9 +28,20 @@ impl TicketApplication {
     }
 
     pub(in crate::app_state) async fn shutdown_ready_worker(&self) {
+        self.work_reviews.stop_admission();
         self.ready_scheduler.shutdown().await;
         if let Err(error) = self.patrol_calls.quiesce().await {
             tracing::warn!(?error, "Patrol calls did not quiesce");
+        }
+        let work_review_drain = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let (service, authority) = self.authority(Principal::Runtime).await?;
+            self.work_reviews
+                .drain_accounting(&service, &authority)
+                .await
+        })
+        .await;
+        if !matches!(work_review_drain, Ok(Ok(()))) && self.service().is_ok() {
+            tracing::warn!("Work Review shutdown could not confirm accounting drained");
         }
         if self.patrol_calls.needs_accounting() {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), async {
