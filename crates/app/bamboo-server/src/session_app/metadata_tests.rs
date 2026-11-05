@@ -470,3 +470,167 @@ async fn set_pinned_then_runtime_save_does_not_clobber() {
         "runtime save must preserve metadata_version"
     );
 }
+
+#[tokio::test]
+async fn generated_title_and_pinned_preserve_owned_tool_checkpoint_and_terminal_closure() {
+    use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+    use bamboo_domain::{
+        ActorActivationClaim, ActorActivationFinish, ActorActivationStatus, ActorDirectoryEntry,
+        ActorDirectoryPort, RootActorRuntimeWrite, RuntimeSessionPersistence, Storage,
+    };
+    use std::sync::Arc;
+
+    const OBSERVATION: &str = "runtime.root_writer_observation_v1";
+    for source in [TitleSource::Auto, TitleSource::Fallback] {
+        for pin_first in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let state = AppState::new(home.path().to_path_buf()).await.unwrap();
+            let mut root = seed_pending_session(&state, "metadata-root", "New Session").await;
+            root.session_version = None;
+            root.set_last_run_status("running");
+            root.add_message(bamboo_domain::Message::user("original input"));
+            state.storage.save_session(&root).await.unwrap();
+            let child = Session::new_child_of("metadata-child", &root, "test-model", "Child");
+            state.storage.save_session(&child).await.unwrap();
+            state.session_store.ensure_actor(&child.id).await.unwrap();
+
+            let now = chrono::Utc::now();
+            let activation = state
+                .session_store
+                .claim_root_activation_observed(
+                    &ActorActivationClaim {
+                        actor_id: root.id.clone(),
+                        run_id: "metadata-run".into(),
+                        lease_owner: "metadata-owner".into(),
+                        lease_expires_at: now + chrono::Duration::minutes(5),
+                        inbox_generation: 0,
+                        placement_ref: None,
+                        now,
+                    },
+                    &root,
+                )
+                .await
+                .unwrap();
+            state
+                .session_store
+                .start_activation(&activation.fence(), now)
+                .await
+                .unwrap();
+            let owner = RootActorRuntimeWrite {
+                fence: activation.fence(),
+                created_at: root.created_at,
+                conversation_generation: root.conversation_generation_observation(),
+            };
+            state
+                .storage
+                .save_root_actor_runtime(&owner, &root, true, Arc::new(|_| {}))
+                .await
+                .unwrap();
+            let mut runtime = state.storage.load_session(&root.id).await.unwrap().unwrap();
+            let writer = state
+                .persistence
+                .bind_root_actor_writer(owner.clone(), Arc::new(|_| {}))
+                .unwrap();
+
+            if pin_first {
+                SessionMetadataService::set_pinned(&state, &root.id, true, Some(0))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            SessionMetadataService::apply_generated_title(
+                &state, &root.id, "Generated title", source, false,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            if !pin_first {
+                SessionMetadataService::set_pinned(&state, &root.id, true, Some(1))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+
+            runtime.add_message(bamboo_domain::Message::assistant_with_reasoning(
+                "checking".into(),
+                Some(vec![ToolCall {
+                    id: "metadata-tool-call".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "read_file".into(),
+                        arguments: "{}".into(),
+                    },
+                }]),
+                Some("retained reasoning".into()),
+            ));
+            // This is the same owned persistence port called before the
+            // runner executes its assistant tool-call batch.
+            writer.save_runtime_session(&mut runtime).await.unwrap();
+            assert_eq!(runtime.metadata_version, 2);
+            assert!(runtime.pinned);
+            assert_eq!(runtime.title, "Generated title");
+            assert_eq!(runtime.messages.len(), 2);
+
+            SessionMetadataService::set_pinned(&state, &root.id, false, Some(2))
+                .await
+                .unwrap()
+                .unwrap();
+            SessionMetadataService::apply_generated_title(
+                &state, &root.id, "Regenerated title", source, true,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            writer.save_runtime_session(&mut runtime).await.unwrap();
+            assert_eq!(runtime.metadata_version, 4);
+            assert!(!runtime.pinned);
+            assert_eq!(runtime.title, "Regenerated title");
+
+            let observation: serde_json::Value =
+                serde_json::from_str(&runtime.metadata[OBSERVATION]).unwrap();
+            assert_eq!(observation["metadata_version"], 4);
+            for relative in [
+                "metadata-root/actor-authority.json",
+                "metadata-root/children/metadata-child/actor-authority.json",
+            ] {
+                let row: ActorDirectoryEntry = serde_json::from_slice(
+                    &tokio::fs::read(home.path().join("sessions").join(relative))
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                if row.actor.actor_id == root.id {
+                    assert_eq!(row.actor.observed_metadata_version, 4);
+                    assert!(row.activation.unwrap().matches_fence(&owner.fence));
+                } else {
+                    assert_eq!(row.actor.ancestor_observations[0].metadata_version, 4);
+                }
+            }
+
+            runtime.set_last_run_status("error");
+            runtime.synchronize_terminal_runtime_status();
+            writer.save_finalized_runtime_session(&mut runtime).await.unwrap();
+            let finished = state
+                .session_store
+                .finish_root_activation_observed(
+                    &owner, chrono::Utc::now(), ActorActivationFinish::Failed, None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(finished.status, ActorActivationStatus::Failed);
+            state.session_store.flush_search_index().await;
+            let reopened = bamboo_storage::SessionStoreV2::new(home.path().to_path_buf())
+                .await
+                .unwrap();
+            let durable = reopened.load_session(&root.id).await.unwrap().unwrap();
+            assert_eq!(durable.messages.len(), 2);
+            assert_eq!(durable.last_run_status().as_deref(), Some("error"));
+            assert!(reopened
+                .reconcile_session_runtime(&durable, chrono::Utc::now(), None, Arc::new(|_| {}))
+                .await
+                .unwrap()
+                .is_some());
+            reopened.flush_search_index().await;
+        }
+    }
+}
