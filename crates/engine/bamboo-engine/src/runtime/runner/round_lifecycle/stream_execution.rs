@@ -304,6 +304,39 @@ fn agent_loop_prompt_cache_key(
     Some(hex::encode(hasher.finalize()))
 }
 
+/// Domain separator for [`provider_relevant_source_digest`].
+const PROVIDER_SOURCE_DIGEST_DOMAIN: &[u8] = b"bamboo.final-request.provider-source.v1";
+
+/// Digest of the Session state an append-safe final-request checkpoint can adopt
+/// that also changes what the provider is asked: the durable message transcript
+/// and the provider-native transcript that anchors it.
+///
+/// A checkpoint that leaves this digest identical adopted nothing relevant, so
+/// the request already reconciled and validated against budget remains exactly
+/// right. Rebuilding it would only re-run nondeterministic request-only work —
+/// most importantly the paid Legacy Vision description, whose fresh text changes
+/// the model-context ledger and can stop the checkpoint loop from ever
+/// stabilizing. This digest is in-memory and request-scoped: it never persists a
+/// description and never becomes a durable image cache.
+fn provider_relevant_source_digest(session: &Session) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(PROVIDER_SOURCE_DIGEST_DOMAIN);
+    let mut absorb = |bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    };
+    for message in &session.messages {
+        absorb(message.id.as_bytes());
+        // Serialize each message so an in-place edit that keeps the id is still
+        // observed as a source change.
+        let rendered = serde_json::to_vec(message).unwrap_or_default();
+        absorb(&rendered);
+    }
+    let transcript = serde_json::to_vec(&session.provider_transcript).unwrap_or_default();
+    absorb(&transcript);
+    hex::encode(hasher.finalize())
+}
+
 /// Whether the stateful Responses continuation (`previous_response_id`) may be
 /// used under the given request policy. Chaining requires the PREVIOUS turn to
 /// have been stored upstream: with `store=false` the upstream never persists a
@@ -1567,6 +1600,10 @@ pub(super) async fn execute_llm_stream(
                         "model-context request could not stabilize after {MAX_FINAL_REQUEST_CHECKPOINT_REPREPARES} append-safe checkpoint reprepares"
                     )));
                 }
+                // Capture what this checkpoint could adopt that the provider would
+                // observe. The comparison below separates a bookkeeping-only
+                // checkpoint from one that genuinely moved the request.
+                let provider_source_digest = provider_relevant_source_digest(session);
                 if let Err(error) = persistence.checkpoint_runtime_session(session).await {
                     // Reconciliation is an in-memory transaction until its durable
                     // checkpoint succeeds. Restore the prior state so an in-process
@@ -1579,6 +1616,15 @@ pub(super) async fn execute_llm_stream(
                     )));
                 }
                 checkpoint_reprepares += 1;
+                // Reuse an already-prepared image description only while the
+                // provider-relevant source state is unchanged. Re-deriving the
+                // prepared context is still required — it owns the convergence
+                // mutation the next reconcile observes — but the paid, inherently
+                // nondeterministic Legacy Vision description inside it must not be
+                // requested again for the same source.
+                if provider_relevant_source_digest(session) != provider_source_digest {
+                    config.vision_description_reuse.clear();
+                }
                 required_tool = required_tool_for_session(session);
                 effective_schemas = effective_tool_schemas(session, base_tool_schemas);
                 let reprepared = Box::pin(super::context_preparation::prepare_round_context(

@@ -7,7 +7,7 @@ use bamboo_compression::PreparedContext;
 use bamboo_llm::LLMProvider;
 
 use super::super::super::image_fallback::{
-    apply_image_fallback_to_llm_messages, resolve_bamboo_attachments_for_llm,
+    apply_image_fallback_to_llm_messages_reusing, resolve_bamboo_attachments_for_llm,
 };
 
 pub(super) enum ImageProjection {
@@ -187,7 +187,7 @@ async fn apply_image_fallback(
         if let Some(target) = target.as_ref() {
             fallback.vision_model = Some(target.model_name.clone());
         }
-        apply_image_fallback_to_llm_messages(
+        apply_image_fallback_to_llm_messages_reusing(
             &mut prepared_context.messages,
             fallback,
             config.attachment_reader.as_deref(),
@@ -197,6 +197,10 @@ async fn apply_image_fallback(
                     .map(|target| &target.provider)
                     .unwrap_or(llm),
             ),
+            // Reuse a description this request already prepared for the same
+            // source. The caller clears the store whenever provider-relevant
+            // source state changes, so a changed input still describes afresh.
+            Some(config.vision_description_reuse.as_ref()),
         )
         .await?;
     }
