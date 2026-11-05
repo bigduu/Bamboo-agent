@@ -157,7 +157,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2583 adds compact model catalog and canonical Child selection observations
 // to the existing default Engine, Server Tools and Server owners. No feature
 // declaration, additive context or explicitly selected case changes.
-const FEATURE_SOURCE_SHA256 = "243c9f8b7fad3f62598e5a181dfc38ebf74b2d4256e25d83a1b1cbe518163c97";
+// #2582 changes the complete V2 writer source covered by its existing
+// test-utils fingerprint. Presentation-metadata regressions remain ordinary
+// storage/packages-0 and metadata-service/server-other cases. No feature
+// declaration, module gate, additive context or selected additive case changes;
+// the existing four contexts still own the same twenty feature-only cases.
+const FEATURE_SOURCE_SHA256 = "05a44d1ecc06833e69d1c08746e3fe2580c55f0a7d8a37c6f636ce5f9c047b30";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
