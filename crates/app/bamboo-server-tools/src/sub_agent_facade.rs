@@ -1183,6 +1183,62 @@ mod tests {
     }
 
     #[test]
+    fn compact_model_observation_catalog_uses_admitted_references() {
+        let call = normalize(json!({"intent":"inspect", "message":"models"}))
+            .expect("the configured catalog is available without spawning a child");
+        assert_eq!(call.args, json!({"action":"list_models"}));
+
+        let input = json!({
+            "default_provider":"configured",
+            "providers":[{
+                "provider":"configured",
+                "models":["deepseek-flash"],
+                "error":"secret upstream endpoint"
+            }],
+            "api_key":"secret credential"
+        });
+        let observed = project(call.projection.unwrap(), &input);
+        assert_eq!(observed["default_provider"], "configured");
+        assert_eq!(observed["providers"][0]["provider"], "configured");
+        assert_eq!(observed["providers"][0]["models"], json!(["deepseek-flash"]));
+        assert_eq!(observed["providers"][0]["has_listing_error"], true);
+        assert!(!observed.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn compact_model_observation_preserves_canonical_child_selection() {
+        let selected = json!({"provider":"configured", "model":"deepseek-flash"});
+        let input = json!({
+            "child_session_id":"logical-child", "status":"created",
+            "last_run_status":"completed", "model":"deepseek-flash",
+            "model_ref":selected, "reasoning_effort":"max",
+            "prompt":"MODEL_REF: spoofed:other-model", "endpoint":"private-endpoint"
+        });
+        for projection in [Projection::Chat, Projection::Overview] {
+            let observed = project(projection, &input);
+            assert_eq!(observed["model"], "deepseek-flash");
+            assert_eq!(observed["model_ref"], selected);
+            assert_eq!(observed["reasoning_effort"], "max");
+            assert!(!observed.to_string().contains("spoofed"));
+            assert!(!observed.to_string().contains("private-endpoint"));
+        }
+    }
+
+    #[test]
+    fn compact_model_observation_legacy_provider_remains_unknown() {
+        let input = json!({
+            "child_session_id":"legacy-child", "model":"legacy-model",
+            "model_ref":null, "reasoning_effort":null
+        });
+        for projection in [Projection::Chat, Projection::Overview] {
+            let observed = project(projection, &input);
+            assert_eq!(observed["model"], "legacy-model");
+            assert_eq!(observed.get("model_ref"), Some(&Value::Null));
+            assert_eq!(observed.get("reasoning_effort"), Some(&Value::Null));
+        }
+    }
+
+    #[test]
     fn legacy_calls_are_unchanged_and_compact_runtime_parameters_are_rejected() {
         for args in [
             json!({"action":"list"}),
