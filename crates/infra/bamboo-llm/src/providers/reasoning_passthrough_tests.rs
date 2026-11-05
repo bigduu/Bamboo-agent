@@ -1,9 +1,12 @@
 use super::{AnthropicProvider, BodhiProvider, GeminiProvider, OpenAIProvider};
+use crate::prompt_ir::{PromptIR, Segment, SegmentRole};
 use crate::provider::{LLMProvider, LLMRequestOptions};
-use bamboo_domain::{FunctionSchema, Message, ReasoningEffort, ToolSchema};
+use crate::resolved_model::ResolvedModel;
+use bamboo_domain::{FunctionSchema, Message, ProviderModelRef, ReasoningEffort, ToolSchema};
 use futures::StreamExt;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -103,6 +106,70 @@ fn assert_effort(body: &Value, pointer: &str, effort: Option<ReasoningEffort>) {
     assert!(body
         .pointer("/generationConfig/thinkingConfig/thinkingBudget")
         .is_none());
+}
+
+#[tokio::test]
+async fn explicit_disable_reaches_native_and_proxy_wires_through_a_max_role() {
+    for (route, endpoint, pointer, sse) in ROUTES {
+        for use_ir in [false, true] {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            let inner: Arc<dyn LLMProvider> =
+                Arc::from(provider(route, &server, Some(ReasoningEffort::High)));
+            let resolved = ResolvedModel::from_ref(
+                inner,
+                &ProviderModelRef::new("configured-route", "custom-route")
+                    .with_reasoning_effort(ReasoningEffort::Max),
+            );
+            let options = LLMRequestOptions {
+                reasoning_effort: Some(ReasoningEffort::Disabled),
+                ..Default::default()
+            };
+            let ir = PromptIR {
+                segments: vec![Segment::new(
+                    SegmentRole::Conversation,
+                    vec![Message::user("Return the final answer")],
+                )],
+                ..Default::default()
+            };
+            let mut stream = if use_ir {
+                resolved
+                    .provider
+                    .chat_stream_ir(&ir, &[], Some(128), &resolved.model_name, Some(&options))
+                    .await
+                    .unwrap()
+            } else {
+                resolved
+                    .provider
+                    .chat_stream_with_options(
+                        &[Message::user("Return the final answer")],
+                        &[],
+                        Some(128),
+                        &resolved.model_name,
+                        Some(&options),
+                    )
+                    .await
+                    .unwrap()
+            };
+            while let Some(chunk) = stream.next().await {
+                chunk.unwrap();
+            }
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 1);
+            let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
+            assert_effort(&body, pointer, Some(ReasoningEffort::Disabled));
+            assert_eq!(requests[0].url.path(), endpoint);
+        }
+    }
 }
 
 #[tokio::test]

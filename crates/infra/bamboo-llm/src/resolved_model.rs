@@ -246,4 +246,42 @@ mod tests {
             &[Some(ReasoningEffort::Low)]
         );
     }
+
+    #[tokio::test]
+    async fn explicit_disable_survives_role_resolution_for_options_and_ir() {
+        let inner = Arc::new(CaptureProvider::default());
+        let provider = provider_with_reasoning_effort(inner.clone(), Some(ReasoningEffort::Max));
+        let options = LLMRequestOptions {
+            reasoning_effort: Some(ReasoningEffort::Disabled),
+            ..Default::default()
+        };
+
+        let _stream = provider
+            .chat_stream(&[], &[], Some(128), "model")
+            .await
+            .unwrap();
+        let _stream = provider
+            .chat_stream_with_options(&[], &[], Some(128), "model", Some(&options))
+            .await
+            .unwrap();
+        let _stream = provider
+            .chat_stream_ir(
+                &PromptIR::default(),
+                &[],
+                Some(128),
+                "model",
+                Some(&options),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            inner.efforts.lock().unwrap().as_slice(),
+            &[
+                Some(ReasoningEffort::Max),
+                Some(ReasoningEffort::Disabled),
+                Some(ReasoningEffort::Disabled),
+            ]
+        );
+    }
 }
