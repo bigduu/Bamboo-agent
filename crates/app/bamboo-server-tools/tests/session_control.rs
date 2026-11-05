@@ -315,7 +315,11 @@ async fn supervisor_followup_preserves_roots_and_rejects_mismatched_target_refer
     );
     let schema = f.tool.parameters_schema();
     assert_eq!(schema["additionalProperties"], false);
-    assert_eq!(schema["properties"].as_object().unwrap().len(), 8);
+    assert_eq!(schema["properties"].as_object().unwrap().len(), 9);
+    assert_eq!(
+        schema["properties"]["notify_on_material_event"]["type"],
+        "boolean"
+    );
     assert!(bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_control").is_some());
     for id in ["a", "b"] {
         let before =
@@ -579,7 +583,7 @@ mod loop_adapter_tests {
             schema["properties"]["action"]["enum"],
             json!(["followup", "loop"])
         );
-        assert_eq!(schema["properties"].as_object().unwrap().len(), 8);
+        assert_eq!(schema["properties"].as_object().unwrap().len(), 9);
         let command = &schema["properties"]["command"];
         assert_eq!(command["additionalProperties"], false);
         assert_eq!(command["required"], json!(["action"]));

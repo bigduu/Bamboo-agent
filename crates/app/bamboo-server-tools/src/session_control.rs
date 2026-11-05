@@ -540,6 +540,8 @@ enum SessionControlArgs {
         target_ref: Option<bamboo_domain::SupervisorCurrentUserTarget>,
         operation_id: String,
         message: String,
+        #[serde(default)]
+        notify_on_material_event: bool,
     },
     ObserveRun {
         target_session_id: String,
@@ -882,6 +884,15 @@ impl Tool for SessionControlTool {
             }
             variants.push(wait_outcomes);
         }
+        schema["properties"]["notify_on_material_event"] = json!({
+            "type":"boolean",
+            "description":"followup only, for an independent Root. Request durable notices for a recorded blocker or handoff from the admitted input's exact run. After dispatch, finish the short coordinating response while task Sessions continue. A notice returns through this Supervisor's Inbox when evidence changes. Preserve this flag with every retry."
+        });
+        for variant in schema["oneOf"].as_array_mut().expect("action variants") {
+            if variant["properties"]["action"]["const"] != "followup" {
+                variant["properties"]["notify_on_material_event"] = Value::Bool(false);
+            }
+        }
         schema
     }
 
@@ -922,10 +933,7 @@ impl Tool for SessionControlTool {
         let original = ctx.executing_caller_for(caller).ok_or_else(|| {
             ToolError::Execution("session_control requires its original complete caller".into())
         })?;
-        let (target_session_id, target_ref, operation_id, message) = match serde_json::from_value(
-            args,
-        )
-        .map_err(|error| {
+        let followup = match serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("invalid session_control arguments: {error}"))
         })? {
             SessionControlArgs::Scope => {
@@ -1062,7 +1070,14 @@ impl Tool for SessionControlTool {
                 target_ref,
                 operation_id,
                 message,
-            } => (target_session_id, target_ref, operation_id, message),
+                notify_on_material_event,
+            } => (
+                target_session_id,
+                target_ref,
+                operation_id,
+                message,
+                notify_on_material_event,
+            ),
             SessionControlArgs::Loop {
                 target_session_id,
                 expected_link_revision,
@@ -1100,18 +1115,26 @@ impl Tool for SessionControlTool {
                 )));
             }
         };
+        let (target_session_id, target_ref, operation_id, message, notify_on_material_event) =
+            followup;
         let target_ref = target_ref.filter(|target| target.session_id == target_session_id)
             .ok_or_else(|| ToolError::InvalidArguments(
                 "followup requires the exact current_user_target from session_history list/inspect; no Project grant or attachment is needed".into()
             ))?;
+        if notify_on_material_event && target_ref.kind != bamboo_domain::SessionKind::Root {
+            return Err(ToolError::InvalidArguments(
+                "material notifications require an independent Root".into(),
+            ));
+        }
         let result = self
             .messenger
-            .supervisor_current_user_followup(
+            .supervisor_followup_with_material_notifications(
                 original,
                 &supervisor,
                 &target_ref,
                 &operation_id,
                 &message,
+                notify_on_material_event,
             )
             .await;
         let (delivery, activation, detail) = match result {
@@ -1136,13 +1159,23 @@ impl Tool for SessionControlTool {
             Err(error) => return Err(ToolError::Execution(error.to_string())),
         };
         let activation_retry_required = activation == "activation_retry_required";
-        Ok(ToolOutcome::Completed(ToolResult::text(!activation_retry_required, json!({
-            "action": "followup", "target_session_id": target_session_id,
-            "operation_id": operation_id, "admitted": true,
-            "receipt_id": delivery.id, "generation": delivery.generation,
-            "activation": activation, "activation_error": detail,
-            "note": "Admission is durable; this is not completion. A waiting target remains waiting. Retry with the same operation_id and message if activation needs recovery; read results with session_history.read_messages."
-        }).to_string())))
+        let note = if notify_on_material_event {
+            "Material notices return through this Supervisor's Inbox. Finish this short decision turn while task Sessions continue. Inspect each cited record and independently review the actual delivery when a notice arrives."
+        } else {
+            "Admission is durable; this is not completion. A waiting target remains waiting. Retry with the same operation_id and message if activation needs recovery; read results with session_history.read_messages."
+        };
+        Ok(ToolOutcome::Completed(ToolResult::text(
+            !activation_retry_required,
+            json!({
+                "action": "followup", "target_session_id": target_session_id,
+                "operation_id": operation_id, "admitted": true,
+                "receipt_id": delivery.id, "generation": delivery.generation,
+                "activation": activation, "activation_error": detail,
+                "notify_on_material_event": notify_on_material_event,
+                "note": note
+            })
+            .to_string(),
+        )))
     }
 }
 
