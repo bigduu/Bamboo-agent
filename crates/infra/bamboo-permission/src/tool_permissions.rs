@@ -1312,21 +1312,21 @@ pub fn check_permissions(
             if matches!(action, "scope" | "directory") {
                 return Ok(None);
             }
-            if action == "observe_run" {
+            if matches!(action, "observe_run" | "wait_run" | "cancel") {
                 let target = required_string_arg(args, "target_session_id")?;
                 bamboo_domain::validate_supervisor_target_id(target)
                     .map_err(|error| PermissionError::CheckFailed(error.into()))?;
-                return Ok(None);
-            }
-            if action == "cancel" {
-                let target = required_string_arg(args, "target_session_id")?;
-                bamboo_domain::validate_supervisor_target_id(target)
-                    .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                if action == "observe_run" {
+                    return Ok(None);
+                }
                 let run = required_string_arg(args, "expected_run_id")?;
                 if !bamboo_domain::valid_session_run_id(run) {
-                    return Err(PermissionError::CheckFailed(
-                        "session_control cancel requires a valid expected_run_id".into(),
-                    ));
+                    return Err(PermissionError::CheckFailed(format!(
+                        "session_control {action} requires a valid expected_run_id"
+                    )));
+                }
+                if action == "wait_run" {
+                    return Ok(None);
                 }
                 return Ok(Some(vec![PermissionContext::new(
                     PermissionType::ExecuteCommand,
@@ -2991,6 +2991,11 @@ mod tests {
         )
         .unwrap()
         .is_none());
+        let wait = json!({"action":"wait_run", "target_session_id":"root-a",
+            "expected_run_id":"private-run-id"});
+        assert!(check_permissions("session_control", &wait)
+            .unwrap()
+            .is_none());
         let args = json!({"action":"cancel", "target_session_id":"root-a",
             "expected_run_id":"private-run-id"});
         let contexts = check_permissions("session_control", &args)
@@ -3002,6 +3007,7 @@ mod tests {
         assert!(!contexts[0].resource.contains("private-run-id"));
         for invalid in [
             json!({"action":"observe_run"}),
+            json!({"action":"wait_run", "target_session_id":"root-a"}),
             json!({"action":"cancel", "target_session_id":"root-a"}),
             json!({"action":"cancel", "target_session_id":"root-a", "expected_run_id":"not a run"}),
             json!({"action":"cancel", "target_session_id":"bad\ntarget", "expected_run_id":"run-a"}),

@@ -170,10 +170,15 @@ fn run_control(
             "terminal_unconfirmed",
         ));
     }
-    if expected.is_some() {
+    if expected.is_some()
+        && gate.is_none()
+        && runner.supervisor_run_observation_matches(target, workspace_path) != Some(true)
+    {
+        return Ok(conflict(&target.session_id, expected, "run_not_observed"));
+    }
+    if let Some(gate) = gate {
         // This is the existing exact Retry/runner cancellation signal. Do not
         // set a terminal status or discard any pending Inbox input here.
-        let gate = gate.ok_or_else(|| io::Error::other("missing Root cancel admission"))?;
         match gate.commit(|| {
             runner.bind_supervisor_run_target(target, workspace_path);
             live_retry.cancel_and_token(&target.session_id, &candidate, &runner.cancel_token);
@@ -263,6 +268,52 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         target: &SupervisorCurrentUserTarget,
     ) -> Result<ToolResult, ToolError> {
         self.control(caller, target, None, None).await
+    }
+
+    async fn wait_run(
+        &self,
+        caller: &SessionCallerReference,
+        target: &SupervisorCurrentUserTarget,
+        expected_run_id: &str,
+    ) -> Result<ToolResult, ToolError> {
+        let expected = Some(expected_run_id);
+        let initial = self.control(caller, target, expected, None).await?;
+        let initial_status: Value = serde_json::from_str(&initial.result)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if !initial.success || initial_status["status"] == "already_finished" {
+            return Ok(initial);
+        }
+
+        let signal = self
+            .runners
+            .read()
+            .await
+            .get(&target.session_id)
+            .filter(|runner| runner.run_id == expected_run_id)
+            .map(AgentRunner::wait_for_exact_finalization);
+        if let Some(signal) = signal {
+            bamboo_orchestration::managed_session::wait_for_finalization(signal).await;
+        }
+
+        // The signal alone cannot authorize a read or name an outcome. Recheck
+        // the canonical target and the exact run, even on timeout or replacement.
+        let final_observation = self.control(caller, target, expected, None).await?;
+        let final_status: Value = serde_json::from_str(&final_observation.result)
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if !final_observation.success || final_status["status"] == "already_finished" {
+            return Ok(final_observation);
+        }
+
+        Ok(ToolResult::text(
+            true,
+            json!({
+                "status": "wait_timeout",
+                "target_session_id": target.session_id,
+                "run_id": expected_run_id,
+                "completion_verified": false
+            })
+            .to_string(),
+        ))
     }
 
     async fn cancel_run(
