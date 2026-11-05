@@ -7,6 +7,7 @@ use bamboo_domain::{
     DEFAULT_SUPERVISOR_SESSION_ID,
 };
 use bamboo_engine::SessionActivationRouter;
+use bamboo_orchestration::managed_session::{ManagedRootNotificationIo, ManagedRootNotifications};
 use bamboo_server_tools::SessionInspectorTool;
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use chrono::{DateTime, Utc};
@@ -40,6 +41,7 @@ pub(super) struct ObserverSubscriptionCoordinator {
     inspector: SessionInspectorTool,
     // Fairness/coalescing only. All event/cursor/retry truth remains canonical.
     next: Mutex<usize>,
+    material_notifications: ManagedRootNotifications,
     native: bool,
 }
 
@@ -58,6 +60,7 @@ impl ObserverSubscriptionCoordinator {
             inbox,
             activation,
             next: Mutex::new(0),
+            material_notifications: ManagedRootNotifications::default(),
             native,
         }
     }
@@ -66,6 +69,9 @@ impl ObserverSubscriptionCoordinator {
     pub(super) async fn tick(&self, now: DateTime<Utc>) {
         if !self.native {
             return;
+        }
+        if let Err(error) = self.material_notifications.tick(self).await {
+            tracing::warn!(%error, "Managed Session material notification remains pending");
         }
         let Ok(mut next) = self.next.try_lock() else {
             return;
@@ -298,6 +304,56 @@ impl ObserverSubscriptionCoordinator {
             .reconcile_wake(id, now)
             .await
             .map_err(|error| (Failure::InboxUnavailable, error.to_string()))?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
+    async fn sources(&self) -> Vec<String> {
+        self.store
+            .list_index_entries()
+            .await
+            .into_iter()
+            .filter(|entry| {
+                entry.kind == bamboo_domain::SessionKind::Root
+                    && entry.id != DEFAULT_SUPERVISOR_SESSION_ID
+            })
+            .map(|entry| entry.id)
+            .collect()
+    }
+
+    async fn candidates(
+        &self,
+        source: &str,
+    ) -> Result<Vec<bamboo_domain::ManagedRootNotification>, String> {
+        let session = self
+            .store
+            .load_execution_admission_snapshot(source)
+            .await
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "managed notification source is unavailable".to_string())?;
+        bamboo_orchestration::managed_session::notification_candidates(&session)
+            .map_err(str::to_owned)
+    }
+
+    async fn deliver(
+        &self,
+        selected: &bamboo_domain::ManagedRootNotification,
+    ) -> Result<(), String> {
+        let now = Utc::now();
+        if self
+            .inbox
+            .deliver_managed_root_notification(selected, now)
+            .await
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            self.activation
+                .reconcile_wake(&selected.caller.session_id, now)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         Ok(())
     }
 }

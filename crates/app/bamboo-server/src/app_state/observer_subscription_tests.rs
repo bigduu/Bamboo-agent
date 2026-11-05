@@ -42,6 +42,7 @@ struct Probe {
     source_inputs: StdMutex<Vec<Vec<Message>>>,
     parent_calls: AtomicUsize,
     parent_inputs: StdMutex<Vec<Vec<Message>>>,
+    parent_dispatch: StdMutex<Option<Vec<ToolCall>>>,
     parent_request_diagnostics: StdMutex<Vec<Value>>,
     diagnostic_home: StdMutex<Option<std::path::PathBuf>>,
     diagnostic_phase: StdMutex<&'static str>,
@@ -307,7 +308,10 @@ impl LLMProvider for Probe {
             PARENT => {
                 self.parent_calls.fetch_add(1, Ordering::SeqCst);
                 self.parent_inputs.lock().unwrap().push(messages.to_vec());
-                LLMChunk::Token("Parent processed its current canonical input.".into())
+                match self.parent_dispatch.lock().unwrap().take() {
+                    Some(calls) => LLMChunk::ToolCalls(calls),
+                    None => LLMChunk::Token("Parent processed its current canonical input.".into()),
+                }
             }
             _ => panic!("source Roots must not invoke a provider: {model}"),
         };
@@ -1267,6 +1271,263 @@ async fn run_native_source(
         "the matching input must reach this actual provider call"
     );
     (input_id, activation.run_id, generation, target_created_at)
+}
+
+async fn drive_material_notices(f: &Fixture, expected_calls: usize) {
+    tokio::time::timeout(WAIT, async {
+        loop {
+            f.state.observer_subscriptions.tick(Utc::now()).await;
+            if f.probe.parent_calls.load(Ordering::SeqCst) >= expected_calls
+                && f.state
+                    .session_activation_router
+                    .current_run_id(&f.reference.session_id)
+                    .await
+                    .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the checked notice must reach the native Supervisor");
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
+}
+
+pub(in crate::app_state) async fn exercise_material_root_notifications() {
+    use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+
+    let f = Fixture::new_with_native_source(true).await;
+    let workspace = f.home.path().join("notifying-second-workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let mut second_session = load(&f.state, ROOT_B).await;
+    second_session.model = SOURCE.into();
+    second_session.model_ref = Some(ProviderModelRef::new(PROVIDER, SOURCE));
+    second_session.set_provider_name(PROVIDER);
+    second_session.workspace = Some(workspace.to_string_lossy().into());
+    second_session.set_workspace_path_meta(workspace.to_string_lossy());
+    f.state.storage.save_session(&second_session).await.unwrap();
+    f.state
+        .permission_checker
+        .permission_config()
+        .unwrap()
+        .grant_typed_scoped_session_permission(
+            &f.reference.session_id,
+            PermissionType::ExecuteCommand,
+            PermissionMatcher {
+                id: "notifying-second-followup".into(),
+                kind: PermissionMatcherKind::ExactResource,
+                value: format!("session_control followup {ROOT_B}"),
+            },
+        )
+        .unwrap();
+    let first = managed_target(&f.state, &f.reference, ROOT_A).await;
+    let second = managed_target(&f.state, &f.reference, ROOT_B).await;
+    *f.probe.parent_dispatch.lock().unwrap() = Some(
+        [
+            (&first, "notifying-first", "managed task blocker"),
+            (&second, "notifying-second", "managed wait second"),
+        ]
+        .into_iter()
+        .map(|(target, operation, message)| ToolCall {
+            id: operation.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "session_control".into(),
+                arguments: json!({
+                    "action":"followup", "target_session_id":target.session_id,
+                    "target_ref":target, "operation_id":operation, "message":message,
+                    "notify_on_material_event":true,
+                })
+                .to_string(),
+            },
+        })
+        .collect(),
+    );
+    f.probe.hold_sources.store(true, Ordering::SeqCst);
+    f.state
+        .session_messenger
+        .send(bamboo_domain::SessionMessageEnvelope::user_input(
+            &f.reference.session_id,
+            "Coordinate the two recorded tasks and wait for their notices.",
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, async {
+        tokio::join!(
+            f.probe.source_entered[0].notified(),
+            f.probe.source_entered[1].notified(),
+        );
+    })
+    .await
+    .expect("the Supervisor's real tool calls must start both Roots");
+    drive_material_notices(&f, 2).await;
+    let first_run = f
+        .state
+        .session_activation_router
+        .current_run_id(ROOT_A)
+        .await
+        .unwrap();
+    let second_run = f
+        .state
+        .session_activation_router
+        .current_run_id(ROOT_B)
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    for second in 0..130 {
+        f.state
+            .observer_subscriptions
+            .tick(now + chrono::Duration::seconds(second))
+            .await;
+    }
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.state
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await,
+        Some(first_run.clone())
+    );
+    assert_eq!(
+        f.state
+            .session_activation_router
+            .current_run_id(ROOT_B)
+            .await,
+        Some(second_run.clone())
+    );
+
+    let parent = load(&f.state, &f.reference.session_id).await;
+    let caller = SessionCallerReference::from(&parent);
+    assert!(
+        f.state
+            .session_messenger
+            .supervisor_current_user_followup(
+                &caller,
+                &f.reference,
+                &first,
+                "notifying-first",
+                "managed task blocker",
+            )
+            .await
+            .is_err(),
+        "an exact retry cannot remove its admitted notification opt-in"
+    );
+    f.state
+        .session_messenger
+        .supervisor_followup_with_material_notifications(
+            &caller,
+            &f.reference,
+            &first,
+            "notifying-first",
+            "managed task blocker",
+            true,
+        )
+        .await
+        .expect("the unchanged opt-in must replay its original receipt");
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
+
+    f.probe.source_release[0].notify_one();
+    tokio::time::timeout(WAIT, f.probe.task_written.notified())
+        .await
+        .unwrap();
+    drive_material_notices(&f, 3).await;
+    let requests = f.probe.parent_inputs.lock().unwrap();
+    let blocker_notice = requests
+        .last()
+        .unwrap()
+        .iter()
+        .find(|message| message.content.contains("recorded a Task blocker"))
+        .unwrap();
+    assert!(blocker_notice.content.contains(&first_run));
+    assert!(blocker_notice.content.contains("dependency"));
+    drop(requests);
+    assert_eq!(
+        f.state
+            .session_activation_router
+            .current_run_id(ROOT_B)
+            .await,
+        Some(second_run.clone())
+    );
+
+    f.probe.source_release[0].notify_one();
+    tokio::time::timeout(WAIT, f.probe.task_rewritten.notified())
+        .await
+        .unwrap();
+    for _ in 0..12 {
+        f.state.observer_subscriptions.tick(Utc::now()).await;
+    }
+    assert_eq!(
+        f.probe.parent_calls.load(Ordering::SeqCst),
+        3,
+        "an unrelated Task update must reuse the already delivered blocker receipt"
+    );
+
+    let root = load(&f.state, ROOT_A).await;
+    let candidate = bamboo_orchestration::managed_session::notification_candidates(&root)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let mut stale = candidate.clone();
+    stale.target.created_at += chrono::Duration::seconds(1);
+    assert!(f
+        .state
+        .observer_subscriptions
+        .inbox
+        .deliver_managed_root_notification(&stale, Utc::now())
+        .await
+        .is_err());
+    let mut stale = candidate;
+    stale.caller.created_at += chrono::Duration::seconds(1);
+    assert!(f
+        .state
+        .observer_subscriptions
+        .inbox
+        .deliver_managed_root_notification(&stale, Utc::now())
+        .await
+        .is_err());
+
+    f.probe.finish_blocker.notify_one();
+    drive_material_notices(&f, 4).await;
+    f.probe.source_release[1].notify_one();
+    drive_material_notices(&f, 5).await;
+    tokio::time::timeout(WAIT, async {
+        while f
+            .state
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await
+            .is_some()
+            || f.state
+                .session_activation_router
+                .current_run_id(ROOT_B)
+                .await
+                .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let Fixture {
+        home,
+        state,
+        probe,
+        reference,
+    } = f;
+    drop(state);
+    let restarted = host(home.path(), probe.clone()).await;
+    for _ in 0..12 {
+        restarted.observer_subscriptions.tick(Utc::now()).await;
+    }
+    assert_eq!(probe.parent_calls.load(Ordering::SeqCst), 5);
+    assert!(restarted
+        .session_activation_router
+        .current_run_id(&reference.session_id)
+        .await
+        .is_none());
 }
 
 pub(in crate::app_state) async fn exercise_managed_wait_blocker() {

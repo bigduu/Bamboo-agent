@@ -446,6 +446,11 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     #[actix_web::test]
+    async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
+        super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
+    }
+
+    #[actix_web::test]
     async fn managed_wait_wakes_on_the_exact_durable_task_blocker_before_root_finishes() {
         super::super::observer_subscriptions::tests::exercise_managed_wait_blocker().await;
     }

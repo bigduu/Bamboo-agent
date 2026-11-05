@@ -1,11 +1,111 @@
 //! Bounded waits on an existing, exact managed Session run.
 use async_trait::async_trait;
-use bamboo_domain::{ManagedRootEvent, ManagedRootEventRead};
+use bamboo_domain::{ManagedRootEvent, ManagedRootEventRead, ManagedRootNotification, Session};
 use std::{future::Future, time::Duration};
 
 const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
 const MAX_ACK_RECHECK: Duration = Duration::from_secs(4);
+const RECENT_NOTIFICATION_SOURCES: usize = 8;
+
+/// Selectors only. The native Inbox writer proves each original source again.
+pub fn notification_candidates(
+    session: &Session,
+) -> Result<Vec<ManagedRootNotification>, &'static str> {
+    let Some(metadata) = session.runtime_metadata.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let Some(outcomes) = metadata.supervised_root_outcomes.as_ref() else {
+        return Ok(Vec::new());
+    };
+    outcomes.validate()?;
+    let mut candidates = Vec::new();
+    for fact in &outcomes.facts {
+        let has_material = fact.result.is_some()
+            || metadata
+                .managed_task_blocker
+                .as_ref()
+                .is_some_and(|blocker| blocker.run_id == fact.run_id);
+        if !has_material {
+            continue;
+        }
+        for input in &fact.inputs {
+            let Some(origin) = input
+                .supervisor_origin
+                .as_ref()
+                .filter(|origin| origin.material_notifications_requested())
+            else {
+                continue;
+            };
+            let (Some(caller), Some(target)) =
+                (origin.original_caller(), origin.current_user_target())
+            else {
+                continue;
+            };
+            candidates.push(ManagedRootNotification {
+                caller: caller.clone(),
+                target: target.clone(),
+                run_id: fact.run_id.clone(),
+                after_sequence: fact.sequence - 1,
+                input_receipt_id: input.receipt_id.clone(),
+            });
+        }
+    }
+    Ok(candidates)
+}
+
+#[async_trait]
+pub trait ManagedRootNotificationIo: Send + Sync {
+    /// Derived source hints, ordered newest first. Delivery proves authority.
+    async fn sources(&self) -> Vec<String>;
+    async fn candidates(&self, source: &str) -> Result<Vec<ManagedRootNotification>, String>;
+    async fn deliver(&self, selected: &ManagedRootNotification) -> Result<(), String>;
+}
+
+/// Pacing is process-local. Original input facts and Inbox receipts own truth.
+#[derive(Default)]
+pub struct ManagedRootNotifications {
+    next: tokio::sync::Mutex<usize>,
+}
+
+impl ManagedRootNotifications {
+    /// Prioritize recent changes and revisit one older source each pass.
+    pub async fn tick(&self, io: &impl ManagedRootNotificationIo) -> Result<(), String> {
+        let Ok(mut next) = self.next.try_lock() else {
+            return Ok(());
+        };
+        let sources = io.sources().await;
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let position = *next;
+        *next = next.wrapping_add(1);
+        let mut selected: Vec<_> = sources
+            .iter()
+            .take(RECENT_NOTIFICATION_SOURCES)
+            .map(|source| (source, position))
+            .collect();
+        let older = &sources[position % sources.len()];
+        if !selected.iter().any(|(source, _)| *source == older) {
+            selected.push((older, position / sources.len()));
+        }
+        let mut first_error = None;
+        for (source, cursor) in selected {
+            let result = async {
+                let candidates = io.candidates(source).await?;
+                if !candidates.is_empty() {
+                    io.deliver(&candidates[cursor % candidates.len()]).await?;
+                }
+                Ok::<_, String>(())
+            }
+            .await;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+}
 
 /// The Host supplies a signal bound to one already observed run. Timing out
 /// leaves its outcome unknown and never cancels the run.
@@ -94,6 +194,54 @@ async fn prefer_verified_outcome<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct SourceReads(std::sync::Mutex<Vec<String>>);
+
+    #[async_trait]
+    impl ManagedRootNotificationIo for SourceReads {
+        async fn sources(&self) -> Vec<String> {
+            (0..12).map(|index| format!("source-{index}")).collect()
+        }
+
+        async fn candidates(&self, source: &str) -> Result<Vec<ManagedRootNotification>, String> {
+            self.0.lock().unwrap().push(source.into());
+            if source == "source-0" {
+                return Err("unavailable source".into());
+            }
+            Ok(Vec::new())
+        }
+
+        async fn deliver(&self, _: &ManagedRootNotification) -> Result<(), String> {
+            unreachable!("empty candidate sets cannot deliver")
+        }
+    }
+
+    #[tokio::test]
+    async fn recent_notification_errors_keep_older_sources_in_the_reconciliation_rotation() {
+        let reads = SourceReads(std::sync::Mutex::new(Vec::new()));
+        let notifications = ManagedRootNotifications::default();
+        for _ in 0..24 {
+            assert_eq!(
+                notifications.tick(&reads).await,
+                Err("unavailable source".into())
+            );
+        }
+        let reads = reads.0.lock().unwrap();
+        for index in 0..12 {
+            let minimum = if index < RECENT_NOTIFICATION_SOURCES {
+                24
+            } else {
+                2
+            };
+            assert!(
+                reads
+                    .iter()
+                    .filter(|source| **source == format!("source-{index}"))
+                    .count()
+                    >= minimum
+            );
+        }
+    }
 
     struct Finalization;
 
