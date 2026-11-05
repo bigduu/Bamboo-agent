@@ -55,6 +55,9 @@ struct Probe {
     hold_sources: AtomicBool,
     source_entered: [Notify; 2],
     source_release: [Notify; 2],
+    task_written: Notify,
+    task_rewritten: Notify,
+    finish_blocker: Notify,
 }
 
 // Read only this test's bounded physical transport. These are diagnostics,
@@ -242,6 +245,54 @@ impl LLMProvider for Probe {
             SOURCE => {
                 self.source_inputs.lock().unwrap().push(messages.to_vec());
                 self.source_calls.fetch_add(1, Ordering::SeqCst);
+                if messages
+                    .iter()
+                    .any(|message| message.content.contains("managed task blocker"))
+                {
+                    let task = |id: &str, tasks: Value| {
+                        LLMChunk::ToolCalls(vec![ToolCall {
+                            id: id.into(),
+                            tool_type: "function".into(),
+                            function: FunctionCall {
+                                name: "Task".into(),
+                                arguments: json!({"tasks":tasks}).to_string(),
+                            },
+                        }])
+                    };
+                    let blocker = json!({
+                        "id":"dependency", "content":"Waiting for dependency", "status":"blocked"
+                    });
+                    let result = |id| {
+                        messages
+                            .iter()
+                            .find(|message| message.tool_call_id.as_deref() == Some(id))
+                    };
+                    let chunk = if let Some(result) = result("update-other-task") {
+                        assert_ne!(result.tool_success, Some(false), "{}", result.content);
+                        self.task_rewritten.notify_one();
+                        self.finish_blocker.notified().await;
+                        LLMChunk::Token("Root finished after the dependency cleared.".into())
+                    } else if let Some(result) = result("report-task-blocker") {
+                        assert_ne!(result.tool_success, Some(false), "{}", result.content);
+                        self.task_written.notify_one();
+                        self.source_release[0].notified().await;
+                        task(
+                            "update-other-task",
+                            json!([blocker, {
+                                "id":"other", "content":"Checked independent input", "status":"completed"
+                            }]),
+                        )
+                    } else {
+                        self.source_entered[0].notify_one();
+                        self.source_release[0].notified().await;
+                        assert!(tools.iter().any(|tool| tool.function.name == "Task"));
+                        task("report-task-blocker", json!([blocker]))
+                    };
+                    return Ok(Box::pin(futures::stream::iter([
+                        Ok(chunk),
+                        Ok(LLMChunk::Done),
+                    ])));
+                }
                 if self.hold_sources.load(Ordering::SeqCst) {
                     let slot = usize::from(
                         messages
@@ -1216,6 +1267,144 @@ async fn run_native_source(
         "the matching input must reach this actual provider call"
     );
     (input_id, activation.run_id, generation, target_created_at)
+}
+
+pub(in crate::app_state) async fn exercise_managed_wait_blocker() {
+    use bamboo_domain::{ManagedRootEvent, ManagedRootEventRead, SessionCallerReference};
+
+    let f = Fixture::new_with_native_source(true).await;
+    let first = managed_target(&f.state, &f.reference, ROOT_A).await;
+    let second = managed_target(&f.state, &f.reference, ROOT_B).await;
+    admit_native_source(&f, &first, "managed-task-blocker", "managed task blocker").await;
+    tokio::time::timeout(WAIT, f.probe.source_entered[0].notified())
+        .await
+        .expect("Root provider reached the first Task round");
+    let router = &f.state.session_activation_router;
+    let run = router.current_run_id(ROOT_A).await.unwrap();
+    let request = |cursor| {
+        json!({
+            "action":"wait_outcomes",
+            "outcome_targets":[
+                {"target_ref":first,"expected_run_id":run,"after_sequence":0,"after_blocker_cursor":cursor},
+                {"target_ref":second,"expected_run_id":"never-started","after_sequence":0,"after_blocker_cursor":0},
+            ],
+        })
+    };
+
+    let result = {
+        let waiter = invoke_managed_control(&f.state, &f.reference, "await-blocker", request(0));
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err(),
+            "an active Root without a recorded blocker must keep waiting"
+        );
+        f.probe.source_release[0].notify_one();
+        tokio::time::timeout(WAIT, waiter)
+            .await
+            .expect("Task write must wake the Supervisor")
+    };
+    assert_eq!(result["status"], "recorded_blocker");
+    assert_eq!(result["blocker"]["target_session_id"], ROOT_A);
+    assert_eq!(result["blocker"]["run_id"], run);
+    assert_eq!(result["blocker"]["task_id"], "dependency");
+    let version = result["blocker"]["task_version"].as_u64().unwrap();
+    let cursor = result["blocker"]["cursor"].as_u64().unwrap();
+    assert!(cursor > 0);
+    assert_eq!(cursor, version);
+    tokio::time::timeout(WAIT, f.probe.task_written.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        router.current_run_id(ROOT_A).await.as_deref(),
+        Some(run.as_str())
+    );
+
+    f.probe.source_release[0].notify_one();
+    tokio::time::timeout(WAIT, f.probe.task_rewritten.notified())
+        .await
+        .expect("same Root committed an unrelated Task update");
+
+    // A fresh store reads the exact evidence without an in-memory runner
+    // signal. Cursors and the run selector must independently exclude replay.
+    let reopened = Arc::new(SessionStoreV2::new(f.home.path().into()).await.unwrap());
+    let inbox = FileSessionInbox::new(reopened, bamboo_domain::SessionInboxLimits::default());
+    let supervisor = load(&f.state, &f.reference.session_id).await;
+    let caller = SessionCallerReference::from(&supervisor);
+    let read = |run_id, cursor| {
+        inbox.read_managed_root_event(&caller, &f.reference, &first, run_id, 0, cursor)
+    };
+    let ManagedRootEventRead::Next(ManagedRootEvent::Blocker(blocker)) =
+        read(run.as_str(), Some(0)).await.unwrap()
+    else {
+        panic!("fresh storage must still observe the Task blocker");
+    };
+    assert!(blocker.task_version > version);
+    assert_eq!(blocker.cursor, cursor);
+    assert_eq!(
+        read(run.as_str(), Some(cursor)).await.unwrap(),
+        ManagedRootEventRead::CaughtUp
+    );
+    assert_eq!(
+        read("different-run", Some(0)).await.unwrap(),
+        ManagedRootEventRead::CaughtUp
+    );
+    assert_eq!(
+        read(run.as_str(), None).await.unwrap(),
+        ManagedRootEventRead::CaughtUp
+    );
+
+    // The generic Task transaction can replace the same version. An old
+    // proof must not authenticate the replacement, even for the same task ID.
+    let original = f
+        .state
+        .storage
+        .load_runtime_control_plane(ROOT_A)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut replaced = original.clone();
+    replaced.task_list.as_mut().unwrap().items[0].description = "external replacement".into();
+    assert!(f
+        .state
+        .storage
+        .save_task_control_plane_if_matches(&original, &replaced)
+        .await
+        .unwrap());
+    assert_eq!(
+        read(run.as_str(), Some(0)).await.unwrap(),
+        ManagedRootEventRead::CaughtUp
+    );
+    assert!(f
+        .state
+        .storage
+        .save_task_control_plane_if_matches(&replaced, &original)
+        .await
+        .unwrap());
+
+    assert_eq!(
+        read(run.as_str(), Some(0)).await.unwrap(),
+        ManagedRootEventRead::CaughtUp,
+        "a later generic restore cannot resurrect the original Root attribution"
+    );
+
+    let outcome = {
+        let waiter =
+            invoke_managed_control(&f.state, &f.reference, "await-handoff", request(cursor));
+        tokio::pin!(waiter);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err()
+        );
+        f.probe.finish_blocker.notify_one();
+        tokio::time::timeout(WAIT, waiter)
+            .await
+            .expect("blocker cursor cannot consume outcome")
+    };
+    assert_eq!(outcome["status"], "recorded_outcome");
+    assert_eq!(outcome["outcome"]["run_id"], run);
 }
 
 fn completed_root_fingerprint(actual_run_id: &str) -> String {

@@ -14,6 +14,8 @@ pub struct ManagedOutcomeTarget {
     pub target_ref: SupervisorCurrentUserTarget,
     pub expected_run_id: String,
     pub after_sequence: u64,
+    #[serde(default)]
+    pub after_blocker_cursor: Option<u64>,
 }
 
 #[async_trait]
