@@ -322,9 +322,43 @@ async fn create_child_action_inner(
                 )));
             }
         };
+    // A native Work retains the Supervisor's tree identity. Its explicit
+    // execution workspace is authorized by the frozen Work Project instead.
+    let ticket_workspace = ticket_context
+        .as_ref()
+        .and_then(|packet| packet.workspace.as_ref());
+    let workspace_project_id = if let (Some(workspace), Some(context)) = (
+        ticket_workspace,
+        ticket_context
+            .as_ref()
+            .and_then(|packet| packet.project_context.as_ref()),
+    ) {
+        if inherited_project_id
+            .as_ref()
+            .is_some_and(|id| id != &context.project_id)
+            || std::path::Path::new(&input.workspace)
+                .canonicalize()
+                .map_err(|error| ChildSessionError::Execution(error.to_string()))?
+                != std::path::Path::new(&workspace.worktree)
+        {
+            return Err(ChildSessionError::InvalidArguments(
+                "Work workspace differs from its frozen Project or execution path".into(),
+            ));
+        }
+        Some(context.project_id.clone())
+    } else {
+        inherited_project_id.clone()
+    };
     let final_workspace = port
-        .validate_child_workspace(inherited_project_id.as_ref(), &input.workspace)
+        .validate_child_workspace(workspace_project_id.as_ref(), &input.workspace)
         .await?;
+    if ticket_workspace.is_some_and(|workspace| {
+        std::path::Path::new(&final_workspace) != std::path::Path::new(&workspace.worktree)
+    }) {
+        return Err(ChildSessionError::InvalidArguments(
+            "Work workspace validation relocated the frozen execution path".into(),
+        ));
+    }
     if shared_workspace {
         // Host policy can change across the async preparation above. Retain
         // the second validation, but never accept its relocation as sharing.

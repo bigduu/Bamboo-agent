@@ -1,7 +1,8 @@
 //! Two real Project workers and an isolated denied-read probe over existing Host ports.
 use actix_web::{http::StatusCode, test, web, App};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
-use bamboo_domain::{ProjectId, Role, WorkspaceBinding};
+use bamboo_domain::{ProjectId, Role, Session, WorkspaceBinding};
+use bamboo_engine::ticket_worker_plan::{TicketWorkerPlan, WorkerLocalPlan};
 use bamboo_llm::LLMChunk;
 use bamboo_server::AppState;
 use bamboo_tickets::{
@@ -179,12 +180,82 @@ fn reply<'a>(request: &'a ModelRequest, id: &str) -> &'a bamboo_domain::Message 
 }
 
 async fn complete_own_work(
+    state: &AppState,
+    assignment: &str,
     requests: &mut mpsc::UnboundedReceiver<ModelRequest>,
     work: &Work,
     other: &Work,
     label: &str,
-) {
+) -> (TicketWorkerPlan, Session) {
     let first = next(requests).await;
+    let service = state.tickets.service().unwrap();
+    let snapshot = service.published().unwrap().1;
+    let receipt = snapshot.assignments[assignment].runtime.as_ref().unwrap();
+    let mut child = state
+        .storage
+        .load_session(&receipt.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        child.project_id_meta().is_none(),
+        "Work must retain its global Supervisor's tree Project"
+    );
+    assert_eq!(
+        child.root_session_id,
+        snapshot.binding.supervisor_session_id
+    );
+    // Mirror Runtime::execute's readonly caller projection, using the native
+    // receipt that already reached this provider gate. Never persist test inputs.
+    child
+        .agent_runtime_state
+        .get_or_insert_with(Default::default)
+        .run_id = receipt.run_id.clone();
+    let plan = TicketWorkerPlan::from_runtime_receipt(service, assignment).unwrap();
+    let path = Some(std::path::Path::new(&work.workspace.worktree));
+    assert!(
+        plan.workspace_project_context(&child, path).is_err(),
+        "unbound capability grants no workspace"
+    );
+    plan.bind_session(&mut child).unwrap();
+    assert_eq!(
+        plan.workspace_project_context(&child, path)
+            .unwrap()
+            .unwrap()
+            .project_id,
+        work.project
+    );
+    assert!(plan
+        .workspace_project_context(
+            &child,
+            Some(std::path::Path::new(&other.workspace.worktree))
+        )
+        .is_err());
+    let mut wrong = child.clone();
+    wrong.created_at += chrono::Duration::seconds(1);
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.parent_created_at = None;
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.root_session_id = "foreign-root".into();
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.agent_runtime_state.as_mut().unwrap().run_id = "foreign-run".into();
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    wrong.set_project_id_meta(other.project.to_string());
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
+    let mut wrong = child.clone();
+    let mut dispatch = bamboo_engine::ticket_runtime::read_dispatch(&wrong)
+        .unwrap()
+        .unwrap();
+    dispatch.spec_hash = "foreign-spec".into();
+    wrong.metadata.insert(
+        bamboo_engine::ticket_runtime::TICKET_DISPATCH_KEY.into(),
+        serde_json::to_string(&dispatch).unwrap(),
+    );
+    assert!(plan.workspace_project_context(&wrong, path).is_err());
     let messages = serde_json::to_string(&first.messages).unwrap();
     assert!(messages.contains(work.marker));
     assert!(
@@ -224,6 +295,7 @@ async fn complete_own_work(
             work.marker
         )))
         .unwrap();
+    (plan, child)
 }
 
 async fn submitted(state: &AppState, work: &Work, assignment: &str) -> Submission {
@@ -327,8 +399,17 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
         assert_eq!(std::fs::read_to_string(a.path()).unwrap(), marker_a);
         assert_eq!(std::fs::read_to_string(b.path()).unwrap(), marker_b);
         let assignment = start_work!(app, state, a, "a");
-        complete_own_work(&mut requests, &a, &b, "a").await;
+        let (plan, child) =
+            complete_own_work(&state, &assignment, &mut requests, &a, &b, "a").await;
         let first = submitted(&state, &a, &assignment).await;
+        assert!(
+            plan.workspace_project_context(
+                &child,
+                Some(std::path::Path::new(&a.workspace.worktree))
+            )
+            .is_err(),
+            "stopped Work cannot reuse a prior workspace capability"
+        );
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         state.shutdown().await;
         (a, b, probe, first, assignment)
@@ -359,8 +440,12 @@ async fn two_project_native_results_and_denied_reads_survive_host_restart() {
         assert!(resumed.assignments[&a_assignment].process_stopped);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
         let assignment = start_work!(app, state, b, "b");
-        complete_own_work(&mut requests, &b, &a, "b").await;
+        let (plan, child) =
+            complete_own_work(&state, &assignment, &mut requests, &b, &a, "b").await;
         let second = submitted(&state, &b, &assignment).await;
+        assert!(plan
+            .workspace_project_context(&child, Some(std::path::Path::new(&b.workspace.worktree)))
+            .is_err());
         assert_ne!(first.id, second.id);
         assert_ne!(first.runtime.session_id, second.runtime.session_id);
         assert_ne!(first.runtime.run_id, second.runtime.run_id);

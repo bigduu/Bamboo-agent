@@ -536,6 +536,34 @@ impl ProjectStoreContextSource {
 
 #[async_trait]
 impl ProjectContextSource for ProjectStoreContextSource {
+    async fn workspace_facts(
+        &self,
+        project_id: &ProjectId,
+        workspace: &std::path::Path,
+    ) -> Result<Option<bamboo_engine::project_context::ProjectWorkspaceFacts>, ProjectContextError>
+    {
+        let manifest = match self.store.get(project_id) {
+            Ok(project) => project,
+            Err(ProjectStoreError::NotFound(_)) => return Ok(None),
+            Err(error) => return Err(ProjectContextError::Source(error.to_string())),
+        };
+        let owner = self
+            .store
+            .find_workspace_owner_for_path(&bamboo_config::paths::path_to_display_string(workspace))
+            .map_err(|error| ProjectContextError::Source(error.to_string()))?
+            .map(|project| project.id);
+        Ok(Some(
+            bamboo_engine::project_context::ProjectWorkspaceFacts {
+                project_id: manifest.id,
+                status: manifest.status,
+                resource_revision: manifest.resource_revision,
+                project_path: manifest.project_path,
+                workspace_bindings: manifest.workspace_bindings,
+                owner,
+            },
+        ))
+    }
+
     async fn find_project(
         &self,
         project_id: &ProjectId,
