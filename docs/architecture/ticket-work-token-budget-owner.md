@@ -1,4 +1,4 @@
-# Explicit owner setup for canonical Work token limits
+# Explicit owner setup for canonical Work token accounting and limits
 
 Issue #2453. Independent dev source starts at
 `b6a6f5ecd468f41aa61b690e96ed4578f1457d3e`, including directory #2456 and
@@ -67,6 +67,31 @@ or a different User for the same decision conflict. Replaying an earlier decisio
 returns its original revision/limits/User/committed sequence without restoring
 those old limits over a later configuration or rewriting accumulated spending.
 The original trusted Rust configuration port keeps its existing strict CAS behavior.
+
+## Semantic accounting without Worker quotas (#2591)
+
+The same owner endpoint also accepts an explicit `"limits": null`. This records
+a canonical configuration decision and enables bounded semantic-call reservations
+and settlement in the original ledger without enabling Work/day/scope quotas.
+Omitting `limits` is rejected, including in persisted configuration and ledger
+JSON; it never silently disables existing limits. Existing finite-limit JSON
+retains its representation and behavior. `configured` reports an initialized
+ledger; `quotas_enforced` separately reports whether finite limits are active.
+
+Native Worker calls in this mode continue through their normal Session execution
+and usage path. Initializing semantic accounting does not enroll them in token
+quota admission or require known model ceilings. Ready owner installation still
+validates its existing authority, grants, workspaces and execution policy; its
+token-quota checks apply only when finite limits were explicitly configured.
+
+Semantic callers retain their bounded input/output request caps. Reservations
+still precede provider entry. Known usage refunds unused reserved tokens;
+pending/unknown usage retains the original reservation, including across restart,
+until authoritative settlement. Receipt identity, replay fencing, storage capacity,
+clock and over-cap accounting guards remain in force. These guards can block a
+new semantic call; they do not impose Worker quotas in accounting-only mode.
+Changing between explicit null and finite limits uses the same revision CAS and
+immutable owner history and never resets reservations or accumulated usage.
 
 Writer restart advances authority epoch. An old HTTP envelope is rejected.
 An authenticated owner can observe the fresh epoch and read the original decision

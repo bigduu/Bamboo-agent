@@ -1,4 +1,6 @@
 use bamboo_tickets::*;
+#[path = "execution_budget/accounting_only.rs"]
+mod accounting_only;
 #[path = "execution_budget/owner_setup.rs"]
 mod owner_setup;
 use std::{

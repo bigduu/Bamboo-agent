@@ -10,7 +10,17 @@ pub struct WorkTokenBudgetSetup {
     pub authority_epoch: u64,
     /// The requested decision is configuration expected_revision + 1.
     pub expected_revision: u64,
-    pub limits: WorkTokenLimits,
+    #[serde(deserialize_with = "required_nullable_limits")]
+    pub limits: Option<WorkTokenLimits>,
+}
+
+fn required_nullable_limits<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WorkTokenLimits>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
 }
 
 fn owner(principal: &Principal) -> Result<()> {
@@ -76,6 +86,7 @@ impl TicketApplication {
             "binding":snapshot.binding,
             "observed":{"commit":commit,"seq":snapshot.seq,"authority_epoch":snapshot.authority_epoch},
             "configured":budget.is_some(),
+            "quotas_enforced":budget.is_some_and(|budget| budget.limits.is_some()),
             "budget_revision":budget.map_or(0, |budget| budget.revision),
             "current_configuration":budget.and_then(|budget| budget.configurations.get(&budget.revision)),
             "requested_configuration":requested,"accounting":accounting,
@@ -97,7 +108,7 @@ impl TicketApplication {
         if service.published()?.1.binding != request.binding {
             return Err(Error::ScopeDenied("scope binding changed".into()));
         }
-        let receipt = service.configure_work_token_budget_at_epoch(
+        let receipt = service.configure_work_token_accounting_at_epoch(
             &authority,
             request.authority_epoch,
             request.expected_revision,

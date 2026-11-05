@@ -266,16 +266,17 @@ impl TicketApplication {
         // Installation never creates limits, reserves money or resets spending.
         let budget = snapshot.execution_budget.as_ref().ok_or_else(|| {
             Error::ResourceBlocked(
-                "configure canonical cumulative Work token limits before installation".into(),
+                "configure canonical Work token accounting before installation".into(),
             )
         })?;
         let today = chrono::Utc::now().timestamp_millis().max(0) as u64 / 86_400_000;
-        if budget.total_charged >= budget.limits.total_tokens
-            || budget.current_utc_day.is_some_and(|day| day > today)
-            || (budget.current_utc_day == Some(today)
-                && budget.daily_charged >= budget.limits.utc_day_tokens)
-            || budget.limits.utc_day_tokens == 0
-        {
+        if budget.limits.as_ref().is_some_and(|limits| {
+            budget.total_charged >= limits.total_tokens
+                || budget.current_utc_day.is_some_and(|day| day > today)
+                || (budget.current_utc_day == Some(today)
+                    && budget.daily_charged >= limits.utc_day_tokens)
+                || limits.utc_day_tokens == 0
+        }) {
             return Err(Error::ResourceBlocked(
                 "canonical token budget exhausted".into(),
             ));
@@ -309,18 +310,14 @@ impl TicketApplication {
             {
                 return Err(Error::RevisionConflict);
             }
-            if budget
-                .limits
-                .work_tokens
-                .get(&grant.work_id)
-                .copied()
-                .unwrap_or(0)
-                <= budget
-                    .work_charged
-                    .get(&grant.work_id)
-                    .copied()
-                    .unwrap_or(0)
-            {
+            if budget.limits.as_ref().is_some_and(|limits| {
+                limits.work_tokens.get(&grant.work_id).copied().unwrap_or(0)
+                    <= budget
+                        .work_charged
+                        .get(&grant.work_id)
+                        .copied()
+                        .unwrap_or(0)
+            }) {
                 return Err(Error::ResourceBlocked(
                     "canonical Work token budget exhausted".into(),
                 ));
