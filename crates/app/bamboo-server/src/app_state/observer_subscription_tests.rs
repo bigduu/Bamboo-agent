@@ -1274,9 +1274,16 @@ async fn run_native_source(
 }
 
 async fn drive_material_notices(f: &Fixture, expected_calls: usize) {
-    tokio::time::timeout(WAIT, async {
+    let mut last_error = None;
+    let finished = tokio::time::timeout(WAIT, async {
         loop {
-            f.state.observer_subscriptions.tick(Utc::now()).await;
+            if let Err(error) = f.state.observer_subscriptions.material_tick().await {
+                assert!(
+                    error.contains("pending") || error.contains("busy"),
+                    "{error}"
+                );
+                last_error = Some(error);
+            }
             if f.probe.parent_calls.load(Ordering::SeqCst) >= expected_calls
                 && f.state
                     .session_activation_router
@@ -1289,8 +1296,27 @@ async fn drive_material_notices(f: &Fixture, expected_calls: usize) {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
-    .await
-    .expect("the checked notice must reach the native Supervisor");
+    .await;
+    if finished.is_err() {
+        let hints =
+            ManagedRootNotificationIo::sources(f.state.observer_subscriptions.as_ref()).await;
+        let cache = f.state.observer_subscriptions.material_cache.lock().await;
+        let cached: Vec<_> = cache
+            .iter()
+            .map(|(id, cached)| {
+                (
+                    id,
+                    &cached.key.run_id,
+                    &cached.key.status,
+                    &cached.key.blocker_cursor,
+                    cached.candidates.len(),
+                    cached.delivered.len(),
+                    cached.settled,
+                )
+            })
+            .collect();
+        panic!("checked notice expected {expected_calls} Supervisor calls, observed {}, last error {last_error:?}, hints {hints:?}, cache {cached:?}", f.probe.parent_calls.load(Ordering::SeqCst));
+    }
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
 }
 
@@ -1298,6 +1324,14 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
     let f = Fixture::new_with_native_source(true).await;
+    let mut unobserved = Session::new("unobserved-large-root", "synthetic-model");
+    unobserved.add_message(Message::user("x".repeat(4 * 1024 * 1024)));
+    f.state.storage.save_session(&unobserved).await.unwrap();
+    assert!(
+        !ManagedRootNotificationIo::sources(f.state.observer_subscriptions.as_ref())
+            .await
+            .contains(&unobserved.id)
+    );
     let workspace = f.home.path().join("notifying-second-workspace");
     std::fs::create_dir(&workspace).unwrap();
     let mut second_session = load(&f.state, ROOT_B).await;
@@ -1375,14 +1409,45 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
         .await
         .unwrap();
 
-    let now = Utc::now();
-    for second in 0..130 {
+    let original_hint = f
+        .state
+        .session_store
+        .get_index_entry(ROOT_A)
+        .await
+        .unwrap()
+        .material_notification_hint;
+    assert!(original_hint.is_some());
+    f.state
+        .session_store
+        .clear_material_notification_hint(ROOT_A, first.created_at, "a-different-request")
+        .await
+        .unwrap();
+    assert_eq!(
+        f.state
+            .session_store
+            .get_index_entry(ROOT_A)
+            .await
+            .unwrap()
+            .material_notification_hint,
+        original_hint
+    );
+
+    for _ in 0..130 {
         f.state
             .observer_subscriptions
-            .tick(now + chrono::Duration::seconds(second))
-            .await;
+            .material_tick()
+            .await
+            .unwrap();
     }
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.state
+            .observer_subscriptions
+            .material_main_reads
+            .load(Ordering::SeqCst),
+        0,
+        "unchanged running records must keep Main transcripts unread"
+    );
     assert_eq!(
         f.state
             .session_activation_router
@@ -1455,9 +1520,31 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
     tokio::time::timeout(WAIT, f.probe.task_rewritten.notified())
         .await
         .unwrap();
+    let reads = f
+        .state
+        .observer_subscriptions
+        .material_main_reads
+        .load(Ordering::SeqCst);
+    let proof_io = Arc::clone(&f.state.observer_subscriptions.material_proof_io)
+        .acquire_owned()
+        .await
+        .unwrap();
     for _ in 0..12 {
-        f.state.observer_subscriptions.tick(Utc::now()).await;
+        f.state
+            .observer_subscriptions
+            .material_tick()
+            .await
+            .unwrap();
     }
+    drop(proof_io);
+    assert_eq!(
+        f.state
+            .observer_subscriptions
+            .material_main_reads
+            .load(Ordering::SeqCst),
+        reads,
+        "handled material evidence must keep full-history proof I/O idle"
+    );
     assert_eq!(
         f.probe.parent_calls.load(Ordering::SeqCst),
         3,
@@ -1520,8 +1607,17 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
     drop(state);
     let restarted = host(home.path(), probe.clone()).await;
     for _ in 0..12 {
-        restarted.observer_subscriptions.tick(Utc::now()).await;
+        restarted
+            .observer_subscriptions
+            .material_tick()
+            .await
+            .unwrap();
     }
+    assert!(
+        ManagedRootNotificationIo::sources(restarted.observer_subscriptions.as_ref())
+            .await
+            .is_empty()
+    );
     assert_eq!(probe.parent_calls.load(Ordering::SeqCst), 5);
     assert!(restarted
         .session_activation_router

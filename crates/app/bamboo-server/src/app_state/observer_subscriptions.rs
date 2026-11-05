@@ -11,7 +11,12 @@ use bamboo_orchestration::managed_session::{ManagedRootNotificationIo, ManagedRo
 use bamboo_server_tools::SessionInspectorTool;
 use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use chrono::{DateTime, Utc};
-use std::{collections::BTreeSet, io, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io,
+    sync::Arc,
+    time::{Instant, SystemTime},
+};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -34,6 +39,35 @@ struct PublishedViewSelector {
     root_outcome: Option<bamboo_domain::ObserverRootOutcomeCursor>,
 }
 
+#[derive(PartialEq, Eq)]
+struct MaterialSourceKey {
+    hint: String,
+    caller: SessionCallerReference,
+    run_id: Option<String>,
+    status: bamboo_domain::AgentStatusState,
+    blocker_cursor: Option<(String, u64)>,
+}
+
+struct CachedMaterialSource {
+    key: MaterialSourceKey,
+    main_stamp: (u64, SystemTime),
+    candidates: Vec<bamboo_domain::ManagedRootNotification>,
+    delivered: Vec<bamboo_domain::ManagedRootNotification>,
+    settled: bool,
+    last_used: Instant,
+}
+
+enum MaterialProofCompletion {
+    Source {
+        source: String,
+        result: Result<Box<CachedMaterialSource>, String>,
+    },
+    Delivered {
+        selected: Box<bamboo_domain::ManagedRootNotification>,
+        result: Result<bool, String>,
+    },
+}
+
 pub(super) struct ObserverSubscriptionCoordinator {
     store: Arc<SessionStoreV2>,
     inbox: Arc<FileSessionInbox>,
@@ -42,6 +76,11 @@ pub(super) struct ObserverSubscriptionCoordinator {
     // Fairness/coalescing only. All event/cursor/retry truth remains canonical.
     next: Mutex<usize>,
     material_notifications: ManagedRootNotifications,
+    material_cache: Mutex<BTreeMap<String, CachedMaterialSource>>,
+    material_proof_io: Arc<tokio::sync::Semaphore>,
+    material_pending: Mutex<Option<tokio::sync::oneshot::Receiver<MaterialProofCompletion>>>,
+    #[cfg(test)]
+    material_main_reads: std::sync::atomic::AtomicUsize,
     native: bool,
 }
 
@@ -53,6 +92,9 @@ impl ObserverSubscriptionCoordinator {
         storage: Arc<dyn Storage>,
         native: bool,
     ) -> Self {
+        if native {
+            inbox.enable_material_notifications();
+        }
         Self {
             inspector: SessionInspectorTool::host_routed(store.clone(), storage)
                 .with_observer_outcome_inbox(inbox.clone()),
@@ -61,17 +103,108 @@ impl ObserverSubscriptionCoordinator {
             activation,
             next: Mutex::new(0),
             material_notifications: ManagedRootNotifications::default(),
+            material_cache: Mutex::new(BTreeMap::new()),
+            material_proof_io: Arc::new(tokio::sync::Semaphore::new(1)),
+            material_pending: Mutex::new(None),
+            #[cfg(test)]
+            material_main_reads: std::sync::atomic::AtomicUsize::new(0),
             native,
         }
+    }
+
+    pub(super) fn spawn_material_notifications(
+        self: &Arc<Self>,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        if !self.native {
+            return;
+        }
+        let io = Arc::clone(self);
+        tokio::spawn(async move {
+            io.material_notifications.run(io.as_ref(), shutdown).await;
+        });
+    }
+
+    #[cfg(test)]
+    pub(super) async fn material_tick(&self) -> Result<(), String> {
+        self.material_notifications.tick(self).await
+    }
+
+    async fn begin_material_proof(
+        &self,
+    ) -> Result<
+        (
+            tokio::sync::OwnedSemaphorePermit,
+            tokio::sync::oneshot::Sender<MaterialProofCompletion>,
+        ),
+        String,
+    > {
+        let mut pending = self.material_pending.lock().await;
+        if pending.is_some() {
+            return Err("material proof I/O remains pending".into());
+        }
+        let permit = Arc::clone(&self.material_proof_io)
+            .try_acquire_owned()
+            .map_err(|_| "material proof I/O is busy".to_string())?;
+        let (send, receive) = tokio::sync::oneshot::channel();
+        *pending = Some(receive);
+        Ok((permit, send))
+    }
+
+    async fn finish_material_proof(&self) -> Result<(), String> {
+        let completion = {
+            let mut pending = self.material_pending.lock().await;
+            let Some(receive) = pending.as_mut() else {
+                return Ok(());
+            };
+            match receive.try_recv() {
+                Ok(completion) => {
+                    *pending = None;
+                    completion
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => return Ok(()),
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    *pending = None;
+                    return Err("material proof I/O completion is unavailable".into());
+                }
+            }
+        };
+        match completion {
+            MaterialProofCompletion::Source { source, result } => {
+                let cached = result?;
+                let mut cache = self.material_cache.lock().await;
+                if cache.len() >= 16 && !cache.contains_key(&source) {
+                    if let Some(oldest) = cache
+                        .iter()
+                        .min_by_key(|(_, cached)| cached.last_used)
+                        .map(|(id, _)| id.clone())
+                    {
+                        cache.remove(&oldest);
+                    }
+                }
+                cache.insert(source, *cached);
+            }
+            MaterialProofCompletion::Delivered { selected, result } => {
+                if result? {
+                    if let Some(cached) = self
+                        .material_cache
+                        .lock()
+                        .await
+                        .get_mut(&selected.target.session_id)
+                        .filter(|cached| cached.candidates.contains(&selected))
+                    {
+                        cached.delivered.push(*selected);
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// At most one registered Observer and its fixed (<=8) targets per tick.
     pub(super) async fn tick(&self, now: DateTime<Utc>) {
         if !self.native {
             return;
-        }
-        if let Err(error) = self.material_notifications.tick(self).await {
-            tracing::warn!(%error, "Managed Session material notification remains pending");
         }
         let Ok(mut next) = self.next.try_lock() else {
             return;
@@ -311,6 +444,9 @@ impl ObserverSubscriptionCoordinator {
 #[async_trait::async_trait]
 impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
     async fn sources(&self) -> Vec<String> {
+        if let Err(error) = self.finish_material_proof().await {
+            tracing::debug!(%error, "Managed Session material proof remains pending");
+        }
         self.store
             .list_index_entries()
             .await
@@ -318,6 +454,7 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
             .filter(|entry| {
                 entry.kind == bamboo_domain::SessionKind::Root
                     && entry.id != DEFAULT_SUPERVISOR_SESSION_ID
+                    && entry.material_notification_hint.is_some()
             })
             .map(|entry| entry.id)
             .collect()
@@ -327,14 +464,99 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
         &self,
         source: &str,
     ) -> Result<Vec<bamboo_domain::ManagedRootNotification>, String> {
-        let session = self
+        let hint = self
             .store
-            .load_execution_admission_snapshot(source)
+            .get_index_entry(source)
+            .await
+            .and_then(|entry| entry.material_notification_hint)
+            .ok_or_else(|| "managed notification hint is unavailable".to_string())?;
+        let main_stamp = self
+            .store
+            .material_notification_main_stamp(source)
+            .await
+            .map_err(|error| error.to_string())?;
+        let side = self
+            .store
+            .load_runtime_control_plane(source)
             .await
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "managed notification source is unavailable".to_string())?;
-        bamboo_orchestration::managed_session::notification_candidates(&session)
-            .map_err(str::to_owned)
+        let status = side
+            .agent_runtime_state
+            .as_ref()
+            .map(|runtime| runtime.status.clone())
+            .unwrap_or_default();
+        let blocker_cursor = side
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.managed_task_blocker.as_ref())
+            .map(|blocker| (blocker.run_id.clone(), blocker.cursor));
+        let terminal = matches!(
+            status,
+            bamboo_domain::AgentStatusState::Completed
+                | bamboo_domain::AgentStatusState::Failed
+                | bamboo_domain::AgentStatusState::Cancelled
+                | bamboo_domain::AgentStatusState::Suspended
+        );
+        if blocker_cursor.is_none() && !terminal {
+            return Ok(Vec::new());
+        }
+        let key = MaterialSourceKey {
+            hint,
+            caller: SessionCallerReference::from(&side),
+            run_id: side.host_run_id().map(str::to_owned),
+            status,
+            blocker_cursor,
+        };
+        {
+            let mut cache = self.material_cache.lock().await;
+            if let Some(cached) = cache.get_mut(source).filter(|cached| {
+                cached.key == key
+                    // Runtime can finish before Main publishes its final fact.
+                    // Revisit that checkpoint when Main changes, even if the
+                    // previous blocker remains a valid selected candidate.
+                    && ((!cached.candidates.is_empty() && (cached.settled || !terminal))
+                        || cached.main_stamp == main_stamp)
+            }) {
+                cached.last_used = Instant::now();
+                return Ok(cached.candidates.clone());
+            }
+        }
+        let (permit, send) = self.begin_material_proof().await?;
+        #[cfg(test)]
+        self.material_main_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let store = Arc::clone(&self.store);
+        let source_id = source.to_owned();
+        let runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let result = (|| {
+                let session = runtime
+                    .block_on(store.load_execution_admission_snapshot(&source_id))
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "managed notification source is unavailable".to_string())?;
+                let candidates =
+                    bamboo_orchestration::managed_session::notification_candidates(&session)
+                        .map_err(str::to_owned)?;
+                let settled = bamboo_orchestration::managed_session::notification_source_settled(
+                    &session, &key.hint,
+                );
+                Ok(Box::new(CachedMaterialSource {
+                    key,
+                    main_stamp,
+                    candidates,
+                    delivered: Vec::new(),
+                    settled,
+                    last_used: Instant::now(),
+                }))
+            })();
+            let _ = send.send(MaterialProofCompletion::Source {
+                source: source_id,
+                result,
+            });
+        });
+        Err("material proof I/O remains pending".into())
     }
 
     async fn deliver(
@@ -342,15 +564,50 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
         selected: &bamboo_domain::ManagedRootNotification,
     ) -> Result<(), String> {
         let now = Utc::now();
-        if self
-            .inbox
-            .deliver_managed_root_notification(selected, now)
+        let already_delivered = self
+            .material_cache
+            .lock()
             .await
-            .map_err(|error| error.to_string())?
-            .is_some()
-        {
-            self.activation
-                .reconcile_wake(&selected.caller.session_id, now)
+            .get(&selected.target.session_id)
+            .is_some_and(|cached| cached.delivered.contains(selected));
+        if !already_delivered {
+            let (permit, send) = self.begin_material_proof().await?;
+            let inbox = Arc::clone(&self.inbox);
+            let notification = selected.clone();
+            let runtime = tokio::runtime::Handle::current();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let result = runtime
+                    .block_on(inbox.deliver_managed_root_notification(&notification, now))
+                    .map(|receipt| receipt.is_some())
+                    .map_err(|error| error.to_string());
+                let _ = send.send(MaterialProofCompletion::Delivered {
+                    selected: Box::new(notification),
+                    result,
+                });
+            });
+            return Err("material proof I/O remains pending".into());
+        }
+        self.activation
+            .reconcile_wake(&selected.caller.session_id, now)
+            .await
+            .map_err(|error| error.to_string())?;
+        let retired_hint = self
+            .material_cache
+            .lock()
+            .await
+            .get(&selected.target.session_id)
+            .filter(|cached| {
+                cached.settled
+                    && cached
+                        .candidates
+                        .iter()
+                        .all(|candidate| cached.delivered.contains(candidate))
+            })
+            .map(|cached| (cached.key.caller.created_at, cached.key.hint.clone()));
+        if let Some((birth, hint)) = retired_hint {
+            self.store
+                .clear_material_notification_hint(&selected.target.session_id, birth, &hint)
                 .await
                 .map_err(|error| error.to_string())?;
         }

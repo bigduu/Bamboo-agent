@@ -3286,6 +3286,7 @@ mod tests {
             supervisor_created_at: Utc::now(),
             caller: None,
             requires_host_scope: None,
+            notify_on_material_event: false,
             target: crate::SupervisorCurrentUserTarget::capture(&target_session).unwrap(),
             operation_id: SessionMessageId::parse("origin-operation").unwrap(),
         };

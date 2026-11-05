@@ -7,6 +7,7 @@ const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
 const MAX_ACK_RECHECK: Duration = Duration::from_secs(4);
 const RECENT_NOTIFICATION_SOURCES: usize = 8;
+const NOTIFICATION_PROOF_BUDGET: Duration = Duration::from_secs(2);
 
 /// Selectors only. The native Inbox writer proves each original source again.
 pub fn notification_candidates(
@@ -48,10 +49,80 @@ pub fn notification_candidates(
                 run_id: fact.run_id.clone(),
                 after_sequence: fact.sequence - 1,
                 input_receipt_id: input.receipt_id.clone(),
+                blocker_cursor: fact
+                    .result
+                    .is_none()
+                    .then(|| {
+                        metadata
+                            .managed_task_blocker
+                            .as_ref()
+                            .filter(|blocker| blocker.run_id == fact.run_id)
+                            .map(|blocker| blocker.cursor)
+                    })
+                    .flatten(),
             });
         }
     }
     Ok(candidates)
+}
+
+/// The exact hint must be present in Main before its derived index hint can
+/// retire. Pending input checkpoints and uncertain outcomes keep discovery live.
+pub fn notification_source_settled(session: &Session, hint: &str) -> bool {
+    let Some(outcomes) = session
+        .runtime_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+    else {
+        return false;
+    };
+    if !session.agent_runtime_state.as_ref().is_some_and(|runtime| {
+        matches!(
+            runtime.status,
+            bamboo_domain::AgentStatusState::Completed
+                | bamboo_domain::AgentStatusState::Failed
+                | bamboo_domain::AgentStatusState::Cancelled
+                | bamboo_domain::AgentStatusState::Suspended
+        )
+    }) {
+        return false;
+    }
+    let mut found_hint = false;
+    for fact in &outcomes.facts {
+        let inputs: Vec<_> = fact
+            .inputs
+            .iter()
+            .filter(|input| {
+                input
+                    .supervisor_origin
+                    .as_ref()
+                    .is_some_and(|origin| origin.material_notifications_requested())
+            })
+            .collect();
+        if inputs.is_empty() {
+            continue;
+        }
+        if inputs.iter().any(|input| {
+            input.supervisor_origin.as_ref().is_none_or(|origin| {
+                origin.original_caller().is_none() || origin.current_user_target().is_none()
+            })
+        }) {
+            return false;
+        }
+        found_hint |= inputs.iter().any(|input| input.receipt_id.as_str() == hint);
+        if !matches!(
+            fact.result,
+            Some(
+                bamboo_domain::SupervisedRootOutcomeResult::Completed
+                    | bamboo_domain::SupervisedRootOutcomeResult::Failed
+                    | bamboo_domain::SupervisedRootOutcomeResult::Cancelled
+                    | bamboo_domain::SupervisedRootOutcomeResult::Suspended
+            )
+        ) {
+            return false;
+        }
+    }
+    found_hint
 }
 
 #[async_trait]
@@ -89,21 +160,48 @@ impl ManagedRootNotifications {
         if !selected.iter().any(|(source, _)| *source == older) {
             selected.push((older, position / sources.len()));
         }
+        let first = selected
+            .iter()
+            .position(|(source, _)| *source == older)
+            .expect("the rotating source is selected above");
+        selected.rotate_left(first);
         let mut first_error = None;
         for (source, cursor) in selected {
-            let result = async {
+            let result = tokio::time::timeout(NOTIFICATION_PROOF_BUDGET, async {
                 let candidates = io.candidates(source).await?;
                 if !candidates.is_empty() {
                     io.deliver(&candidates[cursor % candidates.len()]).await?;
                 }
                 Ok::<_, String>(())
-            }
-            .await;
+            })
+            .await
+            .unwrap_or_else(|_| Err("managed notification proof remains pending".into()));
             if let Err(error) = result {
                 first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
+    }
+
+    pub async fn run(
+        &self,
+        io: &impl ManagedRootNotificationIo,
+        shutdown: tokio_util::sync::CancellationToken,
+    ) {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = interval.tick() => {},
+            }
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                result = self.tick(io) => if let Err(error) = result {
+                    tracing::debug!(%error, "Managed Session material notification remains pending");
+                },
+            }
+        }
     }
 }
 
@@ -195,7 +293,10 @@ async fn prefer_verified_outcome<T, E>(
 mod tests {
     use super::*;
 
-    struct SourceReads(std::sync::Mutex<Vec<String>>);
+    struct SourceReads {
+        reads: std::sync::Mutex<Vec<String>>,
+        stall: bool,
+    }
 
     #[async_trait]
     impl ManagedRootNotificationIo for SourceReads {
@@ -204,8 +305,11 @@ mod tests {
         }
 
         async fn candidates(&self, source: &str) -> Result<Vec<ManagedRootNotification>, String> {
-            self.0.lock().unwrap().push(source.into());
+            self.reads.lock().unwrap().push(source.into());
             if source == "source-0" {
+                if self.stall {
+                    std::future::pending::<()>().await;
+                }
                 return Err("unavailable source".into());
             }
             Ok(Vec::new())
@@ -218,15 +322,26 @@ mod tests {
 
     #[tokio::test]
     async fn recent_notification_errors_keep_older_sources_in_the_reconciliation_rotation() {
-        let reads = SourceReads(std::sync::Mutex::new(Vec::new()));
+        let reads = SourceReads {
+            reads: std::sync::Mutex::new(Vec::new()),
+            stall: false,
+        };
         let notifications = ManagedRootNotifications::default();
+        let mut first_sources = std::collections::BTreeSet::new();
         for _ in 0..24 {
+            let before = reads.reads.lock().unwrap().len();
             assert_eq!(
                 notifications.tick(&reads).await,
                 Err("unavailable source".into())
             );
+            first_sources.insert(reads.reads.lock().unwrap()[before].clone());
         }
-        let reads = reads.0.lock().unwrap();
+        assert_eq!(
+            first_sources.len(),
+            12,
+            "every source gets first I/O admission"
+        );
+        let reads = reads.reads.lock().unwrap();
         for index in 0..12 {
             let minimum = if index < RECENT_NOTIFICATION_SOURCES {
                 24
@@ -241,6 +356,25 @@ mod tests {
                     >= minimum
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_busy_material_source_has_a_finite_observation_budget() {
+        let reads = SourceReads {
+            reads: std::sync::Mutex::new(Vec::new()),
+            stall: true,
+        };
+        let started = tokio::time::Instant::now();
+        let result = ManagedRootNotifications::default().tick(&reads).await;
+        assert_eq!(
+            result,
+            Err("managed notification proof remains pending".into())
+        );
+        assert_eq!(started.elapsed(), NOTIFICATION_PROOF_BUDGET);
+        assert_eq!(
+            reads.reads.lock().unwrap().len(),
+            RECENT_NOTIFICATION_SOURCES
+        );
     }
 
     struct Finalization;

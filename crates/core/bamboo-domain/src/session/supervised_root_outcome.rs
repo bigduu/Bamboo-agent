@@ -80,13 +80,14 @@ fn is_false(value: &bool) -> bool {
 
 /// A reconciliation selector derived from a recorded opted-in input.
 /// The Inbox writer revalidates its source and authority before delivery.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedRootNotification {
     pub caller: crate::SessionCallerReference,
     pub target: SupervisorCurrentUserTarget,
     pub run_id: String,
     pub after_sequence: u64,
     pub input_receipt_id: SessionMessageId,
+    pub blocker_cursor: Option<u64>,
 }
 
 impl SupervisedRootOutcomeInputOrigin {

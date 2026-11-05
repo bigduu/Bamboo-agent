@@ -725,6 +725,7 @@ pub struct FileSessionInbox {
     root_owner: Option<bamboo_domain::RootActorRuntimeWrite>,
     child_owner: Option<bamboo_domain::ChildActorRuntimeWrite>,
     limits: SessionInboxLimits,
+    material_notifications_enabled: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-utils"))]
     observer_cursor_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-utils"))]
@@ -774,6 +775,7 @@ impl FileSessionInbox {
             root_owner: None,
             child_owner: None,
             limits,
+            material_notifications_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
             observer_cursor_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
@@ -805,6 +807,12 @@ impl FileSessionInbox {
             #[cfg(test)]
             owned_scope_drop: None,
         }
+    }
+
+    /// The native Host installs the material-event reconciler before admission.
+    pub fn enable_material_notifications(&self) {
+        self.material_notifications_enabled
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Called only while the canonical Root and its Inbox operation guard are
@@ -1290,6 +1298,17 @@ impl FileSessionInbox {
         let bamboo_domain::ManagedRootEventRead::Next(event) = observed else {
             return Ok(None);
         };
+        match &event {
+            bamboo_domain::ManagedRootEvent::Blocker(blocker)
+                if selected.blocker_cursor != Some(blocker.cursor) =>
+            {
+                return Ok(None)
+            }
+            bamboo_domain::ManagedRootEvent::Outcome(_) if selected.blocker_cursor.is_some() => {
+                return Ok(None);
+            }
+            _ => {}
+        }
         let envelope = match event {
             bamboo_domain::ManagedRootEvent::Outcome(outcome) => supervised_root_outcome_envelope(
                 &supervisor,
@@ -4267,6 +4286,15 @@ impl SessionInboxPort for FileSessionInbox {
         envelope: &SessionMessageEnvelope,
         notify_on_material_event: bool,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
+        if notify_on_material_event
+            && !self
+                .material_notifications_enabled
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(SessionInboxError::Storage(
+                "managed Session material notifications require the installed native Host".into(),
+            ));
+        }
         let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
         let operation = envelope
             .correlation_id
@@ -4329,6 +4357,16 @@ impl SessionInboxPort for FileSessionInbox {
         }
         if notify_on_material_event && authority.target.kind != bamboo_domain::SessionKind::Root {
             return Err(invalid("material notices require an independent Root"));
+        }
+        if notify_on_material_event {
+            self.sessions
+                .mark_material_notification_hint(
+                    &authority.target.id,
+                    authority.target.created_at,
+                    envelope.id.as_str(),
+                )
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         }
         self.sessions
             .validate_current_user_send_scope(&send_scope, &authority)

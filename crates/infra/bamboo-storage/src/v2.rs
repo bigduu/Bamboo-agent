@@ -1065,6 +1065,9 @@ pub struct SessionPlacement {
 pub struct SessionIndexEntry {
     pub id: String,
     pub kind: SessionKind,
+    /// Derived discovery hint. Main and the original Inbox receipt own the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material_notification_hint: Option<String>,
     /// Path relative to `bamboo_home_dir` (e.g. "sessions/<id>" or "sessions/<root>/children/<id>").
     pub rel_path: String,
     pub title: String,
@@ -3338,6 +3341,78 @@ impl SessionStoreV2 {
     pub async fn get_index_entry(&self, session_id: &str) -> Option<SessionIndexEntry> {
         let index = self.index.read().await;
         index.sessions.get(session_id).cloned()
+    }
+
+    pub(crate) async fn mark_material_notification_hint(
+        &self,
+        session_id: &str,
+        created_at: DateTime<Utc>,
+        receipt_id: &str,
+    ) -> io::Result<()> {
+        validate_session_id(session_id)?;
+        let session_id = session_id.to_owned();
+        let receipt_id = receipt_id.to_owned();
+        self.update_index(move |index| {
+            let entry = index
+                .sessions
+                .get_mut(&session_id)
+                .filter(|entry| entry.created_at == created_at)
+                .ok_or_else(|| {
+                    io::Error::other("material notification source index is unavailable")
+                })?;
+            entry.material_notification_hint = Some(receipt_id);
+            Ok(())
+        })
+        .await
+    }
+
+    /// Retire a derived hint only if a newer request has not replaced it.
+    pub async fn clear_material_notification_hint(
+        &self,
+        session_id: &str,
+        created_at: DateTime<Utc>,
+        expected_hint: &str,
+    ) -> io::Result<()> {
+        validate_session_id(session_id)?;
+        let session_id = session_id.to_owned();
+        let expected_hint = expected_hint.to_owned();
+        self.update_index(move |index| {
+            if let Some(entry) = index.sessions.get_mut(&session_id).filter(|entry| {
+                entry.created_at == created_at
+                    && entry.material_notification_hint.as_deref() == Some(expected_hint.as_str())
+            }) {
+                entry.material_notification_hint = None;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// File metadata is a cache hint. Physical notification admission reads Main.
+    pub async fn material_notification_main_stamp(
+        &self,
+        session_id: &str,
+    ) -> io::Result<(u64, std::time::SystemTime)> {
+        validate_session_id(session_id)?;
+        let directory = self.sessions_dir.join(session_id);
+        if !fs::symlink_metadata(&directory).await?.file_type().is_dir() {
+            return Err(io::Error::other(
+                "material notification source is unavailable",
+            ));
+        }
+        let runtime = fs::symlink_metadata(directory.join(RUNTIME_SIDECAR_FILE)).await?;
+        if !runtime.file_type().is_file() {
+            return Err(io::Error::other(
+                "material notification runtime is unavailable",
+            ));
+        }
+        let metadata = fs::symlink_metadata(directory.join("session.json")).await?;
+        if !metadata.file_type().is_file() {
+            return Err(io::Error::other(
+                "material notification Main is not a regular file",
+            ));
+        }
+        Ok((metadata.len(), metadata.modified()?))
     }
 
     /// Recover a root session by its deterministic authoritative directory,
@@ -5693,9 +5768,28 @@ impl SessionStoreV2 {
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
         let session_id = session.id.clone();
-        let entry = SessionIndexEntry {
+        let material_notification_hint = session
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+            .and_then(|outcomes| {
+                outcomes
+                    .facts
+                    .iter()
+                    .rev()
+                    .flat_map(|fact| fact.inputs.iter().rev())
+                    .find(|input| {
+                        input
+                            .supervisor_origin
+                            .as_ref()
+                            .is_some_and(|origin| origin.material_notifications_requested())
+                    })
+            })
+            .map(|input| input.receipt_id.to_string());
+        let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
+            material_notification_hint,
             rel_path,
             title: session.title.clone(),
             title_version: session.title_version,
@@ -5732,6 +5826,13 @@ impl SessionStoreV2 {
             placement,
         };
         self.update_index(move |index: &mut SessionsIndex| {
+            if entry.material_notification_hint.is_none() {
+                entry.material_notification_hint = index
+                    .sessions
+                    .get(&session_id)
+                    .filter(|previous| previous.created_at == entry.created_at)
+                    .and_then(|previous| previous.material_notification_hint.clone());
+            }
             if preserve_newer {
                 if let Some(existing) = index.sessions.get_mut(&session_id) {
                     if existing.updated_at > entry.updated_at {
