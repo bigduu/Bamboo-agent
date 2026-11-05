@@ -1305,8 +1305,10 @@ async fn work_review_fixture() {
     use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolOutcome};
     use bamboo_agent_core::ToolExecutionContext;
     use bamboo_domain::{SessionCallerReference, TokenUsage, DEFAULT_SUPERVISOR_SESSION_ID};
-    use bamboo_orchestration::work_review::{settle_review, WorkReviewUsage};
-    use bamboo_tickets::{Authority, ExecutionBudgetPurpose, ExecutionTokenUsage, WorkTokenLimits};
+    use bamboo_orchestration::work_review::{settle_review, WorkReviewEvidence, WorkReviewUsage};
+    use bamboo_tickets::{
+        Authority, ExecutionBudgetPurpose, ExecutionTokenUsage, FaultPoint, WorkTokenLimits,
+    };
     use wiremock::{
         matchers::{method, path},
         Mock, MockServer, Request, ResponseTemplate,
@@ -1444,20 +1446,35 @@ async fn work_review_fixture() {
         let pending: Vec<_> = budget.reservations.values().filter(|record| record.usage.is_none()).collect();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].request.purpose, ExecutionBudgetPurpose::SupervisorDecision);
-        assert_eq!(budget.total_charged, if call == 0 { 4224 } else { 44 + 8192 + 1024 });
+        let expected_charge = match call {
+            0 => 4224,
+            1 => 44 + 8192 + 1024,
+            _ => 89 + 8192 + 1024,
+        };
+        assert_eq!(budget.total_charged, expected_charge);
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["model"], "review-fixture-model");
         assert_eq!(body["max_tokens"], if call == 0 { 128 } else { 1024 });
         let evidence: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(evidence["waiting"]["request_id"], expected_question);
         let review = json!({"choices":[{"delta":{"content":"{\"summary\":\"Worker is waiting for input.\",\"suggested_intervention\":\"Review the recorded question.\"}"}}]});
-        let usage = if call == 0 {
-            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":4,\"total_tokens\":44}}\n\n"
-        } else { "" };
+        let usage = match call {
+            0 => "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":4,\"total_tokens\":44}}\n\n",
+            1 => "",
+            _ => {
+                ledger_at_send.set_publication_fault(Some(Arc::new(|point| {
+                    if point == FaultPoint::BeforeHeadRename {
+                        return Err(std::io::Error::other("controlled Work Review settlement failure"));
+                    }
+                    Ok(())
+                })));
+                "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":8193,\"completion_tokens\":4,\"total_tokens\":8197}}\n\n"
+            }
+        };
         ResponseTemplate::new(200).set_body_raw(
             format!("data: {review}\n\n{usage}data: [DONE]\n\n"), "text/event-stream",
         )
-    }).expect(2).mount(&provider).await;
+    }).expect(3).mount(&provider).await;
 
     let config = {
         let mut config = state.config.write().await;
@@ -1497,6 +1514,15 @@ async fn work_review_fixture() {
         known["accounting"]["receipt"]
     );
 
+    let mut successor =
+        WorkReviewEvidence::capture(&service, &runtime, project.as_str(), &work, assignment_id)
+            .unwrap();
+    successor.scope.generation += 1;
+    assert!(matches!(
+        successor.recorded_reservation(&service, &runtime, &known_id.to_string()),
+        Err(bamboo_tickets::Error::IdempotencyConflict)
+    ));
+
     // A configured Fast model without a global Model Limits row uses the
     // per-call Work Review ceilings and the same registered provider.
     state.config.write().await.extra.remove("model_limits");
@@ -1530,7 +1556,33 @@ async fn work_review_fixture() {
         2
     );
     assert!(current.tickets[&work].accepted_submission.is_none());
-    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    let over_cap_id = uuid::Uuid::new_v4();
+    let pending = review(over_cap_id).await;
+    assert_eq!(pending["status"], "accounting_pending");
+    service.set_publication_fault(None);
+    let recovered = review(over_cap_id).await;
+    assert_eq!(recovered["status"], "existing_receipt");
+    assert_eq!(
+        recovered["accounting"]["receipt"],
+        pending["accounting"]["receipt"]
+    );
+    assert_eq!(
+        recovered["accounting"]["over_cap_usage"]["input_tokens"],
+        8193
+    );
+    let denied = review(uuid::Uuid::new_v4()).await;
+    assert_eq!(denied["status"], "budget_blocked");
+    assert_eq!(denied["reason"], "accounting");
+
+    let revision = state
+        .project_store
+        .get_read_only(&project)
+        .unwrap()
+        .revision;
+    state.project_store.archive(&project, revision).unwrap();
+    let stale = review(uuid::Uuid::new_v4()).await;
+    assert_eq!(stale["status"], "source_unavailable");
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
     gate.add_permits(1);
     state.shutdown().await;
 }

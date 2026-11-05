@@ -221,6 +221,7 @@ impl TicketApplication {
         service: &Arc<TicketService>,
         authority: &Authority,
     ) -> Result<()> {
+        self.work_reviews.reconcile_accounting(service, authority)?;
         if !self.patrol_calls.needs_accounting() {
             return Ok(());
         }
@@ -561,7 +562,9 @@ impl CallIo for ReadyPatrolIo {
                         observed_output_tokens: usage.output_tokens,
                         observed_total_tokens: usage.total_tokens,
                     },
-                    WorkTextReply::Unknown => return Err(PortError::OutcomeUnknown),
+                    WorkTextReply::NotSent | WorkTextReply::Unknown => {
+                        return Err(PortError::OutcomeUnknown);
+                    }
                 }
             }
         };

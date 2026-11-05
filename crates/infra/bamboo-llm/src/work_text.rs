@@ -1,6 +1,12 @@
 //! Bounded text completion through the existing managed provider transport.
 
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use bamboo_domain::{Message, ReasoningEffort, TokenUsage};
 use futures::{future::BoxFuture, StreamExt};
@@ -28,6 +34,8 @@ pub type Admission = Arc<dyn Fn() -> BoxFuture<'static, crate::provider::Result<
 struct Dispatch {
     client: Client,
     admit: Admission,
+    admission_refused: Arc<AtomicBool>,
+    physical_send_started: Arc<AtomicBool>,
 }
 
 pub(crate) fn active() -> bool {
@@ -38,7 +46,13 @@ pub(crate) async fn send(request: RequestBuilder) -> crate::provider::Result<Res
     match WORK_TEXT.try_with(Clone::clone) {
         Ok(dispatch) => {
             let request = request.build()?;
-            (dispatch.admit)().await?;
+            if let Err(error) = (dispatch.admit)().await {
+                dispatch.admission_refused.store(true, Ordering::Release);
+                return Err(error);
+            }
+            dispatch
+                .physical_send_started
+                .store(true, Ordering::Release);
             Ok(dispatch.client.execute(request).await?)
         }
         Err(_) => Ok(request.send().await?),
@@ -70,6 +84,8 @@ pub enum WorkTextReply {
         exact_usage: Option<TokenUsage>,
     },
     OverCap(ObservedWorkUsage),
+    /// A retained Host proof explicitly refused the only model send.
+    NotSent,
     Unknown,
 }
 
@@ -82,7 +98,7 @@ pub async fn complete(
     request: Request<'_>,
     admit: Admission,
 ) -> WorkTextReply {
-    complete_with_options(
+    let reply = complete_with_options(
         client,
         provider,
         request,
@@ -92,7 +108,11 @@ pub async fn complete(
             ..Default::default()
         },
     )
-    .await
+    .await;
+    match reply {
+        WorkTextReply::NotSent => WorkTextReply::Unknown,
+        other => other,
+    }
 }
 
 /// One explicit Work review over the same bounded managed transport. The role
@@ -136,12 +156,16 @@ async fn complete_with_options(
         return WorkTextReply::Unknown;
     }
     let transport = WorkPhysicalRequest::default();
-    timeout(
+    let admission_refused = Arc::new(AtomicBool::new(false));
+    let physical_send_started = Arc::new(AtomicBool::new(false));
+    let reply = timeout(
         remaining.min(MAX_REQUEST_TIME),
         WORK_TEXT.scope(
             Dispatch {
                 client: client.0.clone(),
                 admit,
+                admission_refused: admission_refused.clone(),
+                physical_send_started: physical_send_started.clone(),
             },
             transport.scope(async {
                 let Ok(mut stream) = provider
@@ -212,7 +236,15 @@ async fn complete_with_options(
         ),
     )
     .await
-    .unwrap_or(WorkTextReply::Unknown)
+    .unwrap_or(WorkTextReply::Unknown);
+    if reply == WorkTextReply::Unknown
+        && admission_refused.load(Ordering::Acquire)
+        && !physical_send_started.load(Ordering::Acquire)
+    {
+        WorkTextReply::NotSent
+    } else {
+        reply
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +385,31 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap(), WorkTextReply::Unknown);
+    }
+
+    #[tokio::test]
+    async fn review_reports_positive_refusal_before_the_physical_request() {
+        let server = MockServer::start().await;
+        let provider = OpenAIProvider::new("controlled-key").with_base_url(server.uri());
+        let admission: Admission = Arc::new(|| {
+            Box::pin(async { Err(crate::LLMError::Auth("controlled refusal".into())) })
+        });
+        let reply = review(
+            &WorkTextClient::from_config(&Config::default()).unwrap(),
+            &provider,
+            Request {
+                model: "review",
+                messages: &[Message::user("bounded evidence")],
+                input_cap: 100,
+                output_cap: 10,
+                remaining: Duration::from_secs(1),
+            },
+            admission,
+            Some(ReasoningEffort::Low),
+        )
+        .await;
+        assert_eq!(reply, WorkTextReply::NotSent);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

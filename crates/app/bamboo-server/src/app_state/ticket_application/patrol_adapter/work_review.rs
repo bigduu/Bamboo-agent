@@ -3,17 +3,24 @@
 use std::{sync::Arc, time::Duration};
 
 use bamboo_config::Config;
-use bamboo_domain::{ProviderModelRef, SessionCallerReference, SupervisorReference};
+use bamboo_domain::{
+    ProjectManifest, ProviderModelRef, SessionCallerReference, SupervisorReference,
+};
 use bamboo_engine::{model_config_helper::try_resolve_work_review_model, ticket_runtime};
 use bamboo_llm::{work_text, LLMError, ProviderRegistry};
 use bamboo_orchestration::work_review::{
-    execute_review, PreparedWorkReview, WorkReviewEvidence, WorkReviewIo, WorkReviewProviderReply,
+    PreparedWorkReview, WorkReviewEvidence, WorkReviewIo, WorkReviewProviderReply,
     WorkReviewSessionObservation, WorkReviewUsage,
 };
-use bamboo_tickets::{Authority, ExecutionTokenOverCapUsage, TicketService, WorkTokenReservation};
+use bamboo_tickets::{
+    Authority, ExecutionTokenOverCapUsage, TicketService, WorkTokenReservation, WorkTokenSubmission,
+};
 use serde_json::{json, Value};
 
-use super::{semantic::RegisteredRoute, Error, Principal, Result, TicketApplication};
+use super::{
+    evidence::current_project_manifest, semantic::RegisteredRoute, Error, Principal, Result,
+    TicketApplication,
+};
 
 fn review_target(config: &Config, registry: &Arc<ProviderRegistry>) -> Option<ProviderModelRef> {
     let route = try_resolve_work_review_model(config, registry).ok()??;
@@ -31,15 +38,16 @@ struct ReviewHost {
     service: Arc<TicketService>,
     supervisor: SupervisorReference,
     original: SessionCallerReference,
+    project: ProjectManifest,
     route: Arc<RegisteredRoute>,
 }
 
 impl ReviewHost {
-    async fn confirm_send(
+    async fn with_live_route<T>(
         &self,
         prepared: &PreparedWorkReview,
-        receipt: &WorkTokenReservation,
-    ) -> Result<()> {
+        effect: impl FnOnce(&Authority) -> Result<T> + Send,
+    ) -> Result<T> {
         let authority = self.accounting_authority().await?;
         self.app.verify_review_caller(&self.original).await?;
         if self
@@ -63,12 +71,34 @@ impl ReviewHost {
         {
             return Err(Error::RevisionConflict);
         }
-        prepared.confirm_submission(&self.service, &authority, receipt)
+        let project = current_project_manifest(
+            &sources.projects,
+            &self.app.root,
+            &self.service,
+            &authority,
+            &prepared.evidence.scope,
+            prepared.evidence.source_revision,
+        )?;
+        if project != self.project {
+            return Err(Error::RevisionConflict);
+        }
+        effect(&authority)
     }
 }
 
 #[async_trait::async_trait]
 impl WorkReviewIo for ReviewHost {
+    async fn reserve(
+        &self,
+        prepared: &PreparedWorkReview,
+        now_ms: u64,
+    ) -> Result<WorkTokenSubmission> {
+        self.with_live_route(prepared, |authority| {
+            prepared.reserve(&self.service, authority, now_ms)
+        })
+        .await
+    }
+
     async fn complete(
         &self,
         prepared: &PreparedWorkReview,
@@ -83,9 +113,11 @@ impl WorkReviewIo for ReviewHost {
                 let prepared = prepared.clone();
                 let receipt = receipt.clone();
                 Box::pin(async move {
-                    host.confirm_send(&prepared, &receipt)
-                        .await
-                        .map_err(|_| LLMError::Auth("Work review admission changed".into()))
+                    host.with_live_route(&prepared, |authority| {
+                        prepared.confirm_submission(&host.service, authority, &receipt)
+                    })
+                    .await
+                    .map_err(|_| LLMError::Auth("Work review admission changed".into()))
                 })
             })
         };
@@ -115,6 +147,10 @@ impl WorkReviewIo for ReviewHost {
                     output_tokens: report.output_tokens,
                     total_tokens: report.total_tokens,
                 }),
+            },
+            work_text::WorkTextReply::NotSent => WorkReviewProviderReply {
+                text: None,
+                usage: WorkReviewUsage::NotSent,
             },
             work_text::WorkTextReply::Unknown => WorkReviewProviderReply {
                 text: None,
@@ -166,6 +202,9 @@ impl TicketApplication {
         let mut evidence =
             WorkReviewEvidence::capture(&service, &authority, project_id, work_id, assignment_id)?;
         evidence.session_observation = self.review_session_observation(&service, &evidence).await;
+        // A replay remains readable during an accounting outage. The live
+        // review admission path requires that retained evidence settle first.
+        let _ = self.work_reviews.reconcile_accounting(&service, &authority);
         let operation_id = operation_id.to_string();
         if let Some(record) = evidence.recorded_reservation(&service, &authority, &operation_id)? {
             return Ok(
@@ -200,11 +239,25 @@ impl TicketApplication {
             }
             Err(error) => return Err(error),
         };
+        let project = match current_project_manifest(
+            &sources.projects,
+            &self.root,
+            &service,
+            &authority,
+            &prepared.evidence.scope,
+            prepared.evidence.source_revision,
+        ) {
+            Ok(project) => project,
+            Err(_) => {
+                return Ok(json!({"status":"source_unavailable","evidence":prepared.evidence}))
+            }
+        };
         let host = ReviewHost {
             app: self.clone(),
             service: service.clone(),
             supervisor,
             original,
+            project,
             route: Arc::new(route),
         };
         let now = chrono::Utc::now()
@@ -212,7 +265,10 @@ impl TicketApplication {
             .try_into()
             .map_err(|_| Error::AuthorityUnavailable("Work Review clock unavailable".into()))?;
         let evidence = serde_json::to_value(&prepared.evidence)?;
-        let result = execute_review(service, &authority, prepared, now, host).await?;
+        let result = self
+            .work_reviews
+            .execute(service, prepared, now, host)
+            .await?;
         let mut output = serde_json::to_value(result)?;
         output["evidence"] = evidence;
         Ok(output)

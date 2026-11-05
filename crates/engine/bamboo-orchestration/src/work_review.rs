@@ -4,7 +4,8 @@ use bamboo_domain::{Message, ProviderModelRef, TokenUsage};
 use bamboo_tickets::{
     AssignmentState, Authority, Error, ExecutionBudgetPurpose, ExecutionTokenOverCapUsage,
     ExecutionTokenUsage, RequestKind, RequestStatus, Result, RuntimeReceipt, Snapshot, StepStatus,
-    TicketService, WorkState, WorkTokenRequest, WorkTokenReservation, WorkTokenSubmission,
+    TicketService, WorkState, WorkTokenAttempt, WorkTokenRequest, WorkTokenReservation,
+    WorkTokenSubmission,
 };
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
@@ -72,6 +73,14 @@ fn preview(value: &str, chars: usize) -> String {
 }
 
 impl WorkReviewEvidence {
+    fn attempt(&self) -> WorkTokenAttempt {
+        WorkTokenAttempt {
+            assignment_id: self.scope.assignment_id.clone(),
+            generation: self.scope.generation,
+            authority_epoch: self.scope.authority_epoch,
+        }
+    }
+
     pub fn recorded_reservation(
         &self,
         service: &TicketService,
@@ -86,6 +95,7 @@ impl WorkReviewEvidence {
             record.request.purpose != ExecutionBudgetPurpose::SupervisorDecision
                 || record.request.work_id != self.scope.work_id
                 || record.request.project_id.as_str() != self.scope.project_id
+                || record.request.attempt.as_ref() != Some(&self.attempt())
         }) {
             return Err(Error::IdempotencyConflict);
         }
@@ -249,9 +259,7 @@ impl PreparedWorkReview {
             observed_seq: 0,
             input_cap,
             output_cap,
-            // The evidence hash binds the exact attempt, including stopped
-            // waits. This ledger purpose belongs to the Supervisor decision.
-            attempt: None,
+            attempt: Some(evidence.attempt()),
         };
         let content = String::from_utf8(text).expect("canonical JSON is UTF-8");
         Ok(Self {
@@ -345,6 +353,7 @@ impl PreparedWorkReview {
 pub enum WorkReviewUsage {
     Observed(TokenUsage),
     OverCap(ExecutionTokenOverCapUsage),
+    NotSent,
     Unknown,
 }
 
@@ -362,6 +371,12 @@ pub struct WorkReviewProviderReply {
 
 #[async_trait::async_trait]
 pub trait WorkReviewIo: Send + Sync {
+    async fn reserve(
+        &self,
+        prepared: &PreparedWorkReview,
+        now_ms: u64,
+    ) -> Result<WorkTokenSubmission>;
+
     async fn complete(
         &self,
         prepared: &PreparedWorkReview,
@@ -383,76 +398,162 @@ pub enum WorkReviewExecution {
     AccountingPending {
         accounting: Box<WorkTokenReservation>,
     },
+    NotSent {
+        accounting: Box<WorkTokenReservation>,
+    },
     Recorded {
         accounting: Box<WorkTokenReservation>,
         advisory: Option<AdvisoryWorkReview>,
     },
 }
 
-pub async fn execute_review(
-    service: Arc<TicketService>,
-    authority: &Authority,
-    prepared: PreparedWorkReview,
-    now_ms: u64,
-    io: impl WorkReviewIo + 'static,
-) -> Result<WorkReviewExecution> {
-    use bamboo_tickets::WorkTokenBlock;
-    let receipt = match prepared.reserve(&service, authority, now_ms) {
-        Ok(WorkTokenSubmission::New(receipt)) => receipt,
-        Ok(WorkTokenSubmission::Existing(accounting)) => {
-            return Ok(WorkReviewExecution::ExistingReceipt { accounting });
+/// Retain one measured reply until its original receipt can be settled. The
+/// explicit Supervisor tool is serial. This slot does not govern Worker runs.
+#[derive(Default)]
+pub struct WorkReviews {
+    pending: Arc<tokio::sync::Mutex<Option<PendingAccounting>>>,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+struct PendingAccounting {
+    receipt: Box<WorkTokenReservation>,
+    reply: WorkReviewProviderReply,
+}
+
+impl WorkReviews {
+    pub fn stop_admission(&self) {
+        self.shutdown.cancel();
+    }
+
+    pub fn reconcile_accounting(
+        &self,
+        service: &TicketService,
+        authority: &Authority,
+    ) -> Result<()> {
+        if let Ok(mut pending) = self.pending.try_lock() {
+            Self::settle_pending(&mut pending, service, authority)?;
         }
-        Ok(WorkTokenSubmission::Blocked(block)) => {
-            let reason = match block {
-                WorkTokenBlock::Work => "work",
-                WorkTokenBlock::Daily => "daily",
-                WorkTokenBlock::Total => "total",
-                WorkTokenBlock::Capacity => "capacity",
-                WorkTokenBlock::Accounting => "accounting",
-            };
-            return Ok(WorkReviewExecution::BudgetBlocked { reason });
-        }
-        Err(Error::ResourceBlocked(_)) => {
-            return Ok(WorkReviewExecution::BudgetBlocked {
-                reason: "unavailable",
-            });
-        }
-        Err(error) => return Err(error),
-    };
-    // Once admitted, accounting remains owned even if the Supervisor stops
-    // awaiting its tool. The Host still revalidates authority at physical send.
-    let pending = receipt.clone();
-    let execution = tokio::spawn(async move {
-        let response = io.complete(&prepared, &receipt).await;
-        for delay_ms in [0, 250, 1000] {
-            if delay_ms != 0 {
-                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        Ok(())
+    }
+
+    pub async fn drain_accounting(
+        &self,
+        service: &TicketService,
+        authority: &Authority,
+    ) -> Result<()> {
+        let mut pending = self.pending.lock().await;
+        Self::settle_pending(&mut pending, service, authority)?;
+        Ok(())
+    }
+
+    fn settle_pending(
+        pending: &mut Option<PendingAccounting>,
+        service: &TicketService,
+        authority: &Authority,
+    ) -> Result<Option<WorkReviewExecution>> {
+        let Some(entry) = pending.as_ref() else {
+            return Ok(None);
+        };
+        let (accounting, advisory) = settle_review(
+            service,
+            authority,
+            &entry.receipt,
+            entry.reply.usage.clone(),
+            entry.reply.text.as_deref(),
+        )?;
+        let accounting = Box::new(accounting);
+        let output = if matches!(entry.reply.usage, WorkReviewUsage::NotSent) {
+            WorkReviewExecution::NotSent { accounting }
+        } else {
+            WorkReviewExecution::Recorded {
+                accounting,
+                advisory,
             }
-            let Ok(fresh) = io.accounting_authority().await else {
-                continue;
-            };
-            if let Ok((accounting, advisory)) = settle_review(
-                &service,
-                &fresh,
-                &receipt,
-                response.usage.clone(),
-                response.text.as_deref(),
-            ) {
-                return WorkReviewExecution::Recorded {
-                    accounting: Box::new(accounting),
-                    advisory,
+        };
+        *pending = None;
+        Ok(Some(output))
+    }
+
+    pub async fn execute(
+        &self,
+        service: Arc<TicketService>,
+        prepared: PreparedWorkReview,
+        now_ms: u64,
+        io: impl WorkReviewIo + 'static,
+    ) -> Result<WorkReviewExecution> {
+        use bamboo_tickets::WorkTokenBlock;
+        let mut pending = self.pending.clone().lock_owned().await;
+        if self.shutdown.is_cancelled() {
+            return Ok(WorkReviewExecution::BudgetBlocked { reason: "shutdown" });
+        }
+        if pending.is_some() {
+            let authority = io.accounting_authority().await?;
+            if Self::settle_pending(&mut pending, &service, &authority).is_err() {
+                return Ok(WorkReviewExecution::BudgetBlocked {
+                    reason: "accounting_pending",
+                });
+            }
+        }
+        let receipt = match io.reserve(&prepared, now_ms).await {
+            Ok(WorkTokenSubmission::New(receipt)) => receipt,
+            Ok(WorkTokenSubmission::Existing(accounting)) => {
+                return Ok(WorkReviewExecution::ExistingReceipt { accounting });
+            }
+            Ok(WorkTokenSubmission::Blocked(block)) => {
+                let reason = match block {
+                    WorkTokenBlock::Work => "work",
+                    WorkTokenBlock::Daily => "daily",
+                    WorkTokenBlock::Total => "total",
+                    WorkTokenBlock::Capacity => "capacity",
+                    WorkTokenBlock::Accounting => "accounting",
                 };
+                return Ok(WorkReviewExecution::BudgetBlocked { reason });
             }
-        }
-        WorkReviewExecution::AccountingPending {
-            accounting: receipt,
-        }
-    });
-    Ok(execution
-        .await
-        .unwrap_or(WorkReviewExecution::AccountingPending {
-            accounting: pending,
-        }))
+            Err(Error::ResourceBlocked(_)) => {
+                return Ok(WorkReviewExecution::BudgetBlocked {
+                    reason: "unavailable",
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        // Once admitted, a cancelled tool waiter cannot drop the receipt or
+        // its measured response. Shutdown stops the model wait, then settles.
+        let original = receipt.clone();
+        let shutdown = self.shutdown.clone();
+        let execution = tokio::spawn(async move {
+            let reply = tokio::select! {
+                biased;
+                reply = io.complete(&prepared, &receipt) => reply,
+                _ = shutdown.cancelled() => WorkReviewProviderReply {
+                    text: None,
+                    usage: WorkReviewUsage::Unknown,
+                },
+            };
+            *pending = Some(PendingAccounting {
+                receipt: receipt.clone(),
+                reply,
+            });
+            for delay_ms in [0, 250, 1000] {
+                if delay_ms != 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                let Ok(fresh) = io.accounting_authority().await else {
+                    continue;
+                };
+                if let Ok(Some(result)) = Self::settle_pending(&mut pending, &service, &fresh) {
+                    return result;
+                }
+            }
+            WorkReviewExecution::AccountingPending {
+                accounting: receipt,
+            }
+        });
+        Ok(execution
+            .await
+            .unwrap_or(WorkReviewExecution::AccountingPending {
+                accounting: original,
+            }))
+    }
 }
 
 pub fn settle_review(
@@ -481,6 +582,10 @@ pub fn settle_review(
                 output_tokens: usage.completion_tokens,
             }
         }
+        WorkReviewUsage::NotSent => ExecutionTokenUsage::Known {
+            input_tokens: 0,
+            output_tokens: 0,
+        },
         WorkReviewUsage::Observed(_) | WorkReviewUsage::Unknown => ExecutionTokenUsage::Unknown,
         WorkReviewUsage::OverCap(usage) => {
             let accounting = service.report_work_token_over_cap(

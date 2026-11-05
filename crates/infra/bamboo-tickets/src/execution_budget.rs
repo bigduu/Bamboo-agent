@@ -213,6 +213,29 @@ fn current_attempt(snapshot: &Snapshot, request: &WorkTokenRequest) -> Result<()
         .as_ref()
         .and_then(|id| snapshot.submissions.get(id))
         .is_some_and(|submission| submission.assignment_id == assignment.id);
+    // Snapshot validation already binds awaiting_request to this assignment,
+    // generation, contract, and yielded Worker question.
+    let yielded_for_input = |assignment: &crate::Assignment| {
+        assignment.state == crate::AssignmentState::Blocked
+            && assignment.process_stopped
+            && assignment
+                .awaiting_request
+                .as_ref()
+                .and_then(|id| snapshot.requests.get(id))
+                .is_some_and(|request| request.status == crate::RequestStatus::Open)
+    };
+    let current_yielded_review = request.purpose == ExecutionBudgetPurpose::SupervisorDecision
+        && work.state == crate::WorkState::Blocked
+        && work.active_assignment.is_none()
+        && work.current_submission.is_none()
+        && yielded_for_input(assignment)
+        && !snapshot.assignments.values().any(|other| {
+            other.id != assignment.id
+                && other.work_id == work.id
+                && other.generation == work.generation
+                && other.contract_revision == work.contract_revision
+                && yielded_for_input(other)
+        });
     if assignment.work_id != work.id
         || work.generation != attempt.generation
         || assignment.generation != attempt.generation
@@ -227,7 +250,9 @@ fn current_attempt(snapshot: &Snapshot, request: &WorkTokenRequest) -> Result<()
         || intent.immutable_spec.binding != snapshot.binding
         || intent.spec_hash != content_hash(&canonical_bytes(&intent.immutable_spec)?)
         || assignment.runtime != intent.receipt
-        || (work.active_assignment.as_ref() != Some(&assignment.id) && !current_submission)
+        || (work.active_assignment.as_ref() != Some(&assignment.id)
+            && !current_submission
+            && !current_yielded_review)
         || matches!(
             work.state,
             crate::WorkState::Accepted | crate::WorkState::Cancelled
