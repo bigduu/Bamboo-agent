@@ -115,9 +115,13 @@ impl Fixture {
     fn with_objective(objective: &str, with_project: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let source = with_project.then(|| tempfile::tempdir().unwrap());
-        let source_path = source
-            .as_ref()
-            .map(|dir| dir.path().canonicalize().unwrap().to_string_lossy().into_owned());
+        let source_path = source.as_ref().map(|dir| {
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        });
         let binding = ScopeBinding {
             scope_id: "fixture-scope".into(),
             supervisor_session_id: "fixture-supervisor".into(),
