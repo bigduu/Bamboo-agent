@@ -352,6 +352,18 @@ fn rename_title(mut session: Session) -> Session {
     session
 }
 
+fn change_presentation(mut session: Session, mutation: SessionPresentationMutation) -> Session {
+    match mutation {
+        SessionPresentationMutation::Title => rename_title(session),
+        SessionPresentationMutation::Pinned => {
+            session.pinned = !session.pinned;
+            session.metadata_version += 1;
+            session.updated_at = Utc::now();
+            session
+        }
+    }
+}
+
 async fn title_row(f: &Fixture, id: &str) -> bamboo_domain::ActorDirectoryEntry {
     serde_json::from_slice(
         &fs::read(f.directory(id).join("actor-authority.json"))
@@ -363,6 +375,15 @@ async fn title_row(f: &Fixture, id: &str) -> bamboo_domain::ActorDirectoryEntry 
 
 #[tokio::test]
 async fn title_observations_preserve_live_fences_and_unaffected_siblings() {
+    presentation_observations_preserve_live_fences(SessionPresentationMutation::Title).await;
+}
+
+#[tokio::test]
+async fn pinned_observations_preserve_live_fences_and_unaffected_siblings() {
+    presentation_observations_preserve_live_fences(SessionPresentationMutation::Pinned).await;
+}
+
+async fn presentation_observations_preserve_live_fences(mutation: SessionPresentationMutation) {
     let f = Fixture::new().await;
     let parent = f.child("title-parent", &f.root).await;
     let leaf = f.child("title-leaf", &parent).await;
@@ -376,8 +397,14 @@ async fn title_observations_preserve_live_fences_and_unaffected_siblings() {
     for id in ids {
         before.push(title_row(&f, id).await);
     }
-    let renamed = rename_title(f.store.load_session(&parent.id).await.unwrap().unwrap());
-    f.store.save_manual_title(&renamed).await.unwrap();
+    let renamed = change_presentation(
+        f.store.load_session(&parent.id).await.unwrap().unwrap(),
+        mutation,
+    );
+    f.store
+        .save_presentation_metadata_committed(&renamed, mutation)
+        .await
+        .unwrap();
     for (index, id) in ids.into_iter().enumerate() {
         let actual = title_row(&f, id).await;
         let mut expected = before[index].clone();
@@ -411,6 +438,17 @@ async fn title_observations_preserve_live_fences_and_unaffected_siblings() {
 
 #[tokio::test]
 async fn title_observations_reject_preexisting_damage_without_publication() {
+    presentation_observations_reject_preexisting_damage(SessionPresentationMutation::Title).await;
+}
+
+#[tokio::test]
+async fn pinned_observations_reject_preexisting_damage_without_publication() {
+    presentation_observations_reject_preexisting_damage(SessionPresentationMutation::Pinned).await;
+}
+
+async fn presentation_observations_reject_preexisting_damage(
+    mutation: SessionPresentationMutation,
+) {
     for damage in ["own", "ancestor", "birth", "project", "marker"] {
         let f = Fixture::new().await;
         let child = f.child("damaged-title-child", &f.root).await;
@@ -441,7 +479,10 @@ async fn title_observations_reject_preexisting_damage_without_publication() {
         );
         assert!(
             f.store
-                .save_manual_title(&rename_title(current))
+                .save_presentation_metadata_committed(
+                    &change_presentation(current, mutation),
+                    mutation
+                )
                 .await
                 .is_err(),
             "rename {damage}"
@@ -456,13 +497,26 @@ async fn title_observations_reject_preexisting_damage_without_publication() {
 
 #[tokio::test]
 async fn title_observations_keep_counter_gaps_and_project_aba_fail_closed() {
+    presentation_observations_reject_counter_gaps(SessionPresentationMutation::Title).await;
+}
+
+#[tokio::test]
+async fn pinned_observations_keep_counter_gaps_and_project_aba_fail_closed() {
+    presentation_observations_reject_counter_gaps(SessionPresentationMutation::Pinned).await;
+}
+
+async fn presentation_observations_reject_counter_gaps(mutation: SessionPresentationMutation) {
     for gap in [2, u64::MAX] {
         let f = Fixture::new().await;
         f.store.ensure_actor(&f.root.id).await.unwrap();
-        let mut renamed = rename_title(f.root.clone());
+        let mut renamed = change_presentation(f.root.clone(), mutation);
         renamed.metadata_version = gap;
         let before = durable_tree(&f.home);
-        assert!(f.store.save_manual_title(&renamed).await.is_err());
+        assert!(f
+            .store
+            .save_presentation_metadata_committed(&renamed, mutation)
+            .await
+            .is_err());
         assert_eq!(durable_tree(&f.home), before);
     }
     let f = Fixture::new().await;
@@ -475,7 +529,10 @@ async fn title_observations_keep_counter_gaps_and_project_aba_fail_closed() {
     let before = durable_tree(&f.home);
     assert!(f
         .store
-        .save_manual_title(&rename_title(previous.clone()))
+        .save_presentation_metadata_committed(
+            &change_presentation(previous.clone(), mutation),
+            mutation
+        )
         .await
         .is_err());
     assert!(f
@@ -488,6 +545,87 @@ async fn title_observations_keep_counter_gaps_and_project_aba_fail_closed() {
         f.store.ensure_actor(&f.root.id).await.unwrap_err(),
         bamboo_domain::ActorDirectoryError::ProjectTransitionBlocked
     );
+}
+
+#[tokio::test]
+async fn presentation_commits_reject_unrelated_changes_without_publication() {
+    for mutation in [
+        SessionPresentationMutation::Title,
+        SessionPresentationMutation::Pinned,
+    ] {
+        for changed in [
+            "title-or-pinned",
+            "transcript",
+            "model",
+            "metadata",
+            "birth",
+            "project",
+        ] {
+            let f = Fixture::new().await;
+            f.store.ensure_actor(&f.root.id).await.unwrap();
+            let mut candidate = change_presentation(f.root.clone(), mutation);
+            match changed {
+                "title-or-pinned" => match mutation {
+                    SessionPresentationMutation::Title => candidate.pinned = !candidate.pinned,
+                    SessionPresentationMutation::Pinned => {
+                        candidate.title = "unadmitted title".into()
+                    }
+                },
+                "transcript" => candidate.add_message(Message::user("unadmitted input")),
+                "model" => candidate.model = "unadmitted model".into(),
+                "metadata" => {
+                    candidate
+                        .metadata
+                        .insert("unadmitted".into(), "value".into());
+                }
+                "birth" => candidate.created_at += chrono::Duration::seconds(1),
+                "project" => candidate.set_project_id_meta("unadmitted-project"),
+                _ => unreachable!(),
+            }
+            let before = durable_tree(&f.home);
+            assert!(
+                f.store
+                    .save_presentation_metadata_committed(&candidate, mutation)
+                    .await
+                    .is_err(),
+                "{mutation:?}: {changed}"
+            );
+            assert_eq!(durable_tree(&f.home), before, "{mutation:?}: {changed}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn pinned_observations_report_partial_io_and_reject_incomplete_noop() {
+    use super::default_actor_context_tests::DefaultWriteHook;
+
+    let f = Fixture::new().await;
+    let before = f.store.ensure_actor(&f.root.id).await.unwrap();
+    let next = change_presentation(f.root.clone(), SessionPresentationMutation::Pinned);
+    let hook = DefaultWriteHook::install(
+        &f.store,
+        "actor-authority.json",
+        DurableWritePhase::BeforeReplace,
+        true,
+    );
+    hook.release();
+    assert!(f
+        .store
+        .save_presentation_metadata_committed(&next, SessionPresentationMutation::Pinned,)
+        .await
+        .is_err());
+    *f.store.default_write_hook.lock().unwrap() = None;
+    let current = f.store.load_session(&f.root.id).await.unwrap().unwrap();
+    assert!(current.pinned);
+    assert_eq!(current.metadata_version, 1);
+    assert_eq!(title_row(&f, &f.root.id).await, before);
+    let durable = durable_tree(&f.home);
+    assert!(f
+        .store
+        .validate_presentation_metadata_observations(&current)
+        .await
+        .is_err());
+    assert_eq!(durable_tree(&f.home), durable);
 }
 
 #[tokio::test]
