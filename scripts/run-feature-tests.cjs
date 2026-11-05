@@ -144,7 +144,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2534 adds patrol endpoint configuration and the Ready Host adapter.
 // The existing config and server-app-state owners cover those regressions.
 // #2547 extends the same Model Policy and server-app-state test owners.
-const FEATURE_SOURCE_SHA256 = "a937262568cbf5a340ea027a2c34ed386079e16269cdd3231fcbdf00baa53f8c";
+const FEATURE_SOURCE_SHA256 = "053b27763f4047250bcc2732ba87371c0fceb2bd77479074e99348d5176e556d";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

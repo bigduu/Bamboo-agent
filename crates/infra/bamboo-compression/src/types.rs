@@ -48,6 +48,9 @@ pub enum BudgetError {
     #[error("Failed to count tokens: {0}")]
     TokenCountError(String),
 
+    #[error("Context summarization failed: {0}")]
+    SummaryGenerationError(String),
+
     #[error("Failed to segment messages: {0}")]
     SegmentationError(String),
 }

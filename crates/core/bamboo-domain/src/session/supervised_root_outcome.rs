@@ -391,6 +391,32 @@ pub enum ObserverRootOutcomeRead {
     Next(ObserverSupervisedRootOutcome),
 }
 
+/// Managed waits use two independent cursors: the Main outcome sequence and
+/// the blocker cursor. The referenced Task revision may advance without
+/// changing the blocker cursor. Observing a blocker does not consume an outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedRootBlockerEvidence {
+    pub target_session_id: String,
+    pub target_created_at: DateTime<Utc>,
+    pub run_id: String,
+    pub cursor: u64,
+    pub task_version: u64,
+    pub task_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedRootEvent {
+    Outcome(ObserverSupervisedRootOutcome),
+    Blocker(ManagedRootBlockerEvidence),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedRootEventRead {
+    CaughtUp,
+    PendingSource,
+    Next(ManagedRootEvent),
+}
+
 impl SupervisedRootOutcomeResult {
     /// Whitelisted persisted labels; never a provider error message.
     pub fn observer_status(&self) -> &'static str {
