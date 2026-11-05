@@ -43,7 +43,11 @@ impl SessionStoreV2 {
             .await?;
         tokio::task::spawn_blocking(move || {
             let workspace_path = authority.target.workspace_path_meta();
-            effect(workspace_path.as_deref())
+            let result = effect(workspace_path.as_deref());
+            // Capture the entire guard so aborting the async waiter cannot
+            // release its locks while the blocking effect is still running.
+            drop(authority);
+            result
         })
         .await
         .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
