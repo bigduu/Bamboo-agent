@@ -440,3 +440,18 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
             .await
     }
 }
+
+// Reuse the native fixture without enrolling a managed-Root case in the
+// Observer feature's fixed historical subscription catalog.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    #[actix_web::test]
+    async fn managed_wait_wakes_on_the_exact_durable_task_blocker_before_root_finishes() {
+        super::super::observer_subscriptions::tests::exercise_managed_wait_blocker().await;
+    }
+
+    #[actix_web::test]
+    async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_after_restart() {
+        super::super::observer_subscriptions::tests::exercise_managed_wait_outcomes().await;
+    }
+}
