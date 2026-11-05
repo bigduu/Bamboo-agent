@@ -325,6 +325,7 @@ async fn root_catalog_keeps_only_current_history_in_the_core_functions() {
             "work_changes".to_string(),
             "work_update".to_string(),
             "work_dispatch".to_string(),
+            "work_review".to_string(),
         ])
     );
     let broad_history = bamboo_domain::ClassifiedToolIdentity::from_schema_name("session_history")

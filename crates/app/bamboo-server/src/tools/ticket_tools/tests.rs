@@ -62,6 +62,32 @@ async fn invoke(tool: &TicketTool, args: Value, ctx: ToolCtx) -> (bool, Value) {
 }
 
 #[tokio::test]
+async fn work_review_refuses_missing_caller_and_plan_mode_before_accounting() {
+    let fixture = Fixture::new().await;
+    let tool = fixture.tool("work_review");
+    let args = json!({
+        "project_id":"project", "work_id":"work", "assignment_id":"assignment",
+        "operation_id":"126c8257-7631-4540-997d-6fe532c774d0"
+    });
+    let service = fixture.app.service().unwrap();
+    let before = service.published().unwrap().0;
+    assert!(matches!(
+        tool.call(args.clone(), &fixture.ctx()).await,
+        Err(Error::ScopeDenied(reason)) if reason.contains("original Work Review caller missing")
+    ));
+    let mut ctx = fixture.ctx();
+    ctx.executing_caller = Some(Arc::new(bamboo_domain::SessionCallerReference::from(
+        &fixture.session,
+    )));
+    ctx.plan_read_only = true;
+    assert!(matches!(
+        tool.call(args, &ctx).await,
+        Err(Error::ScopeDenied(reason)) if reason.contains("Plan mode is read-only")
+    ));
+    assert_eq!(service.published().unwrap().0, before);
+}
+
+#[tokio::test]
 async fn cached_ticket_tools_do_not_own_or_recreate_a_dropped_application() {
     let fixture = Fixture::new().await;
     let tools: Vec<_> = NAMES.iter().map(|&name| fixture.tool(name)).collect();
@@ -509,6 +535,7 @@ async fn ticket_tools_hot_after_scope_initialization_preserve_ordinary_root_deni
         "work_changes".to_string(),
         "work_update".to_string(),
         "work_dispatch".to_string(),
+        "work_review".to_string(),
     ]);
     assert_eq!(names(), expected_names);
     assert!(app.service().is_err());

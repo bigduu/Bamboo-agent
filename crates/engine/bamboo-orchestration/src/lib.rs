@@ -5,6 +5,7 @@
 //! and dispatches through its existing worker runtime. Durable retry metadata
 //! uses a narrow Host storage port, never a second Task/lease or recovered grant.
 pub mod patrol;
+pub mod work_review;
 
 use std::{
     collections::{BTreeMap, BTreeSet},

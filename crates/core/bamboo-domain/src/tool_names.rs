@@ -119,7 +119,7 @@ pub const SERVER_TOOL_NAMES: [&str; 13] = [
 ///
 /// This superset is used by catalogs and discovery without broadening the
 /// legacy `normalize_tool_ref`/`is_builtin_tool` acceptance surface above.
-pub const SERVER_CAPABILITY_NAMES: [&str; 27] = [
+pub const SERVER_CAPABILITY_NAMES: [&str; 28] = [
     "Plan",
     "SubAgent",
     "Project",
@@ -147,6 +147,7 @@ pub const SERVER_CAPABILITY_NAMES: [&str; 27] = [
     "work_changes",
     "work_update",
     "work_dispatch",
+    "work_review",
 ];
 
 /// Resolve any model- or host-facing tool reference to one canonical identity.

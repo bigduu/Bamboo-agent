@@ -123,6 +123,14 @@ pub enum WorkTokenAdmission {
     Blocked(WorkTokenBlock),
 }
 
+/// The accounting record and the one-time right to submit are separate.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WorkTokenSubmission {
+    New(Box<WorkTokenReservation>),
+    Existing(Box<WorkTokenReservation>),
+    Blocked(WorkTokenBlock),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkTokenBudget {
@@ -529,6 +537,24 @@ impl TicketService {
         request: &WorkTokenRequest,
         now_ms: u64,
     ) -> Result<WorkTokenAdmission> {
+        Ok(
+            match self.reserve_work_token_submission(authority, request, now_ms)? {
+                WorkTokenSubmission::New(record) | WorkTokenSubmission::Existing(record) => {
+                    WorkTokenAdmission::Reserved(record)
+                }
+                WorkTokenSubmission::Blocked(block) => WorkTokenAdmission::Blocked(block),
+            },
+        )
+    }
+
+    /// Reserve and report whether this invocation owns a fresh submission.
+    /// Retries can read the original receipt but must not repeat provider I/O.
+    pub fn reserve_work_token_submission(
+        &self,
+        authority: &Authority,
+        request: &WorkTokenRequest,
+        now_ms: u64,
+    ) -> Result<WorkTokenSubmission> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
             .published
@@ -559,7 +585,7 @@ impl TicketService {
             .ok_or_else(|| Error::ResourceBlocked("Work token limits are not configured".into()))?;
         if let Some(record) = budget.reservations.get(&request.operation_id) {
             return if record.request == *request {
-                Ok(WorkTokenAdmission::Reserved(Box::new(record.clone())))
+                Ok(WorkTokenSubmission::Existing(Box::new(record.clone())))
             } else {
                 Err(Error::IdempotencyConflict)
             };
@@ -576,10 +602,10 @@ impl TicketService {
             .values()
             .any(|record| record.over_cap_usage.is_some())
         {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Accounting));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Accounting));
         }
         if budget.reservations.len() >= MAX_RECORDS {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Capacity));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Capacity));
         }
         let tokens = u64::from(request.input_cap) + u64::from(request.output_cap);
         let used = budget
@@ -593,7 +619,7 @@ impl TicketService {
             .get(&request.work_id)
             .is_none_or(|limit| tokens > limit.saturating_sub(used))
         {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Work));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Work));
         }
         let day = now_ms / DAY_MS;
         let daily = if Some(day) == budget.current_utc_day {
@@ -602,7 +628,7 @@ impl TicketService {
             0
         };
         if tokens > budget.limits.utc_day_tokens.saturating_sub(daily) {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Daily));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Daily));
         }
         if tokens
             > budget
@@ -610,7 +636,7 @@ impl TicketService {
                 .total_tokens
                 .saturating_sub(budget.total_charged)
         {
-            return Ok(WorkTokenAdmission::Blocked(WorkTokenBlock::Total));
+            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Total));
         }
         let record = WorkTokenReservation {
             request: request.clone(),
@@ -643,7 +669,7 @@ impl TicketService {
         next.seq = next.seq.checked_add(1).ok_or(Error::RevisionConflict)?;
         crate::service::validate_snapshot(&next)?;
         store.publish_accounting(next)?;
-        Ok(WorkTokenAdmission::Reserved(Box::new(record)))
+        Ok(WorkTokenSubmission::New(Box::new(record)))
     }
 
     /// Reconcile only the original receipt. Unknown usage retains all caps;

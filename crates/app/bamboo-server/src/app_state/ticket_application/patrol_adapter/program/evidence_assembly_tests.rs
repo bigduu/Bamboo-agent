@@ -1295,3 +1295,242 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
         .unwrap();
     state.shutdown().await;
 }
+
+#[tokio::test]
+async fn explicit_work_review_uses_fast_and_reconciles_the_original_work_receipt() {
+    Box::pin(work_review_fixture()).await;
+}
+
+async fn work_review_fixture() {
+    use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolOutcome};
+    use bamboo_agent_core::ToolExecutionContext;
+    use bamboo_domain::{SessionCallerReference, TokenUsage, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_orchestration::work_review::{settle_review, WorkReviewUsage};
+    use bamboo_tickets::{Authority, ExecutionBudgetPurpose, ExecutionTokenUsage, WorkTokenLimits};
+    use wiremock::{
+        matchers::{method, path},
+        Mock, MockServer, Request, ResponseTemplate,
+    };
+
+    let root = tempfile::tempdir().unwrap();
+    let data = root.path().canonicalize().unwrap();
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (state, agent) = Box::pin(host_with_gate(
+        &data,
+        3,
+        Some(gate.clone()),
+        Some(data.join("worktree/native-result.txt")),
+    ))
+    .await;
+    let (work, project) = Box::pin(start_work(
+        &state,
+        workspace(&data),
+        BTreeSet::from(["Task".into(), "Write".into()]),
+    ))
+    .await;
+    tokio::time::timeout(WAIT, async {
+        while agent.calls.load(Ordering::SeqCst) != 3 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let (service, owner) = state.tickets.authority(owner()).await.unwrap();
+    let (_, runtime) = state.tickets.authority(Principal::Runtime).await.unwrap();
+    let snapshot = service.published().unwrap().1;
+    let assignment_id = snapshot.tickets[&work].active_assignment.as_ref().unwrap();
+    let assignment = &snapshot.assignments[assignment_id];
+    let receipt = assignment.runtime.as_ref().unwrap();
+    let worker = Authority::from_verified_host(
+        snapshot.binding.clone(),
+        Principal::Worker {
+            assignment_id: assignment.id.clone(),
+            generation: assignment.generation,
+            run_id: receipt.run_id.clone(),
+            session_id: receipt.session_id.clone(),
+        },
+    );
+    let packet = service
+        .child_context_packet(&worker, &assignment.id, 65536)
+        .unwrap();
+    let ask = service
+        .prepare_command(
+            &worker,
+            "review-fixture-yield",
+            vec![
+                Operation::Ask {
+                    work_id: work.clone(),
+                    temp_id: "question".into(),
+                    prompt: "Which input should the Worker use?".into(),
+                    action: None,
+                },
+                Operation::YieldForInput {
+                    assignment_id: assignment.id.clone(),
+                    request_id: "question".into(),
+                    packet_hash: bamboo_tickets::content_hash(
+                        &bamboo_tickets::canonical_bytes(&packet).unwrap(),
+                    ),
+                },
+            ],
+        )
+        .unwrap();
+    let question = service.execute(&worker, &ask).unwrap().ids["question"].clone();
+
+    let supervisor = state
+        .storage
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .unwrap()
+        .unwrap();
+    let review = async |operation_id: uuid::Uuid| {
+        let call = ToolCall {
+            id: operation_id.to_string(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "work_review".into(),
+                arguments: json!({
+                    "project_id":project, "work_id":work, "assignment_id":assignment_id,
+                    "operation_id":operation_id
+                })
+                .to_string(),
+            },
+        };
+        let mut ctx = ToolExecutionContext::none(&call.id);
+        ctx.session_id = Some(&supervisor.id);
+        ctx.root_session_id = Some(&supervisor.id);
+        ctx = ctx.with_executing_supervisor(
+            ExecutingSupervisorObservation::capture_from_executing_session(&supervisor),
+        );
+        let tools = state.tools_for(crate::tools::ToolSurface::Root);
+        let result = bamboo_agent_core::tools::with_executing_session_caller(
+            Some(Arc::new(SessionCallerReference::from(&supervisor))),
+            tools.execute_with_context_outcome(&call, ctx),
+        )
+        .await
+        .unwrap();
+        let ToolOutcome::Completed(result) = result else {
+            panic!("work_review must return the result and receipt");
+        };
+        assert!(result.success, "{}", result.result);
+        serde_json::from_str::<Value>(&result.result).unwrap()
+    };
+    let unavailable = review(uuid::Uuid::new_v4()).await;
+    assert_eq!(unavailable["status"], "model_unavailable");
+    assert_eq!(unavailable["evidence"]["waiting"]["request_id"], question);
+    assert_eq!(unavailable["evidence"]["session"]["run_id"], receipt.run_id);
+    assert!(service.work_token_budget(&runtime).unwrap().is_none());
+
+    service
+        .configure_work_token_budget(
+            &owner,
+            0,
+            WorkTokenLimits {
+                work_tokens: BTreeMap::from([(work.clone(), 16384)]),
+                utc_day_tokens: 16384,
+                total_tokens: 16384,
+            },
+        )
+        .unwrap();
+    let provider = MockServer::start().await;
+    let ledger_at_send = service.clone();
+    let runtime_at_send = runtime.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let sent = calls.clone();
+    let expected_question = question.clone();
+    Mock::given(method("POST")).and(path("/chat/completions")).respond_with(move |request: &Request| {
+        let call = sent.fetch_add(1, Ordering::SeqCst);
+        let budget = ledger_at_send.work_token_budget(&runtime_at_send).unwrap().unwrap();
+        let pending: Vec<_> = budget.reservations.values().filter(|record| record.usage.is_none()).collect();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].request.purpose, ExecutionBudgetPurpose::SupervisorDecision);
+        assert_eq!(budget.total_charged, if call == 0 { 4224 } else { 44 + 8192 + 1024 });
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "review-fixture-model");
+        assert_eq!(body["max_tokens"], if call == 0 { 128 } else { 1024 });
+        let evidence: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(evidence["waiting"]["request_id"], expected_question);
+        let review = json!({"choices":[{"delta":{"content":"{\"summary\":\"Worker is waiting for input.\",\"suggested_intervention\":\"Review the recorded question.\"}"}}]});
+        let usage = if call == 0 {
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":4,\"total_tokens\":44}}\n\n"
+        } else { "" };
+        ResponseTemplate::new(200).set_body_raw(
+            format!("data: {review}\n\n{usage}data: [DONE]\n\n"), "text/event-stream",
+        )
+    }).expect(2).mount(&provider).await;
+
+    let config = {
+        let mut config = state.config.write().await;
+        config.provider_instances.insert("work-review-existing".into(), serde_json::from_value(json!({
+            "provider_type":"openai", "enabled":true, "api_key":"controlled-registry-key",
+            "base_url":provider.uri(), "model":"review-fixture-model", "runtime_models":["review-fixture-model"]
+        })).unwrap());
+        config.extra.insert(
+            "model_limits".into(),
+            json!([{
+                "model_pattern":"review-fixture-model", "max_context_tokens":4096,
+                "max_output_tokens":128, "safety_margin":0
+            }]),
+        );
+        config.defaults = Some(
+            serde_json::from_value(json!({
+                "chat":{"provider":"openai","model":"patrol-evidence-local"},
+                "fast":{"provider":"work-review-existing","model":"review-fixture-model"}
+            }))
+            .unwrap(),
+        );
+        config.clone()
+    };
+    state.provider_registry.replace_with(
+        ProviderRegistry::from_config(&config, data.clone())
+            .await
+            .unwrap(),
+    );
+    let known_id = uuid::Uuid::new_v4();
+    let known = review(known_id).await;
+    assert_eq!(known["status"], "recorded");
+    assert_eq!(known["advisory"]["summary"], "Worker is waiting for input.");
+    let replay = review(known_id).await;
+    assert_eq!(replay["status"], "existing_receipt");
+    assert_eq!(
+        replay["accounting"]["receipt"],
+        known["accounting"]["receipt"]
+    );
+
+    // A configured Fast model without a global Model Limits row uses the
+    // per-call Work Review ceilings and the same registered provider.
+    state.config.write().await.extra.remove("model_limits");
+    let unknown = review(uuid::Uuid::new_v4()).await;
+    let original: bamboo_tickets::WorkTokenReservation =
+        serde_json::from_value(unknown["accounting"].clone()).unwrap();
+    assert_eq!(original.usage, Some(ExecutionTokenUsage::Unknown));
+    assert!(unknown["advisory"].is_null());
+    let (reconciled, _) = settle_review(
+        &service,
+        &runtime,
+        &original,
+        WorkReviewUsage::Observed(TokenUsage {
+            prompt_tokens: 41,
+            completion_tokens: 4,
+            total_tokens: 45,
+        }),
+        None,
+    )
+    .unwrap();
+    assert_eq!(reconciled.receipt, original.receipt);
+    let current = service.published().unwrap().1;
+    assert_eq!(current.execution_budget.as_ref().unwrap().total_charged, 89);
+    assert_eq!(
+        current
+            .execution_budget
+            .as_ref()
+            .unwrap()
+            .reservations
+            .len(),
+        2
+    );
+    assert!(current.tickets[&work].accepted_submission.is_none());
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    gate.add_permits(1);
+    state.shutdown().await;
+}

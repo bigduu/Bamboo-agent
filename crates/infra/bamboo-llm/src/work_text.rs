@@ -2,7 +2,7 @@
 
 use std::{sync::Arc, time::Duration};
 
-use bamboo_domain::{Message, TokenUsage};
+use bamboo_domain::{Message, ReasoningEffort, TokenUsage};
 use futures::{future::BoxFuture, StreamExt};
 use reqwest::{Client, RequestBuilder, Response};
 use tokio::time::{timeout, timeout_at, Instant};
@@ -82,6 +82,49 @@ pub async fn complete(
     request: Request<'_>,
     admit: Admission,
 ) -> WorkTextReply {
+    complete_with_options(
+        client,
+        provider,
+        request,
+        admit,
+        LLMRequestOptions {
+            request_purpose: Some("semantic_patrol".into()),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// One explicit Work review over the same bounded managed transport. The role
+/// selection supplies the admitted provider and its configured effort.
+pub async fn review(
+    client: &WorkTextClient,
+    provider: &dyn LLMProvider,
+    request: Request<'_>,
+    admit: Admission,
+    effort: Option<ReasoningEffort>,
+) -> WorkTextReply {
+    complete_with_options(
+        client,
+        provider,
+        request,
+        admit,
+        LLMRequestOptions {
+            request_purpose: Some("work_review".into()),
+            reasoning_effort: effort,
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+async fn complete_with_options(
+    client: &WorkTextClient,
+    provider: &dyn LLMProvider,
+    request: Request<'_>,
+    admit: Admission,
+    options: LLMRequestOptions,
+) -> WorkTextReply {
     let Request {
         model,
         messages,
@@ -101,10 +144,6 @@ pub async fn complete(
                 admit,
             },
             transport.scope(async {
-                let options = LLMRequestOptions {
-                    request_purpose: Some("semantic_patrol".into()),
-                    ..Default::default()
-                };
                 let Ok(mut stream) = provider
                     .chat_stream_with_options(
                         messages,
