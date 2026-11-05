@@ -15,10 +15,10 @@
 //!    setters that would be a no-op).
 //! 5. Mutate the field, bump `title_version` (for title) and always bump
 //!    `metadata_version`, set `updated_at`.
-//! 6. `storage.save_manual_title(&session)` for manual titles; other setters
-//!    use `storage.save_session(&session)` — no merge needed because we
-//!    loaded the latest copy inside the lock and no other writer for this
-//!    session could have interleaved.
+//! 6. Title/pinned setters use `save_presentation_metadata_committed` and
+//!    confirm the committed observations. The backend compares the complete
+//!    canonical Session under its cross-process guards and advances existing
+//!    Root/Actor observations with the admitted presentation-only change.
 //! 7. Refresh the in-memory cache (`state.sessions`).
 //! 8. Build the corresponding [`AgentEvent`] from the **final persisted
 //!    session** and publish via [`publish_replayable_session_event`].
@@ -37,6 +37,7 @@
 //!   signal for the entire authoritative metadata group.
 
 use bamboo_agent_core::{AgentEvent, Session, TitleSource};
+use bamboo_domain::SessionPresentationMutation;
 use chrono::Utc;
 
 use crate::app_context::AgentSessionContext;
@@ -71,6 +72,33 @@ fn ensure_if_match(session: &Session, if_match: Option<u64>) -> Result<(), Metad
     Ok(())
 }
 
+async fn validate_presentation_metadata(
+    state: &dyn AgentSessionContext,
+    session: &Session,
+) -> Result<(), MetadataError> {
+    state
+        .persistence()
+        .storage()
+        .validate_presentation_metadata_observations(session)
+        .await
+        .map_err(|e| MetadataError::Storage(format!("validate presentation metadata: {e}")))
+}
+
+async fn commit_presentation_metadata(
+    state: &dyn AgentSessionContext,
+    session: &Session,
+    mutation: SessionPresentationMutation,
+) -> Result<Session, MetadataError> {
+    let committed = state
+        .persistence()
+        .storage()
+        .save_presentation_metadata_committed(session, mutation)
+        .await
+        .map_err(|e| MetadataError::Storage(format!("save presentation metadata: {e}")))?;
+    validate_presentation_metadata(state, &committed).await?;
+    Ok(committed)
+}
+
 /// Outcome of a metadata mutation.
 ///
 /// `None` means the request was a no-op (the field already had the requested
@@ -103,12 +131,7 @@ impl SessionMetadataService {
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
         if session.title == trimmed && session.title_generated {
-            state
-                .persistence()
-                .storage()
-                .validate_title_observations(&session)
-                .await
-                .map_err(|e| MetadataError::Storage(format!("validate title: {e}")))?;
+            validate_presentation_metadata(state, &session).await?;
             return Ok(None);
         }
 
@@ -124,21 +147,8 @@ impl SessionMetadataService {
             .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
-        session = state
-            .persistence()
-            .storage()
-            .save_manual_title_committed(&session)
-            .await
-            .map_err(|e| MetadataError::Storage(format!("save_manual_title: {e}")))?;
-        // Confirm the backend's committed observations before reporting
-        // success, including compatibility backends that delegate this port
-        // to their generic full writer.
-        state
-            .persistence()
-            .storage()
-            .validate_title_observations(&session)
-            .await
-            .map_err(|e| MetadataError::Storage(format!("validate title: {e}")))?;
+        session = commit_presentation_metadata(state, &session, SessionPresentationMutation::Title)
+            .await?;
         refresh_in_memory_cache(state, session_id, session.clone()).await;
 
         let event = AgentEvent::SessionTitleUpdated {
@@ -177,24 +187,28 @@ impl SessionMetadataService {
 
         let mut session = load_latest(state, session_id).await?;
         if !force && session.title_generated {
+            validate_presentation_metadata(state, &session).await?;
             return Ok(None);
         }
         if session.title == trimmed && session.title_generated {
+            validate_presentation_metadata(state, &session).await?;
             return Ok(None);
         }
 
         session.title = trimmed.to_string();
         session.title_generated = true;
-        session.title_version = session.title_version.saturating_add(1);
-        session.metadata_version = session.metadata_version.saturating_add(1);
+        session.title_version = session
+            .title_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("title version overflow".into()))?;
+        session.metadata_version = session
+            .metadata_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
-        state
-            .persistence()
-            .storage()
-            .save_session(&session)
-            .await
-            .map_err(|e| MetadataError::Storage(format!("save_session: {e}")))?;
+        session = commit_presentation_metadata(state, &session, SessionPresentationMutation::Title)
+            .await?;
         refresh_in_memory_cache(state, session_id, session.clone()).await;
 
         let event = AgentEvent::SessionTitleUpdated {
@@ -224,19 +238,20 @@ impl SessionMetadataService {
         let mut session = load_latest(state, session_id).await?;
         ensure_if_match(&session, if_match)?;
         if session.pinned == pinned {
+            validate_presentation_metadata(state, &session).await?;
             return Ok(None);
         }
 
         session.pinned = pinned;
-        session.metadata_version = session.metadata_version.saturating_add(1);
+        session.metadata_version = session
+            .metadata_version
+            .checked_add(1)
+            .ok_or_else(|| MetadataError::Storage("metadata version overflow".into()))?;
         session.updated_at = Utc::now();
 
-        state
-            .persistence()
-            .storage()
-            .save_session(&session)
-            .await
-            .map_err(|e| MetadataError::Storage(format!("save_session: {e}")))?;
+        session =
+            commit_presentation_metadata(state, &session, SessionPresentationMutation::Pinned)
+                .await?;
         refresh_in_memory_cache(state, session_id, session.clone()).await;
 
         let event = AgentEvent::SessionPinnedUpdated {

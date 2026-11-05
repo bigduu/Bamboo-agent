@@ -154,7 +154,12 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // source hash moves with the new helper. No feature declaration, cfg
 // expression, required-features target, owner, additive context or explicit
 // case changes; engine tests are not part of any additive feature owner.
-const FEATURE_SOURCE_SHA256 = "3d9184ac1449eb2e0f0a440b4c4db83683f0fba10e96f7c0bce5b1d5efdbe7db";
+// #2582 changes the complete V2 writer source covered by its existing
+// test-utils fingerprint. Presentation-metadata regressions remain ordinary
+// storage/packages-0 and metadata-service/server-other cases. No feature
+// declaration, module gate, additive context or selected additive case changes;
+// the existing four contexts still own the same twenty feature-only cases.
+const FEATURE_SOURCE_SHA256 = "9f7648823e19c7618a2b4039a697187eefff10d12bad5a2b8325470b14f747ec";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
