@@ -9,11 +9,12 @@ use std::{collections::HashMap, io, sync::Arc};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
 use bamboo_domain::{
-    AdmissionCommit, AdmissionGate, SessionActivationPort, SessionAuthorityIdentity,
-    SessionCallerReference, SupervisorCurrentUserTarget, SupervisorReference,
+    AdmissionCommit, AdmissionGate, ObserverRootOutcomeRead, SessionActivationPort,
+    SessionAuthorityIdentity, SessionCallerReference, SupervisorCurrentUserTarget,
+    SupervisorReference,
 };
-use bamboo_server_tools::session_control::root_run::SupervisedRootRunPort;
-use bamboo_storage::SessionStoreV2;
+use bamboo_server_tools::session_control::root_run::{ManagedOutcomeTarget, SupervisedRootRunPort};
+use bamboo_storage::{FileSessionInbox, SessionStoreV2};
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
@@ -21,6 +22,7 @@ use super::{fresh_sync::FreshSyncRegistry, live_retry::LiveRetryBridge, AgentRun
 
 pub(super) struct SupervisedRootRunController {
     pub(super) store: Arc<SessionStoreV2>,
+    pub(super) inbox: Arc<FileSessionInbox>,
     pub(super) router: Arc<bamboo_engine::SessionActivationRouter>,
     pub(super) runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(super) live_retry: Arc<LiveRetryBridge>,
@@ -218,6 +220,27 @@ fn run_control(
 }
 
 impl SupervisedRootRunController {
+    async fn read_outcome(
+        &self,
+        caller: &SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &ManagedOutcomeTarget,
+    ) -> Result<ObserverRootOutcomeRead, ToolError> {
+        self.inbox
+            .read_managed_root_outcome(
+                caller,
+                supervisor,
+                &target.target_ref,
+                &target.expected_run_id,
+                target.after_sequence,
+            )
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "Managed Root outcome evidence unavailable");
+                ToolError::Execution("managed_root_outcome_evidence_unavailable".into())
+            })
+    }
+
     async fn control(
         &self,
         caller: &SessionCallerReference,
@@ -316,6 +339,50 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         ))
     }
 
+    async fn wait_outcomes(
+        &self,
+        caller: &SessionCallerReference,
+        targets: &[ManagedOutcomeTarget; 2],
+    ) -> Result<ToolResult, ToolError> {
+        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
+        else {
+            return Err(ToolError::Execution("original Supervisor required".into()));
+        };
+        let supervisor = SupervisorReference {
+            session_id: caller.session_id.clone(),
+            incarnation_id: *incarnation_id,
+        };
+        // Subscribe before inspecting Main to cover completion during the read.
+        // A signal is only a hint. The read revalidates the exact authority and ACK.
+        let [first_signal, second_signal] = {
+            let runners = self.runners.read().await;
+            targets.each_ref().map(|target| {
+                runners
+                    .get(&target.target_ref.session_id)
+                    .filter(|runner| runner.run_id == target.expected_run_id)
+                    .map(AgentRunner::wait_for_exact_finalization)
+            })
+        };
+        let [first, second] = targets;
+        use bamboo_orchestration::managed_session::{read_when_verified, wait_for_outcome};
+        let outcome = wait_for_outcome(
+            read_when_verified(
+                || self.read_outcome(caller, &supervisor, first),
+                first_signal,
+            ),
+            read_when_verified(
+                || self.read_outcome(caller, &supervisor, second),
+                second_signal,
+            ),
+        )
+        .await?;
+        let response = match outcome {
+            Some(outcome) => json!({"status":"recorded_outcome", "outcome":outcome}),
+            None => json!({"status":"outcome_unknown"}),
+        };
+        Ok(ToolResult::text(true, response.to_string()))
+    }
+
     async fn cancel_run(
         &self,
         caller: &SessionCallerReference,
@@ -325,5 +392,15 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
     ) -> Result<ToolResult, ToolError> {
         self.control(caller, target, Some(expected_run_id), Some(gate))
             .await
+    }
+}
+
+// Reuse the native fixture without enrolling a managed-Root case in the
+// Observer feature's fixed historical subscription catalog.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests {
+    #[actix_web::test]
+    async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_after_restart() {
+        super::super::observer_subscriptions::tests::exercise_managed_wait_outcomes().await;
     }
 }
