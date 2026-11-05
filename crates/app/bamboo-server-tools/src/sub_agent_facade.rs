@@ -25,7 +25,7 @@ const MAX_RESULT_BYTES: usize = child_session::MAX_CHILD_RESULT_BYTES;
 pub(super) const OBSERVATION_LIMIT_ERROR: &str =
     "SubAgent observation exceeds its limit; request a smaller history slice";
 pub(super) const MODEL_NOT_ADMITTED_ERROR: &str =
-    "The SubAgent model route is not admitted. Check the configured provider and model before retrying.";
+    "The SubAgent model route is not admitted. Use intent=inspect with message=models to read configured references before retrying.";
 #[cfg(test)]
 const MAX_TREE_NODES: usize = 32;
 #[cfg(test)]
@@ -40,6 +40,7 @@ const AUDIT_TERMINAL: &str = "direct_parent_forced_permission_terminal_v1";
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) enum Projection {
     Chat,
+    Models,
     Overview,
     Diagnostics,
     Messages,
@@ -99,16 +100,16 @@ pub(super) fn parameters_schema() -> Value {
             "intent": {"type":"string", "enum":["chat","inspect","control","ask_parent"], "description":"Defaults to chat. ask_parent is Child-only and uses message as a bounded clarification question; it suspends until the canonical direct parent replies."},
             "target": {"type":"string", "description":"Logical Child ActorId returned by this tool. Omit for chat to create a durable child, or inspect to request a tree scoped to this session. Root sees its full tree; an active Child with a Host canonical tree route sees only its owned subtree. The forced permission audit remains Root-only."},
             "role": {"type":"string", "description":"Only chat without target: select a named profile. Defaults include explorer (read-only exploration), implementer (bounded implementation), and reviewer (independent read-only review). Project overrides Global, then the builtin default. Omit for worker; no builtin role is implicitly selected. Invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture; the child uses only the tools the runtime exposes to the child. Role cannot change an existing target."},
-            "model": {"type":"string", "maxLength":256, "description":"Only chat creating a new Worker on the built-in Bamboo runtime, without target, role or reply_to. Use an exact configured provider:model. Unavailable and profile-managed routes fail before launch."},
+            "model": {"type":"string", "maxLength":256, "description":"Only chat creating a new Worker on the built-in Bamboo runtime, without target, role or reply_to. Use an exact configured provider:model from intent=inspect, message=models. Unavailable and profile-managed routes fail before launch."},
             "reasoning_effort": {"type":"string", "enum":["none","low","medium","high","xhigh","max"], "description":"Optional reasoning effort for a new Worker with an explicit model."},
-            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, diagnostics, messages, message, result, error, or a JSON query for pagination. Pass next_cursor unchanged with the same view; do not decode or edit it. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Control: cancel or retry. No host, physical worker, or mailbox identifiers."},
+            "message": {"type":"string", "description":"Chat: complete natural-language task or correction. Inspect without target: models for the locally admitted provider:model catalog, tree, a JSON {view:tree,cursor} page request, or forced_permission_audit (Root-only read-only audit). Inspect with target: overview, diagnostics, messages, message, result, error, or a JSON query for pagination. Creation and overview model fields describe stored Session selection. Pass next_cursor unchanged with the same view; do not decode or edit it. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Control: cancel or retry. No host, physical worker, or mailbox identifiers."},
             "reply_to": {"type":"string", "description":"Exact pending direct-parent ParentRequest id. For forced permission use message exactly approve_once or deny; for a clarification use message as a bounded answer. Omit target and role. The Host checks the canonical request kind and deadline."}
         }
     })
 }
 
 pub(super) fn description() -> &'static str {
-    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. A fresh Worker on the built-in Bamboo runtime with no named profile may select an exact model=provider:model and optional reasoning_effort. Do not drop an explicitly requested model after a route rejection. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
+    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. A fresh Worker on the built-in Bamboo runtime with no named profile may select an exact model=provider:model and optional reasoning_effort. Use intent=inspect with message=models to read locally admitted configured references. Creation receipts and overview expose stored model_ref and reasoning_effort. Completed inference requires its own runtime evidence. Do not drop an explicitly requested model after a route rejection. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
 }
 
 /// Must run before launch-owner classification. Only legacy calls retain the
@@ -259,6 +260,12 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
         }
         Intent::Inspect => {
             let Some(target) = parsed.target else {
+                if parsed.message.as_deref() == Some("models") {
+                    return Ok(NormalizedCall {
+                        args: json!({"action":"list_models"}),
+                        projection: Some(Projection::Models),
+                    });
+                }
                 if parsed.message.as_deref() == Some("forced_permission_audit") {
                     if has_target {
                         return Err(invalid("forced_permission_audit requires omitted target"));
@@ -268,22 +275,21 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
                         projection: Some(Projection::ForcedPermissionAudit),
                     });
                 }
-                let cursor =
-                    match parsed.message.as_deref() {
-                        None | Some("tree") => None,
-                        Some(message) if message.trim().is_empty() => None,
-                        Some(message) if message.starts_with('{') && message.len() <= 4096 => {
-                            let query: InspectionQuery = serde_json::from_str(message)
-                                .map_err(|_| invalid("Invalid tree inspection query"))?;
-                            if query.view.as_deref() != Some("tree") || query.message_id.is_some() {
-                                return Err(invalid("Invalid tree inspection query"));
-                            }
-                            query.cursor
+                let cursor = match parsed.message.as_deref() {
+                    None | Some("tree") => None,
+                    Some(message) if message.trim().is_empty() => None,
+                    Some(message) if message.starts_with('{') && message.len() <= 4096 => {
+                        let query: InspectionQuery = serde_json::from_str(message)
+                            .map_err(|_| invalid("Invalid tree inspection query"))?;
+                        if query.view.as_deref() != Some("tree") || query.message_id.is_some() {
+                            return Err(invalid("Invalid tree inspection query"));
                         }
-                        _ => return Err(invalid(
-                            "inspect without target accepts only tree or forced_permission_audit",
-                        )),
-                    };
+                        query.cursor
+                    }
+                    _ => return Err(invalid(
+                        "inspect without target accepts models, tree or forced_permission_audit",
+                    )),
+                };
                 if cursor.as_ref().is_some_and(|cursor| cursor.is_empty()) {
                     return Err(invalid("Invalid tree inspection cursor"));
                 }
@@ -398,6 +404,18 @@ fn copy_fields(output: &mut Value, input: &Value, fields: &[&str]) {
 fn project(projection: Projection, input: &Value) -> Value {
     let mut output = json!({"actor_id":input["child_session_id"]});
     match projection {
+        Projection::Models => {
+            let providers: Vec<Value> = input["providers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|provider| {
+                    json!({"provider":provider["provider"], "models":provider["models"],
+                        "has_listing_error":!provider["error"].is_null()})
+                })
+                .collect();
+            output = json!({"default_provider":input["default_provider"], "providers":providers});
+        }
         Projection::Chat | Projection::Control => {
             let status = if input["status"] == "already_terminal" {
                 &input["last_run_status"]
@@ -405,7 +423,17 @@ fn project(projection: Projection, input: &Value) -> Value {
                 &input["status"]
             };
             output["observed_status"] = json!(observed_status(status));
-            copy_fields(&mut output, input, &["message_count", "messages_removed"]);
+            copy_fields(
+                &mut output,
+                input,
+                &[
+                    "message_count",
+                    "messages_removed",
+                    "model",
+                    "model_ref",
+                    "reasoning_effort",
+                ],
+            );
             if let Some(id) = input.get("message_id") {
                 output["delivery_message_id"] = id.clone();
             }
@@ -425,6 +453,9 @@ fn project(projection: Projection, input: &Value) -> Value {
                 input,
                 &[
                     "title",
+                    "model",
+                    "model_ref",
+                    "reasoning_effort",
                     "message_count",
                     "is_running",
                     "has_pending_injected_messages",
@@ -878,6 +909,9 @@ pub(super) fn finish(
             Err(ToolError::InvalidArguments(message))
         }
         Err(ToolError::InvalidArguments(_)) => Err(invalid("Invalid SubAgent request or inspection cursor; start a new inspection")),
+        Err(_) if projection == Projection::Models => Err(ToolError::Execution(
+            "Configured runtime model catalog is unavailable".into(),
+        )),
         Err(_) => Err(ToolError::Execution("SubAgent operation failed. Inspect the current child before retrying; execution details are available to the authenticated inspector.".into())),
     }
 }
@@ -1200,7 +1234,10 @@ mod tests {
         let observed = project(call.projection.unwrap(), &input);
         assert_eq!(observed["default_provider"], "configured");
         assert_eq!(observed["providers"][0]["provider"], "configured");
-        assert_eq!(observed["providers"][0]["models"], json!(["deepseek-flash"]));
+        assert_eq!(
+            observed["providers"][0]["models"],
+            json!(["deepseek-flash"])
+        );
         assert_eq!(observed["providers"][0]["has_listing_error"], true);
         assert!(!observed.to_string().contains("secret"));
     }
