@@ -1870,6 +1870,7 @@ mod tests {
         captured_reasoning: Mutex<Vec<Option<ReasoningEffort>>>,
         responses_without_text: usize,
         complete_empty_response: bool,
+        required_reasoning_effort: Option<ReasoningEffort>,
     }
 
     #[async_trait]
@@ -1895,12 +1896,17 @@ mod tests {
             model: &str,
             options: Option<&LLMRequestOptions>,
         ) -> Result<LLMStream, LLMError> {
+            let reasoning_effort = options.and_then(|options| options.reasoning_effort);
             let attempt = {
                 let mut captured = self.captured_reasoning.lock().unwrap();
-                captured.push(options.and_then(|options| options.reasoning_effort));
+                captured.push(reasoning_effort);
                 captured.len()
             };
-            if attempt <= self.responses_without_text {
+            if attempt <= self.responses_without_text
+                || self
+                    .required_reasoning_effort
+                    .is_some_and(|expected| reasoning_effort != Some(expected))
+            {
                 let mut chunks = vec![Ok(LLMChunk::ReasoningToken(
                     "private reasoning".to_string(),
                 ))];
@@ -1971,6 +1977,59 @@ mod tests {
         assert!(efforts[2..]
             .iter()
             .all(|effort| *effort == Some(ReasoningEffort::Low)));
+    }
+
+    #[tokio::test]
+    async fn summary_retry_honors_explicit_disable_after_fast_role_resolution() {
+        let provider = Arc::new(ReasoningCaptureProvider {
+            complete_empty_response: true,
+            required_reasoning_effort: Some(ReasoningEffort::Disabled),
+            ..Default::default()
+        });
+        let registry = Arc::new(bamboo_llm::ProviderRegistry::new(
+            std::collections::HashMap::from([(
+                "configured-fast".to_string(),
+                provider.clone() as Arc<dyn LLMProvider>,
+            )]),
+            "configured-fast".to_string(),
+        ));
+        let config: bamboo_llm::Config = serde_json::from_value(serde_json::json!({
+            "defaults": {
+                "chat": {"provider":"unused-chat", "model":"unused"},
+                "fast": {"provider":"configured-fast", "model":"summary-model", "reasoning_effort":"max"}
+            }
+        }))
+        .unwrap();
+        let resolved = crate::model_config_helper::try_resolve_task_summary_model(
+            &config,
+            "configured-fast",
+            &registry,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(resolved.model_name, "summary-model");
+        let summarizer = LlmSummarizer::new(resolved.provider, resolved.model_name, None, None)
+            .with_request_budget(bounded_budget(3_000, 600, 100, 400));
+        let messages: Vec<_> = (0..12)
+            .map(|index| Message::user(format!("turn {index} {}", "saved progress ".repeat(240))))
+            .collect();
+
+        let report = summarizer.summarize_with_report(&messages).await.unwrap();
+
+        assert!(report.map_calls > 1);
+        assert_eq!(report.content, "captured summary");
+        assert!(!report.fallback_used);
+        let efforts = provider.captured_reasoning.lock().unwrap();
+        assert_eq!(
+            efforts.len(),
+            2 * (report.map_calls + report.reduce_calls) as usize
+        );
+        for pair in efforts.chunks_exact(2) {
+            assert_eq!(
+                pair,
+                [Some(ReasoningEffort::Max), Some(ReasoningEffort::Disabled)]
+            );
+        }
     }
 
     #[tokio::test]
