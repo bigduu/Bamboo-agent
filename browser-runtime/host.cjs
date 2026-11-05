@@ -4143,6 +4143,26 @@ async function finishCloseHost() {
   if (checkpointError) throw checkpointError;
 }
 
+function recordClosedLaunch(control, generation) {
+  const marker = path.join(control, '.bamboo-profile-launch-active-v1');
+  const launch = `BAMBOO_BROWSER_LAUNCH_V1\n${generation}\n`;
+  const closed = Buffer.from(`BAMBOO_BROWSER_CLOSED_V1\n${process.pid}\n`);
+  const descriptor = nativeFs.openSync(marker, fsConstants.O_RDWR |
+    fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+  try {
+    const stat = nativeFs.fstatSync(descriptor);
+    assert.ok(stat.isFile() && stat.uid === process.getuid() && stat.nlink === 1 &&
+      (stat.mode & 0o777) === 0o600 && stat.size === launch.length);
+    const bytes = Buffer.alloc(launch.length);
+    assert.equal(nativeFs.readSync(descriptor, bytes, 0, bytes.length, 0), bytes.length);
+    assert.equal(bytes.toString('utf8'), launch);
+    assert.equal(nativeFs.writeSync(descriptor, closed, 0, closed.length, bytes.length), closed.length);
+    nativeFs.fsyncSync(descriptor);
+  } finally {
+    nativeFs.closeSync(descriptor);
+  }
+}
+
 async function main() {
   const admission = await prepareNativeLaunch();
   hostStorageSettings = productionStorageSettings(admission?.environment || process.env);
@@ -4260,6 +4280,12 @@ async function main() {
   }
   await closeHost();
   await Promise.allSettled([...pending]);
+  if (managedGroup && !retireAfterReply && !process.exitCode &&
+      process.env.BAMBOO_BROWSER_PERSIST_CLOSE_V1 === '1') {
+    // Bamboo can die before it waits for this host. Record the completed close
+    // in the same launch fence, so the next owner can finish the group check.
+    recordClosedLaunch(hostStorageSettings.control, admission.environment.BAMBOO_BROWSER_STORAGE_GENERATION);
+  }
 }
 
 if (require.main === module) {
