@@ -768,6 +768,7 @@ async fn task_recovery_preflights_both_original_targets_and_legacy_cannot_cross_
         version: RUNTIME_TASK_TRANSACTION_VERSION,
         transaction_id: Uuid::new_v4().to_string(),
         first: TaskControlPlaneUndo {
+            managed_task_blocker: None,
             session_id: fixture.canonical.id.clone(),
             task_list: Some(super::tests::transaction_task_list(
                 &fixture.canonical.id,
@@ -779,6 +780,7 @@ async fn task_recovery_preflights_both_original_targets_and_legacy_cannot_cross_
             ),
         },
         second: TaskControlPlaneUndo {
+            managed_task_blocker: None,
             session_id: peer.id.clone(),
             task_list: None,
             task_list_version: "unexpected-undo".into(),
@@ -955,12 +957,14 @@ async fn legacy_v1_task_recovery_preserves_its_existing_zero_generation_behavior
         version: 1,
         transaction_id: Uuid::new_v4().to_string(),
         first: TaskControlPlaneUndo {
+            managed_task_blocker: None,
             session_id: first.id.clone(),
             task_list: first.task_list.clone(),
             task_list_version: first.task_list_version_meta().unwrap(),
             conversation_witness: None,
         },
         second: TaskControlPlaneUndo {
+            managed_task_blocker: None,
             session_id: second.id.clone(),
             task_list: second.task_list.clone(),
             task_list_version: second.task_list_version_meta().unwrap(),

@@ -35,6 +35,14 @@ fn grant_cancel(fixture: &Fixture) {
 }
 
 async fn invoke(fixture: &Fixture, arguments: Value) -> Result<Value, ToolError> {
+    invoke_in_mode(fixture, arguments, false).await
+}
+
+async fn invoke_in_mode(
+    fixture: &Fixture,
+    arguments: Value,
+    plan_read_only: bool,
+) -> Result<Value, ToolError> {
     let supervisor = fixture
         .state
         .storage
@@ -51,6 +59,7 @@ async fn invoke(fixture: &Fixture, arguments: Value) -> Result<Value, ToolError>
         },
     };
     let mut ctx = ToolExecutionContext::none(&call.id);
+    ctx.plan_read_only = plan_read_only;
     ctx.session_id = Some(&supervisor.id);
     ctx.root_session_id = Some(&supervisor.id);
     ctx = ctx.with_executing_supervisor(
@@ -80,6 +89,70 @@ fn args(action: &str, target: &SupervisorCurrentUserTarget, run: Option<&str>) -
         value["expected_run_id"] = json!(run);
     }
     value
+}
+
+#[actix_web::test]
+async fn supervisor_wait_wakes_only_after_the_observed_run_finalizes() {
+    use std::time::Duration;
+    let fixture = Box::pin(Fixture::new()).await;
+    let target = current_target(&fixture).await;
+    let mut runner = crate::app_state::AgentRunner::new();
+    runner.status = crate::app_state::AgentStatus::Running;
+    let run_id = runner.run_id.clone();
+    let token = runner.cancel_token.clone();
+    let owner = fixture
+        .state
+        .session_activation_router
+        .register_session_run(&fixture.original, &run_id)
+        .await
+        .unwrap();
+    let runners = &fixture.state.agent_runners;
+    runners.write().await.insert(TARGET.into(), runner);
+
+    let wait = args("wait_run", &target, Some(&run_id));
+    assert_eq!(
+        invoke(&fixture, wait.clone()).await.unwrap()["reason"],
+        "run_not_observed"
+    );
+    assert_eq!(
+        invoke(&fixture, args("observe_run", &target, None))
+            .await
+            .unwrap()["run_id"],
+        run_id
+    );
+    let plan_attempt = invoke_in_mode(&fixture, wait.clone(), true).await;
+    assert!(
+        matches!(plan_attempt, Err(ToolError::Execution(ref error)) if error.contains("Plan mode")),
+        "{plan_attempt:?}"
+    );
+    assert!(!token.is_cancelled());
+
+    let mut waiter = Box::pin(invoke(&fixture, wait));
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+        .await
+        .is_err());
+
+    // A nonmatching owner cannot wake the waiter, and waiting cannot cancel the run.
+    assert!(
+        !bamboo_engine::execution::finalize_runner_exact(runners, TARGET, "different-run", &Ok(()))
+            .await
+    );
+    assert!(!token.is_cancelled());
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter)
+        .await
+        .is_err());
+    assert!(
+        bamboo_engine::execution::finalize_runner_exact(runners, TARGET, &run_id, &Ok(())).await
+    );
+
+    let observed = tokio::time::timeout(Duration::from_secs(3), waiter)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed["status"], "already_finished");
+    assert_eq!(observed["run_id"], run_id);
+    assert_eq!(observed["completion_verified"], false);
+    owner.finish(0).await.unwrap();
 }
 
 #[actix_web::test]
@@ -624,6 +697,10 @@ async fn cancelled_root_control_admission_cannot_signal_late_owner() {
         .insert(TARGET.into(), runner);
     let port = crate::app_state::supervised_root_run::SupervisedRootRunController {
         store: fixture.state.session_store.clone(),
+        inbox: Arc::new(bamboo_storage::FileSessionInbox::new(
+            fixture.state.session_store.clone(),
+            Default::default(),
+        )),
         router: fixture.state.session_activation_router.clone(),
         runners: fixture.state.agent_runners.clone(),
         live_retry: fixture.state.live_retry.clone(),
