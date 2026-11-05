@@ -7,6 +7,7 @@ use bamboo_domain::{
 };
 
 pub(crate) struct CurrentUserTargetGuard {
+    pub(crate) lock_wait: SessionLockWait,
     pub(crate) source: Session,
     pub(crate) target: Session,
     pub(crate) inbox_dir: PathBuf,
@@ -105,11 +106,15 @@ impl SessionStoreV2 {
     async fn current_user_target_source(
         &self,
         target_id: &str,
+        wait: SessionLockWait,
     ) -> io::Result<Option<(Session, HostScopeSessionObservation)>> {
         target_id_is_valid(target_id)?;
         let _lifecycle = self.lock_session_lifecycle_shared().await?;
         let _task = self.lock_runtime_task_sidecar_shared().await?;
-        let _target = self.acquire_session_maintenance_lock(target_id).await?;
+        let _target = match wait {
+            SessionLockWait::Wait => self.acquire_session_maintenance_lock(target_id).await?,
+            SessionLockWait::Try => self.try_acquire_session_maintenance_lock(target_id).await?,
+        };
         let (relative, _) = self
             .actor_authority_location(target_id)
             .await
@@ -190,7 +195,7 @@ impl SessionStoreV2 {
         let caller = HostScopeSessionObservation::capture(&source, vec![])
             .map_err(|error| denied(&error.to_string()))?;
         let (_, target) = self
-            .current_user_target_source(target_id)
+            .current_user_target_source(target_id, wait)
             .await?
             .ok_or_else(|| {
                 io::Error::new(
@@ -230,6 +235,7 @@ impl SessionStoreV2 {
             Self::child_rel_path(&current.root_session_id, target_id)
         };
         Ok(CurrentUserTargetGuard {
+            lock_wait: wait,
             source,
             target: current,
             inbox_dir: self.abs_path_from_rel(&relative).join("inbox"),

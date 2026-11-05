@@ -45,6 +45,7 @@ struct CachedMaterialSource {
     stamps: bamboo_storage::v2::MaterialNotificationStamps,
     candidates: Vec<bamboo_domain::ManagedRootNotification>,
     delivered: Vec<bamboo_domain::ManagedRootNotification>,
+    delivery_due: bool,
     settled: bool,
     last_used: Instant,
 }
@@ -177,17 +178,19 @@ impl ObserverSubscriptionCoordinator {
                 cache.insert(source, *cached);
             }
             MaterialProofCompletion::Delivered { selected, result } => {
-                if result? {
-                    if let Some(cached) = self
-                        .material_cache
-                        .lock()
-                        .await
-                        .get_mut(&selected.target.session_id)
-                        .filter(|cached| cached.candidates.contains(&selected))
-                    {
+                if let Some(cached) = self
+                    .material_cache
+                    .lock()
+                    .await
+                    .get_mut(&selected.target.session_id)
+                    .filter(|cached| cached.candidates.contains(&selected))
+                {
+                    cached.delivery_due = false;
+                    if matches!(result, Ok(true)) {
                         cached.delivered.push(*selected);
                     }
                 }
+                result?;
             }
         }
         Ok(())
@@ -439,6 +442,19 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
         if let Err(error) = self.finish_material_proof().await {
             tracing::debug!(%error, "Managed Session material proof remains pending");
         }
+        // Attempt a completed observation once before refreshing its stamps or
+        // admitting another source. The final writer always rechecks authority.
+        let ready: Vec<_> = self
+            .material_cache
+            .lock()
+            .await
+            .iter()
+            .filter(|(_, cached)| cached.delivery_due)
+            .map(|(source, _)| source.clone())
+            .collect();
+        if !ready.is_empty() {
+            return ready;
+        }
         self.store
             .list_index_entries()
             .await
@@ -456,6 +472,15 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
         &self,
         source: &str,
     ) -> Result<Vec<bamboo_domain::ManagedRootNotification>, String> {
+        if let Some(cached) = self
+            .material_cache
+            .lock()
+            .await
+            .get(source)
+            .filter(|cached| cached.delivery_due)
+        {
+            return Ok(cached.candidates.clone());
+        }
         let hint = self
             .store
             .get_index_entry(source)
@@ -501,6 +526,7 @@ impl ManagedRootNotificationIo for ObserverSubscriptionCoordinator {
                     hint,
                     created_at: session.created_at,
                     stamps,
+                    delivery_due: !candidates.is_empty(),
                     candidates,
                     delivered: Vec::new(),
                     settled,

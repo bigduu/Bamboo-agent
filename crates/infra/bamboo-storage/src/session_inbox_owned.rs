@@ -792,8 +792,18 @@ impl FileSessionInbox {
         target: &str,
         authority: InboxAuthority,
     ) -> Result<(PathBuf, OwnedFilesystem), SessionInboxError> {
+        let wait = match &authority {
+            InboxAuthority::SupervisedRootOutcome { _guard, .. } => _guard.lock_wait,
+            _ => crate::v2::SessionLockWait::Wait,
+        };
         let dir = self.inbox_dir_with_authority(target, &authority).await?;
-        let process = self.lock_process(&dir).await;
+        let process = match wait {
+            crate::v2::SessionLockWait::Wait => self.lock_process(&dir).await,
+            crate::v2::SessionLockWait::Try => self
+                .process_lock(&dir)
+                .try_lock_owned()
+                .map_err(|_| SessionInboxError::Storage("Inbox proof I/O is busy".into()))?,
+        };
         let scope = Arc::new(OwnedScope {
             _process: process,
             _authority: authority,
@@ -813,7 +823,7 @@ impl FileSessionInbox {
             // instead of creating or locking an object outside the Inbox.
             let anchor = super::anchor::InboxAnchor::acquire(&path)?;
             let file = anchor.open_lock(OPERATION_LOCK_FILE)?;
-            file.lock_exclusive()?;
+            wait.lock_exclusive(&file)?;
             Ok::<_, std::io::Error>(Arc::new(OwnedGuards {
                 _file: FileOperationLock(file),
                 dir: anchor,

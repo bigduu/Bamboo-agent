@@ -1477,7 +1477,7 @@ pub(super) enum SessionLockWait {
 }
 
 impl SessionLockWait {
-    fn lock_exclusive(self, file: &std::fs::File) -> io::Result<()> {
+    pub(crate) fn lock_exclusive(self, file: &std::fs::File) -> io::Result<()> {
         match self {
             Self::Wait => FileExt::lock_exclusive(file),
             Self::Try => FileExt::try_lock_exclusive(file).map_err(|error| {

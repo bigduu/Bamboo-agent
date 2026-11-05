@@ -451,6 +451,13 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn material_notices_deliver_older_sources_beyond_the_process_cache() {
+        super::super::observer_subscriptions::tests::exercise_material_notification_cache_fairness(
+        )
+        .await;
+    }
+
+    #[actix_web::test]
     async fn managed_wait_wakes_on_the_exact_durable_task_blocker_before_root_finishes() {
         super::super::observer_subscriptions::tests::exercise_managed_wait_blocker().await;
     }

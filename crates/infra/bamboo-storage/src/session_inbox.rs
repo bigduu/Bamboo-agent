@@ -1844,7 +1844,7 @@ impl FileSessionInbox {
             .min(MAX_INTENT_TRANSPORT_BYTES)
     }
 
-    async fn lock_process(&self, dir: &Path) -> OwnedMutexGuard<()> {
+    fn process_lock(&self, dir: &Path) -> Arc<AsyncMutex<()>> {
         let key = dir.to_path_buf();
         let lock = {
             let mut locks = self
@@ -1861,7 +1861,11 @@ impl FileSessionInbox {
                 }
             }
         };
-        lock.lock_owned().await
+        lock
+    }
+
+    async fn lock_process(&self, dir: &Path) -> OwnedMutexGuard<()> {
+        self.process_lock(dir).lock_owned().await
     }
 
     async fn lock_file(dir: &Path) -> Result<FileOperationLock, SessionInboxError> {
@@ -5041,6 +5045,57 @@ mod tests {
             &lease.replace("\"version\":1", "\"version\":1,\"version\":1")
         ));
         assert!(!parse(&lease.replace("\"epoch\":1", "\"epoch\":0")));
+    }
+
+    #[tokio::test]
+    async fn material_proof_does_not_wait_for_a_local_or_peer_inbox_writer() {
+        let (_home, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+        let bootstrap = sessions
+            .get_or_create_default_supervisor("model")
+            .await
+            .unwrap();
+        let reference = bamboo_domain::SupervisorReference::from(&bootstrap);
+        let dir = inbox.inbox_dir("session-1").await.unwrap();
+        let held = inbox.lock_operation(&dir).await.unwrap();
+        let peer = FileSessionInbox::new(sessions.clone(), SessionInboxLimits::default());
+        for reader in [&inbox, &peer] {
+            let guard = sessions
+                .try_lock_current_user_target(&reference, "session-1")
+                .await
+                .unwrap();
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                reader.filesystem_with_authority(
+                    "session-1",
+                    InboxAuthority::SupervisedRootOutcome {
+                        inbox_dir: dir.clone(),
+                        _guard: Arc::new(guard),
+                    },
+                ),
+            )
+            .await
+            .expect("busy Inbox proof must return with its writer still retained");
+            assert!(result
+                .err()
+                .expect("retained operation lock must exclude the proof")
+                .to_string()
+                .contains("busy"));
+        }
+        drop(held);
+        let guard = sessions
+            .try_lock_current_user_target(&reference, "session-1")
+            .await
+            .unwrap();
+        inbox
+            .filesystem_with_authority(
+                "session-1",
+                InboxAuthority::SupervisedRootOutcome {
+                    inbox_dir: dir,
+                    _guard: Arc::new(guard),
+                },
+            )
+            .await
+            .unwrap();
     }
 
     #[test]

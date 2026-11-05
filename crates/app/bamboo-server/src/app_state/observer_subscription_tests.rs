@@ -1716,6 +1716,139 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
         .is_none());
 }
 
+pub(in crate::app_state) async fn exercise_material_notification_cache_fairness() {
+    let f = Fixture::new_with_native_source(true).await;
+    let caller = SessionCallerReference::from(&load(&f.state, &f.reference.session_id).await);
+    f.probe.hold_sources.store(true, Ordering::SeqCst);
+    let mut ids = Vec::new();
+    for index in 0..17 {
+        let id = format!("material-cache-source-{index}");
+        let workspace = f.home.path().join(&id);
+        std::fs::create_dir(&workspace).unwrap();
+        let mut session = Session::new(&id, SOURCE);
+        session.model_ref = Some(ProviderModelRef::new(PROVIDER, SOURCE));
+        session.set_provider_name(PROVIDER);
+        session.workspace = Some(workspace.to_string_lossy().into());
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        f.state.storage.save_session(&session).await.unwrap();
+        let target = managed_target(&f.state, &f.reference, &id).await;
+        let message = if index < 9 {
+            "managed wait second cache source"
+        } else {
+            "unchanged cache source"
+        };
+        f.state
+            .session_messenger
+            .supervisor_followup_with_material_notifications(
+                &caller,
+                &f.reference,
+                &target,
+                &format!("material-cache-followup-{index}"),
+                message,
+                true,
+            )
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    tokio::time::timeout(WAIT, async {
+        while f.probe.source_calls.load(Ordering::SeqCst) != 17 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut runs = Vec::new();
+    for id in &ids[..9] {
+        runs.push(
+            f.state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .unwrap(),
+        );
+    }
+    f.probe.source_release[1].notify_waiters();
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let mut active = false;
+            for id in &ids[..9] {
+                active |= f
+                    .state
+                    .session_activation_router
+                    .current_run_id(id)
+                    .await
+                    .is_some();
+            }
+            if !active {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Keep eight unchanged active sources ahead of nine older handoffs.
+    for id in &ids[9..] {
+        let mut session = load(&f.state, id).await;
+        session.updated_at = Utc::now();
+        f.state.storage.save_session(&session).await.unwrap();
+    }
+    let sources = ManagedRootNotificationIo::sources(f.state.observer_subscriptions.as_ref()).await;
+    assert_eq!(sources.len(), 17);
+    assert!(sources[..8].iter().all(|id| ids[9..].contains(id)));
+    tokio::time::timeout(WAIT * 3, async {
+        loop {
+            if let Err(error) = f.state.observer_subscriptions.material_tick().await {
+                assert!(
+                    error.contains("pending") || error.contains("busy"),
+                    "{error}"
+                );
+            }
+            let observed = {
+                let requests = f.probe.parent_inputs.lock().unwrap();
+                runs.iter().all(|run| {
+                    requests
+                        .iter()
+                        .flatten()
+                        .any(|message| message.content.contains(run))
+                })
+            };
+            if observed {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("all nine older handoffs must reach the real native Supervisor path");
+    assert!(
+        f.state
+            .observer_subscriptions
+            .material_cache
+            .lock()
+            .await
+            .len()
+            <= 16
+    );
+    f.probe.source_release[0].notify_waiters();
+    tokio::time::timeout(WAIT, async {
+        for id in &ids[9..] {
+            while f
+                .state
+                .session_activation_router
+                .current_run_id(id)
+                .await
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
 pub(in crate::app_state) async fn exercise_managed_wait_blocker() {
     use bamboo_domain::{ManagedRootEvent, ManagedRootEventRead, SessionCallerReference};
 
