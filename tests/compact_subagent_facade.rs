@@ -317,13 +317,12 @@ async fn response(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
                     .iter()
                     .find(|tool| tool["function"]["name"] == "SubAgent")
                     .unwrap();
-                assert_eq!(
-                    schema["function"]["parameters"]["properties"]
-                        .as_object()
-                        .unwrap()
-                        .len(),
-                    5
-                );
+                let properties = schema["function"]["parameters"]["properties"]
+                    .as_object()
+                    .unwrap();
+                assert_eq!(properties.len(), 7);
+                assert_eq!(properties["model"]["type"], "string");
+                assert_eq!(properties["reasoning_effort"]["type"], "string");
                 let mut args = json!({"message":TASK});
                 if let Some(role) = probe.role {
                     args["role"] = json!(role);

@@ -81,7 +81,8 @@ fn child_error(error: ChildSessionError) -> ToolError {
         ChildSessionError::NotRootSession(id) => {
             ToolError::Execution(format!("session is not a root session: {id}"))
         }
-        ChildSessionError::InvalidArguments(message) => ToolError::InvalidArguments(message),
+        ChildSessionError::InvalidArguments(message)
+        | ChildSessionError::ModelNotAdmitted(message) => ToolError::InvalidArguments(message),
         ChildSessionError::Execution(message) => ToolError::Execution(message),
         other => ToolError::Execution(other.to_string()),
     }
