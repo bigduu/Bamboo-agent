@@ -1,5 +1,7 @@
 //! Owner budget HTTP over the actual FileStore/Inbox/native Host.
 use super::*;
+#[path = "accounting_only.rs"]
+mod accounting_only;
 use actix_web::http::Method;
 use bamboo_server::AppState;
 use bamboo_tickets::{ExecutionTokenUsage, ExecutionWorkspace, TicketService};

@@ -79,7 +79,7 @@ fn original_budget_decision_survives_later_limits_unknown_charge_and_restart() {
     let budget = service.work_token_budget(&runtime()).unwrap().unwrap();
     assert_eq!(budget.revision, 2);
     assert_eq!(budget.configurations.len(), 2);
-    assert_eq!(budget.limits, limits(&work, 500));
+    assert_eq!(budget.limits, Some(limits(&work, 500)));
     assert_eq!(budget.total_charged, 100);
     let mut expected = receipt;
     expected.usage = Some(ExecutionTokenUsage::Unknown);

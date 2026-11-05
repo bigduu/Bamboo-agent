@@ -58,7 +58,9 @@ pub struct WorkTokenConfiguration {
     pub revision: u64,
     pub user_id: String,
     pub committed_seq: u64,
-    pub limits: WorkTokenLimits,
+    /// Explicit null records semantic usage without enabling Worker quotas.
+    #[serde(deserialize_with = "required_nullable_limits")]
+    pub limits: Option<WorkTokenLimits>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,7 +137,8 @@ pub enum WorkTokenSubmission {
 #[serde(deny_unknown_fields)]
 pub struct WorkTokenBudget {
     pub revision: u64,
-    pub limits: WorkTokenLimits,
+    #[serde(deserialize_with = "required_nullable_limits")]
+    pub limits: Option<WorkTokenLimits>,
     pub current_utc_day: Option<u64>,
     pub last_reservation_ms: Option<u64>,
     pub total_charged: u64,
@@ -286,7 +289,19 @@ fn charge(record: &WorkTokenReservation) -> Result<u64> {
         }
     }
 }
-fn limits_valid(limits: &WorkTokenLimits, snapshot: &Snapshot) -> Result<()> {
+fn required_nullable_limits<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<WorkTokenLimits>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::deserialize(deserializer)
+}
+
+fn limits_valid(limits: &Option<WorkTokenLimits>, snapshot: &Snapshot) -> Result<()> {
+    let Some(limits) = limits else {
+        return Ok(());
+    };
     if limits.work_tokens.is_empty()
         || limits.work_tokens.len() > 64
         || !(1..=MAX_LIMIT).contains(&limits.utc_day_tokens)
@@ -364,6 +379,15 @@ pub(crate) fn validate(snapshot: &Snapshot) -> Result<()> {
     let mut works = BTreeMap::<String, u64>::new();
     for (id, record) in &budget.reservations {
         valid_request(&record.request)?;
+        if snapshot
+            .tickets
+            .get(&record.request.work_id)
+            .is_none_or(|work| work.kind != TicketKind::Work)
+            || snapshot.project.links.get(&record.request.work_id)
+                != Some(&record.request.project_id)
+        {
+            return Err(invalid("Work token receipt lost its Work/Project identity"));
+        }
         if record.over_cap_usage.is_some_and(|usage| {
             !usage.exceeds(&record.request)
                 || matches!(record.usage, Some(ExecutionTokenUsage::Known { .. }))
@@ -396,14 +420,15 @@ pub(crate) fn validate(snapshot: &Snapshot) -> Result<()> {
     if total != budget.total_charged
         || daily != budget.daily_charged
         || works != budget.work_charged
-        || total > budget.limits.total_tokens
-        || daily > budget.limits.utc_day_tokens
-        || works.iter().any(|(work, used)| {
-            budget
-                .limits
-                .work_tokens
-                .get(work)
-                .is_none_or(|limit| used > limit)
+        || budget.limits.as_ref().is_some_and(|limits| {
+            total > limits.total_tokens
+                || daily > limits.utc_day_tokens
+                || works.iter().any(|(work, used)| {
+                    limits
+                        .work_tokens
+                        .get(work)
+                        .is_none_or(|limit| used > limit)
+                })
         })
         || budget.last_reservation_ms.map(|ms| ms / DAY_MS) != budget.current_utc_day
     {
@@ -423,7 +448,7 @@ impl TicketService {
         expected_revision: u64,
         limits: WorkTokenLimits,
     ) -> Result<u64> {
-        self.configure_work_token_budget_inner(authority, None, expected_revision, limits)
+        self.configure_work_token_budget_inner(authority, None, expected_revision, Some(limits))
             .map(|configuration| configuration.revision)
     }
 
@@ -442,6 +467,24 @@ impl TicketService {
             authority,
             Some(authority_epoch),
             expected_revision,
+            Some(limits),
+        )
+    }
+
+    /// Explicit owner choice for semantic accounting with optional quotas.
+    /// Null retains the original ledger and leaves Native Worker usage on its
+    /// existing Session path; it grants no execution or model authority.
+    pub fn configure_work_token_accounting_at_epoch(
+        &self,
+        authority: &Authority,
+        authority_epoch: u64,
+        expected_revision: u64,
+        limits: Option<WorkTokenLimits>,
+    ) -> Result<WorkTokenConfiguration> {
+        self.configure_work_token_budget_inner(
+            authority,
+            Some(authority_epoch),
+            expected_revision,
             limits,
         )
     }
@@ -451,7 +494,7 @@ impl TicketService {
         authority: &Authority,
         authority_epoch: Option<u64>,
         expected_revision: u64,
-        limits: WorkTokenLimits,
+        limits: Option<WorkTokenLimits>,
     ) -> Result<WorkTokenConfiguration> {
         let mut store = self.inner.lock().expect("store mutex");
         let snapshot = &store
@@ -638,30 +681,26 @@ impl TicketService {
             .get(&request.work_id)
             .copied()
             .unwrap_or(0);
-        if budget
-            .limits
-            .work_tokens
-            .get(&request.work_id)
-            .is_none_or(|limit| tokens > limit.saturating_sub(used))
-        {
-            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Work));
-        }
         let day = now_ms / DAY_MS;
         let daily = if Some(day) == budget.current_utc_day {
             budget.daily_charged
         } else {
             0
         };
-        if tokens > budget.limits.utc_day_tokens.saturating_sub(daily) {
-            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Daily));
-        }
-        if tokens
-            > budget
-                .limits
-                .total_tokens
-                .saturating_sub(budget.total_charged)
-        {
-            return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Total));
+        if let Some(limits) = &budget.limits {
+            if limits
+                .work_tokens
+                .get(&request.work_id)
+                .is_none_or(|limit| tokens > limit.saturating_sub(used))
+            {
+                return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Work));
+            }
+            if tokens > limits.utc_day_tokens.saturating_sub(daily) {
+                return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Daily));
+            }
+            if tokens > limits.total_tokens.saturating_sub(budget.total_charged) {
+                return Ok(WorkTokenSubmission::Blocked(WorkTokenBlock::Total));
+            }
         }
         let record = WorkTokenReservation {
             request: request.clone(),
