@@ -9,6 +9,7 @@ use super::BrowserError;
 const CLOSE_PENDING: &str = ".bamboo-profile-close-pending";
 pub(super) const LAUNCH_ACTIVE: &str = ".bamboo-profile-launch-active-v1";
 const LAUNCH_MAGIC: &str = "BAMBOO_BROWSER_LAUNCH_V1\n";
+const CLOSED_MAGIC: &str = "BAMBOO_BROWSER_CLOSED_V1\n";
 const WRITER_EXIT_UNCONFIRMED: &str = ".bamboo-profile-writer-exit-unconfirmed";
 const LEASES: &str = ".bamboo-profile-leases";
 const RESET_GATE: &str = ".bamboo-profile-reset.lock";
@@ -61,7 +62,11 @@ pub(super) fn acquire_chat(root: &Path, session_id: &str) -> Result<ChatLease, B
 }
 
 pub(super) fn acquire_shared(root: &Path) -> Result<Lease, BrowserError> {
-    acquire_key(root, &shared_key())
+    acquire_key(root, &shared_key(), false)
+}
+
+pub(super) fn acquire_recoverable_shared(root: &Path) -> Result<Lease, BrowserError> {
+    acquire_key(root, &shared_key(), true)
 }
 
 pub(super) fn shared_key() -> String {
@@ -170,55 +175,115 @@ impl Lease {
     }
 
     pub(super) fn finish_close(&self) -> Result<(), BrowserError> {
-        // Only the owner that created this launch may remove its fence. This
-        // method is called after the native close/group barrier, never by a
-        // fresh opener, reset, Drop of an unused lease, or a PID-based probe.
-        match std::fs::symlink_metadata(self.path.join(LAUNCH_ACTIVE)) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(unavailable()),
-            Ok(metadata) => {
-                use std::io::Read;
-                let generation = self.launch_generation.as_ref().ok_or_else(unavailable)?;
-                if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.len() > 128
-                {
-                    return Err(unavailable());
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-                    if metadata.uid() != unsafe { libc::geteuid() }
-                        || metadata.permissions().mode() & 0o777 != 0o600
-                    {
-                        return Err(unavailable());
-                    }
-                }
-                let mut options = std::fs::OpenOptions::new();
-                options.read(true);
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::OpenOptionsExt;
-                    options.custom_flags(libc::O_NOFOLLOW);
-                }
-                let mut bytes = Vec::new();
-                options
-                    .open(self.path.join(LAUNCH_ACTIVE))
-                    .map_err(|_| unavailable())?
-                    .take(129)
-                    .read_to_end(&mut bytes)
-                    .map_err(|_| unavailable())?;
-                if bytes != format!("{LAUNCH_MAGIC}{generation}\n").as_bytes() {
-                    return Err(unavailable());
-                }
-                std::fs::remove_file(self.path.join(LAUNCH_ACTIVE)).map_err(|_| unavailable())?;
+        // Called by the launch owner after its native close/group barrier.
+        let marker = read_launch_marker(&self.path)?;
+        if let Some(marker) = &marker {
+            let generation = self.launch_generation.as_ref().ok_or_else(unavailable)?;
+            if marker != &format!("{LAUNCH_MAGIC}{generation}\n")
+                && !closed_launch(marker).is_some_and(|(closed, _)| closed == generation)
+            {
+                return Err(unavailable());
             }
         }
-        match std::fs::remove_file(self.path.join(CLOSE_PENDING)) {
-            Ok(()) => Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(unavailable()),
-        }?;
-        sync_directory(&self.path)
+        clear_confirmed_close(&self.path, marker.is_some())
     }
+}
+
+fn read_launch_marker(path: &Path) -> Result<Option<String>, BrowserError> {
+    use std::io::Read;
+    #[cfg(not(unix))]
+    match std::fs::symlink_metadata(path.join(LAUNCH_ACTIVE)) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {}
+        _ => return Err(unavailable()),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let marker = match options.open(path.join(LAUNCH_ACTIVE)) {
+        Ok(marker) => marker,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(unavailable()),
+    };
+    let metadata = marker.metadata().map_err(|_| unavailable())?;
+    if !metadata.is_file() || metadata.len() > 128 {
+        return Err(unavailable());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o777 != 0o600
+            || metadata.nlink() != 1
+        {
+            return Err(unavailable());
+        }
+    }
+    let mut contents = String::new();
+    marker
+        .take(129)
+        .read_to_string(&mut contents)
+        .map_err(|_| unavailable())?;
+    if contents.len() > 128 {
+        return Err(unavailable());
+    }
+    Ok(Some(contents))
+}
+
+fn closed_launch(marker: &str) -> Option<(&str, i32)> {
+    let (generation, evidence) = marker.strip_prefix(LAUNCH_MAGIC)?.split_once('\n')?;
+    let id = uuid::Uuid::parse_str(generation).ok()?;
+    if id.get_version_num() != 4
+        || id.get_variant() != uuid::Variant::RFC4122
+        || id.hyphenated().to_string() != generation
+    {
+        return None;
+    }
+    let group_text = evidence.strip_prefix(CLOSED_MAGIC)?.strip_suffix('\n')?;
+    let group = group_text.parse::<i32>().ok()?;
+    (group > 1 && group.to_string() == group_text).then_some((generation, group))
+}
+
+fn clear_confirmed_close(path: &Path, has_launch: bool) -> Result<(), BrowserError> {
+    match std::fs::remove_file(path.join(CLOSE_PENDING)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(unavailable()),
+    }?;
+    if has_launch {
+        // Keep the launch evidence replayable until pending-close removal is
+        // durable. A second crash between the unlinks can retry recovery.
+        sync_directory(path)?;
+        std::fs::remove_file(path.join(LAUNCH_ACTIVE)).map_err(|_| unavailable())?;
+    }
+    sync_directory(path)
+}
+
+fn recover_closed_launch(path: &Path) -> Result<(), BrowserError> {
+    // These checks run under the stable reset/account locks, before preparing
+    // or opening storage. Explicit quarantine always takes precedence.
+    if !matches!(
+        std::fs::symlink_metadata(path.join(WRITER_EXIT_UNCONFIRMED)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return Ok(());
+    }
+    let Ok(Some(marker)) = read_launch_marker(path) else {
+        return Ok(());
+    };
+    let Some((_, group)) = closed_launch(&marker) else {
+        return Ok(());
+    };
+    // The prior host durably recorded a successful close of the captured
+    // native writer. Independently require its managed group to be gone.
+    if super::managed_group_exit_confirmed(true, Some(group)) {
+        clear_confirmed_close(path, true)?;
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -476,10 +541,10 @@ pub(super) fn acquire(root: &Path, session_id: &str) -> Result<Lease, BrowserErr
     if session_id.contains('\0') {
         return Err(unavailable());
     }
-    acquire_key(root, &key(session_id))
+    acquire_key(root, &key(session_id), false)
 }
 
-fn acquire_key(root: &Path, profile_key: &str) -> Result<Lease, BrowserError> {
+fn acquire_key(root: &Path, profile_key: &str, recover: bool) -> Result<Lease, BrowserError> {
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let reset_gate = admission_gate(&root, false)?;
     let lifecycle_lock = lifecycle_lock_key(&root, profile_key)?;
@@ -488,6 +553,9 @@ fn acquire_key(root: &Path, profile_key: &str) -> Result<Lease, BrowserError> {
     }
     let path = directory_key(&root, profile_key)?;
     let lock = lock_file(&path.join(".bamboo-profile.lock"))?;
+    if recover {
+        recover_closed_launch(&path)?;
+    }
     reject_unconfirmed_writers(&path)?;
     match std::fs::symlink_metadata(path.join(CLOSE_PENDING)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -651,9 +719,74 @@ mod tests {
         );
         drop(lease); // Models process-local lock loss, not a clean writer exit.
         assert!(acquire_shared(&root).is_err());
+        assert!(acquire_recoverable_shared(&root).is_err());
         assert!(remove_key_notifying(&root, &shared_key(), || panic!("not retired")).is_err());
         assert!(begin_reset(&root).is_err());
         assert!(path.join(LAUNCH_ACTIVE).is_file());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_recovers_a_recorded_close_only_after_its_group_exits() {
+        use std::os::unix::process::CommandExt;
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let mut lease = acquire_shared(&root).unwrap();
+        let path = lease.path.clone();
+        let generation = lease.begin_launch().unwrap().to_owned();
+        lease.begin_close().unwrap();
+        let marker = path.join(LAUNCH_ACTIVE);
+        let mut old_host = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let evidence = format!(
+            "{LAUNCH_MAGIC}{generation}\n{CLOSED_MAGIC}{}\n",
+            old_host.id()
+        );
+        std::fs::write(&marker, &evidence).unwrap();
+        drop(lease);
+
+        let while_host_alive = acquire_recoverable_shared(&root);
+        old_host.kill().unwrap();
+        old_host.wait().unwrap();
+        assert!(while_host_alive.is_err());
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), evidence);
+        assert!(begin_reset(&root).is_err());
+
+        // The durable quarantine is stronger than a recorded close.
+        let quarantine = path.join(WRITER_EXIT_UNCONFIRMED);
+        std::fs::File::create(&quarantine).unwrap();
+        assert!(acquire_recoverable_shared(&root).is_err());
+        std::fs::remove_file(quarantine).unwrap();
+
+        let recovered = acquire_recoverable_shared(&root).unwrap();
+        assert!(!marker.exists());
+        assert!(!path.join(CLOSE_PENDING).exists());
+        drop(recovered);
+        assert!(acquire_shared(&root).is_ok());
+    }
+
+    #[test]
+    fn incomplete_or_invalid_close_evidence_keeps_the_launch_fence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("profiles");
+        let mut lease = acquire_shared(&root).unwrap();
+        let generation = lease.begin_launch().unwrap().to_owned();
+        let marker = lease.path.join(LAUNCH_ACTIVE);
+        drop(lease);
+        for suffix in [
+            "BAMBOO_BROWSER_CLOSED_V1\n123",
+            "BAMBOO_BROWSER_CLOSED_V1\n-1\n",
+            "BAMBOO_BROWSER_CLOSED_V1\n00123\n",
+            "BAMBOO_BROWSER_CLOSED_V1\n123\nextra",
+        ] {
+            let evidence = format!("{LAUNCH_MAGIC}{generation}\n{suffix}");
+            std::fs::write(&marker, &evidence).unwrap();
+            assert!(acquire_recoverable_shared(&root).is_err());
+            assert_eq!(std::fs::read_to_string(&marker).unwrap(), evidence);
+        }
     }
 
     #[test]
