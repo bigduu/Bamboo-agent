@@ -862,7 +862,6 @@ impl Tool for SessionControlTool {
             && args["action"] != "scope"
             && args["action"] != "directory"
             && args["action"] != "observe_run"
-            && args["action"] != "wait_run"
         {
             return Err(ToolError::Execution(
                 "session_control is unavailable in Plan mode".into(),

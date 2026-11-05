@@ -120,7 +120,14 @@ async fn supervisor_wait_wakes_only_after_the_observed_run_finalizes() {
             .unwrap()["run_id"],
         run_id
     );
-    let mut waiter = Box::pin(invoke_in_mode(&fixture, wait, true));
+    let plan_attempt = invoke_in_mode(&fixture, wait.clone(), true).await;
+    assert!(
+        matches!(plan_attempt, Err(ToolError::Execution(ref error)) if error.contains("Plan mode")),
+        "{plan_attempt:?}"
+    );
+    assert!(!token.is_cancelled());
+
+    let mut waiter = Box::pin(invoke(&fixture, wait));
     assert!(tokio::time::timeout(Duration::from_millis(50), &mut waiter)
         .await
         .is_err());
