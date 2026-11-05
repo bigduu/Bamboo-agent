@@ -19,11 +19,11 @@ pub async fn wait_for_finalization(signal: impl Future<Output = ()>) -> bool {
 /// can become verifiable independently, so recheck only that pending proof.
 pub async fn read_when_verified<E, F, Read>(
     mut read: F,
-    mut signal: Option<impl Future<Output = ()>>,
+    mut signal: Option<impl Future<Output = ()> + Send>,
 ) -> Result<Option<ObserverSupervisedRootOutcome>, E>
 where
-    F: FnMut() -> Read,
-    Read: Future<Output = Result<ObserverRootOutcomeRead, E>>,
+    F: FnMut() -> Read + Send,
+    Read: Future<Output = Result<ObserverRootOutcomeRead, E>> + Send,
 {
     let mut ack_delay = FIRST_ACK_RECHECK;
     loop {

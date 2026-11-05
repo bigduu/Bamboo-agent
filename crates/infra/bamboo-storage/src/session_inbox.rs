@@ -1051,7 +1051,7 @@ impl FileSessionInbox {
         };
         let guarded = GuardedSupervisorRoot::from_sessions(&authority.source, &authority.target)
             .ok_or_else(|| invalid("Root outcome authority is not canonical"))?;
-        let mut inputs = fact
+        let inputs: Vec<_> = fact
             .inputs
             .iter()
             .filter(|input| {
@@ -1061,8 +1061,9 @@ impl FileSessionInbox {
                         && guarded.owns_recorded_origin(origin, &input.receipt_id)
                 })
             })
-            .peekable();
-        if inputs.peek().is_none() {
+            .cloned()
+            .collect();
+        if inputs.is_empty() {
             return Ok(Read::CaughtUp);
         }
         let (inbox, filesystem) = self
@@ -1076,7 +1077,7 @@ impl FileSessionInbox {
             .await?;
         let mut invalid_ack = None;
         let mut pending_ack = false;
-        for input in inputs {
+        for input in &inputs {
             match tokio::fs::symlink_metadata(Self::admitted_path(&inbox, &input.receipt_id)).await
             {
                 Err(error) if error.kind() == ErrorKind::NotFound => {

@@ -1138,7 +1138,16 @@ async fn run_native_source(
 ) -> (String, String, u64, chrono::DateTime<Utc>) {
     use bamboo_domain::{ActorActivationStatus, ActorDirectoryPort};
 
-    let target = managed_target(&f.state, &f.reference, ROOT_A).await;
+    let target = f
+        .state
+        .storage
+        .list_supervisor_current_user_targets(&f.reference, None, None, 20)
+        .await
+        .unwrap()
+        .targets
+        .into_iter()
+        .find(|target| target.session_id == ROOT_A)
+        .expect("the real current-user directory must contain the original Root");
     let target_created_at = target.created_at;
     let operation = format!("outcome-1053-operation-{calls}");
     let receipt = admit_native_source(f, &target, &operation, text).await;
