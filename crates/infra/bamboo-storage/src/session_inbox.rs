@@ -1846,22 +1846,19 @@ impl FileSessionInbox {
 
     fn process_lock(&self, dir: &Path) -> Arc<AsyncMutex<()>> {
         let key = dir.to_path_buf();
-        let lock = {
-            let mut locks = self
-                .operation_locks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            locks.retain(|_, lock| lock.strong_count() > 0);
-            match locks.get(&key).and_then(Weak::upgrade) {
-                Some(lock) => lock,
-                None => {
-                    let lock = Arc::new(AsyncMutex::new(()));
-                    locks.insert(key, Arc::downgrade(&lock));
-                    lock
-                }
+        let mut locks = self
+            .operation_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        match locks.get(&key).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(AsyncMutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
             }
-        };
-        lock
+        }
     }
 
     async fn lock_process(&self, dir: &Path) -> OwnedMutexGuard<()> {

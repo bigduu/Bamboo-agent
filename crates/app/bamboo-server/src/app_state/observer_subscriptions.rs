@@ -1,4 +1,4 @@
-//! One bounded Host pass on the existing wake tick. No model polling or queue.
+//! Native Host I/O for Observer subscriptions and managed Session notices.
 use super::AppState;
 use bamboo_agent_core::tools::ToolCtx;
 use bamboo_domain::{

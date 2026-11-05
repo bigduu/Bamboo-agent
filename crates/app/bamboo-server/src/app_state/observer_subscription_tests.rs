@@ -1695,23 +1695,32 @@ pub(in crate::app_state) async fn exercise_material_root_notifications() {
         reference,
     } = f;
     drop(state);
-    let restarted = host(home.path(), probe.clone()).await;
+    let state = host(home.path(), probe.clone()).await;
+    let restarted = Fixture {
+        home,
+        state,
+        probe,
+        reference,
+    };
+    settle_material_notices(&restarted).await;
     for _ in 0..12 {
         restarted
+            .state
             .observer_subscriptions
             .material_tick()
             .await
             .unwrap();
     }
     assert!(
-        ManagedRootNotificationIo::sources(restarted.observer_subscriptions.as_ref())
+        ManagedRootNotificationIo::sources(restarted.state.observer_subscriptions.as_ref())
             .await
             .is_empty()
     );
-    assert_eq!(probe.parent_calls.load(Ordering::SeqCst), 5);
+    assert_eq!(restarted.probe.parent_calls.load(Ordering::SeqCst), 5);
     assert!(restarted
+        .state
         .session_activation_router
-        .current_run_id(&reference.session_id)
+        .current_run_id(&restarted.reference.session_id)
         .await
         .is_none());
 }
