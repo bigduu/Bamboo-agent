@@ -171,7 +171,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2603 keeps Work-update union/authority cases in default Server tools.
 // The direct jsonschema dev edge reuses the locked existing validator; no
 // feature declaration, additive context or twenty-case selection changes.
-const FEATURE_SOURCE_SHA256 = "25140d96c8fd719c64255cc2ae37892a89c04853f38ccbdaa6ed890e5c66ce4b";
+// #2604 exposes the existing native wait through the compact facade. Its
+// normalization/Host/permission regressions retain the default package owners;
+// all four additive contexts and their twenty explicit cases are unchanged.
+const FEATURE_SOURCE_SHA256 = "1a17265c899dbe51d924a42e7a9d4705a0634e6ef84a9fc809a59bb70ce23e3d";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

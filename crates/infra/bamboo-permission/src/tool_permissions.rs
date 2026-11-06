@@ -1465,6 +1465,16 @@ fn subagent_permission_action(args: &Value) -> Result<Option<String>, Permission
         "chat" => "create",
         "inspect" => return Ok(None),
         "ask_parent" if !has_target => return Ok(None),
+        "wait"
+            if ["message", "model", "reasoning_effort"]
+                .iter()
+                .all(|field| {
+                    args.get(field)
+                        .is_none_or(|value| value.is_null() || value.as_str() == Some(""))
+                }) =>
+        {
+            "wait"
+        }
         "control" if has_target => {
             match args.get("message").and_then(Value::as_str).map(str::trim) {
                 Some("cancel") => "cancel",
@@ -3169,6 +3179,27 @@ mod tests {
                     check_permissions("SubAgent", &args).unwrap().is_none(),
                     "{args} must not require permission to create a child"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn subagent_compact_wait_preserves_legacy_wait_permission_without_launch_routing() {
+        for args in [
+            json!({"intent":"wait"}),
+            json!({"intent":"wait", "target":"child"}),
+        ] {
+            assert_eq!(
+                subagent_permission_action(&args).unwrap().as_deref(),
+                Some("wait")
+            );
+            assert!(check_permissions("SubAgent", &args).unwrap().is_none());
+        }
+        for field in ["message", "model", "reasoning_effort", "role", "reply_to"] {
+            for value in [json!("nonempty"), json!(true)] {
+                let mut args = json!({"intent":"wait"});
+                args[field] = value;
+                assert!(check_permissions("SubAgent", &args).is_err(), "{args}");
             }
         }
     }
