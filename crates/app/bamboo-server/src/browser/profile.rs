@@ -22,7 +22,14 @@ thread_local! {
     static DIRECTORY_SYNC_FAILURE: std::cell::RefCell<Option<PathBuf>> = const {
         std::cell::RefCell::new(None)
     };
+    static REMOVAL_BARRIER_PROBE: std::cell::RefCell<Option<(PathBuf, Box<dyn FnOnce()>)>> = const {
+        std::cell::RefCell::new(None)
+    };
 }
+
+#[cfg(all(test, unix))]
+#[path = "profile/removal_fork_tests.rs"]
+mod removal_fork_tests;
 
 pub(super) struct Lease {
     pub(super) path: PathBuf,
@@ -300,6 +307,17 @@ fn recover_closed_launch(path: &Path) -> Result<(), BrowserError> {
 #[cfg(unix)]
 pub(super) fn sync_directory(path: &Path) -> Result<(), BrowserError> {
     use std::os::unix::fs::OpenOptionsExt;
+    #[cfg(test)]
+    if let Some(probe) = REMOVAL_BARRIER_PROBE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.as_ref().is_some_and(|(target, _)| target == path) {
+            slot.take().map(|(_, probe)| probe)
+        } else {
+            None
+        }
+    }) {
+        probe();
+    }
     #[cfg(test)]
     if DIRECTORY_SYNC_FAILURE.with(|target| target.borrow().as_deref() == Some(path)) {
         return Err(unavailable());
@@ -607,6 +625,18 @@ fn valid_key(profile_key: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+// A fork may retain this transient owner's open file description. Closing
+// only our descriptor would keep its flock alive until that unrelated child
+// exits/execs. End the removal scope's lock on every return, just as Lease
+// explicitly ends its own locks; never unlink the shared stable inode.
+struct RemovalLockRelease<'a>(&'a std::fs::File);
+
+impl Drop for RemovalLockRelease<'_> {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(self.0);
+    }
+}
+
 fn remove_key_notifying(
     root: &Path,
     profile_key: &str,
@@ -619,6 +649,7 @@ fn remove_key_notifying(
     let root = root_directory(root, true)?.ok_or_else(unavailable)?;
     let path = root.join(profile_key);
     let lifecycle_lock = lifecycle_lock_key(&root, profile_key)?;
+    let _release = RemovalLockRelease(&lifecycle_lock);
     // Hold the original inode before observing absence or writing the marker.
     // Existing/opening owners and preopened descriptors must still contend.
     let present = match std::fs::symlink_metadata(&path) {
