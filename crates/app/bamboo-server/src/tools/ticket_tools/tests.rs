@@ -4,6 +4,8 @@ use bamboo_config::Config;
 use bamboo_domain::{Session, SessionAuthorityIdentity, Storage, DEFAULT_SUPERVISOR_SESSION_ID};
 use bamboo_storage::SessionStoreV2;
 use tokio::sync::RwLock;
+#[path = "tests/variants.rs"]
+mod variants;
 
 struct Fixture {
     _root: tempfile::TempDir,

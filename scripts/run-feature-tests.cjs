@@ -168,6 +168,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2599 keeps paged-file codec, scoped I/O and Native Read/Task cases in
 // the existing default Tickets/Engine/Agent owners. Additive contexts and
 // their twenty explicit cases are unchanged; no second test producer.
+// #2603 keeps Work-update union/authority cases in default Server tools.
+// The direct jsonschema dev edge reuses the locked existing validator; no
+// feature declaration, additive context or twenty-case selection changes.
 const FEATURE_SOURCE_SHA256 = "25140d96c8fd719c64255cc2ae37892a89c04853f38ccbdaa6ed890e5c66ce4b";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
