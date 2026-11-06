@@ -12,6 +12,20 @@ use bamboo_agent_core::storage::Storage;
 use bamboo_memory::memory_store::{resolve_jiandu_data_root, BAMBOO_JIANDU_DATA_DIR_ENV};
 use bamboo_plugin_protocol::{NoopToolEventPublisher, ToolEventPublisher};
 
+async fn init_account_event_sink(
+    events_dir: PathBuf,
+) -> std::io::Result<Arc<bamboo_engine::events::AccountEventSink>> {
+    // Recovery takes the same blocking file lock as journal publishers. Keep
+    // their runtime available while the complete constructor waits on it.
+    tokio::task::spawn_blocking(move || bamboo_engine::events::AccountEventSink::new(events_dir))
+        .await
+        .map_err(std::io::Error::other)?
+}
+
+#[cfg(test)]
+#[path = "account_journal_tests.rs"]
+mod account_journal_tests;
+
 fn default_app_state_memory_store(
     bamboo_home_dir: &std::path::Path,
 ) -> Result<bamboo_memory::memory_store::MemoryStore, AppError> {
@@ -601,7 +615,8 @@ impl AppState {
         // Account-scoped durable change feed. It is initialized before the
         // Project tool surface so non-HTTP Project mutations publish the same
         // replayable events as the REST API.
-        let account_sink = bamboo_engine::events::AccountEventSink::new(data_dir.join("events"))
+        let account_sink = init_account_event_sink(data_dir.join("events"))
+            .await
             .map_err(|e| {
                 AppError::InternalError(anyhow::anyhow!(
                     "failed to initialize account change-feed journal: {e}"
