@@ -162,7 +162,10 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // storage/packages-0 and metadata-service/server-other cases. No feature
 // declaration, module gate, additive context or selected additive case changes;
 // the existing four contexts still own the same twenty feature-only cases.
-const FEATURE_SOURCE_SHA256 = "05a44d1ecc06833e69d1c08746e3fe2580c55f0a7d8a37c6f636ce5f9c047b30";
+// #2598 preserves all four additive contexts and twenty feature-only cases.
+// Scoped path controls and default-shaped Host file regressions remain with
+// the existing default Tickets/Engine owners; no new test producer.
+const FEATURE_SOURCE_SHA256 = "9d64234b451a4feae51c66fa3e82c18b41d234e5b2a450ec63204ea2d78315cc";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

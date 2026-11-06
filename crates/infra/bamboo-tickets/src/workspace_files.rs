@@ -290,17 +290,33 @@ fn file_root<'a>(
     workspace: &'a ExecutionWorkspace,
     path: &Path,
 ) -> Result<&'a Path> {
+    let worktree = Path::new(&workspace.worktree);
+    let relative = path
+        .strip_prefix(worktree)
+        .map_err(|_| Error::ScopeDenied("file outside Assignment worktree".into()))?;
+    let is_control_name = |name: &std::ffi::OsStr| {
+        name.to_str().is_some_and(|name| {
+            name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".bamboo")
+        })
+    };
     if !path.is_absolute()
         || path
             .components()
             .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+        // The frozen worktree may live under the Host's .bamboo/worktrees.
+        // Protect controls relative to that worktree, not the narrower write
+        // root: declaring a nested control directory must not authorize it.
+        || worktree.file_name().is_some_and(is_control_name)
+        || relative
+            .components()
+            .any(|c| matches!(c, Component::Normal(name) if is_control_name(name)))
         || path.components().any(|c| {
             matches!(c, Component::Normal(n) if n.to_str().is_some_and(|name|
-                name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case(".bamboo")))
+                name.eq_ignore_ascii_case(".git")))
         })
     {
         return Err(Error::ScopeDenied(
-            "file path must be absolute without traversal, .git or .bamboo control directories"
+            "file path must be absolute without traversal, .git or workspace .bamboo controls"
                 .into(),
         ));
     }

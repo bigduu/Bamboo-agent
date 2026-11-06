@@ -601,8 +601,10 @@ mod tests {
             Contract, ExecutionWorkspace, RuntimeReceipt, ScopeBinding, TicketKind,
         };
         let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("worker");
-        std::fs::create_dir(&workspace).unwrap();
+        // Match the default Host-managed worktree location. Native permission,
+        // resource ownership and scoped file I/O must work through this ancestor.
+        let workspace = dir.path().join(".bamboo/worktrees/worker");
+        std::fs::create_dir_all(&workspace).unwrap();
         let workspace = workspace.canonicalize().unwrap();
         let path = workspace.to_string_lossy().into_owned();
         let binding = ScopeBinding {
