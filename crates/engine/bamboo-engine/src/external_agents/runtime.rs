@@ -147,6 +147,18 @@ impl CompositeExternalChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for CompositeExternalChildRunner {
+    async fn owns_current_native_work(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        self.supports_native_ticket_budget()
+            && self.runners[0]
+                .owns_current_native_work(session_id, run_id, child_birth)
+                .await
+    }
+
     fn native_task_start(
         &self,
         session_id: &str,

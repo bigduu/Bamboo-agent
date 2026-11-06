@@ -72,7 +72,16 @@ async fn test_models_endpoint_method_not_allowed() {
 
     let resp = test::call_service(&app, req).await;
 
-    // Actix-web returns 404 when route doesn't match the method
-    // This is expected behavior - the route exists but only for GET
-    assert_eq!(resp.status(), actix_web::http::StatusCode::NOT_FOUND);
+    // The GET-only route rejects POST and advertises its allowed method.
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::METHOD_NOT_ALLOWED
+    );
+    assert_eq!(
+        resp.headers()
+            .get(actix_web::http::header::ALLOW)
+            .expect("method rejection must advertise the allowed method")
+            .as_bytes(),
+        b"GET"
+    );
 }

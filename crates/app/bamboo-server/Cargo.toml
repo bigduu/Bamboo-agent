@@ -64,7 +64,7 @@ bamboo-subagent = { path = "../../infra/bamboo-subagent" }
 # HTTP/2. Actix 4's `http2` feature still resolves vulnerable `h2 0.3`; Bamboo's
 # public WSS contract uses HTTP/1.1 Upgrade and is served by the explicit H1
 # builder in `server/h1.rs` (#849).
-actix-web = { version = "4", default-features = false, features = [
+actix-web = { version = "4.18.2", default-features = false, features = [
     "macros",
     "compress-brotli",
     "compress-gzip",
@@ -74,12 +74,12 @@ actix-web = { version = "4", default-features = false, features = [
     "compat",
     "ws",
 ] }
-actix-http = { version = "3", default-features = false, features = ["rustls-0_23"] }
+actix-http = { version = "3.20.3", default-features = false, features = ["rustls-0_23"] }
 actix-server = "2"
 actix-service = "2"
 socket2 = "0.6"
 actix-cors = "0.7"
-actix-files = "0.7"
+actix-files = "0.7.4"
 # v2-P1 (#181): the `GET /v2/stream` unified WebSocket multiplex. `actix-ws`
 # gives a non-actor WS upgrade (`actix_ws::handle`) returning an owned
 # `Session` + `MessageStream` we drive from a spawned task. 0.3 targets the
