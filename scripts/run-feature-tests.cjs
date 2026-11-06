@@ -162,7 +162,24 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // storage/packages-0 and metadata-service/server-other cases. No feature
 // declaration, module gate, additive context or selected additive case changes;
 // the existing four contexts still own the same twenty feature-only cases.
-const FEATURE_SOURCE_SHA256 = "05a44d1ecc06833e69d1c08746e3fe2580c55f0a7d8a37c6f636ce5f9c047b30";
+// #2598 preserves all four additive contexts and twenty feature-only cases.
+// Scoped path controls and default-shaped Host file regressions remain with
+// the existing default Tickets/Engine owners; no new test producer.
+// #2599 keeps paged-file codec, scoped I/O and Native Read/Task cases in
+// the existing default Tickets/Engine/Agent owners. Additive contexts and
+// their twenty explicit cases are unchanged; no second test producer.
+// #2603 keeps Work-update union/authority cases in default Server tools.
+// The direct jsonschema dev edge reuses the locked existing validator; no
+// feature declaration, additive context or twenty-case selection changes.
+// #2604 exposes the existing native wait through the compact facade. Its
+// normalization/Host/permission regressions retain the default package owners;
+// all four additive contexts and their twenty explicit cases are unchanged.
+// #2608 keeps removal-scope native fork/barrier regressions in the existing
+// default server-browser owner; all additive contexts and cases are unchanged.
+// #2611 keeps Local Read retry-window and strict Remote whole-read cases in
+// default Engine, plus the >64-page native fixture in its default Agent owner.
+// No feature declaration, additive context or twenty-case selection changes.
+const FEATURE_SOURCE_SHA256 = "1a17265c899dbe51d924a42e7a9d4705a0634e6ef84a9fc809a59bb70ce23e3d";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

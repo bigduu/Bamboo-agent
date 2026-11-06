@@ -1,6 +1,9 @@
 //! Compact Root → direct Child caller; the existing actions remain internal
 //! compatibility routes. This module grants no placement or lifecycle authority.
 
+#[cfg(test)]
+mod wait_tests;
+
 use bamboo_agent_core::tools::{ToolError, ToolOutcome, ToolResult};
 use bamboo_domain::{
     is_matching_session_message, ActorSession, Message, ParentRequest, ReasoningEffort, Session,
@@ -51,6 +54,7 @@ pub(super) enum Projection {
     ParentRequestReply,
     ParentQuestionAsk,
     Control,
+    Wait,
 }
 
 pub(super) struct NormalizedCall {
@@ -66,6 +70,7 @@ enum Intent {
     Inspect,
     Control,
     AskParent,
+    Wait,
 }
 
 #[derive(Deserialize)]
@@ -97,7 +102,7 @@ pub(super) fn parameters_schema() -> Value {
     json!({
         "type": "object", "additionalProperties": false,
         "properties": {
-            "intent": {"type":"string", "enum":["chat","inspect","control","ask_parent"], "description":"Defaults to chat. ask_parent is Child-only and uses message as a bounded clarification question; it suspends until the canonical direct parent replies."},
+            "intent": {"type":"string", "enum":["chat","inspect","control","ask_parent","wait"], "description":"Defaults to chat. wait suspends on a direct child target, or all active children when target is omitted; omit message, role, model and reply_to. ask_parent is Child-only and uses message as a bounded clarification question; it suspends until the canonical direct parent replies."},
             "target": {"type":"string", "description":"Logical Child ActorId returned by this tool. Omit for chat to create a durable child, or inspect to request a tree scoped to this session. Root sees its full tree; an active Child with a Host canonical tree route sees only its owned subtree. The forced permission audit remains Root-only."},
             "role": {"type":"string", "description":"Only chat without target: select a named profile. Defaults include explorer (read-only exploration), implementer (bounded implementation), and reviewer (independent read-only review). Project overrides Global, then the builtin default. Omit for worker; no builtin role is implicitly selected. Invalid or duplicate known catalog entries fail closed. The selected profile freezes its model, prompt, and read-only/tool posture; the child uses only the tools the runtime exposes to the child. Role cannot change an existing target."},
             "model": {"type":"string", "maxLength":256, "description":"Only chat creating a new Worker on the built-in Bamboo runtime, without target, role or reply_to. Use an exact configured provider:model from intent=inspect, message=models. Unavailable and profile-managed routes fail before launch."},
@@ -109,7 +114,7 @@ pub(super) fn parameters_schema() -> Value {
 }
 
 pub(super) fn description() -> &'static str {
-    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. A fresh Worker on the built-in Bamboo runtime with no named profile may select an exact model=provider:model and optional reasoning_effort. Use intent=inspect with message=models to read locally admitted configured references. Creation receipts and overview expose stored model_ref and reasoning_effort. Completed inference requires its own runtime evidence. Do not drop an explicitly requested model after a route rejection. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
+    "Delegate bounded work to a durable child ActorId. Ordinary executing Sessions use it for parallel or context-heavy tasks and handle simple tasks directly. A trusted Supervisor delegates execution, including simple implementation tasks; necessary dedicated read-only acquisition and orchestration remain with the Supervisor. If a suitable authorized worker is unavailable, report the recoverable blocker without self-execution or repeated unchanged delegation. A child uses only the tools and permissions exposed to it by the runtime. With default chat intent, message is the full assignment: omit target to create, include target to correct or continue. New compact children share this Session's selected workspace/worktree; an unavailable or policy-redirected parent workspace blocks creation. Independent Root creation and choosing another checkout require their separate authorized Host route. role=explorer, implementer, reviewer, or a catalog name applies only on creation; omitted role is worker. A fresh Worker on the built-in Bamboo runtime with no named profile may select an exact model=provider:model and optional reasoning_effort. Use intent=inspect with message=models to read locally admitted configured references. Creation receipts and overview expose stored model_ref and reasoning_effort. Completed inference requires its own runtime evidence. Do not drop an explicitly requested model after a route rejection. intent=inspect shows the tree without target (Root full tree; Host-routed Child its owned subtree) or target overview, diagnostics, messages, message, result, or error. Paginate with the same view and the exact unchanged next_cursor in a JSON message; do not decode or edit cursors. Only view=message accepts message_id: it is required on the first page and must match if included on later pages. Omit message_id for view=result. Changed trees reject stale cursors. intent=wait uses target for one direct Child, or omits target to wait for all active children. Omit message, role, model and reply_to. It reuses the native durable wait: each completion resumes this parent while unfinished children remain tracked; already finished children return immediately. Use Work records and result inspection after waking instead of repeated unchanged inspection. intent=control uses target and message=cancel or retry. Children use intent=ask_parent with a bounded question in message. Direct parents answer an exact pending ParentRequest using reply_to and message, omitting target and role; forced permission accepts only approve_once or deny. Host verifies kind, direct-parent lineage, Project, and deadline. Root audit: intent=inspect, message=forced_permission_audit. Runtime handles activation and waiting; never pass physical worker or mailbox ids."
 }
 
 /// Must run before launch-owner classification. Only legacy calls retain the
@@ -213,6 +218,20 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
         return Err(invalid("target must be an exact logical Child ActorId"));
     }
     let (args, projection) = match parsed.intent {
+        Intent::Wait => {
+            if parsed
+                .message
+                .as_deref()
+                .is_some_and(|message| !message.is_empty())
+            {
+                return Err(invalid("wait does not accept a message"));
+            }
+            let mut args = json!({"action":"wait", "wait_for":"all"});
+            if let Some(target) = parsed.target {
+                args["child_session_ids"] = json!([target]);
+            }
+            (args, Projection::Wait)
+        }
         Intent::AskParent => {
             if has_target || has_role {
                 return Err(invalid("ask_parent requires omitted target and role"));
@@ -404,6 +423,18 @@ fn copy_fields(output: &mut Value, input: &Value, fields: &[&str]) {
 fn project(projection: Projection, input: &Value) -> Value {
     let mut output = json!({"actor_id":input["child_session_id"]});
     match projection {
+        Projection::Wait => {
+            // Keep this observation bounded even when the existing native
+            // wait covers many children. Child identities are already owned
+            // by the caller; no transcript or physical runtime is exposed.
+            output = json!({
+                "status": input["status"],
+                "waiting_on": input["waiting_on"].as_u64().unwrap_or(0),
+                "already_terminal_count": input["already_terminal_child_ids"]
+                    .as_array().map_or(0, Vec::len),
+            });
+            copy_fields(&mut output, input, &["wait_for"]);
+        }
         Projection::Models => {
             let providers: Vec<Value> = input["providers"]
                 .as_array()

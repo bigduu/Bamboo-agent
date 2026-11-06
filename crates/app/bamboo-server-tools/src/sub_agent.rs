@@ -1788,6 +1788,15 @@ impl SubAgentTool {
                 child_session_ids,
                 wait_for,
             } => {
+                if compact {
+                    // A compact target is a logical direct child, not an
+                    // arbitrary legacy wait/watchdog identifier. Reuse the
+                    // existing Host ownership check before registering a wait.
+                    for id in child_session_ids.iter().flatten() {
+                        self.sessions.load_child_for_parent(&parent.id, id).await
+                            .map_err(tool_error_from_child_session)?;
+                    }
+                }
                 let policy = wait_for.unwrap_or(ChildWaitPolicy::All);
                 // Default to every currently-active child; honor an explicit
                 // subset when provided. Explicit ids the index POSITIVELY
@@ -2216,7 +2225,7 @@ mod tests {
         assert_eq!(schema["additionalProperties"], false);
         assert_eq!(
             schema["properties"]["intent"]["enum"],
-            json!(["chat", "inspect", "control", "ask_parent"])
+            json!(["chat", "inspect", "control", "ask_parent", "wait"])
         );
         let actual: std::collections::BTreeSet<_> = schema["properties"]
             .as_object()

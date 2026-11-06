@@ -1380,6 +1380,7 @@ dependencies = [
  "governor",
  "hex",
  "http 1.5.0",
+ "jsonschema",
  "libc",
  "mockall",
  "native-tls",
