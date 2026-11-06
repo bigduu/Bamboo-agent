@@ -103,7 +103,7 @@ fn response(body: &Value, probe: &fixture::Probe) -> Option<(Value, &'static str
 }
 
 #[actix_web::test]
-async fn native_read_task_handoff_consumes_three_large_sources_and_survives_restart() {
+async fn native_read_task_handoff_crosses_retry_window_and_survives_restart() {
     let mut f = Fixture::new().await;
     let repo = f.temp.join("repo");
     let workspace = f.temp.join(".bamboo/worktrees/source-audit");
@@ -112,7 +112,7 @@ async fn native_read_task_handoff_consumes_three_large_sources_and_survives_rest
     git(&repo, &["init", "-b", "main"]);
     let mut files = Vec::new();
     for (name, target) in [
-        ("ChatPane.tsx", 89032),
+        ("ChatPane.tsx", 600000),
         ("ChatPane.test.tsx", 158590),
         ("new-chat-worktree.spec.ts", 15731),
     ] {
@@ -195,7 +195,7 @@ async fn native_read_task_handoff_consumes_three_large_sources_and_survives_rest
     .unwrap();
     let state = f.probe.scenario.lock().unwrap().clone();
     assert_eq!(state["file_index"], 3, "all pages reached verified EOF");
-    assert!(f.probe.input_checks.load(Ordering::SeqCst) > 20);
+    assert!(f.probe.input_checks.load(Ordering::SeqCst) > 64);
     let row = &view["data"][0];
     assert_eq!(row["assignments"][0]["process_stopped"], true);
     let steps = row["assignments"][0]["plan"]["steps"].as_array().unwrap();
