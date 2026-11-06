@@ -7,6 +7,8 @@ mod fixture;
 use fixture::{command, post, Fixture};
 use serde_json::json;
 use std::{path::Path, process::Command, sync::atomic::Ordering, time::Duration};
+#[path = "ticket_runtime_files/read_pages.rs"]
+mod read_pages;
 
 #[actix_web::test]
 async fn inspect_uses_fresh_connection_after_idle_peer_close_without_retry() {

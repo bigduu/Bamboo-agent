@@ -80,6 +80,15 @@ struct FileRequest {
 #[serde(deny_unknown_fields)]
 struct ReadArgs {
     file_path: String,
+    #[serde(default)]
+    offset_bytes: u64,
+    #[serde(default = "default_read_page_bytes")]
+    max_bytes: usize,
+    #[serde(default)]
+    expected_sha256: Option<String>,
+}
+fn default_read_page_bytes() -> usize {
+    12000
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -92,8 +101,11 @@ fn operation(request: &FileRequest) -> Result<FileOperation> {
     match request.tool.as_str() {
         "Read" if request.expected_sha256.is_none() => {
             let args: ReadArgs = serde_json::from_value(request.arguments.clone())?;
-            Ok(FileOperation::Read {
+            Ok(FileOperation::ReadPage {
                 file_path: args.file_path,
+                offset_bytes: args.offset_bytes,
+                max_bytes: args.max_bytes,
+                expected_sha256: args.expected_sha256,
             })
         }
         "Write" => {
@@ -370,8 +382,13 @@ impl ToolExecutor for RemoteFileExecutor {
         for schema in &mut schemas {
             match schema.function.name.as_str() {
                 "Read" => {
-                    schema.function.description="Read one complete UTF-8 file inside this Assignment's write roots. Both raw content and the encoded result must fit 16 KiB. No symlinks, hardlinks, .git, .bamboo control directories, traversal or directory listing.".into();
-                    schema.function.parameters = json!({"type":"object","additionalProperties":false,"required":["file_path"],"properties":{"file_path":{"type":"string"}}});
+                    schema.function.description="Read a bounded UTF-8 source page inside this Assignment's write roots (source at most 1 MiB, encoded reply at most 16 KiB). First call needs only file_path; default max_bytes=12000. The reply's page gives exact byte offsets, source line numbers and EOF. For continuation pass page.next_offset_bytes as offset_bytes and the previous full-file sha256 as expected_sha256; changed source is rejected. A page is not the whole file unless page.eof=true and page.offset_bytes=0. No symlinks, hardlinks, .git, workspace .bamboo controls, traversal or directory listing.".into();
+                    schema.function.parameters = json!({"type":"object","additionalProperties":false,"required":["file_path"],"properties":{
+                        "file_path":{"type":"string"},
+                        "offset_bytes":{"type":"integer","minimum":0,"maximum":bamboo_tickets::READ_SOURCE_BYTES_LIMIT,"description":"Use the previous page.next_offset_bytes; defaults to zero."},
+                        "max_bytes":{"type":"integer","minimum":1,"maximum":bamboo_tickets::FILE_BYTES_LIMIT,"description":"Maximum raw UTF-8 bytes this page; defaults to 12000. JSON escaping can shorten the page."},
+                        "expected_sha256":{"type":["string","null"],"pattern":"^[0-9a-f]{64}$","description":"Full-file sha256 from the prior reply, required for every nonzero offset."}
+                    }});
                 }
                 "Write" => {
                     schema.function.description="Create one absent UTF-8 file, 1–16384 bytes, in an existing directory inside this Assignment's write roots, excluding .git and .bamboo control directories. Existing-file replacement is unsupported even after Read; use a new path. Installation cannot overwrite an externally created file. Unknown effects cannot be automatically retried.".into();
@@ -846,6 +863,83 @@ mod tests {
         assert!(!workspace.join("denied").exists());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_read_pages_consume_large_source_with_full_hash_and_owned_scope() {
+        let (_dir, service, child, workspace) = local_file_fixture();
+        let source = "const sectionId = \"分组🌿\";\n".repeat(5000);
+        let path = workspace.join("large-source.tsx");
+        std::fs::write(&path, &source).unwrap();
+        let before = service.published().unwrap().1.seq;
+        let executor = LocalFileExecutor::new(
+            Arc::new(Gate(std::sync::atomic::AtomicBool::new(false))),
+            service.clone(),
+            child.clone(),
+            "run".into(),
+            &["Task".into(), "Read".into()],
+        )
+        .unwrap();
+        let resources = bamboo_tools::LocalTaskResources::new(&child.id, "run", child.created_at);
+        let mut arguments = json!({"file_path":path});
+        let mut content = String::new();
+        let mut calls = 0;
+        loop {
+            let call = file_call(&format!("page-{calls}"), "Read", arguments);
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&child.id);
+            let result = resources
+                .scope(executor.execute_with_context_outcome(&call, ctx))
+                .await
+                .unwrap()
+                .into_tool_result();
+            let reply: FileReply = serde_json::from_str(&result.result).unwrap();
+            assert_eq!(
+                reply.sha256,
+                bamboo_tickets::content_hash(source.as_bytes())
+            );
+            let page = reply.page.unwrap();
+            content.push_str(reply.content.as_deref().unwrap());
+            calls += 1;
+            if let Some(next) = page.next_offset_bytes {
+                arguments =
+                    json!({"file_path":path,"offset_bytes":next,"expected_sha256":reply.sha256});
+            } else {
+                assert!(page.eof);
+                break;
+            }
+        }
+        assert!(calls > 1);
+        assert_eq!(content, source);
+        assert_eq!(service.published().unwrap().1.seq, before);
+        resources.close_and_drain().await.unwrap();
+    }
+
+    #[test]
+    fn read_page_request_codec_keeps_strict_types_and_legacy_file_path_only_input() {
+        let request = |arguments| FileRequest {
+            tool: "Read".into(),
+            arguments,
+            expected_sha256: None,
+        };
+        assert!(matches!(
+            operation(&request(json!({"file_path":"/source"}))).unwrap(),
+            FileOperation::ReadPage {
+                offset_bytes: 0,
+                max_bytes: 12000,
+                expected_sha256: None,
+                ..
+            }
+        ));
+        for args in [
+            json!({"file_path":"/source","offset_bytes":-1}),
+            json!({"file_path":"/source","max_bytes":1.5}),
+            json!({"file_path":"/source","offset":1}),
+            json!({"file_path":"/source","expected_sha256":true}),
+        ] {
+            assert!(operation(&request(args)).is_err());
+        }
+    }
+
     #[tokio::test]
     async fn dropped_local_file_awaiter_cannot_detach_blocking_mutation() {
         let resources = bamboo_tools::LocalTaskResources::new("child", "run", chrono::Utc::now());
@@ -863,6 +957,7 @@ mod tests {
                     content: None,
                     sha256: "a".repeat(64),
                     artifact: None,
+                    page: None,
                 })
             })
             .await

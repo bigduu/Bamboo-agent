@@ -1042,3 +1042,28 @@ power-loss and arbitrary external actions remain unrun/deferred. External
 side-effects are not claimed exactly once. Structured validity does not prove
 substantive delivery quality; user-required Work and Goal acceptance still
 need their own evidence.
+
+### Scoped source pages (#2599)
+
+The Native Work `Read` tool returns a bounded UTF-8 page by default, including
+when the request contains only `file_path`. `max_bytes` defaults to 12000 and
+may be 1–16384. The complete encoded Host reply still fits 16 KiB; JSON escaping
+can shorten a page. The source itself is limited to 1 MiB per physical read.
+The existing Rust `FileOperation::Read` retains its complete-small-file contract.
+
+`sha256` identifies the entire source, not just the page. `page` discloses the
+start/exclusive-end byte offsets, full byte count, inclusive source line range,
+EOF and the next byte offset. A result is the complete file only when it starts
+at zero and EOF is true. Continue with `page.next_offset_bytes` and the previous
+`sha256` as `expected_sha256`; a nonzero offset without that hash is rejected.
+Every continuation checks a fresh bounded physical read against the full-file
+hash, so changed source cannot silently join an earlier version. UTF-8 characters
+are never split. These reads publish no Work mutation, receipt or artifact and
+introduce no second snapshot store.
+
+The frozen Assignment and current Child/Run remain authoritative. The Host's
+`.bamboo/worktrees` ancestor is supported by #2598; internal `.bamboo`/`.git`
+controls, outside roots, traversal, links and revoked execution remain denied.
+Permission, creation-fenced ownership and fail-closed unsupported platforms are
+unchanged. Source-read fixtures are local feature evidence; configured-provider
+and formal Bodhi acceptance remain separately tracked in #2554.

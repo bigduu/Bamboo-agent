@@ -1,6 +1,8 @@
 #![cfg(unix)]
 use bamboo_tickets::*;
 use std::{collections::BTreeSet, fs, path::Path};
+#[path = "workspace_files/read_pages.rs"]
+mod read_pages;
 
 struct Fixture {
     _temp: tempfile::TempDir,
@@ -752,6 +754,27 @@ fn complete_read_respects_encoded_host_reply_budget_without_truncation() {
 }
 
 #[test]
+fn legacy_complete_read_rejects_large_sources_without_truncating() {
+    let f = fixture_with_workspace(".bamboo/worktrees/worker", &[]);
+    let path = Path::new(&f.workspace.worktree).join("large-source.rs");
+    let content = "// actual source line\n".repeat(8000);
+    fs::write(&path, &content).unwrap();
+    let seq = f.service.published().unwrap().1.seq;
+    assert!(matches!(
+        f.service.workspace_file(
+            &f.worker,
+            "large-complete",
+            &FileOperation::Read {
+                file_path: path.to_string_lossy().into_owned(),
+            }
+        ),
+        Err(Error::ContextBudgetExceeded)
+    ));
+    assert_eq!(fs::read_to_string(path).unwrap(), content);
+    assert_eq!(f.service.published().unwrap().1.seq, seq);
+}
+
+#[test]
 fn runtime_control_cache_cannot_be_read_or_overwritten() {
     let f = fixture();
     let cache = Path::new(&f.workspace.worktree).join(".bamboo");
@@ -766,6 +789,7 @@ fn runtime_control_cache_cannot_be_read_or_overwritten() {
             FileOperation::Read {
                 file_path: alias.to_string_lossy().into_owned(),
             },
+            read_pages::paged(&alias, 0, 12000, None),
             write(
                 &alias,
                 "corrupt",
@@ -825,6 +849,7 @@ fn nested_write_root_cannot_authorize_workspace_control_directories() {
             FileOperation::Read {
                 file_path: existing.to_string_lossy().into_owned(),
             },
+            read_pages::paged(&existing, 0, 12000, None),
             write(&absent, "corrupt", None),
         ] {
             assert!(matches!(
