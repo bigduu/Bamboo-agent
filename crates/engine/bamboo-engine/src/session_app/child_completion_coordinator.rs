@@ -3851,6 +3851,15 @@ impl ChildCompletionCoordinator {
     /// durable state proves: dead children are synthesized terminal, an
     /// already-satisfied wait gets its lost wake replayed, an expired lease or
     /// empty wait force-resumes the parent.
+    #[cfg(test)]
+    pub(crate) async fn sweep_child_wait_for_test(
+        &self,
+        parent_session_id: &str,
+        wait: WaitingForChildrenState,
+    ) {
+        self.sweep_child_wait(parent_session_id, wait).await;
+    }
+
     async fn sweep_child_wait(&self, parent_session_id: &str, wait: WaitingForChildrenState) {
         let now = Utc::now();
 
@@ -3963,10 +3972,31 @@ impl ChildCompletionCoordinator {
                         None => Default::default(),
                     };
                     let idle_limit = policy.max_idle_secs.saturating_add(STALE_RUNNER_SLACK_SECS);
-                    let total_limit = policy
-                        .max_total_secs
-                        .saturating_add(STALE_RUNNER_SLACK_SECS);
-                    if idle_secs >= idle_limit || total_secs >= total_limit {
+                    let scheduler = self.spawn_scheduler.read().await.upgrade();
+                    let current_native_work =
+                        if policy.needs_native_work_proof(total_secs, STALE_RUNNER_SLACK_SECS) {
+                            match (&control_plane, scheduler) {
+                                (Some(child), Some(scheduler)) => {
+                                    scheduler
+                                        .owns_current_native_work(
+                                            child_id,
+                                            &runner.run_id,
+                                            child.created_at,
+                                        )
+                                        .await
+                                }
+                                _ => false,
+                            }
+                        } else {
+                            false
+                        };
+                    if idle_secs >= idle_limit
+                        || policy.total_timeout_reached(
+                            total_secs,
+                            STALE_RUNNER_SLACK_SECS,
+                            current_native_work,
+                        )
+                    {
                         runner.cancel_token.cancel();
                         dead.push(DeadChild {
                             child_id: child_id.clone(),
