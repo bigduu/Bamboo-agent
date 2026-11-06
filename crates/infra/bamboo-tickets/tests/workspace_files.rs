@@ -855,16 +855,59 @@ fn frozen_worktree_cannot_use_a_control_directory_as_its_root() {
 #[test]
 fn assignment_file_roots_cannot_contain_or_enter_ticket_storage() {
     for relative in ["", "authority"] {
-        let f = fixture_with_workspace(relative, &[]);
-        let path = Path::new(&f.workspace.worktree).join("forbidden.txt");
-        let seq = f.service.published().unwrap().1.seq;
-        assert!(matches!(
-            f.service
-                .workspace_file(&f.worker, "storage-root", &write(&path, "corrupt", None)),
-            Err(Error::ScopeDenied(_))
-        ));
+        let f = fixture();
+        let snapshot = f.service.published().unwrap().1;
+        let host = Authority::from_verified_host(
+            snapshot.binding.clone(),
+            Principal::Supervisor {
+                session_id: "root".into(),
+            },
+        );
+        let worktree = f._temp.path().join(relative).canonicalize().unwrap();
+        let path = worktree.join("forbidden.txt");
+        let root = worktree.to_string_lossy().into_owned();
+        let workspace = ExecutionWorkspace {
+            worktree: root.clone(),
+            write_roots: vec![root.clone()],
+            claims: BTreeSet::from([format!("worktree:{root}")]),
+            ..f.workspace.clone()
+        };
+        let contract = snapshot.tickets[&snapshot.assignments[&f.assignment].work_id]
+            .contract
+            .clone();
+        // The existing admission guard rejects this before a Worker exists.
+        // Do not bypass that guard just to exercise the later file-port fence.
+        let result = execute(
+            &f.service,
+            &host,
+            "storage-root",
+            vec![
+                Operation::Create {
+                    temp_id: "unsafe".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    depends_on: BTreeSet::new(),
+                    contract,
+                },
+                Operation::Ready {
+                    work_id: "unsafe".into(),
+                },
+                Operation::Start {
+                    work_id: "unsafe".into(),
+                    temp_id: "forbidden".into(),
+                    workspace: Some(workspace),
+                },
+            ],
+        );
+        assert!(
+            matches!(&result, Err(Error::ScopeDenied(reason)) if reason == "Ticket authority cannot be in a Worker write root"),
+            "{result:?}"
+        );
         assert!(!path.exists());
-        assert_eq!(f.service.published().unwrap().1.seq, seq);
+        assert_eq!(
+            canonical_bytes(&f.service.published().unwrap().1).unwrap(),
+            canonical_bytes(&snapshot).unwrap()
+        );
     }
 }
 
