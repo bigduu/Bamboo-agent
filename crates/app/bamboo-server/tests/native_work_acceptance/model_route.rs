@@ -18,7 +18,7 @@ struct Request {
     account: &'static str,
     model: String,
     effort: Option<ReasoningEffort>,
-    reply: oneshot::Sender<()>,
+    reply: oneshot::Sender<LLMChunk>,
 }
 
 struct CaptureProvider {
@@ -55,11 +55,11 @@ impl LLMProvider for CaptureProvider {
                 reply,
             })
             .map_err(|_| LLMError::Api("capture closed".into()))?;
-        receiver
+        let chunk = receiver
             .await
             .map_err(|_| LLMError::Api("gate closed".into()))?;
         Ok(Box::pin(futures::stream::iter([
-            Ok(LLMChunk::Token(RESULT.into())),
+            Ok(chunk),
             Ok(LLMChunk::Done),
         ])))
     }
@@ -241,10 +241,26 @@ impl Fixture {
             .await
             .unwrap();
         assert_eq!(dispatched["errors"], json!([]), "{dispatched}");
-        let request = tokio::time::timeout(WAIT, self.requests.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        let observed = tokio::time::timeout(WAIT, self.requests.recv()).await;
+        if observed.is_err() {
+            let snapshot = self.service.published().unwrap().1;
+            let mut children = Vec::new();
+            for assignment in snapshot.assignments.values() {
+                let id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
+                children.push(self.state.storage.load_session(&id).await.unwrap());
+            }
+            let diagnostic = json!({"snapshot":snapshot, "children":children});
+            let path = std::env::temp_dir().join(format!(
+                "bamboo-2627-route-timeout-{}.json",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::write(&path, serde_json::to_vec_pretty(&diagnostic).unwrap()).unwrap();
+            panic!(
+                "native request timeout; exact fixture diagnostic: {}",
+                path.display()
+            );
+        }
+        let request = observed.unwrap().unwrap();
         assert_eq!(
             request.model, model,
             "native Work must resolve its configured role"
@@ -306,12 +322,29 @@ impl Fixture {
         assert_eq!(reloaded.reasoning_effort, child.reasoning_effort);
         assert_eq!(self.service.published().unwrap().1.assignments.len(), 1);
         assert!(self.requests.try_recv().is_err());
-        request.reply.send(()).unwrap();
+        request.reply.send(LLMChunk::ToolCalls(vec![ToolCall {
+            id: "role-owned-task".into(), tool_type: "function".into(),
+            function: FunctionCall { name: "Task".into(), arguments: json!({"tasks":[{
+                "id":"role-step", "content":"Verify the configured model and effort", "status":"completed"
+            }]}).to_string() },
+        }])).unwrap();
+        let final_request = tokio::time::timeout(WAIT, self.requests.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_request.account, account);
+        assert_eq!(final_request.model, model);
+        assert_eq!(final_request.effort, expected_effort);
+        final_request
+            .reply
+            .send(LLMChunk::Token(RESULT.into()))
+            .unwrap();
         tokio::time::timeout(WAIT, async {
             loop {
                 let current = self.service.published().unwrap().1;
-                if current.assignments[&assignment.id].process_stopped {
-                    assert_eq!(current.submissions.len(), 1);
+                if current.assignments[&assignment.id].process_stopped
+                    && current.submissions.len() == 1
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
