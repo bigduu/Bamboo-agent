@@ -454,6 +454,70 @@ impl LocalTaskChildRunner {
 
 #[async_trait]
 impl ExternalChildRunner for LocalTaskChildRunner {
+    async fn owns_current_native_work(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        child_birth: chrono::DateTime<chrono::Utc>,
+    ) -> bool {
+        let Some(before) = self.native_task_liveness(session_id, run_id, child_birth) else {
+            return false;
+        };
+        let (Some(store), Some(service)) = ({
+            let bindings = lock(&self.bindings);
+            (bindings.store.clone(), bindings.tickets.clone())
+        }) else {
+            return false;
+        };
+        let Ok(Some(child)) = store.load_runtime_control_plane(session_id).await else {
+            return false;
+        };
+        if child.created_at != child_birth {
+            return false;
+        }
+        let Ok(Some(dispatch)) = crate::ticket_runtime::read_dispatch(&child) else {
+            return false;
+        };
+        let Ok((_, parent)) = crate::ticket_runtime::verified_scope_binding_for_service(
+            store.as_ref(),
+            &service,
+            &dispatch.binding.supervisor_session_id,
+        )
+        .await
+        else {
+            return false;
+        };
+        if child.parent_created_at != Some(parent.created_at) || child.root_session_id != parent.id
+        {
+            return false;
+        }
+        let Ok((_, snapshot)) = service.published() else {
+            return false;
+        };
+        let Some(intent) = snapshot.intents.get(&dispatch.dispatch_key) else {
+            return false;
+        };
+        let Ok(crate::ticket_runtime::DispatchObservation::Admitted { receipt }) =
+            crate::ticket_runtime::query_dispatch(
+                store.as_ref(),
+                &service,
+                &dispatch.dispatch_key,
+                &intent.immutable_spec,
+            )
+            .await
+        else {
+            return false;
+        };
+        receipt.session_id == session_id
+            && receipt.run_id == run_id
+            && self
+                .native_task_liveness(session_id, run_id, child_birth)
+                .is_some_and(|after| {
+                    after.start.instance_id == before.start.instance_id
+                        && after.start.entered_at == before.start.entered_at
+                })
+    }
+
     fn native_task_start(
         &self,
         session_id: &str,

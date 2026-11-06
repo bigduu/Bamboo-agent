@@ -754,8 +754,13 @@ async fn run_child_spawn_inner(
     let timeout_reason = Arc::new(RwLock::new(None::<String>));
     let watchdog_policy = watchdog_policy_for_session(&session);
     let watchdog_handle = tokio::spawn(watch_child_liveness(
-        job.parent_session_id.clone(),
-        job.child_session_id.clone(),
+        crate::execution::spawn::ChildWatchdogTarget {
+            parent_session_id: job.parent_session_id.clone(),
+            child_session_id: job.child_session_id.clone(),
+            child_birth: session.created_at,
+            run_id: run_id.clone(),
+            runtime: ctx.external_child_runner.clone(),
+        },
         ctx.agent_runners.clone(),
         cancel_token.clone(),
         timeout_reason.clone(),
