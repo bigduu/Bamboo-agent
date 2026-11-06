@@ -73,7 +73,10 @@ async fn test_models_endpoint_method_not_allowed() {
     let resp = test::call_service(&app, req).await;
 
     // The GET-only route rejects POST and advertises its allowed method.
-    assert_eq!(resp.status(), actix_web::http::StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        resp.status(),
+        actix_web::http::StatusCode::METHOD_NOT_ALLOWED
+    );
     assert_eq!(
         resp.headers()
             .get(actix_web::http::header::ALLOW)
