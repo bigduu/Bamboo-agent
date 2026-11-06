@@ -11,14 +11,20 @@ use tokio::sync::oneshot;
 
 const ACCOUNT: &str = "work-role-account";
 const MODEL: &str = "configured-work-role-model";
+const PROFILE_ACCOUNT: &str = "named-profile-account";
+const PROFILE_MODEL: &str = "named-profile-model";
 
 struct Request {
+    account: &'static str,
     model: String,
     effort: Option<ReasoningEffort>,
     reply: oneshot::Sender<()>,
 }
 
-struct CaptureProvider(mpsc::UnboundedSender<Request>);
+struct CaptureProvider {
+    account: &'static str,
+    requests: mpsc::UnboundedSender<Request>,
+}
 
 #[async_trait]
 impl LLMProvider for CaptureProvider {
@@ -41,8 +47,9 @@ impl LLMProvider for CaptureProvider {
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream, LLMError> {
         let (reply, receiver) = oneshot::channel();
-        self.0
+        self.requests
             .send(Request {
+                account: self.account,
                 model: model.into(),
                 effort: options.and_then(|options| options.reasoning_effort),
                 reply,
@@ -78,11 +85,21 @@ impl Fixture {
         let root = home.path().canonicalize().unwrap();
         let workspace: ExecutionWorkspace = execution_workspace(&root);
         let (send, requests) = mpsc::unbounded_channel();
-        let provider: Arc<dyn LLMProvider> = Arc::new(CaptureProvider(send));
+        let capture = |account| -> Arc<dyn LLMProvider> {
+            Arc::new(CaptureProvider {
+                account,
+                requests: send.clone(),
+            })
+        };
+        let provider = capture("openai");
         let state = host(&root, provider.clone()).await;
         {
             let mut config = state.config.write().await;
-            for (account, model) in [("openai", native_work::MODEL), (ACCOUNT, MODEL)] {
+            for (account, model) in [
+                ("openai", native_work::MODEL),
+                (ACCOUNT, MODEL),
+                (PROFILE_ACCOUNT, PROFILE_MODEL),
+            ] {
                 config.provider_instances.insert(
                     account.into(),
                     serde_json::from_value(json!({
@@ -101,13 +118,15 @@ impl Fixture {
         let registry = ProviderRegistry::new(
             HashMap::from([
                 ("openai".into(), provider.clone()),
-                (ACCOUNT.into(), provider),
+                (ACCOUNT.into(), capture(ACCOUNT)),
+                (PROFILE_ACCOUNT.into(), capture(PROFILE_ACCOUNT)),
             ]),
             "openai".into(),
         );
         registry.set_runtime_models(HashMap::from([
             ("openai".into(), vec![native_work::MODEL.into()]),
             (ACCOUNT.into(), vec![MODEL.into()]),
+            (PROFILE_ACCOUNT.into(), vec![PROFILE_MODEL.into()]),
         ]));
         state.provider_registry.replace_with(registry);
         let (service, authority) = state.tickets.authority(owner()).await.unwrap();
@@ -206,6 +225,15 @@ impl Fixture {
     }
 
     async fn run(&mut self, expected_effort: Option<ReasoningEffort>) {
+        self.run_selected(ACCOUNT, MODEL, expected_effort).await;
+    }
+
+    async fn run_selected(
+        &mut self,
+        account: &str,
+        model: &str,
+        expected_effort: Option<ReasoningEffort>,
+    ) {
         let dispatched = self
             .state
             .tickets
@@ -218,8 +246,12 @@ impl Fixture {
             .unwrap()
             .unwrap();
         assert_eq!(
-            request.model, MODEL,
+            request.model, model,
             "native Work must resolve its configured role"
+        );
+        assert_eq!(
+            request.account, account,
+            "the actual routed provider account must match the persisted selection"
         );
         assert_eq!(
             request.effort, expected_effort,
@@ -235,8 +267,12 @@ impl Fixture {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(child.model_ref.as_ref().unwrap().provider, ACCOUNT);
-        assert_eq!(child.model_ref.as_ref().unwrap().model, MODEL);
+        assert_eq!(child.model_ref.as_ref().unwrap().provider, account);
+        assert_eq!(child.model_ref.as_ref().unwrap().model, model);
+        assert_eq!(
+            child.model_ref.as_ref().unwrap().reasoning_effort,
+            expected_effort
+        );
         assert_eq!(child.reasoning_effort, expected_effort);
         // A replay must not re-resolve the role or create a second run after a config change.
         self.state
@@ -289,17 +325,41 @@ impl Fixture {
 #[actix_web::test]
 async fn native_work_retains_worker_model_and_effort_through_request_and_replay() {
     for effort in [
-        ReasoningEffort::Max,
-        ReasoningEffort::Low,
-        ReasoningEffort::Disabled,
+        Some(ReasoningEffort::Max),
+        Some(ReasoningEffort::Low),
+        Some(ReasoningEffort::Disabled),
+        None,
     ] {
-        Fixture::new(
-            Some(ProviderModelRef::new(ACCOUNT, MODEL).with_reasoning_effort(effort)),
-            Some(ReasoningEffort::High),
+        let mut role = ProviderModelRef::new(ACCOUNT, MODEL);
+        role.reasoning_effort = effort;
+        Fixture::new(Some(role), Some(ReasoningEffort::High))
+            .await
+            .run(effort)
+            .await;
+    }
+}
+
+#[actix_web::test]
+async fn native_work_profile_override_does_not_borrow_discarded_role_effort() {
+    for hint in [
+        format!("{PROFILE_ACCOUNT}:{PROFILE_MODEL}"),
+        format!("{ACCOUNT}:{MODEL}"),
+    ] {
+        let mut fixture = Fixture::new(
+            Some(
+                ProviderModelRef::new(ACCOUNT, MODEL)
+                    .with_reasoning_effort(ReasoningEffort::Disabled),
+            ),
+            Some(ReasoningEffort::Max),
         )
-        .await
-        .run(Some(effort))
         .await;
+        let agents = fixture.state.session_store.bamboo_home_dir().join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+        std::fs::write(agents.join("worker.md"), format!(
+            "---\nschema_version: 1\nname: worker\ndescription: Native Work profile\nmodel_hint: {hint}\n---\nReturn the assigned bounded result.\n"
+        )).unwrap();
+        let (account, model) = hint.split_once(':').unwrap();
+        fixture.run_selected(account, model, None).await;
     }
 }
 

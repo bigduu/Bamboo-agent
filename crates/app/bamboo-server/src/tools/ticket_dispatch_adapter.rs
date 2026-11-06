@@ -112,9 +112,8 @@ impl ChildSessionAdapter {
                 );
                 // Use the same saved role selection as ordinary SubAgent/Plan.
                 // The engine resolver owns fallback policy; this Host only
-                // freezes its exact account/model/effort into the fresh Child.
+                // passes the full selection to the canonical Work creator.
                 let model_ref = self.resolve_subagent_model(&policy.worker_role).await;
-                let reasoning_effort = model_ref.as_ref().and_then(|model| model.reasoning_effort);
                 if let Some(fence) = &policy.admission_fence {
                     fence.check()?;
                 }
@@ -137,7 +136,7 @@ impl ChildSessionAdapter {
                         runtime_metadata: metadata,
                         read_only: false,
                         auto_run: false,
-                        reasoning_effort,
+                        reasoning_effort: None,
                         lifecycle: None,
                         resident_name: None,
                         resident_context: None,

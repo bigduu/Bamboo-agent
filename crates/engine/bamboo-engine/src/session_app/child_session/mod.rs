@@ -172,8 +172,9 @@ pub struct CreateChildInput {
     /// Defaults to `true`.
     pub auto_run: bool,
     /// Optional reasoning effort to apply to the child's own LLM calls.
-    /// `None` (the default) leaves `Session::reasoning_effort` at `None`,
-    /// so the provider falls back to its default. The child does NOT
+    /// `None` leaves ordinary children at the provider default. Trusted Work
+    /// creation instead derives it from the final selected model reference.
+    /// The child does NOT
     /// inherit the parent's reasoning_effort — fan-out children that
     /// only need a quick lookup should not pay for `xhigh` reasoning
     /// just because the orchestrator is running at `xhigh`.
