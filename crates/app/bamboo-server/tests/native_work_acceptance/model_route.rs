@@ -403,26 +403,28 @@ async fn native_work_profile_override_does_not_borrow_discarded_role_effort() {
         // Named-profile grants predate this slice and do not contain native
         // Work's required Task capability (#2628). Keep that existing refusal;
         // verify the actual fresh Child before treating it as runnable.
-        let stopped = tokio::time::timeout(WAIT, async {
+        let (stopped, child) = tokio::time::timeout(WAIT, async {
             loop {
                 let snapshot = fixture.service.published().unwrap().1;
-                if snapshot.assignments[assignment_id].process_stopped {
-                    break snapshot;
+                let assignment = &snapshot.assignments[assignment_id];
+                if assignment.process_stopped {
+                    let child_id = &assignment.runtime.as_ref().unwrap().session_id;
+                    let child = fixture
+                        .state
+                        .storage
+                        .load_session(child_id)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    if child.last_run_status().as_deref() == Some("error") {
+                        break (snapshot, child);
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await
         .expect("incompatible profile must fail closed before provider execution");
-        let assignment = &stopped.assignments[assignment_id];
-        let child_id = &assignment.runtime.as_ref().unwrap().session_id;
-        let child = fixture
-            .state
-            .storage
-            .load_session(child_id)
-            .await
-            .unwrap()
-            .unwrap();
         assert_eq!(child.model_ref.as_ref().unwrap().provider, account);
         assert_eq!(child.model_ref.as_ref().unwrap().model, model);
         assert_eq!(child.model_ref.as_ref().unwrap().reasoning_effort, None);
