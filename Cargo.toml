@@ -157,7 +157,7 @@ tokio = { version = "1", features = ["full"] }
 # `h2 0.3` line (RUSTSEC-2026-0258), while Bamboo's WSS transport uses the
 # HTTP/1.1 Upgrade protocol. Outbound provider clients retain HTTP/2 through
 # Reqwest's patched `h2 0.4` dependency.
-actix-web = { version = "4", default-features = false, features = [
+actix-web = { version = "4.18.2", default-features = false, features = [
     "macros",
     "compress-brotli",
     "compress-gzip",
@@ -168,7 +168,7 @@ actix-web = { version = "4", default-features = false, features = [
     "ws",
 ] }
 actix-cors = "0.7"
-actix-files = "0.7"
+actix-files = "0.7.4"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
