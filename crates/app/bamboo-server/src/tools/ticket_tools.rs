@@ -253,7 +253,7 @@ impl Tool for TicketTool {
             "work_inspect" => "Inspect up to 32 scope IDs, selected sections, bounded containment depth and byte budget. Ticket contract is always present; sections declares what history was requested. Read revisions, requests and submissions before changing or accepting them.",
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",
             "work_review" => "Explicitly request one metered advisory review of a current Work and Assignment. Use a stable operation UUID for retries and read the cited Work and Session evidence. The configured Work Review or Fast role summarizes purpose, progress, waits and outputs. Review does not dispatch or accept the delivery.",
-            "work_update" => semantic_schema::RESOLUTION_GUIDANCE,
+            "work_update" => semantic_schema::work_update_guidance(),
             _ => "Commit start/steer/pause/cancel/retry intents through the existing Runtime. Explicit pause stays blocked after stop; ready resumes a stopped pause. Reopen/start creates a fresh attempt only after confirmed stop and reconciled effects. Returns accepted_for_dispatch with receipt immediately, not completion or acceptance.",
         }
     }

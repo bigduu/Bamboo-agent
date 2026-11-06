@@ -204,6 +204,7 @@ objc2-foundation = { version = "0.3.2", default-features = false, features = ["s
 zbus = { version = "6", default-features = false }
 
 [dev-dependencies]
+jsonschema = { version = "0.60.0", default-features = false, features = ["idna"] }
 bamboo-server-tools = { path = "../bamboo-server-tools", features = ["test-utils"] }
 wiremock = "0.6"
 tokio-test = "0.4"

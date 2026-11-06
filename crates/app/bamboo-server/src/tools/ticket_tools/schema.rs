@@ -139,8 +139,8 @@ pub fn parameters(name: &str) -> Value {
                 result["properties"]["proposal"] = super::semantic_schema::proposal();
                 result["required"] = json!([]);
                 result["oneOf"] = json!([
-                    {"required":["message_id","proposal"]},
-                    {"required":["operation_id","expected_seq","expected_epoch","operations"]}
+                    {"required":["message_id","proposal"],"maxProperties":2},
+                    {"required":["operation_id","expected_seq","expected_epoch","operations"],"maxProperties":4}
                 ]);
             }
             result
