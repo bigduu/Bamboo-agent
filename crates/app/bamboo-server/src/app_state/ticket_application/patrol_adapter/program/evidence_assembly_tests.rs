@@ -1298,10 +1298,15 @@ async fn live_start_disappearing_at_final_host_read_is_a_conflict_without_ticket
 
 #[tokio::test]
 async fn explicit_work_review_uses_fast_and_reconciles_the_original_work_receipt() {
-    Box::pin(work_review_fixture()).await;
+    Box::pin(work_review_fixture(false)).await;
 }
 
-async fn work_review_fixture() {
+#[tokio::test]
+async fn reasoning_only_work_review_reports_inconclusive_and_preserves_known_usage() {
+    Box::pin(work_review_fixture(true)).await;
+}
+
+async fn work_review_fixture(reasoning_only: bool) {
     use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolOutcome};
     use bamboo_agent_core::ToolExecutionContext;
     use bamboo_domain::{SessionCallerReference, TokenUsage, DEFAULT_SUPERVISOR_SESSION_ID};
@@ -1448,16 +1453,22 @@ async fn work_review_fixture() {
         assert_eq!(pending[0].request.purpose, ExecutionBudgetPurpose::SupervisorDecision);
         let expected_charge = match call {
             0 => 4224,
-            1 => 44 + 8192 + 1024,
-            _ => 89 + 8192 + 1024,
+            1 => 44 + 8192 + 4096,
+            _ => 89 + 8192 + 4096,
         };
         assert_eq!(budget.total_charged, expected_charge);
         let body: Value = serde_json::from_slice(&request.body).unwrap();
         assert_eq!(body["model"], "review-fixture-model");
-        assert_eq!(body["max_tokens"], if call == 0 { 128 } else { 1024 });
+        assert_eq!(body["max_completion_tokens"], if call == 0 { 128 } else { 4096 });
+        assert!(body.get("max_tokens").is_none());
+        assert_eq!(body["reasoning_effort"], if call == 0 { "max" } else { "none" });
         let evidence: Value = serde_json::from_str(body["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert_eq!(evidence["waiting"]["request_id"], expected_question);
-        let review = json!({"choices":[{"delta":{"content":"{\"summary\":\"Worker is waiting for input.\",\"suggested_intervention\":\"Review the recorded question.\"}"}}]});
+        let review = if reasoning_only && call == 0 {
+            json!({"choices":[{"delta":{"reasoning_content":"Private controlled reasoning must never appear in diagnostics."},"finish_reason":"length"}]})
+        } else {
+            json!({"choices":[{"delta":{"content":"{\"summary\":\"Worker is waiting for input.\",\"suggested_intervention\":\"Review the recorded question.\"}"}}]})
+        };
         let usage = match call {
             0 => "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":40,\"completion_tokens\":4,\"total_tokens\":44}}\n\n",
             1 => "",
@@ -1492,7 +1503,7 @@ async fn work_review_fixture() {
         config.defaults = Some(
             serde_json::from_value(json!({
                 "chat":{"provider":"openai","model":"patrol-evidence-local"},
-                "fast":{"provider":"work-review-existing","model":"review-fixture-model"}
+                "fast":{"provider":"work-review-existing","model":"review-fixture-model","reasoning_effort":"max"}
             }))
             .unwrap(),
         );
@@ -1506,7 +1517,31 @@ async fn work_review_fixture() {
     let known_id = uuid::Uuid::new_v4();
     let known = review(known_id).await;
     assert_eq!(known["status"], "recorded");
-    assert_eq!(known["advisory"]["summary"], "Worker is waiting for input.");
+    assert_eq!(
+        serde_json::from_value::<ExecutionTokenUsage>(known["accounting"]["usage"].clone())
+            .unwrap(),
+        ExecutionTokenUsage::Known {
+            input_tokens: 40,
+            output_tokens: 4
+        }
+    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        service
+            .work_token_budget(&runtime)
+            .unwrap()
+            .unwrap()
+            .total_charged,
+        44
+    );
+    if reasoning_only {
+        assert!(known["advisory"].is_null());
+        assert_eq!(known["inconclusive"]["reason"], "reasoning_only");
+        assert_eq!(known["inconclusive"]["finish_reason"], "output_limit");
+        assert!(!known.to_string().contains("Private controlled reasoning"));
+    } else {
+        assert_eq!(known["advisory"]["summary"], "Worker is waiting for input.");
+    }
     let replay = review(known_id).await;
     assert_eq!(replay["status"], "existing_receipt");
     assert_eq!(
@@ -1525,7 +1560,26 @@ async fn work_review_fixture() {
 
     // A configured Fast model without a global Model Limits row uses the
     // per-call Work Review ceilings and the same registered provider.
-    state.config.write().await.extra.remove("model_limits");
+    {
+        let mut config = state.config.write().await;
+        config.extra.remove("model_limits");
+        config
+            .defaults
+            .as_mut()
+            .unwrap()
+            .fast
+            .as_mut()
+            .unwrap()
+            .reasoning_effort = Some(bamboo_domain::ReasoningEffort::Disabled);
+    }
+    let after_policy_change = review(known_id).await;
+    assert_eq!(after_policy_change["status"], "existing_receipt");
+    assert_eq!(after_policy_change["accounting"], known["accounting"]);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "historical receipt precedes new planning"
+    );
     let unknown = review(uuid::Uuid::new_v4()).await;
     let original: bamboo_tickets::WorkTokenReservation =
         serde_json::from_value(unknown["accounting"].clone()).unwrap();

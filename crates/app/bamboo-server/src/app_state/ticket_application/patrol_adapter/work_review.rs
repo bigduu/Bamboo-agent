@@ -9,8 +9,9 @@ use bamboo_domain::{
 use bamboo_engine::{model_config_helper::try_resolve_work_review_model, ticket_runtime};
 use bamboo_llm::{work_text, LLMError, ProviderRegistry};
 use bamboo_orchestration::work_review::{
-    PreparedWorkReview, WorkReviewAdmission, WorkReviewEvidence, WorkReviewIo,
-    WorkReviewProviderReply, WorkReviewSessionObservation, WorkReviewUsage,
+    PreparedWorkReview, ReviewFinishReason, WorkReviewAdmission, WorkReviewEvidence, WorkReviewIo,
+    WorkReviewOutputObservations, WorkReviewProviderReply, WorkReviewSessionObservation,
+    WorkReviewUsage,
 };
 use bamboo_tickets::{
     Authority, ExecutionTokenOverCapUsage, TicketService, WorkTokenReservation, WorkTokenSubmission,
@@ -142,7 +143,7 @@ impl WorkReviewIo for ReviewHost {
                 })
             })
         };
-        let response = work_text::review(
+        let (response, observed) = work_text::review_diagnosed(
             &self.route.transport,
             self.route.provider.as_ref(),
             work_text::Request {
@@ -156,10 +157,18 @@ impl WorkReviewIo for ReviewHost {
             prepared.target.reasoning_effort,
         )
         .await;
+        let observations = WorkReviewOutputObservations {
+            reasoning_seen: observed.reasoning_seen,
+            text_bytes: observed.text_bytes,
+            unexpected_tools: observed.unexpected_tools,
+            text_overflow: observed.text_overflow,
+            finish_reason: ReviewFinishReason::from_provider_code(observed.finish_reason),
+        };
         match response {
             work_text::WorkTextReply::Complete { text, exact_usage } => WorkReviewProviderReply {
                 text,
                 usage: exact_usage.map_or(WorkReviewUsage::Unknown, WorkReviewUsage::Observed),
+                observations,
             },
             work_text::WorkTextReply::OverCap(report) => WorkReviewProviderReply {
                 text: None,
@@ -168,14 +177,17 @@ impl WorkReviewIo for ReviewHost {
                     output_tokens: report.output_tokens,
                     total_tokens: report.total_tokens,
                 }),
+                observations,
             },
             work_text::WorkTextReply::NotSent => WorkReviewProviderReply {
                 text: None,
                 usage: WorkReviewUsage::NotSent,
+                observations,
             },
             work_text::WorkTextReply::Unknown => WorkReviewProviderReply {
                 text: None,
                 usage: WorkReviewUsage::Unknown,
+                observations,
             },
         }
     }
