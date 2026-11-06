@@ -984,6 +984,7 @@ dependencies = [
  "bamboo-mcp",
  "bamboo-memory",
  "bamboo-metrics",
+ "bamboo-orchestration",
  "bamboo-plugin",
  "bamboo-skills",
  "bamboo-storage",
