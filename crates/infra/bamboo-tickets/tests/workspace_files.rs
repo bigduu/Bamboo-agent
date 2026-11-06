@@ -19,10 +19,25 @@ fn execute(
     s.execute(who, &c)
 }
 fn fixture() -> Fixture {
+    fixture_with_workspace("worker", &[])
+}
+fn fixture_with_workspace(relative_worktree: &str, relative_roots: &[&str]) -> Fixture {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("worker");
-    fs::create_dir(&path).unwrap();
+    let path = temp.path().join(relative_worktree);
+    fs::create_dir_all(&path).unwrap();
     let path = path.canonicalize().unwrap().to_string_lossy().into_owned();
+    let write_roots = if relative_roots.is_empty() {
+        vec![path.clone()]
+    } else {
+        relative_roots
+            .iter()
+            .map(|root| {
+                let root = Path::new(&path).join(root);
+                fs::create_dir_all(&root).unwrap();
+                root.to_string_lossy().into_owned()
+            })
+            .collect()
+    };
     let binding = ScopeBinding {
         scope_id: "files".into(),
         supervisor_session_id: "root".into(),
@@ -41,7 +56,7 @@ fn fixture() -> Fixture {
         base_commit: "a".repeat(40),
         branch: "worker".into(),
         worktree: path.clone(),
-        write_roots: vec![path.clone()],
+        write_roots,
         claims: BTreeSet::from([format!("worktree:{path}")]),
     };
     let r = execute(
@@ -767,6 +782,133 @@ fn runtime_control_cache_cannot_be_read_or_overwritten() {
     assert!(f.service.published().unwrap().1.assignments[&f.assignment]
         .effects
         .is_empty());
+}
+
+#[test]
+fn host_data_ancestor_does_not_hide_frozen_worktree_source_or_new_artifacts() {
+    let f = fixture_with_workspace(".bamboo/worktrees/worker", &[]);
+    let root = Path::new(&f.workspace.worktree);
+    let source = root.join("source.rs");
+    fs::write(&source, "fn actual_source() {}\n").unwrap();
+    let reply = f
+        .service
+        .workspace_file(
+            &f.worker,
+            "source",
+            &FileOperation::Read {
+                file_path: source.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+    assert_eq!(reply.content.as_deref(), Some("fn actual_source() {}\n"));
+    assert_eq!(reply.sha256, content_hash(b"fn actual_source() {}\n"));
+    let destination = root.join("handoff.txt");
+    let reply = f
+        .service
+        .workspace_file(&f.worker, "handoff", &write(&destination, "observed", None))
+        .unwrap();
+    assert_eq!(fs::read_to_string(destination).unwrap(), "observed");
+    assert_eq!(reply.artifact.unwrap().sha256, content_hash(b"observed"));
+}
+
+#[test]
+fn nested_write_root_cannot_authorize_workspace_control_directories() {
+    for control in [".bamboo", ".BAMBOO", ".Bamboo", ".git", ".GIT", ".Git"] {
+        let relative = format!("nested/{control}/cache");
+        let f = fixture_with_workspace(".bamboo/worktrees/worker", &[&relative]);
+        let root = Path::new(&f.workspace.write_roots[0]);
+        let existing = root.join("state.json");
+        fs::write(&existing, "private state").unwrap();
+        let absent = root.join("new.json");
+        let seq = f.service.published().unwrap().1.seq;
+        for op in [
+            FileOperation::Read {
+                file_path: existing.to_string_lossy().into_owned(),
+            },
+            write(&absent, "corrupt", None),
+        ] {
+            assert!(matches!(
+                f.service.workspace_file(&f.worker, "control", &op),
+                Err(Error::ScopeDenied(_))
+            ));
+        }
+        assert_eq!(fs::read_to_string(existing).unwrap(), "private state");
+        assert!(!absent.exists());
+        assert_eq!(f.service.published().unwrap().1.seq, seq);
+    }
+}
+
+#[test]
+fn frozen_worktree_cannot_use_a_control_directory_as_its_root() {
+    for control in [".bamboo", ".BAMBOO", ".git", ".GIT"] {
+        let f = fixture_with_workspace(control, &[]);
+        let path = Path::new(&f.workspace.worktree).join("state.json");
+        assert!(matches!(
+            f.service
+                .workspace_file(&f.worker, "control-root", &write(&path, "corrupt", None)),
+            Err(Error::ScopeDenied(_))
+        ));
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn assignment_file_roots_cannot_contain_or_enter_ticket_storage() {
+    for relative in ["", "authority"] {
+        let f = fixture();
+        let snapshot = f.service.published().unwrap().1;
+        let host = Authority::from_verified_host(
+            snapshot.binding.clone(),
+            Principal::Supervisor {
+                session_id: "root".into(),
+            },
+        );
+        let worktree = f._temp.path().join(relative).canonicalize().unwrap();
+        let path = worktree.join("forbidden.txt");
+        let root = worktree.to_string_lossy().into_owned();
+        let workspace = ExecutionWorkspace {
+            worktree: root.clone(),
+            write_roots: vec![root.clone()],
+            claims: BTreeSet::from([format!("worktree:{root}")]),
+            ..f.workspace.clone()
+        };
+        let contract = snapshot.tickets[&snapshot.assignments[&f.assignment].work_id]
+            .contract
+            .clone();
+        // The existing admission guard rejects this before a Worker exists.
+        // Do not bypass that guard just to exercise the later file-port fence.
+        let result = execute(
+            &f.service,
+            &host,
+            "storage-root",
+            vec![
+                Operation::Create {
+                    temp_id: "unsafe".into(),
+                    kind: TicketKind::Work,
+                    parent: None,
+                    depends_on: BTreeSet::new(),
+                    contract,
+                },
+                Operation::Ready {
+                    work_id: "unsafe".into(),
+                },
+                Operation::Start {
+                    work_id: "unsafe".into(),
+                    temp_id: "forbidden".into(),
+                    workspace: Some(workspace),
+                },
+            ],
+        );
+        assert!(
+            matches!(&result, Err(Error::ScopeDenied(reason)) if reason == "Ticket authority cannot be in a Worker write root"),
+            "{result:?}"
+        );
+        assert!(!path.exists());
+        assert_eq!(
+            canonical_bytes(&f.service.published().unwrap().1).unwrap(),
+            canonical_bytes(&snapshot).unwrap()
+        );
+    }
 }
 
 #[test]

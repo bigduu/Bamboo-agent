@@ -666,7 +666,8 @@ async fn expired_capacity_lease_cannot_admit_same_worktree_while_native_pid_is_a
 async fn actual_native_worker_writes_only_its_git_worktree_and_submits_managed_code() {
     let mut f = Fixture::new().await;
     let repo = f.temp.join("repo");
-    let workspace = f.temp.join("assignment");
+    let workspace = f.temp.join(".bamboo/worktrees/assignment");
+    std::fs::create_dir_all(workspace.parent().unwrap()).unwrap();
     std::fs::create_dir(&repo).unwrap();
     git(&repo, &["init", "-b", "main"]);
     std::fs::write(repo.join("answer.rs"), "pub fn answer() -> u8 { 0 }\n").unwrap();
