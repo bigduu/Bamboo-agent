@@ -392,7 +392,48 @@ async fn native_work_profile_override_does_not_borrow_discarded_role_effort() {
             "---\nschema_version: 1\nname: worker\ndescription: Native Work profile\nmodel_hint: {hint}\n---\nReturn the assigned bounded result.\n"
         )).unwrap();
         let (account, model) = hint.split_once(':').unwrap();
-        fixture.run_selected(account, model, None).await;
+        let dispatched = fixture
+            .state
+            .tickets
+            .dispatch(owner(), &fixture.start)
+            .await
+            .unwrap();
+        assert_eq!(dispatched["errors"], json!([]));
+        let assignment_id = dispatched["receipt"]["ids"]["a"].as_str().unwrap();
+        // Named-profile grants predate this slice and do not contain native
+        // Work's required Task capability (#2628). Keep that existing refusal;
+        // verify the actual fresh Child before treating it as runnable.
+        let stopped = tokio::time::timeout(WAIT, async {
+            loop {
+                let snapshot = fixture.service.published().unwrap().1;
+                if snapshot.assignments[assignment_id].process_stopped {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("incompatible profile must fail closed before provider execution");
+        let assignment = &stopped.assignments[assignment_id];
+        let child_id = &assignment.runtime.as_ref().unwrap().session_id;
+        let child = fixture
+            .state
+            .storage
+            .load_session(child_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(child.model_ref.as_ref().unwrap().provider, account);
+        assert_eq!(child.model_ref.as_ref().unwrap().model, model);
+        assert_eq!(child.model_ref.as_ref().unwrap().reasoning_effort, None);
+        assert_eq!(child.reasoning_effort, None);
+        assert_eq!(child.last_run_status().as_deref(), Some("error"));
+        assert!(child
+            .metadata
+            .get("last_run_error")
+            .is_some_and(|error| error.contains("unsupported Ticket native ceiling")));
+        assert!(fixture.requests.try_recv().is_err());
+        assert!(stopped.submissions.is_empty());
     }
 }
 
