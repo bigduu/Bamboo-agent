@@ -225,6 +225,46 @@ async fn complete_own_work(
             .project_id,
         work.project
     );
+    let display = bamboo_config::paths::path_to_display_string(std::path::Path::new(
+        &work.workspace.worktree,
+    ));
+    let nested = std::path::Path::new(&display).join("display-form");
+    std::fs::create_dir(&nested).unwrap();
+    let alias = nested.join("..");
+    assert_ne!(alias, std::path::Path::new(&work.workspace.worktree));
+    assert_eq!(
+        alias.canonicalize().unwrap(),
+        std::path::Path::new(&work.workspace.worktree)
+    );
+    let mut displayed = child.clone();
+    displayed.set_workspace_path_meta(alias.to_string_lossy());
+    assert_eq!(
+        plan.workspace_project_context(&displayed, Some(&alias))
+            .unwrap()
+            .unwrap()
+            .project_id,
+        work.project,
+        "a valid Host display spelling retains only the same physical workspace grant"
+    );
+    displayed.set_workspace_path_meta(&other.workspace.worktree);
+    assert!(plan.workspace_project_context(&displayed, path).is_err());
+    displayed.set_workspace_path_meta(nested.join("missing").to_string_lossy());
+    assert!(plan.workspace_project_context(&displayed, path).is_err());
+    #[cfg(unix)]
+    {
+        let selected = std::path::Path::new(&work.workspace.worktree);
+        let retained = selected.with_extension("retained");
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::rename(selected, &retained).unwrap();
+        std::os::unix::fs::symlink(foreign.path(), selected).unwrap();
+        let result = plan.workspace_project_context(&child, path);
+        std::fs::remove_file(selected).unwrap();
+        std::fs::rename(&retained, selected).unwrap();
+        assert!(
+            result.is_err(),
+            "a replaced frozen directory cannot be re-canonicalized into a new grant"
+        );
+    }
     assert!(plan
         .workspace_project_context(
             &child,

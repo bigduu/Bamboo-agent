@@ -183,12 +183,22 @@ impl TicketWorkerPlan {
             return Ok(None);
         };
         let expected_path = std::path::Path::new(&expected.worktree);
+        let session_workspace = session.workspace_path_meta();
+        let recorded_path = session_workspace
+            .as_deref()
+            .map(std::path::Path::new)
+            .filter(|path| path.is_absolute())
+            .map(std::path::Path::canonicalize)
+            .transpose()?;
+        // Normalize current candidates, never the immutable canonical spec:
+        // replacing that original directory with a link must revoke access.
         if workspace
+            .filter(|path| path.is_absolute())
             .map(std::path::Path::canonicalize)
             .transpose()?
             .as_deref()
             != Some(expected_path)
-            || session.workspace_path_meta().as_deref() != Some(expected.worktree.as_str())
+            || recorded_path.as_deref() != Some(expected_path)
         {
             return Err(Error::ScopeDenied(
                 "Work workspace differs from its exact dispatch".into(),

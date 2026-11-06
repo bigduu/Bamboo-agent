@@ -353,7 +353,12 @@ async fn create_child_action_inner(
         .validate_child_workspace(workspace_project_id.as_ref(), &input.workspace)
         .await?;
     if ticket_workspace.is_some_and(|workspace| {
-        std::path::Path::new(&final_workspace) != std::path::Path::new(&workspace.worktree)
+        let actual = std::path::Path::new(&final_workspace);
+        // Host display paths omit Windows verbatim prefixes. Normalize the
+        // candidate, keeping the frozen canonical spec as the authority.
+        !actual.is_absolute()
+            || actual.canonicalize().ok().as_deref()
+                != Some(std::path::Path::new(&workspace.worktree))
     }) {
         return Err(ChildSessionError::InvalidArguments(
             "Work workspace validation relocated the frozen execution path".into(),
