@@ -176,6 +176,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // all four additive contexts and their twenty explicit cases are unchanged.
 // #2608 keeps removal-scope native fork/barrier regressions in the existing
 // default server-browser owner; all additive contexts and cases are unchanged.
+// #2611 keeps Local Read retry-window and strict Remote whole-read cases in
+// default Engine, plus the >64-page native fixture in its default Agent owner.
+// No feature declaration, additive context or twenty-case selection changes.
 const FEATURE_SOURCE_SHA256 = "1a17265c899dbe51d924a42e7a9d4705a0634e6ef84a9fc809a59bb70ce23e3d";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
