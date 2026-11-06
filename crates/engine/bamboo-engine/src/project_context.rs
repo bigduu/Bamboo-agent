@@ -62,6 +62,18 @@ pub struct ResolvedProjectContext {
     pub binding_status: WorkspaceBindingStatus,
 }
 
+/// Current registry facts for a narrow Work workspace admission. These facts
+/// carry no Project memory, skill, MCP or resource execution authority.
+#[derive(Clone)]
+pub struct ProjectWorkspaceFacts {
+    pub project_id: ProjectId,
+    pub status: bamboo_domain::ProjectStatus,
+    pub resource_revision: u64,
+    pub project_path: Option<String>,
+    pub workspace_bindings: Vec<WorkspaceBinding>,
+    pub owner: Option<ProjectId>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkspaceSource {
@@ -186,12 +198,21 @@ pub trait ProjectContextSource: Send + Sync {
     ) -> Result<Option<ProjectId>, ProjectContextError> {
         Ok(None)
     }
+
+    async fn workspace_facts(
+        &self,
+        _project_id: &ProjectId,
+        _workspace: &Path,
+    ) -> Result<Option<ProjectWorkspaceFacts>, ProjectContextError> {
+        Ok(None)
+    }
 }
 
 #[derive(Clone)]
 pub struct ProjectContextResolver {
     source: Arc<dyn ProjectContextSource>,
     workspace_resolver: bamboo_agent_core::workspace_state::WorkspaceResolver,
+    work_execution: Option<Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +228,7 @@ impl ProjectContextResolver {
             source,
             workspace_resolver:
                 bamboo_agent_core::workspace_state::WorkspaceResolver::from_process_globals(),
+            work_execution: None,
         }
     }
 
@@ -222,7 +244,78 @@ impl ProjectContextResolver {
         Self {
             source,
             workspace_resolver,
+            work_execution: None,
         }
+    }
+
+    pub(crate) fn for_work_execution(
+        &self,
+        plan: Arc<dyn crate::ticket_worker_plan::WorkerLocalPlan>,
+    ) -> Self {
+        let mut scoped = self.clone();
+        scoped.work_execution = Some(plan);
+        scoped
+    }
+
+    async fn validate_work_workspace(
+        &self,
+        session: &Session,
+        workspace: Option<&Path>,
+    ) -> Result<bool, ProjectContextError> {
+        let Some(plan) = &self.work_execution else {
+            return Ok(false);
+        };
+        let Some(context) = plan
+            .workspace_project_context(session, workspace)
+            .map_err(|error| ProjectContextError::Source(error.to_string()))?
+        else {
+            return Ok(false);
+        };
+        let workspace = workspace
+            .ok_or_else(|| ProjectContextError::Source("Work workspace missing".into()))?;
+        let facts = self
+            .source
+            .workspace_facts(&context.project_id, workspace)
+            .await?
+            .ok_or_else(|| ProjectContextError::ProjectUnavailable {
+                project_id: context.project_id.clone(),
+            })?;
+        let binding = facts
+            .workspace_bindings
+            .iter()
+            .find(|binding| binding.path == context.workspace_binding.path);
+        let adopted = binding.map_or_else(
+            || {
+                facts.project_path.as_deref() == Some(context.workspace_binding.path.as_str())
+                    && context.workspace_binding.label.is_none()
+                    && context.workspace_binding.git_common_dir.is_none()
+            },
+            |binding| binding == &context.workspace_binding,
+        );
+        if facts.project_id != context.project_id
+            || facts.status != bamboo_domain::ProjectStatus::Active
+            || facts.resource_revision != context.resource_revision
+            || !adopted
+            || facts
+                .owner
+                .as_ref()
+                .is_some_and(|owner| owner != &context.project_id)
+        {
+            return Err(ProjectContextError::Source(
+                "Work Project workspace facts changed".into(),
+            ));
+        }
+        if plan
+            .workspace_project_context(session, Some(workspace))
+            .map_err(|error| ProjectContextError::Source(error.to_string()))?
+            .as_ref()
+            != Some(&context)
+        {
+            return Err(ProjectContextError::Source(
+                "Work execution changed while reading Project facts".into(),
+            ));
+        }
+        Ok(true)
     }
 
     /// Return the stable, opaque Project id persisted on the session.
@@ -312,6 +405,14 @@ impl ProjectContextResolver {
             SessionProjectIdentity::Unassigned => {
                 let workspace =
                     self.resolve_workspace_candidate_for_instance(session, workspace)?;
+                if self
+                    .validate_work_workspace(session, workspace.as_deref())
+                    .await?
+                {
+                    // Keep the Session Unassigned. Only the exact Work workspace
+                    // is admitted; no adopted-Project resources are projected.
+                    return Ok(None);
+                }
                 if let Some(candidate) = workspace.as_deref() {
                     if let Some(owner_project_id) =
                         self.source.find_workspace_owner(candidate).await?
@@ -849,6 +950,10 @@ fn nearest_git_boundary(start: &Path) -> Option<PathBuf> {
         })
         .map(Path::to_path_buf)
 }
+
+#[cfg(test)]
+#[path = "project_context/work_execution_tests.rs"]
+mod work_execution_tests;
 
 #[cfg(test)]
 mod tests {

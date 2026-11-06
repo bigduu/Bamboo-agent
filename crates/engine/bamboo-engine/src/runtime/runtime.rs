@@ -1415,6 +1415,10 @@ impl AgentRuntime {
                 .run_id = plan.run_id().to_owned();
             plan.bind_session(session)
                 .map_err(|e| bamboo_agent_core::AgentError::LLM(e.to_string()))?;
+            if let Some(resolver) = loop_config.project_context_resolver.as_deref() {
+                loop_config.project_context_resolver =
+                    Some(Arc::new(resolver.for_work_execution(plan.clone())));
+            }
         }
 
         let trace_message_start = session.messages.len();

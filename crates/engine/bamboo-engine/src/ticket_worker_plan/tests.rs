@@ -8,10 +8,21 @@ use std::collections::BTreeSet;
 struct CreationPort {
     parent: Session,
     saved: std::sync::Mutex<Option<Session>>,
+    validated_workspace: Option<String>,
 }
 
 #[async_trait::async_trait]
 impl ChildSessionPort for CreationPort {
+    async fn validate_child_workspace(
+        &self,
+        _: Option<&bamboo_domain::ProjectId>,
+        workspace: &str,
+    ) -> std::result::Result<String, ChildSessionError> {
+        Ok(self
+            .validated_workspace
+            .clone()
+            .unwrap_or_else(|| workspace.into()))
+    }
     async fn validate_required_child_context_route(
         &self,
         _: &std::collections::HashMap<String, String>,
@@ -113,8 +124,12 @@ impl Fixture {
     }
 
     fn with_objective(objective: &str, with_project: bool) -> Self {
+        Self::with_workspace(objective, with_project, with_project)
+    }
+
+    fn with_workspace(objective: &str, with_project: bool, with_workspace: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let source = with_project.then(|| tempfile::tempdir().unwrap());
+        let source = with_workspace.then(|| tempfile::tempdir().unwrap());
         let source_path = source.as_ref().map(|dir| {
             dir.path()
                 .canonicalize()
@@ -187,14 +202,19 @@ impl Fixture {
                 temp_id: "a".into(),
                 // Metadata-only adapter fixture; physical Git/Host admission
                 // belongs to the native Work integration tests.
-                workspace: with_project.then(|| bamboo_tickets::ExecutionWorkspace {
-                    repo: source_path.clone().unwrap(),
-                    base_commit: "f9e69b9fbefdc0b5249c3dbe4cd1ef33739f19f7".into(),
-                    branch: "source-audit".into(),
-                    worktree: source_path.clone().unwrap(),
-                    write_roots: vec![source_path.clone().unwrap()],
-                    claims: BTreeSet::from([format!("worktree:{}", source_path.as_ref().unwrap())]),
-                }),
+                workspace: source_path
+                    .as_ref()
+                    .map(|_| bamboo_tickets::ExecutionWorkspace {
+                        repo: source_path.clone().unwrap(),
+                        base_commit: "f9e69b9fbefdc0b5249c3dbe4cd1ef33739f19f7".into(),
+                        branch: "source-audit".into(),
+                        worktree: source_path.clone().unwrap(),
+                        write_roots: vec![source_path.clone().unwrap()],
+                        claims: BTreeSet::from([format!(
+                            "worktree:{}",
+                            source_path.as_ref().unwrap()
+                        )]),
+                    }),
             },
         ]);
         let command = service
@@ -270,6 +290,7 @@ async fn ticket_child_creation_requires_host_packet_and_starts_with_no_parent_pl
     let port = CreationPort {
         parent: parent.clone(),
         saved: std::sync::Mutex::new(None),
+        validated_workspace: None,
     };
     let input = CreateChildInput {
         parent_session: parent,
@@ -338,32 +359,57 @@ async fn ticket_child_creation_requires_host_packet_and_starts_with_no_parent_pl
 
 #[tokio::test]
 async fn ticket_child_admits_multiline_packet_within_existing_required_byte_bounds() {
-    assert_bounded_ticket_child_packet(24, false).await;
+    assert_bounded_ticket_child_packet(24, false, false).await;
 }
 
 #[tokio::test]
 async fn ticket_child_admits_project_packet_without_losing_adopted_context() {
-    assert_bounded_ticket_child_packet(9, true).await;
+    assert_bounded_ticket_child_packet(9, true, false).await;
 }
 
-async fn assert_bounded_ticket_child_packet(repetitions: usize, with_project: bool) {
+#[tokio::test]
+async fn ticket_child_accepts_same_physical_workspace_from_host_display_validation() {
+    for with_project in [false, true] {
+        assert_bounded_ticket_child_packet(24, with_project, true).await;
+    }
+}
+
+async fn assert_bounded_ticket_child_packet(
+    repetitions: usize,
+    with_project: bool,
+    display_validation: bool,
+) {
     let objective =
         "Review the accepted source; cite exact lines and preserve evidence boundaries. "
             .repeat(repetitions);
     assert!(objective.len() < 2048);
-    let f = Fixture::with_objective(&objective, with_project);
+    let f = Fixture::with_workspace(&objective, with_project, with_project || display_validation);
     let workspace = tempfile::tempdir().unwrap();
     let parent = Session::new("fixture-supervisor", "fixture-model");
-    let port = CreationPort {
-        parent: parent.clone(),
-        saved: std::sync::Mutex::new(None),
-    };
     let runtime =
         Authority::from_verified_host(f.service.published().unwrap().1.binding, Principal::Runtime);
     let packet = f
         .service
         .child_context_packet(&runtime, &f.assignment, 65536)
         .unwrap();
+    let validated_workspace = display_validation.then(|| {
+        let canonical = std::path::Path::new(&packet.workspace.as_ref().unwrap().worktree);
+        let display =
+            std::path::PathBuf::from(bamboo_config::paths::path_to_display_string(canonical));
+        // The Host returns display forms, including non-verbatim paths on
+        // Windows. Exercise a distinct spelling on every local platform too.
+        let nested = display.join("display-form");
+        std::fs::create_dir(&nested).unwrap();
+        let alias = nested.join("..");
+        assert_ne!(alias, canonical);
+        assert_eq!(alias.canonicalize().unwrap(), canonical);
+        alias.to_string_lossy().into_owned()
+    });
+    let port = CreationPort {
+        parent: parent.clone(),
+        saved: std::sync::Mutex::new(None),
+        validated_workspace,
+    };
     let compact = serde_json::to_string(&packet).unwrap();
     assert!(
         compact.len() > 2048,
@@ -399,7 +445,7 @@ async fn assert_bounded_ticket_child_packet(repetitions: usize, with_project: bo
         disabled_tools: None,
         context_fork: None,
     };
-    create_ticket_child_action(&port, input, &f.service, &runtime, &f.assignment)
+    create_ticket_child_action(&port, input.clone(), &f.service, &runtime, &f.assignment)
         .await
         .expect("a bounded Work must not fail because its JSON was serialized on one line");
     let child = port.saved.lock().unwrap().clone().unwrap();
@@ -413,6 +459,21 @@ async fn assert_bounded_ticket_child_packet(repetitions: usize, with_project: bo
     assert!(binding.payload.required_assignment.len() <= bamboo_domain::MAX_CHILD_ASSIGNMENT_BYTES);
     assert_eq!(child.metadata[TICKET_LOCAL_PLAN_KEY], f.assignment);
     assert!(child.task_list.is_none());
+    assert_eq!(child.project_id_meta(), port.parent.project_id_meta());
+    if display_validation {
+        let other = tempfile::tempdir().unwrap();
+        let relocated = CreationPort {
+            parent: port.parent.clone(),
+            saved: std::sync::Mutex::new(None),
+            validated_workspace: Some(bamboo_config::paths::path_to_display_string(other.path())),
+        };
+        assert!(
+            create_ticket_child_action(&relocated, input, &f.service, &runtime, &f.assignment)
+                .await
+                .is_err()
+        );
+        assert!(relocated.saved.lock().unwrap().is_none());
+    }
 }
 
 #[test]
