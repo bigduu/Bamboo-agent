@@ -332,13 +332,9 @@ impl TicketWorkerPlan {
         }
         self.service.authorize_tool(&self.authority, "Task")?;
         let question = question_prompt(args)?;
-        let task_list = TaskTool::task_list_from_args_with_existing(
-            args,
-            &self.session_id,
-            session.task_list.as_ref(),
-            None,
-        )
-        .map_err(|e| Error::InvalidTransition(e.to_string()))?;
+        let task_list =
+            TaskTool::task_list_from_work_args(args, &self.session_id, session.task_list.as_ref())
+                .map_err(|e| Error::InvalidTransition(e.to_string()))?;
         let steps = task_list
             .items
             .iter()

@@ -277,13 +277,9 @@ pub fn apply_host_plan_request(
         // Refuse a plan that cannot fit the existing bounded callback reply
         // before committing it. A transport budget must not become a partial
         // success in which the Host writes but the Worker cannot read its plan.
-        let mut candidate = TaskTool::task_list_from_args_with_existing(
-            task,
-            &caller.id,
-            projection.task_list.as_ref(),
-            None,
-        )
-        .map_err(|e| Error::InvalidTransition(e.to_string()))?;
+        let mut candidate =
+            TaskTool::task_list_from_work_args(task, &caller.id, projection.task_list.as_ref())
+                .map_err(|e| Error::InvalidTransition(e.to_string()))?;
         let snapshot = service.published()?.1;
         let a = &snapshot.assignments[assignment];
         candidate.title = format!(
