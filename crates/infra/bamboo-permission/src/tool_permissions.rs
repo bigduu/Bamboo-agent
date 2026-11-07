@@ -1276,7 +1276,7 @@ pub fn check_permissions(
                     "SubAgent delete",
                     "SubAgent delete: remove a child session",
                 )])),
-                // wait / list / get / list_models → passive or read-only.
+                // Wait and read-only actions need no permission context.
                 _ => Ok(None),
             }
         }
@@ -3235,7 +3235,7 @@ mod tests {
             ("deploy_agent", json!({"action": "list"})),
             ("cluster", json!({"action": "list"})),
             ("cluster", json!({"action": "status", "node": "n1"})),
-            ("SubAgent", json!({"action": "list"})),
+            ("SubAgent", json!({"intent": "inspect"})),
             ("SubAgent", json!({"action": "wait"})),
             ("SubAgent", json!({"action": "get", "session_id": "c1"})),
             ("SubAgent", json!({"action": "list_models"})),

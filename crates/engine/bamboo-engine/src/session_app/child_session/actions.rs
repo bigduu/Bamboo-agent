@@ -7,9 +7,9 @@ use std::{future::Future, pin::Pin};
 
 use super::helpers::{
     append_subagent_delegation_contract, compute_status_guidance,
-    format_child_assignment_with_background, map_child_entry, metadata_text,
-    normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
-    replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
+    format_child_assignment_with_background, metadata_text, normalize_non_empty_optional,
+    normalize_required_text, render_forked_parent_context, replace_or_append_last_user_message,
+    truncate_after_index, truncate_after_last_user,
 };
 use super::{
     ChildSessionEntry, ChildSessionError, ChildSessionPort, CreateChildInput, CreateChildResult,
@@ -693,18 +693,6 @@ async fn create_child_action_inner(
     Ok(CreateChildResult {
         child_session_id: child.id,
         model,
-    })
-}
-
-pub async fn list_children_action(
-    port: &dyn ChildSessionPort,
-    parent_id: &str,
-) -> serde_json::Value {
-    let children = port.list_children(parent_id).await;
-    json!({
-        "parent_session_id": parent_id,
-        "children": children.iter().map(map_child_entry).collect::<Vec<_>>(),
-        "count": children.len(),
     })
 }
 

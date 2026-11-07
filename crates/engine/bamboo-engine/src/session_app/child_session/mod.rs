@@ -26,17 +26,16 @@ mod tests;
 pub use actions::{
     apply_child_session_update, assemble_session_tree, build_session_tree_action,
     cancel_child_action, create_child_action, create_shared_child_action,
-    create_ticket_child_action, delete_child_action, get_child_action, list_children_action,
-    rollback_failed_wait_launch, run_child_action, send_message_to_child_action,
-    send_message_to_child_action_with_gate, update_child_action,
-    update_child_action_with_background, ChildSessionUpdate, SessionTreeNode,
+    create_ticket_child_action, delete_child_action, get_child_action, rollback_failed_wait_launch,
+    run_child_action, send_message_to_child_action, send_message_to_child_action_with_gate,
+    update_child_action, update_child_action_with_background, ChildSessionUpdate, SessionTreeNode,
 };
 pub use depth_policy::validate_spawn_parent;
 pub use helpers::{
     append_subagent_delegation_contract, compute_status_guidance, format_child_assignment,
-    format_child_assignment_with_background, map_child_entry, metadata_text,
-    normalize_non_empty_optional, normalize_required_text, render_forked_parent_context,
-    replace_or_append_last_user_message, truncate_after_index, truncate_after_last_user,
+    format_child_assignment_with_background, metadata_text, normalize_non_empty_optional,
+    normalize_required_text, render_forked_parent_context, replace_or_append_last_user_message,
+    truncate_after_index, truncate_after_last_user,
 };
 pub use inspection::{inspect_child_action, inspect_child_report_action};
 pub use result_projection::{unavailable_child_result, MAX_CHILD_RESULT_BYTES};

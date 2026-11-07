@@ -1085,7 +1085,7 @@ mod tests {
         #[tokio::test]
         async fn disabled_suspension_keeps_subagent_read_and_cancel_authority_paths() {
             for args in [
-                json!({"action":"list"}),
+                json!({"intent":"inspect"}),
                 json!({"action":"get","child_session_id":"missing"}),
                 json!({"action":"cancel","child_session_id":"missing"}),
             ] {
