@@ -879,6 +879,9 @@ pub struct Session {
     /// force compression regardless of threshold. Set by `compact_context` tool.
     #[serde(skip)]
     pub force_manual_compression: Option<String>,
+    /// Runner-produced evidence for its next owned Root terminal save.
+    #[serde(skip)]
+    pub root_final_message_candidate: Option<Box<super::RootFinalMessageCandidate>>,
     /// Workspace directory for file operations in this session.
     /// For child sessions, this is set from the `workspace` field in `CreateChildInput`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -983,6 +986,7 @@ impl Session {
             agent_runtime_state: None,
             runtime_metadata: None,
             force_manual_compression: None,
+            root_final_message_candidate: None,
             workspace: None,
         }
     }
@@ -1081,6 +1085,7 @@ impl Session {
             agent_runtime_state: None,
             runtime_metadata: None,
             force_manual_compression: None,
+            root_final_message_candidate: None,
             workspace: None,
         }
     }

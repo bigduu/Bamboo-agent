@@ -1454,6 +1454,7 @@ pub fn spawn_session_execution_with_upstream_retry(
                 session.set_last_run_status("running");
             }
             let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
+            session.root_final_message_candidate = None;
             let (cancel_token, mut activation_registration) =
                 execution_reservation.disarm_for_execution();
 
@@ -1607,6 +1608,9 @@ pub fn spawn_session_execution_with_upstream_retry(
             }
 
             session.synchronize_terminal_runtime_status();
+            if result.is_err() || suspended_non_terminal {
+                session.root_final_message_candidate = None;
+            }
 
             // Bespoke terminal bookkeeping (e.g. a scheduled-run status) runs
             // here — before persistence — so any closing message the hook
@@ -1704,6 +1708,7 @@ pub fn spawn_session_execution_with_upstream_retry(
                     .map(|inherited| inherited.wait()),
             )
             .await;
+            session.root_final_message_candidate = None;
             let history_committed = saved.is_ok();
             let completion_source =
                 super::child_completion::ChildCompletionSource::after_final_save(

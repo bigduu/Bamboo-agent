@@ -39,7 +39,7 @@ use bamboo_domain::{
     CapabilityMatch, CapabilitySource, ClassifiedToolSchema, DiscoverCapabilitiesRequest,
     EffectiveCallableSet, HookPayload, HookResult, ProviderFamily, ProviderProtocol,
     ProviderTranscriptAuthor, ProviderTranscriptItem, ProviderTranscriptItemKind,
-    ProviderTranscriptOrigin,
+    ProviderTranscriptOrigin, RootFinalMessageCandidate, RootFinalMessageReference,
 };
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::{
@@ -2505,11 +2505,13 @@ async fn handle_no_tool_calls_with_native(
     // assistant message was appended).
     let add_message_before_gold =
         config.goal_loop_active() || config.effective_counted_loop().is_some();
-    let mut deferred_assistant_message = Some(assistant_with_visible_identity(
+    let assistant = assistant_with_visible_identity(
         Message::assistant_with_reasoning(content, None, reasoning)
             .with_reasoning_signature(reasoning_signature),
         visible_message,
-    ));
+    );
+    let answer_id = assistant.id.clone();
+    let mut deferred_assistant_message = Some(assistant);
     let buffered_candidate = config.features_final_evidence_check.then(|| {
         deferred_assistant_message
             .as_ref()
@@ -2812,6 +2814,29 @@ async fn handle_no_tool_calls_with_native(
     }
     if let Some(message) = deferred_assistant_message.take() {
         commit_assistant_message(session, message, &mut native_items)?;
+    }
+    if let Some(owner) = config
+        .persistence
+        .as_ref()
+        .and_then(|persistence| persistence.root_actor_writer())
+        .filter(|owner| {
+            owner.fence.actor_id.as_str() == session.id && owner.created_at == session.created_at
+        })
+    {
+        // Stop/AfterRound hooks can append context. Bind the exact accepted
+        // answer, including any revision made by the final evidence check.
+        session.root_final_message_candidate = session
+            .messages
+            .iter()
+            .rev()
+            .find(|message| message.id == answer_id)
+            .and_then(RootFinalMessageReference::capture)
+            .map(|message| {
+                Box::new(RootFinalMessageCandidate {
+                    run_id: owner.fence.run_id,
+                    message,
+                })
+            });
     }
     let usage = to_event_token_usage(
         complete_usage.prompt_tokens,
