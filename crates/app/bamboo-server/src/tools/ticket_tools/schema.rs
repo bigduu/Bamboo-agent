@@ -29,7 +29,9 @@ pub fn parameters(name: &str) -> Value {
         "work_inspect" => object(
             json!({"ids":ids,"depth":{"type":"integer","minimum":0,"maximum":4},
             "sections":{"type":"array","uniqueItems":true,"maxItems":3,"items":{"type":"string","enum":["assignments","requests","submissions"]}},
-            "budget_bytes":{"type":"integer","minimum":128,"maximum":65536},"fixed_commit":nullable_id}),
+            "budget_bytes":{"type":"integer","minimum":128,"maximum":65536},"fixed_commit":nullable_id,
+            "submission_id":{"type":["string","null"],"description":"Exact handoff. Use one Work ID, depth 0, and empty sections."},
+            "source_path":{"type":["string","null"],"maxLength":1024,"description":"One recorded Work file path for the selected submission."}}),
             &["ids", "sections", "depth", "budget_bytes", "fixed_commit"],
         ),
         "work_review" => object(

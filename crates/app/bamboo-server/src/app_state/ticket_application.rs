@@ -878,4 +878,33 @@ impl TicketApplication {
             .clone();
         ticket_runtime::query_dispatch(self.storage.as_ref(), &service, key, &spec).await
     }
+
+    pub(crate) async fn inspect_handoff(
+        &self,
+        service: &TicketService,
+        authority: &Authority,
+        request: bamboo_orchestration::handoff::Request<'_>,
+    ) -> Result<Value> {
+        let facts = service.work_submission_facts(
+            authority,
+            request.work_id,
+            request.submission_id,
+            request.fixed_commit,
+        )?;
+        let session = match ticket_runtime::load_handoff_session(self.storage.as_ref(), &facts.data)
+            .await
+        {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(submission_id = %request.submission_id, %error, "Work handoff execution evidence unavailable");
+                None
+            }
+        };
+        bamboo_orchestration::handoff::project(
+            &facts,
+            session.as_ref(),
+            request.source_path,
+            request.budget_bytes,
+        )
+    }
 }

@@ -6,9 +6,10 @@ pub mod token_budget;
 use actix_web::{http::StatusCode, web, HttpMessage, HttpRequest, HttpResponse, ResponseError};
 use bamboo_engine::ticket_worker_plan::tickets::*;
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::{
-    app_state::AppState,
+    app_state::{ticket_application::TicketApplication, AppState},
     handlers::settings::{bootstrap_access_snapshot, BootstrapRequestState},
 };
 
@@ -141,15 +142,56 @@ pub struct InspectRequest {
     pub fixed_commit: Option<String>,
     #[serde(default)]
     pub sections: Option<std::collections::BTreeSet<InspectSection>>,
+    pub submission_id: Option<String>,
+    pub source_path: Option<String>,
 }
 impl InspectRequest {
-    pub fn options(&self) -> InspectOptions {
-        InspectOptions {
-            sections: self.sections.clone().unwrap_or_else(all_inspect_sections),
-            depth: self.depth,
-            budget_bytes: self.budget_bytes,
-            fixed_commit: self.fixed_commit.clone(),
+    pub(crate) async fn read(
+        &self,
+        app: &TicketApplication,
+        service: &TicketService,
+        authority: &Authority,
+    ) -> Result<Value> {
+        if let Some(submission_id) = &self.submission_id {
+            let [work_id] = self.ids.as_slice() else {
+                return Err(Error::InvalidTransition(
+                    "handoff requires one Work ID".into(),
+                ));
+            };
+            if self.depth != 0 || self.sections.as_ref().is_some_and(|s| !s.is_empty()) {
+                return Err(Error::InvalidTransition(
+                    "handoff requires depth 0 and no history sections".into(),
+                ));
+            }
+            return app
+                .inspect_handoff(
+                    service,
+                    authority,
+                    bamboo_orchestration::handoff::Request {
+                        work_id,
+                        submission_id,
+                        fixed_commit: self.fixed_commit.as_deref(),
+                        source_path: self.source_path.as_deref(),
+                        budget_bytes: self.budget_bytes,
+                    },
+                )
+                .await;
         }
+        if self.source_path.is_some() {
+            return Err(Error::InvalidTransition(
+                "source_path requires submission_id".into(),
+            ));
+        }
+        Ok(serde_json::to_value(service.work_inspect_sections(
+            authority,
+            &self.ids,
+            &InspectOptions {
+                sections: self.sections.clone().unwrap_or_else(all_inspect_sections),
+                depth: self.depth,
+                budget_bytes: self.budget_bytes,
+                fixed_commit: self.fixed_commit.clone(),
+            },
+        )?)?)
     }
 }
 
@@ -159,11 +201,7 @@ pub async fn inspect(
     body: web::Json<InspectRequest>,
 ) -> std::result::Result<HttpResponse, TicketHttpError> {
     let (service, authority) = state.tickets.authority(user(&state, &req).await?).await?;
-    Ok(HttpResponse::Ok().json(service.work_inspect_sections(
-        &authority,
-        &body.ids,
-        &body.options(),
-    )?))
+    Ok(HttpResponse::Ok().json(body.read(&state.tickets, &service, &authority).await?))
 }
 
 #[derive(Deserialize)]

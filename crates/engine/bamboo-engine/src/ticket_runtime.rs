@@ -5,7 +5,7 @@ use std::sync::Arc;
 use bamboo_domain::{Session, SessionAuthorityIdentity, SessionKind, Storage};
 use bamboo_tickets::{
     canonical_bytes, content_hash, AssignmentState, Authority, DispatchSpec, Error, Operation,
-    Principal, Result, RuntimeReceipt, ScopeBinding, TicketService, WorkState,
+    Principal, Result, RuntimeReceipt, ScopeBinding, SubmissionFacts, TicketService, WorkState,
 };
 use serde::{Deserialize, Serialize};
 
@@ -179,6 +179,38 @@ pub fn read_dispatch(session: &Session) -> Result<Option<TicketDispatchBinding>>
             Ok(serde_json::from_str(raw)?)
         })
         .transpose()
+}
+
+/// Read the retained execution named by a ledger submission. The model never
+/// supplies a Session identity or a file path to this storage boundary.
+pub async fn load_handoff_session(
+    storage: &dyn Storage,
+    facts: &SubmissionFacts,
+) -> Result<Option<Session>> {
+    let receipt = &facts.submission.runtime;
+    if receipt.session_id != ticket_child_id(&receipt.dispatch_key) {
+        return Ok(None);
+    }
+    let Some(session) = storage
+        .load_execution_admission_snapshot(&receipt.session_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(dispatch) = read_dispatch(&session)? else {
+        return Ok(None);
+    };
+    let exact = session.kind == SessionKind::Child
+        && session.id == receipt.session_id
+        && session.parent_session_id.as_deref() == Some(&facts.binding.supervisor_session_id)
+        && session.root_session_id == facts.binding.supervisor_session_id
+        && dispatch.binding == facts.binding
+        && dispatch.assignment_id == facts.assignment.id
+        && dispatch.dispatch_key == receipt.dispatch_key
+        && dispatch.spec_hash == receipt.spec_hash
+        && dispatch.receipt.as_ref() == Some(receipt)
+        && dispatch.receipt_created_at == Some(session.created_at);
+    Ok(exact.then_some(session))
 }
 
 /// Ticket owns this child's result/recovery lifecycle. A short Supervisor turn

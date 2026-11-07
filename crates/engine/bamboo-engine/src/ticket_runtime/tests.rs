@@ -74,6 +74,145 @@ async fn ticket_completed_checkpoint_recovers_unpublished_stop_and_submission_af
     );
 }
 
+#[tokio::test]
+async fn exact_handoff_keeps_plan_and_scoped_reads_separate_from_artifact_claims() {
+    use bamboo_domain::{FunctionCall, Message, ToolCall};
+    use bamboo_orchestration::handoff::project;
+    use bamboo_tickets::{LocalStep, StepStatus};
+    use serde_json::json;
+
+    for with_plan in [true, false] {
+        let mut f = Fixture::new().await;
+        let _registration = f
+            .runtime
+            .router
+            .register_run(&f.child.id, "handoff-run")
+            .await
+            .unwrap();
+        admit_ticket_run(&f.service, &f.runtime, &mut f.child, "handoff-run")
+            .await
+            .unwrap();
+        let worker = Authority::from_verified_host(
+            f.spec.binding.clone(),
+            Principal::Worker {
+                assignment_id: f.spec.assignment_id.clone(),
+                generation: f.spec.generation,
+                run_id: "handoff-run".into(),
+                session_id: f.child.id.clone(),
+            },
+        );
+        if with_plan {
+            execute_runtime_command(
+                &f.service,
+                &worker,
+                "worker-plan",
+                vec![Operation::ReplacePlan {
+                    assignment_id: f.spec.assignment_id.clone(),
+                    expected_plan_revision: 0,
+                    steps: vec![LocalStep {
+                        id: "check".into(),
+                        parent: None,
+                        title: "Verify source digest".into(),
+                        completed: false,
+                        status: Some(StepStatus::InProgress),
+                    }],
+                }],
+            )
+            .unwrap();
+        }
+        let recorded_hash = content_hash(b"recorded source");
+        let wrong_hash = content_hash(b"different source");
+        f.child.messages.push(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: "read-source".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "Read".into(),
+                    arguments: json!({"file_path":"src/example.rs"}).to_string(),
+                },
+            }]),
+        ));
+        let read = Message::tool_result(
+            "read-source",
+            json!({
+                "content":"recorded", "sha256":recorded_hash, "artifact":null,
+                "page":{"offset_bytes":0,"end_offset_bytes":8,"total_bytes":15,
+                    "start_line":1,"end_line":1,"next_offset_bytes":8,"eof":false}
+            })
+            .to_string(),
+        );
+        let read_id = read.id.clone();
+        f.child.messages.push(read);
+        let output = Message::assistant(format!("Source digest: {wrong_hash}"), None);
+        let output_id = output.id.clone();
+        let artifact_hash = content_hash(output.content.as_bytes());
+        f.child.messages.push(output);
+        f.child.set_last_run_status("completed");
+        save_owned_stop_fixture(&mut f.child, true);
+        f.storage.save_session(&f.child).await.unwrap();
+        let submission_id =
+            checkpoint_ticket_result(&f.service, f.storage.as_ref(), &f.child, "handoff-run")
+                .await
+                .unwrap()
+                .unwrap()
+                .ids["submission"]
+                .clone();
+        let supervisor = Authority::from_verified_host(
+            f.spec.binding.clone(),
+            Principal::Supervisor {
+                session_id: f.supervisor.id.clone(),
+            },
+        );
+        let (before, _) = f.service.published().unwrap();
+        let facts = f
+            .service
+            .work_submission_facts(&supervisor, &f.spec.work_id, &submission_id, Some(&before))
+            .unwrap();
+        let session = load_handoff_session(f.storage.as_ref(), &facts.data)
+            .await
+            .unwrap()
+            .unwrap();
+        let path = Some("src/example.rs");
+        let view = project(&facts, Some(&session), path, 4096).unwrap();
+        assert_eq!(view["work_state"], "submitted");
+        assert_eq!(view["accepted"], false);
+        assert_eq!(view["process_stopped"], true);
+        assert_eq!(view["committed_plan"]["revision"], u64::from(with_plan));
+        if with_plan {
+            assert_eq!(view["committed_plan"]["steps"][0]["status"], "in_progress");
+        } else {
+            assert_eq!(view["committed_plan"]["steps"], json!([]));
+        }
+        assert_eq!(view["terminal_message"]["message_id"], output_id);
+        assert_eq!(view["artifacts"][0]["sha256"], artifact_hash);
+        assert_eq!(view["source_reads"]["records"][0]["message_id"], read_id);
+        assert_eq!(view["source_reads"]["records"][0]["sha256"], recorded_hash);
+        assert_eq!(view["source_reads"]["records"][0]["page"]["eof"], false);
+        assert_ne!(view["source_reads"]["records"][0]["sha256"], wrong_hash);
+        assert!(matches!(
+            project(&facts, Some(&session), path, 128),
+            Err(Error::ContextBudgetExceeded)
+        ));
+        let missing = project(&facts, None, path, 4096).unwrap();
+        assert_eq!(missing["terminal_message"], json!(null));
+        assert_eq!(
+            missing["source_reads"]["status"],
+            "execution_evidence_unavailable"
+        );
+        assert!(f
+            .service
+            .work_submission_facts(&supervisor, "other-work", &submission_id, None)
+            .is_err());
+        assert!(matches!(
+            f.service
+                .work_submission_facts(&worker, &f.spec.work_id, &submission_id, None),
+            Err(Error::ScopeDenied(_))
+        ));
+        assert_eq!(f.service.published().unwrap().0, before);
+    }
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     service: Arc<TicketService>,
