@@ -405,6 +405,19 @@ async fn native_work_read_activity_cannot_advance_the_committed_plan() {
     reply_call(first, "plan-start", "Task", task("in_progress"));
     let read_round = next(&mut requests).await;
     assert_eq!(reply(&read_round, "plan-start").tool_success, Some(true));
+    // The forwarder caches each committed plan before broadcasting it. Seeing
+    // this event on the original connection fences the later replay check.
+    let initial_plan = tokio::time::timeout(WAIT, async {
+        loop {
+            if let AgentEvent::TaskListUpdated { task_list, version } = events.recv().await.unwrap()
+            {
+                assert_eq!(task_list.session_id, child_id);
+                break (version, task_list.items[0].status.clone());
+            }
+        }
+    })
+    .await
+    .expect("original connection receives the first committed plan");
     let reads = (0..4)
         .map(|index| ToolCall {
             id: format!("read-activity-{index}"),
@@ -485,7 +498,7 @@ async fn native_work_read_activity_cannot_advance_the_committed_plan() {
     let finish_run = next(&mut requests).await;
     assert_eq!(reply(&finish_run, "plan-finish").tool_success, Some(true));
     let mut observed_reads = BTreeSet::new();
-    let mut observed_plans = Vec::new();
+    let mut observed_plans = vec![initial_plan];
     let mut speculative = Vec::new();
     tokio::time::timeout(WAIT, async {
         loop {
