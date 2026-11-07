@@ -7,6 +7,74 @@ use bamboo_storage::{SessionIndexEntry, SessionPlacement};
 
 use bamboo_engine::model_config_helper::parse_session_gold_config;
 
+/// What a session is doing right now, as far as an observer can tell.
+///
+/// `is_running` alone is the runner's own liveness, and a Root **yields** while
+/// it waits for delegated children or a background shell. During those windows
+/// no runner is executing, so `is_running` reads `false` even though real work is
+/// in flight — clients then have nothing to distinguish "waiting" from
+/// "finished", and the last message (often a tool call) becomes the only signal.
+///
+/// This label is a *derived* observation for presentation. It never grants
+/// control authority, and it deliberately reports a wait rather than an outcome:
+/// only `last_run_status` decides that a run ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionActivity {
+    /// A runner is executing this session right now.
+    Running,
+    /// Yielded while delegated children execute, including the gap between the
+    /// last child finishing and this Root resuming.
+    WaitingChildren,
+    /// Yielded while a background shell executes; its result resumes the run.
+    WaitingBash,
+    /// Blocked on the user (a pending question).
+    WaitingUser,
+    /// The last run reached a terminal status.
+    Terminal,
+    /// Nothing in flight and no terminal status recorded.
+    Idle,
+}
+
+impl SessionActivity {
+    /// Precedence, strongest evidence first.
+    ///
+    /// A live runner outranks everything it contradicts. A pending question is a
+    /// wait the user must break, so it outranks the delegation mirrors — a Root
+    /// that yielded *and* has a question is waiting on the user. A terminal
+    /// `last_run_status` outranks the wait mirrors, so a wait that outlived its
+    /// run can never keep a finished session looking busy; that is the same rule
+    /// the execution reducer applies client-side.
+    pub(crate) fn derive(
+        is_running: bool,
+        has_pending_question: bool,
+        last_run_status: Option<&str>,
+        running_child_count: u32,
+        waiting_for_children: bool,
+        waiting_for_bash: bool,
+    ) -> Self {
+        if is_running {
+            return Self::Running;
+        }
+        if has_pending_question {
+            return Self::WaitingUser;
+        }
+        if matches!(last_run_status, Some("completed" | "error" | "cancelled")) {
+            return Self::Terminal;
+        }
+        // A counted running child is fresher than the persisted wait: it covers
+        // the delegation itself, while the mirror also covers the gap after the
+        // last child stops and before this Root's runner resumes.
+        if running_child_count > 0 || waiting_for_children {
+            return Self::WaitingChildren;
+        }
+        if waiting_for_bash {
+            return Self::WaitingBash;
+        }
+        Self::Idle
+    }
+}
+
 /// Minimal public workflow lifecycle identity. Durable activation metadata also
 /// contains the immutable arguments, context fingerprint and dynamic provider
 /// output used by the runtime; none of those payloads belong in a session
@@ -158,6 +226,18 @@ pub struct SessionSummary {
     /// Computed dynamically at query time by scanning running sessions.
     #[serde(default)]
     pub running_child_count: u32,
+    /// Derived presentation label answering "what is this session doing now?".
+    /// `is_running` alone cannot express a yielded run, so this is the field
+    /// clients should prefer over inferring liveness from `is_running` plus
+    /// `last_run_status`. It carries no control authority.
+    pub activity: SessionActivity,
+    /// Persisted wait discriminants, kept only so [`Self::refresh_activity`] can
+    /// re-derive after `running_child_count` is computed. Clients read `activity`,
+    /// never these raw runtime mirrors.
+    #[serde(skip)]
+    wait_for_children: bool,
+    #[serde(skip)]
+    wait_for_bash: bool,
     /// Total number of child sessions in this root session's flattened tree.
     ///
     /// This lets list clients render an expansion affordance without eagerly
@@ -217,7 +297,9 @@ impl SessionSummary {
         } else {
             entry.permission_mode
         };
-        Self {
+        let wait_for_children = entry.waiting_for_children;
+        let wait_for_bash = entry.waiting_for_bash;
+        let mut summary = Self {
             id: entry.id,
             execution_compatibility: None,
             project_id,
@@ -257,13 +339,45 @@ impl SessionSummary {
             root_mode_transition_epoch: None,
             root_mode_birth_token: None,
             running_child_count: 0,
+            // Derived from the fields just moved in; callers that add their own
+            // `running_child_count` call `refresh_activity()` afterwards.
+            activity: SessionActivity::Idle,
+            wait_for_children,
+            wait_for_bash,
             subagent_count: 0,
             gold_config: parse_session_gold_config(entry.gold_config_json.as_deref()),
             bypass_permissions: entry.bypass_permissions
                 || permission_mode != bamboo_domain::SessionPermissionMode::Default,
             permission_mode,
             placement: entry.placement.unwrap_or_else(local_placement),
-        }
+        };
+        summary.refresh_activity();
+        summary
+    }
+
+    /// Re-derive [`Self::activity`] from this summary's own observed fields.
+    ///
+    /// Call after assigning `running_child_count` (or any other input), so the
+    /// label always agrees with the row it travels with.
+    pub(crate) fn refresh_activity(&mut self) {
+        self.activity = SessionActivity::derive(
+            self.is_running,
+            self.has_pending_question,
+            self.last_run_status.as_deref(),
+            self.running_child_count,
+            self.wait_for_children,
+            self.wait_for_bash,
+        );
+    }
+
+    /// Take the wait discriminants from the authoritative session instead of the
+    /// index mirror, then re-derive. Detail reads already load that session, so
+    /// they never have to trust the rebuildable index row.
+    pub(crate) fn adopt_activity_waits(&mut self, session: &bamboo_domain::Session) {
+        let runtime = session.agent_runtime_state.as_ref();
+        self.wait_for_children = runtime.is_some_and(|state| state.waiting_for_children.is_some());
+        self.wait_for_bash = runtime.is_some_and(|state| state.waiting_for_bash.is_some());
+        self.refresh_activity();
     }
 }
 
@@ -730,6 +844,9 @@ mod tests {
             root_mode_transition_epoch: None,
             root_mode_birth_token: None,
             running_child_count: 0,
+            activity: SessionActivity::Idle,
+            wait_for_children: false,
+            wait_for_bash: false,
             subagent_count: 0,
             gold_config: None,
         };
@@ -788,6 +905,9 @@ mod tests {
             root_mode_transition_epoch: None,
             root_mode_birth_token: None,
             running_child_count: 0,
+            activity: SessionActivity::Idle,
+            wait_for_children: false,
+            wait_for_bash: false,
             subagent_count: 0,
             gold_config: None,
         };
@@ -933,6 +1053,9 @@ mod tests {
             root_mode_transition_epoch: None,
             root_mode_birth_token: None,
             running_child_count: 0,
+            activity: SessionActivity::Idle,
+            wait_for_children: false,
+            wait_for_bash: false,
             subagent_count: 0,
             gold_config: None,
         };
