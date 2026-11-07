@@ -406,12 +406,14 @@ async fn create_child_action_inner(
         child.set_provider_name(parent_provider);
     }
 
-    // Apply explicit reasoning_effort override if the LLM passed one;
-    // otherwise leave at `None` (provider default). Per CreateChildInput
-    // contract, children do NOT inherit the parent's reasoning_effort.
-    if let Some(effort) = input.reasoning_effort {
-        child.reasoning_effort = Some(effort);
-    }
+    // Work has no model-facing effort argument. Use its final selected ref,
+    // after any named profile override, rather than borrowing the discarded
+    // role's effort for another account/model. Ordinary children retain their
+    // explicit-override/provider-default contract and never inherit parent effort.
+    child.reasoning_effort = input.reasoning_effort.or_else(|| {
+        ticket_context.as_ref()?;
+        input.model_ref_override.as_ref()?.reasoning_effort
+    });
 
     // Children inherit the parent's exact permission posture. Auto must remain
     // distinct from legacy Bypass so forced confirmations do not reappear at a

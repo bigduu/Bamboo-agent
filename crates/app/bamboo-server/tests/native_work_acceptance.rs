@@ -25,6 +25,9 @@ use tokio::sync::mpsc;
 mod native_work;
 use native_work::{execution_workspace, host, LocalProvider, CALL, RESULT, WAIT};
 
+#[path = "native_work_acceptance/model_route.rs"]
+mod model_route;
+
 #[actix_web::test]
 async fn native_task_submission_requires_owner_accept_and_survives_host_restart() {
     let root = tempfile::tempdir().unwrap();

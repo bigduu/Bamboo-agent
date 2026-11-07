@@ -1256,7 +1256,7 @@ impl AppState {
             sessions.clone(),
             agent_runners.clone(),
             session_event_senders.clone(),
-            subagent_model_resolver,
+            subagent_model_resolver.clone(),
             config.clone(),
             provider_registry.clone(),
             config_snapshot.subagents().broker.clone(),
@@ -1416,12 +1416,10 @@ impl AppState {
             .await
             .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?,
         );
-        // Dedicated child-session adapter backing the guardian review spawner.
-        // The guardian path passes an explicit model (no subagent_type routing)
-        // and registers its parent wait at the terminal gate (not via the
-        // adapter's coalescing slots), so a lightweight adapter with no resolver
-        // and a fresh wait-slot map suffices. `Arc<ChildSessionAdapter>` doubles
-        // as `Arc<dyn GuardianSpawner>`.
+        // Dedicated adapter shared by Guardian, Workflow and native Work.
+        // Guardian passes an explicit model and registers its own terminal wait;
+        // native Work uses the same saved role resolver as the Root tools.
+        // `Arc<ChildSessionAdapter>` also implements `GuardianSpawner`.
         let child_adapter = Arc::new(crate::tools::ChildSessionAdapter {
             browser: Some(browser.clone()),
             session_store: session_store.clone(),
@@ -1432,7 +1430,7 @@ impl AppState {
             sessions_cache: sessions.clone(),
             agent_runners: agent_runners.clone(),
             session_event_senders: session_event_senders.clone(),
-            subagent_model_resolver: None,
+            subagent_model_resolver,
             config: config.clone(),
             project_store: Some(project_store.clone()),
             workspace_resolver: workspace_resolver.clone(),
