@@ -1095,6 +1095,7 @@ impl FileSessionInbox {
     ) -> Result<bamboo_domain::ManagedRootEventRead, SessionInboxError> {
         use bamboo_domain::{
             ManagedRootBlockerEvidence, ManagedRootEvent, ManagedRootEventRead as Read,
+            ManagedRootOutcome,
         };
         let ManagedRootEventSelection {
             target,
@@ -1212,13 +1213,19 @@ impl FileSessionInbox {
             {
                 Ok(input) => {
                     let event = if let Some(result) = result {
-                        ManagedRootEvent::Outcome(bamboo_domain::ObserverSupervisedRootOutcome {
-                            target_session_id: root.id.clone(),
-                            target_created_at: root.created_at,
-                            sequence: fact.sequence,
-                            run_id: fact.run_id.clone(),
-                            status: result.clone(),
-                            inputs: vec![input],
+                        ManagedRootEvent::Outcome(ManagedRootOutcome {
+                            observed: bamboo_domain::ObserverSupervisedRootOutcome {
+                                target_session_id: root.id.clone(),
+                                target_created_at: root.created_at,
+                                sequence: fact.sequence,
+                                run_id: fact.run_id.clone(),
+                                status: result.clone(),
+                                inputs: vec![input],
+                            },
+                            final_message: notifying_input
+                                .is_none()
+                                .then(|| fact.verified_final_message(&root).cloned())
+                                .flatten(),
                         })
                     } else {
                         let blocker = blocker.expect("filtered blocker");
@@ -1313,8 +1320,8 @@ impl FileSessionInbox {
             bamboo_domain::ManagedRootEvent::Outcome(outcome) => supervised_root_outcome_envelope(
                 &supervisor,
                 authority.source.created_at,
-                &outcome,
-                &outcome.inputs[0],
+                &outcome.observed,
+                &outcome.observed.inputs[0],
                 now,
             ),
             bamboo_domain::ManagedRootEvent::Blocker(blocker) => managed_root_blocker_envelope(

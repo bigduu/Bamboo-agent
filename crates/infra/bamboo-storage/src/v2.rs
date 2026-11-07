@@ -7704,6 +7704,15 @@ impl SessionStoreV2 {
             } else {
                 durable_outcomes.cloned()
             };
+            let current = if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
+                let mut current = session.clone();
+                if let Some(durable_outcomes) = durable_outcomes {
+                    rebase_supervised_input_transcript(&mut current, durable, durable_outcomes)?;
+                }
+                Some(current)
+            } else {
+                None
+            };
             if guards.root_outcome_finalized {
                 if guards.input.is_some() {
                     return Err(io::Error::new(
@@ -7756,20 +7765,22 @@ impl SessionStoreV2 {
                                 ));
                             }
                         };
-                        outcomes.finalize(&owner.fence, result).map_err(|error| {
-                            io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                bamboo_domain::SessionAuthorityConflict(error.into()),
+                        outcomes
+                            .finalize_from_main(
+                                &owner.fence,
+                                result,
+                                current.as_ref().unwrap_or(session),
                             )
-                        })?;
+                            .map_err(|error| {
+                                io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    bamboo_domain::SessionAuthorityConflict(error.into()),
+                                )
+                            })?;
                     }
                 }
             }
-            if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
-                let mut current = session.clone();
-                if let Some(durable_outcomes) = durable_outcomes {
-                    rebase_supervised_input_transcript(&mut current, durable, durable_outcomes)?;
-                }
+            if let Some(mut current) = current {
                 if let Some(outcomes) = outcomes {
                     current
                         .runtime_metadata
