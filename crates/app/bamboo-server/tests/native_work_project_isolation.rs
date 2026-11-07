@@ -401,7 +401,14 @@ async fn native_work_read_activity_cannot_advance_the_committed_plan() {
         .session_id
         .clone();
     let mut events = state.get_session_event_sender(&child_id).await.subscribe();
-    let task = |status| json!({"tasks":[{"id":"read-step","content":"Read the assigned fixture and record evidence","status":status}]});
+    let task = |status| {
+        json!({"tasks":[{
+            "id":"read-step",
+            "content":"Read the assigned fixture and record evidence",
+            "status":status,
+            "completionCriteria":["Read the scoped source bytes"]
+        }]})
+    };
     reply_call(first, "plan-start", "Task", task("in_progress"));
     let read_round = next(&mut requests).await;
     assert_eq!(reply(&read_round, "plan-start").tool_success, Some(true));
@@ -536,6 +543,18 @@ async fn native_work_read_activity_cannot_advance_the_committed_plan() {
             (Some(2), TaskItemStatus::Completed)
         ],
     );
+    for path in [
+        format!("/api/v1/sessions/{child_id}/task"),
+        format!("/api/v1/task/{child_id}"),
+    ] {
+        let response =
+            test::call_service(&app, test::TestRequest::get().uri(&path).to_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let plan: Value = test::read_body_json(response).await;
+        assert_eq!(plan["session_id"], child_id);
+        assert_eq!(plan["version"], 2);
+        assert_eq!(plan["items"][0]["status"], "completed");
+    }
     finish_run
         .reply
         .send(LLMChunk::Token(format!(
