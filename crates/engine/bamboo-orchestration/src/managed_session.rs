@@ -421,13 +421,16 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_pending_ack_is_rechecked_without_another_run_signal() {
-        let expected = ManagedRootEvent::Outcome(bamboo_domain::ObserverSupervisedRootOutcome {
-            target_session_id: "root".into(),
-            target_created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
-            sequence: 1,
-            run_id: "exact-run".into(),
-            status: bamboo_domain::SupervisedRootOutcomeResult::Completed,
-            inputs: vec![],
+        let expected = ManagedRootEvent::Outcome(bamboo_domain::ManagedRootOutcome {
+            observed: bamboo_domain::ObserverSupervisedRootOutcome {
+                target_session_id: "root".into(),
+                target_created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                sequence: 1,
+                run_id: "exact-run".into(),
+                status: bamboo_domain::SupervisedRootOutcomeResult::Completed,
+                inputs: vec![],
+            },
+            final_message: None,
         });
         let start = tokio::time::Instant::now();
         let mut reads = 0;

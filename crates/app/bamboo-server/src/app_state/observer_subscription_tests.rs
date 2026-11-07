@@ -999,9 +999,47 @@ async fn admit_native_source(
 }
 
 pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
+    use bamboo_config::{
+        LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig,
+        DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+    };
+    use bamboo_domain::Role;
+    use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+    use sha2::{Digest, Sha256};
+
+    fn answer_after(session: &Session, receipt: &str) -> Value {
+        use bamboo_domain::{MessagePhase, Role};
+        let input = session
+            .messages
+            .iter()
+            .position(|m| m.id == receipt)
+            .unwrap();
+        let mut answers = session.messages[input + 1..]
+            .iter()
+            .take_while(|message| message.role != Role::User)
+            .filter(|message| message.phase == Some(MessagePhase::FinalAnswer));
+        let answer = answers.next().expect("canonical reply after this input");
+        assert!(answers.next().is_none());
+        assert_eq!(answer.content, "Synthetic original Root finished.");
+        json!({
+            "message_id": answer.id,
+            "content_sha256": hex::encode(Sha256::digest(answer.content.as_bytes())),
+        })
+    }
 
     let f = Fixture::new_with_native_source(true).await;
+    f.state.config.write().await.lifecycle_hooks = LifecycleHooksConfig {
+        enabled: true,
+        stop: vec![LifecycleHookGroup {
+            hooks: vec![LifecycleHookHandler::command(
+                r#"printf '%s' '{"additional_context":"Retained Stop hook context."}'"#,
+                DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+            )],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
     let workspace = f.home.path().join("second-source-workspace");
     std::fs::create_dir(&workspace).unwrap();
     let mut second = load(&f.state, ROOT_B).await;
@@ -1010,6 +1048,18 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     second.set_provider_name(PROVIDER);
     second.workspace = Some(workspace.to_string_lossy().into());
     second.set_workspace_path_meta(workspace.to_string_lossy());
+    // With an active Goal, the terminal answer is committed before Stop runs.
+    // A zero continuation budget keeps this fixture on its single provider turn.
+    second.metadata.insert(
+        GOLD_CONFIG_METADATA_KEY.into(),
+        json!({
+            "enabled": true,
+            "auto_continue_enabled": true,
+            "goal": "Complete the managed assignment",
+            "max_auto_continuations": 0,
+        })
+        .to_string(),
+    );
     f.state.storage.save_session(&second).await.unwrap();
     f.state
         .permission_checker
@@ -1029,7 +1079,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     let first = managed_target(&f.state, &f.reference, ROOT_A).await;
     let second = managed_target(&f.state, &f.reference, ROOT_B).await;
     f.probe.hold_sources.store(true, Ordering::SeqCst);
-    let (_, second_input) = tokio::join!(
+    let (first_input, second_input) = tokio::join!(
         admit_native_source(&f, &first, "managed-wait-first", "managed wait first"),
         admit_native_source(&f, &second, "managed-wait-second", "managed wait second"),
     );
@@ -1095,6 +1145,15 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         result["outcome"]["inputs"][0]["receipt_id"],
         second_input["receipt_id"]
     );
+    let second_main = load(&f.state, ROOT_B).await;
+    let hook_context = second_main.messages.last().unwrap();
+    assert_eq!(hook_context.role, Role::System);
+    assert!(hook_context.content.contains("Retained Stop hook context."));
+    let second_answer = answer_after(&second_main, second_input["receipt_id"].as_str().unwrap());
+    assert_eq!(result["outcome"]["final_message"], second_answer);
+    assert!(!result
+        .to_string()
+        .contains("Synthetic original Root finished."));
     assert_eq!(
         router.current_run_id(ROOT_A).await.as_deref(),
         Some(first_run.as_str())
@@ -1112,6 +1171,11 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     })
     .await
     .expect("both native runs release ownership before reopening");
+    let first_answer = answer_after(
+        &load(&f.state, ROOT_A).await,
+        first_input["receipt_id"].as_str().unwrap(),
+    );
+    assert_ne!(first_answer["message_id"], second_answer["message_id"]);
     let successor = run_native_source(&f, "unselected successor", 3).await;
     assert_ne!(successor.1, first_run);
 
@@ -1132,7 +1196,16 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     .await;
     assert_eq!(recovered["outcome"]["target_session_id"], ROOT_A);
     assert_eq!(recovered["outcome"]["run_id"], first_run);
+    assert_eq!(recovered["outcome"]["final_message"], first_answer);
     let first_cursor = recovered["outcome"]["sequence"].as_u64().unwrap();
+    let mut next_request = request(first_cursor, second_cursor);
+    next_request["outcome_targets"][0]["expected_run_id"] = json!(successor.1);
+    let next =
+        invoke_managed_control(&cold, &reference, "managed-wait-successor", next_request).await;
+    assert_eq!(next["outcome"]["run_id"], successor.1);
+    let next_answer = answer_after(&load(&cold, ROOT_A).await, &successor.0);
+    assert_ne!(next_answer["message_id"], first_answer["message_id"]);
+    assert_eq!(next["outcome"]["final_message"], next_answer);
     let consumed = invoke_managed_control(
         &cold,
         &reference,
@@ -1146,6 +1219,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     let sibling =
         invoke_managed_control(&cold, &reference, "managed-wait-stale-sibling", stale_first).await;
     assert_eq!(sibling["outcome"]["run_id"], second_run);
+    assert_eq!(sibling["outcome"]["final_message"], second_answer);
 
     // Temporarily withhold only the genuine ACK in this isolated fixture.
     // The Main result already exists and the cold Host has no runner signal.
@@ -1179,6 +1253,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         .await
         .expect("restored ACK wakes the wait");
     assert_eq!(verified["outcome"]["run_id"], second_run);
+    assert_eq!(verified["outcome"]["final_message"], second_answer);
     assert_eq!(
         verified["outcome"]["inputs"][0]["receipt_id"],
         second_input["receipt_id"]

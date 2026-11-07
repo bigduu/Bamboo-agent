@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    ActorActivationFence, Message, ResponseOccurrence, Session, SessionActivationPolicy,
-    SessionInboxActivationIntent, SessionKind, SessionMessageBody, SessionMessageEnvelope,
-    SessionMessageId, SessionMessageKind, SupervisorReference,
+    ActorActivationFence, Message, MessagePhase, ResponseOccurrence, Role, Session,
+    SessionActivationPolicy, SessionInboxActivationIntent, SessionKind, SessionMessageBody,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SupervisorReference,
 };
 use crate::SupervisorCurrentUserTarget;
 
@@ -23,7 +23,9 @@ pub const MAX_SUPERVISED_ROOT_OUTCOMES_BYTES: usize = 256 * 1024;
 // Each question keeps its digest and the input prefix seen at that moment.
 // Reserve all eight bounded entries and a terminal variant before side effects.
 const OUTCOME_TERMINAL_HEADROOM: usize = 128;
+const OUTCOME_MANAGED_TERMINAL_HEADROOM: usize = 256;
 const OUTCOME_QUESTION_HEADROOM: usize = 160;
+const MAX_FINAL_MESSAGE_ID_BYTES: usize = 64;
 const OWNED_INPUT_CHECKPOINT_KEY: &str = "_bamboo_owned_input_checkpoint";
 
 /// An admitted input is historical evidence, not proof of provider consumption
@@ -355,6 +357,60 @@ pub struct ObserverSupervisedRootOutcome {
     pub inputs: Vec<ObserverSupervisedRootInput>,
 }
 
+/// A verified reference to one retained assistant message's text bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RootFinalMessageReference {
+    pub message_id: String,
+    pub content_sha256: String,
+}
+
+impl RootFinalMessageReference {
+    pub fn capture(message: &Message) -> Option<Self> {
+        if message.compressed
+            || message.compressed_by_event_id.is_some()
+            || message.compression_level != 0
+        {
+            return None;
+        }
+        Self::from_retained_message(message)
+    }
+
+    // Later context compaction can archive this message while retaining its
+    // canonical ID and exact text. Only a change to the bound evidence matters.
+    fn from_retained_message(message: &Message) -> Option<Self> {
+        (message.role == Role::Assistant
+            && message.phase == Some(MessagePhase::FinalAnswer)
+            && message.tool_calls.as_ref().is_none_or(Vec::is_empty)
+            && !message.content.trim().is_empty()
+            && valid_final_message_id(&message.id))
+        .then(|| Self {
+            message_id: message.id.clone(),
+            content_sha256: hex::encode(Sha256::digest(message.content.as_bytes())),
+        })
+    }
+
+    fn is_valid(&self) -> bool {
+        valid_final_message_id(&self.message_id) && valid_digest(&self.content_sha256)
+    }
+}
+
+/// Passed by the live runner to its existing terminal writer. Never serialized.
+#[derive(Debug, Clone)]
+pub struct RootFinalMessageCandidate {
+    pub run_id: String,
+    pub message: RootFinalMessageReference,
+}
+
+/// Managed Supervisor wait projection. Observer and notification wire formats
+/// retain their existing shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedRootOutcome {
+    #[serde(flatten)]
+    pub observed: ObserverSupervisedRootOutcome,
+    pub final_message: Option<RootFinalMessageReference>,
+}
+
 /// The historical view is derived from the canonical fact, rather than from
 /// an independently replaceable snapshot. Values are escaped and bounded;
 /// full identities remain in the individually verified Supervisor notices.
@@ -445,7 +501,7 @@ pub struct ManagedRootBlockerEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedRootEvent {
-    Outcome(ObserverSupervisedRootOutcome),
+    Outcome(ManagedRootOutcome),
     Blocker(ManagedRootBlockerEvidence),
 }
 
@@ -534,6 +590,59 @@ pub struct SupervisedRootOutcomeFact {
     pub questions: Vec<SupervisedRootOutcomeQuestion>,
     /// None is an unresolved reservation, including after an unconfirmed crash.
     pub result: Option<SupervisedRootOutcomeResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_message: Option<RootFinalMessageReference>,
+}
+
+impl SupervisedRootOutcomeFact {
+    pub fn verified_final_message<'a>(
+        &'a self,
+        main: &Session,
+    ) -> Option<&'a RootFinalMessageReference> {
+        let reference = self.final_message.as_ref()?;
+        (self.result == Some(SupervisedRootOutcomeResult::Completed)
+            && self.matches_final_message(main, reference))
+        .then_some(reference)
+    }
+
+    fn has_supervisor_input(&self) -> bool {
+        self.inputs
+            .iter()
+            .any(|input| input.supervisor_origin.is_some())
+    }
+
+    fn matches_final_message(&self, main: &Session, reference: &RootFinalMessageReference) -> bool {
+        if !self.has_supervisor_input() {
+            return false;
+        }
+        let mut inputs: std::collections::BTreeMap<_, _> = self
+            .inputs
+            .iter()
+            .map(|input| (input.receipt_id.as_str(), false))
+            .collect();
+        let mut remaining = inputs.len();
+        let mut matched = false;
+        for message in &main.messages {
+            if let Some(seen) = inputs.get_mut(message.id.as_str()) {
+                if *seen || message.role != Role::User {
+                    return false;
+                }
+                *seen = true;
+                remaining -= 1;
+            }
+            if message.id == reference.message_id {
+                if matched
+                    || remaining != 0
+                    || RootFinalMessageReference::from_retained_message(message).as_ref()
+                        != Some(reference)
+                {
+                    return false;
+                }
+                matched = true;
+            }
+        }
+        matched
+    }
 }
 
 /// Ordered source facts, not a delivery cursor. Reclamation must be performed
@@ -565,6 +674,14 @@ fn valid_activation_id(value: &str) -> bool {
 
 fn valid_run_id(value: &str) -> bool {
     !value.trim().is_empty()
+}
+
+fn valid_final_message_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= MAX_FINAL_MESSAGE_ID_BYTES
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn valid_digest(value: &str) -> bool {
@@ -733,6 +850,10 @@ impl SupervisedRootOutcomes {
     }
 
     pub fn validate(&self) -> Result<(), &'static str> {
+        self.validate_with_terminal_headroom(false)
+    }
+
+    fn validate_with_terminal_headroom(&self, managed: bool) -> Result<(), &'static str> {
         crate::validate_supervisor_target_id(&self.root_session_id)?;
         if self.version != SUPERVISED_ROOT_OUTCOMES_VERSION
             || self.facts.len() > MAX_SUPERVISED_ROOT_OUTCOMES
@@ -743,6 +864,7 @@ impl SupervisedRootOutcomes {
         let mut previous_attempt = 0_u64;
         let mut previous_lease_epoch = 0_u64;
         let mut run_ids = std::collections::BTreeSet::new();
+        let mut final_message_ids = std::collections::BTreeSet::new();
         let mut activation_ids = std::collections::BTreeSet::new();
         let mut receipt_generations = std::collections::BTreeMap::new();
         let mut generation_receipts = std::collections::BTreeMap::new();
@@ -768,6 +890,14 @@ impl SupervisedRootOutcomes {
                 || (fact.result.is_none() && index + 1 != self.facts.len())
             {
                 return Err("invalid Root outcome identity or order");
+            }
+            if fact.final_message.as_ref().is_some_and(|reference| {
+                fact.result != Some(SupervisedRootOutcomeResult::Completed)
+                    || !fact.has_supervisor_input()
+                    || !reference.is_valid()
+                    || !final_message_ids.insert(&reference.message_id)
+            }) {
+                return Err("invalid or reused Root final message reference");
             }
             previous_sequence = fact.sequence;
             previous_attempt = fact.attempt;
@@ -824,7 +954,12 @@ impl SupervisedRootOutcomes {
             .last()
             .filter(|fact| fact.result.is_none())
             .map_or(0, |fact| {
-                OUTCOME_TERMINAL_HEADROOM
+                let terminal = if managed && fact.has_supervisor_input() {
+                    OUTCOME_MANAGED_TERMINAL_HEADROOM
+                } else {
+                    OUTCOME_TERMINAL_HEADROOM
+                };
+                terminal
                     + (MAX_SUPERVISED_ROOT_OUTCOME_QUESTIONS - fact.questions.len())
                         * OUTCOME_QUESTION_HEADROOM
             });
@@ -1074,6 +1209,7 @@ impl SupervisedRootOutcomes {
             inputs: Vec::new(),
             questions: Vec::new(),
             result: None,
+            final_message: None,
         });
         candidate.validate()?;
         *self = candidate;
@@ -1114,7 +1250,7 @@ impl SupervisedRootOutcomes {
             return Err("Root outcome input capacity exhausted or already finalized");
         }
         fact.inputs.push(input);
-        candidate.validate()?;
+        candidate.validate_with_terminal_headroom(true)?;
         *self = candidate;
         Ok(true)
     }
@@ -1264,6 +1400,47 @@ impl SupervisedRootOutcomes {
         fence: &ActorActivationFence,
         result: SupervisedRootOutcomeResult,
     ) -> Result<bool, &'static str> {
+        self.finalize_with_reference(fence, result, None)
+    }
+
+    /// Run under the owned final writer, after reconciling Main's input
+    /// transcript. A runner can name only a message it produced in this run.
+    pub fn finalize_from_main(
+        &mut self,
+        fence: &ActorActivationFence,
+        result: SupervisedRootOutcomeResult,
+        main: &Session,
+    ) -> Result<bool, &'static str> {
+        let reference = main
+            .root_final_message_candidate
+            .as_deref()
+            .filter(|candidate| {
+                result == SupervisedRootOutcomeResult::Completed
+                    && candidate.run_id == fence.run_id
+                    && main.id == self.root_session_id
+                    && main.created_at == self.root_created_at
+            })
+            .filter(|candidate| {
+                self.facts
+                    .iter()
+                    .find(|fact| fact.result.is_none() && fact_matches_fence(fact, fence))
+                    .is_some_and(|fact| fact.matches_final_message(main, &candidate.message))
+                    && !self.facts.iter().any(|fact| {
+                        fact.final_message.as_ref().is_some_and(|reference| {
+                            reference.message_id == candidate.message.message_id
+                        })
+                    })
+            })
+            .map(|candidate| candidate.message.clone());
+        self.finalize_with_reference(fence, result, reference)
+    }
+
+    fn finalize_with_reference(
+        &mut self,
+        fence: &ActorActivationFence,
+        result: SupervisedRootOutcomeResult,
+        reference: Option<RootFinalMessageReference>,
+    ) -> Result<bool, &'static str> {
         self.validate()?;
         if result == SupervisedRootOutcomeResult::InterruptedUnknown {
             return Err("interrupted Root outcome requires separate loss recovery");
@@ -1287,6 +1464,17 @@ impl SupervisedRootOutcomes {
         let mut candidate = self.clone();
         let fact = candidate.current_mut(fence)?;
         fact.result = Some(result);
+        fact.final_message = reference;
+        // A pending fact written by an older binary reserved only the result
+        // status. It can still finalize if its legacy byte budget is full.
+        if fact.final_message.is_some()
+            && serde_json::to_vec(&candidate)
+                .map_err(|_| "Root outcome facts cannot be encoded")?
+                .len()
+                > MAX_SUPERVISED_ROOT_OUTCOMES_BYTES
+        {
+            candidate.current_mut(fence)?.final_message = None;
+        }
         candidate.validate()?;
         *self = candidate;
         Ok(true)
@@ -1453,6 +1641,142 @@ mod tests {
             generation,
             supervisor_origin: None,
         }
+    }
+
+    #[test]
+    fn final_message_proof_is_run_scoped_and_cannot_backfill_a_legacy_completion() {
+        use SupervisedRootOutcomeResult::{Completed, Failed};
+
+        let mut main = Session::new("test-root", "synthetic-model");
+        let target = SupervisorCurrentUserTarget::capture(&main).unwrap();
+        let supervisor = SupervisorReference {
+            session_id: crate::DEFAULT_SUPERVISOR_SESSION_ID.into(),
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let operation_id = SessionMessageId::parse("exact-output-operation").unwrap();
+        let receipt =
+            crate::supervisor_current_user_message_id(&supervisor, &target, operation_id.as_str());
+        let admitted = SupervisedRootOutcomeInput {
+            receipt_id: receipt.clone(),
+            generation: 1,
+            supervisor_origin: Some(SupervisedRootOutcomeInputOrigin::CurrentUser {
+                supervisor,
+                supervisor_created_at: Utc::now(),
+                caller: None,
+                requires_host_scope: None,
+                notify_on_material_event: false,
+                target,
+                operation_id,
+            }),
+        };
+        let mut user = Message::user("one owned input");
+        user.id = receipt.to_string();
+        let answer = Message::assistant("verified answer", None);
+        let reference = RootFinalMessageReference::capture(&answer).unwrap();
+        main.messages = vec![user.clone(), answer.clone()];
+        let owner = fence(1);
+        let mut pending = SupervisedRootOutcomes::new(&main.id, main.created_at).unwrap();
+        pending.reserve(&owner, None).unwrap();
+        pending.record_input(&owner, admitted.clone()).unwrap();
+        main.root_final_message_candidate = Some(Box::new(RootFinalMessageCandidate {
+            run_id: owner.run_id.clone(),
+            message: reference.clone(),
+        }));
+
+        let mut exact = pending.clone();
+        assert!(exact.finalize_from_main(&owner, Completed, &main).unwrap());
+        assert_eq!(
+            exact.facts[0].verified_final_message(&main),
+            Some(&reference)
+        );
+        let encoded = serde_json::to_vec(&exact).unwrap();
+        let reopened: SupervisedRootOutcomes = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(reopened, exact);
+        let durable_main: Session =
+            serde_json::from_value(serde_json::to_value(&main).unwrap()).unwrap();
+        assert!(durable_main.root_final_message_candidate.is_none());
+
+        let mut changed = main.clone();
+        changed.messages[1].content.push('!');
+        assert_eq!(reopened.facts[0].verified_final_message(&changed), None);
+        let mut archived = durable_main;
+        archived.messages[1].compressed = true;
+        archived.messages[1].compressed_by_event_id = Some("later-compaction".into());
+        archived.messages[1].compression_level = 1;
+        assert!(RootFinalMessageReference::capture(&archived.messages[1]).is_none());
+        assert_eq!(
+            reopened.facts[0].verified_final_message(&archived),
+            Some(&reference)
+        );
+        archived.messages[1].content.push('!');
+        assert_eq!(reopened.facts[0].verified_final_message(&archived), None);
+        let mut reversed = main.clone();
+        reversed.messages.swap(0, 1);
+        let mut duplicate = main.clone();
+        duplicate.messages.push(answer);
+        let mut stale = main.clone();
+        stale.root_final_message_candidate.as_mut().unwrap().run_id = "different-run".into();
+        for (candidate, status) in [
+            (changed, Completed),
+            (reversed, Completed),
+            (duplicate, Completed),
+            (stale, Completed),
+            (main.clone(), Failed),
+        ] {
+            let mut observed = pending.clone();
+            observed
+                .finalize_from_main(&owner, status, &candidate)
+                .unwrap();
+            assert!(observed.facts[0].final_message.is_none());
+        }
+        let mut tool = Message::assistant("tool progress", None);
+        tool.phase = Some(MessagePhase::Commentary);
+        assert!(RootFinalMessageReference::capture(&tool).is_none());
+        assert!(RootFinalMessageReference::capture(&Message::assistant("", None)).is_none());
+        assert!(
+            RootFinalMessageReference::capture(&Message::tool_result("call", "value")).is_none()
+        );
+
+        let mut full_legacy_pending = pending.clone();
+        for question in 0..MAX_SUPERVISED_ROOT_OUTCOME_QUESTIONS {
+            full_legacy_pending
+                .record_question(&owner, &occurrence(&question.to_string()))
+                .unwrap();
+        }
+        let current_bytes = serde_json::to_vec(&full_legacy_pending).unwrap().len();
+        let padding =
+            MAX_SUPERVISED_ROOT_OUTCOMES_BYTES - OUTCOME_TERMINAL_HEADROOM - current_bytes;
+        let mut wide_owner = owner.clone();
+        wide_owner.activation_id.push_str(&"x".repeat(padding));
+        full_legacy_pending.facts[0].activation_id = wide_owner.activation_id.clone();
+        full_legacy_pending.validate().unwrap();
+        assert!(full_legacy_pending
+            .validate_with_terminal_headroom(true)
+            .is_err());
+        full_legacy_pending
+            .finalize_from_main(&wide_owner, Completed, &main)
+            .unwrap();
+        assert_eq!(full_legacy_pending.facts[0].result, Some(Completed));
+        assert!(full_legacy_pending.facts[0].final_message.is_none());
+
+        pending.finalize(&owner, Completed).unwrap();
+        let legacy = serde_json::to_value(pending).unwrap();
+        assert!(legacy["facts"][0].get("final_message").is_none());
+        let mut legacy: SupervisedRootOutcomes = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.finalize_from_main(&owner, Completed, &main).unwrap());
+        assert!(legacy.facts[0].final_message.is_none());
+
+        // Reusing the input receipt in a successor cannot reuse a sealed result.
+        let next = fence(2);
+        exact.reserve(&next, None).unwrap();
+        exact.record_input(&next, admitted).unwrap();
+        main.root_final_message_candidate.as_mut().unwrap().run_id = next.run_id.clone();
+        exact.finalize_from_main(&next, Completed, &main).unwrap();
+        assert_eq!(
+            exact.facts[0].verified_final_message(&main),
+            Some(&reference)
+        );
+        assert!(exact.facts[1].final_message.is_none());
     }
 
     #[test]
@@ -2183,6 +2507,7 @@ mod tests {
                 inputs,
                 questions: Vec::new(),
                 result: Some(SupervisedRootOutcomeResult::Completed),
+                final_message: None,
             });
         }
         facts.validate().unwrap();
