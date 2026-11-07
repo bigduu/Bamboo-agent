@@ -38,6 +38,22 @@ impl bamboo_server_tools::session_control::root_run::SupervisedRootRunPort
         ))
     }
 
+    async fn observe_admission(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: &bamboo_domain::SupervisorCurrentUserTarget,
+        receipt: &bamboo_domain::SessionInboxReceipt,
+    ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(receipt.id.as_str(), "input-1");
+        assert_eq!(receipt.generation, 7);
+        Ok(bamboo_agent_core::tools::ToolResult::text(
+            true,
+            json!({"status":"admission_verified", "admission":{"run_id":"admitted-run"}})
+                .to_string(),
+        ))
+    }
+
     async fn cancel_run(
         &self,
         _caller: &SessionCallerReference,
@@ -79,10 +95,33 @@ async fn exact_root_run_schema_requires_observed_target_and_run_without_granting
         .unwrap();
     let observe = json!({"action":"observe_run", "target_session_id":"a", "target_ref":target});
     assert_eq!(tool.classify(&observe), ToolClass::READONLY_PARALLEL);
-    let observed = completed(tool.invoke(observe, fixture.ctx.clone()).await.unwrap());
+    let observed = completed(
+        tool.invoke(observe.clone(), fixture.ctx.clone())
+            .await
+            .unwrap(),
+    );
     assert_eq!(observed["run_id"], "run-1");
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let mut admission = observe;
+    admission["input_receipt"] = json!({"receipt_id":"input-1","generation":7});
+    assert!(validator.is_valid(&admission));
+    assert_eq!(
+        completed(
+            tool.invoke(admission.clone(), fixture.ctx.clone())
+                .await
+                .unwrap()
+        )["admission"]["run_id"],
+        "admitted-run"
+    );
     let cancel = json!({"action":"cancel", "target_session_id":"a", "target_ref":target, "expected_run_id":"run-1"});
     assert_eq!(tool.classify(&cancel), ToolClass::MUTATING_SERIAL);
+    let mut cancel_with_receipt = cancel.clone();
+    cancel_with_receipt["input_receipt"] = admission["input_receipt"].clone();
+    assert!(!validator.is_valid(&cancel_with_receipt));
+    assert!(tool
+        .invoke(cancel_with_receipt, fixture.ctx.clone())
+        .await
+        .is_err());
     assert_eq!(
         completed(tool.invoke(cancel, fixture.ctx.clone()).await.unwrap())["status"],
         "cancel_requested"
@@ -94,7 +133,19 @@ async fn exact_root_run_schema_requires_observed_target_and_run_without_granting
     ] {
         assert!(tool.invoke(invalid, fixture.ctx.clone()).await.is_err());
     }
-    assert_eq!(port.calls.load(Ordering::SeqCst), 2);
+    for invalid_receipt in [
+        Value::Null,
+        json!({"receipt_id":"input-1","generation":0}),
+        json!({"receipt_id":"input-1"}),
+    ] {
+        admission["input_receipt"] = invalid_receipt;
+        assert!(!validator.is_valid(&admission));
+        assert!(tool
+            .invoke(admission.clone(), fixture.ctx.clone())
+            .await
+            .is_err());
+    }
+    assert_eq!(port.calls.load(Ordering::SeqCst), 3);
 }
 
 #[derive(Default)]

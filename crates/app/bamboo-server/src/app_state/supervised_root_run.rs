@@ -13,8 +13,8 @@ use bamboo_agent_core::{
 };
 use bamboo_domain::{
     AdmissionCommit, AdmissionGate, ManagedRootEvent, ManagedRootEventRead, SessionActivationPort,
-    SessionAuthorityIdentity, SessionCallerReference, SupervisorCurrentUserTarget,
-    SupervisorReference,
+    SessionAuthorityIdentity, SessionCallerReference, SessionInboxReceipt,
+    SupervisorCurrentUserTarget, SupervisorReference,
 };
 use bamboo_orchestration::managed_session::{
     read_when_verified, wait_for_outcome, ManagedRunHint, ManagedRunSignals,
@@ -33,6 +33,16 @@ pub(super) struct SupervisedRootRunController {
     pub(super) runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(super) live_retry: Arc<LiveRetryBridge>,
     pub(super) fresh_sync: Arc<FreshSyncRegistry>,
+}
+
+fn original_supervisor(caller: &SessionCallerReference) -> Result<SupervisorReference, ToolError> {
+    let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity else {
+        return Err(ToolError::Execution("original Supervisor required".into()));
+    };
+    Ok(SupervisorReference {
+        session_id: caller.session_id.clone(),
+        incarnation_id: *incarnation_id,
+    })
 }
 
 fn busy() -> io::Error {
@@ -285,14 +295,7 @@ impl SupervisedRootRunController {
         expected: Option<&str>,
         gate: Option<AdmissionGate>,
     ) -> Result<ToolResult, ToolError> {
-        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
-        else {
-            return Err(ToolError::Execution("original Supervisor required".into()));
-        };
-        let supervisor = SupervisorReference {
-            session_id: caller.session_id.clone(),
-            incarnation_id: *incarnation_id,
-        };
+        let supervisor = original_supervisor(caller)?;
         let selected = target.clone();
         let expected = expected.map(str::to_owned);
         let router = self.router.clone();
@@ -328,6 +331,28 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         target: &SupervisorCurrentUserTarget,
     ) -> Result<ToolResult, ToolError> {
         self.control(caller, target, None, None).await
+    }
+
+    async fn observe_admission(
+        &self,
+        caller: &SessionCallerReference,
+        target: &SupervisorCurrentUserTarget,
+        receipt: &SessionInboxReceipt,
+    ) -> Result<ToolResult, ToolError> {
+        let supervisor = original_supervisor(caller)?;
+        let admission = self
+            .inbox
+            .read_managed_root_admission(caller, &supervisor, target, receipt)
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "Managed Root admission evidence unavailable");
+                ToolError::Execution("managed_root_admission_evidence_unavailable".into())
+            })?;
+        let response = match admission {
+            Some(admission) => json!({"status":"admission_verified", "admission":admission}),
+            None => json!({"status":"admission_unconfirmed"}),
+        };
+        Ok(ToolResult::text(true, response.to_string()))
     }
 
     async fn wait_run(
@@ -381,14 +406,7 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         caller: &SessionCallerReference,
         targets: &[ManagedOutcomeTarget; 2],
     ) -> Result<ToolResult, ToolError> {
-        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
-        else {
-            return Err(ToolError::Execution("original Supervisor required".into()));
-        };
-        let supervisor = SupervisorReference {
-            session_id: caller.session_id.clone(),
-            incarnation_id: *incarnation_id,
-        };
+        let supervisor = original_supervisor(caller)?;
         // Subscribe before inspecting Main to cover completion during the read.
         // A signal is only a hint. The read revalidates the exact authority and ACK.
         let [first_signals, second_signals] = {

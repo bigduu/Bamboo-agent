@@ -430,6 +430,23 @@ struct ManagedRootEventSelection<'a> {
     notifying_input: Option<&'a SessionMessageId>,
 }
 
+fn managed_root_input_matches_caller(
+    input: &bamboo_domain::SupervisedRootOutcomeInput,
+    caller: &bamboo_domain::SessionCallerReference,
+    guarded: &GuardedSupervisorRoot,
+    scoped: bool,
+    notifying_input: Option<&SessionMessageId>,
+) -> bool {
+    input.supervisor_origin.as_ref().is_some_and(|origin| {
+        origin.original_caller() == Some(caller)
+            && origin.permits_scope_replay(scoped)
+            && notifying_input.is_none_or(|id| {
+                id == &input.receipt_id && origin.material_notifications_requested()
+            })
+            && guarded.owns_recorded_origin(origin, &input.receipt_id)
+    })
+}
+
 impl ExpectedRunAdmission {
     // Used only in an owned blocking job. The same check is repeated at the
     // actual Maildir rename; this early check is never publication authority.
@@ -1055,6 +1072,100 @@ impl FileSessionInbox {
         }))
     }
 
+    async fn load_managed_root_main(
+        &self,
+        authority: &crate::v2::CurrentUserTargetGuard,
+    ) -> Result<bamboo_domain::Session, SessionInboxError> {
+        let target = &authority.reference;
+        let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
+        let root = self
+            .sessions
+            .load_execution_admission_unchecked(&target.session_id)
+            .await
+            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
+            .ok_or_else(|| invalid("Root outcome source disappeared"))?;
+        if let Some(outcomes) = root
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+        {
+            outcomes.validate().map_err(invalid)?;
+            if outcomes.root_session_id != target.session_id
+                || outcomes.root_created_at != target.created_at
+            {
+                return Err(invalid("Root outcome source lifetime differs"));
+            }
+        }
+        Ok(root)
+    }
+
+    /// Read a selected input's unique recorded run under the original
+    /// Supervisor's authority. An ACK for the delivery and its exact Main
+    /// evidence must both survive. This read never changes the activation.
+    pub async fn read_managed_root_admission(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &bamboo_domain::SupervisorReference,
+        target: &bamboo_domain::SupervisorCurrentUserTarget,
+        receipt: &SessionInboxReceipt,
+    ) -> Result<Option<bamboo_domain::ManagedRootAdmission>, SessionInboxError> {
+        let authority = Arc::new(
+            self.sessions
+                .lock_unscoped_supervisor_root(caller, supervisor, target)
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?,
+        );
+        let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
+        let root = self.load_managed_root_main(&authority).await?;
+        let Some((fact, input)) = root
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+            .and_then(|outcomes| outcomes.unique_input_run(receipt))
+        else {
+            return Ok(None);
+        };
+        if !bamboo_domain::valid_session_run_id(&fact.run_id)
+            || root
+                .conversation_reset_sha256()
+                .map_err(|_| invalid("Root outcome conversation generation is invalid"))?
+                != fact.conversation_reset_sha256
+        {
+            return Ok(None);
+        }
+        let guarded = GuardedSupervisorRoot::from_sessions(&authority.source, &authority.target)
+            .ok_or_else(|| invalid("Root outcome authority is not canonical"))?;
+        if !managed_root_input_matches_caller(input, caller, &guarded, false, None) {
+            return Ok(None);
+        }
+        let (inbox, filesystem) = self
+            .filesystem_with_authority(
+                &target.session_id,
+                InboxAuthority::SupervisedRootOutcome {
+                    inbox_dir: authority.inbox_dir.clone(),
+                    _guard: authority,
+                },
+            )
+            .await?;
+        if let Err(error) =
+            tokio::fs::symlink_metadata(Self::admitted_path(&inbox, &receipt.id)).await
+        {
+            return match error.kind() {
+                ErrorKind::NotFound => Ok(None),
+                _ => Err(SessionInboxError::Storage(error.to_string())),
+            };
+        }
+        let input = self
+            .verify_supervised_root_input_ack(&root, &guarded, input, &inbox, &filesystem)
+            .await?;
+        Ok(Some(bamboo_domain::ManagedRootAdmission {
+            target_session_id: root.id.clone(),
+            target_created_at: root.created_at,
+            run_id: fact.run_id.clone(),
+            input,
+        }))
+    }
+
     /// Read one exact Root event under the original Supervisor's authority.
     /// Canonical evidence and an owned input ACK are required. This neither delivers an
     /// Inbox message nor consumes the caller's evidence cursor.
@@ -1105,12 +1216,7 @@ impl FileSessionInbox {
             notifying_input,
         } = selected;
         let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
-        let root = self
-            .sessions
-            .load_execution_admission_unchecked(&target.session_id)
-            .await
-            .map_err(|error| SessionInboxError::Storage(error.to_string()))?
-            .ok_or_else(|| invalid("Root outcome source disappeared"))?;
+        let root = self.load_managed_root_main(authority).await?;
         let Some(outcomes) = root
             .runtime_metadata
             .as_ref()
@@ -1118,12 +1224,6 @@ impl FileSessionInbox {
         else {
             return Ok(Read::CaughtUp);
         };
-        outcomes.validate().map_err(invalid)?;
-        if outcomes.root_session_id != target.session_id
-            || outcomes.root_created_at != target.created_at
-        {
-            return Err(invalid("Root outcome source lifetime differs"));
-        }
         let Some(fact) = outcomes
             .facts
             .iter()
@@ -1168,14 +1268,7 @@ impl FileSessionInbox {
             .inputs
             .iter()
             .filter(|input| {
-                input.supervisor_origin.as_ref().is_some_and(|origin| {
-                    origin.original_caller() == Some(caller)
-                        && origin.permits_scope_replay(scoped)
-                        && notifying_input.is_none_or(|id| {
-                            id == &input.receipt_id && origin.material_notifications_requested()
-                        })
-                        && guarded.owns_recorded_origin(origin, &input.receipt_id)
-                })
+                managed_root_input_matches_caller(input, caller, &guarded, scoped, notifying_input)
             })
             .cloned()
             .collect();
