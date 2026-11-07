@@ -10,8 +10,9 @@ use sha2::{Digest, Sha256};
 
 use super::{
     ActorActivationFence, Message, MessagePhase, ResponseOccurrence, Role, Session,
-    SessionActivationPolicy, SessionInboxActivationIntent, SessionKind, SessionMessageBody,
-    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SupervisorReference,
+    SessionActivationPolicy, SessionInboxActivationIntent, SessionInboxReceipt, SessionKind,
+    SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
+    SupervisorReference,
 };
 use crate::SupervisorCurrentUserTarget;
 
@@ -344,6 +345,17 @@ pub struct ObserverSupervisedRootInput {
     pub receipt_id: SessionMessageId,
     pub generation: u64,
     pub operation_id: SessionMessageId,
+}
+
+/// The exact owned run that incorporated an input, verified against Main and
+/// its Inbox ACK. Admission is independent of liveness and outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedRootAdmission {
+    pub target_session_id: String,
+    pub target_created_at: DateTime<Utc>,
+    pub run_id: String,
+    pub input: ObserverSupervisedRootInput,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -851,6 +863,25 @@ impl SupervisedRootOutcomes {
 
     pub fn validate(&self) -> Result<(), &'static str> {
         self.validate_with_terminal_headroom(false)
+    }
+
+    /// Select one candidate from validated facts. Recovery can record the
+    /// same input in more than one activation. Storage still has to verify
+    /// the caller, conversation and physical ACK for a unique match.
+    pub fn unique_input_run(
+        &self,
+        receipt: &SessionInboxReceipt,
+    ) -> Option<(&SupervisedRootOutcomeFact, &SupervisedRootOutcomeInput)> {
+        let mut owners = self.facts.iter().filter_map(|fact| {
+            fact.inputs
+                .iter()
+                .find(|input| {
+                    input.receipt_id == receipt.id && input.generation == receipt.generation
+                })
+                .map(|input| (fact, input))
+        });
+        let owner = owners.next()?;
+        owners.next().is_none().then_some(owner)
     }
 
     fn validate_with_terminal_headroom(&self, managed: bool) -> Result<(), &'static str> {
@@ -1958,8 +1989,16 @@ mod tests {
     fn outcome_receipt_recovery_preserves_exact_global_generation() {
         let mut facts = SupervisedRootOutcomes::new("test-root", Utc::now()).unwrap();
         let first = fence(1);
+        let receipt = SessionInboxReceipt {
+            id: SessionMessageId::parse("receipt-1").unwrap(),
+            generation: 1,
+        };
         facts.reserve(&first, None).unwrap();
         facts.record_input(&first, input("receipt-1", 1)).unwrap();
+        assert_eq!(
+            facts.unique_input_run(&receipt).unwrap().0.run_id,
+            first.run_id
+        );
         let second = fence(2);
         assert_eq!(
             facts
@@ -1969,6 +2008,7 @@ mod tests {
         );
         // A successor can encounter the exact receipt after an uncertain ACK.
         facts.record_input(&second, input("receipt-1", 1)).unwrap();
+        assert!(facts.unique_input_run(&receipt).is_none());
         let before = facts.clone();
         assert!(facts
             .record_input(&second, input("receipt-other", 1))

@@ -514,10 +514,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
-use bamboo_domain::{LoopControlRequest, SessionActivationDisposition, SupervisorReference};
+use bamboo_domain::{
+    LoopControlRequest, SessionActivationDisposition, SessionInboxReceipt, SessionMessageId,
+    SupervisorReference,
+};
 use bamboo_engine::{SessionMessenger, SessionMessengerError};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedInputReceipt {
+    receipt_id: SessionMessageId,
+    generation: u64,
+}
+
+impl ManagedInputReceipt {
+    fn deserialize_present<'de, D>(deserializer: D) -> Result<Option<Self>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::deserialize(deserializer).map(Some)
+    }
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
@@ -546,6 +565,8 @@ enum SessionControlArgs {
     ObserveRun {
         target_session_id: String,
         target_ref: bamboo_domain::SupervisorCurrentUserTarget,
+        #[serde(default, deserialize_with = "ManagedInputReceipt::deserialize_present")]
+        input_receipt: Option<ManagedInputReceipt>,
     },
     WaitRun {
         target_session_id: String,
@@ -795,6 +816,15 @@ impl Tool for SessionControlTool {
                 "type":"string", "minLength":1, "maxLength":128,
                 "description":"wait_run or cancel only: copy the exact run_id from observe_run; never infer or refresh it during an uncertain retry."
             });
+            schema["properties"]["input_receipt"] = json!({
+                "type":"object", "additionalProperties":false,
+                "description":"Optional for observe_run. Copy receipt_id and generation from the delivery to find the exact run that admitted it. Admission is separate from liveness and completion. Omit this field for a live run observation.",
+                "required":["receipt_id","generation"],
+                "properties":{
+                    "receipt_id":{"type":"string","minLength":1,"maxLength":256},
+                    "generation":{"type":"integer","minimum":1}
+                }
+            });
             schema["properties"]["target_ref"]["description"] = json!(
                 "Copy the unchanged current_user_target from session_history. It selects the exact target birth/generation; it is never a grant."
             );
@@ -883,6 +913,11 @@ impl Tool for SessionControlTool {
                 wait_outcomes["properties"][field] = Value::Bool(false);
             }
             variants.push(wait_outcomes);
+            for variant in variants {
+                if variant["properties"]["action"]["const"] != "observe_run" {
+                    variant["properties"]["input_receipt"] = Value::Bool(false);
+                }
+            }
         }
         schema["properties"]["notify_on_material_event"] = json!({
             "type":"boolean",
@@ -984,16 +1019,30 @@ impl Tool for SessionControlTool {
             SessionControlArgs::ObserveRun {
                 target_session_id,
                 target_ref,
+                input_receipt,
             } => {
                 validate_root_run_caller(original, &supervisor)?;
                 validate_root_run_target(&target_session_id, &target_ref)?;
                 let port = self.root_run.as_ref().ok_or_else(|| {
                     ToolError::Execution("supervised_root_run_unavailable".into())
                 })?;
-                return port
-                    .observe_run(original, &target_ref)
-                    .await
-                    .map(ToolOutcome::Completed);
+                let result = match input_receipt {
+                    Some(input) => {
+                        if input.generation == 0 {
+                            return Err(ToolError::InvalidArguments(
+                                "input_receipt.generation must be positive".into(),
+                            ));
+                        }
+                        let receipt = SessionInboxReceipt {
+                            id: input.receipt_id,
+                            generation: input.generation,
+                        };
+                        port.observe_admission(original, &target_ref, &receipt)
+                            .await
+                    }
+                    None => port.observe_run(original, &target_ref).await,
+                };
+                return result.map(ToolOutcome::Completed);
             }
             SessionControlArgs::WaitRun {
                 target_session_id,

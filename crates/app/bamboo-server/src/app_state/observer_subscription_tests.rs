@@ -1003,7 +1003,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig,
         DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
     };
-    use bamboo_domain::Role;
+    use bamboo_domain::{Role, SessionInboxReceipt, SessionMessageId, SupervisorCurrentUserTarget};
     use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
     use sha2::{Digest, Sha256};
@@ -1095,6 +1095,58 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     let router = &f.state.session_activation_router;
     let first_run = router.current_run_id(ROOT_A).await.unwrap();
     let second_run = router.current_run_id(ROOT_B).await.unwrap();
+    let admission_request = |target: &SupervisorCurrentUserTarget, delivery: &Value| {
+        json!({
+            "action":"observe_run",
+            "target_session_id":target.session_id,
+            "target_ref":target,
+            "input_receipt":{"receipt_id":delivery["receipt_id"],"generation":delivery["generation"]},
+        })
+    };
+    for (target, input, run) in [
+        (&first, &first_input, &first_run),
+        (&second, &second_input, &second_run),
+    ] {
+        let id = format!("managed-admission-{}", target.session_id);
+        let admission = invoke_managed_control(
+            &f.state,
+            &f.reference,
+            &id,
+            admission_request(target, input),
+        )
+        .await;
+        assert_eq!(
+            admission,
+            json!({
+                "status":"admission_verified",
+                "admission":{
+                    "target_session_id":target.session_id,
+                    "target_created_at":target.created_at,
+                    "run_id":run,
+                    "input":{
+                        "receipt_id":input["receipt_id"],"generation":input["generation"],
+                        "operation_id":input["operation_id"]
+                    },
+                }
+            })
+        );
+    }
+    let unconfirmed = json!({"status":"admission_unconfirmed"});
+    let mut wrong_generation = admission_request(&first, &first_input);
+    wrong_generation["input_receipt"]["generation"] =
+        json!(first_input["generation"].as_u64().unwrap() + 1);
+    for (operation, request) in [
+        ("managed-admission-wrong-generation", wrong_generation),
+        (
+            "managed-admission-cross-target",
+            admission_request(&second, &first_input),
+        ),
+    ] {
+        assert_eq!(
+            invoke_managed_control(&f.state, &f.reference, operation, request).await,
+            unconfirmed
+        );
+    }
     let request = |first_cursor, second_cursor| {
         json!({
             "action":"wait_outcomes",
@@ -1187,6 +1239,41 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     } = f;
     drop(state);
     let cold = host(home.path(), Arc::new(Probe::default())).await;
+    let next_delivery = json!({"receipt_id":successor.0,"generation":successor.2});
+    for (operation, input, run) in [
+        ("managed-admission-original", &first_input, &first_run),
+        ("managed-admission-successor", &next_delivery, &successor.1),
+    ] {
+        let recovered = invoke_managed_control(
+            &cold,
+            &reference,
+            operation,
+            admission_request(&first, input),
+        )
+        .await;
+        assert_eq!(recovered["status"], "admission_verified");
+        assert_eq!(recovered["admission"]["run_id"], *run);
+        assert_eq!(
+            recovered["admission"]["input"]["receipt_id"],
+            input["receipt_id"]
+        );
+    }
+    let supervisor = load(&cold, &reference.session_id).await;
+    let caller = SessionCallerReference::from(&supervisor);
+    let mut stale_target = first.clone();
+    stale_target.created_at -= chrono::Duration::seconds(1);
+    let exact_receipt = SessionInboxReceipt {
+        id: SessionMessageId::parse(first_input["receipt_id"].as_str().unwrap()).unwrap(),
+        generation: first_input["generation"].as_u64().unwrap(),
+    };
+    let retained_inbox = FileSessionInbox::new(
+        cold.session_store.clone(),
+        bamboo_domain::SessionInboxLimits::default(),
+    );
+    assert!(retained_inbox
+        .read_managed_root_admission(&caller, &reference, &stale_target, &exact_receipt)
+        .await
+        .is_err());
     let recovered = invoke_managed_control(
         &cold,
         &reference,
@@ -1236,6 +1323,16 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     assert_eq!(receipts.len(), 1);
     let parked = home.path().join("parked-ack");
     std::fs::rename(&receipts[0], &parked).unwrap();
+    assert_eq!(
+        invoke_managed_control(
+            &cold,
+            &reference,
+            "managed-admission-pending-ack",
+            admission_request(&second, &second_input),
+        )
+        .await,
+        unconfirmed
+    );
     let pending = invoke_managed_control(
         &cold,
         &reference,
@@ -1249,6 +1346,15 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
             .is_err()
     );
     std::fs::rename(&parked, &receipts[0]).unwrap();
+    let restored_admission = invoke_managed_control(
+        &cold,
+        &reference,
+        "managed-admission-restored-ack",
+        admission_request(&second, &second_input),
+    )
+    .await;
+    assert_eq!(restored_admission["status"], "admission_verified");
+    assert_eq!(restored_admission["admission"]["run_id"], second_run);
     let verified = tokio::time::timeout(WAIT, pending)
         .await
         .expect("restored ACK wakes the wait");
