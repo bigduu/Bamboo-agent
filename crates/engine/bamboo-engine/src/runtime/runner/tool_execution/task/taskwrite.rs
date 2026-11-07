@@ -41,9 +41,9 @@ pub(super) async fn maybe_handle_taskwrite(
         .metadata
         .contains_key(crate::ticket_worker_plan::TICKET_LOCAL_PLAN_KEY)
     {
-        // TicketService already committed the exact private LocalPlan. This
-        // Session list is a display cache, and must never patch an old Root Task.
-        reinitialize_task_context(task_context, session, session_id, true);
+        // TicketService already committed the exact private LocalPlan. Publish
+        // that snapshot without starting ordinary tool-count status tracking.
+        *task_context = None;
         if let Some(task_list) = session.task_list.clone() {
             let _ = event_tx
                 .send(AgentEvent::TaskListUpdated {

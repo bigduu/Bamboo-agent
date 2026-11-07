@@ -49,6 +49,7 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
         accepted,
         before_submission,
         artifact,
+        task_snapshot,
     ) = {
         let state = web::Data::new(host(&physical_root, provider.clone()).await);
         let (service, owner) = state
@@ -205,6 +206,14 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
         assert_eq!(replay["errors"], json!([]));
         assert_eq!(service.published().unwrap().1.assignments.len(), 1);
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/task/{child_id}"))
+                .to_request(),
+        )
+        .await;
+        let empty_task: Value = test::read_body_json(response).await;
         first.reply.send(LLMChunk::ToolCalls(vec![ToolCall {
             id: CALL.into(), tool_type: "function".into(), function: FunctionCall {
                 name: "Task".into(), arguments: json!({"tasks":[{"id":"native-step","content":"Complete the bounded plan","status":"completed"}]}).to_string(),
@@ -229,6 +238,14 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
             Some(StepStatus::Completed)
         );
         assert!(planned.tickets[&work_id].accepted_submission.is_none());
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri(&format!("/api/v1/sessions/{child_id}/task"))
+                .to_request(),
+        )
+        .await;
+        let running_task: Value = test::read_body_json(response).await;
         second.reply.send(LLMChunk::Token(RESULT.into())).unwrap();
         tokio::time::timeout(WAIT, async {
             loop {
@@ -275,6 +292,36 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
         assert!(stop["pid"].is_null());
         assert!(stop["task_instance"].as_str().is_some());
         assert_eq!(stop["completed"], true);
+        assert_eq!(empty_task["session_id"], child_id);
+        assert_eq!(empty_task["items"], json!([]));
+        assert_eq!(running_task["session_id"], child_id);
+        assert_eq!(
+            running_task["version"],
+            planned.assignments[&assignment_id].plan.plan_revision
+        );
+        assert_eq!(running_task["items"][0]["id"], "native-step");
+        let mut task_snapshot = Value::Null;
+        for path in [
+            format!("/api/v1/task/{child_id}"),
+            format!("/api/v1/sessions/{child_id}/task"),
+        ] {
+            let response =
+                test::call_service(&app, test::TestRequest::get().uri(&path).to_request()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = test::read_body_json(response).await;
+            assert_eq!(body["session_id"], child_id);
+            assert_eq!(
+                body["version"],
+                submitted.assignments[&assignment_id].plan.plan_revision
+            );
+            assert_eq!(body["items"][0]["id"], "native-step");
+            assert_eq!(body["items"][0]["status"], "completed");
+            assert_eq!(body["progress"]["percentage"], 100);
+            if !task_snapshot.is_null() {
+                assert_eq!(body, task_snapshot);
+            }
+            task_snapshot = body;
+        }
         let before_submission = canonical_bytes(submission).unwrap();
         let artifact = submission.artifacts[0].clone();
         let response = test::call_service(
@@ -339,6 +386,7 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
             accepted,
             before_submission,
             artifact,
+            task_snapshot,
         )
     };
 
@@ -363,6 +411,19 @@ async fn native_task_submission_requires_owner_accept_and_survives_host_restart(
         Some(submission_id.as_str())
     );
     assert!(snapshot.assignments[&assignment_id].process_stopped);
+    let response = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/task/{child_id}"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored_task: Value = test::read_body_json(response).await;
+    assert_eq!(
+        restored_task, task_snapshot,
+        "Task purpose and revision survive Host restart"
+    );
     assert_eq!(
         snapshot.assignments[&assignment_id]
             .runtime
