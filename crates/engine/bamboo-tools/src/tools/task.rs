@@ -214,6 +214,25 @@ impl TaskTool {
         existing: Option<&TaskList>,
         default_phase: Option<TaskPhase>,
     ) -> Result<TaskList, ToolError> {
+        Self::parse_task_list(args, session_id, existing, default_phase, true)
+    }
+
+    /// Normalize a private Work plan while preserving each Worker-reported status.
+    pub fn task_list_from_work_args(
+        args: &serde_json::Value,
+        session_id: &str,
+        existing: Option<&TaskList>,
+    ) -> Result<TaskList, ToolError> {
+        Self::parse_task_list(args, session_id, existing, None, false)
+    }
+
+    fn parse_task_list(
+        args: &serde_json::Value,
+        session_id: &str,
+        existing: Option<&TaskList>,
+        default_phase: Option<TaskPhase>,
+        enforce_completion_criteria: bool,
+    ) -> Result<TaskList, ToolError> {
         let parsed: TaskArgsRaw = serde_json::from_value(args.clone())
             .map_err(|e| ToolError::InvalidArguments(format!("Invalid Task args: {e}")))?;
         let incoming_count = parsed.tasks.len();
@@ -311,7 +330,6 @@ impl TaskTool {
             depends_on.retain(|dependency_id| dependency_id != &task_id);
             let mut completion_criteria = normalize_string_list(task.completion_criteria);
             completion_criteria.retain(|criterion| !criterion.is_empty());
-            let criteria_met = normalize_string_list(task.criteria_met);
             let mut parent_id = normalize_optional_text(task.parent_id);
             if parent_id.as_deref() == Some(task_id.as_str()) {
                 parent_id = None;
@@ -319,9 +337,11 @@ impl TaskTool {
 
             let mut effective_status = status;
             let mut gate_note: Option<String> = None;
-            if matches!(effective_status, TaskItemStatus::Completed)
+            if enforce_completion_criteria
+                && matches!(effective_status, TaskItemStatus::Completed)
                 && !completion_criteria.is_empty()
             {
+                let criteria_met = normalize_string_list(task.criteria_met);
                 let missing = missing_completion_criteria(&completion_criteria, &criteria_met);
                 if !missing.is_empty() {
                     effective_status = TaskItemStatus::InProgress;
