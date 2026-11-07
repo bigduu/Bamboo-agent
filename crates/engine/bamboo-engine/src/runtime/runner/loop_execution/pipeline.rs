@@ -10923,8 +10923,11 @@ mod tests {
             "action=wait manages an existing child, not a spawn"
         );
         assert!(
-            !is_child_spawn_call(&call("SubAgent", r#"{"action":"list"}"#)),
-            "action=list is read-only, not a spawn"
+            !is_child_spawn_call(&call(
+                "SubAgent",
+                r#"{"action":"get","child_session_id":"child"}"#,
+            )),
+            "action=get inspects an existing child"
         );
         assert!(
             !is_child_spawn_call(&call("Bash", r#"{"action":"create"}"#)),

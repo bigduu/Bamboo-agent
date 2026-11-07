@@ -164,7 +164,6 @@ enum SubAgentArgs {
         #[serde(default)]
         wait_for: Option<ChildWaitPolicy>,
     },
-    List,
     Get {
         child_session_id: String,
         /// Overview is metadata only. Other views return bounded, durable
@@ -1897,11 +1896,6 @@ impl SubAgentTool {
                     "waiting_on": count,
                     "note": "Each completed child wakes the parent to process its result. Unfinished children remain tracked until the wait release policy is satisfied.",
                 }))
-            }
-            SubAgentArgs::List => {
-                let result =
-                    child_session::list_children_action(self.sessions.as_ref(), &parent.id).await;
-                tool_result(result)
             }
             SubAgentArgs::Get { .. } => unreachable!("get returns before loading the root"),
             SubAgentArgs::Update {
