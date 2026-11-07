@@ -4,8 +4,8 @@ use bamboo_domain::{
     SessionKind, SupervisedRootOutcomeResult,
 };
 use bamboo_tickets::{
-    Authority, DispatchIntent, DispatchSpec, Error, ManagedWorkRoot, Operation, OperationReceipt,
-    Principal, Result, RuntimeReceipt, TicketService,
+    AssignmentState, Authority, Command, DispatchIntent, DispatchSpec, Error, ManagedWorkRoot,
+    Operation, OperationReceipt, Principal, Result, RuntimeReceipt, TicketService,
 };
 
 pub fn validate_start(spec: &DispatchSpec) -> Result<()> {
@@ -137,6 +137,55 @@ pub fn execute_runtime_command(
         }
     }
     unreachable!()
+}
+
+/// The Host has proved no launch or joined the exact unadmitted Root. A
+/// concurrent admission or a changed assignment must keep its own stop path.
+pub fn confirm_unadmitted_stop(
+    service: &TicketService,
+    key: &str,
+    spec: &DispatchSpec,
+) -> Result<()> {
+    let (_, snapshot) = service.published()?;
+    let intent = snapshot
+        .intents
+        .get(key)
+        .filter(|intent| &intent.immutable_spec == spec && spec.managed_root.is_some())
+        .ok_or(Error::IdempotencyConflict)?;
+    let assignment = &snapshot.assignments[&intent.assignment_id];
+    if intent.receipt.is_some()
+        || intent.managed_admission.is_some()
+        || assignment.runtime.is_some()
+    {
+        return Err(Error::ScopeDenied("managed Work was admitted".into()));
+    }
+    if assignment.process_stopped {
+        return Ok(());
+    }
+    if !matches!(
+        assignment.state,
+        AssignmentState::Cancelling | AssignmentState::OutcomeUnknown
+    ) {
+        return Err(Error::ScopeDenied(
+            "managed Work stop was not requested".into(),
+        ));
+    }
+    let authority = Authority::from_verified_host(snapshot.binding.clone(), Principal::Runtime);
+    service.execute(
+        &authority,
+        &Command {
+            operation_id: format!("runtime-queued-stop/{key}"),
+            binding: snapshot.binding,
+            expected_seq: snapshot.seq,
+            expected_epoch: snapshot.authority_epoch,
+            operations: vec![Operation::ConfirmStopped {
+                assignment_id: assignment.id.clone(),
+                effects_reconciled: true,
+            }],
+            source: None,
+        },
+    )?;
+    Ok(())
 }
 
 /// The Host calls this after joining the Root task and its exact resources.

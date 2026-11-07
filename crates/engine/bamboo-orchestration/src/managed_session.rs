@@ -3,7 +3,7 @@ use async_trait::async_trait;
 use bamboo_domain::{ManagedRootEvent, ManagedRootEventRead, ManagedRootNotification, Session};
 use std::{future::Future, time::Duration};
 
-const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
+pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
 const MAX_ACK_RECHECK: Duration = Duration::from_secs(4);
 const RECENT_NOTIFICATION_SOURCES: usize = 8;

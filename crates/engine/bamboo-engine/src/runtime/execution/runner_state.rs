@@ -181,6 +181,22 @@ impl AgentRunner {
         self.execution_finalized.clone().cancelled_owned()
     }
 
+    pub async fn wait_for_managed_work_root_stop(
+        &self,
+        session: &bamboo_domain::Session,
+    ) -> std::io::Result<()> {
+        if !crate::ticket_runtime::is_managed_work_root(session) {
+            return Err(std::io::Error::other("managed Work Root required"));
+        }
+        tokio::time::timeout(
+            bamboo_orchestration::managed_session::MAX_FINALIZATION_WAIT,
+            self.root_execution
+                .wait_for_work_stop(session, &self.run_id),
+        )
+        .await
+        .map_err(|_| std::io::Error::other("exact managed Work Root stop timed out"))?
+    }
+
     /// Compare an existing Host observation without treating it as a grant.
     /// Ordinary metadata edits may advance metadata_version, while the
     /// canonical target and Workspace are separately revalidated by the Host.

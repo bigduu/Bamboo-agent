@@ -197,6 +197,19 @@ impl SessionExecutionReservation {
                 self.root_actor = Some(Box::new(RootActorExecution::start(binding)));
             }
         }
+        if !for_compaction
+            && crate::ticket_runtime::is_managed_work_root(session)
+            && self.root_actor.as_ref().is_some_and(|actor| {
+                let owner = &actor.binding.owner;
+                owner.fence.actor_id.as_str() == session.id
+                    && owner.fence.run_id == self.run_id
+                    && owner.created_at == session.created_at
+            })
+        {
+            if let Some(admission) = self.physical_admission.as_mut() {
+                admission.track_managed_work_root(session)?;
+            }
+        }
         self.bind_execution_persistence(agent, session)
     }
 
@@ -315,9 +328,19 @@ impl SessionExecutionReservation {
     /// Finish a valid adapter-owned pause only after its actual history
     /// publication barrier. Abandonment remains the rejected-startup fallback.
     pub async fn finish_root_actor(&mut self, outcome: bamboo_domain::ActorActivationFinish) {
-        if let Some(owner) = self.root_actor.take() {
-            (*owner).finish(outcome).await;
-        }
+        self.finish_root_actor_with_stop(outcome).await;
+    }
+
+    async fn finish_root_actor_with_stop(
+        &mut self,
+        outcome: bamboo_domain::ActorActivationFinish,
+    ) -> bool {
+        let Some(owner) = self.root_actor.take() else {
+            return false;
+        };
+        (*owner)
+            .finish(outcome, self.physical_admission.as_ref())
+            .await
     }
 
     /// Build the handoff owned by a router activation launch.
@@ -400,7 +423,8 @@ impl SessionExecutionReservation {
     pub(crate) async fn rollback_unpublished_activation(mut self) {
         self.armed = false;
         self.cancel_token.cancel();
-        self.finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+        let stopped = self
+            .finish_root_actor_with_stop(bamboo_domain::ActorActivationFinish::Cancelled)
             .await;
         let activation = std::mem::replace(
             &mut self.activation,
@@ -410,7 +434,19 @@ impl SessionExecutionReservation {
             activation,
             SessionExecutionActivationOwnership::UnpublishedActivation(_)
         ));
-        remove_runner_exact(&self.runners, &self.session_id, &self.run_id).await;
+        if stopped {
+            // Retain the exact terminal runner as the cancellation observer.
+            // It carries the verified no-launch proof, with no Router owner.
+            finalize_runner_exact(
+                &self.runners,
+                &self.session_id,
+                &self.run_id,
+                &Err(AgentError::Cancelled),
+            )
+            .await;
+        } else {
+            remove_runner_exact(&self.runners, &self.session_id, &self.run_id).await;
+        }
     }
 
     /// Adopt a router-published activation placeholder before any adapter-side
@@ -458,11 +494,8 @@ impl SessionExecutionReservation {
     pub async fn abandon(mut self) {
         self.armed = false;
         self.cancel_token.cancel();
-        if let Some(owner) = self.root_actor.take() {
-            (*owner)
-                .finish(bamboo_domain::ActorActivationFinish::Cancelled)
-                .await;
-        }
+        self.finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+            .await;
         let activation = std::mem::replace(
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,
@@ -2109,9 +2142,20 @@ impl RootActorExecution {
         self.binding.persistence.clone()
     }
 
-    pub(super) async fn finish(self, outcome: bamboo_domain::ActorActivationFinish) {
-        if let Err(error) = self.finish_observed(outcome).await {
-            tracing::warn!(%error, "Root Actor closure unconfirmed");
+    async fn finish(
+        self,
+        outcome: bamboo_domain::ActorActivationFinish,
+        admission: Option<&super::root_execution_lifetime::RootRunAdmission>,
+    ) -> bool {
+        match self.finish_observed(outcome).await {
+            Ok(()) => {
+                outcome == bamboo_domain::ActorActivationFinish::Cancelled
+                    && admission.is_some_and(|admission| admission.record_prelaunch_stop())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Root Actor closure unconfirmed");
+                false
+            }
         }
     }
 

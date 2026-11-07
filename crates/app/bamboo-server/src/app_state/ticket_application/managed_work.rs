@@ -1,6 +1,9 @@
 //! Host wiring for the explicit Supervisor Work Start route.
 use super::*;
-use bamboo_domain::{ProjectStatus, ProviderModelRef, SessionCallerReference};
+use bamboo_domain::{
+    ActorDirectoryError, ActorDirectoryPort, ProjectStatus, ProviderModelRef, Session,
+    SessionCallerReference, SupervisorCurrentUserTarget,
+};
 use bamboo_engine::model_config_helper::{
     get_fast_model_for_provider, get_reasoning_effort_for_provider, resolve_provider_routing_key,
 };
@@ -269,7 +272,7 @@ impl ManagedWorkHost {
         {
             return Ok(());
         }
-        let (binding, supervisor) = ticket_runtime::verified_scope_binding_for_service(
+        let (_, supervisor) = ticket_runtime::verified_scope_binding_for_service(
             self.creator.store.as_ref(),
             service,
             &snapshot.binding.supervisor_session_id,
@@ -281,40 +284,46 @@ impl ManagedWorkHost {
             .as_ref()
             .expect("managed cancellation");
         let Some(receipt) = &assignment.runtime else {
-            // The same creation claim guards durable reservation and first
-            // input. A retained reservation or Root requires its own stop proof.
+            // The creation claim prevents a late first input. The cancelled
+            // Ticket cannot admit a new Work run while the Host proves closure.
             let (digest, id) =
                 bamboo_domain::host_session_create_identity(&target.caller, target.operation_id)
                     .map_err(|error| Error::ScopeDenied(error.into()))?;
             let _creation = self.creator.operations.lock(&digest).await?;
-            if self
-                .creator
-                .operations
-                .load_for_status(&digest)
-                .await?
-                .is_some()
-                || self.creator.store.load_root_authority(&id).await?.is_some()
+            let operation = self.creator.operations.load_for_status(&digest).await?;
+            let spec = &intent.immutable_spec;
+            let dispatch = ticket_runtime::dispatch_binding(service, key, spec)?;
+            let matches = |root: &Session| {
+                operation.as_ref().is_some_and(|record| {
+                    record.session_id == id && record.created_at == root.created_at
+                }) && managed_work::matches_root(target, spec, root)
+                    && ticket_runtime::read_dispatch(root).ok().flatten().as_ref()
+                        == Some(&dispatch)
+            };
+            let root = self.creator.store.load_runtime_control_plane(&id).await?;
+            match &root {
+                Some(root) if matches(root) => {}
+                None if operation.as_ref().is_none_or(|record| {
+                    record.session_id == id && record.supervised_delivery.is_none()
+                }) => {}
+                _ => {
+                    return Err(Error::ScopeDenied(
+                        "reserved Work Root lifetime changed".into(),
+                    ))
+                }
+            }
+            self.stop_unadmitted_root(&supervisor, &id, root.as_ref())
+                .await?;
+            let current = self.creator.store.load_runtime_control_plane(&id).await?;
+            if current.as_ref().map(|root| root.created_at)
+                != root.as_ref().map(|root| root.created_at)
+                || current.as_ref().is_some_and(|root| !matches(root))
             {
-                return Err(Error::AuthorityUnavailable(
-                    "managed Work creation has no confirmed stop".into(),
+                return Err(Error::ScopeDenied(
+                    "reserved Work Root lifetime changed".into(),
                 ));
             }
-            let authority = Authority::from_verified_host(binding.clone(), Principal::Runtime);
-            service.execute(
-                &authority,
-                &Command {
-                    operation_id: format!("runtime-queued-stop/{key}"),
-                    binding,
-                    expected_seq: snapshot.seq,
-                    expected_epoch: snapshot.authority_epoch,
-                    operations: vec![Operation::ConfirmStopped {
-                        assignment_id: assignment.id.clone(),
-                        effects_reconciled: true,
-                    }],
-                    source: None,
-                },
-            )?;
-            return Ok(());
+            return managed_work::confirm_unadmitted_stop(service, key, spec);
         };
         let admission = intent.managed_admission.as_ref().ok_or_else(|| {
             Error::ScopeDenied("managed Work cancellation has no exact admission".into())
@@ -334,7 +343,7 @@ impl ManagedWorkHost {
             .ok_or_else(|| {
                 Error::ScopeDenied("managed Work cancellation lifetime changed".into())
             })?;
-        let root = bamboo_domain::SupervisorCurrentUserTarget::capture(&root)
+        let root = SupervisorCurrentUserTarget::capture(&root)
             .map_err(|error| Error::ScopeDenied(error.into()))?;
         // The committed Work cancellation is the Host's authority. The
         // canonical Root control still fences the exact target birth and run.
@@ -353,6 +362,51 @@ impl ManagedWorkHost {
         if !result.success {
             return Err(Error::AuthorityUnavailable(
                 "managed Work exact cancellation unconfirmed".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn stop_unadmitted_root(
+        &self,
+        supervisor: &Session,
+        id: &str,
+        root: Option<&Session>,
+    ) -> Result<()> {
+        let runs = self.runs.get().ok_or_else(host_unavailable)?;
+        let runner = runs.runners.read().await.get(id).cloned();
+        if let Some(runner) = runner {
+            let root =
+                root.ok_or_else(|| Error::ScopeDenied("unadmitted Root disappeared".into()))?;
+            let target = SupervisorCurrentUserTarget::capture(root)
+                .map_err(|error| Error::ScopeDenied(error.into()))?;
+            // A pending or already-finalizing owner can refuse the signal.
+            // The retained runner must prove prelaunch abandonment or join.
+            let _ = runs
+                .cancel_run(
+                    &SessionCallerReference::from(supervisor),
+                    &target,
+                    &runner.run_id,
+                    bamboo_domain::AdmissionGate::default(),
+                )
+                .await;
+            runner.wait_for_managed_work_root_stop(root).await?;
+            return Ok(());
+        }
+        match self.creator.store.inspect_actor(id).await {
+            Ok(actor) if actor.activation.is_none() => {}
+            Err(ActorDirectoryError::NotFound(_)) if root.is_none() => {}
+            _ => {
+                return Err(Error::AuthorityUnavailable(
+                    "unadmitted Work Actor has no confirmed stop".into(),
+                ));
+            }
+        }
+        if runs.router.has_activation_owner_or_reservation(id).await
+            || runs.runners.read().await.contains_key(id)
+        {
+            return Err(Error::AuthorityUnavailable(
+                "unadmitted Work Root activation is still pending".into(),
             ));
         }
         Ok(())

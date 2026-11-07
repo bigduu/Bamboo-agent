@@ -74,6 +74,7 @@ struct State {
     unobserved_predecessor: bool,
     tasks: HashMap<u64, OuterTask>,
     joined: Option<JoinedOuter>,
+    prelaunch_stopped: Option<RootObservation>,
     failure: Option<String>,
     next_reset: u64,
     joins: Vec<JoinHandle<()>>,
@@ -120,6 +121,7 @@ pub(super) struct RootRunAdmission {
     lifetime: Arc<RootExecutionLifetime>,
     epoch: u64,
     run_id: String,
+    managed_work_root: Option<RootObservation>,
 }
 
 /// Only the installed runner owns this slot. Snapshot clones are observers.
@@ -168,6 +170,7 @@ impl Drop for RootRunnerSlot {
         if self.owner {
             self.lifetime.closed.store(true, Ordering::Release);
             self.lifetime.reset.store(0, Ordering::Release);
+            self.lifetime.changed.notify_waiters();
         }
     }
 }
@@ -205,17 +208,20 @@ impl RootExecutionLifetime {
             .load(Ordering::Acquire)
             .checked_add(1)
             .ok_or_else(|| unsupported("Root admission epoch exhausted"))?;
-        if state.run_id.is_some() && !state.attached {
+        if state.run_id.is_some() && !state.attached && state.prelaunch_stopped.is_none() {
             state.unobserved_predecessor = true;
         }
         state.run_id = Some(run_id.into());
         state.attached = false;
         state.joined = None;
+        state.prelaunch_stopped = None;
         self.epoch.store(epoch, Ordering::Release);
+        self.changed.notify_waiters();
         Ok(RootRunAdmission {
             lifetime: self.clone(),
             epoch,
             run_id: run_id.into(),
+            managed_work_root: None,
         })
     }
 
@@ -226,7 +232,9 @@ impl RootExecutionLifetime {
         if let Some(error) = &state.failure {
             return RootOuterClosure::Unconfirmed(error.clone());
         }
-        if !state.tasks.is_empty() || (state.run_id.is_some() && !state.attached) {
+        if !state.tasks.is_empty()
+            || (state.run_id.is_some() && !state.attached && state.prelaunch_stopped.is_none())
+        {
             return RootOuterClosure::Pending;
         }
         if state.unobserved_predecessor {
@@ -239,6 +247,42 @@ impl RootExecutionLifetime {
                 }
             }
             _ => RootOuterClosure::Unknown,
+        }
+    }
+
+    /// Wait for exact Actor abandonment before launch, or for actual join and
+    /// Actor closure after launch. Work with no admission has no Work resources.
+    pub(super) async fn wait_for_work_stop(
+        &self,
+        session: &Session,
+        run_id: &str,
+    ) -> io::Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            {
+                let state = self.state.lock().map_err(|_| busy("Root owner poisoned"))?;
+                if state.run_id.as_deref() != Some(run_id)
+                    || state.unobserved_predecessor
+                    || state.failure.is_some()
+                {
+                    return Err(busy("exact Root join is unconfirmed"));
+                }
+                if let Some(original) = &state.prelaunch_stopped {
+                    return original.check(session);
+                }
+                if let Some(joined) = state.joined.as_ref().filter(|joined| {
+                    state.tasks.is_empty() && joined.epoch == self.epoch.load(Ordering::Acquire)
+                }) {
+                    if !joined.actor_finished {
+                        return Err(busy("exact Root Actor closure is unconfirmed"));
+                    }
+                    return joined.original.check(session);
+                }
+                if self.closed.load(Ordering::Acquire) {
+                    return Err(busy("Root owner disappeared before join"));
+                }
+            }
+            changed.await;
         }
     }
 
@@ -326,8 +370,10 @@ impl RootExecutionLifetime {
                             if state.tasks.is_empty() {
                                 let unconfirmed = state.failure.clone().or_else(|| {
                                     (state.unobserved_predecessor
-                                        || (state.run_id.is_some() && !state.attached))
-                                        .then(|| "Root launch handoff is unconfirmed".into())
+                                        || (state.run_id.is_some()
+                                            && !state.attached
+                                            && state.prelaunch_stopped.is_none()))
+                                    .then(|| "Root launch handoff is unconfirmed".into())
                                 });
                                 break (std::mem::take(&mut state.joins), unconfirmed);
                             }
@@ -357,6 +403,35 @@ impl RootExecutionLifetime {
 }
 
 impl RootRunAdmission {
+    pub(super) fn track_managed_work_root(&mut self, session: &Session) -> io::Result<()> {
+        self.managed_work_root = Some(RootObservation::capture(session)?);
+        Ok(())
+    }
+
+    /// Called only after the matching native Actor's owned cancellation has
+    /// succeeded. An outer task that has attached must use its real join.
+    pub(super) fn record_prelaunch_stop(&self) -> bool {
+        let Some(original) = &self.managed_work_root else {
+            return false;
+        };
+        let Ok(mut state) = self.lifetime.state.lock() else {
+            return false;
+        };
+        if self.lifetime.closed.load(Ordering::Acquire)
+            || self.lifetime.epoch.load(Ordering::Acquire) != self.epoch
+            || state.run_id.as_deref() != Some(self.run_id.as_str())
+            || state.attached
+            || !state.tasks.is_empty()
+            || state.unobserved_predecessor
+            || state.failure.is_some()
+        {
+            return false;
+        }
+        state.prelaunch_stopped = Some(original.clone());
+        self.lifetime.changed.notify_waiters();
+        true
+    }
+
     pub(super) fn attach(&self, session: &Session) -> io::Result<RootOuterTask> {
         let original = RootObservation::capture(session)?;
         let mut state = self
@@ -369,6 +444,7 @@ impl RootRunAdmission {
             || self.lifetime.epoch.load(Ordering::Acquire) != self.epoch
             || state.run_id.as_deref() != Some(self.run_id.as_str())
             || state.attached
+            || state.prelaunch_stopped.is_some()
             || state.tasks.len() >= MAX_RETAINED_OUTER_TASKS
         {
             return Err(busy("Root launch handoff changed or is unavailable"));
@@ -507,7 +583,7 @@ impl RootOuterTask {
                     task.actor_finished
                 }
             };
-            lifetime.changed.notify_one();
+            lifetime.changed.notify_waiters();
             if confirmed {
                 complete().await;
             }

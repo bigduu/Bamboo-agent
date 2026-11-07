@@ -4,7 +4,12 @@ use bamboo_agent_core::tools::{
     with_executing_session_caller, ExecutingSupervisorObservation, ToolExecutionContext,
     ToolExecutionSessionFlags, ToolOutcome,
 };
-use bamboo_domain::{Session, SessionCallerReference, SessionKind};
+use bamboo_domain::{
+    ActorActivationStatus, ActorDirectoryPort, Session, SessionCallerReference, SessionKind,
+};
+use bamboo_engine::session_activation::{
+    SessionActivationReserveOutcome, SessionActivationSpawner,
+};
 use bamboo_server::{tools::ToolSurface, AppState};
 use bamboo_tickets::{AssignmentState, Authority, Command, ExecutionWorkspace, TicketService};
 
@@ -467,4 +472,206 @@ async fn supervisor_work_start_admits_one_independent_root_and_submits_owned_res
     assert!(stopped.tickets[&cancel_work].current_submission.is_none());
     assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
     reopened.shutdown().await;
+}
+
+struct HeldActivation {
+    real: Option<Arc<bamboo_engine::ChildCompletionCoordinator>>,
+    abandon_prepared: bool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    calls: AtomicUsize,
+}
+
+#[async_trait::async_trait]
+impl SessionActivationSpawner for HeldActivation {
+    async fn reserve_activation(
+        &self,
+        id: &str,
+        generation: u64,
+    ) -> std::result::Result<SessionActivationReserveOutcome, bamboo_domain::SessionActivationError>
+    {
+        let reserved = match &self.real {
+            Some(real) => real.reserve_activation(id, generation).await,
+            None => Err(bamboo_domain::SessionActivationError::Internal(
+                "controlled activation unavailable".into(),
+            )),
+        };
+        if (self.real.is_none()
+            || matches!(&reserved, Ok(SessionActivationReserveOutcome::Reserved(_))))
+            && self.calls.fetch_add(1, Ordering::SeqCst) == 0
+        {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        if self.abandon_prepared
+            && matches!(&reserved, Ok(SessionActivationReserveOutcome::Reserved(_)))
+        {
+            // Dropping the actual two-phase launch runs its native Actor
+            // rollback. No Root outer task has been attached.
+            drop(reserved);
+            return Err(bamboo_domain::SessionActivationError::Internal(
+                "controlled abandonment of the reserved Root".into(),
+            ));
+        }
+        reserved
+    }
+}
+
+#[actix_web::test]
+async fn supervisor_cancels_managed_root_before_work_admission_and_releases_its_claim() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home.path().canonicalize().unwrap();
+    let workspace = execution_workspace(&path);
+    let (send, _requests) = mpsc::unbounded_channel();
+    let provider = Arc::new(LocalProvider {
+        requests: send,
+        calls: AtomicUsize::new(0),
+        max_requests: 0,
+    });
+    let state = host(&path, provider.clone()).await;
+    let owner_principal = Principal::User {
+        user_id: "host-owner".into(),
+    };
+    let (service, owner) = state
+        .tickets
+        .authority(owner_principal.clone())
+        .await
+        .unwrap();
+    let supervisor_id = service.published().unwrap().1.binding.supervisor_session_id;
+    let supervisor = state
+        .storage
+        .load_execution_admission_snapshot(&supervisor_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, authority) = state
+        .tickets
+        .authority(Principal::Supervisor {
+            session_id: supervisor_id,
+        })
+        .await
+        .unwrap();
+    let project = state.project_store.create("Managed Work", None).unwrap();
+    state
+        .project_store
+        .bind_workspace(
+            &project.id,
+            project.revision,
+            WorkspaceBinding {
+                path: workspace.worktree.clone(),
+                label: None,
+                git_common_dir: None,
+            },
+        )
+        .unwrap();
+    for (label, prepare_actor, abandon_prepared) in [
+        ("staged-without-launch", false, false),
+        ("abandoned-real-reservation", true, true),
+        ("launched-real-run", true, false),
+    ] {
+        let gate = Arc::new(HeldActivation {
+            real: prepare_actor.then(|| state.child_completion_coordinator.clone()),
+            abandon_prepared,
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+            calls: AtomicUsize::new(0),
+        });
+        state
+            .session_activation_router
+            .set_spawner(gate.clone())
+            .await;
+        let (work, start) = prepare_start(
+            &service,
+            &owner,
+            &authority,
+            label,
+            workspace.clone(),
+            Vec::new(),
+        );
+        let cancel_before_admission = async {
+            tokio::time::timeout(WAIT, gate.entered.notified())
+                .await
+                .unwrap();
+            let (_, snapshot) = service.published().unwrap();
+            let assignment_id = snapshot.tickets[&work].active_assignment.clone().unwrap();
+            let assignment = &snapshot.assignments[&assignment_id];
+            let target = snapshot.intents[&assignment.dispatch_key]
+                .immutable_spec
+                .managed_root
+                .as_ref()
+                .unwrap()
+                .session_id()
+                .unwrap();
+            let pending = state.session_inbox.inspect(&target).await.unwrap();
+            assert_eq!(pending.pending, 1);
+            assert!(assignment.runtime.is_none());
+            assert!(!assignment.process_stopped);
+            let activation = state
+                .session_store
+                .inspect_actor(&target)
+                .await
+                .unwrap()
+                .activation;
+            assert_eq!(
+                activation
+                    .as_ref()
+                    .is_some_and(|actor| actor.status.is_live()),
+                prepare_actor
+            );
+            let cancel = service
+                .prepare_command(
+                    &owner,
+                    &format!("cancel-{label}"),
+                    vec![Operation::Cancel {
+                        work_id: work.clone(),
+                    }],
+                )
+                .unwrap();
+            state
+                .tickets
+                .update(owner_principal.clone(), &cancel)
+                .await
+                .unwrap();
+            assert!(!service.published().unwrap().1.assignments[&assignment_id].process_stopped);
+            gate.release.notify_one();
+            (assignment_id, target)
+        };
+        let (_, (assignment, target)) = tokio::join!(
+            dispatch(&state, &supervisor, &start, true),
+            cancel_before_admission
+        );
+        tokio::time::timeout(WAIT, async {
+            loop {
+                let (_, snapshot) = service.published().unwrap();
+                let assignment = &snapshot.assignments[&assignment];
+                if assignment.process_stopped {
+                    assert_eq!(assignment.state, AssignmentState::Cancelled);
+                    assert!(assignment.runtime.is_none());
+                    assert!(snapshot.intents[&assignment.dispatch_key]
+                        .managed_admission
+                        .is_none());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("confirmed unadmitted stop must release the Work claim");
+        let activation = state
+            .session_store
+            .inspect_actor(&target)
+            .await
+            .unwrap()
+            .activation;
+        assert_eq!(activation.is_some(), prepare_actor);
+        if abandon_prepared {
+            assert_eq!(
+                activation.as_ref().map(|actor| actor.status),
+                Some(ActorActivationStatus::Cancelled)
+            );
+        }
+        assert!(activation.is_none_or(|actor| !actor.status.is_live()));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+    }
+    state.shutdown().await;
 }

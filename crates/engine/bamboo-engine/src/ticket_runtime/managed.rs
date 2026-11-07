@@ -30,6 +30,20 @@ pub(crate) struct ManagedWorkRun {
 }
 
 impl ManagedWorkRuntime {
+    fn service(&self) -> Result<Arc<TicketService>> {
+        self.service
+            .upgrade()
+            .and_then(|slot| slot.get().cloned())
+            .ok_or_else(|| Error::AuthorityUnavailable("managed Work ledger unavailable".into()))
+    }
+
+    pub(crate) fn require_launch_permission(&self, session: &Session) -> Result<()> {
+        let service = self.service()?;
+        let dispatch = read_dispatch(session)?
+            .ok_or_else(|| Error::ScopeDenied("managed Work dispatch missing".into()))?;
+        require_dispatch_permission(&service, &dispatch)
+    }
+
     pub(crate) async fn admit(
         &self,
         agent: &Agent,
@@ -37,11 +51,7 @@ impl ManagedWorkRuntime {
         run_id: &str,
         roster: &ModelRoster,
     ) -> Result<ManagedWorkRun> {
-        let service = self
-            .service
-            .upgrade()
-            .and_then(|slot| slot.get().cloned())
-            .ok_or_else(|| Error::AuthorityUnavailable("managed Work ledger unavailable".into()))?;
+        let service = self.service()?;
         let dispatch = read_dispatch(session)?
             .ok_or_else(|| Error::ScopeDenied("managed Work dispatch missing".into()))?;
         let (_, snapshot) = service.published()?;
