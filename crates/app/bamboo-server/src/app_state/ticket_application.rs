@@ -24,6 +24,7 @@ pub struct TicketApplication {
     root: PathBuf,
     unavailable: Option<String>,
     adapter: OnceLock<Arc<ChildSessionAdapter>>,
+    managed_work_host: OnceLock<managed_work::ManagedWorkHost>,
     messenger: OnceLock<Arc<bamboo_engine::SessionMessenger>>,
     workspace: String,
     ready_scheduler: Arc<bamboo_orchestration::ReadyWorkScheduler>,
@@ -51,6 +52,7 @@ struct CancellationProbe {
 
 mod admission;
 mod initialization;
+mod managed_work;
 mod memory_sources;
 pub use initialization::{ScopeInitialization, ScopeInitializationError};
 mod patrol_adapter;
@@ -91,6 +93,7 @@ impl TicketApplication {
             root: root.to_path_buf(),
             unavailable,
             adapter: OnceLock::new(),
+            managed_work_host: OnceLock::new(),
             messenger: OnceLock::new(),
             workspace: root
                 .join("workspaces")
@@ -313,6 +316,22 @@ impl TicketApplication {
         let Some(receipt) = &assignment.runtime else {
             return Ok(());
         };
+        let snapshot = service.published()?.1;
+        let intent = &snapshot.intents[&assignment.dispatch_key];
+        if intent.immutable_spec.managed_root.is_some() {
+            if assignment.process_stopped {
+                if let Some(main) = self
+                    .storage
+                    .load_execution_admission_snapshot(&receipt.session_id)
+                    .await?
+                {
+                    bamboo_orchestration::managed_work::reconcile_stopped_result(
+                        service, receipt, &main,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
         let child_id = ticket_runtime::ticket_child_id(&assignment.dispatch_key);
         let Some(child) = self.storage.load_runtime_control_plane(&child_id).await? else {
             return Ok(());
@@ -672,9 +691,6 @@ impl TicketApplication {
     }
 
     fn cancel_after_commit(&self, service: &Arc<TicketService>, command: &Command) {
-        let Some(adapter) = self.adapter.get() else {
-            return;
-        };
         let Ok((_, snapshot)) = service.published() else {
             return;
         };
@@ -705,6 +721,22 @@ impl TicketApplication {
                                         == "accepted dependency input revoked; review required"
                                 }))))
         }) {
+            let intent = &snapshot.intents[&assignment.dispatch_key];
+            if intent.immutable_spec.managed_root.is_some() {
+                if let Some(host) = self.managed_work_host.get().cloned() {
+                    let service = service.clone();
+                    let key = assignment.dispatch_key.clone();
+                    tasks.spawn(async move {
+                        if let Err(error) = host.cancel(&service, &key).await {
+                            tracing::warn!(%key, %error, "managed Work cancellation retained for reconciliation");
+                        }
+                    });
+                }
+                continue;
+            }
+            let Some(adapter) = self.adapter.get() else {
+                continue;
+            };
             let assignment = assignment.clone();
             let service = service.clone();
             let adapter = adapter.clone();
@@ -824,6 +856,14 @@ impl TicketApplication {
         fence: Option<&bamboo_orchestration::ReadyAdmissionFence>,
     ) -> Result<ticket_runtime::DispatchObservation> {
         let service = self.service()?;
+        if spec.managed_root.is_some() {
+            if max_rounds.is_some() || fence.is_some() {
+                return Err(Error::ScopeDenied(
+                    "managed Work requires its explicit dispatch route".into(),
+                ));
+            }
+            return self.ensure_managed_work(&service, key, spec).await;
+        }
         let enabled = self.config.read().await.features.ticket_dispatch;
         if enabled {
             // All paths, including semantic resolution and recovered pending

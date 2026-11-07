@@ -273,12 +273,68 @@ pub struct DispatchIntent {
     pub immutable_spec: DispatchSpec,
     pub spec_hash: String,
     pub receipt: Option<RuntimeReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_admission: Option<bamboo_domain::ManagedRootAdmission>,
+}
+
+/// Frozen Host selection for one explicit Work dispatch. The canonical Root
+/// creation store still owns the reservation and the immutable Session birth.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedWorkRoot {
+    pub operation_id: uuid::Uuid,
+    pub caller: bamboo_domain::SessionCallerReference,
+    pub scope_revision: u64,
+    pub project_id: bamboo_domain::ProjectId,
+    pub model: bamboo_domain::ProviderModelRef,
+}
+
+impl ManagedWorkRoot {
+    pub fn session_id(&self) -> Result<String, &'static str> {
+        bamboo_domain::host_session_create_identity(&self.caller, self.operation_id)
+            .map(|(_, session_id)| session_id)
+    }
+
+    pub fn supervisor(&self) -> Option<bamboo_domain::SupervisorReference> {
+        let bamboo_domain::SessionAuthorityIdentity::Supervisor { incarnation_id } =
+            self.caller.authority_identity
+        else {
+            return None;
+        };
+        Some(bamboo_domain::SupervisorReference {
+            session_id: self.caller.session_id.clone(),
+            incarnation_id,
+        })
+    }
+
+    pub fn input_id(&self, session_id: &str) -> Option<bamboo_domain::SessionMessageId> {
+        Some(bamboo_domain::supervisor_followup_message_id(
+            &self.supervisor()?,
+            session_id,
+            &self.operation_id.to_string(),
+        ))
+    }
+
+    pub(crate) fn matches_admission(
+        &self,
+        receipt: &RuntimeReceipt,
+        admission: &bamboo_domain::ManagedRootAdmission,
+    ) -> bool {
+        self.session_id().as_deref() == Ok(receipt.session_id.as_str())
+            && admission.target_session_id == receipt.session_id
+            && admission.run_id == receipt.run_id
+            && admission.input.generation != 0
+            && self.input_id(&receipt.session_id).as_ref() == Some(&admission.input.receipt_id)
+            && admission.input.operation_id.as_str() == self.operation_id.to_string()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_context_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_root: Option<ManagedWorkRoot>,
     pub binding: ScopeBinding,
     pub work_id: String,
     pub assignment_id: String,
@@ -479,6 +535,11 @@ pub enum Operation {
     Admitted {
         assignment_id: String,
         receipt: RuntimeReceipt,
+    },
+    ManagedAdmitted {
+        assignment_id: String,
+        receipt: RuntimeReceipt,
+        admission: bamboo_domain::ManagedRootAdmission,
     },
     Running {
         assignment_id: String,

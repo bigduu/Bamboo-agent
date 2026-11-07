@@ -4702,12 +4702,14 @@ impl SessionInboxPort for FileSessionInbox {
             )
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        // This retained guard proves the unscoped source. An exact retry
+        // keeps the original published Inbox intent.
         let intent = Self::legacy_supervisor_root_intent(
             SessionInboxActivationIntent::new(SessionActivationPolicy::RespectSpecificWait),
             caller,
             reserved_root.created_at,
             envelope,
-            None,
+            Some(false),
         )?;
         self.deliver_with_lifecycle_held_state(
             envelope,

@@ -6,6 +6,7 @@
 //! uses a narrow Host storage port, never a second Task/lease or recovered grant.
 pub mod handoff;
 pub mod managed_session;
+pub mod managed_work;
 pub mod patrol;
 pub mod work_lifetime;
 pub mod work_review;

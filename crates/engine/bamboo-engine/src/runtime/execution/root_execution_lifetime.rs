@@ -441,7 +441,16 @@ impl RootOuterTask {
 
     /// Own the actual outer JoinHandle in a retained coordinator. The producer
     /// never records join success itself or substitutes terminal registry state.
+    #[cfg(test)]
     pub(super) fn retain(self, task: JoinHandle<()>) {
+        self.retain_with_completion(task, || async {});
+    }
+
+    pub(super) fn retain_with_completion<F, Fut>(self, task: JoinHandle<()>, complete: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let Some(lifetime) = self.lifetime.upgrade() else {
             tokio::spawn(async move {
                 let _ = task.await;
@@ -467,33 +476,41 @@ impl RootOuterTask {
             let Some(lifetime) = weak.upgrade() else {
                 return;
             };
-            let Ok(mut state) = lifetime.state.lock() else {
-                return;
+            let confirmed = {
+                let Ok(mut state) = lifetime.state.lock() else {
+                    return;
+                };
+                let Some(task) = state.tasks.remove(&epoch) else {
+                    state
+                        .failure
+                        .get_or_insert("Root task join lost its exact handoff".into());
+                    return;
+                };
+                let failure = joined
+                    .err()
+                    .map(|e| e.to_string())
+                    .or(task.failure)
+                    .or_else(|| {
+                        (!task.tail_completed).then(|| "Root outer tail did not complete".into())
+                    });
+                if let Some(error) = failure {
+                    state.failure.get_or_insert(error);
+                    false
+                } else {
+                    if lifetime.epoch.load(Ordering::Acquire) == epoch {
+                        state.joined = Some(JoinedOuter {
+                            epoch,
+                            original: task.original,
+                            actor_finished: task.actor_finished,
+                        });
+                    }
+                    task.actor_finished
+                }
             };
-            let Some(task) = state.tasks.remove(&epoch) else {
-                state
-                    .failure
-                    .get_or_insert("Root task join lost its exact handoff".into());
-                return;
-            };
-            let failure = joined
-                .err()
-                .map(|e| e.to_string())
-                .or(task.failure)
-                .or_else(|| {
-                    (!task.tail_completed).then(|| "Root outer tail did not complete".into())
-                });
-            if let Some(error) = failure {
-                state.failure.get_or_insert(error);
-            } else if lifetime.epoch.load(Ordering::Acquire) == epoch {
-                state.joined = Some(JoinedOuter {
-                    epoch,
-                    original: task.original,
-                    actor_finished: task.actor_finished,
-                });
-            }
-            drop(state);
             lifetime.changed.notify_one();
+            if confirmed {
+                complete().await;
+            }
         });
         state.joins.push(join);
     }

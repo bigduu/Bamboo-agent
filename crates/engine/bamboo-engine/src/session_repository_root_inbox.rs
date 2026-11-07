@@ -68,18 +68,21 @@ impl SessionRepository {
         session: &mut Session,
         inbox: Arc<dyn SessionInboxPort>,
         active_run_id: Option<&str>,
+        expected_work_input: Option<&bamboo_domain::SessionMessageId>,
     ) -> io::Result<Option<RootInboxAdmission>> {
         let Some((directory, owner)) = &self.root_actor_owner else {
             return Ok(None);
         };
-        if session.id != owner.fence.actor_id {
+        if session.id != owner.fence.actor_id
+            || expected_work_input.is_some() && active_run_id != Some(owner.fence.run_id.as_str())
+        {
             return Err(io::Error::other("Root Inbox execution target mismatch"));
         }
         // Probe/bind before claim changes this queue's durable protocol version.
         let inbox = self.storage.bind_root_actor_inbox(owner, inbox)?;
         let consumer = SessionInboxConsumerId::new();
         let mut admission = RootInboxAdmission::default();
-        let limit = if self.root_inbox_receipt.is_some() {
+        let limit = if self.root_inbox_receipt.is_some() || expected_work_input.is_some() {
             1
         } else {
             128
@@ -93,6 +96,7 @@ impl SessionRepository {
                     directory.as_ref(),
                     owner,
                     &consumer,
+                    expected_work_input,
                 )
                 .await
             {
@@ -118,6 +122,7 @@ impl SessionRepository {
         directory: &dyn bamboo_domain::ActorDirectoryPort,
         owner: &RootActorRuntimeWrite,
         consumer: &SessionInboxConsumerId,
+        expected_work_input: Option<&bamboo_domain::SessionMessageId>,
     ) -> io::Result<InputAdmission> {
         let request = lease_request(directory, owner, consumer).await?;
         let claim = match self.root_inbox_receipt.as_ref() {
@@ -151,6 +156,11 @@ impl SessionRepository {
             .map_err(io::Error::other)?;
         pending.claim = Some(claim.clone());
         let envelope = &claim.claim.envelope;
+        if expected_work_input.is_some_and(|expected| &envelope.id != expected) {
+            return Err(io::Error::other(
+                "Root input differs from the reserved Work dispatch",
+            ));
+        }
         if self.root_inbox_receipt.is_some()
             && (envelope.source != bamboo_domain::SessionMessageSource::User
                 || envelope.kind != bamboo_domain::SessionMessageKind::UserInput)

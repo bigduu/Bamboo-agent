@@ -220,7 +220,12 @@ impl TicketTool {
                     source: None,
                 };
                 if self.name == "work_dispatch" {
-                    app.dispatch(principal, &command).await
+                    app.dispatch_from_supervisor(
+                        principal,
+                        &command,
+                        ctx.executing_caller_for(caller),
+                    )
+                    .await
                 } else {
                     Ok(
                         json!({"status":"committed", "receipt":app.update(principal, &command).await?}),
@@ -250,7 +255,7 @@ impl Tool for TicketTool {
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",
             "work_review" => "Explicitly request one metered advisory review of a current Work and Assignment. Use a stable operation UUID for retries and read the cited Work and Session evidence. The configured Work Review or Fast role summarizes purpose, progress, waits and outputs. Review does not dispatch or accept the delivery.",
             "work_update" => semantic_schema::work_update_guidance(),
-            _ => "Commit start/steer/pause/cancel/retry intents through the existing Runtime. Explicit pause stays blocked after stop; ready resumes a stopped pause. Reopen/start creates a fresh attempt only after confirmed stop and reconciled effects. Returns accepted_for_dispatch with receipt immediately, not completion or acceptance.",
+            _ => "Start Task or Read/Task Work in an independent Session with its explicit isolated worktree. The receipt records the dispatch. Use Work inspection and exact Session progress to verify its delivery before owner acceptance. Pause stays blocked after stop and ready resumes a stopped pause. Reopen/start requires confirmed stop and reconciled effects.",
         }
     }
     fn parameters_schema(&self) -> Value {

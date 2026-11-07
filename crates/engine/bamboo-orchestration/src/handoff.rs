@@ -63,8 +63,13 @@ fn relative_path(path: &str, workspace: Option<&ExecutionWorkspace>) -> Option<P
 /// Retained sessions may have been compacted or may have newer messages.
 fn terminal_message(session: &Session, submission: &Submission) -> Option<usize> {
     let receipt = &submission.runtime;
+    let kind = if session.kind == bamboo_domain::SessionKind::Root {
+        "Root"
+    } else {
+        "Child"
+    };
     let prefix = format!(
-        "canonical Child {}; run {}; message ",
+        "canonical {kind} {}; run {}; message ",
         receipt.session_id, receipt.run_id
     );
     let (message_id, sha256) = submission

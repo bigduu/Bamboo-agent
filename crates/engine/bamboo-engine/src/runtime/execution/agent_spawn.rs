@@ -1295,6 +1295,16 @@ pub fn spawn_session_execution_with_upstream_retry(
         None
     };
     let task_outer = outer.clone();
+    let managed_root = crate::ticket_runtime::is_managed_work_root(&args.session);
+    let (work_completion, joined_work) = if managed_root && outer.is_some() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<(
+            crate::ticket_runtime::managed::ManagedWorkRun,
+            bamboo_tools::DrainedLocalTaskResources,
+        )>();
+        (Some(tx), Some((rx, args.agent.storage().clone())))
+    } else {
+        (None, None)
+    };
 
     let task = tokio::spawn(
         async move {
@@ -1463,6 +1473,27 @@ pub fn spawn_session_execution_with_upstream_retry(
             // for session attribution / logging (same value the caller set).
             let model = model_roster.model.clone().unwrap_or_default();
 
+            let (work, work_error) = if managed_root {
+                match (agent.managed_work_runtime(), work_completion.as_ref()) {
+                    (Some(runtime), Some(_)) => {
+                        match runtime
+                            .admit(&agent, &mut session, &activation_run_id, &model_roster)
+                            .await
+                        {
+                            Ok(work) => (Some(work), None),
+                            Err(error) => (None, Some(AgentError::Tool(error.to_string()))),
+                        }
+                    }
+                    _ => (
+                        None,
+                        Some(AgentError::Tool(
+                            "managed Work native ownership unavailable".into(),
+                        )),
+                    ),
+                }
+            } else {
+                (None, None)
+            };
             let initial_message = initial_user_message_for_session(&session);
             let selected_skill_ids =
                 selected_skill_ids.or_else(|| selected_skill_ids_for_session(&session));
@@ -1500,7 +1531,7 @@ pub fn spawn_session_execution_with_upstream_retry(
             // newly armed safety-net wait, it must not resurrect a completed
             // child wait. Tagged tool waits are reconciled by the final writer.
             let inherited_child_wait = agent.persistence().inherited_child_wait();
-            let execute_request = build_execute_request(
+            let mut execute_request = build_execute_request(
                 initial_message,
                 mpsc_tx.clone(),
                 cancel_token,
@@ -1534,17 +1565,31 @@ pub fn spawn_session_execution_with_upstream_retry(
             // waiting parent. Map a panic to a terminal error instead.
             let result = {
                 use futures::FutureExt;
-                match std::panic::AssertUnwindSafe(agent.execute_with_inputs_and_upstream_retry(
-                    &mut session,
-                    execute_request,
-                    inputs,
-                    upstream_retry,
-                ))
-                .catch_unwind()
-                .await
-                {
+                let run = async {
+                    if let Some(error) = work_error {
+                        return Err(error);
+                    }
+                    if let Some(work) = &work {
+                        work.bind_request(&agent, &mut session, &mut execute_request)
+                            .map_err(|error| AgentError::Tool(error.to_string()))?;
+                    }
+                    let execution = agent.execute_with_inputs_and_upstream_retry(
+                        &mut session,
+                        execute_request,
+                        inputs,
+                        upstream_retry,
+                    );
+                    match &work {
+                        Some(work) => work.resources.scope(execution).await,
+                        None => execution.await,
+                    }
+                };
+                match std::panic::AssertUnwindSafe(run).catch_unwind().await {
                     Ok(result) => result,
                     Err(panic) => {
+                        if let Some(work) = &work {
+                            work.resources.record_unconfirmed("Work execution unwound");
+                        }
                         if let Some(outer) = &task_outer {
                             outer
                                 .unconfirmed("Root loop unwound; physical effects are unconfirmed");
@@ -1564,6 +1609,19 @@ pub fn spawn_session_execution_with_upstream_retry(
                         )))
                     }
                 }
+            };
+            let stopped_work = if let Some(work) = work {
+                match work.resources.close_and_drain().await {
+                    Ok(drained) => Some((work, drained)),
+                    Err(error) => {
+                        if let Some(outer) = &task_outer {
+                            outer.unconfirmed(format!("Work resources did not drain: {error}"));
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
             };
 
             // Send terminal event for all error cases (including cancellation).
@@ -1838,6 +1896,9 @@ pub fn spawn_session_execution_with_upstream_retry(
             }
 
             tracing::info!("[{}] Agent execution completed", session_id);
+            if let (Some(tx), Some(stopped)) = (work_completion, stopped_work) {
+                let _ = tx.send(stopped);
+            }
             if let Some(outer) = &task_outer {
                 outer.tail_completed();
             }
@@ -1845,7 +1906,15 @@ pub fn spawn_session_execution_with_upstream_retry(
         .instrument(session_span),
     );
     if let Some(outer) = outer {
-        outer.retain(task);
+        outer.retain_with_completion(task, || async move {
+            if let Some((rx, storage)) = joined_work {
+                if let Ok((work, drained)) = rx.await {
+                    if let Err(error) = work.publish_joined(storage.as_ref(), drained).await {
+                        tracing::warn!(%error, "managed Work completion retained for reconciliation");
+                    }
+                }
+            }
+        });
     } else if is_root {
         // Legacy/custom composition has no supported Root issuer. Still join
         // this actual task, but do not invent an observable physical receipt.

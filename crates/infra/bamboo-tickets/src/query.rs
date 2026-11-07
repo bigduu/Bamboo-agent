@@ -82,6 +82,8 @@ pub struct Overview {
 pub struct TicketView {
     pub ticket: Ticket,
     pub assignments: Vec<Assignment>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub managed_admissions: BTreeMap<String, bamboo_domain::ManagedRootAdmission>,
     pub requests: Vec<PendingRequest>,
     pub submissions: Vec<Submission>,
     /// Opt-in owner control facts; absence on an older producer is unsupported.
@@ -125,6 +127,7 @@ pub struct SubmissionFacts {
     pub accepted: bool,
     pub assignment: Assignment,
     pub submission: Submission,
+    pub managed_intent: Option<DispatchIntent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -408,6 +411,11 @@ impl TicketService {
             accepted: work.accepted_submission.as_deref() == Some(submission_id),
             assignment: assignment.clone(),
             submission: submission.clone(),
+            managed_intent: snapshot
+                .intents
+                .get(&assignment.dispatch_key)
+                .filter(|intent| intent.immutable_spec.managed_root.is_some())
+                .cloned(),
         };
         Ok(envelope(commit, &snapshot, authority, facts, 0, None))
     }
@@ -455,7 +463,7 @@ impl TicketService {
                 .get(&id)
                 .ok_or_else(|| Error::InvalidTransition("inspect ID absent at snapshot".into()))?
                 .clone();
-            let assignments = snapshot
+            let assignments: Vec<_> = snapshot
                 .assignments
                 .values()
                 .filter(|a| {
@@ -494,9 +502,20 @@ impl TicketService {
             let controls = (ticket.kind == TicketKind::Work
                 && options.sections.contains(&InspectSection::Controls))
             .then(|| crate::controls::facts(&snapshot, &ticket));
+            let managed_admissions = assignments
+                .iter()
+                .filter_map(|assignment| {
+                    snapshot
+                        .intents
+                        .get(&assignment.dispatch_key)
+                        .and_then(|intent| intent.managed_admission.clone())
+                        .map(|admission| (assignment.id.clone(), admission))
+                })
+                .collect();
             data.push(TicketView {
                 ticket,
                 assignments,
+                managed_admissions,
                 requests,
                 submissions,
                 controls,
@@ -643,6 +662,34 @@ impl TicketService {
         authority: &Authority,
         command: &Command,
     ) -> Result<OperationReceipt> {
+        self.dispatch_with_root_selection(authority, command, None)
+    }
+
+    /// Trusted Host selection runs only for a new Start, on the exact spec
+    /// about to be published under the existing Work transaction.
+    pub fn dispatch_managed_work(
+        &self,
+        authority: &Authority,
+        command: &Command,
+        select_root: &dyn Fn(&DispatchSpec) -> Result<ManagedWorkRoot>,
+        validate_input: &dyn Fn(&WorkContextPacket) -> Result<()>,
+    ) -> Result<OperationReceipt> {
+        self.dispatch_with_root_selection(
+            authority,
+            command,
+            Some(crate::service::ManagedStart {
+                select_root,
+                validate_input,
+            }),
+        )
+    }
+
+    fn dispatch_with_root_selection(
+        &self,
+        authority: &Authority,
+        command: &Command,
+        managed_start: Option<crate::service::ManagedStart<'_>>,
+    ) -> Result<OperationReceipt> {
         if command.operations.iter().any(|op| {
             !matches!(
                 op,
@@ -658,7 +705,7 @@ impl TicketService {
                 "dispatch accepts start/steer/cancel/retry only".into(),
             ));
         }
-        self.execute(authority, command)
+        self.execute_with_root_selection(authority, command, managed_start)
     }
 }
 
