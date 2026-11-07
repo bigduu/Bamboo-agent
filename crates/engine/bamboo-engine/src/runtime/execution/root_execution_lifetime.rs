@@ -121,7 +121,7 @@ pub(super) struct RootRunAdmission {
     lifetime: Arc<RootExecutionLifetime>,
     epoch: u64,
     run_id: String,
-    managed_work_root: Option<RootObservation>,
+    managed_work_root: Option<Box<RootObservation>>,
 }
 
 /// Only the installed runner owns this slot. Snapshot clones are observers.
@@ -404,14 +404,14 @@ impl RootExecutionLifetime {
 
 impl RootRunAdmission {
     pub(super) fn track_managed_work_root(&mut self, session: &Session) -> io::Result<()> {
-        self.managed_work_root = Some(RootObservation::capture(session)?);
+        self.managed_work_root = Some(Box::new(RootObservation::capture(session)?));
         Ok(())
     }
 
     /// Called only after the matching native Actor's owned cancellation has
     /// succeeded. An outer task that has attached must use its real join.
     pub(super) fn record_prelaunch_stop(&self) -> bool {
-        let Some(original) = &self.managed_work_root else {
+        let Some(original) = self.managed_work_root.as_deref() else {
             return false;
         };
         let Ok(mut state) = self.lifetime.state.lock() else {
