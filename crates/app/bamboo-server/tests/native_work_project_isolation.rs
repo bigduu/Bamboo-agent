@@ -1,5 +1,5 @@
 //! Two real Project workers and an isolated denied-read probe over existing Host ports.
-use actix_web::{http::StatusCode, test, web, App};
+use actix_web::{body::MessageBody, http::StatusCode, test, web, App};
 use bamboo_agent_core::tools::{FunctionCall, ToolCall};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{ProjectId, Role, Session, TaskItemStatus, WorkspaceBinding};
@@ -441,6 +441,45 @@ async fn native_work_read_activity_cannot_advance_the_committed_plan() {
         child.task_list.as_ref().unwrap().items[0].status,
         TaskItemStatus::InProgress
     );
+
+    // Start a second client after the tool activity, while the real provider
+    // is still held before the explicit completion. It must replay v1.
+    let reconnect = test::call_service(
+        &app,
+        test::TestRequest::get()
+            .uri(&format!("/api/v1/events/{child_id}"))
+            .to_request(),
+    )
+    .await;
+    assert_eq!(reconnect.status(), StatusCode::OK);
+    let mut reconnect = Box::pin(reconnect.into_body());
+    let (version, list) = tokio::time::timeout(WAIT, async {
+        loop {
+            let bytes = std::future::poll_fn(|cx| reconnect.as_mut().poll_next(cx))
+                .await
+                .expect("reconnect closed before replay")
+                .expect("SSE body frame");
+            let frame = std::str::from_utf8(&bytes).unwrap();
+            for payload in frame.lines().filter_map(|line| line.strip_prefix("data: ")) {
+                match serde_json::from_str::<AgentEvent>(payload) {
+                    Ok(AgentEvent::TaskListUpdated { version, task_list }) => {
+                        return (version, task_list);
+                    }
+                    Ok(AgentEvent::TaskListItemProgress { .. }) => {
+                        panic!("reconnect must not replay speculative progress");
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("late subscriber receives the committed native Work plan");
+    assert_eq!(version, Some(1));
+    assert_eq!(list.session_id, child_id);
+    assert_eq!(list.items[0].id, "read-step");
+    assert_eq!(list.items[0].status, TaskItemStatus::InProgress);
+    drop(reconnect);
 
     reply_call(finish_plan, "plan-finish", "Task", task("completed"));
     let finish_run = next(&mut requests).await;
