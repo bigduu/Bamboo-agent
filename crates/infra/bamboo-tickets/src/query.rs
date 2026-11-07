@@ -116,6 +116,17 @@ pub struct InspectOptions {
     pub fixed_commit: Option<String>,
 }
 
+/// Exact ledger facts for a handoff, including a retained superseded attempt.
+/// The Host uses the binding and receipt to read the corresponding execution.
+pub struct SubmissionFacts {
+    pub binding: ScopeBinding,
+    pub work_state: WorkState,
+    pub current: bool,
+    pub accepted: bool,
+    pub assignment: Assignment,
+    pub submission: Submission,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ContextArtifact {
     pub source: DependencyInput,
@@ -355,6 +366,50 @@ impl TicketService {
                 fixed_commit: fixed_commit.map(str::to_owned),
             },
         )
+    }
+
+    pub fn work_submission_facts(
+        &self,
+        authority: &Authority,
+        work_id: &str,
+        submission_id: &str,
+        fixed_commit: Option<&str>,
+    ) -> Result<ReadEnvelope<SubmissionFacts>> {
+        authority.supervisor()?;
+        let (commit, snapshot) =
+            self.query_snapshot(authority, "submission", None, fixed_commit)?;
+        validate_authority(authority, &snapshot)?;
+        let missing =
+            || Error::InvalidTransition("submission absent for this Work at snapshot".into());
+        let work = snapshot
+            .tickets
+            .get(work_id)
+            .filter(|ticket| ticket.kind == TicketKind::Work)
+            .ok_or_else(missing)?;
+        let submission = snapshot
+            .submissions
+            .get(submission_id)
+            .filter(|submission| submission.work_id == work.id)
+            .ok_or_else(missing)?;
+        let assignment = snapshot
+            .assignments
+            .get(&submission.assignment_id)
+            .filter(|assignment| {
+                assignment.work_id == work.id
+                    && assignment.generation == submission.generation
+                    && assignment.contract_revision == submission.contract_revision
+                    && assignment.runtime.as_ref() == Some(&submission.runtime)
+            })
+            .ok_or_else(|| Error::ScopeDenied("submission assignment identity mismatch".into()))?;
+        let facts = SubmissionFacts {
+            binding: snapshot.binding.clone(),
+            work_state: work.state,
+            current: work.current_submission.as_deref() == Some(submission_id),
+            accepted: work.accepted_submission.as_deref() == Some(submission_id),
+            assignment: assignment.clone(),
+            submission: submission.clone(),
+        };
+        Ok(envelope(commit, &snapshot, authority, facts, 0, None))
     }
 
     /// Ticket/contract is always present. The response declares selected

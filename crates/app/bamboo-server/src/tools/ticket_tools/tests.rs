@@ -196,6 +196,101 @@ async fn ticket_model_update_replays_exact_receipt_and_cannot_write_ingress_or_u
     assert!(f.session.task_list.is_none());
 }
 
+#[tokio::test]
+async fn exact_handoff_tool_reads_a_submission_under_original_supervisor_authority() {
+    let f = Fixture::new().await;
+    let (service, supervisor) = f
+        .app
+        .authority(Principal::Supervisor {
+            session_id: f.session.id.clone(),
+        })
+        .await
+        .unwrap();
+    let operations = serde_json::from_value(json!([
+        {"op":"create","temp_id":"work","kind":"work","parent":null,"depends_on":[],"contract":{
+            "title":"One Work","objective":"One result","constraints":[],"acceptance":["Exact output"],
+            "user_acceptance_required":true,"allowed_tools":["Task"]}},
+        {"op":"ready","work_id":"work"},
+        {"op":"start","work_id":"work","temp_id":"assignment","workspace":null}
+    ])).unwrap();
+    let create = service
+        .prepare_command(&supervisor, "handoff-create", operations)
+        .unwrap();
+    let ids = service.execute(&supervisor, &create).unwrap().ids;
+    let snapshot = service.published().unwrap().1;
+    let binding = snapshot.binding.clone();
+    let assignment = &snapshot.assignments[&ids["assignment"]];
+    let runtime = Authority::from_verified_host(binding.clone(), Principal::Runtime);
+    let receipt = RuntimeReceipt {
+        dispatch_key: assignment.dispatch_key.clone(),
+        spec_hash: snapshot.intents[&assignment.dispatch_key].spec_hash.clone(),
+        run_id: "retained-run".into(),
+        session_id: "missing-execution-session".into(),
+    };
+    let admit = service
+        .prepare_command(
+            &runtime,
+            "handoff-admit",
+            vec![
+                Operation::Admitted {
+                    assignment_id: assignment.id.clone(),
+                    receipt: receipt.clone(),
+                },
+                Operation::Running {
+                    assignment_id: assignment.id.clone(),
+                },
+            ],
+        )
+        .unwrap();
+    service.execute(&runtime, &admit).unwrap();
+    let worker = Authority::from_verified_host(
+        binding,
+        Principal::Worker {
+            assignment_id: assignment.id.clone(),
+            generation: assignment.generation,
+            run_id: receipt.run_id,
+            session_id: receipt.session_id,
+        },
+    );
+    let artifact = service
+        .store_artifact(&runtime, b"original artifact bytes")
+        .unwrap();
+    let submit = service
+        .prepare_command(
+            &worker,
+            "handoff-submit",
+            vec![Operation::Submit {
+                assignment_id: assignment.id.clone(),
+                temp_id: "submission".into(),
+                evidence: vec!["retained evidence".into()],
+                artifacts: vec![artifact.clone()],
+            }],
+        )
+        .unwrap();
+    let submission = &service.execute(&worker, &submit).unwrap().ids["submission"];
+
+    let args = json!({
+        "ids":[ids["work"]],"depth":0,"sections":[],"budget_bytes":4096,
+        "submission_id":submission, "source_path":"src/example.rs",
+    });
+    let tool = f.tool("work_inspect");
+    let mut plan = f.ctx();
+    plan.plan_read_only = true;
+    let (ok, view) = invoke(&tool, args.clone(), plan).await;
+    assert!(ok, "{view}");
+    assert_eq!(view["submission_id"], *submission);
+    assert_eq!(view["artifacts"][0]["sha256"], artifact.sha256);
+    assert_eq!(view["committed_plan"]["steps"], json!([]));
+    assert_eq!(
+        view["source_reads"]["status"],
+        "execution_evidence_unavailable"
+    );
+    assert_eq!(
+        invoke(&tool, args, ToolCtx::none("unobserved")).await.1["status_code"],
+        403
+    );
+}
+
 #[test]
 fn six_ticket_schemas_remain_bounded_and_host_fields_are_absent() {
     for &name in NAMES {

@@ -4,6 +4,7 @@
 //! owns selection and wake/retry state only; the Host checks current eligibility
 //! and dispatches through its existing worker runtime. Durable retry metadata
 //! uses a narrow Host storage port, never a second Task/lease or recovered grant.
+pub mod handoff;
 pub mod managed_session;
 pub mod patrol;
 pub mod work_lifetime;
