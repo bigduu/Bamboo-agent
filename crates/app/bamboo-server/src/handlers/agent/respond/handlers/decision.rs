@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use actix_web::{web, HttpResponse};
+use actix_web::{body::MessageBody, web, HttpResponse};
 use bamboo_config::ConfigStoreError;
 use bamboo_tools::permission::{
     DurablePermissionRule, PermissionDecision, PermissionDecisionKind, PermissionMatcher,
@@ -249,8 +249,97 @@ pub async fn submit_permission_decision(
     session_id: web::Path<String>,
     payload: web::Json<PermissionDecision>,
 ) -> Result<HttpResponse, AppError> {
-    let session_id = session_id.into_inner();
-    let mut decision = payload.into_inner();
+    apply_permission_decision(
+        state,
+        session_id.into_inner(),
+        payload.into_inner(),
+        None,
+        None,
+    )
+    .await
+}
+
+/// Apply a single overdue decision after proving the Supervisor's delivered handoff.
+pub(crate) async fn decide_delegated_approval(
+    state: web::Data<AppState>,
+    caller: &bamboo_domain::SessionCallerReference,
+    target: String,
+    reference: &str,
+    decision: PermissionDecisionKind,
+) -> Result<serde_json::Value, AppError> {
+    let supervisor = supervisor_reference(caller)?;
+    let session = state
+        .storage
+        .load_session(&target)
+        .await?
+        .ok_or_else(|| AppError::NotFound("Execution session".into()))?;
+    let (handoff, _) = super::pending::capture_approval_handoff(&state, &supervisor, &session)
+        .filter(|(handoff, _)| handoff.reference == reference)
+        .ok_or_else(|| AppError::Forbidden("Approval occurrence changed".into()))?;
+    let pending = handoff.pending;
+    let expected_target = bamboo_domain::SessionCallerReference::from(&session);
+    let permission = PermissionDecision {
+        request_id: pending.occurrence.tool_call_id.clone(),
+        request_generation: pending
+            .occurrence
+            .permission_generation
+            .clone()
+            .expect("typed permission occurrence"),
+        decision,
+        matcher_id: None,
+        expected_policy_revision: None,
+        confirm_global: false,
+    };
+    let response = apply_permission_decision(
+        state,
+        target,
+        permission,
+        Some((&expected_target, &pending.occurrence)),
+        Some(caller),
+    )
+    .await?;
+    let status = response.status();
+    let bytes = response.into_body().try_into_bytes().map_err(|_| {
+        AppError::InternalError(anyhow::anyhow!("Expected a JSON decision response"))
+    })?;
+    let body: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|error| AppError::InternalError(error.into()))?;
+    if !status.is_success() {
+        return Err(AppError::BadRequest(format!(
+            "Approval was not applied: {body}"
+        )));
+    }
+    Ok(body)
+}
+
+fn supervisor_reference(
+    caller: &bamboo_domain::SessionCallerReference,
+) -> Result<bamboo_domain::SupervisorReference, AppError> {
+    use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+
+    if let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity {
+        if caller.session_id == DEFAULT_SUPERVISOR_SESSION_ID {
+            return Ok(bamboo_domain::SupervisorReference {
+                session_id: caller.session_id.clone(),
+                incarnation_id: *incarnation_id,
+            });
+        }
+    }
+    Err(AppError::Forbidden(
+        "Canonical Supervisor session required".into(),
+    ))
+}
+
+async fn apply_permission_decision(
+    state: web::Data<AppState>,
+    session_id: String,
+    mut decision: PermissionDecision,
+    expected_approval: Option<(
+        &bamboo_domain::SessionCallerReference,
+        &bamboo_domain::ResponseOccurrence,
+    )>,
+    delegated_by: Option<&bamboo_domain::SessionCallerReference>,
+) -> Result<HttpResponse, AppError> {
     if decision.request_generation.trim().is_empty() {
         return Err(AppError::BadRequest(
             "permission decision generation must not be blank".to_string(),
@@ -267,7 +356,7 @@ pub async fn submit_permission_decision(
     // response source across policy mutation and pending-question consume.
     // This prevents a remembered rule from being committed for a question
     // that another responder replaced between preflight and the final CAS.
-    let response_guard =
+    let mut response_guard =
         bamboo_engine::session_app::respond::acquire_pending_response_guard(&session_id).await;
     let mut permission_guard = Some(Arc::clone(&state.permission_io_lock).lock_owned().await);
     // The cache may predate another producer's behavior contract. Inspect
@@ -283,11 +372,60 @@ pub async fn submit_permission_decision(
             ))
         })?
         .ok_or_else(|| AppError::NotFound("session".to_string()))?;
+    if expected_approval.is_some_and(|(target, occurrence)| {
+        !target.matches_session(&session)
+            || bamboo_domain::pending_permission_occurrence(&session).as_ref() != Some(occurrence)
+    }) {
+        return Ok(HttpResponse::Conflict().json(serde_json::json!({
+            "error": crate::error::error_value("The approval request has already been handled or changed. Refresh its reference.")
+        })));
+    }
     if let Some(response) =
         crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session)
     {
         return Ok(response);
     }
+    let delegation = if let Some(caller) = delegated_by {
+        let supervisor = supervisor_reference(caller)?;
+        if !bamboo_orchestration::managed_session::approval_handoff::is_once(decision.decision) {
+            return Err(AppError::Forbidden(
+                "Single decision by the current Supervisor required".into(),
+            ));
+        }
+        if config.requires_forced_confirmation(
+            "session_control",
+            &serde_json::json!({
+                "action":"decide_approval",
+                "target_session_id":session_id,
+                "decision":decision.decision,
+            }),
+        ) {
+            return Err(AppError::Forbidden("Approval requires the owner".into()));
+        }
+        let (handoff, request) =
+            super::pending::capture_approval_handoff(&state, &supervisor, &session)
+                .ok_or_else(|| AppError::Forbidden("Approval requires the owner".into()))?;
+        let envelope = handoff
+            .notice(&supervisor, &request, chrono::Utc::now())
+            .ok_or_else(|| AppError::Forbidden("Approval handoff is not due".into()))?;
+        if !state
+            .session_inbox
+            .was_admitted(&supervisor.session_id, &envelope.id)
+            .await
+            .map_err(|error| AppError::InternalError(error.into()))?
+        {
+            return Err(AppError::Forbidden(
+                "Approval handoff has not been delivered".into(),
+            ));
+        }
+        let target = bamboo_domain::SupervisorCurrentUserTarget::capture(&session)
+            .map_err(|_| AppError::Forbidden("Managed approval target changed".into()))?;
+        decision.expected_policy_revision = Some(request.policy_revision);
+        config.register_pending_request(request);
+        Some((caller, supervisor, target))
+    } else {
+        None
+    };
     let existing = config.decision_receipt(
         &session_id,
         &decision.request_id,
@@ -462,15 +600,72 @@ pub async fn submit_permission_decision(
             }
 
             match decision.decision {
-                PermissionDecisionKind::AllowOnce => config
-                    .grant_once_for_generation(
-                        &session_id,
-                        &request.request_id,
-                        &request.request_generation,
-                        request.permission_type,
-                        request.resource.clone(),
-                    )
-                    .map_err(AppError::BadRequest)?,
+                PermissionDecisionKind::AllowOnce | PermissionDecisionKind::DenyOnce => {
+                    let apply_once = |config: &bamboo_tools::permission::PermissionConfig,
+                                      request: &bamboo_tools::permission::PermissionRequest,
+                                      decision: &PermissionDecision|
+                     -> Result<(), String> {
+                        if decision.decision == PermissionDecisionKind::AllowOnce {
+                            config.grant_once_for_generation(
+                                &request.session_id,
+                                &request.request_id,
+                                &request.request_generation,
+                                request.permission_type,
+                                request.resource.clone(),
+                            )?;
+                        }
+                        config.record_decision(&request.session_id, decision.clone())?;
+                        Ok(())
+                    };
+                    if let Some((caller, supervisor, target)) = &delegation {
+                        let config = config.clone();
+                        let decision = decision.clone();
+                        let state_for_guard = state.clone();
+                        let supervisor_for_guard = supervisor.clone();
+                        let occurrence = expected_approval
+                            .map(|(_, occurrence)| occurrence.clone())
+                            .ok_or_else(|| AppError::Forbidden("Expected approval occurrence required".into()))?;
+                        let guard = permission_guard
+                            .take()
+                            .expect("permission mutation lock is held");
+                        let (returned_response, returned_permission) = state
+                            .session_store
+                            .with_unscoped_supervisor_root_state(
+                                caller,
+                                supervisor,
+                                target,
+                                move |current| {
+                                    let still_eligible = super::pending::capture_approval_handoff(
+                                        &state_for_guard,
+                                        &supervisor_for_guard,
+                                        current,
+                                    )
+                                    .is_some_and(|(handoff, current_request)| {
+                                        handoff.pending.occurrence == occurrence && current_request == request
+                                    });
+                                    if !still_eligible {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::PermissionDenied,
+                                            "Parked approval changed",
+                                        ));
+                                    }
+                                    apply_once(&config, &request, &decision)
+                                        .map_err(std::io::Error::other)?;
+                                    Ok((response_guard, guard))
+                                },
+                            )
+                            .await
+                            .map_err(|error| {
+                                AppError::Forbidden(format!(
+                                    "Managed approval authority changed: {error}"
+                                ))
+                            })?;
+                        response_guard = returned_response;
+                        permission_guard = Some(returned_permission);
+                    } else {
+                        apply_once(&config, &request, &decision).map_err(AppError::BadRequest)?;
+                    }
+                }
                 PermissionDecisionKind::AllowSession => {
                     let matcher = selected_matcher(&request, &decision)?;
                     config
@@ -538,11 +733,13 @@ pub async fn submit_permission_decision(
                     })??;
                     permission_guard = Some(returned_guard);
                 }
-                PermissionDecisionKind::DenyOnce => {}
             }
-            config
-                .record_decision(&session_id, decision.clone())
-                .map_err(AppError::BadRequest)?;
+            if !bamboo_orchestration::managed_session::approval_handoff::is_once(decision.decision)
+            {
+                config
+                    .record_decision(&session_id, decision.clone())
+                    .map_err(AppError::BadRequest)?;
+            }
             false
         }
     };
@@ -603,13 +800,9 @@ pub async fn submit_permission_decision(
     if !response.status().is_success() {
         return Ok(response);
     }
-    let response_body = actix_web::body::to_bytes(response.into_body())
-        .await
-        .map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!(
-                "failed to read successful response submission body: {error}"
-            ))
-        })?;
+    let response_body = response.into_body().try_into_bytes().map_err(|_| {
+        AppError::InternalError(anyhow::anyhow!("Expected a JSON response submission body"))
+    })?;
     let resume: serde_json::Value = serde_json::from_slice(&response_body).map_err(|error| {
         AppError::InternalError(anyhow::anyhow!(
             "successful response submission returned invalid JSON: {error}"

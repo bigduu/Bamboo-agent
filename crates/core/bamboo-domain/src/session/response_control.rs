@@ -18,6 +18,9 @@ pub const CONSUMED_CLARIFICATION_IDS_KEY: &str = "clarification.consumed_tool_ca
 pub const CONSUMED_RESPONSE_OCCURRENCES_KEY: &str =
     "clarification.consumed_response_occurrences.v1";
 
+/// The retained result message can park for another permission generation.
+pub const PERMISSION_REPARKED_AT_KEY: &str = "permission_reparked_at";
+
 /// Identity of one concrete pending-response occurrence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseOccurrence {

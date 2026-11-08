@@ -305,6 +305,7 @@ pub struct AppState {
     /// capabilities; no public messaging endpoint is registered.
     pub session_inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
     observer_subscriptions: Arc<observer_subscriptions::ObserverSubscriptionCoordinator>,
+    approval_runtime: approval_handoff::ApprovalRuntime,
     pub session_activation_router: Arc<bamboo_engine::SessionActivationRouter>,
     pub session_messenger: Arc<bamboo_engine::SessionMessenger>,
 
@@ -628,6 +629,7 @@ mod wake_reconciler;
 // field of the public `schedule_app::ScheduleContext`) is typed
 // `session_events::NotificationRelayDeps`, so external callers that build a
 // `ScheduleContext` by hand (e.g. integration tests) need to name it.
+mod approval_handoff;
 pub(crate) mod mutation_idempotency;
 mod observer_subscriptions;
 pub(crate) mod session_create_operations;

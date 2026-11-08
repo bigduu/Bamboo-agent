@@ -267,6 +267,10 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::put().to(settings::update_default_session_permission_mode),
         )
         .route(
+            "/bamboo/permission/supervisor-handoff",
+            web::put().to(settings::update_supervisor_approval_handoff),
+        )
+        .route(
             "/bamboo/permission/policy",
             web::get().to(settings::get_permission_policy),
         )

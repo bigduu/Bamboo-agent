@@ -10,6 +10,7 @@ license = "MIT"
 serde.workspace = true
 serde_json.workspace = true
 bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-permission = { path = "../../infra/bamboo-permission" }
 bamboo-tickets = { path = "../../infra/bamboo-tickets" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }

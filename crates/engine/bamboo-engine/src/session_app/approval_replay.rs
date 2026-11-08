@@ -918,6 +918,10 @@ pub fn repark_permission_replay(
         serde_json::to_value(&new_request).expect("permission request serializes"),
     );
     object.remove("permission_decision_receipt");
+    object.insert(
+        bamboo_domain::PERMISSION_REPARKED_AT_KEY.into(),
+        serde_json::json!(chrono::Utc::now()),
+    );
     message.content.clone_from(&result.result);
     message.tool_success = Some(result.success);
 

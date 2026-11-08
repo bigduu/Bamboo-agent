@@ -39,12 +39,29 @@ impl SessionStoreV2 {
         T: Send + 'static,
         F: FnOnce(Option<&str>) -> io::Result<T> + Send + 'static,
     {
+        self.with_unscoped_supervisor_root_state(caller, supervisor, target, move |current| {
+            effect(current.workspace_path_meta().as_deref())
+        })
+        .await
+    }
+
+    /// Run a Root-control effect against the canonical target under its retained guards.
+    pub async fn with_unscoped_supervisor_root_state<T, F>(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        supervisor: &SupervisorReference,
+        target: &SupervisorCurrentUserTarget,
+        effect: F,
+    ) -> io::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Session) -> io::Result<T> + Send + 'static,
+    {
         let authority = self
             .lock_unscoped_supervisor_root(caller, supervisor, target)
             .await?;
         tokio::task::spawn_blocking(move || {
-            let workspace_path = authority.target.workspace_path_meta();
-            let result = effect(workspace_path.as_deref());
+            let result = effect(&authority.target);
             // Capture the entire guard so aborting the async waiter cannot
             // release its locks while the blocking effect is still running.
             drop(authority);

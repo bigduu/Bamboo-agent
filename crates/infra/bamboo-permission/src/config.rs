@@ -795,6 +795,7 @@ pub struct PermissionConfig {
     /// durable value lives in `SerializablePermissionConfig` and is published
     /// through the permission section snapshot).
     default_session_permission_mode: RwLock<bamboo_domain::SessionPermissionMode>,
+    supervisor_approval_handoff_since: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
 
     /// Stable workspace identity registered by the execution boundary. This is
     /// non-durable runtime context, keyed by session to prevent workspace rules
@@ -832,6 +833,7 @@ impl PermissionConfig {
             default_session_permission_mode: RwLock::new(
                 bamboo_domain::SessionPermissionMode::Default,
             ),
+            supervisor_approval_handoff_since: RwLock::new(None),
             session_workspaces: DashMap::new(),
         }
     }
@@ -859,6 +861,7 @@ impl PermissionConfig {
             default_session_permission_mode: RwLock::new(
                 bamboo_domain::SessionPermissionMode::Default,
             ),
+            supervisor_approval_handoff_since: RwLock::new(None),
             session_workspaces: DashMap::new(),
         }
     }
@@ -1131,6 +1134,10 @@ impl PermissionConfig {
                 .default_session_permission_mode
                 .unwrap_or_default(),
         );
+        *self
+            .supervisor_approval_handoff_since
+            .write()
+            .recover_poison() = candidate.supervisor_approval_handoff_since;
         self.set_policy_revision(revision);
     }
 
@@ -2164,6 +2171,10 @@ impl PermissionConfig {
             ask_rules: self.ask_rule_patterns(),
             durable_rules: self.durable_rules(),
             default_session_permission_mode: Some(self.default_session_permission_mode()),
+            supervisor_approval_handoff_since: *self
+                .supervisor_approval_handoff_since
+                .read()
+                .recover_poison(),
         }
     }
 
@@ -2208,6 +2219,9 @@ impl PermissionConfig {
             pending_requests: DashMap::new(),
             decision_receipts: DashMap::new(),
             default_session_permission_mode: RwLock::new(default_session_permission_mode),
+            supervisor_approval_handoff_since: RwLock::new(
+                config.supervisor_approval_handoff_since,
+            ),
             session_workspaces: DashMap::new(),
         }
     }
@@ -2376,6 +2390,9 @@ pub struct SerializablePermissionConfig {
     /// process-wide `mode`/read-only gates still bound it at execution time.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_session_permission_mode: Option<bamboo_domain::SessionPermissionMode>,
+    /// Owner opt-in time for one-shot review of ordinary managed approvals.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_approval_handoff_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Conservative external-runner preflight for explicit Bamboo deny policy.
@@ -2414,6 +2431,7 @@ impl Default for SerializablePermissionConfig {
             ask_rules: Vec::new(),
             durable_rules: Vec::new(),
             default_session_permission_mode: None,
+            supervisor_approval_handoff_since: None,
         }
     }
 }
