@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use actix_files as fs;
 use actix_web::{
     dev::{fn_service, ServiceRequest, ServiceResponse},
-    web, App, HttpResponse,
+    App, HttpResponse,
 };
 use tracing::{error, info};
 
@@ -155,11 +155,10 @@ pub async fn run_with_tls(
 
     let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, None)?;
 
-    let app_state = web::Data::new(
-        AppState::new(bamboo_home_dir.clone())
-            .await
-            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
-    );
+    let app_state = AppState::new(bamboo_home_dir.clone())
+        .await
+        .map_err(|e| format!("Failed to initialize app state: {e}"))?
+        .into_http_data();
     // Retained for graceful shutdown after the server stops — the `move` factory
     // below consumes `app_state`. #119.
     let app_state_for_shutdown = app_state.clone();
@@ -331,11 +330,10 @@ async fn run_with_static_options(
 
     let static_dir = resolve_runtime_static_dir(&bamboo_home_dir, static_dir)?;
 
-    let app_state = web::Data::new(
-        AppState::new(bamboo_home_dir.clone())
-            .await
-            .map_err(|e| format!("Failed to initialize app state: {e}"))?,
-    );
+    let app_state = AppState::new(bamboo_home_dir.clone())
+        .await
+        .map_err(|e| format!("Failed to initialize app state: {e}"))?
+        .into_http_data();
     // Retained for graceful shutdown after the server stops — the `move` factory
     // below consumes `app_state`. #119.
     let app_state_for_shutdown = app_state.clone();

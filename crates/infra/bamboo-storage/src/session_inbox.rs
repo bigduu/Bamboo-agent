@@ -851,6 +851,36 @@ impl FileSessionInbox {
             .get_or_init(|| (handoff, presentation));
     }
 
+    /// Verify an exact permanent RuntimeInstruction ACK. Queued or claimed
+    /// envelopes cannot prove that the recipient admitted the instruction.
+    pub async fn verify_admitted_runtime_instruction(
+        &self,
+        envelope: &SessionMessageEnvelope,
+    ) -> Result<bool, SessionInboxError> {
+        envelope
+            .validate()
+            .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?;
+        if !matches!(&envelope.source, SessionMessageSource::Runtime { .. })
+            || envelope.kind != bamboo_domain::SessionMessageKind::RuntimeInstruction
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "RuntimeInstruction is required for permanent receipt proof".into(),
+            ));
+        }
+        let (dir, filesystem) = self.owned_filesystem(&envelope.target_session_id).await?;
+        Self::admitted_receipt_in_mode_retaining(
+            &dir,
+            envelope,
+            ReceiptLookupMode::ObserverProof {
+                max_bytes: self.max_transport_bytes(),
+                anchor: self.sessions.bamboo_home_dir(),
+            },
+            Some(&filesystem),
+        )
+        .await
+        .map(|receipt| receipt.is_some())
+    }
+
     /// Called only while the canonical Root and its Inbox operation guard are
     /// retained. An origin in Main is not sufficient without its actual ACK.
     async fn verify_supervised_root_input_ack(
@@ -6231,6 +6261,82 @@ mod tests {
         assert_eq!(duplicate_receipt.generation, claim.generation);
         assert!(reopened.claim("session-1", 1).await.unwrap().is_empty());
         assert_eq!(reopened.inspect("session-1").await.unwrap().pending, 0);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    #[tokio::test]
+    async fn runtime_receipt_proof_requires_a_permanent_exact_ack() {
+        let (_temp, sessions, inbox) = fixture(SessionInboxLimits::default()).await;
+        let envelope = SessionMessageEnvelope {
+            id: SessionMessageId::parse("exact-runtime-instruction").unwrap(),
+            source: SessionMessageSource::Runtime {
+                subsystem: "approval_handoff".into(),
+            },
+            target_session_id: "session-1".into(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(
+                bamboo_domain::SessionRuntimeInstruction {
+                    instruction: "approval_handoff_v1".into(),
+                    content: None,
+                    data: Some(serde_json::json!({"operation": "one"})),
+                    provider_message: None,
+                },
+            ),
+            created_at: Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: None,
+        };
+        inbox.deliver(&envelope).await.unwrap();
+        assert!(!inbox
+            .verify_admitted_runtime_instruction(&envelope)
+            .await
+            .unwrap());
+        authorize_latest(&inbox).await;
+        let claim = inbox.claim("session-1", 1).await.unwrap().remove(0);
+        assert!(!inbox
+            .verify_admitted_runtime_instruction(&envelope)
+            .await
+            .unwrap());
+        inbox.ack("session-1", &claim).await.unwrap();
+
+        let reopened = FileSessionInbox::new(sessions, SessionInboxLimits::default());
+        assert!(reopened
+            .verify_admitted_runtime_instruction(&envelope)
+            .await
+            .unwrap());
+        let mut changed = envelope.clone();
+        let SessionMessageBody::RuntimeInstruction(instruction) = &mut changed.body else {
+            unreachable!("test runtime instruction");
+        };
+        instruction.data = Some(serde_json::json!({"operation": "different"}));
+        assert!(reopened
+            .verify_admitted_runtime_instruction(&changed)
+            .await
+            .is_err());
+
+        let dir = reopened.inbox_dir("session-1").await.unwrap();
+        let path = FileSessionInbox::admitted_path(&dir, &envelope.id);
+        let bytes = tokio::fs::read(&path).await.unwrap();
+        let mut receipt: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        receipt["generation"] = serde_json::json!(0);
+        atomic_write(&path, &serde_json::to_vec(&receipt).unwrap())
+            .await
+            .unwrap();
+        assert!(reopened
+            .verify_admitted_runtime_instruction(&envelope)
+            .await
+            .is_err());
+
+        let malformed = serde_json::json!({"id": envelope.id});
+        atomic_write(&path, &serde_json::to_vec(&malformed).unwrap())
+            .await
+            .unwrap();
+        assert!(reopened
+            .verify_admitted_runtime_instruction(&envelope)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

@@ -27,6 +27,7 @@ use tokio::sync::{broadcast, RwLock};
 use super::{fresh_sync::FreshSyncRegistry, live_retry::LiveRetryBridge, AgentRunner, AgentStatus};
 
 pub(super) struct SupervisedRootRunController {
+    pub(super) approval_runtime: super::approval_handoff::ApprovalRuntime,
     pub(super) store: Arc<SessionStoreV2>,
     pub(super) inbox: Arc<FileSessionInbox>,
     pub(super) router: Arc<bamboo_engine::SessionActivationRouter>,
@@ -325,6 +326,31 @@ impl SupervisedRootRunController {
 
 #[async_trait]
 impl SupervisedRootRunPort for SupervisedRootRunController {
+    async fn decide_approval(
+        &self,
+        caller: &SessionCallerReference,
+        target: String,
+        reference: &str,
+        decision: bamboo_tools::permission::PermissionDecisionKind,
+    ) -> Result<ToolResult, ToolError> {
+        let state = self
+            .approval_runtime
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| ToolError::Execution("managed_approval_handoff_unavailable".into()))?;
+        let result = crate::handlers::agent::respond::decide_delegated_approval(
+            actix_web::web::Data::from(state),
+            &self.inbox,
+            caller,
+            target,
+            reference,
+            decision,
+        )
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+        Ok(ToolResult::text(true, result.to_string()))
+    }
+
     async fn observe_run(
         &self,
         caller: &SessionCallerReference,
@@ -551,5 +577,21 @@ mod tests {
     async fn subscribed_background_exec_delivers_once_after_owned_host_restart() {
         super::super::observer_subscriptions::tests::background_exec::exercise_background_exec_handoff()
             .await;
+    }
+
+    #[actix_web::test]
+    async fn ordinary_approval_handoff_waits_for_deadline_and_keeps_forced_requests_with_owner() {
+        super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
+            PermissionDecisionKind::DenyOnce,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn ordinary_approval_handoff_can_allow_the_exact_workspace_edit_once() {
+        super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
+            PermissionDecisionKind::AllowOnce,
+        )
+        .await;
     }
 }

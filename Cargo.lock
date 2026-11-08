@@ -1212,7 +1212,9 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "bamboo-domain",
+ "bamboo-permission",
  "bamboo-tickets",
+ "chrono",
  "serde",
  "serde_json",
  "tokio",

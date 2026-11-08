@@ -1312,6 +1312,15 @@ pub fn check_permissions(
             if matches!(action, "scope" | "directory" | "wait_outcomes") {
                 return Ok(None);
             }
+            if action == "decide_approval" {
+                let target = required_string_arg(args, "target_session_id")?;
+                bamboo_domain::validate_supervisor_target_id(target)
+                    .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                // The native Host owns the exact timed, one-shot authority.
+                // Requiring a second permission request here would delegate
+                // the approval of an approval.
+                return Ok(None);
+            }
             if matches!(action, "observe_run" | "wait_run" | "cancel") {
                 let target = required_string_arg(args, "target_session_id")?;
                 bamboo_domain::validate_supervisor_target_id(target)

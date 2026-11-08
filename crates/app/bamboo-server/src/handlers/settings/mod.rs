@@ -53,6 +53,7 @@ pub use permission::{
     create_permission_rule, delete_permission_rule, diagnose_permission,
     get_default_session_permission_mode, get_permission_ask_rules, get_permission_policy,
     update_default_session_permission_mode, update_permission_ask_rules, update_permission_rule,
+    update_supervisor_approval_handoff,
 };
 pub use provider::{fetch_catalog_models, get_provider_catalog, reload_provider_config};
 pub use provider_instances::{

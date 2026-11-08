@@ -58,6 +58,18 @@ pub trait SupervisedRootRunPort: Send + Sync {
         ))
     }
 
+    async fn decide_approval(
+        &self,
+        _caller: &SessionCallerReference,
+        _target: String,
+        _reference: &str,
+        _decision: bamboo_tools::permission::PermissionDecisionKind,
+    ) -> Result<ToolResult, ToolError> {
+        Err(ToolError::Execution(
+            "managed_approval_handoff_unavailable".into(),
+        ))
+    }
+
     async fn cancel_run(
         &self,
         caller: &SessionCallerReference,

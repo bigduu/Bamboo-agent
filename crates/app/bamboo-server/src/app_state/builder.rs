@@ -1244,7 +1244,9 @@ impl AppState {
             data_dir.join("browser-profiles"),
         ));
         let fresh_sync = Arc::new(super::fresh_sync::FreshSyncRegistry::default());
+        let approval_runtime = super::approval_handoff::ApprovalRuntime::default();
         let root_run = Arc::new(super::supervised_root_run::SupervisedRootRunController {
+            approval_runtime: approval_runtime.clone(),
             store: session_store.clone(),
             inbox: file_session_inbox.clone(),
             router: session_activation_router.clone(),
@@ -1580,6 +1582,7 @@ impl AppState {
             persistence,
             session_inbox,
             observer_subscriptions,
+            approval_runtime,
             session_activation_router,
             session_messenger,
             spawn_scheduler,

@@ -696,6 +696,7 @@ async fn cancelled_root_control_admission_cannot_signal_late_owner() {
         .await
         .insert(TARGET.into(), runner);
     let port = crate::app_state::supervised_root_run::SupervisedRootRunController {
+        approval_runtime: Default::default(),
         store: fixture.state.session_store.clone(),
         inbox: Arc::new(bamboo_storage::FileSessionInbox::new(
             fixture.state.session_store.clone(),
