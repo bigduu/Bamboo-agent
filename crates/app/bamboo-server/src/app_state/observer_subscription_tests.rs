@@ -2306,6 +2306,14 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     .await
     .unwrap();
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    config.set_ask_rules(["session_control".into()]);
+    assert!(capture_approval_handoff(state, &f.reference, &target).is_none());
+    crate::app_state::approval_handoff::sweep(state, &mut cursor, now)
+        .await
+        .unwrap();
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    config.set_ask_rules(Vec::new());
     let notice = handoff.notice(&f.reference, &current_request, now).unwrap();
     state
         .session_inbox

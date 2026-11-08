@@ -99,12 +99,21 @@ impl ApprovalHandoff {
         );
         let digest = &digest.as_str()["stable-".len()..][..32];
         let reference = format!("approval:{}/{digest}", target.id);
-        Some(Self {
+        let handoff = Self {
             pending,
             reference,
             due_at,
             parked_at,
-        })
+        };
+        // Do not spend the one-time wake while the Supervisor is barred from
+        // deciding this occurrence. The decision path still checks again.
+        [
+            PermissionDecisionKind::AllowOnce,
+            PermissionDecisionKind::DenyOnce,
+        ]
+        .into_iter()
+        .any(|decision| handoff.allows_supervisor_control(config, supervisor, &target.id, decision))
+        .then_some(handoff)
     }
 
     pub fn allows_supervisor_control(
