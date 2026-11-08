@@ -574,6 +574,12 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn subscribed_background_exec_delivers_once_after_owned_host_restart() {
+        super::super::observer_subscriptions::tests::background_exec::exercise_background_exec_handoff()
+            .await;
+    }
+
+    #[actix_web::test]
     async fn ordinary_approval_handoff_waits_for_deadline_and_keeps_forced_requests_with_owner() {
         super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
             PermissionDecisionKind::DenyOnce,
