@@ -1936,10 +1936,17 @@ pub trait SessionInboxPort: Send + Sync {
         _operation_id: uuid::Uuid,
         _reserved_root: &super::Session,
         _envelope: &SessionMessageEnvelope,
+        _notify_on_material_event: bool,
     ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
         Err(SessionInboxError::Storage(
             "unscoped observed Supervisor Root first-input admission is unsupported".into(),
         ))
+    }
+
+    /// The first-input writer and its native material notification projector
+    /// are both installed. The writer still validates each concrete admission.
+    fn supports_root_creation_material_notifications(&self) -> bool {
+        false
     }
 
     /// Canonical adapter compatibility only. The concrete writer must retain

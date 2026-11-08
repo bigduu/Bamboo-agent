@@ -733,6 +733,13 @@ impl UnownedActorClaimGuard {
     }
 }
 
+type ManagedHandoffProjection = fn(
+    &bamboo_domain::ObserverSupervisedRootOutcome,
+    Option<&bamboo_domain::RootFinalMessageReference>,
+    Option<&str>,
+    bamboo_domain::ManagedRootHandoffFormat,
+) -> String;
+
 /// Filesystem SessionInbox implementation. Clone/share one instance per
 /// runtime so concurrent senders serialize only the small generation/backlog
 /// transaction for their target session.
@@ -742,7 +749,7 @@ pub struct FileSessionInbox {
     root_owner: Option<bamboo_domain::RootActorRuntimeWrite>,
     child_owner: Option<bamboo_domain::ChildActorRuntimeWrite>,
     limits: SessionInboxLimits,
-    material_notifications_enabled: Arc<std::sync::atomic::AtomicBool>,
+    material_handoff: Arc<std::sync::OnceLock<ManagedHandoffProjection>>,
     #[cfg(any(test, feature = "test-utils"))]
     observer_cursor_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-utils"))]
@@ -792,7 +799,7 @@ impl FileSessionInbox {
             root_owner: None,
             child_owner: None,
             limits,
-            material_notifications_enabled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            material_handoff: Arc::new(std::sync::OnceLock::new()),
             #[cfg(any(test, feature = "test-utils"))]
             observer_cursor_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-utils"))]
@@ -826,10 +833,9 @@ impl FileSessionInbox {
         }
     }
 
-    /// The native Host installs the material-event reconciler before admission.
-    pub fn enable_material_notifications(&self) {
-        self.material_notifications_enabled
-            .store(true, std::sync::atomic::Ordering::Release);
+    /// The native Host installs the reconciler and its projection before admission.
+    pub fn enable_material_notifications(&self, handoff: ManagedHandoffProjection) {
+        self.material_handoff.get_or_init(|| handoff);
     }
 
     /// Called only while the canonical Root and its Inbox operation guard are
@@ -1184,6 +1190,7 @@ impl FileSessionInbox {
                 .await
                 .map_err(|error| SessionInboxError::Storage(error.to_string()))?,
         );
+        let root = self.load_managed_root_main(&authority).await?;
         self.read_managed_root_event_guarded(
             caller,
             ManagedRootEventSelection {
@@ -1194,6 +1201,7 @@ impl FileSessionInbox {
                 notifying_input: None,
             },
             &authority,
+            &root,
         )
         .await
     }
@@ -1203,6 +1211,7 @@ impl FileSessionInbox {
         caller: &bamboo_domain::SessionCallerReference,
         selected: ManagedRootEventSelection<'_>,
         authority: &Arc<crate::v2::CurrentUserTargetGuard>,
+        root: &bamboo_domain::Session,
     ) -> Result<bamboo_domain::ManagedRootEventRead, SessionInboxError> {
         use bamboo_domain::{
             ManagedRootBlockerEvidence, ManagedRootEvent, ManagedRootEventRead as Read,
@@ -1216,7 +1225,6 @@ impl FileSessionInbox {
             notifying_input,
         } = selected;
         let invalid = |message: &str| SessionInboxError::InvalidClaim(message.into());
-        let root = self.load_managed_root_main(authority).await?;
         let Some(outcomes) = root
             .runtime_metadata
             .as_ref()
@@ -1301,7 +1309,7 @@ impl FileSessionInbox {
                 Ok(_) => {}
             }
             match self
-                .verify_supervised_root_input_ack(&root, &guarded, input, &inbox, &filesystem)
+                .verify_supervised_root_input_ack(root, &guarded, input, &inbox, &filesystem)
                 .await
             {
                 Ok(input) => {
@@ -1317,7 +1325,7 @@ impl FileSessionInbox {
                             },
                             final_message: notifying_input
                                 .is_none()
-                                .then(|| fact.verified_final_message(&root).cloned())
+                                .then(|| fact.verified_final_message(root).cloned())
                                 .flatten(),
                         })
                     } else {
@@ -1382,6 +1390,7 @@ impl FileSessionInbox {
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         authority._send_scope = Some(send_scope);
         let authority = Arc::new(authority);
+        let root = self.load_managed_root_main(&authority).await?;
         let observed = self
             .read_managed_root_event_guarded(
                 &selected.caller,
@@ -1393,6 +1402,7 @@ impl FileSessionInbox {
                     notifying_input: Some(&selected.input_receipt_id),
                 },
                 &authority,
+                &root,
             )
             .await?;
         let bamboo_domain::ManagedRootEventRead::Next(event) = observed else {
@@ -1410,13 +1420,14 @@ impl FileSessionInbox {
             _ => {}
         }
         let envelope = match event {
-            bamboo_domain::ManagedRootEvent::Outcome(outcome) => supervised_root_outcome_envelope(
+            bamboo_domain::ManagedRootEvent::Outcome(outcome) => self.root_outcome_notice(
                 &supervisor,
                 authority.source.created_at,
+                &root,
                 &outcome.observed,
                 &outcome.observed.inputs[0],
                 now,
-            ),
+            )?,
             bamboo_domain::ManagedRootEvent::Blocker(blocker) => managed_root_blocker_envelope(
                 &supervisor,
                 authority.source.created_at,
@@ -1443,6 +1454,89 @@ impl FileSessionInbox {
         )
         .await
         .map(Some)
+    }
+
+    /// Both outcome writers use the same body for the same admitted input.
+    /// Only a directly subscribed first input selects the handoff projection.
+    fn root_outcome_notice(
+        &self,
+        supervisor: &bamboo_domain::SupervisorReference,
+        supervisor_created_at: chrono::DateTime<Utc>,
+        root: &bamboo_domain::Session,
+        outcome: &bamboo_domain::ObserverSupervisedRootOutcome,
+        input: &bamboo_domain::ObserverSupervisedRootInput,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<SessionMessageEnvelope, SessionInboxError> {
+        let mut envelope = supervised_root_outcome_envelope(
+            supervisor,
+            supervisor_created_at,
+            outcome,
+            input,
+            now,
+        );
+        let Some((fact, format)) =
+            root.runtime_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+                .and_then(|outcomes| {
+                    outcomes.facts.iter().find(|fact| {
+                        fact.sequence == outcome.sequence && fact.run_id == outcome.run_id
+                    })
+                })
+                .and_then(|fact| {
+                    let admitted = fact.inputs.iter().find(|admitted| {
+                        admitted.receipt_id == input.receipt_id
+                            && admitted.generation == input.generation
+                    })?;
+                    Some((fact, admitted.supervisor_origin.as_ref()?.handoff_format()?))
+                })
+        else {
+            return Ok(envelope);
+        };
+        if root
+            .conversation_reset_sha256()
+            .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?
+            != fact.conversation_reset_sha256
+        {
+            return Err(SessionInboxError::InvalidClaim(
+                "handoff conversation generation changed".into(),
+            ));
+        }
+        let project = self.material_handoff.get().ok_or_else(|| {
+            SessionInboxError::Storage("managed Session handoff projection is unavailable".into())
+        })?;
+        let reference = fact.verified_final_message(root);
+        let content = reference.and_then(|reference| {
+            root.messages
+                .iter()
+                .find(|message| message.id == reference.message_id)
+                .map(|message| message.content.as_str())
+        });
+        let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) = &mut envelope.body
+        else {
+            unreachable!("Root outcome envelope has a RuntimeInstruction")
+        };
+        let content = bamboo_domain::SessionMessageContent::text(project(
+            outcome, reference, content, format,
+        ));
+        let final_message =
+            if format == bamboo_domain::ManagedRootHandoffFormat::PresentationSummary {
+                instruction.provider_message = Some(bamboo_domain::SessionProviderMessage {
+                    content,
+                    metadata: Default::default(),
+                    never_compress: false,
+                });
+                // The terminal fact pins the reference. Later edits can change
+                // current verification and display but cannot change delivery identity.
+                fact.final_message.as_ref()
+            } else {
+                instruction.content = Some(content);
+                reference
+            };
+        if let (Some(data), Some(reference)) = (instruction.data.as_mut(), final_message) {
+            data["final_message"] = serde_json::json!(reference);
+        }
+        Ok(envelope)
     }
 
     /// Publish one immutable Root result through the existing Supervisor
@@ -1551,13 +1645,14 @@ impl FileSessionInbox {
             status: result.clone(),
             inputs: vec![input.clone()],
         };
-        let event = supervised_root_outcome_envelope(
+        let event = self.root_outcome_notice(
             supervisor,
             authority.source.created_at,
+            &root,
             &outcome,
             &input,
             now,
-        );
+        )?;
         let parent_inbox = self
             .sessions
             .sessions_root_dir()
@@ -2932,6 +3027,7 @@ impl FileSessionInbox {
         target_birth: chrono::DateTime<Utc>,
         envelope: &SessionMessageEnvelope,
         requires_host_scope: Option<bool>,
+        notification_target: Option<bamboo_domain::SupervisorCurrentUserTarget>,
     ) -> Result<SessionInboxActivationIntent, SessionInboxError> {
         let bamboo_domain::SessionAuthorityIdentity::Supervisor { incarnation_id } =
             &caller.authority_identity
@@ -2945,6 +3041,7 @@ impl FileSessionInbox {
         else {
             return Ok(base);
         };
+        let notification_requested = notification_target.is_some();
         let origin = bamboo_domain::SupervisedRootOutcomeInputOrigin::LegacyOrCreatedRoot {
             supervisor: bamboo_domain::SupervisorReference {
                 session_id: caller.session_id.clone(),
@@ -2953,11 +3050,19 @@ impl FileSessionInbox {
             supervisor_created_at: caller.created_at,
             caller: Some(caller.clone()),
             requires_host_scope,
+            notification_target,
+            structured_handoff: false,
+            handoff_format: notification_requested
+                .then_some(bamboo_domain::ManagedRootHandoffFormat::PresentationSummary),
             target_created_at: target_birth,
             operation_id: operation,
         };
         if origin.matches_input_envelope(envelope) {
             base.with_supervised_root_origin(origin)
+        } else if notification_requested {
+            Err(SessionInboxError::InvalidClaim(
+                "created Root notification source differs from its first input".into(),
+            ))
         } else {
             Ok(base)
         }
@@ -4343,6 +4448,7 @@ impl SessionInboxPort for FileSessionInbox {
                 authority.target.created_at,
                 envelope,
                 None,
+                None,
             )?
         } else {
             base
@@ -4387,11 +4493,7 @@ impl SessionInboxPort for FileSessionInbox {
         envelope: &SessionMessageEnvelope,
         notify_on_material_event: bool,
     ) -> Result<SessionInboxReceipt, SessionInboxError> {
-        if notify_on_material_event
-            && !self
-                .material_notifications_enabled
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if notify_on_material_event && self.material_handoff.get().is_none() {
             return Err(SessionInboxError::Storage(
                 "managed Session material notifications require the installed native Host".into(),
             ));
@@ -4634,6 +4736,7 @@ impl SessionInboxPort for FileSessionInbox {
                 observation.identity.created_at,
                 envelope,
                 Some(true),
+                None,
             )?
         } else {
             base
@@ -4671,6 +4774,7 @@ impl SessionInboxPort for FileSessionInbox {
             reserved_root.created_at,
             envelope,
             Some(true),
+            None,
         )?;
         self.deliver_with_lifecycle_held_state(
             envelope,
@@ -4683,6 +4787,10 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    fn supports_root_creation_material_notifications(&self) -> bool {
+        self.material_handoff.get().is_some()
+    }
+
     async fn deliver_unscoped_supervisor_root_first_input(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
@@ -4690,7 +4798,13 @@ impl SessionInboxPort for FileSessionInbox {
         operation_id: uuid::Uuid,
         reserved_root: &bamboo_domain::Session,
         envelope: &SessionMessageEnvelope,
+        notify_on_material_event: bool,
     ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
+        if notify_on_material_event && !self.supports_root_creation_material_notifications() {
+            return Err(SessionInboxError::Storage(
+                "managed Session material notifications require the installed native Host".into(),
+            ));
+        }
         let authority = self
             .sessions
             .lock_unscoped_supervisor_root_first_input(
@@ -4702,6 +4816,26 @@ impl SessionInboxPort for FileSessionInbox {
             )
             .await
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+        let notification_target = if notify_on_material_event {
+            let (_, target) = authority.supervisor_sessions().ok_or_else(|| {
+                SessionInboxError::InvalidClaim(
+                    "first-input Supervisor authority is missing".into(),
+                )
+            })?;
+            let reference = bamboo_domain::SupervisorCurrentUserTarget::capture(target)
+                .map_err(|error| SessionInboxError::InvalidClaim(error.into()))?;
+            self.sessions
+                .mark_material_notification_hint(
+                    &target.id,
+                    target.created_at,
+                    envelope.id.as_str(),
+                )
+                .await
+                .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
+            Some(reference)
+        } else {
+            None
+        };
         // This retained guard proves the unscoped source. An exact retry
         // keeps the original published Inbox intent.
         let intent = Self::legacy_supervisor_root_intent(
@@ -4710,6 +4844,7 @@ impl SessionInboxPort for FileSessionInbox {
             reserved_root.created_at,
             envelope,
             Some(false),
+            notification_target,
         )?;
         self.deliver_with_lifecycle_held_state(
             envelope,
@@ -4786,7 +4921,14 @@ impl SessionInboxPort for FileSessionInbox {
             .map_err(|error| SessionInboxError::Storage(error.to_string()))?;
         let base = SessionInboxActivationIntent::new(SessionActivationPolicy::RespectSpecificWait);
         let intent = if authority.is_supervisor_root_target() {
-            Self::legacy_supervisor_root_intent(base, caller, target_created_at, envelope, None)?
+            Self::legacy_supervisor_root_intent(
+                base,
+                caller,
+                target_created_at,
+                envelope,
+                None,
+                None,
+            )?
         } else {
             base
         };

@@ -587,7 +587,11 @@ impl AppState {
             )
             .await;
         // Preserve committed prefix events even when a later ACK/tail rejects startup.
-        for message in &refreshed.committed_messages {
+        for message in refreshed
+            .committed_messages
+            .iter()
+            .filter(|message| !bamboo_orchestration::managed_session::is_internal_handoff(message))
+        {
             self.account_sink.record(
                 Some(id),
                 &bamboo_agent_core::AgentEvent::message_appended(id, message),

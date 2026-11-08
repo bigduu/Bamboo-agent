@@ -217,6 +217,7 @@ impl TicketApplication {
                 bamboo_engine::session_messaging::MAX_SUPERVISOR_FOLLOWUP_BYTES,
             )?,
             title: Some(spec.contract.title.trim().chars().take(256).collect()),
+            notify_on_material_event: false,
         };
         let result = host
             .creator

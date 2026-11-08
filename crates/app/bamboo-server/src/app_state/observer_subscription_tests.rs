@@ -33,6 +33,11 @@ const OBSERVER: &str = "subscription-observer";
 const ROOT_A: &str = "subscription-source-a";
 const ROOT_B: &str = "subscription-source-b";
 const PRIVATE: &str = "SOURCE_PRIVATE_TRANSCRIPT";
+const SUBSCRIBED_FIRST_INPUT: &str = "Produce a short first-input handoff.";
+const HANDOFF_HEAD: &str = "The independent task verified the requested source.";
+const HANDOFF_EVIDENCE: &str = "src/fixture.rs:42";
+const HANDOFF_RISK: &str = "The external integration was not exercised.";
+const HANDOFF_TAIL: &str = "DETAILS_STAY_IN_THE_EXECUTION_SESSION";
 const WAIT: Duration = Duration::from_secs(40);
 
 #[derive(Default)]
@@ -185,6 +190,28 @@ impl LLMProvider for Probe {
         _: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
+        if messages.iter().any(|message| {
+            message.role == bamboo_domain::Role::User && message.content == SUBSCRIBED_FIRST_INPUT
+        }) {
+            assert!(
+                messages.iter().any(|message| {
+                    message.content.contains("Managed Session Delivery Summary")
+                        && message.content.contains("<!-- bamboo-handoff:v1 -->")
+                }),
+                "the exact subscribed Worker Run must receive the delivery contract"
+            );
+            self.source_calls.fetch_add(1, Ordering::SeqCst);
+            self.source_entered[0].notify_one();
+            self.source_release[0].notified().await;
+            let answer = format!(
+                "{}\n<!-- bamboo-handoff:v1 -->\n- **Task** Verify fixture\n- **Conclusion** {HANDOFF_HEAD}\n- **Evidence** `{HANDOFF_EVIDENCE}`\n- **Risk** {HANDOFF_RISK}\n<!-- /bamboo-handoff:v1 -->\n{HANDOFF_TAIL}",
+                "界".repeat(500),
+            );
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token(answer)),
+                Ok(LLMChunk::Done),
+            ])));
+        }
         if model != SOURCE {
             assert!(messages
                 .iter()
@@ -1514,6 +1541,191 @@ async fn settle_material_notices(f: &Fixture) {
     })
     .await
     .expect("unchanged sources must finish their finite proof I/O");
+}
+
+pub(in crate::app_state) async fn exercise_subscribed_create_handoff() {
+    use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+
+    let f = Fixture::new_with_native_source(true).await;
+    let workspace = f.home.path().join("subscribed-dispatch");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let workspace = bamboo_config::paths::path_to_display_string(&workspace);
+    let project = f
+        .state
+        .project_store
+        .create_with_project_path("Subscribed dispatch", None, &workspace, Vec::new())
+        .unwrap();
+    f.state
+        .permission_checker
+        .permission_config()
+        .unwrap()
+        .grant_typed_scoped_session_permission(
+            &f.reference.session_id,
+            PermissionType::ExecuteCommand,
+            PermissionMatcher {
+                id: "subscribed-dispatch-create".into(),
+                kind: PermissionMatcherKind::ExactResource,
+                value: format!("session_control create {} {workspace}", project.id),
+            },
+        )
+        .unwrap();
+    let args = json!({
+        "action":"create",
+        "request":{
+            "operation_id":uuid::Uuid::new_v4(),
+            "expected_state_revision":0,
+            "project_id":project.id,
+            "workspace_path":workspace,
+            "title":"Subscribed dispatch",
+            "message":SUBSCRIBED_FIRST_INPUT,
+            "notify_on_material_event":true,
+        }
+    });
+    *f.probe.parent_dispatch.lock().unwrap() = Some(
+        ["dispatch", "dispatch-retry"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "session_control".into(),
+                    arguments: args.to_string(),
+                },
+            })
+            .collect(),
+    );
+    f.state
+        .session_messenger
+        .send(bamboo_domain::SessionMessageEnvelope::user_input(
+            &f.reference.session_id,
+            "Dispatch a subscribed Session and report its eventual result.",
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, f.probe.source_entered[0].notified())
+        .await
+        .expect("the created Root's first input must reach its provider");
+    drive_material_notices(&f, 2).await;
+    let parent = load(&f.state, &f.reference.session_id).await;
+    let result = |id| {
+        let message = parent
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(id))
+            .expect("native Supervisor creation result");
+        assert_eq!(message.tool_success, Some(true), "{}", message.content);
+        serde_json::from_str::<Value>(&message.content).unwrap()
+    };
+    let created = result("dispatch");
+    let retried = result("dispatch-retry");
+    for key in ["target_session_id", "receipt_id", "generation"] {
+        assert_eq!(created[key], retried[key]);
+    }
+    assert_eq!(created["notify_on_material_event"], true);
+    assert_eq!(retried["replayed"], true);
+    let target = created["target_session_id"].as_str().unwrap();
+    let reference = managed_target(&f.state, &f.reference, target).await;
+    assert_eq!(created["current_user_target"], json!(reference));
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+
+    f.probe.source_release[0].notify_one();
+    drive_material_notices(&f, 3).await;
+    settle_material_notices(&f).await;
+    let worker = load(&f.state, target).await;
+    let facts = worker
+        .runtime_metadata
+        .as_ref()
+        .unwrap()
+        .supervised_root_outcomes
+        .as_ref()
+        .unwrap();
+    let [fact] = facts.facts.as_slice() else {
+        panic!("exactly one subscribed Run");
+    };
+    assert_eq!(fact.inputs.len(), 1);
+    assert_eq!(
+        fact.inputs[0]
+            .supervisor_origin
+            .as_ref()
+            .and_then(|origin| origin.handoff_format()),
+        Some(bamboo_domain::ManagedRootHandoffFormat::PresentationSummary)
+    );
+    let reference = fact.verified_final_message(&worker).unwrap();
+    assert!(worker.messages.iter().any(|message| {
+        message.id == reference.message_id && message.content.ends_with(HANDOFF_TAIL)
+    }));
+    let parent = load(&f.state, &f.reference.session_id).await;
+    let notices: Vec<_> = parent
+        .messages
+        .iter()
+        .filter(|message| message.content.starts_with("# Managed Session handoff"))
+        .collect();
+    let [notice] = notices.as_slice() else {
+        panic!("exactly one durable handoff");
+    };
+    assert!(notice.content.contains(HANDOFF_HEAD), "{}", notice.content);
+    assert!(notice.content.contains(HANDOFF_EVIDENCE));
+    assert!(notice.content.contains(HANDOFF_RISK));
+    assert!(!notice.content.contains('界'));
+    assert!(bamboo_engine::session_app::execute::is_hidden_from_ui(
+        notice
+    ));
+    assert!(notice.content.contains(&reference.message_id));
+    assert!(notice.content.contains(&fact.run_id));
+    assert!(notice.content.len() < 1_600);
+    assert!(!notice.content.contains(HANDOFF_TAIL));
+    assert!(f.probe.parent_inputs.lock().unwrap()[2]
+        .iter()
+        .any(|message| message.id == notice.id && message.content == notice.content));
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 3);
+
+    let mut projected_replay: bamboo_domain::SessionMessageEnvelope =
+        serde_json::from_value(notice.metadata.as_ref().unwrap()["session_message"].clone())
+            .unwrap();
+    let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) =
+        &mut projected_replay.body
+    else {
+        panic!("handoff must be a typed runtime instruction");
+    };
+    assert_eq!(
+        instruction.data.as_ref().unwrap()["final_message"],
+        json!(reference)
+    );
+    assert!(!instruction
+        .content
+        .as_ref()
+        .unwrap()
+        .text
+        .contains(HANDOFF_HEAD));
+    let presentation = instruction.provider_message.as_mut().unwrap();
+    assert_eq!(presentation.content.text, notice.content);
+    presentation.content.text = "The Worker final message is unavailable.".into();
+
+    // Replay the original notice through its production delivery path. The
+    // permanent receipt also proves that a changed presentation keeps its ID.
+    let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let inbox = &f.state.observer_subscriptions.inbox;
+    let retry = inbox
+        .deliver_managed_root_notification(&selected, Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.delivery.id.as_str(), notice.id);
+    assert!(!retry.pending);
+    let (admitted, _, _) = inbox
+        .admitted_receipt_for_testing(&projected_replay)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted, retry.delivery);
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 3);
+    f.state.shutdown().await;
 }
 
 pub(in crate::app_state) async fn exercise_material_root_notifications() {

@@ -86,7 +86,9 @@ impl ObserverSubscriptionCoordinator {
         native: bool,
     ) -> Self {
         if native {
-            inbox.enable_material_notifications();
+            inbox.enable_material_notifications(
+                bamboo_orchestration::managed_session::project_handoff_notice,
+            );
         }
         Self {
             inspector: SessionInspectorTool::host_routed(store.clone(), storage)

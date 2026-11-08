@@ -375,6 +375,7 @@ impl CreationAuthority {
                 Ok(ToolResult::text(available, json!({
                     "action":"scope", "authority":"host_finite", "state_revision":revision,
                     "create_route_exposed":available, "creation_permits":creates,
+                    "create_material_notifications":false,
                     "code":if !self.first_input_available() { "host_root_first_input_unavailable" }
                         else if creates.is_empty() { "host_root_create_not_granted" }
                         else if !available { "host_created_target_rights_unsupported" }
@@ -390,6 +391,20 @@ impl CreationAuthority {
         creator: &SupervisedRootCreator,
         request: &SupervisedRootCreateRequest,
     ) -> Result<u64, CreationAuthorizationError> {
+        if request.notify_on_material_event
+            && !matches!(
+                self,
+                Self::Supervisor {
+                    original_caller: Some(_),
+                    ..
+                }
+            )
+        {
+            return Err(CreationAuthorizationError::blocked(
+                "notification_scope_unavailable",
+                "First-input notifications require the original executing Supervisor",
+            ));
+        }
         match self {
             Self::Supervisor {
                 reference,
@@ -541,6 +556,7 @@ impl CreationAuthority {
                             request.operation_id,
                             candidate,
                             &request.message,
+                            request.notify_on_material_event,
                         )
                         .await
                 }
