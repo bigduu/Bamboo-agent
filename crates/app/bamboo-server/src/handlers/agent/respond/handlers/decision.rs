@@ -339,6 +339,75 @@ fn supervisor_reference(
     ))
 }
 
+struct DelegatedApprovalProof<'a> {
+    caller: &'a bamboo_domain::SessionCallerReference,
+    supervisor: bamboo_domain::SupervisorReference,
+    target: bamboo_domain::SupervisorCurrentUserTarget,
+    notice: bamboo_domain::SessionMessageEnvelope,
+    occurrence: bamboo_domain::ResponseOccurrence,
+    request: bamboo_tools::permission::PermissionRequest,
+}
+
+impl DelegatedApprovalProof<'_> {
+    async fn with_current_authority<T, F>(
+        &self,
+        state: &web::Data<AppState>,
+        effect: F,
+    ) -> Result<T, AppError>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> std::io::Result<T> + Send + 'static,
+    {
+        let state_for_guard = state.clone();
+        let supervisor_for_guard = self.supervisor.clone();
+        let expected_notice = self.notice.clone();
+        let occurrence = self.occurrence.clone();
+        let request = self.request.clone();
+        state
+            .session_store
+            .with_unscoped_supervisor_root_state(
+                self.caller,
+                &self.supervisor,
+                &self.target,
+                move |source, current| {
+                    let received = source
+                        .messages
+                        .iter()
+                        .rev()
+                        .find(|message| message.id == expected_notice.id.as_str())
+                        .is_some_and(|message| {
+                            bamboo_domain::is_matching_session_message(message, &expected_notice)
+                        });
+                    if !received {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Supervisor handoff receipt no longer matches Main",
+                        ));
+                    }
+                    let still_eligible = super::pending::capture_approval_handoff(
+                        &state_for_guard,
+                        &supervisor_for_guard,
+                        current,
+                    )
+                    .is_some_and(|(handoff, current_request)| {
+                        handoff.pending.occurrence == occurrence && current_request == request
+                    });
+                    if !still_eligible {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "Parked approval changed",
+                        ));
+                    }
+                    effect()
+                },
+            )
+            .await
+            .map_err(|error| {
+                AppError::Forbidden(format!("Managed approval authority changed: {error}"))
+            })
+    }
+}
+
 async fn apply_permission_decision(
     state: web::Data<AppState>,
     session_id: String,
@@ -431,8 +500,15 @@ async fn apply_permission_decision(
         let target = bamboo_domain::SupervisorCurrentUserTarget::capture(&session)
             .map_err(|_| AppError::Forbidden("Managed approval target changed".into()))?;
         decision.expected_policy_revision = Some(request.policy_revision);
-        config.register_pending_request(request);
-        Some((caller, supervisor, target, envelope))
+        config.register_pending_request(request.clone());
+        Some(DelegatedApprovalProof {
+            caller,
+            supervisor,
+            target,
+            notice: envelope,
+            occurrence: handoff.pending.occurrence,
+            request,
+        })
     } else {
         None
     };
@@ -444,6 +520,9 @@ async fn apply_permission_decision(
     let replayed = if let Some(receipt) = existing.as_ref() {
         if !same_durable_decision_semantics(&receipt.decision, &decision) {
             return Ok(resolved_decision_conflict(&receipt.decision, &decision));
+        }
+        if let Some(proof) = &delegation {
+            proof.with_current_authority(&state, || Ok(())).await?;
         }
         // A provider may legally reuse a tool-call id in a later round. Even
         // an exact replay receipt for the old generation must not consume that
@@ -627,70 +706,19 @@ async fn apply_permission_decision(
                         config.record_decision(&request.session_id, decision.clone())?;
                         Ok(())
                     };
-                    if let Some((caller, supervisor, target, envelope)) = &delegation {
+                    if let Some(proof) = &delegation {
                         let config = config.clone();
                         let decision = decision.clone();
-                        let state_for_guard = state.clone();
-                        let supervisor_for_guard = supervisor.clone();
-                        let expected_notice = envelope.clone();
-                        let occurrence = expected_approval
-                            .map(|(_, occurrence)| occurrence.clone())
-                            .ok_or_else(|| {
-                                AppError::Forbidden("Expected approval occurrence required".into())
-                            })?;
                         let guard = permission_guard
                             .take()
                             .expect("permission mutation lock is held");
-                        let (returned_response, returned_permission) = state
-                            .session_store
-                            .with_unscoped_supervisor_root_state(
-                                caller,
-                                supervisor,
-                                target,
-                                move |source, current| {
-                                    let received = source
-                                        .messages
-                                        .iter()
-                                        .rev()
-                                        .find(|message| message.id == expected_notice.id.as_str())
-                                        .is_some_and(|message| {
-                                            bamboo_domain::is_matching_session_message(
-                                                message,
-                                                &expected_notice,
-                                            )
-                                        });
-                                    if !received {
-                                        return Err(std::io::Error::new(
-                                            std::io::ErrorKind::PermissionDenied,
-                                            "Supervisor handoff receipt no longer matches Main",
-                                        ));
-                                    }
-                                    let still_eligible = super::pending::capture_approval_handoff(
-                                        &state_for_guard,
-                                        &supervisor_for_guard,
-                                        current,
-                                    )
-                                    .is_some_and(|(handoff, current_request)| {
-                                        handoff.pending.occurrence == occurrence
-                                            && current_request == request
-                                    });
-                                    if !still_eligible {
-                                        return Err(std::io::Error::new(
-                                            std::io::ErrorKind::PermissionDenied,
-                                            "Parked approval changed",
-                                        ));
-                                    }
-                                    apply_once(&config, &request, &decision)
-                                        .map_err(std::io::Error::other)?;
-                                    Ok((response_guard, guard))
-                                },
-                            )
-                            .await
-                            .map_err(|error| {
-                                AppError::Forbidden(format!(
-                                    "Managed approval authority changed: {error}"
-                                ))
-                            })?;
+                        let (returned_response, returned_permission) = proof
+                            .with_current_authority(&state, move || {
+                                apply_once(&config, &request, &decision)
+                                    .map_err(std::io::Error::other)?;
+                                Ok((response_guard, guard))
+                            })
+                            .await?;
                         response_guard = returned_response;
                         permission_guard = Some(returned_permission);
                     } else {
