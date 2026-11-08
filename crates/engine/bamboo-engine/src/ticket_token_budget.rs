@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use bamboo_domain::{Session, SessionKind, Storage};
-use bamboo_tickets::{Authority, Error, Principal, Result, TicketService};
+use bamboo_tickets::{Authority, Error, Principal, Result, RuntimeReceipt, TicketService};
 
 use crate::ticket_runtime::{self, TicketDispatchBinding};
 
@@ -57,10 +57,39 @@ pub struct NativeWorkTokenBudget {
     storage: Arc<dyn Storage>,
     chain: Vec<SessionStamp>,
     dispatch: Option<TicketDispatchBinding>,
+    managed_receipt: Option<RuntimeReceipt>,
     binding: bamboo_tickets::ScopeBinding,
 }
 
 impl NativeWorkTokenBudget {
+    pub(crate) fn managed_root(
+        service: Arc<TicketService>,
+        storage: Arc<dyn Storage>,
+        session: &Session,
+        dispatch: TicketDispatchBinding,
+        receipt: RuntimeReceipt,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            service,
+            storage,
+            chain: vec![SessionStamp::from_session(session)],
+            binding: dispatch.binding.clone(),
+            dispatch: Some(dispatch),
+            managed_receipt: Some(receipt),
+        })
+    }
+
+    pub(crate) fn matches_managed_root(&self, session: &Session, run_id: &str) -> bool {
+        self.managed_receipt.as_ref().is_some_and(|receipt| {
+            receipt.run_id == run_id
+                && receipt.session_id == session.id
+                && self
+                    .chain
+                    .first()
+                    .is_some_and(|stamp| stamp.matches(session))
+        })
+    }
+
     pub(crate) async fn capture(
         service: Option<Arc<TicketService>>,
         storage: Arc<dyn Storage>,
@@ -137,6 +166,7 @@ impl NativeWorkTokenBudget {
                     storage,
                     chain,
                     dispatch,
+                    managed_receipt: None,
                     binding,
                 })));
             }
@@ -191,8 +221,9 @@ impl NativeWorkTokenBudget {
             .get(&dispatch.dispatch_key)
             .ok_or_else(|| Error::ScopeDenied("Native budget dispatch missing".into()))?
             .immutable_spec;
+        let expected = self.managed_receipt.as_ref().or(dispatch.receipt.as_ref());
         if !matches!(ticket_runtime::query_dispatch(self.storage.as_ref(), &self.service, &dispatch.dispatch_key, spec).await?,
-            ticket_runtime::DispatchObservation::Admitted { receipt } if dispatch.receipt.as_ref() == Some(&receipt))
+            ticket_runtime::DispatchObservation::Admitted { receipt } if expected == Some(&receipt))
         {
             return Err(Error::ScopeDenied(
                 "Native budget requires the original admitted attempt".into(),

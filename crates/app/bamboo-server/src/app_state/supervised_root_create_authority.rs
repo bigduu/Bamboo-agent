@@ -111,7 +111,7 @@ impl SupervisedRootCreator {
         })
     }
 
-    async fn check_original_caller(
+    pub(in crate::app_state) async fn check_original_caller(
         &self,
         caller: &SessionCallerReference,
     ) -> Result<Session, ToolError> {
@@ -205,11 +205,15 @@ impl SessionRootCreatePort for CallerRootCreator {
                 "This Host has no canonical create-purpose first-input port; no Root creation was started"));
         }
         let service = self.creator.clone();
-        tokio::spawn(async move { service.create_authorized_inner(&authority, request).await })
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("caller Root creation task failed: {error}"))
-            })?
+        tokio::spawn(async move {
+            service
+                .create_authorized_inner(&authority, request, None)
+                .await
+        })
+        .await
+        .map_err(|error| {
+            ToolError::Execution(format!("caller Root creation task failed: {error}"))
+        })?
     }
 }
 

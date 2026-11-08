@@ -1159,8 +1159,23 @@ impl bamboo_domain::RuntimeSessionPersistence for SessionRepository {
         inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
         active_run_id: Option<&str>,
     ) -> std::io::Result<Option<bamboo_domain::RootInboxAdmission>> {
-        self.admit_owned_root_inbox(session, inbox, active_run_id)
+        if crate::ticket_runtime::is_managed_work_root(session) {
+            return Ok(Some(bamboo_domain::RootInboxAdmission::default()));
+        }
+        self.admit_owned_root_inbox(session, inbox, active_run_id, None)
             .await
+    }
+
+    async fn admit_managed_work_input(
+        &self,
+        session: &mut Session,
+        inbox: Arc<dyn bamboo_domain::SessionInboxPort>,
+        run_id: &str,
+        expected: &bamboo_domain::SessionMessageId,
+    ) -> std::io::Result<bamboo_domain::RootInboxAdmission> {
+        self.admit_owned_root_inbox(session, inbox, Some(run_id), Some(expected))
+            .await?
+            .ok_or_else(|| root_actor_binding_error("managed Work requires its exact Root writer"))
     }
 
     async fn checkpoint_retrieval_window(

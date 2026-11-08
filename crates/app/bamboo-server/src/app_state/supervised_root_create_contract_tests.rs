@@ -181,6 +181,7 @@ impl Fixture {
                 &record,
                 &self.request,
                 std::path::Path::new(&self.request.workspace_path),
+                None,
             )
             .await;
         self.creator

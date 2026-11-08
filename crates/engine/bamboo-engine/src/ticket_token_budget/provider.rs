@@ -196,6 +196,9 @@ impl BudgetedProvider {
             .as_ref()
             .is_none_or(|budget| budget.limits.is_none())
         {
+            if self.budget.managed_receipt.is_some() {
+                self.budget.authority().await.map_err(denied)?;
+            }
             return Ok(None);
         }
         let (input_cap, model_output) =

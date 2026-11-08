@@ -25,6 +25,8 @@ use tokio::sync::mpsc;
 mod native_work;
 use native_work::{execution_workspace, host, LocalProvider, CALL, RESULT, WAIT};
 
+#[path = "native_work_acceptance/managed_root.rs"]
+mod managed_root;
 #[path = "native_work_acceptance/model_route.rs"]
 mod model_route;
 

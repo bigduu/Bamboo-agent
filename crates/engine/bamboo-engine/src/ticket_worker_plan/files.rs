@@ -148,6 +148,11 @@ pub fn apply_host_file_request(
     call_id: &str,
     ceiling: &[String],
 ) -> Result<FileReply> {
+    if caller.kind != SessionKind::Child {
+        return Err(Error::ScopeDenied(
+            "remote Work files require a Child".into(),
+        ));
+    }
     apply_file_request(
         service,
         caller,
@@ -184,11 +189,7 @@ fn apply_file_request(
         .get(TICKET_LOCAL_PLAN_KEY)
         .ok_or_else(|| Error::ScopeDenied("Child has no Ticket capability".into()))?;
     let plan = TicketWorkerPlan::from_receipt_identity(Arc::new(service.clone()), assignment)?;
-    if caller.kind != SessionKind::Child
-        || caller.id != plan.session_id
-        || run_id != plan.run_id
-        || caller.parent_session_id.as_deref() != Some(plan.supervisor_session_id.as_str())
-    {
+    if !plan.matches_dispatch_session(caller) || run_id != plan.run_id {
         return Err(Error::ScopeDenied("file callback Run changed".into()));
     }
     service.workspace_file(&plan.authority, call_id, &operation(&request, read_mode)?)
@@ -531,17 +532,15 @@ impl LocalFileExecutor {
         ceiling: &[String],
     ) -> Result<Self> {
         bamboo_tickets::validate_native_tool_ceiling(ceiling.iter().map(String::as_str))?;
-        if canonical_child_snapshot.kind != SessionKind::Child
-            || canonical_child_snapshot
-                .agent_runtime_state
-                .as_ref()
-                .is_none_or(|runtime| runtime.run_id != run_id)
-            || !canonical_child_snapshot
-                .metadata
-                .contains_key(TICKET_LOCAL_PLAN_KEY)
-        {
+        let assignment = canonical_child_snapshot
+            .metadata
+            .get(TICKET_LOCAL_PLAN_KEY)
+            .ok_or_else(|| Error::ScopeDenied("local Work file plan missing".into()))?;
+        let plan = TicketWorkerPlan::from_receipt_identity(service.clone(), assignment)?;
+        plan.require_session_identity(&canonical_child_snapshot)?;
+        if plan.run_id != run_id {
             return Err(Error::ScopeDenied(
-                "local file executor requires its exact Child Run".into(),
+                "local file executor requires its exact Work Run".into(),
             ));
         }
         Ok(Self {
