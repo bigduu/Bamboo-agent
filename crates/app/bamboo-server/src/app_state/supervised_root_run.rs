@@ -518,30 +518,36 @@ mod tests {
 
     #[actix_web::test]
     async fn subscribed_creation_retries_converge_and_wake_with_a_short_verified_handoff() {
-        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(None).await;
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            None, false,
+        )
+        .await;
     }
 
     #[actix_web::test]
     async fn subscribed_creation_wakes_supervisor_after_permission_resume() {
-        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(Some(
-            PermissionDecisionKind::AllowOnce,
-        ))
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            Some(PermissionDecisionKind::AllowOnce),
+            false,
+        )
         .await;
     }
 
     #[actix_web::test]
     async fn subscribed_creation_wakes_supervisor_after_permission_denial() {
-        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(Some(
-            PermissionDecisionKind::DenyOnce,
-        ))
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            Some(PermissionDecisionKind::DenyOnce),
+            false,
+        )
         .await;
     }
 
     #[actix_web::test]
-    async fn subscribed_creation_wakes_supervisor_after_two_permissions_on_one_tool_call() {
-        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(Some(
-            PermissionDecisionKind::AllowSession,
-        ))
+    async fn subscribed_creation_wakes_supervisor_after_two_sequential_permissions() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            Some(PermissionDecisionKind::AllowOnce),
+            true,
+        )
         .await;
     }
 
