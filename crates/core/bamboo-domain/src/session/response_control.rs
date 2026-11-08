@@ -71,6 +71,36 @@ pub fn latest_response_occurrence(
     })
 }
 
+pub fn pending_permission_occurrence(session: &Session) -> Option<ResponseOccurrence> {
+    let pending = session.pending_question.as_ref()?;
+    let occurrence = latest_response_occurrence(session, &pending.tool_call_id)?;
+    occurrence
+        .permission_generation
+        .is_some()
+        .then_some(occurrence)
+}
+
+/// Compare the response mutation against the pending occurrence in durable Main.
+pub fn consumed_pending_permission(
+    before: &Session,
+    after: &Session,
+) -> Option<ResponseOccurrence> {
+    let occurrence = pending_permission_occurrence(before)?;
+    if after.pending_question.is_some()
+        || latest_response_occurrence(after, &occurrence.tool_call_id).as_ref() != Some(&occurrence)
+    {
+        return None;
+    }
+    let consumed = |session: &Session| {
+        session
+            .metadata
+            .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+            .and_then(|encoded| serde_json::from_str::<Vec<ResponseOccurrence>>(encoded).ok())
+            .is_some_and(|occurrences| occurrences.contains(&occurrence))
+    };
+    (!consumed(before) && consumed(after)).then_some(occurrence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
