@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use bamboo_domain::SessionPermissionMode;
 use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -59,6 +60,9 @@ pub(crate) struct SessionCreateOperationRecord {
     pub payload_fingerprint: String,
     pub session_id: String,
     pub status: StoredOperationStatus,
+    /// Freeze the permission mode when a Supervisor dispatch reserves its ID.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_execution_permission_mode: Option<SessionPermissionMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervised_delivery: Option<SupervisedRootDelivery>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +91,7 @@ impl SessionCreateOperationRecord {
             payload_fingerprint,
             session_id,
             status: StoredOperationStatus::Pending,
+            supervisor_execution_permission_mode: None,
             supervised_delivery: None,
             error: None,
             created_at: now,

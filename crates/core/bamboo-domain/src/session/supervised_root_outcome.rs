@@ -656,6 +656,9 @@ pub struct SupervisedRootOutcomeFact {
     /// Historical projection of the exact canonical reset ledger observed at
     /// reservation. It is not a replacement for the live generation proof.
     pub conversation_reset_sha256: Option<String>,
+    /// The preceding suspended fact whose permission response started this run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<u64>,
     pub inputs: Vec<SupervisedRootOutcomeInput>,
     /// Separately persisted clarification identities and their input prefixes.
     /// A pending question can coexist with a failed or cancelled run.
@@ -667,6 +670,17 @@ pub struct SupervisedRootOutcomeFact {
 }
 
 impl SupervisedRootOutcomeFact {
+    pub fn handoff_format(
+        &self,
+        input: &SupervisedRootOutcomeInput,
+    ) -> Option<ManagedRootHandoffFormat> {
+        let origin = input.supervisor_origin.as_ref()?;
+        if self.resumed_from.is_some() && origin.material_notifications_requested() {
+            return Some(ManagedRootHandoffFormat::PresentationSummary);
+        }
+        origin.handoff_format()
+    }
+
     pub fn verified_final_message<'a>(
         &'a self,
         main: &Session,
@@ -678,9 +692,11 @@ impl SupervisedRootOutcomeFact {
     }
 
     fn has_supervisor_input(&self) -> bool {
-        self.inputs
-            .iter()
-            .any(|input| input.supervisor_origin.is_some())
+        self.resumed_from.is_some()
+            || self
+                .inputs
+                .iter()
+                .any(|input| input.supervisor_origin.is_some())
     }
 
     fn matches_final_message(&self, main: &Session, reference: &RootFinalMessageReference) -> bool {
@@ -908,6 +924,54 @@ fn matches_projected_input(
 }
 
 impl SupervisedRootOutcomes {
+    /// Read opted-in inputs of this run and its proven approval predecessors.
+    /// The original input and its Inbox ACK retain their original run identity.
+    pub fn material_inputs<'a>(
+        &'a self,
+        fact: &'a SupervisedRootOutcomeFact,
+    ) -> impl Iterator<Item = &'a SupervisedRootOutcomeInput> {
+        let mut seen = std::collections::BTreeSet::new();
+        std::iter::successors(Some(fact), |fact| {
+            let sequence = fact
+                .resumed_from
+                .filter(|sequence| *sequence < fact.sequence)?;
+            self.facts
+                .get(usize::try_from(sequence.checked_sub(1)?).ok()?)
+        })
+        .flat_map(|fact| &fact.inputs)
+        .filter(move |input| {
+            input
+                .supervisor_origin
+                .as_ref()
+                .is_some_and(SupervisedRootOutcomeInputOrigin::material_notifications_requested)
+                && seen.insert(input.receipt_id.as_str())
+        })
+    }
+
+    /// A new resume invalidates a discovery hint cached for the suspended run.
+    pub fn material_hint_for(&self, fact: &SupervisedRootOutcomeFact) -> Option<String> {
+        if fact.resumed_from.is_some() {
+            let input = self.material_inputs(fact).next()?;
+            Some(
+                SessionMessageId::stable(
+                    "managed-root-resume-hint:v1",
+                    &serde_json::json!([input.receipt_id, fact.run_id]),
+                )
+                .to_string(),
+            )
+        } else {
+            fact.inputs
+                .iter()
+                .rev()
+                .find(|input| {
+                    input.supervisor_origin.as_ref().is_some_and(
+                        SupervisedRootOutcomeInputOrigin::material_notifications_requested,
+                    )
+                })
+                .map(|input| input.receipt_id.to_string())
+        }
+    }
+
     pub fn new(
         root_session_id: &str,
         root_created_at: DateTime<Utc>,
@@ -947,13 +1011,24 @@ impl SupervisedRootOutcomes {
     fn validate_with_terminal_headroom(&self, managed: bool) -> Result<(), &'static str> {
         crate::validate_supervisor_target_id(&self.root_session_id)?;
         if self.version != SUPERVISED_ROOT_OUTCOMES_VERSION
-            || self.facts.len() > MAX_SUPERVISED_ROOT_OUTCOMES
+            // Each valid fact alone contains a 64-byte lease-owner digest.
+            || self.facts.len() > MAX_SUPERVISED_ROOT_OUTCOMES_BYTES / 64
         {
             return Err("unsupported or oversized Root outcome facts");
+        }
+        if self
+            .facts
+            .iter()
+            .filter(|fact| fact.resumed_from.is_none())
+            .count()
+            > MAX_SUPERVISED_ROOT_OUTCOMES
+        {
+            return Err("Root outcome capacity exhausted before execution");
         }
         let mut previous_sequence = 0_u64;
         let mut previous_attempt = 0_u64;
         let mut previous_lease_epoch = 0_u64;
+        let mut previous_notifying = false;
         let mut run_ids = std::collections::BTreeSet::new();
         let mut final_message_ids = std::collections::BTreeSet::new();
         let mut activation_ids = std::collections::BTreeSet::new();
@@ -982,6 +1057,17 @@ impl SupervisedRootOutcomes {
             {
                 return Err("invalid Root outcome identity or order");
             }
+            if let Some(resumed_from) = fact.resumed_from {
+                if !index.checked_sub(1).is_some_and(|prior| {
+                    let predecessor = &self.facts[prior];
+                    predecessor.sequence == resumed_from
+                        && predecessor.result == Some(SupervisedRootOutcomeResult::Suspended)
+                        && predecessor.conversation_reset_sha256 == fact.conversation_reset_sha256
+                        && previous_notifying
+                }) {
+                    return Err("invalid Root permission resume predecessor");
+                }
+            }
             if fact.final_message.as_ref().is_some_and(|reference| {
                 fact.result != Some(SupervisedRootOutcomeResult::Completed)
                     || !fact.has_supervisor_input()
@@ -993,6 +1079,12 @@ impl SupervisedRootOutcomes {
             previous_sequence = fact.sequence;
             previous_attempt = fact.attempt;
             previous_lease_epoch = fact.lease_epoch;
+            previous_notifying = fact.resumed_from.is_some()
+                || fact.inputs.iter().any(|input| {
+                    input.supervisor_origin.as_ref().is_some_and(
+                        SupervisedRootOutcomeInputOrigin::material_notifications_requested,
+                    )
+                });
             let mut questions = std::collections::BTreeSet::new();
             let mut previous_input_count = 0;
             for question in &fact.questions {
@@ -1250,6 +1342,47 @@ impl SupervisedRootOutcomes {
         fence: &ActorActivationFence,
         conversation_reset_sha256: Option<&str>,
     ) -> Result<SupervisedRootOutcomeReservation, &'static str> {
+        self.reserve_with_predecessor(fence, conversation_reset_sha256, None)
+    }
+
+    /// Called by the fenced Main writer only for the exact consumed permission
+    /// occurrence. A legacy fact with no occurrence proof is usable only when
+    /// no other Actor activation could have written the pending question.
+    pub fn reserve_permission_resume(
+        &mut self,
+        fence: &ActorActivationFence,
+        conversation_reset_sha256: Option<&str>,
+        occurrence: &ResponseOccurrence,
+    ) -> Result<(), &'static str> {
+        let Some(predecessor) = self.facts.last().filter(|fact| {
+            fact.result == Some(SupervisedRootOutcomeResult::Suspended)
+                && fact.conversation_reset_sha256.as_deref() == conversation_reset_sha256
+                && self.material_inputs(fact).next().is_some()
+        }) else {
+            return Ok(());
+        };
+        let exact = predecessor.questions.last().is_some_and(|question| {
+            question.question_id_sha256 == supervised_root_question_occurrence_digest(occurrence)
+        });
+        let legacy = predecessor.questions.is_empty()
+            && predecessor.attempt.checked_add(1) == Some(fence.attempt)
+            && predecessor.lease_epoch.checked_add(1) == Some(fence.lease_epoch);
+        if occurrence.permission_generation.is_some() && (exact || legacy) {
+            self.reserve_with_predecessor(
+                fence,
+                conversation_reset_sha256,
+                Some(predecessor.sequence),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn reserve_with_predecessor(
+        &mut self,
+        fence: &ActorActivationFence,
+        conversation_reset_sha256: Option<&str>,
+        resumed_from: Option<u64>,
+    ) -> Result<SupervisedRootOutcomeReservation, &'static str> {
         self.validate()?;
         if fence.actor_id != self.root_session_id
             || !valid_activation_id(&fence.activation_id)
@@ -1277,9 +1410,6 @@ impl SupervisedRootOutcomes {
                 Err("Root outcome run identity conflicts")
             };
         }
-        if self.facts.len() >= MAX_SUPERVISED_ROOT_OUTCOMES {
-            return Err("Root outcome capacity exhausted before execution");
-        }
         if self.facts.last().is_some_and(|fact| fact.result.is_none()) {
             return Err("prior Root outcome reservation remains unresolved");
         }
@@ -1297,12 +1427,13 @@ impl SupervisedRootOutcomes {
             lease_owner_sha256: lease_owner_digest(&fence.lease_owner),
             run_id: fence.run_id.clone(),
             conversation_reset_sha256: conversation_reset_sha256.map(str::to_owned),
+            resumed_from,
             inputs: Vec::new(),
             questions: Vec::new(),
             result: None,
             final_message: None,
         });
-        candidate.validate()?;
+        candidate.validate_with_terminal_headroom(resumed_from.is_some())?;
         *self = candidate;
         Ok(SupervisedRootOutcomeReservation::New(sequence))
     }
@@ -1732,6 +1863,118 @@ mod tests {
             generation,
             supervisor_origin: None,
         }
+    }
+
+    #[test]
+    fn approval_resume_keeps_the_original_receipt_across_runs() {
+        use SupervisedRootOutcomeResult::Suspended;
+
+        let root = Session::new("test-root", "model");
+        let target = SupervisorCurrentUserTarget::capture(&root).unwrap();
+        let supervisor = SupervisorReference {
+            session_id: crate::DEFAULT_SUPERVISOR_SESSION_ID.into(),
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let operation_id = SessionMessageId::parse("permission-resume-operation").unwrap();
+        let receipt_id =
+            crate::supervisor_current_user_message_id(&supervisor, &target, operation_id.as_str());
+        let admitted = SupervisedRootOutcomeInput {
+            receipt_id: receipt_id.clone(),
+            generation: 1,
+            supervisor_origin: Some(SupervisedRootOutcomeInputOrigin::CurrentUser {
+                supervisor,
+                supervisor_created_at: Utc::now(),
+                caller: None,
+                requires_host_scope: None,
+                notify_on_material_event: true,
+                target,
+                operation_id,
+            }),
+        };
+        let mut outcomes = SupervisedRootOutcomes::new(&root.id, root.created_at).unwrap();
+        outcomes.reserve(&fence(1), None).unwrap();
+        outcomes.record_input(&fence(1), admitted.clone()).unwrap();
+        let mut question = occurrence("one");
+        question.permission_generation = Some("permission-1".into());
+
+        let mut legacy = outcomes.clone();
+        legacy.finalize(&fence(1), Suspended).unwrap();
+        legacy
+            .reserve_permission_resume(&fence(3), None, &question)
+            .unwrap();
+        assert_eq!(legacy.facts.len(), 1);
+        legacy
+            .reserve_permission_resume(&fence(2), None, &question)
+            .unwrap();
+        assert_eq!(legacy.facts[1].resumed_from, Some(1));
+
+        outcomes.record_question(&fence(1), &question).unwrap();
+        outcomes.finalize(&fence(1), Suspended).unwrap();
+        let wrong = ResponseOccurrence {
+            permission_generation: Some("wrong".into()),
+            ..question.clone()
+        };
+        outcomes
+            .reserve_permission_resume(&fence(3), None, &wrong)
+            .unwrap();
+        outcomes
+            .reserve_permission_resume(&fence(3), Some(&"a".repeat(64)), &question)
+            .unwrap();
+        assert_eq!(outcomes.facts.len(), 1);
+
+        outcomes
+            .reserve_permission_resume(&fence(3), None, &question)
+            .unwrap();
+        let mut next_question = occurrence("two");
+        next_question.permission_generation = Some("permission-2".into());
+        outcomes.record_question(&fence(3), &next_question).unwrap();
+        outcomes.finalize(&fence(3), Suspended).unwrap();
+        outcomes
+            .reserve_permission_resume(&fence(4), None, &next_question)
+            .unwrap();
+        let resumed = &outcomes.facts[2];
+        assert_eq!(resumed.resumed_from, Some(2));
+        assert!(resumed.inputs.is_empty());
+        assert_eq!(
+            outcomes.material_inputs(resumed).collect::<Vec<_>>(),
+            vec![&admitted]
+        );
+        assert_ne!(
+            outcomes.material_hint_for(resumed),
+            outcomes.material_hint_for(&outcomes.facts[1])
+        );
+        let receipt = SessionInboxReceipt {
+            id: receipt_id,
+            generation: 1,
+        };
+        assert_eq!(
+            outcomes.unique_input_run(&receipt),
+            Some((&outcomes.facts[0], &admitted))
+        );
+
+        let mut long = outcomes.clone();
+        for attempt in 5..=(MAX_SUPERVISED_ROOT_OUTCOMES as u64 + 5) {
+            let mut question = occurrence(&attempt.to_string());
+            question.permission_generation = Some(format!("permission-{attempt}"));
+            long.record_question(&fence(attempt - 1), &question)
+                .unwrap();
+            long.finalize(&fence(attempt - 1), Suspended).unwrap();
+            long.reserve_permission_resume(&fence(attempt), None, &question)
+                .unwrap();
+        }
+        assert!(long.facts.len() > MAX_SUPERVISED_ROOT_OUTCOMES);
+        assert_eq!(
+            long.material_inputs(long.facts.last().unwrap())
+                .collect::<Vec<_>>(),
+            vec![&admitted]
+        );
+
+        outcomes.finalize(&fence(4), Suspended).unwrap();
+        outcomes.reserve(&fence(5), None).unwrap();
+        assert!(outcomes
+            .material_inputs(&outcomes.facts[3])
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -2607,6 +2850,7 @@ mod tests {
                 lease_owner_sha256: lease_owner_digest(&current.lease_owner),
                 run_id: current.run_id,
                 conversation_reset_sha256: None,
+                resumed_from: None,
                 inputs,
                 questions: Vec::new(),
                 result: Some(SupervisedRootOutcomeResult::Completed),
