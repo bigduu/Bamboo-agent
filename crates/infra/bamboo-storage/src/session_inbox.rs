@@ -1516,10 +1516,24 @@ impl FileSessionInbox {
         else {
             unreachable!("Root outcome envelope has a RuntimeInstruction")
         };
-        instruction.content = Some(bamboo_domain::SessionMessageContent::text(project(
+        let content = bamboo_domain::SessionMessageContent::text(project(
             outcome, reference, content, format,
-        )));
-        if let (Some(data), Some(reference)) = (instruction.data.as_mut(), reference) {
+        ));
+        let final_message =
+            if format == bamboo_domain::ManagedRootHandoffFormat::PresentationSummary {
+                instruction.provider_message = Some(bamboo_domain::SessionProviderMessage {
+                    content,
+                    metadata: Default::default(),
+                    never_compress: false,
+                });
+                // The terminal fact pins the reference. Later edits can change
+                // current verification and display but cannot change delivery identity.
+                fact.final_message.as_ref()
+            } else {
+                instruction.content = Some(content);
+                reference
+            };
+        if let (Some(data), Some(reference)) = (instruction.data.as_mut(), final_message) {
             data["final_message"] = serde_json::json!(reference);
         }
         Ok(envelope)
@@ -3039,7 +3053,7 @@ impl FileSessionInbox {
             notification_target,
             structured_handoff: false,
             handoff_format: notification_requested
-                .then_some(bamboo_domain::ManagedRootHandoffFormat::WorkerSummary),
+                .then_some(bamboo_domain::ManagedRootHandoffFormat::PresentationSummary),
             target_created_at: target_birth,
             operation_id: operation,
         };
@@ -4773,6 +4787,10 @@ impl SessionInboxPort for FileSessionInbox {
         .await
     }
 
+    fn supports_root_creation_material_notifications(&self) -> bool {
+        self.material_handoff.get().is_some()
+    }
+
     async fn deliver_unscoped_supervisor_root_first_input(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
@@ -4782,7 +4800,7 @@ impl SessionInboxPort for FileSessionInbox {
         envelope: &SessionMessageEnvelope,
         notify_on_material_event: bool,
     ) -> Result<SessionInboxDeliveryReceipt, SessionInboxError> {
-        if notify_on_material_event && self.material_handoff.get().is_none() {
+        if notify_on_material_event && !self.supports_root_creation_material_notifications() {
             return Err(SessionInboxError::Storage(
                 "managed Session material notifications require the installed native Host".into(),
             ));

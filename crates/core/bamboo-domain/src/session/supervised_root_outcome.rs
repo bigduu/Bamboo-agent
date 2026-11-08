@@ -49,6 +49,8 @@ pub enum ManagedRootHandoffFormat {
     Excerpt,
     StrictSummary,
     WorkerSummary,
+    /// The committed outcome identifies delivery; the summary is presentation.
+    PresentationSummary,
 }
 
 /// A retained observation, not a capability. Storage must capture it while

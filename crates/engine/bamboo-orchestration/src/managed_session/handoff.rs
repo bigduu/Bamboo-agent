@@ -48,6 +48,7 @@ pub fn worker_handoff_context(session: &Session, run_id: Option<&str>) -> Option
                 Some(
                     ManagedRootHandoffFormat::StrictSummary
                         | ManagedRootHandoffFormat::WorkerSummary
+                        | ManagedRootHandoffFormat::PresentationSummary
                 )
             )
         })

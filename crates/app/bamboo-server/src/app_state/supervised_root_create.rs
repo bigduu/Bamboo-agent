@@ -136,6 +136,7 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
             "allowed_projects":legacy.allowed_projects, "legacy_scope_is_authorization":false,
             "projects":projects, "requires_project_authorization":false,
             "create_route_exposed":true, "project_scope_configured":true,
+            "create_material_notifications":self.messenger.inbox().supports_root_creation_material_notifications(),
             "code":"current_user_scope_ready", "owner_action":null,
             "work_scope":{
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
@@ -267,6 +268,25 @@ impl SupervisedRootCreator {
                     "The operation UUID is already bound to a different request",
                 ));
             }
+        }
+        if request.notify_on_material_event
+            && !self
+                .messenger
+                .inbox()
+                .supports_root_creation_material_notifications()
+            && existing
+                .as_ref()
+                .is_none_or(|operation| operation.status != StoredOperationStatus::Succeeded)
+        {
+            return Ok(blocked(
+                operation_id,
+                existing
+                    .as_ref()
+                    .map(|operation| operation.session_id.as_str()),
+                "authorization",
+                "notification_scope_unavailable",
+                "First-input material notifications are unavailable on this Host",
+            ));
         }
         if authority.retains_operation() {
             if let Some(operation) = existing

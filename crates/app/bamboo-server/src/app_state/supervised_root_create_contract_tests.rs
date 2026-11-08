@@ -237,6 +237,49 @@ async fn concurrent_creation_and_restart_replay_preserve_one_root_link_and_first
 }
 
 #[tokio::test]
+async fn unsupported_first_input_subscription_does_not_reserve_or_create_a_root() {
+    let f = Fixture::new().await;
+    let supervisor = f
+        .creator
+        .store
+        .load_session(&f.supervisor.session_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let caller = bamboo_domain::SessionCallerReference::from(&supervisor);
+    let scope = f.creator.scope_observed(&caller).await.unwrap();
+    assert_eq!(value(scope)["create_material_notifications"], false);
+
+    let mut subscribed = f.request.clone();
+    subscribed.notify_on_material_event = true;
+    let result = f
+        .creator
+        .create_observed(&caller, subscribed)
+        .await
+        .unwrap();
+    assert!(!result.success);
+    assert_eq!(value(result)["code"], "notification_scope_unavailable");
+    assert_eq!(f.count().await, 1);
+    assert!(f
+        .creator
+        .operations
+        .load_for_status(&f.digest())
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 0);
+
+    let created = f
+        .creator
+        .create_observed(&caller, f.request.clone())
+        .await
+        .unwrap();
+    assert_eq!(accepted(created)["replayed"], false);
+    assert_eq!(f.count().await, 2);
+    assert_eq!(f.activation.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn changed_payload_conflicts_without_a_second_root_or_instruction() {
     let f = Fixture::new().await;
     let first = accepted(f.create(f.request.clone()).await);

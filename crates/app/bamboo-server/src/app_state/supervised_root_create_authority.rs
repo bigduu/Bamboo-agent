@@ -375,6 +375,7 @@ impl CreationAuthority {
                 Ok(ToolResult::text(available, json!({
                     "action":"scope", "authority":"host_finite", "state_revision":revision,
                     "create_route_exposed":available, "creation_permits":creates,
+                    "create_material_notifications":false,
                     "code":if !self.first_input_available() { "host_root_first_input_unavailable" }
                         else if creates.is_empty() { "host_root_create_not_granted" }
                         else if !available { "host_created_target_rights_unsupported" }

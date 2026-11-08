@@ -1646,6 +1646,13 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff() {
         panic!("exactly one subscribed Run");
     };
     assert_eq!(fact.inputs.len(), 1);
+    assert_eq!(
+        fact.inputs[0]
+            .supervisor_origin
+            .as_ref()
+            .and_then(|origin| origin.handoff_format()),
+        Some(bamboo_domain::ManagedRootHandoffFormat::PresentationSummary)
+    );
     let reference = fact.verified_final_message(&worker).unwrap();
     assert!(worker.messages.iter().any(|message| {
         message.id == reference.message_id && message.content.ends_with(HANDOFF_TAIL)
@@ -1673,6 +1680,37 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff() {
     assert!(f.probe.parent_inputs.lock().unwrap()[2]
         .iter()
         .any(|message| message.id == notice.id && message.content == notice.content));
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 3);
+
+    // An admitted handoff can be retried after the worker's history is edited.
+    // The model presentation may no longer verify, but the durable receipt
+    // must still identify the same result and must never schedule a second turn.
+    let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let response = crate::handlers::agent::messages::delete_message(
+        f.state.clone(),
+        web::Path::from((target.to_owned(), reference.message_id.clone())),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    let edited = load(&f.state, target).await;
+    assert!(edited
+        .messages
+        .iter()
+        .all(|message| message.id != reference.message_id));
+    let retry = f
+        .state
+        .observer_subscriptions
+        .inbox
+        .deliver_managed_root_notification(&selected, Utc::now())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retry.delivery.id.as_str(), notice.id);
+    assert!(!retry.pending);
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 3);
     f.state.shutdown().await;
 }

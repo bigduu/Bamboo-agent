@@ -1943,6 +1943,12 @@ pub trait SessionInboxPort: Send + Sync {
         ))
     }
 
+    /// The first-input writer and its native material notification projector
+    /// are both installed. The writer still validates each concrete admission.
+    fn supports_root_creation_material_notifications(&self) -> bool {
+        false
+    }
+
     /// Canonical adapter compatibility only. The concrete writer must retain
     /// proof that the caller's Host namespace is still never-installed through
     /// physical admission, along with its original caller and existing peer
