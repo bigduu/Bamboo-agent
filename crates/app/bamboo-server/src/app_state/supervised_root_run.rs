@@ -330,7 +330,32 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         caller: &SessionCallerReference,
         target: &SupervisorCurrentUserTarget,
     ) -> Result<ToolResult, ToolError> {
-        self.control(caller, target, None, None).await
+        use bamboo_domain::Storage;
+        use bamboo_orchestration::managed_session::approval::PendingApproval;
+
+        let observed = self.control(caller, target, None, None).await?;
+        if observed.success {
+            let status: Value = serde_json::from_str(&observed.result)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            if status["status"] != "already_finished" {
+                return Ok(observed);
+            }
+        }
+        let supervisor = original_supervisor(caller)?;
+        let root = self
+            .store
+            .load_session(&target.session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if let Some(root) = root.filter(|root| target.matches(root)) {
+            if let Some(approval) = PendingApproval::capture(&supervisor, &root) {
+                return Ok(ToolResult::text(
+                    true,
+                    approval.observation(&supervisor, &root).to_string(),
+                ));
+            }
+        }
+        Ok(observed)
     }
 
     async fn observe_admission(

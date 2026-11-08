@@ -321,7 +321,14 @@ impl SupervisedRootCreator {
             ));
         }
         let mut operation = existing.unwrap_or_else(|| {
-            SessionCreateOperationRecord::pending(digest, fingerprint, reserved_id)
+            let mut operation =
+                SessionCreateOperationRecord::pending(digest, fingerprint, reserved_id);
+            if !authority.is_host() && managed.is_none() {
+                operation.supervisor_execution_permission_mode = Some(
+                    bamboo_orchestration::managed_session::DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE,
+                );
+            }
+            operation
         });
         let id = operation.session_id.clone();
         let workspace =
@@ -566,7 +573,11 @@ impl SupervisedRootCreator {
                 reasoning_effort: None,
                 gold_config_json: None,
                 workspace_path: Some(bamboo_config::paths::path_to_display_string(workspace)),
-                permission_mode: Some(bamboo_domain::SessionPermissionMode::Default),
+                permission_mode: Some(
+                    operation
+                        .supervisor_execution_permission_mode
+                        .unwrap_or_default(),
+                ),
             },
             &CreateSessionConfig {
                 default_model: config.get_model(),

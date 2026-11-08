@@ -402,6 +402,15 @@ async fn recovered_root_before_link_and_link_before_input_use_the_reserved_lifet
             .unwrap();
         assert_eq!(canonical.created_at, candidate.created_at);
         assert_eq!(canonical.model, candidate.model);
+        assert_eq!(
+            canonical
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Default,
+            "reservations written before this default retain their mode"
+        );
         assert_eq!(f.activation.calls.load(Ordering::SeqCst), 1);
     }
 }
