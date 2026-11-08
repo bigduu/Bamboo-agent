@@ -2232,6 +2232,31 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     let (handoff, current_request) = capture_approval_handoff(state, &f.reference, &target)
         .expect("a pending, exact native workspace edit is eligible");
     assert_eq!(handoff.due_at, parked_at + DELAY);
+    let outside = f.home.path().canonicalize().unwrap().join("outside.txt");
+    let outside = bamboo_config::paths::path_to_display_string(&outside);
+    let mut misleading = current_request.clone();
+    misleading.resource = format!(" {outside}");
+    #[cfg(unix)]
+    std::fs::create_dir_all(
+        std::path::Path::new(&workspace)
+            .join(&misleading.resource)
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        bamboo_orchestration::managed_session::approval_handoff::ApprovalHandoff::capture(
+            &f.reference,
+            &target,
+            &misleading,
+            &json!({"file_path":misleading.resource}),
+            &config,
+            &state.app_data_dir,
+            parked_at,
+        )
+        .is_none(),
+        "the path approved by policy must be the path executed by the native tool"
+    );
     let mut reparked = target.clone();
     let tool_result = reparked.messages.last_mut().unwrap();
     tool_result.metadata.as_mut().unwrap()[bamboo_domain::PERMISSION_REPARKED_AT_KEY] = json!(now);

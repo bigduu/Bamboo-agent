@@ -233,6 +233,12 @@ fn is_ordinary_workspace_edit(
     let Some(file) = args.get("file_path").and_then(Value::as_str) else {
         return false;
     };
+    let path = Path::new(file);
+    // The native tools trim before opening an absolute path. Only accept the
+    // unambiguous path that both the permission request and the tool will use.
+    if file != file.trim() || file != request.resource || !path.is_absolute() {
+        return false;
+    }
     let Some((workspace, requested_workspace)) = std::fs::canonicalize(&workspace).ok().zip(
         request
             .workspace_path
@@ -265,41 +271,24 @@ fn is_ordinary_workspace_edit(
     }) {
         return false;
     }
-    let path = Path::new(file);
-    let absolute = if path.is_absolute() {
-        path.to_owned()
-    } else {
-        workspace.join(path)
-    };
-    let Some((parent, file_name)) = absolute
+    let Some((parent, file_name)) = path
         .parent()
         .and_then(|dir| std::fs::canonicalize(dir).ok())
-        .zip(absolute.file_name())
+        .zip(path.file_name())
     else {
         return false;
     };
     let physical = parent.join(file_name);
-    let request_path = Path::new(&request.resource);
-    let request_path = if request_path.is_absolute() {
-        request_path.to_owned()
-    } else {
-        workspace.join(request_path)
-    };
-    let requested = request_path
-        .to_str()
-        .and_then(canonicalize_path_for_matching);
-    let actual = absolute.to_str().and_then(canonicalize_path_for_matching);
     // Existing targets must be regular files. A create must have an existing
     // canonical parent. Exclude dot paths such as VCS and private config.
-    actual.is_some()
-        && actual == requested
+    canonicalize_path_for_matching(file).is_some()
         && physical.strip_prefix(workspace).is_ok_and(|relative| {
             relative.components().next().is_some()
                 && relative.components().all(|part| {
                     matches!(part, Component::Normal(name) if !name.to_string_lossy().starts_with('.'))
                 })
         })
-        && match std::fs::symlink_metadata(&absolute) {
+        && match std::fs::symlink_metadata(path) {
             Ok(metadata) => metadata.is_file(),
             Err(error) => error.kind() == std::io::ErrorKind::NotFound,
         }
