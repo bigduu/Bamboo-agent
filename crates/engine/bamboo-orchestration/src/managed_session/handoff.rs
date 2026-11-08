@@ -2,10 +2,12 @@
 use bamboo_domain::{
     ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
     ManagedRootHandoffFormat, Message, ObserverSupervisedRootOutcome, Role,
-    RootFinalMessageReference, Session, SupervisedRootOutcomeResult,
+    RootFinalMessageReference, Session, SessionMessageContent, SessionProviderMessage,
+    SupervisedRootOutcomeFact, SupervisedRootOutcomeResult, SupervisorReference,
 };
 use serde::Serialize;
 use serde_json::json;
+use std::borrow::Cow;
 
 const SUMMARY_START: &str = "<!-- bamboo-handoff:v1 -->";
 const SUMMARY_END: &str = "<!-- /bamboo-handoff:v1 -->";
@@ -17,10 +19,26 @@ pub const DISPATCH_CONFIRMATION: &str = concat!(
     "and execution status in the tools."
 );
 
+const CONTINUE_AFTER_DELIVERY: &str = concat!(
+    "For an ongoing assignment, take the next authorized action before reporting. ",
+    "If review found an unverified risk or missing tests, dispatch a bounded reproduction ",
+    "and the independent missing coverage before asking for a product decision. ",
+    "Reuse suitable Sessions, subscribe to their results, and separate overlapping writes. ",
+    "A Session waiting for approval is unavailable for new work. ",
+    "Start independent checks in available Sessions instead of queuing them behind that approval."
+);
+
 pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
     "For managed Session work, make dispatch calls without a preamble. ",
+    "Give each new Session a short title that names the concrete task in the user's language, ",
+    "such as \"核对 Bodhi 开发启动流程\" or \"Fix duplicate progress events\". ",
+    "Honor any title explicitly supplied by the user. Keep operation IDs, timestamps and retry labels in the tools. ",
     "Acknowledge a dispatch once in a short reply with the user-facing task names. ",
     "Keep dispatch and monitoring mechanics in tools. On a committed handoff, use the Worker summary by default. ",
+    "For an ongoing goal, dispatch or resume the next unblocked step before reporting. ",
+    "A Session waiting for approval cannot run a new followup. Keep that work parked. ",
+    "Dispatch independent reproduction and missing validation in available Sessions, creating new ones as needed. ",
+    "Treat a queued or coalesced admission as pending until execution is observed. ",
     "Report only the newly delivered task in one short update with its conclusion, key source locations and material risk. ",
     "If multiple handoffs arrive together, give each new task one entry. Use the user's language. ",
     "Leave tool narration, internal identifiers and repeated rollups out of the reply unless requested. ",
@@ -28,6 +46,47 @@ pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
     "the user requests detail, or an explicit verification or acceptance step requires more evidence. ",
     "Report delivery as the Worker's result and preserve its uncertainty. Keep formal verification and acceptance separate."
 );
+
+/// The canonical notice stays stable across retries. The provider presentation
+/// can clarify what to do with a newly delivered result.
+pub fn project_managed_notice(
+    _supervisor: &SupervisorReference,
+    target: &Session,
+    fact: &SupervisedRootOutcomeFact,
+    canonical_handoff: Option<&str>,
+) -> Option<SessionProviderMessage> {
+    let status = fact.result.as_ref()?;
+    if *status != SupervisedRootOutcomeResult::Completed {
+        return None;
+    }
+    let body = if let Some(body) = canonical_handoff {
+        Cow::Borrowed(body)
+    } else {
+        // Current-user follow-ups retain the original status receipt.
+        // Project their exact committed result only into presentation.
+        let reference = fact.verified_final_message(target);
+        let text = reference.and_then(|reference| {
+            target
+                .messages
+                .iter()
+                .find(|message| message.id == reference.message_id)
+                .map(|message| message.content.as_str())
+        });
+        Cow::Owned(worker_handoff_text(
+            &target.id,
+            &fact.run_id,
+            status,
+            reference,
+            text,
+            false,
+        ))
+    };
+    Some(SessionProviderMessage {
+        content: SessionMessageContent::text(format!("{body}\n\n{CONTINUE_AFTER_DELIVERY}")),
+        metadata: Default::default(),
+        never_compress: false,
+    })
+}
 
 pub fn worker_handoff_context(session: &Session, run_id: Option<&str>) -> Option<ContextBlock> {
     let run_id = run_id?;
@@ -39,18 +98,12 @@ pub fn worker_handoff_context(session: &Session, run_id: Option<&str>) -> Option
     let fact = outcomes.facts.last()?;
     if fact.run_id != run_id
         || fact.result.is_some()
-        || !fact.inputs.iter().any(|input| {
-            matches!(
-                input
-                    .supervisor_origin
-                    .as_ref()
-                    .and_then(|origin| origin.handoff_format()),
-                Some(
-                    ManagedRootHandoffFormat::StrictSummary
-                        | ManagedRootHandoffFormat::WorkerSummary
-                        | ManagedRootHandoffFormat::PresentationSummary
-                )
-            )
+        || !outcomes.material_inputs(fact).any(|input| {
+            input
+                .supervisor_origin
+                .as_ref()
+                .is_some_and(|origin| origin.material_notifications_requested())
+                && fact.handoff_format(input) != Some(ManagedRootHandoffFormat::Excerpt)
         })
     {
         return None;
@@ -162,11 +215,29 @@ pub fn project_handoff_notice(
     if format == ManagedRootHandoffFormat::Excerpt {
         return super::short_handoff_notice(outcome, reference, committed_text);
     }
+    worker_handoff_text(
+        &outcome.target_session_id,
+        &outcome.run_id,
+        &outcome.status,
+        reference,
+        committed_text,
+        format == ManagedRootHandoffFormat::StrictSummary,
+    )
+}
+
+fn worker_handoff_text(
+    target_id: &str,
+    run_id: &str,
+    status: &SupervisedRootOutcomeResult,
+    reference: Option<&RootFinalMessageReference>,
+    committed_text: Option<&str>,
+    strict: bool,
+) -> String {
     let mut notice = format!(
         "# Managed Session handoff\n\n- Session: {}\n- Run: {}\n- Recorded outcome: {}\n",
-        json!(outcome.target_session_id),
-        json!(outcome.run_id),
-        outcome.status.observer_status()
+        json!(target_id),
+        json!(run_id),
+        status.observer_status()
     );
     if let Some(reference) = reference {
         notice.push_str(&format!(
@@ -174,13 +245,12 @@ pub fn project_handoff_notice(
             json!(reference.message_id)
         ));
     }
-    let strict = format == ManagedRootHandoffFormat::StrictSummary;
     if let Some(summary) = reference
         .and(committed_text)
         .and_then(|text| WorkerSummary::parse(text, strict))
     {
         notice.push_str(&format!("- Worker summary: {}\n", json!(summary)));
-    } else if outcome.status == SupervisedRootOutcomeResult::Completed {
+    } else if *status == SupervisedRootOutcomeResult::Completed {
         notice.push_str("- Worker summary: unavailable\n");
     }
     notice.push_str(if strict {
@@ -213,12 +283,17 @@ pub fn is_internal_handoff(message: &Message) -> bool {
     message.role == Role::User
         && marker["id"].as_str() == Some(message.id.as_str())
         && marker["source"]["type"].as_str() == Some("runtime")
-        && marker["source"]["subsystem"].as_str() == Some("supervised_root_outcome")
         && marker["kind"].as_str() == Some("runtime_instruction")
         && marker["body"]["type"].as_str() == Some("runtime_instruction")
         && matches!(
-            marker["body"]["instruction"].as_str(),
-            Some("supervised_root_outcome_v1" | "managed_root_blocker_v1")
+            (
+                marker["source"]["subsystem"].as_str(),
+                marker["body"]["instruction"].as_str(),
+            ),
+            (
+                Some("supervised_root_outcome"),
+                Some("supervised_root_outcome_v1" | "managed_root_blocker_v1")
+            )
         )
 }
 
