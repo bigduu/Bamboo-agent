@@ -14,9 +14,9 @@ pub use handlers::{
 pub use types::{
     ActivateDiscoverableToolsRequest, CleanupRequest, CopySessionResponse, CreateSessionRequest,
     CreateSessionResponse, DiscoverableToolsResponse, GetSessionResponse, ListSessionsResponse,
-    PatchSessionRequest, RunningSessionEntry, RunningSessionsResponse, SessionCreateOperationError,
-    SessionCreateOperationResponse, SessionCreateOperationStatus, SessionSummary,
-    SessionSystemPromptResponse,
+    PatchSessionRequest, RunningSessionEntry, RunningSessionsResponse, SessionActivity,
+    SessionCreateOperationError, SessionCreateOperationResponse, SessionCreateOperationStatus,
+    SessionSummary, SessionSystemPromptResponse,
 };
 
 #[cfg(test)]

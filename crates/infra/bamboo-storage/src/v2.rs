@@ -973,6 +973,25 @@ fn normalized_project_id(session: &Session) -> Option<String> {
     }
 }
 
+/// Whether the session has yielded to a delegated child.
+///
+/// Read through the same typed-or-legacy path as the rest of the runtime state
+/// so a row written before the typed sidecar existed still mirrors correctly.
+fn session_waiting_for_children(session: &Session) -> bool {
+    session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.waiting_for_children.is_some())
+}
+
+/// Whether the session has yielded to a background shell whose result resumes it.
+fn session_waiting_for_bash(session: &Session) -> bool {
+    session
+        .agent_runtime_state
+        .as_ref()
+        .is_some_and(|state| state.waiting_for_bash.is_some())
+}
+
 /// Exactly the Session-owned inputs to PublicActorSnapshotNode, plus the
 /// authority scope that makes a cursor unsafe across Project/Root rebinding.
 /// Private transcript, model context and runtime heartbeats do not advance the
@@ -1118,6 +1137,19 @@ pub struct SessionIndexEntry {
     /// can display the question dialog badge without loading session.json.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// Whether this session has yielded to a delegated child, mirrored from
+    /// `session.agent_runtime_state.waiting_for_children`. A yielding Root stops
+    /// counting as a running runner, so without this mirror a list read cannot
+    /// tell "delegating" apart from "idle" — the two windows are the delegation
+    /// wait itself and the gap between the last child finishing and this Root
+    /// resuming. Only presence is mirrored; the awaited ids stay in session.json.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_children: bool,
+    /// Whether this session has yielded to a background shell, mirrored from
+    /// `session.agent_runtime_state.waiting_for_bash`. The shell's result resumes
+    /// the run, so the wait is live work even though no runner is executing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_bash: bool,
     /// Latest canonical Human UI engagement mark, mirrored from
     /// `session.agent_runtime_state.last_human_input`. Absent means no human
     /// input was admitted through the interactive route since creation. This is
@@ -5893,6 +5925,8 @@ impl SessionStoreV2 {
             message_count: session.messages.len(),
             has_attachments,
             has_pending_question: session.has_pending_question(),
+            waiting_for_children: session_waiting_for_children(session),
+            waiting_for_bash: session_waiting_for_bash(session),
             last_human_input,
             plan_mode,
             bypass_permissions,
