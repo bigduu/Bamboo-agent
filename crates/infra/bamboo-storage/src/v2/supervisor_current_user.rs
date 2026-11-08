@@ -39,13 +39,22 @@ impl SessionStoreV2 {
         T: Send + 'static,
         F: FnOnce(Option<&str>) -> io::Result<T> + Send + 'static,
     {
-        self.with_unscoped_supervisor_root_state(caller, supervisor, target, move |current| {
-            effect(current.workspace_path_meta().as_deref())
+        let authority = self
+            .lock_unscoped_supervisor_root(caller, supervisor, target)
+            .await?;
+        tokio::task::spawn_blocking(move || {
+            let workspace_path = authority.target.workspace_path_meta();
+            let result = effect(workspace_path.as_deref());
+            // Keep the physical locks alive for the complete blocking effect.
+            drop(authority);
+            result
         })
         .await
+        .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
     }
 
-    /// Run a Root-control effect against the canonical target under its retained guards.
+    /// Run an approval effect after re-reading both canonical Main sessions
+    /// under the original Supervisor, target and finite-scope fences.
     pub async fn with_unscoped_supervisor_root_state<T, F>(
         &self,
         caller: &bamboo_domain::SessionCallerReference,
@@ -55,20 +64,27 @@ impl SessionStoreV2 {
     ) -> io::Result<T>
     where
         T: Send + 'static,
-        F: FnOnce(&Session) -> io::Result<T> + Send + 'static,
+        F: FnOnce(&Session, &Session) -> io::Result<T> + Send + 'static,
     {
         let authority = self
             .lock_unscoped_supervisor_root(caller, supervisor, target)
             .await?;
+        let source = self
+            .peer_delivery_session(&caller.session_id, &caller.session_id)
+            .await?;
+        let current = self
+            .peer_delivery_session(&target.session_id, &target.session_id)
+            .await?;
+        if !caller.matches_session(&source) || !target.matches(&current) {
+            return Err(denied("Managed approval authority changed"));
+        }
         tokio::task::spawn_blocking(move || {
-            let result = effect(&authority.target);
-            // Capture the entire guard so aborting the async waiter cannot
-            // release its locks while the blocking effect is still running.
+            let result = effect(&source, &current);
             drop(authority);
             result
         })
         .await
-        .map_err(|error| io::Error::other(format!("Root control job failed: {error}")))?
+        .map_err(|error| io::Error::other(format!("Root approval job failed: {error}")))?
     }
 
     pub(crate) async fn lock_unscoped_supervisor_root(

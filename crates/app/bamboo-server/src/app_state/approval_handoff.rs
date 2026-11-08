@@ -3,9 +3,7 @@
 use std::sync::{Arc, OnceLock, Weak};
 
 use actix_web::web;
-use bamboo_domain::{
-    SessionActivationPolicy, SessionKind, SupervisorReference, DEFAULT_SUPERVISOR_SESSION_ID,
-};
+use bamboo_domain::{SessionActivationPolicy, SupervisorReference, DEFAULT_SUPERVISOR_SESSION_ID};
 use chrono::{DateTime, Utc};
 
 use crate::handlers::agent::respond::capture_approval_handoff;
@@ -49,7 +47,7 @@ pub(super) async fn sweep(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     use bamboo_orchestration::managed_session::{
-        approval::is_candidate, approval_handoff::select_candidates,
+        approval::classify_candidate, approval_handoff::select_candidates,
     };
 
     if state
@@ -65,14 +63,14 @@ pub(super) async fn sweep(
     let candidates = select_candidates(
         entries.into_iter().filter_map(|entry| {
             let eligible = entry.id != DEFAULT_SUPERVISOR_SESSION_ID
-                && (is_candidate(
+                && classify_candidate(
                     entry.kind,
                     entry.has_pending_question,
                     entry.session_origin.as_deref(),
-                    entry.pending_material_run.unwrap_or(false),
-                ) || (entry.kind == SessionKind::Root
-                    && entry.has_pending_question
-                    && entry.pending_material_run.is_none()));
+                    entry.pending_material_run,
+                    entry.material_notification_hint.is_some(),
+                )
+                .is_some();
             eligible.then_some(entry.id)
         }),
         after,

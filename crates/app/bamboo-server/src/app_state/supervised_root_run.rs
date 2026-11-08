@@ -340,6 +340,7 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
             .ok_or_else(|| ToolError::Execution("managed_approval_handoff_unavailable".into()))?;
         let result = crate::handlers::agent::respond::decide_delegated_approval(
             actix_web::web::Data::from(state),
+            &self.inbox,
             caller,
             target,
             reference,

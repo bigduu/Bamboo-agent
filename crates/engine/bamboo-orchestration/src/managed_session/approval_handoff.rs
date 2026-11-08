@@ -12,7 +12,8 @@ use bamboo_domain::{
 };
 use bamboo_permission::{
     config::canonicalize_path_for_matching, PermissionConfig, PermissionDecisionKind,
-    PermissionReasonCode, PermissionRequest, PermissionType, RiskLevel,
+    PermissionEvaluation, PermissionOutcome, PermissionReasonCode, PermissionRequest,
+    PermissionType, RiskLevel,
 };
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::{json, Value};
@@ -49,6 +50,7 @@ pub struct ApprovalHandoff {
     pub pending: PendingApproval,
     pub reference: String,
     pub due_at: DateTime<Utc>,
+    parked_at: DateTime<Utc>,
 }
 
 impl ApprovalHandoff {
@@ -58,6 +60,7 @@ impl ApprovalHandoff {
         request: &PermissionRequest,
         arguments: &Value,
         config: &PermissionConfig,
+        profile: &Path,
         enabled_since: DateTime<Utc>,
     ) -> Option<Self> {
         let pending = PendingApproval::capture(supervisor, target)?;
@@ -67,7 +70,7 @@ impl ApprovalHandoff {
             || Some(request.request_generation.as_str())
                 != pending.occurrence.permission_generation.as_deref()
             || request.policy_revision != config.policy_revision()
-            || !is_ordinary_workspace_edit(target, request, arguments)
+            || !is_ordinary_workspace_edit(target, request, arguments, profile)
             || config.requires_forced_confirmation(&request.tool_name, arguments)
         {
             return None;
@@ -100,7 +103,46 @@ impl ApprovalHandoff {
             pending,
             reference,
             due_at,
+            parked_at,
         })
+    }
+
+    pub fn allows_supervisor_control(
+        &self,
+        config: &PermissionConfig,
+        supervisor: &SupervisorReference,
+        target_session_id: &str,
+        decision: PermissionDecisionKind,
+    ) -> bool {
+        let tool_name = "session_control";
+        let tool_args = json!({
+            "action": "decide_approval",
+            "target_session_id": target_session_id,
+            "approval_reference": self.reference,
+            "decision": decision,
+        });
+        if !is_once(decision) || config.requires_forced_confirmation(tool_name, &tool_args) {
+            return false;
+        }
+        matches!(
+            config.evaluate(PermissionEvaluation {
+                request_id: self.reference.clone(),
+                session_id: supervisor.session_id.clone(),
+                workspace_path: config.session_workspace(&supervisor.session_id),
+                tool_name: tool_name.into(),
+                tool_args,
+                permission_type: PermissionType::ExecuteCommand,
+                resource: format!("session_control decide_approval {target_session_id}"),
+                operation_summary: "Resolve an overdue managed approval once".into(),
+                risk_level: RiskLevel::Medium,
+                bypass_requested: true,
+                auto_approve_requested: false,
+                platform_hard_deny: None,
+                consume_once: false,
+                supported_decisions: PermissionRequest::forced_decisions(),
+            }),
+            PermissionOutcome::Allow { .. },
+        )
     }
 
     pub fn notice(
@@ -147,7 +189,7 @@ impl ApprovalHandoff {
                     never_compress: false,
                 }),
             }),
-            created_at: self.due_at,
+            created_at: self.parked_at,
             thread_id: None,
             in_reply_to: None,
             attempt: None,
@@ -163,7 +205,12 @@ pub fn is_once(decision: PermissionDecisionKind) -> bool {
     )
 }
 
-fn is_ordinary_workspace_edit(target: &Session, request: &PermissionRequest, args: &Value) -> bool {
+fn is_ordinary_workspace_edit(
+    target: &Session,
+    request: &PermissionRequest,
+    args: &Value,
+    profile: &Path,
+) -> bool {
     // Authorization is intentionally limited to exact native single-file
     // edits. Shell, browser, network, deletion and remembered rules retain
     // their existing authority boundary.
@@ -195,6 +242,27 @@ fn is_ordinary_workspace_edit(target: &Session, request: &PermissionRequest, arg
         return false;
     };
     if workspace != requested_workspace || workspace.parent().is_none() {
+        return false;
+    }
+    let Ok(profile) = std::fs::canonicalize(profile) else {
+        return false;
+    };
+    let visible_workspace = if let Ok(relative) = workspace.strip_prefix(&profile) {
+        let mut components = relative.components();
+        match components.next() {
+            Some(Component::Normal(dir)) if dir == "workspaces" || dir == "worktrees" => {}
+            _ => return false,
+        }
+        if components.next().is_none() {
+            return false;
+        }
+        relative
+    } else {
+        workspace.as_path()
+    };
+    if visible_workspace.components().any(|component| {
+        matches!(component, Component::Normal(name) if name.to_string_lossy().starts_with('.'))
+    }) {
         return false;
     }
     let path = Path::new(file);

@@ -551,6 +551,7 @@ pub(crate) fn capture_approval_handoff(
         &request,
         &arguments,
         &config,
+        &state.app_data_dir,
         enabled_since,
     )?;
     Some((handoff, request))

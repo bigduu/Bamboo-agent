@@ -2189,7 +2189,15 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     config.publish_persistent_policy(snapshot.revision, snapshot.data.as_ref());
 
     let mut target = load(state, ROOT_A).await;
-    let workspace = std::fs::canonicalize(target.workspace_path_meta().unwrap()).unwrap();
+    let workspace = state
+        .app_data_dir
+        .join("workspaces")
+        .join("approval-fixture");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let workspace_name = bamboo_config::paths::path_to_display_string(&workspace);
+    target.workspace = Some(workspace_name.clone());
+    target.set_workspace_path_meta(workspace_name);
     let file = workspace.join("handoff-test.txt");
     let file = bamboo_config::paths::path_to_display_string(&file);
     let workspace = bamboo_config::paths::path_to_display_string(&workspace);
@@ -2212,7 +2220,7 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
         request_id: call.into(),
         request_generation: "write-handoff-generation".into(),
         session_id: target.id.clone(),
-        workspace_path: Some(workspace),
+        workspace_path: Some(workspace.clone()),
         tool_name: "Write".into(),
         permission_type: PermissionType::WriteFile,
         resource: file.clone(),
@@ -2257,10 +2265,32 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     let (fresh, request) = capture_approval_handoff(state, &f.reference, &reparked).unwrap();
     assert_eq!(fresh.due_at, now + DELAY);
     assert!(fresh.notice(&f.reference, &request, now).is_none());
+    let mut control = target.clone();
+    let git_dir = std::path::Path::new(&workspace).join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    let control_workspace = bamboo_config::paths::path_to_display_string(&git_dir);
+    control.set_workspace_path_meta(control_workspace.clone());
+    let mut control_request = current_request.clone();
+    control_request.workspace_path = Some(control_workspace);
+    control_request.resource =
+        bamboo_config::paths::path_to_display_string(&git_dir.join("config"));
+    assert!(
+        bamboo_orchestration::managed_session::approval_handoff::ApprovalHandoff::capture(
+            &f.reference,
+            &control,
+            &control_request,
+            &json!({"file_path":control_request.resource}),
+            &config,
+            &state.app_data_dir,
+            parked_at,
+        )
+        .is_none()
+    );
     let caller = SessionCallerReference::from(&load(state, &f.reference.session_id).await);
     let decision = |kind| {
         decide_delegated_approval(
             state.clone(),
+            &f.state.observer_subscriptions.inbox,
             &caller,
             ROOT_A.into(),
             &handoff.reference,
@@ -2313,6 +2343,11 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
 
     // Revalidation happens at the decision, even after a due notice exists.
     config.set_ask_rules(["Write".into()]);
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    config.set_ask_rules([format!(
+        r#"session_control(*"approval_reference":"{}"*)"#,
+        handoff.reference,
+    )]);
     assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
     config.set_ask_rules(Vec::new());
     assert!(decision(PermissionDecisionKind::AllowGlobal).await.is_err());
