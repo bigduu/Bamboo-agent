@@ -737,7 +737,7 @@ type ManagedHandoffProjection = fn(
     &bamboo_domain::ObserverSupervisedRootOutcome,
     Option<&bamboo_domain::RootFinalMessageReference>,
     Option<&str>,
-    bool,
+    bamboo_domain::ManagedRootHandoffFormat,
 ) -> String;
 
 /// Filesystem SessionInbox implementation. Clone/share one instance per
@@ -1474,7 +1474,7 @@ impl FileSessionInbox {
             input,
             now,
         );
-        let Some((fact, structured_handoff)) =
+        let Some((fact, format)) =
             root.runtime_metadata
                 .as_ref()
                 .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
@@ -1488,15 +1488,7 @@ impl FileSessionInbox {
                         admitted.receipt_id == input.receipt_id
                             && admitted.generation == input.generation
                     })?;
-                    let bamboo_domain::SupervisedRootOutcomeInputOrigin::LegacyOrCreatedRoot {
-                        notification_target: Some(_),
-                        structured_handoff,
-                        ..
-                    } = admitted.supervisor_origin.as_ref()?
-                    else {
-                        return None;
-                    };
-                    Some((fact, *structured_handoff))
+                    Some((fact, admitted.supervisor_origin.as_ref()?.handoff_format()?))
                 })
         else {
             return Ok(envelope);
@@ -1525,10 +1517,7 @@ impl FileSessionInbox {
             unreachable!("Root outcome envelope has a RuntimeInstruction")
         };
         instruction.content = Some(bamboo_domain::SessionMessageContent::text(project(
-            outcome,
-            reference,
-            content,
-            structured_handoff,
+            outcome, reference, content, format,
         )));
         if let (Some(data), Some(reference)) = (instruction.data.as_mut(), reference) {
             data["final_message"] = serde_json::json!(reference);
@@ -3048,7 +3037,9 @@ impl FileSessionInbox {
             caller: Some(caller.clone()),
             requires_host_scope,
             notification_target,
-            structured_handoff: notification_requested,
+            structured_handoff: false,
+            handoff_format: notification_requested
+                .then_some(bamboo_domain::ManagedRootHandoffFormat::WorkerSummary),
             target_created_at: target_birth,
             operation_id: operation,
         };

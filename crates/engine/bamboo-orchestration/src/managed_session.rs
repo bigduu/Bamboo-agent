@@ -8,7 +8,7 @@ use std::{future::Future, time::Duration};
 
 mod handoff;
 pub use handoff::{
-    is_internal_handoff, project_handoff_notice, worker_handoff_context,
+    is_internal_handoff, project_handoff_notice, worker_handoff_context, DISPATCH_CONFIRMATION,
     SUPERVISOR_HANDOFF_GUIDANCE,
 };
 

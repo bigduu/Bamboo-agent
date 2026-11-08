@@ -42,6 +42,15 @@ pub struct SupervisedRootOutcomeInput {
     pub supervisor_origin: Option<SupervisedRootOutcomeInputOrigin>,
 }
 
+/// Pinned at first admission so a reconciled notice keeps its original body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedRootHandoffFormat {
+    Excerpt,
+    StrictSummary,
+    WorkerSummary,
+}
+
 /// A retained observation, not a capability. Storage must capture it while
 /// the original caller/target guards are held and revalidate before use.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,9 +85,11 @@ pub enum SupervisedRootOutcomeInputOrigin {
         /// exact authority. Legacy admissions have no notification target.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_target: Option<SupervisorCurrentUserTarget>,
-        /// Chosen on the first admission. Replay retains the original notice bytes.
+        /// Retains the format used by the original strict summary receipts.
         #[serde(default, skip_serializing_if = "is_false")]
         structured_handoff: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        handoff_format: Option<ManagedRootHandoffFormat>,
         target_created_at: DateTime<Utc>,
         operation_id: SessionMessageId,
     },
@@ -112,6 +123,22 @@ impl SupervisedRootOutcomeInputOrigin {
                 ..
             }
         )
+    }
+
+    pub fn handoff_format(&self) -> Option<ManagedRootHandoffFormat> {
+        match self {
+            Self::LegacyOrCreatedRoot {
+                notification_target: Some(_),
+                structured_handoff,
+                handoff_format,
+                ..
+            } => Some(handoff_format.unwrap_or(if *structured_handoff {
+                ManagedRootHandoffFormat::StrictSummary
+            } else {
+                ManagedRootHandoffFormat::Excerpt
+            })),
+            _ => None,
+        }
     }
 
     pub fn current_user_target(&self) -> Option<&SupervisorCurrentUserTarget> {
@@ -249,10 +276,13 @@ impl SupervisedRootOutcomeInputOrigin {
                 target_created_at,
                 notification_target,
                 structured_handoff,
+                handoff_format,
                 ..
             } => {
                 *target_created_at == root_created_at
-                    && (!structured_handoff || notification_target.is_some())
+                    && (!structured_handoff || handoff_format.is_none())
+                    && ((!structured_handoff && handoff_format.is_none())
+                        || notification_target.is_some())
                     && notification_target.as_ref().is_none_or(matches_target)
                     && crate::supervisor_followup_message_id(
                         supervisor,
@@ -2300,6 +2330,7 @@ mod tests {
                             requires_host_scope: None,
                             notification_target: None,
                             structured_handoff: false,
+                            handoff_format: None,
                             target_created_at: birth,
                             operation_id: operation,
                         },

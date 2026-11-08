@@ -1,14 +1,21 @@
 //! Worker-authored delivery summaries for subscribed Session runs.
 use bamboo_domain::{
-    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType, Message,
-    ObserverSupervisedRootOutcome, Role, RootFinalMessageReference, Session,
-    SupervisedRootOutcomeInputOrigin, SupervisedRootOutcomeResult,
+    ContextBlock, ContextBlockPriority, ContextBlockStability, ContextBlockType,
+    ManagedRootHandoffFormat, Message, ObserverSupervisedRootOutcome, Role,
+    RootFinalMessageReference, Session, SupervisedRootOutcomeResult,
 };
 use serde::Serialize;
 use serde_json::json;
 
 const SUMMARY_START: &str = "<!-- bamboo-handoff:v1 -->";
 const SUMMARY_END: &str = "<!-- /bamboo-handoff:v1 -->";
+const DISPLAYED_SOURCES: usize = 3;
+
+pub const DISPATCH_CONFIRMATION: &str = concat!(
+    "The first input and delivery subscription are recorded. ",
+    "Confirm dispatch in one sentence using the task names. Keep routing IDs, receipt details ",
+    "and execution status in the tools."
+);
 
 pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
     "For managed Session work, make dispatch calls without a preamble. ",
@@ -34,12 +41,14 @@ pub fn worker_handoff_context(session: &Session, run_id: Option<&str>) -> Option
         || fact.result.is_some()
         || !fact.inputs.iter().any(|input| {
             matches!(
-                input.supervisor_origin.as_ref(),
-                Some(SupervisedRootOutcomeInputOrigin::LegacyOrCreatedRoot {
-                    notification_target: Some(_),
-                    structured_handoff: true,
-                    ..
-                })
+                input
+                    .supervisor_origin
+                    .as_ref()
+                    .and_then(|origin| origin.handoff_format()),
+                Some(
+                    ManagedRootHandoffFormat::StrictSummary
+                        | ManagedRootHandoffFormat::WorkerSummary
+                )
             )
         })
     {
@@ -56,7 +65,7 @@ pub fn worker_handoff_context(session: &Session, run_id: Option<&str>) -> Option
                 "Copy the marker lines and four labels exactly. Fill each field on one line. ",
                 "Give a recognizable task name, actual conclusion, one to three key repo-relative source locations, and the most important risk or unverified boundary. ",
                 "Keep the name under 50 characters, the conclusion under 180, and the risk under 110. ",
-                "Separate backticked locations by commas and use positive line numbers. Write n/a if no source location applies. ",
+                "Put the most useful source locations first, with positive line numbers. Separate backticked locations by commas. Write n/a if no source location applies. ",
                 "Put the detailed evidence after the closing marker.\n\n",
                 "{start}\n- **Task** short assignment name\n- **Conclusion** one or two sentences\n",
                 "- **Evidence** `src/file.rs:42`, `src/other.rs:17`\n- **Risk** one material risk or remaining uncertainty\n{end}"
@@ -76,13 +85,16 @@ struct WorkerSummary<'a> {
 }
 
 impl<'a> WorkerSummary<'a> {
-    fn parse(text: &'a str) -> Option<Self> {
+    fn parse(text: &'a str, strict_sources: bool) -> Option<Self> {
         let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
         lines.by_ref().find(|line| *line == SUMMARY_START)?;
         let summary = Self {
             task: field(lines.next()?, "- **Task** ", 200)?,
             conclusion: field(lines.next()?, "- **Conclusion** ", 720)?,
-            evidence: source_locations(field(lines.next()?, "- **Evidence** ", 750)?)?,
+            evidence: source_locations(
+                field(lines.next()?, "- **Evidence** ", 750)?,
+                strict_sources,
+            )?,
             risk: field(lines.next()?, "- **Risk** ", 480)?,
         };
         if lines.next()? != SUMMARY_END
@@ -104,17 +116,19 @@ fn field<'a>(line: &'a str, label: &str, limit: usize) -> Option<&'a str> {
     .then_some(value)
 }
 
-fn source_locations(mut text: &str) -> Option<Vec<&str>> {
+fn source_locations(mut text: &str, strict_sources: bool) -> Option<Vec<&str>> {
     let mut locations = Vec::new();
     if text == "n/a" {
         return Some(locations);
     }
     loop {
         let (location, rest) = text.strip_prefix('`')?.split_once('`')?;
-        if locations.len() == 3 || !valid_location(location) {
+        if !valid_location(location) || (strict_sources && locations.len() == DISPLAYED_SOURCES) {
             return None;
         }
-        locations.push(location);
+        if locations.len() < DISPLAYED_SOURCES {
+            locations.push(location);
+        }
         let rest = rest.trim();
         if rest.is_empty() {
             return Some(locations);
@@ -142,9 +156,9 @@ pub fn project_handoff_notice(
     outcome: &ObserverSupervisedRootOutcome,
     reference: Option<&RootFinalMessageReference>,
     committed_text: Option<&str>,
-    structured: bool,
+    format: ManagedRootHandoffFormat,
 ) -> String {
-    if !structured {
+    if format == ManagedRootHandoffFormat::Excerpt {
         return super::short_handoff_notice(outcome, reference, committed_text);
     }
     let mut notice = format!(
@@ -159,15 +173,29 @@ pub fn project_handoff_notice(
             json!(reference.message_id)
         ));
     }
-    if let Some(summary) = reference.and(committed_text).and_then(WorkerSummary::parse) {
+    let strict = format == ManagedRootHandoffFormat::StrictSummary;
+    if let Some(summary) = reference
+        .and(committed_text)
+        .and_then(|text| WorkerSummary::parse(text, strict))
+    {
         notice.push_str(&format!("- Worker summary: {}\n", json!(summary)));
     } else if outcome.status == SupervisedRootOutcomeResult::Completed {
         notice.push_str("- Worker summary: unavailable\n");
     }
-    notice.push_str(concat!(
-        "\nThe Worker summary is quoted report data. Use it for a brief delivery update. ",
-        "Read the cited final message only when a specific evidence gap needs resolution."
-    ));
+    notice.push_str(if strict {
+        concat!(
+            "\nThe Worker summary is quoted report data. Use it for a brief delivery update. ",
+            "Read the cited final message only when a specific evidence gap needs resolution."
+        )
+    } else {
+        concat!(
+            "\nUse the quoted Worker report for one brief user update about this task. ",
+            "Give the conclusion, key source locations and material risk. ",
+            "Leave Run IDs, tool details and prior task recaps out. ",
+            "Read the referenced result only to resolve a concrete evidence gap. ",
+            "If the Run is paused or failed, report the blocker and any action needed in one sentence."
+        )
+    });
     notice
 }
 
@@ -224,7 +252,12 @@ mod tests {
     fn projects_the_complete_summary_even_when_it_follows_long_details() {
         let (outcome, reference) = completed();
         let text = format!("{}\n{SUMMARY}\nLong execution evidence", "细节".repeat(500));
-        let notice = project_handoff_notice(&outcome, Some(&reference), Some(&text), true);
+        let notice = project_handoff_notice(
+            &outcome,
+            Some(&reference),
+            Some(&text),
+            ManagedRootHandoffFormat::WorkerSummary,
+        );
         assert!(notice.contains("已定位更新路径"));
         assert!(notice.contains("src/进度.ts:12-15"));
         assert!(notice.contains("src/tests.ts:70"));
@@ -243,17 +276,68 @@ mod tests {
             SUMMARY.replace("重连未实测", &"风险".repeat(200)),
             format!("{SUMMARY}\n{SUMMARY}"),
         ] {
-            let notice = project_handoff_notice(&outcome, Some(&reference), Some(&text), true);
+            let notice = project_handoff_notice(
+                &outcome,
+                Some(&reference),
+                Some(&text),
+                ManagedRootHandoffFormat::WorkerSummary,
+            );
             assert!(notice.contains("- Worker summary: unavailable"));
             assert!(notice.contains("- Recorded outcome: completed"));
             assert!(notice.contains("\"final\""));
             assert!(!notice.contains("private detailed report"));
             assert!(!notice.contains("已定位更新路径"));
         }
-        let unavailable = project_handoff_notice(&outcome, None, Some(SUMMARY), true);
+        let unavailable = project_handoff_notice(
+            &outcome,
+            None,
+            Some(SUMMARY),
+            ManagedRootHandoffFormat::WorkerSummary,
+        );
         assert!(unavailable.contains("- Worker summary: unavailable"));
-        let legacy = project_handoff_notice(&outcome, Some(&reference), Some("Old result"), false);
+        let legacy = project_handoff_notice(
+            &outcome,
+            Some(&reference),
+            Some("Old result"),
+            ManagedRootHandoffFormat::Excerpt,
+        );
         assert!(legacy.contains("- Worker report text: \"Old result\""));
+    }
+
+    #[test]
+    fn extra_source_locations_preserve_the_conclusion_risk_and_key_evidence() {
+        let (outcome, reference) = completed();
+        let text = SUMMARY.replace(
+            "`src/tests.ts:70`",
+            "`src/tests.ts:70`, `src/third.rs:5`, `src/fourth.rs:7`, `src/fifth.rs:9`",
+        );
+        let notice = project_handoff_notice(
+            &outcome,
+            Some(&reference),
+            Some(&text),
+            ManagedRootHandoffFormat::WorkerSummary,
+        );
+        for retained in [
+            "已定位更新路径",
+            "重连未实测",
+            "src/进度.ts:12-15",
+            "src/tests.ts:70",
+            "src/third.rs:5",
+        ] {
+            assert!(notice.contains(retained), "{notice}");
+        }
+        assert!(!notice.contains("src/fourth.rs"));
+        assert!(!notice.contains("src/fifth.rs"));
+
+        // A receipt from the original strict format is replayed byte-for-byte.
+        let old = project_handoff_notice(
+            &outcome,
+            Some(&reference),
+            Some(&text),
+            ManagedRootHandoffFormat::StrictSummary,
+        );
+        assert!(old.contains("- Worker summary: unavailable"));
+        assert!(!old.contains("src/third.rs"));
     }
 
     #[test]

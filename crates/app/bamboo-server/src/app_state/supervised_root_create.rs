@@ -636,6 +636,14 @@ fn completed(
     }
     if request.notify_on_material_event {
         response["notify_on_material_event"] = json!(true);
+        if !replayed
+            && matches!(
+                delivery.activation.as_str(),
+                "active_notified" | "activation_reserved" | "activation_coalesced"
+            )
+        {
+            response["note"] = json!(bamboo_orchestration::managed_session::DISPATCH_CONFIRMATION);
+        }
         if let Ok(reference) = bamboo_domain::SupervisorCurrentUserTarget::capture(target) {
             response["current_user_target"] = json!(reference);
         }

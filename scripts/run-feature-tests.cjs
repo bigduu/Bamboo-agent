@@ -179,7 +179,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2611 keeps Local Read retry-window and strict Remote whole-read cases in
 // default Engine, plus the >64-page native fixture in its default Agent owner.
 // No feature declaration, additive context or twenty-case selection changes.
-const FEATURE_SOURCE_SHA256 = "b8f7cec33fd1d5d485103726a6f21d77151c2bc48aed7b99cae73ce83288d212";
+const FEATURE_SOURCE_SHA256 = "72c11b5d27fd2fa9517c5bc22c21d5e130f294959d0f708eefaa9f4452294a32";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature
