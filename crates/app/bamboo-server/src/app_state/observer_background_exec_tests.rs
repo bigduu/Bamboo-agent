@@ -7,7 +7,7 @@ const OUTPUT: &str = "managed-background-exec-finished";
 const RELEASE_FILE: &str = "managed-exec-release";
 const CRASH_STAGE: &str = "after-native-exec-final";
 const MARKER_ENV: &str = "BAMBOO_2662_MARKER";
-const TEST_NAME: &str = "app_state::observer_subscriptions::tests::background_exec::subscribed_background_exec_delivers_once_after_owned_host_restart";
+const TEST_NAME: &str = "app_state::supervised_root_run::tests::subscribed_background_exec_delivers_once_after_owned_host_restart";
 
 struct ReleaseGate(std::path::PathBuf);
 
@@ -215,8 +215,7 @@ async fn worker_before_delivery() {
     drop(f);
 }
 
-#[actix_web::test]
-async fn subscribed_background_exec_delivers_once_after_owned_host_restart() {
+pub(in crate::app_state) async fn exercise_background_exec_handoff() {
     if std::env::var(CRASH_WORKER_ENV).as_deref() == Ok(CRASH_STAGE) {
         worker_before_delivery().await;
         return;
