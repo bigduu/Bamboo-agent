@@ -946,6 +946,7 @@ pub fn repark_permission_replay(
         "runtime.suspend_reason".to_string(),
         "awaiting_clarification".to_string(),
     );
+    session.set_last_run_status("suspended");
     Ok(Some(ReparkedPermissionApproval {
         question,
         options,

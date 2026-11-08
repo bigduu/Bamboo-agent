@@ -487,6 +487,14 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn subscribed_creation_wakes_supervisor_after_two_permissions_on_one_tool_call() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(Some(
+            PermissionDecisionKind::AllowSession,
+        ))
+        .await;
+    }
+
+    #[actix_web::test]
     async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
         super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
     }

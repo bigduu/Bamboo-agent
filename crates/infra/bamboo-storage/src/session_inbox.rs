@@ -15,7 +15,7 @@ use bamboo_domain::{
     SessionActivationPolicy, SessionInboxActivationIntent, SessionInboxBacklog, SessionInboxClaim,
     SessionInboxDeliveryReceipt, SessionInboxError, SessionInboxLimits, SessionInboxPort,
     SessionInboxReceipt, SessionMessageDeliveryIntent, SessionMessageEnvelope, SessionMessageId,
-    SessionMessageSource, SESSION_FOLLOWUP_INSTRUCTION, SESSION_FOLLOWUP_SUBSYSTEM,
+    SessionMessageSource,
 };
 use bamboo_subagent::{AgentRef, InboxKind, InboxMessage, Mailbox, MsgId};
 use base64::Engine;

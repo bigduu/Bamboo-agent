@@ -675,10 +675,10 @@ impl SupervisedRootOutcomeFact {
         input: &SupervisedRootOutcomeInput,
     ) -> Option<ManagedRootHandoffFormat> {
         let origin = input.supervisor_origin.as_ref()?;
-        origin.handoff_format().or_else(|| {
-            (self.resumed_from.is_some() && origin.material_notifications_requested())
-                .then_some(ManagedRootHandoffFormat::WorkerSummary)
-        })
+        if self.resumed_from.is_some() && origin.material_notifications_requested() {
+            return Some(ManagedRootHandoffFormat::PresentationSummary);
+        }
+        origin.handoff_format()
     }
 
     pub fn verified_final_message<'a>(

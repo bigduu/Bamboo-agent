@@ -38,6 +38,8 @@ const PRIVATE: &str = "SOURCE_PRIVATE_TRANSCRIPT";
 const SUBSCRIBED_FIRST_INPUT: &str = "Produce a short first-input handoff.";
 const SUBSCRIBED_PERMISSION_INPUT: &str = "Produce a handoff after the gated command.";
 const SUBSCRIBED_DENY_INPUT: &str = "Produce a handoff if the gated command is declined.";
+const SUBSCRIBED_BATCH_INPUT: &str = "Produce a handoff after the two scoped approvals.";
+const HANDOFF_BATCH_RESOURCES: [&str; 2] = ["docker compose up -d", "registry.example.com"];
 const HANDOFF_PERMISSION_CALL: &str = "handoff-permission-command";
 const HANDOFF_COMMAND_OUTPUT: &str = "handoff-approval-executed";
 const HANDOFF_HEAD: &str = "The independent task verified the requested source.";
@@ -196,13 +198,17 @@ impl LLMProvider for Probe {
         _: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
-        if messages.iter().any(|message| {
+        let subscribed_input = messages.iter().rev().find(|message| {
             message.role == bamboo_domain::Role::User
                 && matches!(
                     message.content.as_str(),
-                    SUBSCRIBED_FIRST_INPUT | SUBSCRIBED_PERMISSION_INPUT | SUBSCRIBED_DENY_INPUT
+                    SUBSCRIBED_FIRST_INPUT
+                        | SUBSCRIBED_PERMISSION_INPUT
+                        | SUBSCRIBED_DENY_INPUT
+                        | SUBSCRIBED_BATCH_INPUT
                 )
-        }) {
+        });
+        if let Some(input) = subscribed_input.map(|message| message.content.as_str()) {
             assert!(
                 messages.iter().any(|message| {
                     message.content.contains("Managed Session Delivery Summary")
@@ -214,31 +220,55 @@ impl LLMProvider for Probe {
                 self.source_entered[0].notify_one();
                 self.source_release[0].notified().await;
             }
-            let result = messages
-                .iter()
-                .find(|message| message.tool_call_id.as_deref() == Some(HANDOFF_PERMISSION_CALL));
-            if let Some(result) = result {
-                let denied = messages
-                    .iter()
-                    .any(|message| message.content == SUBSCRIBED_DENY_INPUT);
-                assert_eq!(
-                    result.content.contains(HANDOFF_COMMAND_OUTPUT),
-                    !denied,
-                    "unexpected gated command result: {}",
-                    result.content
-                );
-            } else {
-                return Ok(Box::pin(futures::stream::iter([
-                    Ok(LLMChunk::ToolCalls(vec![ToolCall {
-                        id: HANDOFF_PERMISSION_CALL.into(),
-                        tool_type: "function".into(),
-                        function: FunctionCall {
-                            name: "exec_command".into(),
-                            arguments: json!({"cmd": format!("pwd && printf '%s\\n' {HANDOFF_COMMAND_OUTPUT}")}).to_string(),
-                        },
-                    }])),
-                    Ok(LLMChunk::Done),
-                ])));
+            if input != SUBSCRIBED_FIRST_INPUT {
+                let result = messages.iter().find(|message| {
+                    message.tool_call_id.as_deref() == Some(HANDOFF_PERMISSION_CALL)
+                });
+                if let Some(result) = result {
+                    if input == SUBSCRIBED_BATCH_INPUT {
+                        let payload: Value = serde_json::from_str(&result.content).unwrap();
+                        assert_eq!(payload["status"], "permissions_authorized");
+                        assert_eq!(payload["permissions"].as_array().unwrap().len(), 2);
+                    } else {
+                        assert_eq!(
+                            result.content.contains(HANDOFF_COMMAND_OUTPUT),
+                            input != SUBSCRIBED_DENY_INPUT,
+                            "unexpected gated command result: {}",
+                            result.content
+                        );
+                    }
+                } else {
+                    let (name, arguments) = if input == SUBSCRIBED_BATCH_INPUT {
+                        (
+                            "request_permissions",
+                            json!({
+                                "reason": "Validate two scoped approvals",
+                                "permissions": [
+                                    {"type":"execute_command","resource":HANDOFF_BATCH_RESOURCES[0]},
+                                    {"type":"http_request","resource":HANDOFF_BATCH_RESOURCES[1]},
+                                ],
+                            }),
+                        )
+                    } else {
+                        (
+                            "exec_command",
+                            json!({
+                                "cmd": format!("pwd && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
+                            }),
+                        )
+                    };
+                    return Ok(Box::pin(futures::stream::iter([
+                        Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                            id: HANDOFF_PERMISSION_CALL.into(),
+                            tool_type: "function".into(),
+                            function: FunctionCall {
+                                name: name.into(),
+                                arguments: arguments.to_string(),
+                            },
+                        }])),
+                        Ok(LLMChunk::Done),
+                    ])));
+                }
             }
             let answer = format!(
                 "{}\n<!-- bamboo-handoff:v1 -->\n- **Task** Verify fixture\n- **Conclusion** {HANDOFF_HEAD}\n- **Evidence** `{HANDOFF_EVIDENCE}`\n- **Risk** {HANDOFF_RISK}\n<!-- /bamboo-handoff:v1 -->\n{HANDOFF_TAIL}",
@@ -1598,7 +1628,8 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         .unwrap();
     let permissions = f.state.permission_checker.permission_config().unwrap();
     permissions.set_default_session_permission_mode(SessionPermissionMode::Auto);
-    if decision.is_some() {
+    let batch = decision == Some(PermissionDecisionKind::AllowSession);
+    if decision.is_some() && !batch {
         permissions.set_ask_rules(["exec_command".into()]);
     }
     permissions
@@ -1623,8 +1654,9 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             "message":match decision {
                 Some(PermissionDecisionKind::AllowOnce) => SUBSCRIBED_PERMISSION_INPUT,
                 Some(PermissionDecisionKind::DenyOnce) => SUBSCRIBED_DENY_INPUT,
+                Some(PermissionDecisionKind::AllowSession) => SUBSCRIBED_BATCH_INPUT,
                 None => SUBSCRIBED_FIRST_INPUT,
-                _ => unreachable!("fixture uses one-shot decisions"),
+                _ => unreachable!("fixture uses the supported test decisions"),
             },
             "notify_on_material_event":true,
         }
@@ -1682,61 +1714,101 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     drive_material_notices(&f, 3).await;
     settle_material_notices(&f).await;
     let expected_calls = if let Some(decision) = decision {
-        let suspended = load(&f.state, target).await;
-        let occurrence = bamboo_domain::pending_permission_occurrence(&suspended).unwrap();
-        assert_eq!(occurrence.tool_call_id, HANDOFF_PERMISSION_CALL);
-        let pending = crate::handlers::agent::respond::get_pending_question(
-            f.state.clone(),
-            web::Path::from(target.to_string()),
-        )
-        .await
-        .unwrap();
-        assert_eq!(pending.status(), StatusCode::OK);
-        let pending: Value = serde_json::from_slice(
-            &actix_web::body::to_bytes(pending.into_body())
-                .await
-                .unwrap(),
-        )
-        .unwrap();
-        let request = &pending["permission_request"];
-        assert_eq!(request["request_id"], occurrence.tool_call_id);
-        assert_eq!(
-            request["request_generation"],
-            json!(occurrence.permission_generation)
-        );
-        let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
-        assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
-        assert!(request["operation_summary"]
-            .as_str()
-            .unwrap()
-            .contains(command));
-        let action = if decision == PermissionDecisionKind::AllowOnce {
-            "allow_once"
-        } else {
-            "deny_once"
-        };
-        let response = crate::handlers::agent::respond::submit_permission_decision(
-            f.state.clone(),
-            web::Path::from(target.to_string()),
-            web::Json(
-                serde_json::from_value(json!({
-                    "request_id": request["request_id"],
-                    "request_generation": request["request_generation"],
-                    "expected_policy_revision": request["policy_revision"],
-                    "decision": action,
-                }))
-                .unwrap(),
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = actix_web::body::to_bytes(response.into_body())
+        let mut previous = None;
+        for index in 0..if batch { 2 } else { 1 } {
+            let suspended = tokio::time::timeout(WAIT, async {
+                loop {
+                    let current = load(&f.state, target).await;
+                    if let Some(occurrence) = bamboo_domain::pending_permission_occurrence(&current)
+                        .filter(|occurrence| previous.as_ref() != Some(occurrence))
+                    {
+                        if f.state
+                            .session_activation_router
+                            .current_run_id(target)
+                            .await
+                            .is_none()
+                        {
+                            break (current, occurrence);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("next typed permission occurrence must park");
+            let (root, occurrence) = suspended;
+            assert_eq!(occurrence.tool_call_id, HANDOFF_PERMISSION_CALL);
+            let facts = &root
+                .runtime_metadata
+                .as_ref()
+                .unwrap()
+                .supervised_root_outcomes
+                .as_ref()
+                .unwrap()
+                .facts;
+            let parked = facts.last().unwrap();
+            assert_eq!(
+                parked.result,
+                Some(bamboo_domain::SupervisedRootOutcomeResult::Suspended)
+            );
+            assert_eq!(parked.questions.len(), 1);
+            assert_eq!(parked.resumed_from, (index > 0).then_some(index as u64));
+            let pending = crate::handlers::agent::respond::get_pending_question(
+                f.state.clone(),
+                web::Path::from(target.to_string()),
+            )
             .await
             .unwrap();
-        let receipt: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(receipt["auto_resume_status"], "started");
-        assert_eq!(receipt["receipt"]["decision"]["decision"], action);
+            assert_eq!(pending.status(), StatusCode::OK);
+            let pending: Value = serde_json::from_slice(
+                &actix_web::body::to_bytes(pending.into_body())
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let request = &pending["permission_request"];
+            assert_eq!(request["request_id"], occurrence.tool_call_id);
+            assert_eq!(
+                request["request_generation"],
+                json!(occurrence.permission_generation)
+            );
+            let matcher_id = if batch {
+                assert_eq!(request["resource"], HANDOFF_BATCH_RESOURCES[index]);
+                request["suggested_matchers"][0]["id"].as_str()
+            } else {
+                let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
+                assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
+                assert!(request["operation_summary"]
+                    .as_str()
+                    .unwrap()
+                    .contains(command));
+                None
+            };
+            let response = crate::handlers::agent::respond::submit_permission_decision(
+                f.state.clone(),
+                web::Path::from(target.to_string()),
+                web::Json(
+                    serde_json::from_value(json!({
+                        "request_id": request["request_id"],
+                        "request_generation": request["request_generation"],
+                        "expected_policy_revision": request["policy_revision"],
+                        "decision": decision,
+                        "matcher_id": matcher_id,
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            let receipt: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(receipt["auto_resume_status"], "started");
+            assert_eq!(receipt["receipt"]["decision"]["decision"], json!(decision));
+            previous = Some(occurrence);
+        }
         drive_material_notices(&f, 4).await;
         settle_material_notices(&f).await;
         4
@@ -1752,7 +1824,10 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .effective_permission_mode(),
         SessionPermissionMode::Default
     );
-    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        f.probe.source_calls.load(Ordering::SeqCst),
+        if decision.is_some() { 2 } else { 1 },
+    );
     let facts = worker
         .runtime_metadata
         .as_ref()
@@ -1762,13 +1837,16 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         .unwrap();
     let fact = facts.facts.last().unwrap();
     if decision.is_some() {
-        let [suspended, resumed] = facts.facts.as_slice() else {
-            panic!("expected the suspended Run and its resumed Run");
-        };
-        assert_ne!(suspended.run_id, resumed.run_id);
-        assert_eq!(resumed.resumed_from, Some(suspended.sequence));
-        assert!(resumed.inputs.is_empty());
-        assert_eq!(suspended.questions.len(), 1);
+        assert_eq!(facts.facts.len(), if batch { 3 } else { 2 });
+        for pair in facts.facts.windows(2) {
+            let [suspended, resumed] = pair else {
+                unreachable!()
+            };
+            assert_ne!(suspended.run_id, resumed.run_id);
+            assert_eq!(resumed.resumed_from, Some(suspended.sequence));
+            assert!(resumed.inputs.is_empty());
+            assert_eq!(suspended.questions.len(), 1);
+        }
     } else {
         assert_eq!(facts.facts.len(), 1);
         assert_eq!(fact.inputs.len(), 1);
@@ -1805,6 +1883,37 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         .iter()
         .any(|message| message.id == notice.id && message.content == notice.content));
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
+    if decision.is_some() {
+        let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.run_id == fact.run_id)
+            .unwrap();
+        let response = crate::handlers::agent::messages::patch_message(
+            f.state.clone(),
+            web::Path::from((target.to_string(), reference.message_id.clone())),
+            web::Json(crate::handlers::agent::messages::PatchMessageRequest {
+                content: "Edited result after delivery".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(fact
+            .verified_final_message(&load(&f.state, target).await)
+            .is_none());
+        let replayed = f
+            .state
+            .observer_subscriptions
+            .inbox
+            .deliver_managed_root_notification(&selected, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.delivery.id.as_str(), notice.id);
+        assert!(!replayed.pending);
+        assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
+    }
     if decision.is_none() {
         assert_eq!(
             fact.inputs[0]
