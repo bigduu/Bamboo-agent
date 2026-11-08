@@ -1522,6 +1522,25 @@ impl FileSessionInbox {
         allow_terminal: bool,
     ) -> Result<(SessionMessageEnvelope, Option<SessionInboxActivationIntent>), SessionInboxError>
     {
+        self.locked_owned_claim_with_message_policy(dir, target, claim, now, allow_terminal)
+            .map(|(envelope, intent, _)| (envelope, intent))
+    }
+
+    pub(crate) fn locked_owned_claim_with_message_policy(
+        &self,
+        dir: &Path,
+        target: &str,
+        claim: &SessionInboxOwnedClaim,
+        now: DateTime<Utc>,
+        allow_terminal: bool,
+    ) -> Result<
+        (
+            SessionMessageEnvelope,
+            Option<SessionInboxActivationIntent>,
+            Option<SessionActivationPolicy>,
+        ),
+        SessionInboxError,
+    > {
         use std::io::Read;
         let storage = |error: std::io::Error| SessionInboxError::Storage(error.to_string());
         let read = |path: &Path| -> Result<Vec<u8>, SessionInboxError> {
@@ -1557,6 +1576,10 @@ impl FileSessionInbox {
         let stored = stored.ok_or_else(|| invalid("Inbox lease missing"))?;
         let intent = Self::activation_intent(&wrapper.body)?;
         let activation_intent = Self::message_activation_intent(&wrapper.body)?;
+        let message_policy = activation_intent
+            .as_ref()
+            .map(|intent| intent.policy())
+            .transpose()?;
         if !stored.same_identity(&claim.lease)
             || stored.policy != claim.claim.activation_policy
             || stored.token.expires_at <= now
@@ -1585,7 +1608,7 @@ impl FileSessionInbox {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(SessionInboxError::Storage(error.to_string())),
         }
-        Ok((actual.claim.envelope, intent))
+        Ok((actual.claim.envelope, intent, message_policy))
     }
 
     async fn current_owned(

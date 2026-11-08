@@ -546,4 +546,10 @@ mod tests {
     async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_after_restart() {
         super::super::observer_subscriptions::tests::exercise_managed_wait_outcomes().await;
     }
+
+    #[actix_web::test]
+    async fn subscribed_background_exec_delivers_once_after_owned_host_restart() {
+        super::super::observer_subscriptions::tests::background_exec::exercise_background_exec_handoff()
+            .await;
+    }
 }
