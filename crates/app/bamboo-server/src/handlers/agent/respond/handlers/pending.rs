@@ -427,10 +427,10 @@ pub async fn list_supervisor_approval_cards(
     state: web::Data<AppState>,
     request: HttpRequest,
 ) -> Result<HttpResponse> {
-    use bamboo_domain::{SessionKind, SupervisorReference, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_domain::{SupervisorReference, DEFAULT_SUPERVISOR_SESSION_ID};
     use bamboo_orchestration::managed_session::approval::{
-        is_candidate, legacy_candidate_limit, PendingApproval, MAX_APPROVAL_CANDIDATES,
-        MAX_APPROVAL_CARDS,
+        classify_candidate, legacy_candidate_limit, ApprovalCandidate, PendingApproval,
+        MAX_APPROVAL_CANDIDATES, MAX_APPROVAL_CARDS,
     };
 
     crate::handlers::agent::tickets::user(&state, &request)
@@ -449,19 +449,22 @@ pub async fn list_supervisor_approval_cards(
     let mut approvals = Vec::new();
     if let Some(supervisor) = supervisor {
         let candidate = |entry: &bamboo_storage::SessionIndexEntry| {
-            entry.id != supervisor.session_id
-                && is_candidate(
-                    entry.kind,
-                    entry.has_pending_question,
-                    entry.session_origin.as_deref(),
-                    entry
-                        .pending_material_run
-                        .unwrap_or(entry.material_notification_hint.is_some()),
-                )
+            if entry.id == supervisor.session_id {
+                return None;
+            }
+            classify_candidate(
+                entry.kind,
+                entry.has_pending_question,
+                entry.session_origin.as_deref(),
+                entry.pending_material_run,
+                entry.material_notification_hint.is_some(),
+            )
         };
         let mut entries = state
             .session_store
-            .recent_index_entries_matching(MAX_APPROVAL_CANDIDATES, candidate)
+            .recent_index_entries_matching(MAX_APPROVAL_CANDIDATES, |entry| {
+                candidate(entry) == Some(ApprovalCandidate::Managed)
+            })
             .await;
         let legacy_limit = legacy_candidate_limit(entries.len());
         if legacy_limit != 0 {
@@ -469,11 +472,7 @@ pub async fn list_supervisor_approval_cards(
                 state
                     .session_store
                     .recent_index_entries_matching(legacy_limit, |entry| {
-                        entry.id != supervisor.session_id
-                            && entry.kind == SessionKind::Root
-                            && entry.has_pending_question
-                            && entry.pending_material_run.is_none()
-                            && !candidate(entry)
+                        candidate(entry) == Some(ApprovalCandidate::Legacy)
                     })
                     .await,
             );
@@ -505,6 +504,7 @@ pub async fn list_supervisor_approval_cards(
                     "session_id": session.id,
                     "created_at": session.created_at,
                     "title": session.title,
+                    "workspace_path": session.workspace_path_meta(),
                     "pending": pending,
                 }));
                 if approvals.len() == MAX_APPROVAL_CARDS {

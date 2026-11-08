@@ -259,7 +259,7 @@ impl LLMProvider for Probe {
                         (
                             "exec_command",
                             json!({
-                                "cmd": format!("pwd && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
+                                "cmd": format!("pwd -P && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
                             }),
                         )
                     };
@@ -1845,6 +1845,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             assert_eq!(card["session_id"], target);
             assert_eq!(card["created_at"], json!(root.created_at));
             assert_eq!(card["title"], "Subscribed dispatch");
+            assert_eq!(card["workspace_path"], workspace);
             let pending = &card["pending"];
             let request = &pending["permission_request"];
             assert_eq!(request["request_id"], occurrence.tool_call_id);
@@ -1856,7 +1857,6 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
                 assert_eq!(request["resource"], HANDOFF_BATCH_RESOURCES[index]);
                 request["suggested_matchers"][0]["id"].as_str()
             } else {
-                assert_eq!(request["workspace_path"], workspace);
                 assert_eq!(request["reason_code"], "configured_always_ask");
                 let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
                 assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
@@ -1916,6 +1916,17 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         3
     };
     let worker = load(&f.state, target).await;
+    if decision == Some(PermissionDecisionKind::AllowOnce) {
+        let result = worker
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(HANDOFF_PERMISSION_CALL))
+            .expect("approved command result");
+        let result: Value = serde_json::from_str(&result.content).expect("structured exec result");
+        assert_eq!(result["exit_code"], 0);
+        let output = result["output"].as_str().unwrap();
+        assert_eq!(output.lines().next(), Some(workspace.as_str()));
+    }
     assert_eq!(
         worker
             .agent_runtime_state
