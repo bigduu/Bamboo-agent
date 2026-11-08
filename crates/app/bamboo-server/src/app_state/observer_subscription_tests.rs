@@ -1682,39 +1682,48 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff() {
         .any(|message| message.id == notice.id && message.content == notice.content));
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 3);
 
-    // An admitted handoff can be retried after the worker's history is edited.
-    // The model presentation may no longer verify, but the durable receipt
-    // must still identify the same result and must never schedule a second turn.
+    let mut projected_replay: bamboo_domain::SessionMessageEnvelope =
+        serde_json::from_value(notice.metadata.as_ref().unwrap()["session_message"].clone())
+            .unwrap();
+    let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) =
+        &mut projected_replay.body
+    else {
+        panic!("handoff must be a typed runtime instruction");
+    };
+    assert_eq!(
+        instruction.data.as_ref().unwrap()["final_message"],
+        json!(reference)
+    );
+    assert!(!instruction
+        .content
+        .as_ref()
+        .unwrap()
+        .text
+        .contains(HANDOFF_HEAD));
+    let presentation = instruction.provider_message.as_mut().unwrap();
+    assert_eq!(presentation.content.text, notice.content);
+    presentation.content.text = "The Worker final message is unavailable.".into();
+
+    // Replay the original notice through its production delivery path. The
+    // permanent receipt also proves that a changed presentation keeps its ID.
     let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)
         .unwrap()
         .pop()
         .unwrap();
-    let final_message_id = reference.message_id.clone();
-    let mut worker = worker;
-    worker
-        .messages
-        .retain(|message| message.id != final_message_id);
-    worker.clear_derived_context_state();
-    f.state
-        .persistence
-        .merge_save_runtime(&mut worker)
-        .await
-        .unwrap();
-    let edited = load(&f.state, target).await;
-    assert!(edited
-        .messages
-        .iter()
-        .all(|message| message.id != final_message_id));
-    let retry = f
-        .state
-        .observer_subscriptions
-        .inbox
+    let inbox = &f.state.observer_subscriptions.inbox;
+    let retry = inbox
         .deliver_managed_root_notification(&selected, Utc::now())
         .await
         .unwrap()
         .unwrap();
     assert_eq!(retry.delivery.id.as_str(), notice.id);
     assert!(!retry.pending);
+    let (admitted, _, _) = inbox
+        .admitted_receipt_for_testing(&projected_replay)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted, retry.delivery);
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 3);
     f.state.shutdown().await;
 }
