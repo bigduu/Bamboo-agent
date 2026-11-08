@@ -641,7 +641,7 @@ impl AppStateResumeRef {
                                             })
                                             .await;
                                         if let Some(persistence) = execution_reservation.execution_persistence() {
-                                            if let Err(error) = persistence.save_runtime_session(&mut session).await {
+                                            if let Err(error) = persistence.save_finalized_runtime_session(&mut session).await {
                                                 tracing::warn!(%session_id, %error, "Root replay pause checkpoint rejected");
                                                 return;
                                             }

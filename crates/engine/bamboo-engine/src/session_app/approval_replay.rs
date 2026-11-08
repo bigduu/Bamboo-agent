@@ -946,6 +946,7 @@ pub fn repark_permission_replay(
         "runtime.suspend_reason".to_string(),
         "awaiting_clarification".to_string(),
     );
+    session.set_last_run_status("suspended");
     Ok(Some(ReparkedPermissionApproval {
         question,
         options,
@@ -1860,6 +1861,7 @@ mod tests {
                 .unwrap()
                 .expect("second context must park");
         assert_eq!(reparked.question, "Approve context two?");
+        assert_eq!(session.last_run_status().as_deref(), Some("suspended"));
         assert_eq!(
             session
                 .pending_question

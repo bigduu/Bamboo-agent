@@ -88,6 +88,7 @@ impl ObserverSubscriptionCoordinator {
         if native {
             inbox.enable_material_notifications(
                 bamboo_orchestration::managed_session::project_handoff_notice,
+                bamboo_orchestration::managed_session::project_managed_notice,
             );
         }
         Self {
@@ -224,6 +225,10 @@ impl ObserverSubscriptionCoordinator {
         let Some(state) = parent.supervisor_management.as_ref() else {
             return;
         };
+        let reference = SupervisorReference {
+            session_id: parent.id.clone(),
+            incarnation_id,
+        };
         let eligible: Vec<_> = state
             .subscriptions
             .iter()
@@ -245,10 +250,6 @@ impl ObserverSubscriptionCoordinator {
         }
         let (id, subscription) = eligible[*next % eligible.len()];
         *next = next.wrapping_add(1);
-        let reference = SupervisorReference {
-            session_id: parent.id.clone(),
-            incarnation_id,
-        };
         if subscription.failures == 8 {
             match self
                 .inbox

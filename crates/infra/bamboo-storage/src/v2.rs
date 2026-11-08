@@ -5857,15 +5857,8 @@ impl SessionStoreV2 {
                     .facts
                     .iter()
                     .rev()
-                    .flat_map(|fact| fact.inputs.iter().rev())
-                    .find(|input| {
-                        input
-                            .supervisor_origin
-                            .as_ref()
-                            .is_some_and(|origin| origin.material_notifications_requested())
-                    })
-            })
-            .map(|input| input.receipt_id.to_string());
+                    .find_map(|fact| outcomes.material_hint_for(fact))
+            });
         let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
@@ -7704,6 +7697,23 @@ impl SessionStoreV2 {
             } else {
                 durable_outcomes.cloned()
             };
+            if guards.input.is_none() {
+                if let (Some(outcomes), Some(response)) = (
+                    outcomes.as_mut(),
+                    bamboo_domain::consumed_pending_permission(durable, session),
+                ) {
+                    let reset = durable
+                        .conversation_reset_sha256()
+                        .map_err(|error| other_io_error(error.to_string()))?;
+                    outcomes
+                        .reserve_permission_resume(
+                            &root_actor.owner().fence,
+                            reset.as_deref(),
+                            &response,
+                        )
+                        .map_err(io::Error::other)?;
+                }
+            }
             let current = if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
                 let mut current = session.clone();
                 if let Some(durable_outcomes) = durable_outcomes {
@@ -7765,12 +7775,22 @@ impl SessionStoreV2 {
                                 ));
                             }
                         };
+                        let final_main = current.as_ref().unwrap_or(session);
+                        if result == bamboo_domain::SupervisedRootOutcomeResult::Suspended
+                            && outcomes.facts.last().is_some_and(|fact| {
+                                fact.run_id == owner.fence.run_id && fact.result.is_none()
+                            })
+                        {
+                            if let Some(question) =
+                                bamboo_domain::pending_permission_occurrence(final_main)
+                            {
+                                outcomes
+                                    .record_question(&owner.fence, &question)
+                                    .map_err(io::Error::other)?;
+                            }
+                        }
                         outcomes
-                            .finalize_from_main(
-                                &owner.fence,
-                                result,
-                                current.as_ref().unwrap_or(session),
-                            )
+                            .finalize_from_main(&owner.fence, result, final_main)
                             .map_err(|error| {
                                 io::Error::new(
                                     io::ErrorKind::WouldBlock,

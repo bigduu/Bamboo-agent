@@ -740,6 +740,13 @@ type ManagedHandoffProjection = fn(
     bamboo_domain::ManagedRootHandoffFormat,
 ) -> String;
 
+type ManagedNoticePresentation = fn(
+    &bamboo_domain::SupervisorReference,
+    &bamboo_domain::Session,
+    &bamboo_domain::SupervisedRootOutcomeFact,
+    Option<&str>,
+) -> Option<bamboo_domain::SessionProviderMessage>;
+
 /// Filesystem SessionInbox implementation. Clone/share one instance per
 /// runtime so concurrent senders serialize only the small generation/backlog
 /// transaction for their target session.
@@ -749,7 +756,8 @@ pub struct FileSessionInbox {
     root_owner: Option<bamboo_domain::RootActorRuntimeWrite>,
     child_owner: Option<bamboo_domain::ChildActorRuntimeWrite>,
     limits: SessionInboxLimits,
-    material_handoff: Arc<std::sync::OnceLock<ManagedHandoffProjection>>,
+    material_handoff:
+        Arc<std::sync::OnceLock<(ManagedHandoffProjection, ManagedNoticePresentation)>>,
     #[cfg(any(test, feature = "test-utils"))]
     observer_cursor_failure: Arc<std::sync::atomic::AtomicBool>,
     #[cfg(any(test, feature = "test-utils"))]
@@ -834,8 +842,13 @@ impl FileSessionInbox {
     }
 
     /// The native Host installs the reconciler and its projection before admission.
-    pub fn enable_material_notifications(&self, handoff: ManagedHandoffProjection) {
-        self.material_handoff.get_or_init(|| handoff);
+    pub fn enable_material_notifications(
+        &self,
+        handoff: ManagedHandoffProjection,
+        presentation: ManagedNoticePresentation,
+    ) {
+        self.material_handoff
+            .get_or_init(|| (handoff, presentation));
     }
 
     /// Called only while the canonical Root and its Inbox operation guard are
@@ -1272,14 +1285,18 @@ impl FileSessionInbox {
             authority._send_scope.as_ref(),
             Some(crate::v2::host_session_scope::CurrentUserSendScope::Scoped { .. })
         );
-        let inputs: Vec<_> = fact
-            .inputs
-            .iter()
-            .filter(|input| {
-                managed_root_input_matches_caller(input, caller, &guarded, scoped, notifying_input)
-            })
-            .cloned()
-            .collect();
+        let mut inputs = match notifying_input {
+            Some(receipt_id) => outcomes
+                .material_inputs(fact)
+                .find(|input| &input.receipt_id == receipt_id)
+                .cloned()
+                .into_iter()
+                .collect(),
+            None => fact.inputs.clone(),
+        };
+        inputs.retain(|input| {
+            managed_root_input_matches_caller(input, caller, &guarded, scoped, notifying_input)
+        });
         if inputs.is_empty() {
             return Ok(Read::CaughtUp);
         }
@@ -1457,7 +1474,7 @@ impl FileSessionInbox {
     }
 
     /// Both outcome writers use the same body for the same admitted input.
-    /// Only a directly subscribed first input selects the handoff projection.
+    /// Follow-up presentation can include a summary without rewriting the retained body.
     fn root_outcome_notice(
         &self,
         supervisor: &bamboo_domain::SupervisorReference,
@@ -1474,67 +1491,99 @@ impl FileSessionInbox {
             input,
             now,
         );
-        let Some((fact, format)) =
-            root.runtime_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
-                .and_then(|outcomes| {
-                    outcomes.facts.iter().find(|fact| {
-                        fact.sequence == outcome.sequence && fact.run_id == outcome.run_id
-                    })
-                })
-                .and_then(|fact| {
-                    let admitted = fact.inputs.iter().find(|admitted| {
+        let Some((fact, admitted)) = root
+            .runtime_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
+            .and_then(|outcomes| {
+                let fact = outcomes.facts.iter().find(|fact| {
+                    fact.sequence == outcome.sequence && fact.run_id == outcome.run_id
+                })?;
+                let admitted = fact
+                    .inputs
+                    .iter()
+                    .chain(outcomes.material_inputs(fact))
+                    .find(|admitted| {
                         admitted.receipt_id == input.receipt_id
                             && admitted.generation == input.generation
                     })?;
-                    Some((fact, admitted.supervisor_origin.as_ref()?.handoff_format()?))
-                })
+                Some((fact, admitted))
+            })
         else {
             return Ok(envelope);
         };
+        let format = fact.handoff_format(admitted);
+        let subscribed = admitted
+            .supervisor_origin
+            .as_ref()
+            .is_some_and(|origin| origin.material_notifications_requested());
+        if format.is_none() && !subscribed {
+            return Ok(envelope);
+        }
         if root
             .conversation_reset_sha256()
             .map_err(|error| SessionInboxError::InvalidClaim(error.to_string()))?
             != fact.conversation_reset_sha256
         {
+            if format.is_none() {
+                return Ok(envelope);
+            }
             return Err(SessionInboxError::InvalidClaim(
                 "handoff conversation generation changed".into(),
             ));
         }
-        let project = self.material_handoff.get().ok_or_else(|| {
-            SessionInboxError::Storage("managed Session handoff projection is unavailable".into())
-        })?;
-        let reference = fact.verified_final_message(root);
-        let content = reference.and_then(|reference| {
-            root.messages
-                .iter()
-                .find(|message| message.id == reference.message_id)
-                .map(|message| message.content.as_str())
-        });
+        let Some((project, present)) = self.material_handoff.get() else {
+            if format.is_some() {
+                return Err(SessionInboxError::Storage(
+                    "managed Session handoff projection is unavailable".into(),
+                ));
+            }
+            return Ok(envelope);
+        };
         let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) = &mut envelope.body
         else {
             unreachable!("Root outcome envelope has a RuntimeInstruction")
         };
-        let content = bamboo_domain::SessionMessageContent::text(project(
-            outcome, reference, content, format,
-        ));
-        let final_message =
-            if format == bamboo_domain::ManagedRootHandoffFormat::PresentationSummary {
-                instruction.provider_message = Some(bamboo_domain::SessionProviderMessage {
-                    content,
-                    metadata: Default::default(),
-                    never_compress: false,
+        let mut presented_handoff = None;
+        if let Some(format) = format {
+            let reference = fact.verified_final_message(root);
+            let content = reference.and_then(|reference| {
+                root.messages
+                    .iter()
+                    .find(|message| message.id == reference.message_id)
+                    .map(|message| message.content.as_str())
+            });
+            let text = project(outcome, reference, content, format);
+            let final_message =
+                if format == bamboo_domain::ManagedRootHandoffFormat::PresentationSummary {
+                    presented_handoff = Some(text);
+                    // The terminal fact pins the reference. History edits can
+                    // change presentation but cannot change delivery identity.
+                    fact.final_message.as_ref()
+                } else {
+                    instruction.content = Some(bamboo_domain::SessionMessageContent::text(text));
+                    reference
+                };
+            if let (Some(data), Some(reference)) = (instruction.data.as_mut(), final_message) {
+                data["final_message"] = serde_json::json!(reference);
+            }
+        }
+        if subscribed {
+            let handoff_text = presented_handoff.as_deref().or_else(|| {
+                instruction
+                    .content
+                    .as_ref()
+                    .filter(|_| format.is_some())
+                    .map(|content| content.text.as_str())
+            });
+            instruction.provider_message =
+                present(supervisor, root, fact, handoff_text).or_else(|| {
+                    presented_handoff.map(|text| bamboo_domain::SessionProviderMessage {
+                        content: bamboo_domain::SessionMessageContent::text(text),
+                        metadata: Default::default(),
+                        never_compress: false,
+                    })
                 });
-                // The terminal fact pins the reference. Later edits can change
-                // current verification and display but cannot change delivery identity.
-                fact.final_message.as_ref()
-            } else {
-                instruction.content = Some(content);
-                reference
-            };
-        if let (Some(data), Some(reference)) = (instruction.data.as_mut(), final_message) {
-            data["final_message"] = serde_json::json!(reference);
         }
         Ok(envelope)
     }

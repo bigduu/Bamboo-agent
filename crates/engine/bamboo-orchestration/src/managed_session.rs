@@ -8,8 +8,8 @@ use std::{future::Future, time::Duration};
 
 mod handoff;
 pub use handoff::{
-    is_internal_handoff, project_handoff_notice, worker_handoff_context, DISPATCH_CONFIRMATION,
-    SUPERVISOR_HANDOFF_GUIDANCE,
+    is_internal_handoff, project_handoff_notice, project_managed_notice, worker_handoff_context,
+    DISPATCH_CONFIRMATION, SUPERVISOR_HANDOFF_GUIDANCE,
 };
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
@@ -78,12 +78,15 @@ pub fn notification_candidates(
         if !has_material {
             continue;
         }
-        for input in &fact.inputs {
-            let Some(origin) = input
-                .supervisor_origin
-                .as_ref()
-                .filter(|origin| origin.material_notifications_requested())
-            else {
+        for input in outcomes.material_inputs(fact) {
+            // An inherited subscription already received its approval pause.
+            // Report the eventual result or a new durable task blocker.
+            if fact.result == Some(bamboo_domain::SupervisedRootOutcomeResult::Suspended)
+                && !fact.inputs.contains(input)
+            {
+                continue;
+            }
+            let Some(origin) = input.supervisor_origin.as_ref() else {
                 continue;
             };
             let (Some(caller), Some(target)) =
@@ -126,16 +129,7 @@ pub fn notification_source_settled(session: &Session, hint: &str) -> bool {
     };
     let mut found_hint = false;
     for fact in &outcomes.facts {
-        let inputs: Vec<_> = fact
-            .inputs
-            .iter()
-            .filter(|input| {
-                input
-                    .supervisor_origin
-                    .as_ref()
-                    .is_some_and(|origin| origin.material_notifications_requested())
-            })
-            .collect();
+        let inputs: Vec<_> = outcomes.material_inputs(fact).collect();
         if inputs.is_empty() {
             continue;
         }
@@ -146,7 +140,8 @@ pub fn notification_source_settled(session: &Session, hint: &str) -> bool {
         }) {
             return false;
         }
-        found_hint |= inputs.iter().any(|input| input.receipt_id.as_str() == hint);
+        found_hint |= outcomes.material_hint_for(fact).as_deref() == Some(hint)
+            || inputs.iter().any(|input| input.receipt_id.as_str() == hint);
         if !matches!(
             fact.result,
             Some(
@@ -188,26 +183,27 @@ impl ManagedRootNotifications {
         }
         let position = *next;
         *next = next.wrapping_add(1);
-        let mut selected: Vec<_> = sources
-            .iter()
-            .take(RECENT_NOTIFICATION_SOURCES)
-            .map(|source| (source, position))
-            .collect();
+        let mut selected: Vec<_> = sources.iter().take(RECENT_NOTIFICATION_SOURCES).collect();
         let older = &sources[position % sources.len()];
-        if !selected.iter().any(|(source, _)| *source == older) {
-            selected.push((older, position / sources.len()));
+        if !selected.contains(&older) {
+            selected.push(older);
         }
         let first = selected
             .iter()
-            .position(|(source, _)| *source == older)
+            .position(|source| *source == older)
             .expect("the rotating source is selected above");
         selected.rotate_left(first);
+        // A Host can start one proof per tick. Each source advances its
+        // candidate on its next first-priority turn, one full rotation later.
+        // Indexing by the tick would revisit only a subset of its candidates
+        // when the source and candidate counts share a divisor.
+        let round = position / sources.len();
         let mut first_error = None;
-        for (source, cursor) in selected {
+        for source in selected {
             let result = tokio::time::timeout(NOTIFICATION_PROOF_BUDGET, async {
                 let candidates = io.candidates(source).await?;
                 if !candidates.is_empty() {
-                    io.deliver(&candidates[cursor % candidates.len()]).await?;
+                    io.deliver(&candidates[round % candidates.len()]).await?;
                 }
                 Ok::<_, String>(())
             })
@@ -411,6 +407,72 @@ mod tests {
         assert_eq!(
             reads.reads.lock().unwrap().len(),
             RECENT_NOTIFICATION_SOURCES
+        );
+    }
+
+    #[tokio::test]
+    async fn a_single_proof_slot_reaches_every_candidate_for_both_sources() {
+        use bamboo_domain::{
+            SessionCallerReference, SessionMessageId, SupervisorCurrentUserTarget,
+        };
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct OneProofPerTick {
+            attempts: Mutex<Vec<String>>,
+            busy: Mutex<bool>,
+        }
+
+        #[async_trait]
+        impl ManagedRootNotificationIo for OneProofPerTick {
+            async fn sources(&self) -> Vec<String> {
+                *self.busy.lock().unwrap() = false;
+                vec!["recent".into(), "older".into()]
+            }
+
+            async fn candidates(
+                &self,
+                source: &str,
+            ) -> Result<Vec<ManagedRootNotification>, String> {
+                let caller = SessionCallerReference::from(&Session::new("supervisor", "model"));
+                let target =
+                    SupervisorCurrentUserTarget::capture(&Session::new(source, "model")).unwrap();
+                Ok((0..4)
+                    .map(|index| ManagedRootNotification {
+                        caller: caller.clone(),
+                        target: target.clone(),
+                        run_id: format!("{source}-{index}"),
+                        after_sequence: index,
+                        input_receipt_id: SessionMessageId::parse("receipt").unwrap(),
+                        blocker_cursor: None,
+                    })
+                    .collect())
+            }
+
+            async fn deliver(&self, selected: &ManagedRootNotification) -> Result<(), String> {
+                let mut busy = self.busy.lock().unwrap();
+                if !*busy {
+                    *busy = true;
+                    self.attempts.lock().unwrap().push(selected.run_id.clone());
+                }
+                Err("proof remains pending".into())
+            }
+        }
+
+        let io = OneProofPerTick::default();
+        let notifications = ManagedRootNotifications::default();
+        for _ in 0..8 {
+            assert_eq!(
+                notifications.tick(&io).await,
+                Err("proof remains pending".into())
+            );
+        }
+        assert_eq!(
+            *io.attempts.lock().unwrap(),
+            [
+                "recent-0", "older-0", "recent-1", "older-1", "recent-2", "older-2", "recent-3",
+                "older-3",
+            ]
         );
     }
 
