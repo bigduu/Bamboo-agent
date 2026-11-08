@@ -1118,6 +1118,11 @@ pub struct SessionIndexEntry {
     /// can display the question dialog badge without loading session.json.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// The latest run has a material subscriber while this Session has a
+    /// pending question. Its delivery hint can retire before the question clears.
+    /// Absent on older index rows or Sessions with no pending question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_material_run: Option<bool>,
     /// Latest canonical Human UI engagement mark, mirrored from
     /// `session.agent_runtime_state.last_human_input`. Absent means no human
     /// input was admitted through the interactive route since creation. This is
@@ -3400,6 +3405,31 @@ impl SessionStoreV2 {
         let mut items: Vec<_> = index.sessions.values().cloned().collect();
         items.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         items
+    }
+
+    pub async fn recent_index_entries_matching(
+        &self,
+        limit: usize,
+        matches: impl Fn(&SessionIndexEntry) -> bool,
+    ) -> Vec<SessionIndexEntry> {
+        let index = self.index.read().await;
+        let mut items: Vec<_> = index
+            .sessions
+            .values()
+            .filter(|entry| matches(entry))
+            .collect();
+        let newest = |left: &&SessionIndexEntry, right: &&SessionIndexEntry| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        };
+        if items.len() > limit {
+            items.select_nth_unstable_by(limit, newest);
+            items.truncate(limit);
+        }
+        items.sort_unstable_by(newest);
+        items.into_iter().cloned().collect()
     }
 
     pub async fn get_index_entry(&self, session_id: &str) -> Option<SessionIndexEntry> {
@@ -5848,17 +5878,26 @@ impl SessionStoreV2 {
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
         let session_id = session.id.clone();
-        let material_notification_hint = session
+        let outcomes = session
             .runtime_metadata
             .as_ref()
-            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
-            .and_then(|outcomes| {
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref());
+        let material_notification_hint = outcomes.and_then(|outcomes| {
+            outcomes
+                .facts
+                .iter()
+                .rev()
+                .find_map(|fact| outcomes.material_hint_for(fact))
+        });
+        let has_pending_question = session.has_pending_question();
+        let pending_material_run = has_pending_question.then(|| {
+            outcomes.is_some_and(|outcomes| {
                 outcomes
                     .facts
-                    .iter()
-                    .rev()
-                    .find_map(|fact| outcomes.material_hint_for(fact))
-            });
+                    .last()
+                    .is_some_and(|fact| outcomes.material_inputs(fact).next().is_some())
+            })
+        });
         let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
@@ -5885,7 +5924,8 @@ impl SessionStoreV2 {
             last_activity_at: session.updated_at,
             message_count: session.messages.len(),
             has_attachments,
-            has_pending_question: session.has_pending_question(),
+            has_pending_question,
+            pending_material_run,
             last_human_input,
             plan_mode,
             bypass_permissions,

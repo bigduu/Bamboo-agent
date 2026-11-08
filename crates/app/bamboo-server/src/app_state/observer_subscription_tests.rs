@@ -246,7 +246,7 @@ impl LLMProvider for Probe {
                                 function: FunctionCall {
                                     name: "exec_command".into(),
                                     arguments: json!({
-                                        "cmd": format!("pwd && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
+                                        "cmd": format!("pwd -P && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
                                     }).to_string(),
                                 },
                             }])),
@@ -1599,7 +1599,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     decision: Option<PermissionDecisionKind>,
     repeat: bool,
 ) {
-    use actix_web::http::StatusCode;
+    use actix_web::{http::StatusCode, test, App};
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 
     let f = Fixture::new_with_native_source(true).await;
@@ -1694,12 +1694,51 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
     assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
 
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let session_uri = format!("/api/v1/sessions/{target}");
+    let worker = load(&f.state, target).await;
+    assert_eq!(
+        worker
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .effective_permission_mode(),
+        SessionPermissionMode::Bypass
+    );
+    let read_cards = || async {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/supervisor/default/approvals")
+                .peer_addr("127.0.0.1:8080".parse().unwrap())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        test::read_body_json::<Value, _>(response).await
+    };
+    let decisions_uri = format!("{session_uri}/permission-decisions");
+    let submit = |body: &Value| {
+        test::TestRequest::post()
+            .uri(&decisions_uri)
+            .peer_addr("127.0.0.1:8080".parse().unwrap())
+            .set_json(body)
+            .to_request()
+    };
+
     f.probe.source_release[0].notify_one();
     drive_material_notices(&f, 3).await;
     settle_material_notices(&f).await;
+    let calls = [HANDOFF_PERMISSION_CALL, HANDOFF_SECOND_PERMISSION_CALL];
+    let calls = &calls[..if repeat { 2 } else { 1 }];
     let expected_calls = if let Some(decision) = decision {
         let mut previous = None;
-        for index in 0..if repeat { 2 } else { 1 } {
+        for (index, &expected_call) in calls.iter().enumerate() {
             let suspended = tokio::time::timeout(WAIT, async {
                 loop {
                     let current = load(&f.state, target).await;
@@ -1721,10 +1760,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .await
             .expect("next typed permission occurrence must park");
             let (root, occurrence) = suspended;
-            assert_eq!(
-                occurrence.tool_call_id,
-                [HANDOFF_PERMISSION_CALL, HANDOFF_SECOND_PERMISSION_CALL][index],
-            );
+            assert_eq!(occurrence.tool_call_id, expected_call);
             let facts = &root
                 .runtime_metadata
                 .as_ref()
@@ -1740,73 +1776,126 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             );
             assert_eq!(parked.questions.len(), 1);
             assert_eq!(parked.resumed_from, (index > 0).then_some(index as u64));
-            let pending = crate::handlers::agent::respond::get_pending_question(
-                f.state.clone(),
-                web::Path::from(target.to_string()),
+            let observed = invoke_managed_control(
+                &f.state,
+                &f.reference,
+                "observe-approval",
+                json!({"action":"observe_run", "target_session_id":target, "target_ref":reference}),
             )
-            .await
-            .unwrap();
-            assert_eq!(pending.status(), StatusCode::OK);
-            let pending: Value = serde_json::from_slice(
-                &actix_web::body::to_bytes(pending.into_body())
-                    .await
-                    .unwrap(),
-            )
-            .unwrap();
+            .await;
+            assert_eq!(observed["status"], "awaiting_response");
+            assert_eq!(observed["tool_name"], "exec_command");
+            assert_eq!(observed["approval_card"], true);
+            if index == 0 {
+                let parent = load(&f.state, &f.reference.session_id).await;
+                assert!(parent.messages.iter().any(|message| {
+                    message
+                        .content
+                        .starts_with("# Managed Session approval required")
+                        && message.content.contains(observed["link"].as_str().unwrap())
+                        && bamboo_engine::session_app::execute::is_hidden_from_ui(message)
+                }));
+            }
+            let cards = read_cards().await;
+            let [card] = cards["approvals"].as_array().unwrap().as_slice() else {
+                panic!("exactly one managed approval card");
+            };
+            assert_eq!(card["session_id"], target);
+            assert_eq!(card["created_at"], json!(root.created_at));
+            assert_eq!(card["title"], "Subscribed dispatch");
+            assert_eq!(card["workspace_path"], workspace);
+            let pending = &card["pending"];
             let request = &pending["permission_request"];
             assert_eq!(request["request_id"], occurrence.tool_call_id);
             assert_eq!(
                 request["request_generation"],
                 json!(occurrence.permission_generation)
             );
+            assert_eq!(request["reason_code"], "configured_always_ask");
             let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
             assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
             assert!(request["operation_summary"]
                 .as_str()
                 .unwrap()
                 .contains(command));
-            let response = crate::handlers::agent::respond::submit_permission_decision(
-                f.state.clone(),
-                web::Path::from(target.to_string()),
-                web::Json(
-                    serde_json::from_value(json!({
-                        "request_id": request["request_id"],
-                        "request_generation": request["request_generation"],
-                        "expected_policy_revision": request["policy_revision"],
-                        "decision": decision,
-                    }))
-                    .unwrap(),
+            if index == 0 {
+                let independent = managed_target(&f.state, &f.reference, ROOT_A).await;
+                admit_native_source(
+                    &f,
+                    &independent,
+                    "during-approval",
+                    "Check an independent task.",
+                )
+                .await;
+                settled(&f.state, ROOT_A).await;
+                assert_eq!(
+                    bamboo_domain::pending_permission_occurrence(&load(&f.state, target).await)
+                        .as_ref(),
+                    Some(&occurrence)
+                );
+            }
+            let submission = json!({
+                "request_id": request["request_id"],
+                "request_generation": request["request_generation"],
+                "expected_policy_revision": request["policy_revision"],
+                "decision": decision,
+            });
+            let older_generation = previous
+                .as_ref()
+                .and_then(|occurrence| occurrence.permission_generation.as_deref())
+                .unwrap_or("older-generation");
+            for (field, invalid) in [
+                ("request_generation", json!(older_generation)),
+                (
+                    "expected_policy_revision",
+                    json!(request["policy_revision"].as_u64().unwrap() + 1),
                 ),
-            )
-            .await
-            .unwrap();
+            ] {
+                let mut stale = submission.clone();
+                stale[field] = invalid;
+                let response = test::call_service(&app, submit(&stale)).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{field}");
+            }
+            let response = test::call_service(&app, submit(&submission)).await;
             assert_eq!(response.status(), StatusCode::OK);
-            let body = actix_web::body::to_bytes(response.into_body())
-                .await
-                .unwrap();
-            let receipt: Value = serde_json::from_slice(&body).unwrap();
+            let receipt: Value = test::read_body_json(response).await;
             assert_eq!(receipt["auto_resume_status"], "started");
             assert_eq!(receipt["receipt"]["decision"]["decision"], json!(decision));
             previous = Some(occurrence);
         }
         drive_material_notices(&f, 4).await;
         settle_material_notices(&f).await;
+        assert_eq!(read_cards().await["approvals"], json!([]));
         4
     } else {
         3
     };
     let worker = load(&f.state, target).await;
+    if decision == Some(PermissionDecisionKind::AllowOnce) {
+        for &id in calls {
+            let result = worker
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(id))
+                .expect("approved command result");
+            let result: Value =
+                serde_json::from_str(&result.content).expect("structured exec result");
+            assert_eq!(result["exit_code"], 0);
+            let output = result["output"].as_str().unwrap();
+            assert_eq!(output.lines().next(), Some(workspace.as_str()));
+        }
+    }
     assert_eq!(
         worker
             .agent_runtime_state
             .as_ref()
             .unwrap()
             .effective_permission_mode(),
-        SessionPermissionMode::Default
+        SessionPermissionMode::Bypass,
     );
     assert_eq!(
         f.probe.source_calls.load(Ordering::SeqCst),
-        1 + usize::from(decision.is_some()) + usize::from(repeat),
+        1 + 2 * usize::from(decision.is_some()) + usize::from(repeat),
     );
     let facts = worker
         .runtime_metadata
