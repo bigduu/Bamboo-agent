@@ -1567,11 +1567,15 @@ async fn maybe_background_quiet_exec(
         format!("Moved command `{handle}` to background monitoring. You can continue this conversation; its result will return automatically."),
         None,
     );
-    notice.metadata = Some(serde_json::json!({
+    let mut notice_metadata = serde_json::json!({
         "runtime_kind": "background_exec_wait",
         "source": "runtime",
         "exec_session_id": handle,
-    }));
+    });
+    if let Some(owner) = persistence.root_actor_writer() {
+        notice_metadata["run_id"] = serde_json::json!(owner.fence.run_id);
+    }
+    notice.metadata = Some(notice_metadata);
     candidate.add_message(notice.clone());
     persistence
         .save_runtime_session(&mut candidate)

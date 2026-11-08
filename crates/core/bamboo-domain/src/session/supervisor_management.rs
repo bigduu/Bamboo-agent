@@ -15,6 +15,8 @@ pub const SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION: u32 = 4;
 pub const SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION: u32 = 4;
 /// Observer outcome positions are committed with the existing receipt cursor.
 pub const SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION: u32 = 5;
+/// Compatibility for development profiles whose follow-up policy was disabled.
+pub const SUPERVISOR_SESSION_FOLLOWUP_SCHEMA_VERSION: u32 = 6;
 pub const MAX_SUPERVISOR_OBSERVERS: usize = 8;
 pub const MAX_SUPERVISOR_OBSERVER_TARGETS: usize = 8;
 pub const MAX_SUPERVISOR_PROJECTS: usize = 64;
@@ -40,6 +42,7 @@ impl From<&SupervisorBootstrapReceipt> for SupervisorReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupervisorManagedLink {
     pub revision: u64,
     pub enabled: bool,
@@ -95,6 +98,7 @@ pub struct SupervisorObserverContext {
 /// Only the canonical Supervisor runtime may publish this state. A missing
 /// field means empty scope, no links and revision zero for legacy Supervisors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupervisorManagementState {
     pub schema_version: u32,
     pub incarnation_id: Uuid,
@@ -120,6 +124,7 @@ impl SupervisorManagementState {
                 | SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION
                 | SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION
                 | SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION
+                | SUPERVISOR_SESSION_FOLLOWUP_SCHEMA_VERSION
         ) || (self.schema_version == SUPERVISOR_MANAGEMENT_SCHEMA_VERSION
             && !self.observers.is_empty())
             || (self.schema_version < SUPERVISOR_SUBSCRIPTION_SCHEMA_VERSION

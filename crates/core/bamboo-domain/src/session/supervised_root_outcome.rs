@@ -12,7 +12,7 @@ use super::{
     ActorActivationFence, Message, MessagePhase, ResponseOccurrence, Role, Session,
     SessionActivationPolicy, SessionInboxActivationIntent, SessionInboxReceipt, SessionKind,
     SessionMessageBody, SessionMessageEnvelope, SessionMessageId, SessionMessageKind,
-    SupervisorReference,
+    SessionMessageSource, SupervisorReference,
 };
 use crate::SupervisorCurrentUserTarget;
 
@@ -656,7 +656,7 @@ pub struct SupervisedRootOutcomeFact {
     /// Historical projection of the exact canonical reset ledger observed at
     /// reservation. It is not a replacement for the live generation proof.
     pub conversation_reset_sha256: Option<String>,
-    /// The preceding suspended fact whose permission response started this run.
+    /// The preceding suspended fact whose verified continuation started this run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resumed_from: Option<u64>,
     pub inputs: Vec<SupervisedRootOutcomeInput>,
@@ -1065,7 +1065,7 @@ impl SupervisedRootOutcomes {
                         && predecessor.conversation_reset_sha256 == fact.conversation_reset_sha256
                         && previous_notifying
                 }) {
-                    return Err("invalid Root permission resume predecessor");
+                    return Err("invalid Root continuation predecessor");
                 }
             }
             if fact.final_message.as_ref().is_some_and(|reference| {
@@ -1375,6 +1375,92 @@ impl SupervisedRootOutcomes {
             )?;
         }
         Ok(())
+    }
+
+    /// Only the writer holding the native completion's exact owned Inbox
+    /// claim can apply this transition. The pre-admission Main still ends at
+    /// the runtime's wait notice even though its live wait has been cleared.
+    pub fn reserve_background_exec_resume(
+        &mut self,
+        fence: &ActorActivationFence,
+        durable: &Session,
+        completion: &SessionMessageEnvelope,
+        generation: u64,
+    ) -> Result<bool, &'static str> {
+        if durable.id != self.root_session_id
+            || durable.created_at != self.root_created_at
+            || completion.target_session_id != durable.id
+            || completion.kind != SessionMessageKind::RuntimeInstruction
+            || !matches!(&completion.source, SessionMessageSource::Runtime { subsystem }
+                if subsystem == "background_exec")
+            || generation == 0
+            || durable
+                .session_inbox_admission()
+                .is_some_and(|cursor| generation <= cursor.last_admitted_sequence)
+        {
+            return Ok(false);
+        }
+        let SessionMessageBody::RuntimeInstruction(instruction) = &completion.body else {
+            return Ok(false);
+        };
+        let Some(data) = instruction.data.as_ref() else {
+            return Ok(false);
+        };
+        let Some(handle) = data["exec_session_id"].as_str().filter(|id| !id.is_empty()) else {
+            return Ok(false);
+        };
+        if instruction.instruction != "background_exec_completed"
+            || data["session_id"].as_str() != Some(durable.id.as_str())
+            || completion.correlation_id.as_deref() != Some(handle)
+            || !matches!(
+                data["status"].as_str(),
+                Some("completed" | "killed" | "error")
+            )
+            || completion.id != SessionMessageId::stable("background_exec_completion", data)
+        {
+            return Ok(false);
+        }
+        let Some(wait) = durable
+            .messages
+            .last()
+            .filter(|message| message.role == Role::Assistant)
+            .and_then(|message| message.metadata.as_ref())
+            .filter(|metadata| {
+                metadata["runtime_kind"] == "background_exec_wait"
+                    && metadata["source"] == "runtime"
+                    && metadata["exec_session_id"] == handle
+            })
+        else {
+            return Ok(false);
+        };
+        let reset = durable
+            .conversation_reset_sha256()
+            .map_err(|_| "Root outcome Main generation is invalid")?;
+        let Some(predecessor) = self.facts.last().filter(|fact| {
+            fact.result == Some(SupervisedRootOutcomeResult::Suspended)
+                && fact.conversation_reset_sha256 == reset
+                && fact.run_id != fence.run_id
+                && fact.attempt < fence.attempt
+                && fact.lease_epoch < fence.lease_epoch
+                && self.material_inputs(fact).next().is_some()
+        }) else {
+            return Ok(false);
+        };
+        let exact = match wait.get("run_id") {
+            Some(run) => run.as_str() == Some(predecessor.run_id.as_str()),
+            // An older notice can bind only the immediate next activation.
+            // It cannot distinguish a gap with an unrelated untracked Run.
+            None => {
+                predecessor.questions.is_empty()
+                    && predecessor.attempt.checked_add(1) == Some(fence.attempt)
+                    && predecessor.lease_epoch.checked_add(1) == Some(fence.lease_epoch)
+            }
+        };
+        if !exact {
+            return Ok(false);
+        }
+        self.reserve_with_predecessor(fence, reset.as_deref(), Some(predecessor.sequence))?;
+        Ok(true)
     }
 
     fn reserve_with_predecessor(
@@ -1863,6 +1949,107 @@ mod tests {
             generation,
             supervisor_origin: None,
         }
+    }
+
+    #[test]
+    fn background_exec_resume_binds_the_latest_wait_and_its_original_run() {
+        let mut root = Session::new("test-root", "model");
+        let target = SupervisorCurrentUserTarget::capture(&root).unwrap();
+        let supervisor = SupervisorReference {
+            session_id: crate::DEFAULT_SUPERVISOR_SESSION_ID.into(),
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let operation_id = SessionMessageId::parse("background-exec-operation").unwrap();
+        let receipt_id =
+            crate::supervisor_current_user_message_id(&supervisor, &target, operation_id.as_str());
+        let subscribed = SupervisedRootOutcomeInput {
+            receipt_id,
+            generation: 1,
+            supervisor_origin: Some(SupervisedRootOutcomeInputOrigin::CurrentUser {
+                supervisor,
+                supervisor_created_at: Utc::now(),
+                caller: None,
+                requires_host_scope: None,
+                notify_on_material_event: true,
+                target,
+                operation_id,
+            }),
+        };
+        let mut outcomes = SupervisedRootOutcomes::new(&root.id, root.created_at).unwrap();
+        outcomes.reserve(&fence(1), None).unwrap();
+        outcomes
+            .record_input(&fence(1), subscribed.clone())
+            .unwrap();
+        outcomes
+            .finalize(&fence(1), SupervisedRootOutcomeResult::Suspended)
+            .unwrap();
+        root.session_inbox_admission_mut().last_admitted_sequence = 1;
+
+        let data = serde_json::json!({
+            "session_id":root.id, "exec_session_id":"exec-1", "status":"completed", "exit_code":0,
+        });
+        let completion = SessionMessageEnvelope {
+            id: SessionMessageId::stable("background_exec_completion", &data),
+            source: SessionMessageSource::Runtime {
+                subsystem: "background_exec".into(),
+            },
+            target_session_id: root.id.clone(),
+            kind: SessionMessageKind::RuntimeInstruction,
+            body: SessionMessageBody::RuntimeInstruction(crate::SessionRuntimeInstruction {
+                instruction: "background_exec_completed".into(),
+                content: None,
+                data: Some(data),
+                provider_message: None,
+            }),
+            created_at: Utc::now(),
+            thread_id: None,
+            in_reply_to: None,
+            attempt: None,
+            correlation_id: Some("exec-1".into()),
+        };
+        let mut wait = Message::assistant("Waiting on command.", None);
+        for (handle, run) in [("other-exec", "run-1"), ("exec-1", "other-run")] {
+            wait.metadata = Some(serde_json::json!({
+                "runtime_kind":"background_exec_wait", "source":"runtime",
+                "exec_session_id":handle, "run_id":run,
+            }));
+            root.messages = vec![wait.clone()];
+            assert!(!outcomes
+                .reserve_background_exec_resume(&fence(2), &root, &completion, 2)
+                .unwrap());
+        }
+
+        let metadata = wait.metadata.as_mut().unwrap();
+        metadata.as_object_mut().unwrap().remove("run_id");
+        root.messages = vec![wait.clone()];
+        assert!(!outcomes
+            .reserve_background_exec_resume(&fence(3), &root, &completion, 2)
+            .unwrap());
+        let mut legacy = outcomes.clone();
+        assert!(legacy
+            .reserve_background_exec_resume(&fence(2), &root, &completion, 2)
+            .unwrap());
+
+        wait.metadata.as_mut().unwrap()["run_id"] = serde_json::json!("run-1");
+        root.messages = vec![wait];
+        assert!(!outcomes
+            .reserve_background_exec_resume(&fence(2), &root, &completion, 1)
+            .unwrap());
+        root.messages
+            .push(Message::user("I am taking over this Session."));
+        assert!(!outcomes
+            .reserve_background_exec_resume(&fence(3), &root, &completion, 2)
+            .unwrap());
+        root.messages.pop();
+        assert!(outcomes
+            .reserve_background_exec_resume(&fence(3), &root, &completion, 2)
+            .unwrap());
+        let continuation = outcomes.facts.last().unwrap();
+        assert_eq!(continuation.resumed_from, Some(1));
+        assert_eq!(
+            outcomes.material_inputs(continuation).collect::<Vec<_>>(),
+            vec![&subscribed]
+        );
     }
 
     #[test]
