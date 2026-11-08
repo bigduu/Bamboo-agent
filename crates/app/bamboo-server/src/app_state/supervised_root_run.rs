@@ -572,4 +572,20 @@ mod tests {
     async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_after_restart() {
         super::super::observer_subscriptions::tests::exercise_managed_wait_outcomes().await;
     }
+
+    #[actix_web::test]
+    async fn ordinary_approval_handoff_waits_for_deadline_and_keeps_forced_requests_with_owner() {
+        super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
+            PermissionDecisionKind::DenyOnce,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn ordinary_approval_handoff_can_allow_the_exact_workspace_edit_once() {
+        super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
+            PermissionDecisionKind::AllowOnce,
+        )
+        .await;
+    }
 }

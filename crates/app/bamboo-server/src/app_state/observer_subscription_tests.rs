@@ -2119,17 +2119,9 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     f.state.shutdown().await;
 }
 
-#[actix_web::test]
-async fn ordinary_approval_handoff_waits_for_deadline_and_keeps_forced_requests_with_owner() {
-    exercise_ordinary_approval_handoff(PermissionDecisionKind::DenyOnce).await;
-}
-
-#[actix_web::test]
-async fn ordinary_approval_handoff_can_allow_the_exact_workspace_edit_once() {
-    exercise_ordinary_approval_handoff(PermissionDecisionKind::AllowOnce).await;
-}
-
-async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKind) {
+pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
+    final_decision: PermissionDecisionKind,
+) {
     use crate::handlers::agent::respond::{capture_approval_handoff, decide_delegated_approval};
     use bamboo_orchestration::managed_session::approval_handoff::DELAY;
     use bamboo_tools::permission::{
