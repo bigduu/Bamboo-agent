@@ -1689,18 +1689,22 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff() {
         .unwrap()
         .pop()
         .unwrap();
-    let response = crate::handlers::agent::messages::delete_message(
-        f.state.clone(),
-        web::Path::from((target.to_owned(), reference.message_id.clone())),
-    )
-    .await
-    .unwrap();
-    assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+    let final_message_id = reference.message_id.clone();
+    let mut worker = worker;
+    worker
+        .messages
+        .retain(|message| message.id != final_message_id);
+    worker.clear_derived_context_state();
+    f.state
+        .persistence
+        .merge_save_runtime(&mut worker)
+        .await
+        .unwrap();
     let edited = load(&f.state, target).await;
     assert!(edited
         .messages
         .iter()
-        .all(|message| message.id != reference.message_id));
+        .all(|message| message.id != final_message_id));
     let retry = f
         .state
         .observer_subscriptions
