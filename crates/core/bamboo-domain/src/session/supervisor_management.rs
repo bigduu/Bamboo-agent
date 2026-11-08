@@ -15,6 +15,7 @@ pub const SUPERVISOR_OBSERVER_FAULT_SCHEMA_VERSION: u32 = 4;
 pub const SUPERVISOR_CURRENT_USER_MANAGEMENT_SCHEMA_VERSION: u32 = 4;
 /// Observer outcome positions are committed with the existing receipt cursor.
 pub const SUPERVISOR_OBSERVER_ROOT_OUTCOME_SCHEMA_VERSION: u32 = 5;
+/// Compatibility for development profiles whose follow-up policy was disabled.
 pub const SUPERVISOR_SESSION_FOLLOWUP_SCHEMA_VERSION: u32 = 6;
 pub const MAX_SUPERVISOR_OBSERVERS: usize = 8;
 pub const MAX_SUPERVISOR_OBSERVER_TARGETS: usize = 8;
@@ -41,6 +42,7 @@ impl From<&SupervisorBootstrapReceipt> for SupervisorReference {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupervisorManagedLink {
     pub revision: u64,
     pub enabled: bool,
@@ -96,6 +98,7 @@ pub struct SupervisorObserverContext {
 /// Only the canonical Supervisor runtime may publish this state. A missing
 /// field means empty scope, no links and revision zero for legacy Supervisors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupervisorManagementState {
     pub schema_version: u32,
     pub incarnation_id: Uuid,
@@ -108,9 +111,6 @@ pub struct SupervisorManagementState {
     pub observers: BTreeMap<String, SupervisorObserverRegistration>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub subscriptions: BTreeMap<String, crate::ObserverSubscription>,
-    /// Preserve the known profile wire field when checking compatibility.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_followup: Option<serde_json::Value>,
 }
 
 impl SupervisorManagementState {
@@ -131,9 +131,6 @@ impl SupervisorManagementState {
                 && !self.subscriptions.is_empty())
         {
             return Err("unsupported Supervisor management schema version");
-        }
-        if self.session_followup.is_some() {
-            return Err("active Supervisor follow-up requires its owning runtime");
         }
         if incarnation_id.is_nil() || self.incarnation_id != incarnation_id || self.revision == 0 {
             return Err("invalid Supervisor management incarnation or revision");
@@ -409,7 +406,6 @@ mod tests {
             links: BTreeMap::new(),
             observers: BTreeMap::new(),
             subscriptions: BTreeMap::new(),
-            session_followup: None,
         };
         state.validate(incarnation_id).unwrap();
         assert_eq!(

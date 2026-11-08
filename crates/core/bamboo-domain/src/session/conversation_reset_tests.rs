@@ -103,7 +103,6 @@ fn source(supervisor: bool) -> Session {
             schema_version: 1,
             observers: Default::default(),
             subscriptions: Default::default(),
-            session_followup: None,
             incarnation_id: incarnation,
             revision: 3,
             allowed_projects: [project.clone()].into(),

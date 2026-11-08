@@ -112,7 +112,6 @@ fn empty_state(incarnation_id: Uuid) -> SupervisorManagementState {
         links: BTreeMap::new(),
         observers: BTreeMap::new(),
         subscriptions: BTreeMap::new(),
-        session_followup: None,
     }
 }
 
