@@ -1430,13 +1430,15 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         &reference,
         "managed-admission-restored-ack",
         admission_request(&second, &second_input),
-    )
-    .await;
+    );
+    // The deadline above can leave the pinned outcome read holding a storage
+    // guard needed by the admission query. Keep polling both after ACK restore.
+    let (verified, restored_admission) =
+        tokio::time::timeout(WAIT, async { tokio::join!(pending, restored_admission) })
+            .await
+            .expect("restored ACK wakes both reads");
     assert_eq!(restored_admission["status"], "admission_verified");
     assert_eq!(restored_admission["admission"]["run_id"], second_run);
-    let verified = tokio::time::timeout(WAIT, pending)
-        .await
-        .expect("restored ACK wakes the wait");
     assert_eq!(verified["outcome"]["run_id"], second_run);
     assert_eq!(verified["outcome"]["final_message"], second_answer);
     assert_eq!(
