@@ -624,7 +624,9 @@ async fn apply_permission_decision(
                         let supervisor_for_guard = supervisor.clone();
                         let occurrence = expected_approval
                             .map(|(_, occurrence)| occurrence.clone())
-                            .ok_or_else(|| AppError::Forbidden("Expected approval occurrence required".into()))?;
+                            .ok_or_else(|| {
+                                AppError::Forbidden("Expected approval occurrence required".into())
+                            })?;
                         let guard = permission_guard
                             .take()
                             .expect("permission mutation lock is held");
@@ -641,7 +643,8 @@ async fn apply_permission_decision(
                                         current,
                                     )
                                     .is_some_and(|(handoff, current_request)| {
-                                        handoff.pending.occurrence == occurrence && current_request == request
+                                        handoff.pending.occurrence == occurrence
+                                            && current_request == request
                                     });
                                     if !still_eligible {
                                         return Err(std::io::Error::new(

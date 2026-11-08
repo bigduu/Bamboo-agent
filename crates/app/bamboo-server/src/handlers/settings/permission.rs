@@ -245,13 +245,17 @@ pub async fn update_supervisor_approval_handoff(
         == snapshot.data.supervisor_approval_handoff_since
     {
         return Ok(
-            HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(&snapshot, true)),
+            HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
+                &snapshot, true,
+            )),
         );
     }
     let committed =
         commit_permission_candidate(&state, payload.expected_revision, candidate).await?;
     Ok(
-        HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(&committed, true)),
+        HttpResponse::Ok().json(DefaultSessionPermissionModeResponse::from_snapshot(
+            &committed, true,
+        )),
     )
 }
 

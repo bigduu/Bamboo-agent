@@ -297,6 +297,9 @@ pub fn is_internal_handoff(message: &Message) -> bool {
             (
                 Some("supervised_root_outcome"),
                 Some("supervised_root_outcome_v1" | "managed_root_blocker_v1")
+            ) | (
+                Some(super::approval_handoff::SUBSYSTEM),
+                Some(super::approval_handoff::INSTRUCTION)
             )
         )
 }

@@ -48,7 +48,9 @@ pub(super) async fn sweep(
     after: &mut Option<String>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    use bamboo_orchestration::managed_session::approval_handoff::select_candidates;
+    use bamboo_orchestration::managed_session::{
+        approval::is_candidate, approval_handoff::select_candidates,
+    };
 
     if state
         .permission_section
@@ -62,10 +64,16 @@ pub(super) async fn sweep(
     let entries = state.session_store.list_index_entries().await;
     let candidates = select_candidates(
         entries.into_iter().filter_map(|entry| {
-            (entry.kind == SessionKind::Root
-                && entry.id != DEFAULT_SUPERVISOR_SESSION_ID
-                && entry.has_pending_question)
-                .then_some(entry.id)
+            let eligible = entry.id != DEFAULT_SUPERVISOR_SESSION_ID
+                && (is_candidate(
+                    entry.kind,
+                    entry.has_pending_question,
+                    entry.session_origin.as_deref(),
+                    entry.pending_material_run.unwrap_or(false),
+                ) || (entry.kind == SessionKind::Root
+                    && entry.has_pending_question
+                    && entry.pending_material_run.is_none()));
+            eligible.then_some(entry.id)
         }),
         after,
     );

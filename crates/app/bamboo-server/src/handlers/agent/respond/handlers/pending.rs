@@ -506,6 +506,8 @@ pub async fn list_supervisor_approval_cards(
                     "created_at": session.created_at,
                     "title": session.title,
                     "pending": pending,
+                    "supervisor_handoff_at": capture_approval_handoff(&state, &supervisor, &session)
+                        .map(|(handoff, _)| handoff.due_at),
                 }));
                 if approvals.len() == MAX_APPROVAL_CARDS {
                     break;
@@ -516,6 +518,42 @@ pub async fn list_supervisor_approval_cards(
     Ok(HttpResponse::Ok()
         .insert_header((header::CACHE_CONTROL, "no-store"))
         .json(serde_json::json!({ "approvals": approvals })))
+}
+
+pub(crate) fn capture_approval_handoff(
+    state: &AppState,
+    supervisor: &bamboo_domain::SupervisorReference,
+    target: &Session,
+) -> Option<(
+    bamboo_orchestration::managed_session::approval_handoff::ApprovalHandoff,
+    PermissionRequest,
+)> {
+    use bamboo_orchestration::managed_session::approval_handoff::ApprovalHandoff;
+
+    let snapshot = state.permission_section.snapshot();
+    let enabled_since = snapshot.data.supervisor_approval_handoff_since?;
+    let config = state.permission_checker.permission_config()?;
+    let pending = target.pending_question.as_ref()?;
+    let request = persisted_permission_request(target, &pending.tool_call_id)?;
+    // A rule narrowing an existing request cannot turn an originally forced
+    // confirmation into delegated authority.
+    if request.reason_code != bamboo_tools::permission::PermissionReasonCode::RiskThreshold {
+        return None;
+    }
+    let arguments = pending_tool_arguments_exact(target, &pending.tool_call_id)?;
+    let request = refresh_request_for_current_policy(&config, target, pending, &request)?;
+    if request.policy_revision != snapshot.revision {
+        return None;
+    }
+    let handoff = ApprovalHandoff::capture(
+        supervisor,
+        target,
+        &request,
+        &arguments,
+        &config,
+        enabled_since,
+    )?;
+    Some((handoff, request))
 }
 
 fn pending_question_display(

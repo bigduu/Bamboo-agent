@@ -6,9 +6,9 @@ use std::{
 };
 
 use bamboo_domain::{
-    Session, SessionCallerReference, SessionMessageBody, SessionMessageContent, SessionMessageEnvelope, SessionMessageId,
-    SessionMessageKind, SessionMessageSource, SessionProviderMessage, SessionRuntimeInstruction,
-    SupervisorReference,
+    Session, SessionCallerReference, SessionMessageBody, SessionMessageContent,
+    SessionMessageEnvelope, SessionMessageId, SessionMessageKind, SessionMessageSource,
+    SessionProviderMessage, SessionRuntimeInstruction, SupervisorReference,
 };
 use bamboo_permission::{
     config::canonicalize_path_for_matching, PermissionConfig, PermissionDecisionKind,
@@ -88,11 +88,19 @@ impl ApprovalHandoff {
         let due_at = parked_at.max(enabled_since).checked_add_signed(DELAY)?;
         let digest = SessionMessageId::stable(
             "supervisor-managed-permission:v1",
-            &json!([supervisor, SessionCallerReference::from(target), pending.occurrence]),
+            &json!([
+                supervisor,
+                SessionCallerReference::from(target),
+                pending.occurrence
+            ]),
         );
         let digest = &digest.as_str()["stable-".len()..][..32];
         let reference = format!("approval:{}/{digest}", target.id);
-        Some(Self { pending, reference, due_at })
+        Some(Self {
+            pending,
+            reference,
+            due_at,
+        })
     }
 
     pub fn notice(

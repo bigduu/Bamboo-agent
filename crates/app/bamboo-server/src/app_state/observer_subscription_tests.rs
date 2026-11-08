@@ -2115,6 +2115,202 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     f.state.shutdown().await;
 }
 
+#[actix_web::test]
+async fn ordinary_approval_handoff_waits_for_deadline_and_keeps_forced_requests_with_owner() {
+    exercise_ordinary_approval_handoff(PermissionDecisionKind::DenyOnce).await;
+}
+
+#[actix_web::test]
+async fn ordinary_approval_handoff_can_allow_the_exact_workspace_edit_once() {
+    exercise_ordinary_approval_handoff(PermissionDecisionKind::AllowOnce).await;
+}
+
+async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKind) {
+    use crate::handlers::agent::respond::{capture_approval_handoff, decide_delegated_approval};
+    use bamboo_orchestration::managed_session::approval_handoff::DELAY;
+    use bamboo_tools::permission::{
+        PermissionMode, PermissionReasonCode, PermissionRequest, PermissionType, RiskLevel,
+    };
+
+    let f = Fixture::new_with_native_source(true).await;
+    let state = &f.state;
+    let now = Utc::now();
+    let parked_at = now - DELAY - chrono::TimeDelta::seconds(1);
+    let snapshot = state.permission_section.snapshot();
+    let mut candidate = snapshot.data.as_ref().clone();
+    candidate.supervisor_approval_handoff_since = Some(parked_at);
+    state
+        .permission_section
+        .commit(snapshot.revision, candidate)
+        .unwrap();
+    let snapshot = state.permission_section.snapshot();
+    let config = state.permission_checker.permission_config().unwrap();
+    config.publish_persistent_policy(snapshot.revision, snapshot.data.as_ref());
+
+    let mut target = load(state, ROOT_A).await;
+    let workspace = std::fs::canonicalize(target.workspace_path_meta().unwrap()).unwrap();
+    let file = workspace.join("handoff-test.txt");
+    let file = bamboo_config::paths::path_to_display_string(&file);
+    let workspace = bamboo_config::paths::path_to_display_string(&workspace);
+    let call = "write-with-handoff";
+    target
+        .metadata
+        .insert("session.origin.v1".into(), "supervisor_created".into());
+    target.add_message(Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: call.into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "Write".into(),
+                arguments: json!({"file_path":file,"content":"test\n"}).to_string(),
+            },
+        }]),
+    ));
+    let request = PermissionRequest {
+        request_id: call.into(),
+        request_generation: "write-handoff-generation".into(),
+        session_id: target.id.clone(),
+        workspace_path: Some(workspace),
+        tool_name: "Write".into(),
+        permission_type: PermissionType::WriteFile,
+        resource: file.clone(),
+        operation_summary: "Write one file in the workspace".into(),
+        risk_level: RiskLevel::Medium,
+        reason_code: PermissionReasonCode::RiskThreshold,
+        effective_mode: PermissionMode::Default,
+        bypass_requested: false,
+        auto_approve_requested: false,
+        policy_revision: snapshot.revision,
+        matched_rule: None,
+        allowed_decisions: PermissionRequest::forced_decisions(),
+        suggested_matchers: vec![],
+    };
+    let mut parked = Message::tool_result(
+        call,
+        json!({
+            "status":"awaiting_permission_approval",
+            "permission_type":"write_file",
+            "permission_request":request,
+        })
+        .to_string(),
+    );
+    parked.created_at = parked_at;
+    target.add_message(parked);
+    target.set_pending_question_with_source(
+        call.into(),
+        "Write".into(),
+        "Write the test file?".into(),
+        vec!["Approve".into(), "Deny".into()],
+        false,
+        bamboo_domain::PendingQuestionSource::PauseTool,
+    );
+    state.save_and_cache_session(&mut target).await;
+    let target = load(state, ROOT_A).await;
+    let (handoff, current_request) = capture_approval_handoff(state, &f.reference, &target)
+        .expect("a pending, exact native workspace edit is eligible");
+    assert_eq!(handoff.due_at, parked_at + DELAY);
+    let mut reparked = target.clone();
+    let tool_result = reparked.messages.last_mut().unwrap();
+    tool_result.metadata = Some(json!({(bamboo_domain::PERMISSION_REPARKED_AT_KEY): now}));
+    let (fresh, request) = capture_approval_handoff(state, &f.reference, &reparked).unwrap();
+    assert_eq!(fresh.due_at, now + DELAY);
+    assert!(fresh.notice(&f.reference, &request, now).is_none());
+    let caller = SessionCallerReference::from(&load(state, &f.reference.session_id).await);
+    let decision = |kind| {
+        decide_delegated_approval(
+            state.clone(),
+            &caller,
+            ROOT_A.into(),
+            &handoff.reference,
+            kind,
+        )
+    };
+    assert!(decision(PermissionDecisionKind::DenyOnce).await.is_err());
+
+    let mut cursor = None;
+    crate::app_state::approval_handoff::sweep(
+        state,
+        &mut cursor,
+        handoff.due_at - chrono::TimeDelta::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    let notice = handoff.notice(&f.reference, &current_request, now).unwrap();
+    state
+        .session_inbox
+        .deliver_runtime_for_target(&notice, caller.created_at)
+        .await
+        .unwrap();
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    crate::app_state::approval_handoff::sweep(state, &mut cursor, now)
+        .await
+        .unwrap();
+    drive_material_notices(&f, 1).await;
+    settle_material_notices(&f).await;
+    // The stable Inbox proof is reused when the sweep restarts.
+    crate::app_state::approval_handoff::sweep(state, &mut None, now)
+        .await
+        .unwrap();
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    {
+        let inputs = f.probe.parent_inputs.lock().unwrap();
+        let notice = inputs[0]
+            .iter()
+            .find(|message| message.content.contains(&handoff.reference))
+            .expect("the original Supervisor received the timed review");
+        assert!(notice.content.contains(&file));
+        assert!(bamboo_orchestration::managed_session::is_internal_handoff(
+            notice
+        ));
+        assert!(bamboo_engine::session_app::execute::is_hidden_from_ui(
+            notice
+        ));
+    }
+
+    // Revalidation happens at the decision, even after a due notice exists.
+    config.set_ask_rules(["Write".into()]);
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    config.set_ask_rules(Vec::new());
+    assert!(decision(PermissionDecisionKind::AllowGlobal).await.is_err());
+
+    state
+        .approval_runtime
+        .set(Arc::downgrade(&state.clone().into_inner()))
+        .expect("bind the native decision port");
+    let result = invoke_managed_control(
+        state,
+        &f.reference,
+        "timed-decision",
+        json!({"action":"decide_approval", "target_session_id":ROOT_A,
+            "approval_reference":handoff.reference, "decision":final_decision}),
+    )
+    .await;
+    assert_eq!(
+        result["receipt"]["decision"]["decision"],
+        json!(final_decision)
+    );
+    assert!(load(state, ROOT_A).await.pending_question.is_none());
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    if final_decision == PermissionDecisionKind::AllowOnce {
+        tokio::time::timeout(WAIT, async {
+            loop {
+                if std::fs::read_to_string(&file).is_ok_and(|content| content == "test\n") {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the approved workspace edit executes on the original Session");
+    } else {
+        assert!(!std::path::Path::new(&file).exists());
+    }
+    state.shutdown().await;
+}
+
 pub(in crate::app_state) async fn exercise_material_root_notifications() {
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 

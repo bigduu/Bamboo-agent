@@ -7,6 +7,7 @@ use bamboo_domain::{
 use std::{future::Future, time::Duration};
 
 pub mod approval;
+pub mod approval_handoff;
 mod handoff;
 pub use handoff::{
     is_internal_handoff, project_handoff_notice, project_managed_notice, worker_handoff_context,
