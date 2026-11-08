@@ -27,7 +27,7 @@ use std::{
 use tokio::sync::Notify;
 
 #[path = "observer_background_exec_tests.rs"]
-mod background_exec;
+pub(in crate::app_state) mod background_exec;
 
 const PROVIDER: &str = "subscription-fixture";
 const READER: &str = "subscription-reader";
