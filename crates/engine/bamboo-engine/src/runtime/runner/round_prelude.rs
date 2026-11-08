@@ -244,7 +244,7 @@ async fn refresh_round_boundary_inner(
         for message in turn_refresh
             .committed_messages
             .iter()
-            .filter(|message| !crate::session_app::execute::is_hidden_from_ui(message))
+            .filter(|message| !bamboo_orchestration::managed_session::is_internal_handoff(message))
         {
             let _ = event_tx
                 .send(AgentEvent::message_appended(&session.id, message))

@@ -590,7 +590,7 @@ impl AppState {
         for message in refreshed
             .committed_messages
             .iter()
-            .filter(|message| !bamboo_engine::session_app::execute::is_hidden_from_ui(message))
+            .filter(|message| !bamboo_orchestration::managed_session::is_internal_handoff(message))
         {
             self.account_sink.record(
                 Some(id),
