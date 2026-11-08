@@ -16,16 +16,32 @@ pub fn legacy_candidate_limit(current: usize) -> usize {
     MAX_LEGACY_CANDIDATES.min(MAX_APPROVAL_CANDIDATES.saturating_sub(current))
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalCandidate {
+    Managed,
+    Legacy,
+}
+
 /// Index entries only select bounded reads. The current Session owns the proof.
-pub fn is_candidate(
+pub fn classify_candidate(
     kind: SessionKind,
     has_pending_question: bool,
     session_origin: Option<&str>,
-    pending_material_run: bool,
-) -> bool {
-    kind == SessionKind::Root
-        && has_pending_question
-        && (session_origin == Some(SUPERVISOR_CREATED) || pending_material_run)
+    pending_material_run: Option<bool>,
+    has_material_hint: bool,
+) -> Option<ApprovalCandidate> {
+    if kind != SessionKind::Root || !has_pending_question {
+        return None;
+    }
+    if session_origin == Some(SUPERVISOR_CREATED)
+        || pending_material_run.unwrap_or(has_material_hint)
+    {
+        Some(ApprovalCandidate::Managed)
+    } else if pending_material_run.is_none() {
+        Some(ApprovalCandidate::Legacy)
+    } else {
+        None
+    }
 }
 
 pub struct PendingApproval {

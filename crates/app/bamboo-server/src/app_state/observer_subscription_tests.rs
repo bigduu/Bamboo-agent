@@ -226,7 +226,13 @@ impl LLMProvider for Probe {
                 });
                 if let Some(result) = result {
                     if input == SUBSCRIBED_BATCH_INPUT {
-                        let payload: Value = serde_json::from_str(&result.content).unwrap();
+                        let payload: Value =
+                            serde_json::from_str(&result.content).unwrap_or_else(|error| {
+                                panic!(
+                                    "Invalid permission replay result: {error}; {}",
+                                    result.content
+                                )
+                            });
                         assert_eq!(payload["status"], "permissions_authorized");
                         assert_eq!(payload["permissions"].as_array().unwrap().len(), 2);
                     } else {
@@ -253,7 +259,7 @@ impl LLMProvider for Probe {
                         (
                             "exec_command",
                             json!({
-                                "cmd": format!("pwd && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
+                                "cmd": format!("pwd -P && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
                             }),
                         )
                     };
@@ -1630,8 +1636,13 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         .create_with_project_path("Subscribed dispatch", None, &workspace, Vec::new())
         .unwrap();
     let permissions = f.state.permission_checker.permission_config().unwrap();
-    permissions.set_default_session_permission_mode(SessionPermissionMode::Auto);
     let batch = decision == Some(PermissionDecisionKind::AllowSession);
+    if batch {
+        permissions.set_mode(bamboo_tools::permission::PermissionMode::Default);
+        permissions.set_default_session_permission_mode(SessionPermissionMode::Default);
+    } else {
+        permissions.set_default_session_permission_mode(SessionPermissionMode::Auto);
+    }
     if decision.is_some() && !batch {
         permissions.set_ask_rules(["exec_command".into()]);
     }
@@ -1834,6 +1845,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             assert_eq!(card["session_id"], target);
             assert_eq!(card["created_at"], json!(root.created_at));
             assert_eq!(card["title"], "Subscribed dispatch");
+            assert_eq!(card["workspace_path"], workspace);
             let pending = &card["pending"];
             let request = &pending["permission_request"];
             assert_eq!(request["request_id"], occurrence.tool_call_id);
@@ -1845,7 +1857,6 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
                 assert_eq!(request["resource"], HANDOFF_BATCH_RESOURCES[index]);
                 request["suggested_matchers"][0]["id"].as_str()
             } else {
-                assert_eq!(request["workspace_path"], workspace);
                 assert_eq!(request["reason_code"], "configured_always_ask");
                 let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
                 assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
@@ -1905,6 +1916,17 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         3
     };
     let worker = load(&f.state, target).await;
+    if decision == Some(PermissionDecisionKind::AllowOnce) {
+        let result = worker
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(HANDOFF_PERMISSION_CALL))
+            .expect("approved command result");
+        let result: Value = serde_json::from_str(&result.content).expect("structured exec result");
+        assert_eq!(result["exit_code"], 0);
+        let output = result["output"].as_str().unwrap();
+        assert_eq!(output.lines().next(), Some(workspace.as_str()));
+    }
     assert_eq!(
         worker
             .agent_runtime_state
@@ -1982,19 +2004,38 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .into_iter()
             .find(|candidate| candidate.run_id == fact.run_id)
             .unwrap();
-        let response = crate::handlers::agent::messages::patch_message(
-            f.state.clone(),
-            web::Path::from((target.to_string(), reference.message_id.clone())),
-            web::Json(crate::handlers::agent::messages::PatchMessageRequest {
-                content: "Edited result after delivery".into(),
-            }),
-        )
-        .await
-        .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(fact
-            .verified_final_message(&load(&f.state, target).await)
-            .is_none());
+        let mut reprojected: bamboo_domain::SessionMessageEnvelope =
+            serde_json::from_value(notice.metadata.as_ref().unwrap()["session_message"].clone())
+                .unwrap();
+        let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) =
+            &mut reprojected.body
+        else {
+            panic!("resumed handoff must be a typed runtime instruction");
+        };
+        assert_eq!(
+            instruction.data.as_ref().unwrap()["final_message"],
+            json!(reference)
+        );
+        assert!(!instruction
+            .content
+            .as_ref()
+            .unwrap()
+            .text
+            .contains(HANDOFF_HEAD));
+        let presentation = instruction.provider_message.as_mut().unwrap();
+        assert!(presentation.content.text.contains(HANDOFF_HEAD));
+        presentation.content = bamboo_domain::SessionMessageContent::text(
+            "Committed result text unavailable after a history change",
+        );
+        let (permanent, _, _) = f
+            .state
+            .observer_subscriptions
+            .inbox
+            .admitted_receipt_for_testing(&reprojected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permanent.id.as_str(), notice.id);
         let replayed = f
             .state
             .observer_subscriptions
@@ -2003,7 +2044,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(replayed.delivery.id.as_str(), notice.id);
+        assert_eq!(replayed.delivery, permanent);
         assert!(!replayed.pending);
         assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
     }
