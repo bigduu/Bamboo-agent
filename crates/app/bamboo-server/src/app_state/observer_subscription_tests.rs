@@ -2151,7 +2151,13 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     let workspace = workspace.canonicalize().unwrap();
     let workspace_name = bamboo_config::paths::path_to_display_string(&workspace);
     target.workspace = Some(workspace_name.clone());
-    target.set_workspace_path_meta(workspace_name);
+    target.set_workspace_path_meta(workspace_name.clone());
+    config.set_session_workspace(ROOT_A, Some(workspace_name));
+    target
+        .agent_runtime_state
+        .get_or_insert_with(Default::default)
+        .set_permission_mode(SessionPermissionMode::Default);
+    target.set_last_run_status("suspended");
     let file = workspace.join("handoff-test.txt");
     let file = bamboo_config::paths::path_to_display_string(&file);
     let workspace = bamboo_config::paths::path_to_display_string(&workspace);
@@ -2159,17 +2165,15 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     target
         .metadata
         .insert("session.origin.v1".into(), "supervisor_created".into());
-    target.add_message(Message::assistant(
-        "",
-        Some(vec![ToolCall {
-            id: call.into(),
-            tool_type: "function".into(),
-            function: FunctionCall {
-                name: "Write".into(),
-                arguments: json!({"file_path":file,"content":"test\n"}).to_string(),
-            },
-        }]),
-    ));
+    let tool_call = ToolCall {
+        id: call.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Write".into(),
+            arguments: json!({"file_path":file,"content":"test\n"}).to_string(),
+        },
+    };
+    target.add_message(Message::assistant("", Some(vec![tool_call.clone()])));
     let request = PermissionRequest {
         request_id: call.into(),
         request_generation: "write-handoff-generation".into(),
@@ -2194,10 +2198,25 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
         json!({
             "status":"awaiting_permission_approval",
             "permission_type":"write_file",
+            "resource": file,
             "permission_request":request,
         })
         .to_string(),
     );
+    use bamboo_agent_core::tools::{PendingToolOperation, PENDING_TOOL_OPERATION_METADATA_KEY};
+    let operation = PendingToolOperation::capture_with_contract(
+        SessionCallerReference::from(&target),
+        &parked.id,
+        &tool_call,
+        "Write",
+        &request.request_generation,
+        None,
+        true,
+    );
+    parked.metadata = Some(json!({
+        "permission_request": request,
+        (PENDING_TOOL_OPERATION_METADATA_KEY): operation.metadata_value(),
+    }));
     parked.created_at = parked_at;
     target.add_message(parked);
     target.set_pending_question_with_source(
@@ -2215,7 +2234,7 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     assert_eq!(handoff.due_at, parked_at + DELAY);
     let mut reparked = target.clone();
     let tool_result = reparked.messages.last_mut().unwrap();
-    tool_result.metadata = Some(json!({(bamboo_domain::PERMISSION_REPARKED_AT_KEY): now}));
+    tool_result.metadata.as_mut().unwrap()[bamboo_domain::PERMISSION_REPARKED_AT_KEY] = json!(now);
     let (fresh, request) = capture_approval_handoff(state, &f.reference, &reparked).unwrap();
     assert_eq!(fresh.due_at, now + DELAY);
     assert!(fresh.notice(&f.reference, &request, now).is_none());
@@ -2325,16 +2344,20 @@ async fn exercise_ordinary_approval_handoff(final_decision: PermissionDecisionKi
     assert!(load(state, ROOT_A).await.pending_question.is_none());
     assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
     if final_decision == PermissionDecisionKind::AllowOnce {
-        tokio::time::timeout(WAIT, async {
-            loop {
-                if std::fs::read_to_string(&file).is_ok_and(|content| content == "test\n") {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .expect("the approved workspace edit executes on the original Session");
+        assert_eq!(result["auto_resume_status"], "started", "{result}");
+        let completed = settled(state, ROOT_A).await;
+        let tool_result = completed
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(call))
+            .unwrap();
+        assert_eq!(
+            tool_result.tool_success,
+            Some(true),
+            "{}",
+            tool_result.content
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
     } else {
         assert!(!std::path::Path::new(&file).exists());
     }
