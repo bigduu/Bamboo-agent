@@ -26,6 +26,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+#[path = "observer_background_exec_tests.rs"]
+mod background_exec;
+
 const PROVIDER: &str = "subscription-fixture";
 const READER: &str = "subscription-reader";
 const PARENT: &str = "subscription-parent";
@@ -198,6 +201,12 @@ impl LLMProvider for Probe {
         _: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
+        if messages.iter().any(|message| {
+            message.role == bamboo_domain::Role::User
+                && message.content.contains(background_exec::INPUT)
+        }) {
+            return background_exec::stream(self, messages).await;
+        }
         let subscribed_input = messages.iter().rev().find(|message| {
             message.role == bamboo_domain::Role::User
                 && matches!(
