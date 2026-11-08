@@ -38,8 +38,8 @@ const PRIVATE: &str = "SOURCE_PRIVATE_TRANSCRIPT";
 const SUBSCRIBED_FIRST_INPUT: &str = "Produce a short first-input handoff.";
 const SUBSCRIBED_PERMISSION_INPUT: &str = "Produce a handoff after the gated command.";
 const SUBSCRIBED_DENY_INPUT: &str = "Produce a handoff if the gated command is declined.";
-const SUBSCRIBED_BATCH_INPUT: &str = "Produce a handoff after the two scoped approvals.";
-const HANDOFF_BATCH_RESOURCES: [&str; 2] = ["docker compose up -d", "registry.example.com"];
+const SUBSCRIBED_REPEAT_INPUT: &str = "Produce a handoff after two individually gated commands.";
+const HANDOFF_SECOND_PERMISSION_CALL: &str = "handoff-second-permission-command";
 const HANDOFF_PERMISSION_CALL: &str = "handoff-permission-command";
 const HANDOFF_COMMAND_OUTPUT: &str = "handoff-approval-executed";
 const HANDOFF_HEAD: &str = "The independent task verified the requested source.";
@@ -205,7 +205,7 @@ impl LLMProvider for Probe {
                     SUBSCRIBED_FIRST_INPUT
                         | SUBSCRIBED_PERMISSION_INPUT
                         | SUBSCRIBED_DENY_INPUT
-                        | SUBSCRIBED_BATCH_INPUT
+                        | SUBSCRIBED_REPEAT_INPUT
                 )
         });
         if let Some(input) = subscribed_input.map(|message| message.content.as_str()) {
@@ -221,59 +221,38 @@ impl LLMProvider for Probe {
                 self.source_release[0].notified().await;
             }
             if input != SUBSCRIBED_FIRST_INPUT {
-                let result = messages.iter().find(|message| {
-                    message.tool_call_id.as_deref() == Some(HANDOFF_PERMISSION_CALL)
-                });
-                if let Some(result) = result {
-                    if input == SUBSCRIBED_BATCH_INPUT {
-                        let payload: Value =
-                            serde_json::from_str(&result.content).unwrap_or_else(|error| {
-                                panic!(
-                                    "Invalid permission replay result: {error}; {}",
-                                    result.content
-                                )
-                            });
-                        assert_eq!(payload["status"], "permissions_authorized");
-                        assert_eq!(payload["permissions"].as_array().unwrap().len(), 2);
-                    } else {
+                let calls = [HANDOFF_PERMISSION_CALL, HANDOFF_SECOND_PERMISSION_CALL];
+                let call_count = if input == SUBSCRIBED_REPEAT_INPUT {
+                    2
+                } else {
+                    1
+                };
+                for &id in &calls[..call_count] {
+                    if let Some(result) = messages
+                        .iter()
+                        .find(|message| message.tool_call_id.as_deref() == Some(id))
+                    {
                         assert_eq!(
                             result.content.contains(HANDOFF_COMMAND_OUTPUT),
                             input != SUBSCRIBED_DENY_INPUT,
                             "unexpected gated command result: {}",
                             result.content
                         );
-                    }
-                } else {
-                    let (name, arguments) = if input == SUBSCRIBED_BATCH_INPUT {
-                        (
-                            "request_permissions",
-                            json!({
-                                "reason": "Validate two scoped approvals",
-                                "permissions": [
-                                    {"type":"execute_command","resource":HANDOFF_BATCH_RESOURCES[0]},
-                                    {"type":"http_request","resource":HANDOFF_BATCH_RESOURCES[1]},
-                                ],
-                            }),
-                        )
                     } else {
-                        (
-                            "exec_command",
-                            json!({
-                                "cmd": format!("pwd && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
-                            }),
-                        )
-                    };
-                    return Ok(Box::pin(futures::stream::iter([
-                        Ok(LLMChunk::ToolCalls(vec![ToolCall {
-                            id: HANDOFF_PERMISSION_CALL.into(),
-                            tool_type: "function".into(),
-                            function: FunctionCall {
-                                name: name.into(),
-                                arguments: arguments.to_string(),
-                            },
-                        }])),
-                        Ok(LLMChunk::Done),
-                    ])));
+                        return Ok(Box::pin(futures::stream::iter([
+                            Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                                id: id.into(),
+                                tool_type: "function".into(),
+                                function: FunctionCall {
+                                    name: "exec_command".into(),
+                                    arguments: json!({
+                                        "cmd": format!("pwd && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
+                                    }).to_string(),
+                                },
+                            }])),
+                            Ok(LLMChunk::Done),
+                        ])));
+                    }
                 }
             }
             let answer = format!(
@@ -1618,6 +1597,7 @@ async fn settle_material_notices(f: &Fixture) {
 
 pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     decision: Option<PermissionDecisionKind>,
+    repeat: bool,
 ) {
     use actix_web::http::StatusCode;
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
@@ -1633,14 +1613,8 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         .create_with_project_path("Subscribed dispatch", None, &workspace, Vec::new())
         .unwrap();
     let permissions = f.state.permission_checker.permission_config().unwrap();
-    let batch = decision == Some(PermissionDecisionKind::AllowSession);
-    if batch {
-        permissions.set_mode(bamboo_tools::permission::PermissionMode::Default);
-        permissions.set_default_session_permission_mode(SessionPermissionMode::Default);
-    } else {
-        permissions.set_default_session_permission_mode(SessionPermissionMode::Auto);
-    }
-    if decision.is_some() && !batch {
+    permissions.set_default_session_permission_mode(SessionPermissionMode::Auto);
+    if decision.is_some() {
         permissions.set_ask_rules(["exec_command".into()]);
     }
     permissions
@@ -1662,13 +1636,12 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             "project_id":project.id,
             "workspace_path":workspace,
             "title":"Subscribed dispatch",
-            "message":match decision {
+            "message":if repeat { SUBSCRIBED_REPEAT_INPUT } else { match decision {
                 Some(PermissionDecisionKind::AllowOnce) => SUBSCRIBED_PERMISSION_INPUT,
                 Some(PermissionDecisionKind::DenyOnce) => SUBSCRIBED_DENY_INPUT,
-                Some(PermissionDecisionKind::AllowSession) => SUBSCRIBED_BATCH_INPUT,
                 None => SUBSCRIBED_FIRST_INPUT,
                 _ => unreachable!("fixture uses the supported test decisions"),
-            },
+            }},
             "notify_on_material_event":true,
         }
     });
@@ -1726,7 +1699,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     settle_material_notices(&f).await;
     let expected_calls = if let Some(decision) = decision {
         let mut previous = None;
-        for index in 0..if batch { 2 } else { 1 } {
+        for index in 0..if repeat { 2 } else { 1 } {
             let suspended = tokio::time::timeout(WAIT, async {
                 loop {
                     let current = load(&f.state, target).await;
@@ -1748,7 +1721,10 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             .await
             .expect("next typed permission occurrence must park");
             let (root, occurrence) = suspended;
-            assert_eq!(occurrence.tool_call_id, HANDOFF_PERMISSION_CALL);
+            assert_eq!(
+                occurrence.tool_call_id,
+                [HANDOFF_PERMISSION_CALL, HANDOFF_SECOND_PERMISSION_CALL][index],
+            );
             let facts = &root
                 .runtime_metadata
                 .as_ref()
@@ -1783,18 +1759,12 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
                 request["request_generation"],
                 json!(occurrence.permission_generation)
             );
-            let matcher_id = if batch {
-                assert_eq!(request["resource"], HANDOFF_BATCH_RESOURCES[index]);
-                request["suggested_matchers"][0]["id"].as_str()
-            } else {
-                let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
-                assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
-                assert!(request["operation_summary"]
-                    .as_str()
-                    .unwrap()
-                    .contains(command));
-                None
-            };
+            let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
+            assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
+            assert!(request["operation_summary"]
+                .as_str()
+                .unwrap()
+                .contains(command));
             let response = crate::handlers::agent::respond::submit_permission_decision(
                 f.state.clone(),
                 web::Path::from(target.to_string()),
@@ -1804,7 +1774,6 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
                         "request_generation": request["request_generation"],
                         "expected_policy_revision": request["policy_revision"],
                         "decision": decision,
-                        "matcher_id": matcher_id,
                     }))
                     .unwrap(),
                 ),
@@ -1837,7 +1806,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
     );
     assert_eq!(
         f.probe.source_calls.load(Ordering::SeqCst),
-        if decision.is_some() { 2 } else { 1 },
+        1 + usize::from(decision.is_some()) + usize::from(repeat),
     );
     let facts = worker
         .runtime_metadata
@@ -1848,7 +1817,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
         .unwrap();
     let fact = facts.facts.last().unwrap();
     if decision.is_some() {
-        assert_eq!(facts.facts.len(), if batch { 3 } else { 2 });
+        assert_eq!(facts.facts.len(), if repeat { 3 } else { 2 });
         for pair in facts.facts.windows(2) {
             let [suspended, resumed] = pair else {
                 unreachable!()
