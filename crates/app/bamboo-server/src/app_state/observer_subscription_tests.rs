@@ -35,6 +35,8 @@ const ROOT_B: &str = "subscription-source-b";
 const PRIVATE: &str = "SOURCE_PRIVATE_TRANSCRIPT";
 const SUBSCRIBED_FIRST_INPUT: &str = "Produce a short first-input handoff.";
 const HANDOFF_HEAD: &str = "The independent task verified the requested source.";
+const HANDOFF_EVIDENCE: &str = "src/fixture.rs:42";
+const HANDOFF_RISK: &str = "The external integration was not exercised.";
 const HANDOFF_TAIL: &str = "DETAILS_STAY_IN_THE_EXECUTION_SESSION";
 const WAIT: Duration = Duration::from_secs(40);
 
@@ -191,10 +193,20 @@ impl LLMProvider for Probe {
         if messages.iter().any(|message| {
             message.role == bamboo_domain::Role::User && message.content == SUBSCRIBED_FIRST_INPUT
         }) {
+            assert!(
+                messages.iter().any(|message| {
+                    message.content.contains("Managed Session Delivery Summary")
+                        && message.content.contains("<!-- bamboo-handoff:v1 -->")
+                }),
+                "the exact subscribed Worker Run must receive the delivery contract"
+            );
             self.source_calls.fetch_add(1, Ordering::SeqCst);
             self.source_entered[0].notify_one();
             self.source_release[0].notified().await;
-            let answer = format!("{HANDOFF_HEAD}\n{}\n{HANDOFF_TAIL}", "界".repeat(500));
+            let answer = format!(
+                "{}\n<!-- bamboo-handoff:v1 -->\n- **Task** Verify fixture\n- **Conclusion** {HANDOFF_HEAD}\n- **Evidence** `{HANDOFF_EVIDENCE}`\n- **Risk** {HANDOFF_RISK}\n<!-- /bamboo-handoff:v1 -->\n{HANDOFF_TAIL}",
+                "界".repeat(500),
+            );
             return Ok(Box::pin(futures::stream::iter([
                 Ok(LLMChunk::Token(answer)),
                 Ok(LLMChunk::Done),
@@ -1648,6 +1660,12 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff() {
         panic!("exactly one durable handoff");
     };
     assert!(notice.content.contains(HANDOFF_HEAD), "{}", notice.content);
+    assert!(notice.content.contains(HANDOFF_EVIDENCE));
+    assert!(notice.content.contains(HANDOFF_RISK));
+    assert!(!notice.content.contains('界'));
+    assert!(bamboo_engine::session_app::execute::is_hidden_from_ui(
+        notice
+    ));
     assert!(notice.content.contains(&reference.message_id));
     assert!(notice.content.contains(&fact.run_id));
     assert!(notice.content.len() < 1_600);

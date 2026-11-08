@@ -87,7 +87,7 @@ impl ObserverSubscriptionCoordinator {
     ) -> Self {
         if native {
             inbox.enable_material_notifications(
-                bamboo_orchestration::managed_session::short_handoff_notice,
+                bamboo_orchestration::managed_session::project_handoff_notice,
             );
         }
         Self {

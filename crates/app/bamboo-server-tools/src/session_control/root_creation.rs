@@ -156,7 +156,7 @@ pub(super) fn request_schema() -> Value {
             "workspace_path":{"type":"string", "minLength":1, "maxLength":4096, "description":"Explicit existing workspace already bound to this Project by the Host; no caller workspace inheritance, path registration, or worktree creation."},
             "message":{"type":"string", "minLength":1, "maxLength":16384, "description":"One explicit first instruction, at most 16 KiB UTF-8. No private caller history is copied."},
             "title":{"type":["string","null"], "minLength":1, "maxLength":256},
-            "notify_on_material_event":{"type":"boolean", "default":false, "description":"Set true for new Supervisor work. Subscribe on the initial instruction to durable blocker and short handoff notices from its exact Run. Ask the execution Session to lead its final message with a brief result. Keep this flag on exact retries."}
+            "notify_on_material_event":{"type":"boolean", "default":false, "description":"Set true for new Supervisor work. Subscribe on the initial instruction to durable blocker and Worker summary notices from its exact Run. Keep this flag on exact retries."}
         },
         "required":["operation_id","expected_state_revision","project_id","workspace_path","message"]
     })

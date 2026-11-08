@@ -76,6 +76,9 @@ pub enum SupervisedRootOutcomeInputOrigin {
         /// exact authority. Legacy admissions have no notification target.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         notification_target: Option<SupervisorCurrentUserTarget>,
+        /// Chosen on the first admission. Replay retains the original notice bytes.
+        #[serde(default, skip_serializing_if = "is_false")]
+        structured_handoff: bool,
         target_created_at: DateTime<Utc>,
         operation_id: SessionMessageId,
     },
@@ -245,9 +248,11 @@ impl SupervisedRootOutcomeInputOrigin {
             Self::LegacyOrCreatedRoot {
                 target_created_at,
                 notification_target,
+                structured_handoff,
                 ..
             } => {
                 *target_created_at == root_created_at
+                    && (!structured_handoff || notification_target.is_some())
                     && notification_target.as_ref().is_none_or(matches_target)
                     && crate::supervisor_followup_message_id(
                         supervisor,
@@ -319,6 +324,7 @@ impl SupervisedRootOutcomeInputOrigin {
                     notification_target: left_notify,
                     target_created_at: left_target_birth,
                     operation_id: left_operation,
+                    ..
                 },
                 Self::LegacyOrCreatedRoot {
                     supervisor: right_supervisor,
@@ -328,12 +334,15 @@ impl SupervisedRootOutcomeInputOrigin {
                     notification_target: right_notify,
                     target_created_at: right_target_birth,
                     operation_id: right_operation,
+                    ..
                 },
             ) => {
                 left_supervisor == right_supervisor
                     && left_birth == right_birth
                     && left_target_birth == right_target_birth
                     && left_operation == right_operation
+                    // The original receipt also retains the presentation
+                    // contract across an upgrade while first-input retry is pending.
                     && left_notify.is_some() == right_notify.is_some()
             }
             _ => false,
@@ -2290,6 +2299,7 @@ mod tests {
                             caller: None,
                             requires_host_scope: None,
                             notification_target: None,
+                            structured_handoff: false,
                             target_created_at: birth,
                             operation_id: operation,
                         },

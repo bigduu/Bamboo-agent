@@ -6,6 +6,12 @@ use bamboo_domain::{
 };
 use std::{future::Future, time::Duration};
 
+mod handoff;
+pub use handoff::{
+    is_internal_handoff, project_handoff_notice, worker_handoff_context,
+    SUPERVISOR_HANDOFF_GUIDANCE,
+};
+
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
 const MAX_ACK_RECHECK: Duration = Duration::from_secs(4);
@@ -13,9 +19,8 @@ const RECENT_NOTIFICATION_SOURCES: usize = 8;
 const NOTIFICATION_PROOF_BUDGET: Duration = Duration::from_secs(2);
 const HANDOFF_EXCERPT_BYTES: usize = 900;
 
-/// The Host supplies the text only after proving the final message against Main.
-/// The worker's leading takeaway fits in a bounded, quoted data field.
-pub fn short_handoff_notice(
+/// Preserve the exact body used by an already admitted excerpt subscription.
+fn short_handoff_notice(
     outcome: &ObserverSupervisedRootOutcome,
     reference: Option<&RootFinalMessageReference>,
     committed_text: Option<&str>,
