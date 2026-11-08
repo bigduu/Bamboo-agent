@@ -42,8 +42,8 @@ pub fn select_candidates(
 }
 
 pub const DELAY: TimeDelta = TimeDelta::minutes(10);
-const SUBSYSTEM: &str = "supervisor_approval_handoff";
-const INSTRUCTION: &str = "supervisor_approval_handoff_v1";
+pub(super) const SUBSYSTEM: &str = "supervisor_approval_handoff";
+pub(super) const INSTRUCTION: &str = "supervisor_approval_handoff_v1";
 
 pub struct ApprovalHandoff {
     pub pending: PendingApproval,
