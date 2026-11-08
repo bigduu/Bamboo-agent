@@ -644,6 +644,40 @@ fn compact_frame_corruption_never_becomes_legacy_absence() {
 }
 
 #[test]
+fn compact_main_reopens_disabled_followup_authority_without_downgrading() {
+    let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+    let incarnation_id = Uuid::new_v4();
+    session.authority_identity = SessionAuthorityIdentity::Supervisor { incarnation_id };
+    session.supervisor_management = Some(SupervisorManagementState {
+        schema_version: bamboo_domain::SUPERVISOR_SESSION_FOLLOWUP_SCHEMA_VERSION,
+        incarnation_id,
+        revision: 12,
+        allowed_projects: Default::default(),
+        links: Default::default(),
+        observers: Default::default(),
+        subscriptions: Default::default(),
+        session_followup: None,
+    });
+
+    let raw = compact_main::serialize_main(&session).unwrap();
+    compact_main::validate_full_main(&raw).unwrap();
+    let reloaded: Session = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(
+        reloaded.supervisor_management,
+        session.supervisor_management
+    );
+    assert_eq!(compact_main::serialize_main(&reloaded).unwrap(), raw);
+
+    let management = session.supervisor_management.as_mut().unwrap();
+    management.session_followup = Some(json!({"project_id":"legacy-project"}));
+    assert!(compact_main::serialize_main(&session).is_err());
+    let management = session.supervisor_management.as_mut().unwrap();
+    management.session_followup = None;
+    management.schema_version += 1;
+    assert!(compact_main::serialize_main(&session).is_err());
+}
+
+#[test]
 fn compact_max_management_receipts_preserve_tombstones_and_bound_rejects() {
     let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
     let incarnation_id = Uuid::new_v4();
@@ -656,6 +690,7 @@ fn compact_max_management_receipts_preserve_tombstones_and_bound_rejects() {
         schema_version: 1,
         observers: Default::default(),
         subscriptions: Default::default(),
+        session_followup: None,
         incarnation_id,
         revision: u64::MAX,
         allowed_projects: projects,
