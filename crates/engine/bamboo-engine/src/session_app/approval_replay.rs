@@ -1861,6 +1861,7 @@ mod tests {
                 .unwrap()
                 .expect("second context must park");
         assert_eq!(reparked.question, "Approve context two?");
+        assert_eq!(session.last_run_status().as_deref(), Some("suspended"));
         assert_eq!(
             session
                 .pending_question
