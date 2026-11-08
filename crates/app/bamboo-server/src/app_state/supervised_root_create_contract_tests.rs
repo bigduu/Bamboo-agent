@@ -82,6 +82,7 @@ impl Fixture {
             workspace_path: workspace.to_string_lossy().into_owned(),
             message: "Inspect only this explicit assignment".into(),
             title: Some("Independent task".into()),
+            notify_on_material_event: false,
         };
         Self {
             home,

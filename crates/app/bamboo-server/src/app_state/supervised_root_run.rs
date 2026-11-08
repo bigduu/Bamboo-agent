@@ -464,6 +464,11 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     #[actix_web::test]
+    async fn subscribed_creation_retries_converge_and_wake_with_a_short_verified_handoff() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff().await;
+    }
+
+    #[actix_web::test]
     async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
         super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
     }

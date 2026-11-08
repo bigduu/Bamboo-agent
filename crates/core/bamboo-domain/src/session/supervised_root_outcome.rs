@@ -72,6 +72,10 @@ pub enum SupervisedRootOutcomeInputOrigin {
         caller: Option<crate::SessionCallerReference>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         requires_host_scope: Option<bool>,
+        /// Captured by the created Root's first-input writer while holding its
+        /// exact authority. Legacy admissions have no notification target.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        notification_target: Option<SupervisorCurrentUserTarget>,
         target_created_at: DateTime<Utc>,
         operation_id: SessionMessageId,
     },
@@ -100,6 +104,9 @@ impl SupervisedRootOutcomeInputOrigin {
             Self::CurrentUser {
                 notify_on_material_event: true,
                 ..
+            } | Self::LegacyOrCreatedRoot {
+                notification_target: Some(_),
+                ..
             }
         )
     }
@@ -107,7 +114,10 @@ impl SupervisedRootOutcomeInputOrigin {
     pub fn current_user_target(&self) -> Option<&SupervisorCurrentUserTarget> {
         match self {
             Self::CurrentUser { target, .. } => Some(target),
-            Self::LegacyOrCreatedRoot { .. } => None,
+            Self::LegacyOrCreatedRoot {
+                notification_target,
+                ..
+            } => notification_target.as_ref(),
         }
     }
 
@@ -214,15 +224,18 @@ impl SupervisedRootOutcomeInputOrigin {
         }) {
             return false;
         }
+        let matches_target = |target: &SupervisorCurrentUserTarget| {
+            target.session_id == root_id
+                && target.created_at == root_created_at
+                && target.kind == SessionKind::Root
+                && target.parent_session_id.is_none()
+                && (target.root_session_id.is_empty() || target.root_session_id == root_id)
+                && valid_digest(&target.authority_sha256)
+                && valid_digest(&target.ancestry_sha256)
+        };
         match self {
             Self::CurrentUser { target, .. } => {
-                target.session_id == root_id
-                    && target.created_at == root_created_at
-                    && target.kind == SessionKind::Root
-                    && target.parent_session_id.is_none()
-                    && (target.root_session_id.is_empty() || target.root_session_id == root_id)
-                    && valid_digest(&target.authority_sha256)
-                    && valid_digest(&target.ancestry_sha256)
+                matches_target(target)
                     && crate::supervisor_current_user_message_id(
                         supervisor,
                         target,
@@ -230,9 +243,12 @@ impl SupervisedRootOutcomeInputOrigin {
                     ) == *receipt_id
             }
             Self::LegacyOrCreatedRoot {
-                target_created_at, ..
+                target_created_at,
+                notification_target,
+                ..
             } => {
                 *target_created_at == root_created_at
+                    && notification_target.as_ref().is_none_or(matches_target)
                     && crate::supervisor_followup_message_id(
                         supervisor,
                         root_id,
@@ -300,6 +316,7 @@ impl SupervisedRootOutcomeInputOrigin {
                     supervisor_created_at: left_birth,
                     caller: _,
                     requires_host_scope: _,
+                    notification_target: left_notify,
                     target_created_at: left_target_birth,
                     operation_id: left_operation,
                 },
@@ -308,6 +325,7 @@ impl SupervisedRootOutcomeInputOrigin {
                     supervisor_created_at: right_birth,
                     caller: _,
                     requires_host_scope: _,
+                    notification_target: right_notify,
                     target_created_at: right_target_birth,
                     operation_id: right_operation,
                 },
@@ -316,6 +334,7 @@ impl SupervisedRootOutcomeInputOrigin {
                     && left_birth == right_birth
                     && left_target_birth == right_target_birth
                     && left_operation == right_operation
+                    && left_notify.is_some() == right_notify.is_some()
             }
             _ => false,
         }
@@ -2270,6 +2289,7 @@ mod tests {
                             supervisor_created_at: birth,
                             caller: None,
                             requires_host_scope: None,
+                            notification_target: None,
                             target_created_at: birth,
                             operation_id: operation,
                         },

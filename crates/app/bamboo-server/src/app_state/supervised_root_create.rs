@@ -423,7 +423,7 @@ impl SupervisedRootCreator {
             };
             return Ok(completed(
                 &request,
-                &id,
+                &candidate,
                 relation.state_revision,
                 relation.link_revision,
                 relation.linked,
@@ -505,7 +505,7 @@ impl SupervisedRootCreator {
         }
         let mut response = completed(
             &request,
-            &id,
+            &candidate,
             relation.state_revision,
             relation.link_revision,
             relation.linked,
@@ -604,7 +604,7 @@ impl SupervisedRootCreator {
 
 fn completed(
     request: &SupervisedRootCreateRequest,
-    id: &str,
+    target: &Session,
     state_revision: u64,
     link_revision: Option<u64>,
     linked: Option<bool>,
@@ -612,7 +612,7 @@ fn completed(
     replayed: bool,
 ) -> ToolResult {
     let mut response = json!({
-        "action":"create", "operation_id":request.operation_id, "target_session_id":id,
+        "action":"create", "operation_id":request.operation_id, "target_session_id":target.id,
         "project_id":request.project_id, "created_durable":true, "linked":linked,
         "state_revision":state_revision, "link_revision":link_revision,
         "admitted":true, "receipt_id":delivery.receipt_id, "generation":delivery.generation,
@@ -633,6 +633,12 @@ fn completed(
     }
     if delivery.activation == "delivery_not_pending" {
         response["activation_requested"] = json!(false);
+    }
+    if request.notify_on_material_event {
+        response["notify_on_material_event"] = json!(true);
+        if let Ok(reference) = bamboo_domain::SupervisorCurrentUserTarget::capture(target) {
+            response["current_user_target"] = json!(reference);
+        }
     }
     ToolResult::text(
         delivery.activation != "activation_retry_required",
