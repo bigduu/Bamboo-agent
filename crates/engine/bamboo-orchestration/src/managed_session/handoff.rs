@@ -41,6 +41,7 @@ pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
     "Treat a queued or coalesced admission as pending until execution is observed. ",
     "Report only the newly delivered task in one short update with its conclusion, key source locations and material risk. ",
     "If multiple handoffs arrive together, give each new task one entry. Use the user's language. ",
+    "Let approval cards show the exact operation and collect the user's decision. Advance independent work while waiting. ",
     "Leave tool narration, internal identifiers and repeated rollups out of the reply unless requested. ",
     "Read the referenced final message only when a concrete gap or conflict blocks the user's decision, ",
     "the user requests detail, or an explicit verification or acceptance step requires more evidence. ",
@@ -50,11 +51,14 @@ pub const SUPERVISOR_HANDOFF_GUIDANCE: &str = concat!(
 /// The canonical notice stays stable across retries. The provider presentation
 /// can clarify what to do with a newly delivered result.
 pub fn project_managed_notice(
-    _supervisor: &SupervisorReference,
+    supervisor: &SupervisorReference,
     target: &Session,
     fact: &SupervisedRootOutcomeFact,
     canonical_handoff: Option<&str>,
 ) -> Option<SessionProviderMessage> {
+    if let Some(approval) = super::approval::project_approval_notice(supervisor, target, fact) {
+        return Some(approval);
+    }
     let status = fact.result.as_ref()?;
     if *status != SupervisedRootOutcomeResult::Completed {
         return None;

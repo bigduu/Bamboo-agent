@@ -130,6 +130,10 @@ pub fn agent_routes(cfg: &mut web::ServiceConfig) {
             web::get().to(agent::supervisor::inspect_managed_sessions),
         )
         .route(
+            "/supervisor/default/approvals",
+            web::get().to(agent::respond::list_supervisor_approval_cards),
+        )
+        .route(
             "/supervisor/default/sessions/{target_id}/history",
             web::post().to(agent::supervisor::inspect_managed_history),
         )

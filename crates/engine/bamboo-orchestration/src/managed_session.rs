@@ -2,16 +2,20 @@
 use async_trait::async_trait;
 use bamboo_domain::{
     ManagedRootEvent, ManagedRootEventRead, ManagedRootNotification, ObserverSupervisedRootOutcome,
-    RootFinalMessageReference, Session,
+    RootFinalMessageReference, Session, SessionPermissionMode,
 };
 use std::{future::Future, time::Duration};
 
+pub mod approval;
 mod handoff;
 pub use handoff::{
     is_internal_handoff, project_handoff_notice, project_managed_notice, worker_handoff_context,
     DISPATCH_CONFIRMATION, SUPERVISOR_HANDOFF_GUIDANCE,
 };
 
+/// New independent execution Sessions keep explicit confirmation policies.
+pub const DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE: SessionPermissionMode =
+    SessionPermissionMode::Bypass;
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
 const MAX_ACK_RECHECK: Duration = Duration::from_secs(4);

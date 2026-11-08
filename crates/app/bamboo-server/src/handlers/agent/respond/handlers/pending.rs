@@ -1,4 +1,4 @@
-use actix_web::{web, HttpResponse, Result};
+use actix_web::{http::header, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::{PendingQuestion, Role, Session};
 use bamboo_tools::permission::{
     PermissionConfig, PermissionDecisionKind, PermissionDecisionReceipt, PermissionEvaluation,
@@ -418,24 +418,134 @@ pub async fn get_pending_question(
         })));
     };
 
+    Ok(HttpResponse::Ok().json(pending_question_display(&state, &session, None)))
+}
+
+/// Use the same display and private argument redaction as the owning Session.
+/// The index limits the reads. Only the current Session can supply a card.
+pub async fn list_supervisor_approval_cards(
+    state: web::Data<AppState>,
+    request: HttpRequest,
+) -> Result<HttpResponse> {
+    use bamboo_domain::{SessionKind, SupervisorReference, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_orchestration::managed_session::approval::{
+        is_candidate, legacy_candidate_limit, PendingApproval, MAX_APPROVAL_CANDIDATES,
+        MAX_APPROVAL_CARDS,
+    };
+
+    crate::handlers::agent::tickets::user(&state, &request)
+        .await
+        .map_err(crate::handlers::agent::tickets::TicketHttpError::from)?;
+    let supervisor = state
+        .storage
+        .load_root_authority(DEFAULT_SUPERVISOR_SESSION_ID)
+        .await
+        .map_err(crate::error::AppError::from)?
+        .and_then(|root| root.supervisor_incarnation_id())
+        .map(|incarnation_id| SupervisorReference {
+            session_id: DEFAULT_SUPERVISOR_SESSION_ID.into(),
+            incarnation_id,
+        });
+    let mut approvals = Vec::new();
+    if let Some(supervisor) = supervisor {
+        let candidate = |entry: &bamboo_storage::SessionIndexEntry| {
+            entry.id != supervisor.session_id
+                && is_candidate(
+                    entry.kind,
+                    entry.has_pending_question,
+                    entry.session_origin.as_deref(),
+                    entry
+                        .pending_material_run
+                        .unwrap_or(entry.material_notification_hint.is_some()),
+                )
+        };
+        let mut entries = state
+            .session_store
+            .recent_index_entries_matching(MAX_APPROVAL_CANDIDATES, candidate)
+            .await;
+        let legacy_limit = legacy_candidate_limit(entries.len());
+        if legacy_limit != 0 {
+            entries.extend(
+                state
+                    .session_store
+                    .recent_index_entries_matching(legacy_limit, |entry| {
+                        entry.id != supervisor.session_id
+                            && entry.kind == SessionKind::Root
+                            && entry.has_pending_question
+                            && entry.pending_material_run.is_none()
+                            && !candidate(entry)
+                    })
+                    .await,
+            );
+        }
+        for entry in entries {
+            // A display refresh may rehydrate the exact typed request. Order
+            // that write with decisions that consume or replace the request.
+            let _response =
+                bamboo_engine::session_app::respond::acquire_pending_response_guard(&entry.id)
+                    .await;
+            let Ok(Some(session)) = state.storage.load_session(&entry.id).await else {
+                continue;
+            };
+            let Some(approval) =
+                PendingApproval::capture(&supervisor, &session).filter(|approval| {
+                    session.created_at == entry.created_at
+                        && approval.is_managed(&supervisor, &session)
+                })
+            else {
+                continue;
+            };
+            let pending = pending_question_display(
+                &state,
+                &session,
+                approval.occurrence.permission_generation.as_deref(),
+            );
+            if pending["permission_request"].is_object() {
+                approvals.push(serde_json::json!({
+                    "session_id": session.id,
+                    "created_at": session.created_at,
+                    "title": session.title,
+                    "pending": pending,
+                }));
+                if approvals.len() == MAX_APPROVAL_CARDS {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(HttpResponse::Ok()
+        .insert_header((header::CACHE_CONTROL, "no-store"))
+        .json(serde_json::json!({ "approvals": approvals })))
+}
+
+fn pending_question_display(
+    state: &AppState,
+    session: &Session,
+    expected_generation: Option<&str>,
+) -> serde_json::Value {
     match session.pending_question.as_ref() {
         Some(pending) => {
+            let matches_generation = |request: &PermissionRequest| {
+                expected_generation
+                    .is_none_or(|generation| request.request_generation == generation)
+            };
             let permission_config = state.permission_checker.permission_config();
             let in_memory_request = permission_config
                 .as_ref()
                 .and_then(|config| {
-                    config.pending_request(&session_id, pending.tool_call_id.as_str())
+                    config.pending_request(&session.id, pending.tool_call_id.as_str())
                 })
-                .filter(|request| request_matches_pending(request, &session, pending));
-            let mut interaction =
-                resolve_pending_interaction(&session, pending, in_memory_request.clone());
+                .filter(matches_generation);
+            let mut interaction = resolve_pending_interaction(session, pending, in_memory_request);
+            interaction.permission_request =
+                interaction.permission_request.filter(matches_generation);
             if let (Some(config), Some(request)) = (
                 permission_config.as_ref(),
                 interaction.permission_request.as_ref(),
             ) {
                 if request.policy_revision != config.policy_revision() {
                     interaction.permission_request =
-                        refresh_request_for_current_policy(config, &session, pending, request);
+                        refresh_request_for_current_policy(config, session, pending, request);
                 }
             }
             if let (Some(config), Some(request)) = (
@@ -451,7 +561,7 @@ pub async fn get_pending_question(
             let bounded_tool_arguments = (interaction.kind == PendingInteractionKind::Permission)
                 .then(|| {
                     pending_tool_arguments_for_display(
-                        &session,
+                        session,
                         pending,
                         interaction.permission_request.as_ref(),
                     )
@@ -573,7 +683,7 @@ pub async fn get_pending_question(
                     request
                 });
 
-            Ok(HttpResponse::Ok().json(serde_json::json!({
+            serde_json::json!({
                 "has_pending_question": true,
                 "question": if browser_arguments_unavailable {
                     "Approve browser action?"
@@ -601,12 +711,12 @@ pub async fn get_pending_question(
                 "permission_request": permission_request_for_display,
                 "tool_arguments": tool_arguments,
                 "tool_arguments_truncated": tool_arguments_truncated,
-            })))
+            })
         }
-        None => Ok(HttpResponse::Ok().json(serde_json::json!({
+        None => serde_json::json!({
             "has_pending_question": false,
             "interaction_kind": null,
-        }))),
+        }),
     }
 }
 
@@ -712,6 +822,92 @@ mod http_tests {
             })
             .to_string(),
         )
+    }
+
+    #[actix_web::test]
+    async fn supervisor_approval_cards_redact_private_input_and_filter_before_the_limit() {
+        use bamboo_engine::session_app::supervisor::SupervisorSessionService;
+        use bamboo_orchestration::managed_session::approval::MAX_APPROVAL_CANDIDATES;
+
+        let home = tempdir().unwrap();
+        let state = web::Data::new(AppState::new(home.path().to_path_buf()).await.unwrap());
+        SupervisorSessionService::new(state.session_store.clone())
+            .get_or_create_default("test-model")
+            .await
+            .unwrap();
+
+        let private_input = "private browser input for approval fixture";
+        let tool_call_id = "browser-approval";
+        for index in 0..=MAX_APPROVAL_CANDIDATES {
+            let id = format!("parked-browser-{index}");
+            let mut session = Session::new(&id, "test-model");
+            if index == 0 {
+                session
+                    .metadata
+                    .insert("session.origin.v1".into(), "supervisor_created".into());
+            }
+            let mut request = permission_request(&id, tool_call_id);
+            request.tool_name = "browser".into();
+            request.permission_type = PermissionType::BrowserInteraction;
+            request.resource = "browser:17:type:focused:opaque".into();
+            request.operation_summary = format!("Type {private_input}");
+            session.add_message(assistant_browser_call(
+                tool_call_id,
+                &serde_json::json!({
+                    "action":"type", "text":private_input, "expected_epoch":17,
+                })
+                .to_string(),
+            ));
+            session.add_message(permission_tool_result(
+                tool_call_id,
+                serde_json::json!(request),
+            ));
+            session.set_pending_question_with_source(
+                tool_call_id.into(),
+                "browser".into(),
+                format!("Approve {private_input}?"),
+                vec!["Approve".into(), "Deny".into()],
+                false,
+                PendingQuestionSource::PauseTool,
+            );
+            state.storage.save_session(&session).await.unwrap();
+        }
+        let app = test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(configure_routes),
+        )
+        .await;
+        let get = |peer: &str| {
+            test::TestRequest::get()
+                .uri("/api/v1/supervisor/default/approvals")
+                .peer_addr(peer.parse().unwrap())
+                .to_request()
+        };
+        let remote = test::call_service(&app, get("192.0.2.10:8080")).await;
+        assert_eq!(remote.status(), StatusCode::FORBIDDEN);
+        let response = test::call_service(&app, get("127.0.0.1:8080")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-store"
+        );
+        let cards: Value = test::read_body_json(response).await;
+        let [card] = cards["approvals"].as_array().unwrap().as_slice() else {
+            panic!("only the Supervisor-managed card should be visible");
+        };
+        assert_eq!(card["session_id"], "parked-browser-0");
+        assert_eq!(
+            card["pending"]["permission_request"]["request_generation"],
+            "generation-browser-approval"
+        );
+        assert_eq!(card["pending"]["tool_arguments"]["text"], "[redacted]");
+        assert_eq!(
+            card["pending"]["permission_request"]["resource"],
+            "[redacted]"
+        );
+        assert!(!cards.to_string().contains(private_input));
+        state.shutdown().await;
     }
 
     /// `GET /api/v1/sessions/{id}/respond/pending` for an unknown session must
