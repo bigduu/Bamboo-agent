@@ -559,9 +559,9 @@ pub(super) fn current_project_manifest(
     if snapshot.execution_facts_revision() != source_revision {
         return Err(Error::RevisionConflict);
     }
-    let plan = Plan::prepare(&snapshot, scope, &commit, 0)?;
-    let manifest = read_project_manifest(projects, root, &plan.context().project_id)?;
-    plan.validate_project(&manifest)?;
+    let adoption = core::AdoptedProject::for_assignment(&snapshot, scope)?;
+    let manifest = read_project_manifest(projects, root, &adoption.context().project_id)?;
+    adoption.validate_project(&manifest)?;
     if service.published()?.1.execution_facts_revision() != source_revision {
         return Err(Error::RevisionConflict);
     }
