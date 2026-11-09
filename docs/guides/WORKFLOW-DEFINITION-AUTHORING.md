@@ -52,9 +52,14 @@ Example create body:
 
 The response returns the normalized definition, description, source,
 `content_digest`, `skill_digest`, `saved`, and `catalog_available`. The first
-digest is SHA-256 of the exact `workflow.yaml` bytes; the second is SHA-256 of
-its immutable `SKILL.md` header/body. Neither token is the catalog's separate
+digest is SHA-256 of the exact `workflow.yaml` bytes. The second is SHA-256 of
+the exact `SKILL.md` header and body. Neither token is the catalog's separate
 bundle `catalog_content_digest`. Echo both editing tokens for an update.
+An update can include a new `description`. When the description changes, Bamboo
+exchanges the generated two-file bundle so the description and definition take
+effect together. Omitting the description or passing the current one updates
+`workflow.yaml` in place and preserves any added resources. A bundle with
+additional resources rejects a description change.
 An observed stale revision, changed metadata, replacement file identity or an
 existing create destination produces a conflict before publication. An external
 editor can still replace the definition after the final check. Updates exchange
@@ -80,8 +85,8 @@ project-authored definition to revise.
   through the normal Workflow Run engine.
 - `GET /sessions/{session_id}/workflow-proposals/{run_id}` reports run state.
   A successful run projects a validated draft, a clarification, or an unchanged
-  definition. Drafts include the pinned Project and any previous definition
-  and edit tokens so the client can render a revision comparison.
+  definition and description. Drafts include the pinned Project, the previous
+  description and definition when present, and the edit tokens for comparison.
 - The user's save action calls the existing create or update API with
   `expected_project_id`. The server checks this against the durable Session
   assignment under the Session scope lock. Revisions also require the original
@@ -93,9 +98,8 @@ orchestration definitions.
 
 ## Boundaries
 
-- The canonical location is the existing owned Skill bundle, containing generated
-  immutable `SKILL.md` and `workflow.yaml` (JSON is valid YAML). There is no new
-  definition registry or run format.
+- The canonical location is the existing owned Skill bundle containing generated
+  `SKILL.md` and `workflow.yaml` (JSON is valid YAML).
 - This first slice only edits bundles marked by this authoring API. It does not
   adopt arbitrary external bundles, builtins, plugins, or builtin-clone
   publications. Existing unmanaged content remains untouched. External metadata
@@ -131,7 +135,7 @@ orchestration definitions.
   publication keep their existing platform paths; this change does not certify
   those paths on Windows.
 - Writes use the shared descriptor-bound publication lock, bounded no-follow
-  reads, no-replace creation and preserving exchange for updates. Prior files
+  reads, no-replace creation and preserving exchange for updates. Prior files or bundles
   from successful updates and failed/uncertain stages are retained outside
   catalog discovery. The API never swaps back over a later editor's version,
   adopts retained entries or automatically removes them. An uncertain error is

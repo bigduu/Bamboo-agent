@@ -53,6 +53,8 @@ pub struct UpdateDefinitionRequest {
     pub expected_revision: u64,
     pub expected_digest: String,
     pub expected_skill_digest: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub definition: Value,
 }
 
@@ -492,6 +494,8 @@ async fn response_for(
                 && entry.kind == WorkflowKind::Orchestration
                 && entry.status == WorkflowStatus::Valid
                 && entry.revision == definition.revision
+                // Discovery normalizes whitespace in portable Skill descriptions.
+                && entry.description.split_whitespace().eq(description.split_whitespace())
         });
     // Same-revision external edits or missing nested revisions must not make
     // an unrelated publication look executable merely because its id matches.
@@ -666,6 +670,15 @@ pub async fn update_workflow_definition(
     if let Err(response) = verify_authored_skill(&id, &current.skill_bytes) {
         return Ok(*response);
     }
+    let revised_skill = match body
+        .description
+        .as_deref()
+        .map(|value| skill_bytes(&id, value))
+        .transpose()
+    {
+        Ok(skill) => skill,
+        Err(response) => return Ok(*response),
+    };
     if let Err(response) = stored_definition(&current) {
         return Ok(*response);
     }
@@ -686,7 +699,10 @@ pub async fn update_workflow_definition(
             &expected_digest,
             revision,
             &expected_skill_digest,
-            &bytes,
+            definition_publication::DefinitionReplacement {
+                definition: &bytes,
+                skill: revised_skill.as_deref(),
+            },
         );
         (result, session_guard)
     })

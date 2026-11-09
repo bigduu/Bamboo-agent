@@ -15,6 +15,10 @@ use wiremock::{
 
 const SESSION: &str = "workflow-teaching-session";
 const MODEL: &str = "workflow-teaching-fixture";
+const DESCRIPTIONS: [&str; 2] = [
+    "Read the first  project fixture",
+    "Read the second project fixture",
+];
 
 struct Host(Child);
 
@@ -63,7 +67,7 @@ fn provider_response(request: &Request, files: &[PathBuf; 2]) -> ResponseTemplat
             "Keep reported_evidence, reported_verification, proposals, blockers, and open_decisions present and empty for every outcome."
         ));
         let draft = json!({
-            "decision":"draft", "description":"Read the project fixture",
+            "decision":"draft", "description":DESCRIPTIONS[index],
             "definition":{
                 "workflow_schema":1, "id":"read-project-fixture", "revision":index + 1,
                 "steps":[{"id":"inspect","type":"tool","tool":"Read","capabilities":["read"],
@@ -225,17 +229,18 @@ async fn workflow_skill_teaching_runs_the_curator_and_publishes_only_accepted_re
         assert_eq!(proposal["decision"], "draft");
         assert_eq!(proposal["project_id"], project_id);
         assert_eq!(proposal["definition"]["revision"], revision);
+        let expected_description = DESCRIPTIONS[revision as usize - 1];
+        assert_eq!(proposal["description"], expected_description);
         assert!(body.get("prompt").is_none());
 
         let mut publication = json!({"target":"project","session_id":SESSION,"expected_project_id":project_id,
-            "definition":proposal["definition"]});
+            "definition":proposal["definition"], "description":proposal["description"]});
         let saved = if revision == 1 {
             assert_eq!(
                 client.get(&read_url).send().await.unwrap().status(),
                 StatusCode::NOT_FOUND
             );
             assert!(proposal["base"].is_null());
-            publication["description"] = proposal["description"].clone();
             expect_json(
                 client
                     .post(&definitions)
@@ -250,7 +255,9 @@ async fn workflow_skill_teaching_runs_the_curator_and_publishes_only_accepted_re
             let still_saved =
                 expect_json(client.get(&read_url).send().await.unwrap(), StatusCode::OK).await;
             assert_eq!(still_saved["definition"]["revision"], 1);
+            assert_eq!(still_saved["description"], DESCRIPTIONS[0]);
             assert_eq!(proposal["base"]["definition"], still_saved["definition"]);
+            assert_eq!(proposal["base"]["description"], still_saved["description"]);
             publication["expected_revision"] = json!(1);
             publication["expected_digest"] = proposal["base"]["content_digest"].clone();
             publication["expected_skill_digest"] = proposal["base"]["skill_digest"].clone();
@@ -277,6 +284,39 @@ async fn workflow_skill_teaching_runs_the_curator_and_publishes_only_accepted_re
             saved
         };
         assert_eq!(saved["catalog_available"], true);
+        assert_eq!(saved["description"], expected_description);
+        let read_back =
+            expect_json(client.get(&read_url).send().await.unwrap(), StatusCode::OK).await;
+        assert_eq!(read_back["description"], expected_description);
+        assert_eq!(read_back["skill_digest"], saved["skill_digest"]);
+        if revision == 2 {
+            assert_ne!(saved["skill_digest"], proposal["base"]["skill_digest"]);
+        }
+        let catalog = expect_json(
+            client
+                .get(format!(
+                    "{base}/bamboo/workflow-catalog?session_id={SESSION}"
+                ))
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::OK,
+        )
+        .await;
+        let entry = catalog["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == "read-project-fixture")
+            .unwrap();
+        assert_eq!(
+            entry["description"],
+            expected_description
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        assert_eq!(entry["revision"], revision);
         let run = expect_json(
             client
                 .post(&runs)

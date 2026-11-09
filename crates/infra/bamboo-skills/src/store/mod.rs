@@ -1544,7 +1544,7 @@ impl SkillStore {
         let mut dirs = dirs;
         let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
         dirs.extend(discover_plugin_skill_dirs(&plugins_root).await);
-        let (mut report, captures) = load_captured_records(
+        let (mut report, captures, authored_headers) = load_captured_records(
             &dirs,
             self.snapshot_limits.max_file_bytes,
             MAX_WORKFLOWS_PER_PUBLICATION,
@@ -1674,6 +1674,10 @@ impl SkillStore {
             &HashMap::new(),
         )
         .await?;
+        // An authored update can swap the whole directory between discovery and
+        // resource capture. Reject that refresh instead of publishing a mixed pair.
+        storage::verify_authored_headers(&authored_headers, resolved_workflow_roots.values())
+            .await?;
         let mut resolved_sources = HashMap::new();
         for entry in &mut skill_entries {
             let Some(captured) = winner_captures.get(&entry.id) else {
@@ -5742,6 +5746,59 @@ Use this skill for testing.
             .await
             .expect("LKG remains executable");
         assert_eq!(pinned.root(), original.root());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authored_workflow_refresh_rejects_a_bundle_replaced_after_discovery() {
+        const ID: &str = "authored-review";
+        let directory = tempfile::tempdir().unwrap();
+        let skills_dir = directory.path().join("skills");
+        let root = skills_dir.join(ID);
+        let replacement = directory.path().join("replacement");
+        let retained = directory.path().join("retained");
+        for (path, revision, description) in [
+            (&root, 1, "Original description"),
+            (&replacement, 2, "Revised description"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("SKILL.md"), format!("---\nname: {ID}\ndescription: {description}\nmetadata:\n  workflow_definition_authoring: 1\n---\n\nInstructions\n")).unwrap();
+            std::fs::write(path.join("workflow.yaml"), orchestration_yaml(ID, revision)).unwrap();
+        }
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.unwrap();
+        store.set_source_snapshot_hook(move || {
+            std::fs::rename(&root, retained).unwrap();
+            std::fs::rename(replacement, root).unwrap();
+        });
+
+        assert!(store.reload().await.is_err());
+        let entry = store
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == ID)
+            .unwrap();
+        assert_eq!(
+            (entry.revision, entry.description.as_str()),
+            (1, "Original description")
+        );
+        store.reload().await.unwrap();
+        let entry = store
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == ID)
+            .unwrap();
+        assert_eq!(
+            (entry.revision, entry.description.as_str()),
+            (2, "Revised description")
+        );
     }
 
     #[tokio::test]

@@ -28,7 +28,7 @@ const CURATOR_GUIDANCE: &str = r#"You author Bamboo Workflow Skill proposals. Us
 Keep reported_evidence, reported_verification, proposals, blockers, and open_decisions present and empty for every outcome. The proposal or question in summary fulfills the assignment's reporting requirements. Do not include Markdown fences or text outside the JSON.
 Use outcome "blocked" if clarification is needed and put {"decision":"clarify","question":"a focused question in the user's language"} in summary. Ask for clarification when the goal, input, or result is unclear or needs a write, network access, shell, or another unsupported action.
 
-For a supported task, put {"decision":"draft","description":"one line describing when to use this workflow","definition":{...}} in summary. Keep the compact summary under 2048 UTF-8 bytes. Use schema 1 and a kebab-case id. For a new definition use revision 1. For a revision use the previous id and revision plus one, preserving unaffected steps and inputs. Available steps are read-only file tools Read, Glob, Grep, GetFileInfo and optionally the named Agent reviewer. Use actual tool argument names and capabilities ["read"]. Bind dynamic file_path to a required string input. Agent prompts are strings or {"from":"args","pointer":"/input_name"}. No nested workflows, secret values, permission or invocation fields. Example definition:
+For a supported task, put {"decision":"draft","description":"one line describing when to use this workflow","definition":{...}} in summary. Keep the compact summary under 2048 UTF-8 bytes. Use schema 1 and a kebab-case id. For a new definition use revision 1. For a revision use the previous id and revision plus one, preserving unaffected steps and inputs. Update the description if requested or if the previous description no longer matches the revised workflow. Otherwise preserve the previous description. Available steps are read-only file tools Read, Glob, Grep, GetFileInfo and optionally the named Agent reviewer. Use actual tool argument names and capabilities ["read"]. Bind dynamic file_path to a required string input. Agent prompts are strings or {"from":"args","pointer":"/input_name"}. No nested workflows, secret values, permission or invocation fields. Example definition:
 {"workflow_schema":1,"id":"inspect-file","revision":1,"input_schema":{"type":"object","required":["path"],"additionalProperties":false,"properties":{"path":{"type":"string"}}},"steps":[{"id":"inspect","type":"tool","tool":"Read","args":{"file_path":{"from":"args","pointer":"/path"}},"capabilities":["read"]}],"plan":{"type":"step","step":"inspect"}}
 For a sequence use {"type":"sequence","nodes":[{"type":"step","step":"first"},{"type":"step","step":"second"}]}. Earlier output can be referenced with {"from":"step","step":"first","pointer":""}.
 "#;
@@ -264,22 +264,19 @@ fn project_output(
             {
                 return Err(invalid_proposal());
             }
-            let description = match &base {
-                None if definition.revision == 1 => {
-                    let description = description.trim();
-                    skill_bytes(&definition.id, description).map_err(|_| invalid_proposal())?;
-                    description
-                }
+            let description = description.trim();
+            skill_bytes(&definition.id, description).map_err(|_| invalid_proposal())?;
+            match &base {
+                None if definition.revision == 1 => {}
                 Some(base)
                     if definition.id == base.definition.id
                         && base.definition.revision.checked_add(1) == Some(definition.revision) =>
                 {
                     let mut prior = base.definition.clone();
                     prior.revision = definition.revision;
-                    if prior == definition {
+                    if prior == definition && base.description == description {
                         return Ok(json!({ "decision": "no_change" }));
                     }
-                    &base.description
                 }
                 _ => return Err(invalid_proposal()),
             };
@@ -309,9 +306,9 @@ mod tests {
         })
     }
 
-    fn child_report(definition: Value) -> Value {
+    fn child_report(definition: Value, description: &str) -> Value {
         let summary = json!({
-            "decision":"draft", "description":"Read the selected file", "definition":definition,
+            "decision":"draft", "description":description, "definition":definition,
         })
         .to_string();
         json!({
@@ -323,25 +320,64 @@ mod tests {
     #[test]
     fn workflow_proposal_projects_validated_content_and_keeps_base_identity() {
         let project = ProjectId::new();
-        let draft = project_output(&project, None, child_report(definition(1, "Read"))).unwrap();
+        let description = "Read the selected file";
+        let draft = project_output(
+            &project,
+            None,
+            child_report(definition(1, "Read"), description),
+        )
+        .unwrap();
         assert_eq!(draft["project_id"], project.as_str());
         assert_eq!(draft["definition"]["revision"], 1);
         assert!(draft["base"].is_null());
         assert!(draft.get("summary").is_none());
-        assert!(project_output(&project, None, child_report(definition(1, "Write"))).is_err());
-        assert!(project_output(&project, None, child_report(definition(2, "Read"))).is_err());
+        assert!(project_output(
+            &project,
+            None,
+            child_report(definition(1, "Write"), description)
+        )
+        .is_err());
+        assert!(project_output(
+            &project,
+            None,
+            child_report(definition(2, "Read"), description)
+        )
+        .is_err());
         let base = || ProposalBase {
             definition: validate_definition(&definition(1, "Read")).unwrap(),
-            description: "An existing description".into(),
+            description: description.into(),
             content_digest: "a".repeat(64),
             skill_digest: "b".repeat(64),
         };
-        let same =
-            project_output(&project, Some(base()), child_report(definition(2, "Read"))).unwrap();
+        let same = project_output(
+            &project,
+            Some(base()),
+            child_report(definition(2, "Read"), description),
+        )
+        .unwrap();
         assert_eq!(same, json!({"decision":"no_change"}));
-        let update =
-            project_output(&project, Some(base()), child_report(definition(2, "Grep"))).unwrap();
-        assert_eq!(update["description"], "An existing description");
+        let description_only = project_output(
+            &project,
+            Some(base()),
+            child_report(definition(2, "Read"), "Read the release guide"),
+        )
+        .unwrap();
+        assert_eq!(description_only["decision"], "draft");
+        assert_eq!(description_only["description"], "Read the release guide");
+        assert!(project_output(
+            &project,
+            Some(base()),
+            child_report(definition(2, "Read"), " ")
+        )
+        .is_err());
+        let update = project_output(
+            &project,
+            Some(base()),
+            child_report(definition(2, "Grep"), "Search the selected file"),
+        )
+        .unwrap();
+        assert_eq!(update["description"], "Search the selected file");
+        assert_eq!(update["base"]["description"], description);
         assert_eq!(update["definition"]["revision"], 2);
         assert_eq!(update["base"]["content_digest"], "a".repeat(64));
         assert_eq!(update["base"]["definition"]["revision"], 1);
