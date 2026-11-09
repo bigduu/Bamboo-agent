@@ -260,8 +260,7 @@ fn project_output(
                     ..
                 } => agent == "reviewer" && capabilities == &["read"],
                 WorkflowStepKind::Workflow { .. } => false,
-            }) || definition.id == bamboo_skills::SKILL_CURATOR_ID
-            {
+            }) {
                 return Err(invalid_proposal());
             }
             let description = description.trim();

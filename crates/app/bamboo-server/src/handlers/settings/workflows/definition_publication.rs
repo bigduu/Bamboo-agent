@@ -377,12 +377,20 @@ fn ensure_file_unchanged(
 ) -> Result<(), DefinitionPublicationError> {
     ensure_cap_file_is_still_named(parent, Path::new(name), expected)?;
     let named = parent.symlink_metadata(name)?;
+    #[cfg(unix)]
+    let permissions_changed = {
+        use cap_std::fs::PermissionsExt;
+        named.permissions().mode() != expected.permissions().mode()
+    };
+    #[cfg(not(unix))]
+    let permissions_changed = false;
     if named.file_type().is_symlink()
         || !named.is_file()
         || cap_node_identity(&named) != cap_node_identity(expected)
         || !cap_regular_file_has_single_link(&named)
         || named.len() != expected.len()
         || named.modified()? != expected.modified()?
+        || permissions_changed
     {
         return Err(DefinitionPublicationError::Conflict(
             "Workflow definition file authority changed before publication",
@@ -851,6 +859,45 @@ fn verify_pair(dir: &CapDir, expected: &OpenedBundle) -> Result<(), DefinitionPu
     Ok(())
 }
 
+#[cfg(unix)]
+fn preserve_pair_permissions(
+    bundle: &CapDir,
+    original: &OpenedBundle,
+    stage: &mut StagedBundle,
+) -> Result<(), DefinitionPublicationError> {
+    use cap_std::fs::{Permissions, PermissionsExt};
+
+    let ordinary_permissions =
+        |metadata: &Metadata| Permissions::from_mode(metadata.permissions().mode() & 0o777);
+    for (name, original, staged) in [
+        (
+            SKILL_FILE,
+            &original.files.skill,
+            &mut stage.contents.files.skill,
+        ),
+        (
+            DEFINITION_FILE,
+            &original.files.definition,
+            &mut stage.contents.files.definition,
+        ),
+    ] {
+        let file = open_file_nofollow(&stage.dir, Path::new(name))?;
+        if cap_node_identity(&file.metadata()?) != cap_node_identity(staged) {
+            return Err(DefinitionPublicationError::Conflict(
+                "Workflow definition stage changed before permissions could be preserved",
+            ));
+        }
+        file.set_permissions(ordinary_permissions(original))?;
+        file.sync_all()?;
+        *staged = file.metadata()?;
+    }
+    stage
+        .dir
+        .set_permissions(".", ordinary_permissions(&bundle.dir_metadata()?))?;
+    sync_cap_directory(&stage.dir)?;
+    Ok(())
+}
+
 fn exchange_bundle(
     authority: &Authority,
     id: &str,
@@ -864,7 +911,11 @@ fn exchange_bundle(
     // A generated bundle owns these two files. Leave user-added resources
     // in place instead of moving or copying them as part of a description edit.
     require_generated_pair(bundle)?;
-    let stage = stage_bundle(authority, id, skill, bytes)?;
+    let mut stage = stage_bundle(authority, id, skill, bytes)?;
+    #[cfg(unix)]
+    preserve_pair_permissions(bundle, original, &mut stage)?;
+    #[cfg(not(unix))]
+    let _ = &mut stage;
     verify_pair(bundle, original)?;
     verify_pair(&stage.dir, &stage.contents)?;
     authority.ensure_bundle_named(id, bundle)?;
@@ -1003,11 +1054,21 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn description_update_faults_keep_definition_and_skill_from_one_revision() {
+        use std::os::unix::fs::PermissionsExt;
+
         for (fault, committed) in [
             (PublicationFault::BeforeRename, false),
             (PublicationFault::AfterRename, true),
         ] {
             let (root, original) = fixture();
+            let bundle = root.path().join("skills").join(ID);
+            for (path, mode) in [
+                (bundle.clone(), 0o700),
+                (bundle.join(SKILL_FILE), 0o600),
+                (bundle.join(DEFINITION_FILE), 0o600),
+            ] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
             let next_skill = String::from_utf8(skill(ID))
                 .unwrap()
                 .replace("An authored workflow.", "Revised purpose.");
@@ -1024,6 +1085,16 @@ mod tests {
                 fault,
             );
             let saved = read_definition(root.path(), ID).unwrap();
+            for (path, mode) in [
+                (bundle.clone(), 0o700),
+                (bundle.join(SKILL_FILE), 0o600),
+                (bundle.join(DEFINITION_FILE), 0o600),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
             if committed {
                 assert!(matches!(
                     result,

@@ -94,7 +94,8 @@ project-authored definition to revise.
 
 The curator uses one read-only Agent step with a bounded typed Child report.
 Teaching is explicit in the panel. Its scope is small, project-owned, read-only
-orchestration definitions.
+orchestration definitions. The host pins the packaged curator directly. Its
+reserved identity is unavailable to ordinary starts, clones and nested runs.
 
 ## Boundaries
 
@@ -135,7 +136,8 @@ orchestration definitions.
   publication keep their existing platform paths; this change does not certify
   those paths on Windows.
 - Writes use the shared descriptor-bound publication lock, bounded no-follow
-  reads, no-replace creation and preserving exchange for updates. Prior files or bundles
+  reads, no-replace creation and preserving exchange for updates. Bundle swaps
+  preserve ordinary access permissions. Prior files or bundles
   from successful updates and failed/uncertain stages are retained outside
   catalog discovery. The API never swaps back over a later editor's version,
   adopts retained entries or automatically removes them. An uncertain error is

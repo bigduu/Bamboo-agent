@@ -180,7 +180,8 @@ pub(super) fn validate_definition(
             "Normalized workflow definition is too large",
         ));
     }
-    if !is_safe_workflow_name(&definition.id)
+    if definition.id == bamboo_skills::SKILL_CURATOR_ID
+        || !is_safe_workflow_name(&definition.id)
         || definition.id.starts_with('.')
         || definition.id.ends_with('.')
     {
@@ -311,6 +312,16 @@ async fn validate_nested_definitions(
                         "Nested workflow revision is unavailable in the selected catalog",
                     )
                 })?;
+            if bundle
+                .definitions
+                .values()
+                .any(|nested| nested.id == bamboo_skills::SKILL_CURATOR_ID)
+            {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "Skill Curator is unavailable as a nested Workflow",
+                ));
+            }
             if bundle
                 .definitions
                 .values()

@@ -196,6 +196,28 @@ async fn workflow_skill_teaching_runs_the_curator_and_publishes_only_accepted_re
     )
     .await;
     let project_id = project["id"].as_str().unwrap();
+    let project_skills = data.join("projects").join(project_id).join("skills");
+    for (id, step) in [
+        (
+            "skill-curator",
+            json!({"id":"step","type":"tool","tool":"Read","args":{"file_path":files[0]}}),
+        ),
+        (
+            "outer-curator",
+            json!({"id":"step","type":"workflow","workflow_id":"skill-curator","revision":1}),
+        ),
+    ] {
+        let bundle = project_skills.join(id);
+        std::fs::create_dir_all(&bundle).unwrap();
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: Project Workflow fixture\n---\n\nFixture\n"),
+        )
+        .unwrap();
+        std::fs::write(bundle.join("workflow.yaml"), json!({
+            "workflow_schema":1,"id":id,"revision":1,"steps":[step],"plan":{"type":"step","step":"step"},
+        }).to_string()).unwrap();
+    }
     expect_json(client.post(format!("{base}/chat")).json(&json!({
         "session_id":SESSION,"message":"Workflow authoring fixture","project_id":project_id,"workspace_path":workspace,
         "model":MODEL,"model_ref":{"provider":"openai","model":MODEL},"provider":"openai",
@@ -206,6 +228,34 @@ async fn workflow_skill_teaching_runs_the_curator_and_publishes_only_accepted_re
     let runs = format!("{base}/sessions/{SESSION}/workflow-runs");
     let authored_url = format!("{definitions}/read-project-fixture");
     let read_url = format!("{authored_url}?target=project&session_id={SESSION}");
+    let catalog_url = format!("{base}/bamboo/workflow-catalog?session_id={SESSION}");
+    let catalog = expect_json(
+        client.get(&catalog_url).send().await.unwrap(),
+        StatusCode::OK,
+    )
+    .await;
+    for id in ["skill-curator", "outer-curator"] {
+        assert!(catalog["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["id"] == id && entry["source"] == "project" && entry["status"] == "valid"
+        }));
+        expect_json(
+            client
+                .post(&runs)
+                .json(&json!({"workflow_id":id,"revision":1}))
+                .send()
+                .await
+                .unwrap(),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    expect_json(client.post(format!("{base}/bamboo/workflow-catalog/skill-curator/clone")).json(&json!({
+        "target":"project","session_id":SESSION,"source":"builtin","revision":1,"content_digest":"a".repeat(64),
+    })).send().await.unwrap(), StatusCode::BAD_REQUEST).await;
+    assert_eq!(
+        expect_json(client.get(&runs).send().await.unwrap(), StatusCode::OK).await,
+        json!([])
+    );
     let mut previous_run = None;
     for revision in 1..=2 {
         let teaching = if revision == 1 {

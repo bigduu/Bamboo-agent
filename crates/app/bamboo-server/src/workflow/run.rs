@@ -426,59 +426,81 @@ impl WorkflowRunAccess {
     ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
         self.ensure_run_index_capacity(session_id).await?;
         let context = self.definition_start_context(session_id).await?;
-        let store = context.store;
-        let workspace_trusted = context.workspace_trusted;
-        let catalog = store.workflow_catalog_snapshot().await;
-        let entry = catalog
-            .entries
-            .iter()
-            .find(|entry| {
-                entry.winner
-                    && entry.id == workflow_id
-                    && entry.revision == revision
-                    && entry.status == bamboo_skills::WorkflowStatus::Valid
-            })
-            .ok_or_else(|| {
-                WorkflowRunError::Preflight(
-                    "requested workflow revision is unavailable".to_string(),
-                )
-            })?;
-        if entry.kind != bamboo_skills::WorkflowKind::Orchestration {
-            return Err(WorkflowRunError::Preflight(
-                "instruction workflows must be activated with load_skill".to_string(),
-            ));
-        }
-        if invoker == WorkflowInvoker::Curator {
+        let automatic = matches!(
+            invoker,
+            WorkflowInvoker::Automatic | WorkflowInvoker::Schedule
+        );
+        let mut bundle = if invoker == WorkflowInvoker::Curator {
             if context
                 .project_id
                 .as_ref()
                 .map(bamboo_domain::ProjectId::as_str)
                 != args.get("project_id").and_then(Value::as_str)
                 || context.project_id.is_none()
-                || entry.source != bamboo_skills::WorkflowSource::Builtin
             {
                 return Err(WorkflowRunError::Preflight(
-                    "Workflow authoring project or builtin changed".into(),
+                    "Workflow authoring project changed".into(),
                 ));
             }
-        } else if workflow_id == bamboo_skills::SKILL_CURATOR_ID {
-            return Err(WorkflowRunError::Preflight(
-                "Start Skill Curator from the Workflow authoring panel".into(),
-            ));
-        }
-        let automatic = matches!(
-            invoker,
-            WorkflowInvoker::Automatic | WorkflowInvoker::Schedule
-        );
-        if automatic && !context.automatic_opted_in {
-            return Err(WorkflowRunError::Preflight(
-                "model-started orchestration requires explicit session opt-in".to_string(),
-            ));
-        }
-        let mut bundle = store
-            .pin_workflow_definition_bundle(workflow_id, revision)
-            .await
-            .map_err(|_| WorkflowRunError::Preflight("workflow catalog pin failed".to_string()))?;
+            let definition = skill_curator_definition()?;
+            WorkflowDefinitionBundle {
+                publication_revision: 0,
+                root_id: definition.id.clone(),
+                root_revision: definition.revision,
+                root_invocation_policy: json!({"explicit": true, "automatic": false}),
+                definitions: [(
+                    WorkflowDefinitionBundle::key(&definition.id, definition.revision),
+                    definition,
+                )]
+                .into(),
+            }
+        } else {
+            if workflow_id == bamboo_skills::SKILL_CURATOR_ID {
+                return Err(WorkflowRunError::Preflight(
+                    "Start Skill Curator from the Workflow authoring panel".into(),
+                ));
+            }
+            let store = context.store;
+            let catalog = store.workflow_catalog_snapshot().await;
+            let entry = catalog
+                .entries
+                .iter()
+                .find(|entry| {
+                    entry.winner
+                        && entry.id == workflow_id
+                        && entry.revision == revision
+                        && entry.status == bamboo_skills::WorkflowStatus::Valid
+                })
+                .ok_or_else(|| {
+                    WorkflowRunError::Preflight("requested workflow revision is unavailable".into())
+                })?;
+            if entry.kind != bamboo_skills::WorkflowKind::Orchestration {
+                return Err(WorkflowRunError::Preflight(
+                    "instruction workflows must be activated with load_skill".to_string(),
+                ));
+            }
+            if automatic && !context.automatic_opted_in {
+                return Err(WorkflowRunError::Preflight(
+                    "model-started orchestration requires explicit session opt-in".to_string(),
+                ));
+            }
+            let bundle = store
+                .pin_workflow_definition_bundle(workflow_id, revision)
+                .await
+                .map_err(|_| {
+                    WorkflowRunError::Preflight("workflow catalog pin failed".to_string())
+                })?;
+            if bundle
+                .definitions
+                .values()
+                .any(|nested| nested.id == bamboo_skills::SKILL_CURATOR_ID)
+            {
+                return Err(WorkflowRunError::Preflight(
+                    "Skill Curator is unavailable as a nested Workflow".into(),
+                ));
+            }
+            bundle
+        };
         let policy = if automatic { "automatic" } else { "explicit" };
         if bundle.root_invocation_policy[policy].as_bool() != Some(true) {
             return Err(WorkflowRunError::Preflight(format!(
@@ -492,11 +514,6 @@ impl WorkflowRunAccess {
         let mut definition = bundle.root().cloned().ok_or_else(|| {
             WorkflowRunError::Preflight("pinned workflow root is missing".to_string())
         })?;
-        if invoker == WorkflowInvoker::Curator && definition != skill_curator_definition()? {
-            return Err(WorkflowRunError::Preflight(
-                "Pinned Skill Curator differs from the builtin definition".into(),
-            ));
-        }
         if invoker == WorkflowInvoker::Schedule {
             ensure_scheduled_readonly_workflow(&bundle, &definition)?;
         }
@@ -513,7 +530,7 @@ impl WorkflowRunAccess {
                     definition,
                     args,
                     session_id: session_id.to_string(),
-                    workspace_trusted,
+                    workspace_trusted: context.workspace_trusted,
                     // #601 is not a production capability authority yet. Grant
                     // only the server-owned read-only class needed by the review
                     // dogfood workflow; the concrete base ToolExecutor still
@@ -918,7 +935,13 @@ fn ensure_scheduled_readonly_workflow(
 fn ensure_workflow_restart_as_new_run_allowed(
     snapshot: &WorkflowRunSnapshot,
 ) -> Result<(), WorkflowRunError> {
-    if snapshot.definition.id == bamboo_skills::SKILL_CURATOR_ID {
+    if snapshot.definition.id == bamboo_skills::SKILL_CURATOR_ID
+        || snapshot
+            .definition_bundle
+            .definitions
+            .values()
+            .any(|definition| definition.id == bamboo_skills::SKILL_CURATOR_ID)
+    {
         return Err(WorkflowRunError::Preflight(
             "Create a new proposal from the Workflow authoring panel".into(),
         ));

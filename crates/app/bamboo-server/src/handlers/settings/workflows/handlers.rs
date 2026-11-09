@@ -409,7 +409,8 @@ pub async fn clone_workflow(
     payload: web::Json<CloneWorkflowRequest>,
 ) -> Result<HttpResponse, AppError> {
     let workflow_id = workflow_id.into_inner();
-    if !is_safe_workflow_name(&workflow_id)
+    if workflow_id == bamboo_skills::SKILL_CURATOR_ID
+        || !is_safe_workflow_name(&workflow_id)
         || payload.revision == 0
         || !valid_sha256(&payload.content_digest)
     {
