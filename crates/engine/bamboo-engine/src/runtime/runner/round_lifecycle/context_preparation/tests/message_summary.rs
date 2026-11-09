@@ -206,22 +206,38 @@ async fn message_summary_excludes_tools_and_metadata_from_summary_and_next_reque
 #[tokio::test]
 async fn message_summary_waits_for_every_result_in_the_active_batch() {
     let mut session = message_summary_session();
-    session.messages[2]
-        .tool_calls
-        .as_mut()
-        .unwrap()
-        .push(ToolCall {
-            id: "second-call".into(),
-            tool_type: "function".into(),
-            function: FunctionCall {
-                name: "Read".into(),
-                arguments: "{}".into(),
-            },
-        });
+    let mut calls = session.messages[2].tool_calls.clone().unwrap();
+    calls[0].id = "first-call".into();
+    calls.push(ToolCall {
+        id: "second-call".into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Read".into(),
+            arguments: "{}".into(),
+        },
+    });
+    session.add_message(Message::assistant("", Some(calls)));
+    session.add_message(Message::tool_result("first-call", "FIRST_PRIVATE_RESULT"));
     let before = archive_state(&session);
     let (provider, requests) = prompt_capture_llm();
     let config = message_summary_config(provider);
-    assert!(!run_message_summary(&mut session, &config).await.unwrap());
+    let (tx, mut rx) = mpsc::channel(8);
+    assert!(!maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &noop_llm(),
+        Some(&tx),
+        "pre-turn",
+    )
+    .await
+    .unwrap());
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(AgentEvent::ContextCompressionStatus { status, .. }) if status == "deferred_tool_protocol"
+    ));
     assert_eq!(archive_state(&session), before);
     assert!(requests.lock().unwrap().is_empty());
     assert!(session.force_manual_compression.is_some());
@@ -232,6 +248,101 @@ async fn message_summary_waits_for_every_result_in_the_active_batch() {
         .iter()
         .filter(|message| !message.compressed)
         .all(|message| message.role != Role::Tool && message.tool_calls.is_none()));
+}
+
+#[tokio::test]
+async fn automatic_message_summary_compresses_once_after_the_last_tool_result() {
+    use super::super::super::maybe_apply_mid_turn_context_compression;
+
+    let mut session = message_summary_session();
+    session.force_manual_compression = None;
+    let mut calls = session.messages[2].tool_calls.clone().unwrap();
+    let mut second = calls[0].clone();
+    second.id = "last-call".into();
+    calls.push(second);
+    session.add_message(Message::assistant("", Some(calls)));
+    session.add_message(Message::tool_result(
+        "private-tool-call",
+        "tool output ".repeat(14_500),
+    ));
+    let before = archive_state(&session);
+    let budget = session.token_budget.as_ref().unwrap();
+    assert!(
+        TiktokenTokenCounter::default().count_messages(&session.messages)
+            > budget.compression_trigger_context_tokens()
+    );
+    let (provider, requests) = prompt_capture_llm();
+    let config = message_summary_config(provider);
+    let llm = noop_llm();
+    let (tx, mut rx) = mpsc::channel(32);
+
+    assert!(!maybe_apply_mid_turn_context_compression(
+        &mut session,
+        &config,
+        &llm,
+        &tx,
+        "message-summary-1827",
+        "test-model",
+        &[],
+    )
+    .await
+    .unwrap());
+    assert_eq!(archive_state(&session), before);
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(
+        rx.try_recv().is_err(),
+        "no compaction attempt for a partial batch"
+    );
+
+    session.add_message(Message::tool_result("last-call", "LAST_PRIVATE_RESULT"));
+    assert!(maybe_apply_mid_turn_context_compression(
+        &mut session,
+        &config,
+        &llm,
+        &tx,
+        "message-summary-1827",
+        "test-model",
+        &[],
+    )
+    .await
+    .unwrap());
+    let summary_requests = requests.lock().unwrap().len();
+    assert!(summary_requests > 0);
+    assert!(!maybe_apply_host_context_compression(
+        &mut session,
+        &config,
+        "test-model",
+        "message-summary-1827",
+        &[],
+        &llm,
+        Some(&tx),
+        "pre-turn",
+    )
+    .await
+    .unwrap());
+    assert_eq!(requests.lock().unwrap().len(), summary_requests);
+    assert_eq!(session.compression_events.len(), 1);
+    let applied = &session.compression_events[0];
+    assert!(applied.usage_after_percent <= config.context_management.target_usage_ratio * 100.0);
+    assert!(session
+        .messages
+        .iter()
+        .filter(|message| !message.compressed)
+        .all(|message| message.role != Role::Tool && message.tool_calls.is_none()));
+    let statuses = std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|event| match event {
+            AgentEvent::ContextCompressionStatus { status, .. }
+                if matches!(
+                    status.as_str(),
+                    "started" | "completed" | "deferred_tool_protocol"
+                ) =>
+            {
+                Some(status)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, ["started", "completed"]);
 }
 
 #[tokio::test]

@@ -88,7 +88,9 @@ pub enum CompressionPlanError {
     },
     /// The session changed after candidate selection and before finalization.
     CandidateSetChanged,
-    /// Message-only compression must never archive a partial or protected tool chain.
+    /// The final assistant batch is still waiting for tool results.
+    MessageSummaryPendingToolResults,
+    /// The active history contains malformed or protected tool protocol.
     MessageSummaryToolProtocol { reason: String },
     /// A message-only summary may be empty only when no prose is represented.
     EmptyMessageSummary,
@@ -136,8 +138,11 @@ impl std::fmt::Display for CompressionPlanError {
             Self::CandidateSetChanged => {
                 write!(f, "compression candidate set changed before finalization")
             }
+            Self::MessageSummaryPendingToolResults => {
+                write!(f, "message-summary compression is waiting for tool results")
+            }
             Self::MessageSummaryToolProtocol { reason } => {
-                write!(f, "message-summary compression deferred: {reason}")
+                write!(f, "message-summary compression blocked: {reason}")
             }
             Self::EmptyMessageSummary => {
                 write!(
@@ -604,8 +609,7 @@ fn validate_message_summary_tool_protocol(
     let invalid = |reason: &str| CompressionPlanError::MessageSummaryToolProtocol {
         reason: reason.to_string(),
     };
-    let mut calls = HashSet::new();
-    let mut results = HashSet::new();
+    let mut pending_calls = HashSet::new();
     for message in messages {
         let has_calls = message
             .tool_calls
@@ -617,12 +621,21 @@ fn validate_message_summary_tool_protocol(
         if message.never_compress && has_tool_protocol {
             return Err(invalid("a tool-chain record is marked never_compress"));
         }
+        // A provider can reuse a call ID in a later response. Each assistant
+        // batch must finish before another assistant or user message begins.
+        if matches!(
+            message.role,
+            bamboo_domain::Role::Assistant | bamboo_domain::Role::User
+        ) && !pending_calls.is_empty()
+        {
+            return Err(invalid("a previous tool batch is missing results"));
+        }
         if has_calls {
             if message.role != bamboo_domain::Role::Assistant {
                 return Err(invalid("tool calls have a non-assistant role"));
             }
             for call in message.tool_calls.iter().flatten() {
-                if call.id.is_empty() || !calls.insert(call.id.as_str()) {
+                if call.id.is_empty() || !pending_calls.insert(call.id.as_str()) {
                     return Err(invalid("tool calls have an empty or duplicate identifier"));
                 }
             }
@@ -633,15 +646,15 @@ fn validate_message_summary_tool_protocol(
                 .as_deref()
                 .filter(|id| !id.is_empty())
                 .ok_or_else(|| invalid("a tool result has no call identifier"))?;
-            if !results.insert(id) {
-                return Err(invalid("a tool call has duplicate results"));
+            if !pending_calls.remove(id) {
+                return Err(invalid("a tool result has no pending call in its batch"));
             }
         } else if message.tool_call_id.is_some() {
             return Err(invalid("a tool result identifier has a non-tool role"));
         }
     }
-    if calls != results {
-        return Err(invalid("tool calls and results are incomplete or orphaned"));
+    if !pending_calls.is_empty() {
+        return Err(CompressionPlanError::MessageSummaryPendingToolResults);
     }
     Ok(())
 }

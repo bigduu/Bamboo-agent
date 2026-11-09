@@ -255,6 +255,21 @@ fn tool_only_pass_archives_without_llm_summary_or_tool_derived_recovery() {
 }
 
 #[test]
+fn completed_batches_can_reuse_a_tool_call_identifier() {
+    let mut session = Session::new("message-summary-reused-tool-id", "test-model");
+    session.add_message(Message::user("previous request"));
+    for name in ["Read", "Grep"] {
+        session.add_message(tool_call("reused", "checking", name));
+        session.add_message(Message::tool_result("reused", "completed"));
+    }
+    session.add_message(Message::user("current request"));
+
+    let plan = candidate(&session).expect("each assistant batch has its own matching result");
+    assert_eq!(plan.compressed_message_ids.len(), 5);
+    assert_eq!(plan.messages_to_summarize.len(), 3);
+}
+
+#[test]
 fn incomplete_or_orphan_tools_reject_the_whole_pass_without_mutation() {
     for messages in [
         vec![tool_call("pending", "pending prose", "Read")],
@@ -263,6 +278,12 @@ fn incomplete_or_orphan_tools_reject_the_whole_pass_without_mutation() {
             tool_call("duplicate", "calling", "Read"),
             Message::tool_result("duplicate", "first result"),
             Message::tool_result("duplicate", "second result"),
+        ],
+        vec![
+            tool_call("first", "calling", "Read"),
+            tool_call("second", "calling", "Read"),
+            Message::tool_result("first", "late result from the previous batch"),
+            Message::tool_result("second", "current result"),
         ],
     ] {
         let mut session = Session::new("message-summary-incomplete", "test-model");
@@ -281,7 +302,7 @@ fn incomplete_or_orphan_tools_reject_the_whole_pass_without_mutation() {
 }
 
 #[test]
-fn protected_tool_chain_defers_instead_of_leaving_tool_context_active() {
+fn protected_tool_chain_blocks_message_summary() {
     for protect_call in [true, false] {
         let mut session = Session::new("message-summary-protected-tool", "test-model");
         let mut call = tool_call("protected", "calling", "load_skill");

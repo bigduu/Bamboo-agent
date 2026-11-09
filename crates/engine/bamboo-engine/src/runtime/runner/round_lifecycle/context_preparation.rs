@@ -2163,26 +2163,22 @@ async fn maybe_apply_summary_context_compression_with_budget(
     }
     let candidate = match candidate {
         Ok(candidate) => candidate,
-        Err(CompressionPlanError::MessageSummaryToolProtocol { reason }) => {
+        Err(reason @ CompressionPlanError::MessageSummaryPendingToolResults) => {
             tracing::debug!(
                 session_id,
                 phase_label,
-                reason,
-                "Message summary deferred until tool protocol is complete and compressible"
+                "Message summary deferred until the current tool batch is complete"
             );
             emit_context_compression_status(event_tx, phase_label, "deferred_tool_protocol").await;
             if user_command {
-                return Err(AgentError::Budget(format!(
-                    "Tool history must be complete before compression: {reason}"
-                )));
+                return Err(AgentError::Budget(reason.to_string()));
             }
             return Ok(false);
         }
-        Err(reason @ CompressionPlanError::ProtectedContentExceedsTarget { .. })
-            if user_command =>
-        {
-            return Err(AgentError::Budget(reason.to_string()));
-        }
+        Err(
+            reason @ (CompressionPlanError::ProtectedContentExceedsTarget { .. }
+            | CompressionPlanError::MessageSummaryToolProtocol { .. }),
+        ) if user_command => return Err(AgentError::Budget(reason.to_string())),
         Err(reason) => {
             tracing::warn!(
                 "[{}] {} context compression pass {} candidate planning failed before summarization: {}",
