@@ -78,10 +78,9 @@ enum GoalTerminalAction {
 /// only as a side-channel double-check at the moment the run would otherwise
 /// stop: it can veto a premature completion (agent declared complete but the
 /// objective is not actually met) or allow a confident stop. The default bias is
-/// to KEEP WORKING — the run stops only when the agent declared complete (and
-/// the judge does not object), the judge is confidently achieved, the agent
-/// declared blocked / the judge reports a hard blocker, or the continuation
-/// budget is spent.
+/// to keep working. A confident `continue` can also veto a blocked declaration.
+/// A `need_input` verdict can stop the loop only if it names required user
+/// input, meets the confidence floor, and supplies no independent next step.
 ///
 /// Running inside the runner loop keeps the single-terminal-`Complete` invariant
 /// intact, so `is_running` stays accurate and the SSE stream stays open across
@@ -252,18 +251,13 @@ fn decide_goal_terminal_action(
     floor: GoldConfidence,
 ) -> GoalTerminalAction {
     match declared {
-        // The agent explicitly gave up (after the strict blocked discipline).
-        Some(GoalDeclaredStatus::Blocked) => GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked),
-        // The agent declared complete: the double-check can only VETO with a
-        // confident "continue"; otherwise we trust the agent and stop.
-        Some(GoalDeclaredStatus::Complete) => {
-            if matches!(verdict.decision, GoldDecision::Continue) && verdict.confidence.meets(floor)
-            {
-                GoalTerminalAction::Continue
-            } else {
-                GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
-            }
+        Some(_)
+            if verdict.decision == GoldDecision::Continue && verdict.confidence.meets(floor) =>
+        {
+            GoalTerminalAction::Continue
         }
+        Some(GoalDeclaredStatus::Blocked) => GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked),
+        Some(GoalDeclaredStatus::Complete) => GoalTerminalAction::Stop(GoalRuntimeStatus::Complete),
         // The agent did not declare anything; default to KEEP WORKING unless the
         // judge is confident the goal is achieved, or reports a hard stop.
         None => match verdict.decision {
@@ -271,7 +265,13 @@ fn decide_goal_terminal_action(
                 GoalTerminalAction::Stop(GoalRuntimeStatus::Complete)
             }
             GoldDecision::Blocked => GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked),
-            GoldDecision::NeedInput => GoalTerminalAction::Stop(GoalRuntimeStatus::NeedInput),
+            GoldDecision::NeedInput
+                if verdict.confidence.meets(floor)
+                    && !verdict.missing_information.is_empty()
+                    && verdict.next_action.is_none() =>
+            {
+                GoalTerminalAction::Stop(GoalRuntimeStatus::NeedInput)
+            }
             GoldDecision::Exhausted => GoalTerminalAction::Stop(GoalRuntimeStatus::BudgetLimited),
             _ => GoalTerminalAction::Continue,
         },
@@ -304,6 +304,7 @@ async fn persist_goal_state_and_emit(
 const GOAL_CONTINUATION_GUIDANCE: &str = "Continuation behavior:\n\
 - This goal persists across turns. Ending this turn does not require shrinking the objective to what fits now.\n\
 - Keep the full objective intact. If it cannot be finished now, make concrete progress toward the real requested end state and keep going; do not redefine success around a smaller or easier task.\n\
+- Resolve uncertainty from available evidence and use reasonable, reversible assumptions. Do independent work first. Ask a focused question only when the user's answer is essential to further safe progress. Follow required approval and permission steps.\n\
 - Temporary rough edges are acceptable while the work moves in the right direction. Completion still requires the requested end state to be true and verified.\n\n\
 Completion audit — before deciding the goal is achieved, treat completion as unproven and verify it against the current state:\n\
 - Derive concrete requirements from the objective and any referenced files, plans, specs, or instructions.\n\
@@ -330,11 +331,15 @@ fn goal_continue_runtime_message(
             result.missing_information.join("; ")
         )
     };
-    let next_action_line = result
-        .next_action
-        .as_deref()
-        .map(|action| format!("Suggested next action: {action}\n"))
-        .unwrap_or_default();
+    let next_action_line = if result.decision == GoldDecision::NeedInput {
+        "The double-check did not establish that user input is required. Check the available evidence and take a safe independent step.\n".to_string()
+    } else {
+        result
+            .next_action
+            .as_deref()
+            .map(|action| format!("Suggested next action: {action}\n"))
+            .unwrap_or_default()
+    };
 
     let body = format!(
         "Runtime notification: the session goal is not yet verified as complete, so keep working autonomously toward it.\n\n\
@@ -940,10 +945,20 @@ mod tests {
     // ---- Pure policy (decide_goal_terminal_action) ----
 
     #[test]
-    fn policy_declared_blocked_stops_blocked() {
+    fn policy_declared_blocked_keeps_working_when_gold_finds_more_work() {
         let action = decide_goal_terminal_action(
             Some(GoalDeclaredStatus::Blocked),
             &verdict(GoldDecision::Continue, GoldConfidence::High),
+            GoldConfidence::Medium,
+        );
+        assert_eq!(action, GoalTerminalAction::Continue);
+    }
+
+    #[test]
+    fn policy_declared_blocked_stops_when_gold_agrees() {
+        let action = decide_goal_terminal_action(
+            Some(GoalDeclaredStatus::Blocked),
+            &verdict(GoldDecision::Blocked, GoldConfidence::High),
             GoldConfidence::Medium,
         );
         assert_eq!(action, GoalTerminalAction::Stop(GoalRuntimeStatus::Blocked));
@@ -1036,19 +1051,40 @@ mod tests {
         assert_eq!(
             decide_goal_terminal_action(
                 None,
-                &verdict(GoldDecision::NeedInput, GoldConfidence::Low),
-                GoldConfidence::Medium,
-            ),
-            GoalTerminalAction::Stop(GoalRuntimeStatus::NeedInput)
-        );
-        assert_eq!(
-            decide_goal_terminal_action(
-                None,
                 &verdict(GoldDecision::Exhausted, GoldConfidence::Low),
                 GoldConfidence::Medium,
             ),
             GoalTerminalAction::Stop(GoalRuntimeStatus::BudgetLimited)
         );
+    }
+
+    #[test]
+    fn policy_need_input_requires_confidence_specific_input_and_no_next_action() {
+        let mut result = verdict(GoldDecision::NeedInput, GoldConfidence::High);
+        result.next_action = None;
+        assert_eq!(
+            decide_goal_terminal_action(None, &result, GoldConfidence::Medium),
+            GoalTerminalAction::Stop(GoalRuntimeStatus::NeedInput)
+        );
+        for result in [
+            GoldEvaluationResult {
+                confidence: GoldConfidence::Low,
+                ..result.clone()
+            },
+            GoldEvaluationResult {
+                missing_information: Vec::new(),
+                ..result.clone()
+            },
+            GoldEvaluationResult {
+                next_action: Some("inspect the available evidence".into()),
+                ..result
+            },
+        ] {
+            assert_eq!(
+                decide_goal_terminal_action(None, &result, GoldConfidence::Medium),
+                GoalTerminalAction::Continue
+            );
+        }
     }
 
     // ---- Gate integration (evaluate_gold_terminal) ----
