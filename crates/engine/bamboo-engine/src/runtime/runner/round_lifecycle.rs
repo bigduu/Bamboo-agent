@@ -9,7 +9,8 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::stream::handler::StreamHandlingOutput;
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
+use bamboo_config::ContextManagementStrategy;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -348,6 +349,23 @@ pub(crate) async fn maybe_apply_mid_turn_context_compression(
     model_name: &str,
     tool_schemas: &[ToolSchema],
 ) -> Result<bool, AgentError> {
+    if config.context_management.strategy == ContextManagementStrategy::MessageSummary {
+        // Tool execution reaches this check after each result. Only the latest
+        // assistant batch can still be receiving results at this boundary.
+        let current_batch = session
+            .messages
+            .iter()
+            .rposition(|message| {
+                !message.compressed && matches!(message.role, Role::Assistant | Role::User)
+            })
+            .map(|start| &session.messages[start..]);
+        if current_batch.is_some_and(|batch| {
+            !crate::session_app::truncation::unresolved_tool_call_ids(batch).is_empty()
+        }) {
+            return Ok(false);
+        }
+    }
+
     context_preparation::maybe_apply_host_context_compression(
         session,
         config,

@@ -341,8 +341,10 @@ based on the output allowance and safety margin, bounded by one fifth of `H`.
 The effective trigger is the earlier of the configured window ratio and the
 remaining safe input boundary. This avoids the previous fixed-50K behavior that
 waited until 95% on a 1M window. Execution/verification task status does not delay
-compression past that boundary; incomplete tool protocols still wait for their
-matching results. Provider prefix-cache hits do not disable maintenance.
+compression past that boundary. Message summaries wait for the current tool
+batch to complete. After a newer user turn and with no pending tool work,
+an unanswered call from an earlier turn can be archived with its original
+transcript intact. Provider prefix-cache hits do not disable maintenance.
 
 For the ordinary default limits, a 1M window with 32K output and 10K safety
 triggers at 800K with a 250K target. Smaller windows or larger output reservations

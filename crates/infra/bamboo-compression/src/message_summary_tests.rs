@@ -255,14 +255,34 @@ fn tool_only_pass_archives_without_llm_summary_or_tool_derived_recovery() {
 }
 
 #[test]
-fn incomplete_or_orphan_tools_reject_the_whole_pass_without_mutation() {
+fn completed_batches_can_reuse_a_tool_call_identifier() {
+    let mut session = Session::new("message-summary-reused-tool-id", "test-model");
+    session.add_message(Message::user("previous request"));
+    for name in ["Read", "Grep"] {
+        session.add_message(tool_call("reused", "checking", name));
+        session.add_message(Message::tool_result("reused", "completed"));
+    }
+    session.add_message(Message::user("current request"));
+
+    let plan = candidate(&session).expect("each assistant batch has its own matching result");
+    assert_eq!(plan.compressed_message_ids.len(), 5);
+    assert_eq!(plan.messages_to_summarize.len(), 3);
+}
+
+#[test]
+fn orphan_or_mismatched_results_reject_the_whole_pass_without_mutation() {
     for messages in [
-        vec![tool_call("pending", "pending prose", "Read")],
         vec![Message::tool_result("orphan", "orphan payload")],
         vec![
             tool_call("duplicate", "calling", "Read"),
             Message::tool_result("duplicate", "first result"),
             Message::tool_result("duplicate", "second result"),
+        ],
+        vec![
+            tool_call("first", "calling", "Read"),
+            tool_call("second", "calling", "Read"),
+            Message::tool_result("first", "late result from the previous batch"),
+            Message::tool_result("second", "current result"),
         ],
     ] {
         let mut session = Session::new("message-summary-incomplete", "test-model");
@@ -281,7 +301,148 @@ fn incomplete_or_orphan_tools_reject_the_whole_pass_without_mutation() {
 }
 
 #[test]
-fn protected_tool_chain_defers_instead_of_leaving_tool_context_active() {
+fn unresolved_tools_wait_for_a_new_user_turn_and_no_live_wait() {
+    let mut session = Session::new("message-summary-pending-tool", "test-model");
+    session.add_message(Message::user("original request"));
+    session.add_message(tool_call("pending", "checking", "write_stdin"));
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryPendingToolResults)
+    ));
+
+    for kind in [
+        "retry_resume",
+        "stop_hook_continuation",
+        "run_budget_summary",
+        "max_rounds_summary",
+        "counted_loop_iteration",
+    ] {
+        let mut synthetic = session.clone();
+        let mut resume = Message::user("continue the current turn");
+        resume.metadata = Some(serde_json::json!({"runtime_kind": kind}));
+        synthetic.add_message(resume);
+        assert!(
+            matches!(
+                candidate(&synthetic),
+                Err(CompressionPlanError::MessageSummaryToolProtocol { .. })
+            ),
+            "{kind} is part of the original turn"
+        );
+    }
+
+    let mut direction = Message::user("Continue");
+    direction.metadata = Some(serde_json::json!({"runtime_kind": "no_progress_continue"}));
+    session.add_message(direction);
+    let plan = candidate(&session).expect("a later user request supersedes the unanswered call");
+    session.pending_question = Some(bamboo_domain::PendingQuestion {
+        tool_call_id: "pending".into(),
+        tool_name: "write_stdin".into(),
+        question: "May this command continue?".into(),
+        options: vec![],
+        allow_custom: true,
+        source: bamboo_domain::PendingQuestionSource::default(),
+    });
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryPendingToolResults)
+    ));
+    assert!(matches!(
+        finalize_compression_candidate_plan(&session, plan, "summary".into()),
+        Err(CompressionPlanError::CandidateSetChanged)
+    ));
+}
+
+#[test]
+fn paired_tool_placeholder_waits_until_the_question_is_answered() {
+    let mut session = Session::new("message-summary-tool-placeholder", "test-model");
+    session.add_message(Message::user("current request"));
+    session.add_message(tool_call("clarification", "asking", "clarify"));
+    session.add_message(Message::tool_result("clarification", "waiting for input"));
+    let plan = candidate(&session).expect("the tool rows are structurally paired");
+    session.pending_question = Some(bamboo_domain::PendingQuestion {
+        tool_call_id: "clarification".into(),
+        tool_name: "clarify".into(),
+        question: "What should I use?".into(),
+        options: vec![],
+        allow_custom: true,
+        source: bamboo_domain::PendingQuestionSource::AgenticClarification,
+    });
+
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryPendingToolResults)
+    ));
+    assert!(matches!(
+        finalize_compression_candidate_plan(&session, plan, "summary".into()),
+        Err(CompressionPlanError::CandidateSetChanged)
+    ));
+
+    session.pending_question = None;
+    session.messages.last_mut().unwrap().content = "user response".into();
+    let plan = candidate(&session).expect("the replaced tool result can now be archived");
+    assert_eq!(plan.compressed_message_ids.len(), 2);
+}
+
+#[test]
+fn an_older_unanswered_call_cannot_be_archived_during_legacy_tool_work() {
+    use bamboo_domain::{AgentRuntimeState, AgentStatusState};
+
+    let mut session = Session::new("message-summary-legacy-tool-work", "test-model");
+    session.add_message(Message::user("earlier request"));
+    session.add_message(tool_call("pending", "polling", "write_stdin"));
+    session.add_message(Message::user("new request"));
+
+    let mut legacy = AgentRuntimeState::new("legacy");
+    legacy.status = AgentStatusState::Running;
+    legacy.tools.active_tool_calls = 1;
+    session.metadata.insert(
+        "agent.runtime.state".into(),
+        serde_json::to_string(&legacy).unwrap(),
+    );
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryPendingToolResults)
+    ));
+
+    legacy.status = AgentStatusState::Suspended;
+    legacy.tools.active_tool_calls = 0;
+    session.metadata.insert(
+        "agent.runtime.state".into(),
+        serde_json::to_string(&legacy).unwrap(),
+    );
+    let mut running = AgentRuntimeState::new("current");
+    running.status = AgentStatusState::Running;
+    session.agent_runtime_state = Some(running);
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryPendingToolResults)
+    ));
+
+    legacy.status = AgentStatusState::Running;
+    legacy.version += 1;
+    for unknown in [
+        "not valid json".into(),
+        serde_json::to_string(&legacy).unwrap(),
+    ] {
+        session
+            .metadata
+            .insert("agent.runtime.state".into(), unknown);
+        assert!(matches!(
+            candidate(&session),
+            Err(CompressionPlanError::MessageSummaryPendingToolResults)
+        ));
+    }
+
+    legacy.version = bamboo_domain::AGENT_RUNTIME_STATE_VERSION;
+    session.metadata.insert(
+        "agent.runtime.state".into(),
+        serde_json::to_string(&legacy).unwrap(),
+    );
+    assert!(candidate(&session).is_ok());
+}
+
+#[test]
+fn protected_tool_chain_blocks_message_summary() {
     for protect_call in [true, false] {
         let mut session = Session::new("message-summary-protected-tool", "test-model");
         let mut call = tool_call("protected", "calling", "load_skill");

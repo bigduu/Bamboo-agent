@@ -12,7 +12,10 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::{AgentRuntimeState, AgentStatusState, PlanModeStatus, Role, Session, SessionKind};
+use super::{
+    AgentRuntimeState, AgentStatusState, PlanModeStatus, Role, Session, SessionKind,
+    AGENT_RUNTIME_STATE_VERSION,
+};
 
 pub const CONVERSATION_RESET_SCHEMA_VERSION: u32 = 1;
 pub const CONVERSATION_RESET_RECEIPT_LIMIT: usize = 8;
@@ -210,7 +213,7 @@ impl ConversationResetState {
 pub fn conversation_reset_pending_rejection(
     session: &Session,
 ) -> Option<ConversationResetRejection> {
-    pending_snapshot_rejection(session, false, false)
+    pending_snapshot_rejection(session, PendingSnapshotScope::Reset)
 }
 
 /// C1 preserves an idle, non-approval Plan. Every other pending or uncertain
@@ -218,7 +221,7 @@ pub fn conversation_reset_pending_rejection(
 pub fn conversation_clear_readback_pending_rejection(
     session: &Session,
 ) -> Option<ConversationResetRejection> {
-    pending_snapshot_rejection(session, true, false)
+    pending_snapshot_rejection(session, PendingSnapshotScope::ClearReadback)
 }
 
 /// Compaction preserves the control plane. Accept a readable legacy runtime
@@ -226,19 +229,32 @@ pub fn conversation_clear_readback_pending_rejection(
 pub fn conversation_compaction_pending_rejection(
     session: &Session,
 ) -> Option<ConversationResetRejection> {
-    pending_snapshot_rejection(session, true, true).or_else(|| {
-        session
-            .has_runtime_wait()
-            .then_some(ConversationResetRejection::PendingWait)
-    })
+    pending_snapshot_rejection(session, PendingSnapshotScope::IdleCompaction)
+}
+
+/// Message summaries may run between tool batches during a live run. A
+/// durable wait can still replace a tool result already in the transcript.
+pub fn message_summary_tool_work_pending(session: &Session) -> bool {
+    pending_snapshot_rejection(session, PendingSnapshotScope::MessageSummary).is_some()
+}
+
+enum PendingSnapshotScope {
+    Reset,
+    ClearReadback,
+    IdleCompaction,
+    MessageSummary,
 }
 
 fn pending_snapshot_rejection(
     session: &Session,
-    allow_idle_plan: bool,
-    read_legacy_runtime: bool,
+    scope: PendingSnapshotScope,
 ) -> Option<ConversationResetRejection> {
     use ConversationResetRejection as Rejection;
+    let allow_live_run = matches!(scope, PendingSnapshotScope::MessageSummary);
+    let inspect_legacy_runtime = matches!(
+        scope,
+        PendingSnapshotScope::IdleCompaction | PendingSnapshotScope::MessageSummary
+    );
     if session
         .metadata
         .contains_key("permission.replay_save_recovery_required")
@@ -260,14 +276,15 @@ fn pending_snapshot_rejection(
     // Clear/reset cannot discard an old control plane. Compaction keeps it,
     // so inspect both representations and reject any unreadable mirror.
     let legacy_runtime = match session.metadata.get("agent.runtime.state") {
-        Some(raw) if read_legacy_runtime => match serde_json::from_str::<AgentRuntimeState>(raw) {
+        Some(raw) if inspect_legacy_runtime => match serde_json::from_str::<AgentRuntimeState>(raw)
+        {
             Ok(runtime) => Some(runtime),
             Err(_) => return Some(Rejection::LegacyRuntimeState),
         },
         Some(_) => return Some(Rejection::LegacyRuntimeState),
         None => None,
     };
-    if session.has_pending_injected_messages() {
+    if !allow_live_run && session.has_pending_injected_messages() {
         return Some(Rejection::PendingInput);
     }
     for runtime in session
@@ -275,12 +292,17 @@ fn pending_snapshot_rejection(
         .iter()
         .chain(legacy_runtime.as_ref())
     {
-        if matches!(
-            runtime.status,
-            AgentStatusState::Initializing
-                | AgentStatusState::Running
-                | AgentStatusState::Finalizing
-        ) || runtime.tools.active_tool_calls > 0
+        if allow_live_run && runtime.version != AGENT_RUNTIME_STATE_VERSION {
+            return Some(Rejection::UncertainOperation);
+        }
+        if runtime.tools.active_tool_calls > 0
+            || (!allow_live_run
+                && matches!(
+                    runtime.status,
+                    AgentStatusState::Initializing
+                        | AgentStatusState::Running
+                        | AgentStatusState::Finalizing
+                ))
         {
             return Some(Rejection::ActiveRun);
         }
@@ -288,14 +310,7 @@ fn pending_snapshot_rejection(
             || runtime.waiting_for_children.is_some()
             || runtime.waiting_for_bash.is_some()
             || runtime.plan_mode.as_ref().is_some_and(|plan| {
-                !allow_idle_plan
-                    || !matches!(
-                        runtime.status,
-                        AgentStatusState::Idle
-                            | AgentStatusState::Completed
-                            | AgentStatusState::Cancelled
-                            | AgentStatusState::Failed
-                    )
+                matches!(scope, PendingSnapshotScope::Reset)
                     || !matches!(
                         plan.status,
                         PlanModeStatus::Exploring
@@ -309,7 +324,7 @@ fn pending_snapshot_rejection(
             return Some(Rejection::PendingWait);
         }
     }
-    None
+    (inspect_legacy_runtime && session.has_runtime_wait()).then_some(Rejection::PendingWait)
 }
 
 /// Calculate only. A canonical same-Root storage transaction with separate idle

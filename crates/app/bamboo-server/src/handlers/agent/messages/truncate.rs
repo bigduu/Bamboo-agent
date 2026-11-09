@@ -44,7 +44,7 @@ pub async fn truncate_messages(
         return retry::prepare(&state, session).await;
     }
 
-    let (removed, new_len, should_clear_derived_state, should_persist) = match req.into_inner() {
+    let (removed, should_persist) = match req.into_inner() {
         TruncateRequest::AfterLastUser => {
             let Some(removed) = truncate_after_last_user(&mut session) else {
                 return Ok(HttpResponse::BadRequest().json(serde_json::json!({
@@ -59,12 +59,10 @@ pub async fn truncate_messages(
             if cleared_retry_flags {
                 clear_startup_handoff(&mut session);
             }
-            (
-                removed,
-                session.messages.len(),
-                removed > 0,
-                removed > 0 || cleared_retry_flags,
-            )
+            if removed > 0 {
+                clear_derived_context_state(&mut session);
+            }
+            (removed, removed > 0 || cleared_retry_flags)
         }
         TruncateRequest::ErrorRetry => match prepare_error_retry(&mut session) {
             Ok(prepared) => prepared,
@@ -76,11 +74,7 @@ pub async fn truncate_messages(
         },
     };
 
-    if should_clear_derived_state {
-        // Truncation invalidates derived context state.
-        clear_derived_context_state(&mut session);
-    }
-
+    let new_len = session.messages.len();
     if should_persist {
         save_and_cache_session(&state, &session_id, session).await?;
     }
@@ -97,9 +91,9 @@ pub async fn truncate_messages(
 // exact Actor writer; deriving another run's input or tool grant is forbidden.
 fn prepare_error_retry(
     session: &mut bamboo_agent_core::Session,
-) -> std::result::Result<(usize, usize, bool, bool), &'static str> {
+) -> std::result::Result<(usize, bool), &'static str> {
     let session_id = session.id.clone();
-    Ok({
+    let (removed, should_persist) = {
         let unresolved_before = unresolved_tool_call_ids(&session.messages);
         if unresolved_before.is_empty() {
             session
@@ -110,7 +104,7 @@ fn prepare_error_retry(
                 "error_retry".to_string(),
             );
             mark_startup_handoff(session);
-            (0, session.messages.len(), false, true)
+            (0, true)
         } else {
             let removed_via_sanitization = sanitize_malformed_tool_chains(session);
             let unresolved_after_sanitization = unresolved_tool_call_ids(&session.messages);
@@ -129,12 +123,7 @@ fn prepare_error_retry(
                     "error_retry".to_string(),
                 );
                 mark_startup_handoff(session);
-                (
-                    removed_via_sanitization,
-                    session.messages.len(),
-                    removed_via_sanitization > 0,
-                    true,
-                )
+                (removed_via_sanitization, true)
             } else {
                 tracing::warn!(
                     "[{}] error_retry unresolved tool calls remain after sanitization (before={}, after={}); falling back to truncation",
@@ -144,7 +133,7 @@ fn prepare_error_retry(
                 );
                 let Some(removed) = truncate_for_unresolved_tool_calls(session) else {
                     return Err(
-                        "Found unresolved tool calls but no prior user message to retry from",
+                        "Found unresolved tool calls without a safe active user anchor to retry from",
                     );
                 };
 
@@ -157,13 +146,22 @@ fn prepare_error_retry(
                     clear_startup_handoff(session);
                 }
 
-                (
-                    removed,
-                    session.messages.len(),
-                    removed > 0,
-                    removed > 0 || cleared_retry_flags,
-                )
+                (removed, removed > 0 || cleared_retry_flags)
             }
         }
-    })
+    };
+    if removed > 0 {
+        if session.messages.iter().any(|message| message.compressed) {
+            // Repairing active history invalidates request state while the
+            // archived messages and their summaries still describe the same prefix.
+            session.token_usage = None;
+            session.metadata.remove("responses.previous_response_id");
+            session.reset_model_context_epoch(
+                bamboo_domain::ModelContextResetReason::ExplicitHistoryRewrite,
+            );
+        } else {
+            clear_derived_context_state(session);
+        }
+    }
+    Ok((removed, should_persist))
 }
