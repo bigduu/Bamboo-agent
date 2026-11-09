@@ -16,6 +16,7 @@ pub mod host_registry;
 pub mod inbox;
 pub mod loop_control_request;
 pub mod message_part;
+mod message_summary;
 pub mod model_context;
 pub mod parent_question;
 pub mod parent_question_checkpoint;
@@ -57,6 +58,9 @@ pub use host_registry::*;
 pub use inbox::*;
 pub use loop_control_request::{parse_loop_control_request, LoopControlRequest};
 pub use message_part::{ImageUrlRef, MessagePart};
+pub use message_summary::{
+    validate_message_summary_tool_protocol, MessageSummaryToolProtocolError,
+};
 pub use model_context::*;
 pub use parent_question::*;
 pub use parent_question_checkpoint::*;

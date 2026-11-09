@@ -8,11 +8,11 @@ use std::collections::HashSet;
 use bamboo_agent_core::{Message, Role, Session};
 use bamboo_domain::ModelContextResetReason;
 
-/// Find tool call IDs that have no corresponding tool result.
+/// Find active tool call IDs that have no corresponding active tool result.
 pub fn unresolved_tool_call_ids(messages: &[Message]) -> HashSet<String> {
     let mut pending_ids = HashSet::new();
 
-    for message in messages {
+    for message in messages.iter().filter(|message| !message.compressed) {
         if let Some(tool_calls) = &message.tool_calls {
             for call in tool_calls {
                 if !call.id.trim().is_empty() {
@@ -31,14 +31,14 @@ pub fn unresolved_tool_call_ids(messages: &[Message]) -> HashSet<String> {
     pending_ids
 }
 
-/// Remove assistant tool calls that have no result, and tool results that have no call.
+/// Remove unmatched calls and results from the active conversation.
 ///
 /// Returns the total number of messages and tool calls removed.
 pub fn sanitize_malformed_tool_chains(session: &mut Session) -> usize {
     let resolved_tool_result_ids: HashSet<String> = session
         .messages
         .iter()
-        .filter(|message| matches!(message.role, Role::Tool))
+        .filter(|message| !message.compressed && matches!(message.role, Role::Tool))
         .filter_map(|message| {
             message
                 .tool_call_id
@@ -51,7 +51,7 @@ pub fn sanitize_malformed_tool_chains(session: &mut Session) -> usize {
 
     let mut removed_assistant_calls = 0usize;
     for message in session.messages.iter_mut() {
-        if !matches!(message.role, Role::Assistant) {
+        if message.compressed || !matches!(message.role, Role::Assistant) {
             continue;
         }
         let Some(tool_calls) = message.tool_calls.take() else {
@@ -76,6 +76,7 @@ pub fn sanitize_malformed_tool_chains(session: &mut Session) -> usize {
     let valid_tool_call_ids: HashSet<String> = session
         .messages
         .iter()
+        .filter(|message| !message.compressed)
         .filter_map(|message| message.tool_calls.as_ref())
         .flatten()
         .filter_map(|call| {
@@ -94,7 +95,7 @@ pub fn sanitize_malformed_tool_chains(session: &mut Session) -> usize {
         .filter(|message| matches!(message.role, Role::Tool))
         .count();
     session.messages.retain(|message| {
-        if !matches!(message.role, Role::Tool) {
+        if message.compressed || !matches!(message.role, Role::Tool) {
             return true;
         }
         message
@@ -136,9 +137,10 @@ pub fn truncate_after_last_user(session: &mut Session) -> Option<usize> {
     Some(removed)
 }
 
-/// Truncate at the user message preceding the first unresolved tool call.
+/// Truncate at the active user message preceding the first unresolved active tool call.
 ///
-/// Returns `None` if there are no unresolved calls or no prior user anchor.
+/// Returns `Some(0)` if every active call has a result. Returns `None` if there
+/// is no active user anchor or the truncation would remove archived messages.
 pub fn truncate_for_unresolved_tool_calls(session: &mut Session) -> Option<usize> {
     let unresolved = unresolved_tool_call_ids(&session.messages);
     if unresolved.is_empty() {
@@ -146,17 +148,24 @@ pub fn truncate_for_unresolved_tool_calls(session: &mut Session) -> Option<usize
     }
 
     let first_unresolved_call_idx = session.messages.iter().position(|message| {
-        message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| calls.iter().any(|call| unresolved.contains(&call.id)))
+        !message.compressed
+            && message
+                .tool_calls
+                .as_ref()
+                .is_some_and(|calls| calls.iter().any(|call| unresolved.contains(&call.id)))
     })?;
 
     let retry_anchor_idx = session.messages[..first_unresolved_call_idx]
         .iter()
-        .rposition(|message| matches!(message.role, Role::User))?;
+        .rposition(|message| !message.compressed && matches!(message.role, Role::User))?;
 
     let keep_len = retry_anchor_idx + 1;
+    if session.messages[keep_len..]
+        .iter()
+        .any(|message| message.compressed)
+    {
+        return None;
+    }
     let removed = session.messages.len().saturating_sub(keep_len);
     if removed > 0 {
         session.messages.truncate(keep_len);
@@ -228,6 +237,20 @@ mod tests {
         session.add_message(Message::assistant("", Some(vec![make_tool_call("call_1")])));
 
         assert!(truncate_for_unresolved_tool_calls(&mut session).is_none());
+    }
+
+    #[test]
+    fn truncate_for_unresolved_tool_calls_preserves_interleaved_archived_messages() {
+        let mut session = Session::new("session-1", "gpt-5");
+        session.add_message(Message::user("task-1"));
+        let mut archived = Message::assistant("archived output", None);
+        archived.compressed = true;
+        session.add_message(archived);
+        session.add_message(Message::assistant("", Some(vec![make_tool_call("call_1")])));
+
+        assert!(truncate_for_unresolved_tool_calls(&mut session).is_none());
+        assert_eq!(session.messages.len(), 3);
+        assert!(session.messages[1].compressed);
     }
 
     #[test]

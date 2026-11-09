@@ -4,8 +4,9 @@ use crate::skill_history::{is_skill_tool_name, SkillNameMatch};
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_domain::MessagePhase;
 use bamboo_domain::{
-    CompressionEvent, CompressionEventKind, CompressionTriggerType, ConversationSummary, Message,
-    ModelContextResetReason, Session,
+    message_summary_tool_work_pending, validate_message_summary_tool_protocol, CompressionEvent,
+    CompressionEventKind, CompressionTriggerType, ConversationSummary, Message,
+    MessageSummaryToolProtocolError, ModelContextResetReason, Session,
 };
 
 /// Checks if a message is part of a skill tool chain (load_skill / read_skill_resource).
@@ -88,7 +89,9 @@ pub enum CompressionPlanError {
     },
     /// The session changed after candidate selection and before finalization.
     CandidateSetChanged,
-    /// Message-only compression must never archive a partial or protected tool chain.
+    /// Tool work is still pending or the final assistant batch awaits results.
+    MessageSummaryPendingToolResults,
+    /// The active history contains malformed or protected tool protocol.
     MessageSummaryToolProtocol { reason: String },
     /// A message-only summary may be empty only when no prose is represented.
     EmptyMessageSummary,
@@ -136,8 +139,11 @@ impl std::fmt::Display for CompressionPlanError {
             Self::CandidateSetChanged => {
                 write!(f, "compression candidate set changed before finalization")
             }
+            Self::MessageSummaryPendingToolResults => {
+                write!(f, "message-summary compression is waiting for tool results")
+            }
             Self::MessageSummaryToolProtocol { reason } => {
-                write!(f, "message-summary compression deferred: {reason}")
+                write!(f, "message-summary compression blocked: {reason}")
             }
             Self::EmptyMessageSummary => {
                 write!(
@@ -572,6 +578,7 @@ fn message_summary_snapshot(session: &Session) -> Result<Vec<u8>, CompressionPla
         &session.messages,
         &session.conversation_summary,
         &session.compression_events,
+        message_summary_tool_work_pending(session),
     ))
     .map_err(|_| CompressionPlanError::CandidateSetChanged)
 }
@@ -598,54 +605,6 @@ fn message_content_source(message: &Message) -> Option<Message> {
     Some(source)
 }
 
-fn validate_message_summary_tool_protocol(
-    messages: &[Message],
-) -> Result<(), CompressionPlanError> {
-    let invalid = |reason: &str| CompressionPlanError::MessageSummaryToolProtocol {
-        reason: reason.to_string(),
-    };
-    let mut calls = HashSet::new();
-    let mut results = HashSet::new();
-    for message in messages {
-        let has_calls = message
-            .tool_calls
-            .as_ref()
-            .is_some_and(|calls| !calls.is_empty());
-        let has_tool_protocol = has_calls
-            || message.tool_call_id.is_some()
-            || message.role == bamboo_domain::Role::Tool;
-        if message.never_compress && has_tool_protocol {
-            return Err(invalid("a tool-chain record is marked never_compress"));
-        }
-        if has_calls {
-            if message.role != bamboo_domain::Role::Assistant {
-                return Err(invalid("tool calls have a non-assistant role"));
-            }
-            for call in message.tool_calls.iter().flatten() {
-                if call.id.is_empty() || !calls.insert(call.id.as_str()) {
-                    return Err(invalid("tool calls have an empty or duplicate identifier"));
-                }
-            }
-        }
-        if message.role == bamboo_domain::Role::Tool {
-            let id = message
-                .tool_call_id
-                .as_deref()
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| invalid("a tool result has no call identifier"))?;
-            if !results.insert(id) {
-                return Err(invalid("a tool call has duplicate results"));
-            }
-        } else if message.tool_call_id.is_some() {
-            return Err(invalid("a tool result identifier has a non-tool role"));
-        }
-    }
-    if calls != results {
-        return Err(invalid("tool calls and results are incomplete or orphaned"));
-    }
-    Ok(())
-}
-
 fn summary_prompt_tokens(
     kind: CompressionEventKind,
     content: &str,
@@ -661,9 +620,9 @@ fn summary_prompt_tokens(
 /// Archive all eligible active history, retaining the current user request and
 /// explicit prose anchors, while summarizing only user/assistant `content`.
 ///
-/// Completed tool chains, including Skill-loading chains, are archived without
-/// entering the summary source. Incomplete or protected tool protocol rejects
-/// the whole pass, so no successful plan leaves completed tool context active.
+/// Completed tool chains and abandoned calls from superseded user turns are
+/// archived without entering the summary source. Unresolved current or
+/// protected tool protocol still blocks the pass.
 /// A mixed existing summary is rebuilt from durable prose on the first pass.
 pub fn build_message_summary_candidate_plan_with_fixed_tokens(
     session: &Session,
@@ -705,7 +664,16 @@ pub fn build_message_summary_candidate_plan_with_input_costs(
     if active_messages.is_empty() {
         return Err(CompressionPlanError::NoActiveMessages);
     }
-    validate_message_summary_tool_protocol(&active_messages)?;
+    validate_message_summary_tool_protocol(session).map_err(|error| match error {
+        MessageSummaryToolProtocolError::PendingResults => {
+            CompressionPlanError::MessageSummaryPendingToolResults
+        }
+        MessageSummaryToolProtocolError::Invalid(reason) => {
+            CompressionPlanError::MessageSummaryToolProtocol {
+                reason: reason.to_owned(),
+            }
+        }
+    })?;
     let latest_user_id = active_messages
         .iter()
         .rfind(|message| message.role == bamboo_domain::Role::User)

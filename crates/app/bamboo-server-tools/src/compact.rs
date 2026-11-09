@@ -28,7 +28,8 @@ impl Tool for CompactContextTool {
          Use at natural task boundaries (after finishing a feature, before starting a new topic). \
          message_summary summarizes historical user/assistant text, retains the current user \
          request, and removes completed tool exchanges from the next model context. \
-         In message_summary mode, incomplete tool chains defer compression until they finish. \
+         Message summaries wait for the current tool batch and can archive unanswered calls \
+         superseded by a newer user turn. \
          The summary strategy accepts optional focus instructions; message_summary ignores \
          tool arguments, including custom instructions."
     }
