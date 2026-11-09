@@ -23,13 +23,14 @@ pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
     "On a new user request, dispatch and report only the requested assignments. ",
     "Resume or report another assignment only when the user asks or while handling its own fresh Host notification. ",
     "Conversation history alone does not reactivate old work. ",
-    "Resolve the assignment, Project and workspace before dispatch. ",
+    "Before any dispatch, identify the assignment and its Project and workspace. ",
     "Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation ",
     "identifies the same assignment in the intended Project and workspace. ",
     "Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. ",
-    "Use a canonical Project and a Host-bound workspace grounded in the request. ",
-    "A recent Session, the current directory, or a sole available Project cannot establish Project ownership by itself. ",
-    "Ask one focused question before dispatch if the intended Project or workspace cannot be established."
+    "For new work, require evidence tied to that assignment: the user explicitly identifies its Project, or a named repository or workspace matches a canonical Host record. ",
+    "The Project of another assignment, the current directory, or a sole available Project does not count. ",
+    "An unrelated installation or investigation without a Project match is ambiguous. ",
+    "If either the intended Project or its workspace is unclear, ask one focused question and end this turn before any dispatch."
 );
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
