@@ -717,6 +717,7 @@ async fn snapshot_skill_resources(
     previous: PreviousCatalog<'_>,
     limits: SkillSnapshotLimits,
     captures: &HashMap<SkillId, Arc<CapturedSkill>>,
+    authored_headers: &storage::AuthoredHeaders,
 ) -> SkillResult<(HashMap<SkillId, SkillResourceSnapshot>, HashSet<SkillId>)> {
     let mut snapshots = HashMap::with_capacity(roots.len());
     let mut legacy_resource_fallbacks = HashSet::new();
@@ -734,6 +735,7 @@ async fn snapshot_skill_resources(
                     definition_bytes(definitions.get(&skill_id)),
                     limits,
                     captures.get(&skill_id).map(Arc::as_ref),
+                    authored_headers.get(root),
                 )
                 .await,
             )
@@ -796,6 +798,7 @@ async fn snapshot_bundle_resources(
     definition_bytes: usize,
     limits: SkillSnapshotLimits,
     capture: Option<&CapturedSkill>,
+    authored_header: Option<&std::fs::Metadata>,
 ) -> SkillResult<(SkillResourceSnapshot, usize)> {
     let skill_markdown_bytes = tokio::fs::metadata(root.join("SKILL.md"))
         .await
@@ -846,6 +849,11 @@ async fn snapshot_bundle_resources(
             "snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
             limits.max_skill_bytes
         )));
+    }
+    // A directory exchange during discovery can leave an old header and new
+    // resources. Route that bundle through the same isolated fallback as a bad resource.
+    if let Some(header) = authored_header {
+        storage::verify_authored_header(root, header).await?;
     }
     Ok((Arc::new(resources), skill_bytes))
 }
@@ -1602,7 +1610,7 @@ impl SkillStore {
         let mut dirs = dirs;
         let plugins_root = Self::plugins_root_dir(&self.config.skills_dir);
         dirs.extend(discover_plugin_skill_dirs(&plugins_root).await);
-        let (mut report, captures) = load_captured_records(
+        let (mut report, captures, authored_headers) = load_captured_records(
             &dirs,
             self.snapshot_limits.max_file_bytes,
             MAX_WORKFLOWS_PER_PUBLICATION,
@@ -1727,6 +1735,7 @@ impl SkillStore {
             },
             self.snapshot_limits,
             &winner_captures,
+            &authored_headers,
         )
         .await?;
         let (resolved_workflow_resources, _) = snapshot_skill_resources(
@@ -1742,6 +1751,7 @@ impl SkillStore {
             },
             self.snapshot_limits,
             &HashMap::new(),
+            &authored_headers,
         )
         .await?;
         let mut resolved_sources = HashMap::new();
@@ -5856,6 +5866,72 @@ Use this skill for testing.
             .await
             .expect("LKG remains executable");
         assert_eq!(pinned.root(), original.root());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authored_workflow_refresh_rejects_a_bundle_replaced_after_discovery() {
+        const ID: &str = "authored-review";
+        let directory = tempfile::tempdir().unwrap();
+        let skills_dir = directory.path().join("skills");
+        let root = skills_dir.join(ID);
+        let replacement = directory.path().join("replacement");
+        let retained = directory.path().join("retained");
+        for (path, revision, description) in [
+            (&root, 1, "Original description"),
+            (&replacement, 2, "Revised description"),
+        ] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("SKILL.md"), format!("---\nname: {ID}\ndescription: {description}\nmetadata:\n  workflow_definition_authoring: 1\n---\n\nInstructions\n")).unwrap();
+            std::fs::write(path.join("workflow.yaml"), orchestration_yaml(ID, revision)).unwrap();
+        }
+        let unaffected = write_skill(&skills_dir, "unaffected-flow", "Ready", "Instructions")
+            .await
+            .unwrap();
+        fs::write(
+            unaffected.join("workflow.yaml"),
+            orchestration_yaml("unaffected-flow", 1),
+        )
+        .await
+        .unwrap();
+        let store = SkillStore::new(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        store.initialize().await.unwrap();
+        store.set_source_snapshot_hook(move || {
+            std::fs::rename(&root, retained).unwrap();
+            std::fs::rename(replacement, root).unwrap();
+        });
+
+        store.reload().await.unwrap();
+        let catalog = store.workflow_catalog_snapshot().await;
+        let entry = catalog.entries.iter().find(|entry| entry.id == ID).unwrap();
+        assert_eq!(entry.status, WorkflowStatus::Invalid);
+        assert_eq!(
+            (entry.revision, entry.description.as_str()),
+            (1, "Original description")
+        );
+        assert_eq!(
+            store.workflow_resources.read().await[ID]["workflow.yaml"].as_slice(),
+            orchestration_yaml(ID, 1).as_bytes()
+        );
+        assert!(catalog.entries.iter().any(|entry| {
+            entry.id == "unaffected-flow" && entry.status == WorkflowStatus::Valid
+        }));
+        store.reload().await.unwrap();
+        let entry = store
+            .workflow_catalog_snapshot()
+            .await
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == ID)
+            .unwrap();
+        assert_eq!(entry.status, WorkflowStatus::Valid);
+        assert_eq!(
+            (entry.revision, entry.description.as_str()),
+            (2, "Revised description")
+        );
     }
 
     #[tokio::test]

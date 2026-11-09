@@ -52,9 +52,14 @@ Example create body:
 
 The response returns the normalized definition, description, source,
 `content_digest`, `skill_digest`, `saved`, and `catalog_available`. The first
-digest is SHA-256 of the exact `workflow.yaml` bytes; the second is SHA-256 of
-its immutable `SKILL.md` header/body. Neither token is the catalog's separate
+digest is SHA-256 of the exact `workflow.yaml` bytes. The second is SHA-256 of
+the exact `SKILL.md` header and body. Neither token is the catalog's separate
 bundle `catalog_content_digest`. Echo both editing tokens for an update.
+An update can include a new `description`. When the description changes, Bamboo
+exchanges the generated two-file bundle so the description and definition take
+effect together. Omitting the description or passing the current one updates
+`workflow.yaml` in place and preserves any added resources. A bundle with
+additional resources rejects a description change.
 An observed stale revision, changed metadata, replacement file identity or an
 existing create destination produces a conflict before publication. An external
 editor can still replace the definition after the final check. Updates exchange
@@ -68,11 +73,34 @@ A filesystem save can succeed while a subsequent catalog refresh is unavailable;
 publication error means the caller must GET and reconcile before retrying. It
 is not evidence that the old bytes survived.
 
+## Project teaching
+
+Lotus opens **Teach a workflow** from the current session's Workflow Runs
+panel. A user can describe a new read-only procedure or select an existing
+project-authored definition to revise.
+
+- `POST /sessions/{session_id}/workflow-proposals` accepts `instruction` and
+  an optional `workflow_id` for a revision. The host captures the durable
+  Project and the existing definition, then starts the embedded Skill Curator
+  through the normal Workflow Run engine.
+- `GET /sessions/{session_id}/workflow-proposals/{run_id}` reports run state.
+  A successful run projects a validated draft, a clarification, or an unchanged
+  definition and description. Drafts include the pinned Project, the previous
+  description and definition when present, and the edit tokens for comparison.
+- The user's save action calls the existing create or update API with
+  `expected_project_id`. The server checks this against the durable Session
+  assignment under the Session scope lock. Revisions also require the original
+  revision and both digests. The run control remains a separate action.
+
+The curator uses one read-only Agent step with a bounded typed Child report.
+Teaching is explicit in the panel. Its scope is small, project-owned, read-only
+orchestration definitions. The host pins the packaged curator directly. Its
+reserved identity is unavailable to ordinary starts, clones and nested runs.
+
 ## Boundaries
 
-- The canonical location is the existing owned Skill bundle, containing generated
-  immutable `SKILL.md` and `workflow.yaml` (JSON is valid YAML). There is no new
-  definition registry or run format.
+- The canonical location is the existing owned Skill bundle containing generated
+  `SKILL.md` and `workflow.yaml` (JSON is valid YAML).
 - This first slice only edits bundles marked by this authoring API. It does not
   adopt arbitrary external bundles, builtins, plugins, or builtin-clone
   publications. Existing unmanaged content remains untouched. External metadata
@@ -108,13 +136,12 @@ is not evidence that the old bytes survived.
   publication keep their existing platform paths; this change does not certify
   those paths on Windows.
 - Writes use the shared descriptor-bound publication lock, bounded no-follow
-  reads, no-replace creation and preserving exchange for updates. Prior files
+  reads, no-replace creation and preserving exchange for updates. Bundle swaps
+  preserve ordinary access permissions. Prior files or bundles
   from successful updates and failed/uncertain stages are retained outside
   catalog discovery. The API never swaps back over a later editor's version,
   adopts retained entries or automatically removes them. An uncertain error is
   not proof of crash durability or that the old bytes stayed at their old path.
 
-This API is the first authoring foundation. An Agent-facing mutation tool and a
-minimal creation/editing UI remain separate consumer work; the API alone is not
-an end-to-end natural-language authoring editor. DAG runtime visualization uses
-[the topology contract](WORKFLOW-RUN-TOPOLOGY.md), not definition-file access.
+DAG runtime visualization uses [the topology contract](WORKFLOW-RUN-TOPOLOGY.md)
+to show the plan pinned to a run.

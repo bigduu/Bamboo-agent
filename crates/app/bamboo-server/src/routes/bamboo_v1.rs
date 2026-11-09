@@ -64,6 +64,14 @@ pub(crate) fn bamboo_relative_routes() -> impl HttpServiceFactory {
             web::post().to(settings::clone_workflow),
         )
         .route(
+            "/sessions/{session_id}/workflow-proposals",
+            web::post().to(settings::start_workflow_proposal),
+        )
+        .route(
+            "/sessions/{session_id}/workflow-proposals/{run_id}",
+            web::get().to(settings::get_workflow_proposal),
+        )
+        .route(
             "/sessions/{session_id}/workflow-runs",
             web::post().to(workflow_runs::start),
         )

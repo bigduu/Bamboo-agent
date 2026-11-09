@@ -212,6 +212,7 @@ pub async fn list_workflow_catalog(
 
 pub(super) struct CloneTargetScope {
     pub(super) trusted_root: PathBuf,
+    pub(super) project_id: Option<bamboo_domain::ProjectId>,
     pub(super) store: Arc<SkillStore>,
     pub(super) published_source: WorkflowSource,
     pub(super) session_guard: Option<bamboo_storage::session_merge::SessionLockGuard>,
@@ -276,6 +277,7 @@ pub(super) async fn clone_target_scope(
                 })?;
             Ok(CloneTargetScope {
                 trusted_root: app_state.app_data_dir.clone(),
+                project_id: None,
                 store,
                 published_source: WorkflowSource::User,
                 session_guard: None,
@@ -361,6 +363,7 @@ pub(super) async fn clone_target_scope(
                 })?;
             Ok(CloneTargetScope {
                 trusted_root: project_home,
+                project_id: Some(project_id),
                 store,
                 published_source: WorkflowSource::Project,
                 session_guard: Some(session_guard),
@@ -406,7 +409,8 @@ pub async fn clone_workflow(
     payload: web::Json<CloneWorkflowRequest>,
 ) -> Result<HttpResponse, AppError> {
     let workflow_id = workflow_id.into_inner();
-    if !is_safe_workflow_name(&workflow_id)
+    if workflow_id == bamboo_skills::SKILL_CURATOR_ID
+        || !is_safe_workflow_name(&workflow_id)
         || payload.revision == 0
         || !valid_sha256(&payload.content_digest)
     {

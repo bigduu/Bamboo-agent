@@ -1360,13 +1360,22 @@ impl ChildCompletionHandler for ChildCompletionCoordinator {
                     return;
                 }
             }
+            // Workflow reads its own Child result. An untracked completion
+            // must not schedule a separate conversation turn.
+            let workflow_owned = loaded_child.as_ref().is_some_and(|child| {
+                child
+                    .metadata
+                    .get(bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY)
+                    .is_some_and(|value| value == "true")
+            });
             if !tracked_wait
-                && crate::ticket_runtime::is_independent_ticket_child(
-                    self.storage.as_ref(),
-                    &parent,
-                    &completion.child_session_id,
-                )
-                .await
+                && (workflow_owned
+                    || crate::ticket_runtime::is_independent_ticket_child(
+                        self.storage.as_ref(),
+                        &parent,
+                        &completion.child_session_id,
+                    )
+                    .await)
             {
                 return;
             }
@@ -5784,6 +5793,45 @@ mod tests {
             error: None,
             completed_at: child.updated_at,
             source: test_child_source(store, child_id).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_skill_teaching_child_completion_respects_parent_wait() {
+        for tracked in [false, true] {
+            let (_temp, store, inbox, coordinator, _, launches) = completion_inbox_fixture().await;
+            let parent_id = "workflow-parent";
+            let child_id = "workflow-child";
+            if tracked {
+                save_waiting_test_parent(
+                    &store,
+                    parent_id,
+                    vec![child_id.into()],
+                    ChildWaitPolicy::All,
+                )
+                .await;
+            } else {
+                store
+                    .save_session(&Session::new(parent_id, "model"))
+                    .await
+                    .unwrap();
+            }
+            let mut child = Session::new_child(child_id, parent_id, "model", "Workflow Child");
+            child.metadata.insert(
+                bamboo_subagent::proto::WORKFLOW_USAGE_REQUESTED_KEY.into(),
+                "true".into(),
+            );
+            store.save_session(&child).await.unwrap();
+            let completion =
+                save_completion_test_child(&store, parent_id, child_id, "completed").await;
+            coordinator.on_child_completed(completion).await;
+
+            let outcomes = inbox
+                .pending_child_outcomes(parent_id, child_id)
+                .await
+                .unwrap();
+            assert_eq!(outcomes.len(), usize::from(tracked));
+            assert_eq!(launches.load(Ordering::SeqCst), usize::from(tracked));
         }
     }
 

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -225,8 +226,19 @@ pub(crate) async fn read_skill_file_bounded(
     label: &str,
     max_bytes: usize,
 ) -> SkillResult<Vec<u8>> {
+    read_skill_file_with_metadata(path, label, max_bytes)
+        .await
+        .map(|(bytes, _)| bytes)
+}
+
+async fn read_skill_file_with_metadata(
+    path: &Path,
+    label: &str,
+    max_bytes: usize,
+) -> SkillResult<(Vec<u8>, std::fs::Metadata)> {
     let file = open_skill_file_no_follow(path).await?;
-    let size = file.metadata().await?.len();
+    let metadata = file.metadata().await?;
+    let size = metadata.len();
     let over_limit = |size| {
         SkillError::Storage(format!(
             "{label} exceeds per-file limit ({size} > {max_bytes} bytes)"
@@ -242,7 +254,7 @@ pub(crate) async fn read_skill_file_bounded(
     if bytes.len() > max_bytes {
         return Err(over_limit(bytes.len() as u64));
     }
-    Ok(bytes)
+    Ok((bytes, metadata))
 }
 
 fn public_skill_error(error: &SkillError) -> String {
@@ -425,7 +437,33 @@ pub async fn load_skills_from_discovery_dirs_detailed_with_limits(
         None,
     )
     .await
-    .map(|(report, _)| report)
+    .map(|(report, _, _)| report)
+}
+
+pub(crate) type AuthoredHeaders = HashMap<PathBuf, std::fs::Metadata>;
+
+pub(crate) async fn verify_authored_header(
+    root: &Path,
+    opened: &std::fs::Metadata,
+) -> SkillResult<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::symlink_metadata(root.join("SKILL.md")).await?;
+        if !current.is_file()
+            || current.dev() != opened.dev()
+            || current.ino() != opened.ino()
+            || current.len() != opened.len()
+            || current.modified()? != opened.modified()?
+        {
+            return Err(SkillError::Storage(
+                "Authored Workflow changed during catalog refresh".into(),
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (root, opened);
+    Ok(())
 }
 
 pub(crate) async fn load_captured_records(
@@ -433,10 +471,15 @@ pub(crate) async fn load_captured_records(
     max_skill_file_bytes: usize,
     max_skill_candidates: usize,
     pool: Option<std::sync::Arc<crate::progressive::source::SourcePool>>,
-) -> SkillResult<(SkillLoadReport, crate::progressive::source::CapturedSources)> {
+) -> SkillResult<(
+    SkillLoadReport,
+    crate::progressive::source::CapturedSources,
+    AuthoredHeaders,
+)> {
     use crate::progressive::source::CandidateKey;
     let mut report = SkillLoadReport::default();
     let mut captures = crate::progressive::source::CapturedSources::new();
+    let mut authored_headers = AuthoredHeaders::new();
 
     for discovery in discovery_dirs {
         match fs::try_exists(&discovery.dir).await {
@@ -562,11 +605,15 @@ pub(crate) async fn load_captured_records(
             } else {
                 None
             };
-            let bytes = if let Some(captured) = &mut captured {
-                std::mem::take(&mut captured.main).into_bytes()
+            let (bytes, opened_header) = if let Some(captured) = &mut captured {
+                (std::mem::take(&mut captured.main).into_bytes(), None)
             } else {
-                match read_skill_file_bounded(&skill_file, "SKILL.md", max_skill_file_bytes).await {
-                    Ok(bytes) => bytes,
+                match read_skill_file_with_metadata(&skill_file, "SKILL.md", max_skill_file_bytes)
+                    .await
+                {
+                    Ok((bytes, metadata)) => {
+                        (bytes, (cfg!(unix) && workflow_marker).then_some(metadata))
+                    }
                     Err(error) => {
                         let skill_root = skill_file
                             .parent()
@@ -604,6 +651,16 @@ pub(crate) async fn load_captured_records(
                             .parent()
                             .map(Path::to_path_buf)
                             .unwrap_or_else(|| discovery.dir.clone());
+                        if skill.metadata.as_ref().is_some_and(|metadata| {
+                            metadata
+                                .get("workflow_definition_authoring")
+                                .and_then(serde_json::Value::as_u64)
+                                == Some(1)
+                        }) {
+                            if let Some(metadata) = opened_header {
+                                authored_headers.insert(skill_root.clone(), metadata);
+                            }
+                        }
                         report.loaded.push(LoadedSkillRecord {
                             skill,
                             skill_root,
@@ -670,7 +727,7 @@ pub(crate) async fn load_captured_records(
         report.loaded.len(),
         report.failed.len()
     );
-    Ok((report, captures))
+    Ok((report, captures, authored_headers))
 }
 
 /// Discover additional skill-discovery dirs contributed by installed

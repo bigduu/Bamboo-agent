@@ -30,6 +30,10 @@ pub use store::{
 };
 pub use types::*;
 
+/// The host authoring entry point verifies its executable against these packaged bytes.
+pub const SKILL_CURATOR_WORKFLOW: &str = include_str!("../assets/skill-curator/workflow.yaml");
+pub const SKILL_CURATOR_ID: &str = "skill-curator";
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;

@@ -36,6 +36,8 @@ pub struct CreateDefinitionRequest {
     pub target: CloneWorkflowTarget,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub expected_project_id: Option<bamboo_domain::ProjectId>,
     pub description: String,
     pub definition: Value,
 }
@@ -46,9 +48,13 @@ pub struct UpdateDefinitionRequest {
     pub target: CloneWorkflowTarget,
     #[serde(default)]
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub expected_project_id: Option<bamboo_domain::ProjectId>,
     pub expected_revision: u64,
     pub expected_digest: String,
     pub expected_skill_digest: String,
+    #[serde(default)]
+    pub description: Option<String>,
     pub definition: Value,
 }
 
@@ -74,7 +80,7 @@ struct AuthoringMetadata {
     workflow_definition_authoring: u32,
 }
 
-fn error(status: StatusCode, message: &str) -> Box<HttpResponse> {
+pub(super) fn error(status: StatusCode, message: &str) -> Box<HttpResponse> {
     Box::new(crate::error::json_error(status, message))
 }
 
@@ -96,7 +102,9 @@ fn input_fields_preserved(input: &Value, normalized: &Value) -> bool {
     }
 }
 
-fn validate_definition(value: &Value) -> Result<WorkflowRunDefinition, Box<HttpResponse>> {
+pub(super) fn validate_definition(
+    value: &Value,
+) -> Result<WorkflowRunDefinition, Box<HttpResponse>> {
     let encoded = serde_json::to_vec(value)
         .map_err(|_| error(StatusCode::BAD_REQUEST, "Invalid workflow definition"))?;
     if encoded.len() > MAX_DEFINITION_BYTES {
@@ -172,7 +180,8 @@ fn validate_definition(value: &Value) -> Result<WorkflowRunDefinition, Box<HttpR
             "Normalized workflow definition is too large",
         ));
     }
-    if !is_safe_workflow_name(&definition.id)
+    if definition.id == bamboo_skills::SKILL_CURATOR_ID
+        || !is_safe_workflow_name(&definition.id)
         || definition.id.starts_with('.')
         || definition.id.ends_with('.')
     {
@@ -192,7 +201,7 @@ fn validate_definition(value: &Value) -> Result<WorkflowRunDefinition, Box<HttpR
     Ok(definition)
 }
 
-fn skill_bytes(id: &str, description: &str) -> Result<Vec<u8>, Box<HttpResponse>> {
+pub(super) fn skill_bytes(id: &str, description: &str) -> Result<Vec<u8>, Box<HttpResponse>> {
     let description = description.trim();
     if description.is_empty()
         || description.len() > MAX_DESCRIPTION_BYTES
@@ -230,7 +239,7 @@ fn skill_bytes(id: &str, description: &str) -> Result<Vec<u8>, Box<HttpResponse>
     Ok(markdown.into_bytes())
 }
 
-fn verify_authored_skill(id: &str, bytes: &[u8]) -> Result<String, Box<HttpResponse>> {
+pub(super) fn verify_authored_skill(id: &str, bytes: &[u8]) -> Result<String, Box<HttpResponse>> {
     let text = std::str::from_utf8(bytes).map_err(|_| {
         error(
             StatusCode::CONFLICT,
@@ -265,7 +274,7 @@ fn verify_authored_skill(id: &str, bytes: &[u8]) -> Result<String, Box<HttpRespo
     Ok(header.description)
 }
 
-fn stored_definition(
+pub(super) fn stored_definition(
     snapshot: &DefinitionSnapshot,
 ) -> Result<WorkflowRunDefinition, Box<HttpResponse>> {
     let value: Value = serde_yaml::from_slice(&snapshot.bytes).map_err(|_| {
@@ -306,6 +315,16 @@ async fn validate_nested_definitions(
             if bundle
                 .definitions
                 .values()
+                .any(|nested| nested.id == bamboo_skills::SKILL_CURATOR_ID)
+            {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "Skill Curator is unavailable as a nested Workflow",
+                ));
+            }
+            if bundle
+                .definitions
+                .values()
                 .any(|nested| nested.id == definition.id)
             {
                 return Err(error(
@@ -318,7 +337,7 @@ async fn validate_nested_definitions(
     Ok(())
 }
 
-fn publication_error(problem: DefinitionPublicationError) -> Box<HttpResponse> {
+pub(super) fn publication_error(problem: DefinitionPublicationError) -> Box<HttpResponse> {
     match problem {
         DefinitionPublicationError::Invalid(message) => error(StatusCode::BAD_REQUEST, message),
         DefinitionPublicationError::Conflict(message) => error(StatusCode::CONFLICT, message),
@@ -351,7 +370,7 @@ fn publication_error(problem: DefinitionPublicationError) -> Box<HttpResponse> {
     }
 }
 
-async fn scope_for(
+pub(super) async fn scope_for(
     state: &AppState,
     target: CloneWorkflowTarget,
     session_id: Option<&str>,
@@ -359,7 +378,7 @@ async fn scope_for(
     clone_target_scope(state, target, session_id).await
 }
 
-async fn require_winner(
+pub(super) async fn require_winner(
     scope: &CloneTargetScope,
     id: &str,
     creating: bool,
@@ -419,6 +438,46 @@ async fn require_winner(
     }
 }
 
+pub(super) async fn read_authoring_snapshot(
+    scope: &CloneTargetScope,
+    id: &str,
+) -> Result<DefinitionSnapshot, Box<HttpResponse>> {
+    if !is_safe_workflow_name(id) || id.starts_with('.') || id.ends_with('.') {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "Invalid workflow definition id",
+        ));
+    }
+    require_winner(scope, id, false).await?;
+    let root = scope.trusted_root.clone();
+    let id = id.to_string();
+    match tokio::task::spawn_blocking(move || definition_publication::read_definition(&root, &id))
+        .await
+    {
+        Ok(result) => result.map_err(publication_error),
+        Err(problem) => {
+            tracing::error!(%problem, "workflow definition read failed");
+            Err(error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Workflow definition is unavailable",
+            ))
+        }
+    }
+}
+
+fn check_expected_project(
+    scope: &CloneTargetScope,
+    expected: Option<&bamboo_domain::ProjectId>,
+) -> Result<(), Box<HttpResponse>> {
+    if expected.is_some() && expected != scope.project_id.as_ref() {
+        return Err(error(
+            StatusCode::CONFLICT,
+            "Workflow authoring project changed",
+        ));
+    }
+    Ok(())
+}
+
 async fn response_for(
     scope: &CloneTargetScope,
     snapshot: DefinitionSnapshot,
@@ -446,6 +505,8 @@ async fn response_for(
                 && entry.kind == WorkflowKind::Orchestration
                 && entry.status == WorkflowStatus::Valid
                 && entry.revision == definition.revision
+                // Discovery normalizes whitespace in portable Skill descriptions.
+                && entry.description.split_whitespace().eq(description.split_whitespace())
         });
     // Same-revision external edits or missing nested revisions must not make
     // an unrelated publication look executable merely because its id matches.
@@ -508,6 +569,9 @@ pub async fn create_workflow_definition(
         Ok(value) => value,
         Err(response) => return Ok(*response),
     };
+    if let Err(response) = check_expected_project(&scope, body.expected_project_id.as_ref()) {
+        return Ok(*response);
+    }
     if let Err(response) = require_winner(&scope, &definition.id, true).await {
         return Ok(*response);
     }
@@ -547,32 +611,13 @@ pub async fn get_workflow_definition(
     query: web::Query<DefinitionQuery>,
 ) -> Result<HttpResponse, AppError> {
     let id = id.into_inner();
-    if !is_safe_workflow_name(&id) || id.starts_with('.') || id.ends_with('.') {
-        return Ok(*error(
-            StatusCode::BAD_REQUEST,
-            "Invalid workflow definition id",
-        ));
-    }
     let scope = match scope_for(&state, query.target, query.session_id.as_deref()).await {
         Ok(value) => value,
         Err(response) => return Ok(*response),
     };
-    if let Err(response) = require_winner(&scope, &id, false).await {
-        return Ok(*response);
-    }
-    let root = scope.trusted_root.clone();
-    match tokio::task::spawn_blocking(move || definition_publication::read_definition(&root, &id))
-        .await
-    {
-        Ok(Ok(snapshot)) => Ok(response_for(&scope, snapshot, StatusCode::OK, false).await),
-        Ok(Err(problem)) => Ok(*publication_error(problem)),
-        Err(problem) => {
-            tracing::error!(%problem, "workflow definition read failed");
-            Ok(*error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "Workflow definition is unavailable",
-            ))
-        }
+    match read_authoring_snapshot(&scope, &id).await {
+        Ok(snapshot) => Ok(response_for(&scope, snapshot, StatusCode::OK, false).await),
+        Err(response) => Ok(*response),
     }
 }
 
@@ -601,6 +646,9 @@ pub async fn update_workflow_definition(
         Ok(value) => value,
         Err(response) => return Ok(*response),
     };
+    if let Err(response) = check_expected_project(&scope, body.expected_project_id.as_ref()) {
+        return Ok(*response);
+    }
     if let Err(response) = require_winner(&scope, &id, false).await {
         return Ok(*response);
     }
@@ -633,6 +681,15 @@ pub async fn update_workflow_definition(
     if let Err(response) = verify_authored_skill(&id, &current.skill_bytes) {
         return Ok(*response);
     }
+    let revised_skill = match body
+        .description
+        .as_deref()
+        .map(|value| skill_bytes(&id, value))
+        .transpose()
+    {
+        Ok(skill) => skill,
+        Err(response) => return Ok(*response),
+    };
     if let Err(response) = stored_definition(&current) {
         return Ok(*response);
     }
@@ -653,7 +710,10 @@ pub async fn update_workflow_definition(
             &expected_digest,
             revision,
             &expected_skill_digest,
-            &bytes,
+            definition_publication::DefinitionReplacement {
+                definition: &bytes,
+                skill: revised_skill.as_deref(),
+            },
         );
         (result, session_guard)
     })

@@ -2,6 +2,7 @@ mod clone_publication;
 mod definition_publication;
 mod definitions;
 mod handlers;
+mod proposals;
 #[cfg(test)]
 mod tests;
 mod types;
@@ -22,3 +23,5 @@ pub use definitions::{
     create_workflow_definition, get_workflow_definition, update_workflow_definition,
     validate_workflow_definition,
 };
+
+pub use proposals::{get_workflow_proposal, start_workflow_proposal};

@@ -4,7 +4,7 @@
 //! Clone and authoring writes share one descriptor-bound transaction lock.
 //! Failed stages are deliberately retained, never adopted or recursively
 //! removed: without a durable ownership journal, their ownership is uncertain.
-//! Updates also retain the displaced file outside catalog discovery. An
+//! Updates also retain the displaced file or bundle outside catalog discovery. An
 //! exchange detects concurrent replacement without destroying its bytes; it
 //! does not provide an expected-inode CAS against uncooperative editors.
 
@@ -64,8 +64,13 @@ pub(super) struct DefinitionSnapshot {
     pub digest: String,
     pub revision: u64,
     pub skill_bytes: Vec<u8>,
-    /// Separate immutable-header compare-and-swap token.
+    /// Separate compare-and-swap token for the exact SKILL.md bytes.
     pub skill_digest: String,
+}
+
+pub(super) struct DefinitionReplacement<'a> {
+    pub definition: &'a [u8],
+    pub skill: Option<&'a [u8]>,
 }
 
 fn sha256(bytes: &[u8]) -> String {
@@ -329,28 +334,40 @@ fn read_bundle(
     id: &str,
     bundle: &CapDir,
 ) -> Result<DefinitionSnapshot, DefinitionPublicationError> {
-    read_bundle_with_metadata(id, bundle).map(|(snapshot, _, _)| snapshot)
+    read_bundle_with_metadata(id, bundle).map(|bundle| bundle.snapshot)
+}
+
+struct BundleFiles {
+    skill: Metadata,
+    definition: Metadata,
+}
+
+struct OpenedBundle {
+    snapshot: DefinitionSnapshot,
+    files: BundleFiles,
 }
 
 fn read_bundle_with_metadata(
     id: &str,
     bundle: &CapDir,
-) -> Result<(DefinitionSnapshot, Metadata, Metadata), DefinitionPublicationError> {
+) -> Result<OpenedBundle, DefinitionPublicationError> {
     let (skill_bytes, skill_metadata) = read_file(bundle, SKILL_FILE, MAX_SKILL_BYTES)?;
     validate_authored_skill(id, &skill_bytes)?;
     let (bytes, definition_metadata) = read_file(bundle, DEFINITION_FILE, MAX_DEFINITION_BYTES)?;
     let revision = definition_revision(id, &bytes)?;
-    Ok((
-        DefinitionSnapshot {
+    Ok(OpenedBundle {
+        snapshot: DefinitionSnapshot {
             digest: sha256(&bytes),
             skill_digest: sha256(&skill_bytes),
             bytes,
             skill_bytes,
             revision,
         },
-        skill_metadata,
-        definition_metadata,
-    ))
+        files: BundleFiles {
+            skill: skill_metadata,
+            definition: definition_metadata,
+        },
+    })
 }
 
 fn ensure_file_unchanged(
@@ -360,12 +377,20 @@ fn ensure_file_unchanged(
 ) -> Result<(), DefinitionPublicationError> {
     ensure_cap_file_is_still_named(parent, Path::new(name), expected)?;
     let named = parent.symlink_metadata(name)?;
+    #[cfg(unix)]
+    let permissions_changed = {
+        use cap_std::fs::PermissionsExt;
+        named.permissions().mode() != expected.permissions().mode()
+    };
+    #[cfg(not(unix))]
+    let permissions_changed = false;
     if named.file_type().is_symlink()
         || !named.is_file()
         || cap_node_identity(&named) != cap_node_identity(expected)
         || !cap_regular_file_has_single_link(&named)
         || named.len() != expected.len()
         || named.modified()? != expected.modified()?
+        || permissions_changed
     {
         return Err(DefinitionPublicationError::Conflict(
             "Workflow definition file authority changed before publication",
@@ -428,6 +453,47 @@ fn injected_failure() -> DefinitionPublicationError {
     ))
 }
 
+struct StagedBundle {
+    name: String,
+    dir: CapDir,
+    contents: OpenedBundle,
+}
+
+fn stage_bundle(
+    authority: &Authority,
+    id: &str,
+    skill: &[u8],
+    definition: &[u8],
+) -> Result<StagedBundle, DefinitionPublicationError> {
+    // Stages stay outside catalog discovery and are never reused.
+    let name = format!("definition-{}", uuid::Uuid::new_v4());
+    authority.ensure_named()?;
+    authority.transaction.create_dir(&name)?;
+    let dir = open_real_child_dir(&authority.transaction, Path::new(&name))?;
+    let create = |file, bytes| {
+        authority.ensure_named()?;
+        ensure_open_child_is_still_named(&authority.transaction, Path::new(&name), &dir)?;
+        create_file(&dir, file, bytes)
+    };
+    let files = BundleFiles {
+        skill: create(SKILL_FILE, skill)?,
+        definition: create(DEFINITION_FILE, definition)?,
+    };
+    let snapshot = read_bundle(id, &dir)?;
+    if snapshot.bytes != definition || snapshot.skill_bytes != skill {
+        return Err(DefinitionPublicationError::Conflict(
+            "Workflow definition stage differs from requested bytes",
+        ));
+    }
+    sync_cap_directory(&dir)?;
+    sync_cap_directory(&authority.transaction)?;
+    Ok(StagedBundle {
+        name,
+        dir,
+        contents: OpenedBundle { snapshot, files },
+    })
+}
+
 pub(super) fn create_definition(
     trusted_root: &Path,
     id: &str,
@@ -462,27 +528,12 @@ fn create_definition_with_fault(
             ))
         }
     }
-    // Stages live outside catalog discovery. Never reuse or remove an existing
-    // stage, even after an earlier request returned an I/O error.
-    let stage_name = format!("definition-{}", uuid::Uuid::new_v4());
-    authority.ensure_named()?;
-    authority.transaction.create_dir(&stage_name)?;
-    let stage = open_real_child_dir(&authority.transaction, Path::new(&stage_name))?;
+    let StagedBundle {
+        name: stage_name,
+        dir: stage,
+        contents: OpenedBundle { snapshot, files },
+    } = stage_bundle(&authority, id, skill_bytes, bytes)?;
     let stage_identity = cap_node_identity(&stage.dir_metadata()?);
-    let mut created_files = Vec::with_capacity(2);
-    for (name, contents) in [(SKILL_FILE, skill_bytes), (DEFINITION_FILE, bytes)] {
-        authority.ensure_named()?;
-        ensure_open_child_is_still_named(&authority.transaction, Path::new(&stage_name), &stage)?;
-        created_files.push((name, create_file(&stage, name, contents)?));
-    }
-    let snapshot = read_bundle(id, &stage)?;
-    if snapshot.bytes != bytes || snapshot.skill_bytes != skill_bytes {
-        return Err(DefinitionPublicationError::Conflict(
-            "Workflow definition stage differs from requested bytes",
-        ));
-    }
-    sync_cap_directory(&stage)?;
-    sync_cap_directory(&authority.transaction)?;
     authority.ensure_named()?;
     authority.reject_clone_marker(id)?;
     ensure_open_child_is_still_named(&authority.transaction, Path::new(&stage_name), &stage)?;
@@ -490,9 +541,8 @@ fn create_definition_with_fault(
     if matches!(_fault, PublicationFault::BeforeRename) {
         return Err(injected_failure());
     }
-    for (name, metadata) in &created_files {
-        ensure_file_unchanged(&stage, name, metadata)?;
-    }
+    ensure_file_unchanged(&stage, SKILL_FILE, &files.skill)?;
+    ensure_file_unchanged(&stage, DEFINITION_FILE, &files.definition)?;
     // Drop handles before directory rename on Windows; the pinned parent and
     // shared no-replace helper still validate the exact source identity.
     drop(stage);
@@ -562,7 +612,7 @@ pub(super) fn update_definition(
     expected_digest: &str,
     expected_revision: u64,
     expected_skill_digest: &str,
-    bytes: &[u8],
+    replacement: DefinitionReplacement<'_>,
 ) -> Result<DefinitionSnapshot, DefinitionPublicationError> {
     update_definition_with_fault(
         trusted_root,
@@ -570,7 +620,7 @@ pub(super) fn update_definition(
         expected_digest,
         expected_revision,
         expected_skill_digest,
-        bytes,
+        replacement,
         PublicationFault::None,
     )
 }
@@ -585,10 +635,11 @@ pub(super) fn require_update_support() -> Result<(), DefinitionPublicationError>
     }
 }
 
-fn exchange_definition(
+fn exchange_entry(
     transaction: &CapDir,
     temporary_name: &str,
-    bundle: &CapDir,
+    destination: &CapDir,
+    destination_name: &str,
 ) -> std::io::Result<()> {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
@@ -597,15 +648,15 @@ fn exchange_definition(
         rustix::fs::renameat_with(
             transaction.as_fd(),
             Path::new(temporary_name),
-            bundle.as_fd(),
-            Path::new(DEFINITION_FILE),
+            destination.as_fd(),
+            Path::new(destination_name),
             rustix::fs::RenameFlags::EXCHANGE,
         )
         .map_err(std::io::Error::from)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = (transaction, temporary_name, bundle);
+        let _ = (transaction, temporary_name, destination, destination_name);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Workflow definition exchange is unavailable on this platform",
@@ -619,12 +670,13 @@ fn update_definition_with_fault(
     expected_digest: &str,
     expected_revision: u64,
     expected_skill_digest: &str,
-    bytes: &[u8],
+    replacement: DefinitionReplacement<'_>,
     _fault: PublicationFault,
 ) -> Result<DefinitionSnapshot, DefinitionPublicationError> {
     validate_id(id)?;
     validate_digest(expected_digest)?;
     validate_digest(expected_skill_digest)?;
+    let bytes = replacement.definition;
     let revision = definition_revision(id, bytes)?;
     if expected_revision == 0 || expected_revision.checked_add(1) != Some(revision) {
         return Err(DefinitionPublicationError::Invalid(
@@ -637,7 +689,8 @@ fn update_definition_with_fault(
     let authority = Authority::open(trusted_root)?;
     authority.reject_clone_marker(id)?;
     let bundle = open_real_child_dir(&authority.root.skills_dir, Path::new(id))?;
-    let (current, initial_skill, initial_definition) = read_bundle_with_metadata(id, &bundle)?;
+    let opened = read_bundle_with_metadata(id, &bundle)?;
+    let current = &opened.snapshot;
     if current.digest != expected_digest
         || current.revision != expected_revision
         || current.skill_digest != expected_skill_digest
@@ -647,6 +700,12 @@ fn update_definition_with_fault(
         ));
     }
     authority.ensure_bundle_named(id, &bundle)?;
+    if let Some(skill) = replacement
+        .skill
+        .filter(|skill| *skill != current.skill_bytes)
+    {
+        return exchange_bundle(&authority, id, &bundle, &opened, bytes, skill, _fault);
+    }
     // Temporary bytes stay outside the bundle, so no failed/incomplete write
     // can enter a catalog resource snapshot.
     let temporary_name = format!("definition-{}.yaml", uuid::Uuid::new_v4());
@@ -669,8 +728,8 @@ fn update_definition_with_fault(
     let (skill_bytes, skill_metadata) = read_file(&bundle, SKILL_FILE, MAX_SKILL_BYTES)?;
     if old_bytes != current.bytes
         || skill_bytes != current.skill_bytes
-        || cap_node_identity(&old_metadata) != cap_node_identity(&initial_definition)
-        || cap_node_identity(&skill_metadata) != cap_node_identity(&initial_skill)
+        || cap_node_identity(&old_metadata) != cap_node_identity(&opened.files.definition)
+        || cap_node_identity(&skill_metadata) != cap_node_identity(&opened.files.skill)
     {
         return Err(DefinitionPublicationError::Conflict(
             "Workflow definition bundle changed during update",
@@ -692,7 +751,12 @@ fn update_definition_with_fault(
     // actually displaced, then verify it was the checked original. Ordinary
     // rename would unlink an editor's replacement in this last-check window.
     // Never fall back to rename or swap back over a later visible version.
-    let exchanged = exchange_definition(&authority.transaction, &temporary_name, &bundle);
+    let exchanged = exchange_entry(
+        &authority.transaction,
+        &temporary_name,
+        &bundle,
+        DEFINITION_FILE,
+    );
     #[cfg(test)]
     if exchanged.is_ok() && matches!(_fault, PublicationFault::AfterRename) {
         return Err(DefinitionPublicationError::PublicationUncertain(
@@ -743,13 +807,166 @@ fn update_definition_with_fault(
             "Workflow update exchanged files but the original target or current publication changed; reload before retrying",
         )
     })?;
+    let DefinitionSnapshot {
+        skill_bytes,
+        skill_digest,
+        ..
+    } = opened.snapshot;
     Ok(DefinitionSnapshot {
         bytes: bytes.to_vec(),
         digest: sha256(bytes),
         revision,
-        skill_bytes: current.skill_bytes,
-        skill_digest: current.skill_digest,
+        skill_bytes,
+        skill_digest,
     })
+}
+
+fn require_generated_pair(dir: &CapDir) -> Result<(), DefinitionPublicationError> {
+    for entry in dir.entries()? {
+        let name = entry?.file_name();
+        if name != SKILL_FILE && name != DEFINITION_FILE {
+            return Err(DefinitionPublicationError::Conflict(
+                "Workflow description updates require a bundle without additional resources",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_pair(dir: &CapDir, expected: &OpenedBundle) -> Result<(), DefinitionPublicationError> {
+    require_generated_pair(dir)?;
+    for (name, limit, bytes, metadata) in [
+        (
+            SKILL_FILE,
+            MAX_SKILL_BYTES,
+            &expected.snapshot.skill_bytes,
+            &expected.files.skill,
+        ),
+        (
+            DEFINITION_FILE,
+            MAX_DEFINITION_BYTES,
+            &expected.snapshot.bytes,
+            &expected.files.definition,
+        ),
+    ] {
+        if read_file(dir, name, limit)?.0 != *bytes {
+            return Err(DefinitionPublicationError::Conflict(
+                "Workflow definition bundle changed during update",
+            ));
+        }
+        ensure_file_unchanged(dir, name, metadata)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn preserve_pair_permissions(
+    bundle: &CapDir,
+    original: &OpenedBundle,
+    stage: &mut StagedBundle,
+) -> Result<(), DefinitionPublicationError> {
+    use cap_std::fs::{Permissions, PermissionsExt};
+
+    let ordinary_permissions =
+        |metadata: &Metadata| Permissions::from_mode(metadata.permissions().mode() & 0o777);
+    for (name, original, staged) in [
+        (
+            SKILL_FILE,
+            &original.files.skill,
+            &mut stage.contents.files.skill,
+        ),
+        (
+            DEFINITION_FILE,
+            &original.files.definition,
+            &mut stage.contents.files.definition,
+        ),
+    ] {
+        let file = open_file_nofollow(&stage.dir, Path::new(name))?;
+        if cap_node_identity(&file.metadata()?) != cap_node_identity(staged) {
+            return Err(DefinitionPublicationError::Conflict(
+                "Workflow definition stage changed before permissions could be preserved",
+            ));
+        }
+        file.set_permissions(ordinary_permissions(original))?;
+        file.sync_all()?;
+        *staged = file.metadata()?;
+    }
+    stage
+        .dir
+        .set_permissions(".", ordinary_permissions(&bundle.dir_metadata()?))?;
+    sync_cap_directory(&stage.dir)?;
+    Ok(())
+}
+
+fn exchange_bundle(
+    authority: &Authority,
+    id: &str,
+    bundle: &CapDir,
+    original: &OpenedBundle,
+    bytes: &[u8],
+    skill: &[u8],
+    _fault: PublicationFault,
+) -> Result<DefinitionSnapshot, DefinitionPublicationError> {
+    validate_authored_skill(id, skill)?;
+    // A generated bundle owns these two files. Leave user-added resources
+    // in place instead of moving or copying them as part of a description edit.
+    require_generated_pair(bundle)?;
+    let mut stage = stage_bundle(authority, id, skill, bytes)?;
+    #[cfg(unix)]
+    preserve_pair_permissions(bundle, original, &mut stage)?;
+    #[cfg(not(unix))]
+    let _ = &mut stage;
+    verify_pair(bundle, original)?;
+    verify_pair(&stage.dir, &stage.contents)?;
+    authority.ensure_bundle_named(id, bundle)?;
+    ensure_open_child_is_still_named(&authority.transaction, Path::new(&stage.name), &stage.dir)?;
+    #[cfg(test)]
+    if matches!(_fault, PublicationFault::BeforeRename) {
+        return Err(injected_failure());
+    }
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if let PublicationFault::BeforeRenameHook(hook) = &_fault {
+        hook(&authority.transaction, bundle);
+    }
+    let exchanged = exchange_entry(
+        &authority.transaction,
+        &stage.name,
+        &authority.root.skills_dir,
+        id,
+    );
+    #[cfg(test)]
+    if exchanged.is_ok() && matches!(_fault, PublicationFault::AfterRename) {
+        return Err(DefinitionPublicationError::PublicationUncertain(
+            "Workflow update committed but durability could not be confirmed",
+        ));
+    }
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    if exchanged.is_ok() {
+        if let PublicationFault::AfterRenameHook(hook) = &_fault {
+            hook(&authority.transaction, &stage.dir);
+        }
+    }
+    let published_sync = sync_cap_directory(&authority.root.skills_dir);
+    let retained_sync = sync_cap_directory(&authority.transaction);
+    if exchanged.is_err() || published_sync.is_err() || retained_sync.is_err() {
+        return Err(DefinitionPublicationError::PublicationUncertain(
+            "Workflow bundle publication or durability could not be confirmed; reload before retrying",
+        ));
+    }
+    // Both names remain available even if an outside writer raced the exchange.
+    // Verify the exact retained and published directories without swapping back.
+    let confirmed = (|| -> Result<(), DefinitionPublicationError> {
+        verify_pair(bundle, original)?;
+        verify_pair(&stage.dir, &stage.contents)?;
+        ensure_open_child_is_still_named(&authority.transaction, Path::new(&stage.name), bundle)?;
+        authority.ensure_bundle_named(id, &stage.dir)
+    })();
+    confirmed.map_err(|_| {
+        DefinitionPublicationError::PublicationUncertain(
+            "Workflow bundle changed during exchange; reload before retrying",
+        )
+    })?;
+    Ok(stage.contents.snapshot)
 }
 
 #[cfg(test)]
@@ -783,6 +1000,13 @@ mod tests {
         (root, snapshot)
     }
 
+    fn definition_only(bytes: &[u8]) -> DefinitionReplacement<'_> {
+        DefinitionReplacement {
+            definition: bytes,
+            skill: None,
+        }
+    }
+
     fn update(
         root: &Path,
         snapshot: &DefinitionSnapshot,
@@ -794,7 +1018,7 @@ mod tests {
             &snapshot.digest,
             snapshot.revision,
             &snapshot.skill_digest,
-            bytes,
+            definition_only(bytes),
         )
     }
 
@@ -827,6 +1051,107 @@ mod tests {
         assert_eq!(read_definition(root.path(), ID).unwrap(), revised);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn description_update_faults_keep_definition_and_skill_from_one_revision() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for (fault, committed) in [
+            (PublicationFault::BeforeRename, false),
+            (PublicationFault::AfterRename, true),
+        ] {
+            let (root, original) = fixture();
+            let bundle = root.path().join("skills").join(ID);
+            for (path, mode) in [
+                (bundle.clone(), 0o700),
+                (bundle.join(SKILL_FILE), 0o600),
+                (bundle.join(DEFINITION_FILE), 0o600),
+            ] {
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+            }
+            let next_skill = String::from_utf8(skill(ID))
+                .unwrap()
+                .replace("An authored workflow.", "Revised purpose.");
+            let result = update_definition_with_fault(
+                root.path(),
+                ID,
+                &original.digest,
+                original.revision,
+                &original.skill_digest,
+                DefinitionReplacement {
+                    definition: &definition(ID, 2),
+                    skill: Some(next_skill.as_bytes()),
+                },
+                fault,
+            );
+            let saved = read_definition(root.path(), ID).unwrap();
+            for (path, mode) in [
+                (bundle.clone(), 0o700),
+                (bundle.join(SKILL_FILE), 0o600),
+                (bundle.join(DEFINITION_FILE), 0o600),
+            ] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    mode
+                );
+            }
+            if committed {
+                assert!(matches!(
+                    result,
+                    Err(DefinitionPublicationError::PublicationUncertain(_))
+                ));
+                assert_eq!(saved.revision, 2);
+                assert_eq!(saved.skill_bytes, next_skill.as_bytes());
+                let transaction = root.path().join(CLONE_TRANSACTION_DIRECTORY);
+                let displaced = std::fs::read_dir(transaction)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .find(|entry| entry.file_type().unwrap().is_dir())
+                    .unwrap()
+                    .path();
+                assert_eq!(
+                    std::fs::read(displaced.join(SKILL_FILE)).unwrap(),
+                    original.skill_bytes
+                );
+                assert_eq!(
+                    std::fs::read(displaced.join(DEFINITION_FILE)).unwrap(),
+                    original.bytes
+                );
+            } else {
+                assert!(matches!(result, Err(DefinitionPublicationError::Io(_))));
+                assert_eq!(saved, original);
+            }
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn description_update_rejects_bundles_with_additional_resources() {
+        let (root, original) = fixture();
+        let notes = root.path().join("skills").join(ID).join("notes.txt");
+        std::fs::write(&notes, "user resource").unwrap();
+        let next_skill = String::from_utf8(skill(ID))
+            .unwrap()
+            .replace("An authored workflow.", "Revised purpose.");
+        let result = update_definition(
+            root.path(),
+            ID,
+            &original.digest,
+            original.revision,
+            &original.skill_digest,
+            DefinitionReplacement {
+                definition: &definition(ID, 2),
+                skill: Some(next_skill.as_bytes()),
+            },
+        );
+        assert!(matches!(
+            result,
+            Err(DefinitionPublicationError::Conflict(_))
+        ));
+        assert_eq!(read_definition(root.path(), ID).unwrap(), original);
+        assert_eq!(std::fs::read_to_string(notes).unwrap(), "user resource");
+    }
+
     #[test]
     fn create_conflicts_without_replacing_existing_bundle() {
         let (root, original) = fixture();
@@ -853,7 +1178,7 @@ mod tests {
                 &newer.digest,
                 1,
                 &newer.skill_digest,
-                &definition(ID, 2)
+                definition_only(&definition(ID, 2))
             ),
             Err(DefinitionPublicationError::Conflict(_))
         ));
@@ -864,7 +1189,7 @@ mod tests {
                 &newer.digest,
                 2,
                 &"0".repeat(64),
-                &definition(ID, 3)
+                definition_only(&definition(ID, 3))
             ),
             Err(DefinitionPublicationError::Conflict(_))
         ));
@@ -1073,7 +1398,7 @@ mod tests {
                 "bad",
                 1,
                 &original.skill_digest,
-                &definition(ID, 2)
+                definition_only(&definition(ID, 2))
             ),
             Err(DefinitionPublicationError::Invalid(_))
         ));
@@ -1084,7 +1409,7 @@ mod tests {
                 &original.digest,
                 1,
                 &"A".repeat(64),
-                &definition(ID, 2)
+                definition_only(&definition(ID, 2))
             ),
             Err(DefinitionPublicationError::Invalid(_))
         ));
@@ -1095,7 +1420,7 @@ mod tests {
                 &original.digest,
                 u64::MAX,
                 &original.skill_digest,
-                &definition(ID, 1)
+                definition_only(&definition(ID, 1))
             ),
             Err(DefinitionPublicationError::Invalid(_))
         ));
@@ -1172,7 +1497,7 @@ mod tests {
                 &original.digest,
                 original.revision,
                 &original.skill_digest,
-                &definition(ID, 2),
+                definition_only(&definition(ID, 2)),
                 PublicationFault::BeforeRename
             ),
             Err(DefinitionPublicationError::Io(_))
@@ -1216,7 +1541,7 @@ mod tests {
                     &original.digest,
                     original.revision,
                     &original.skill_digest,
-                    &definition(ID, 2),
+                    definition_only(&definition(ID, 2)),
                     PublicationFault::AfterRename
                 ),
                 Err(DefinitionPublicationError::PublicationUncertain(_))
@@ -1253,7 +1578,7 @@ mod tests {
             &original.digest,
             original.revision,
             &original.skill_digest,
-            &definition(ID, 2),
+            definition_only(&definition(ID, 2)),
             PublicationFault::BeforeRenameHook(Arc::new(move |transaction, bundle| {
                 let name = format!("external-{}.yaml", uuid::Uuid::new_v4());
                 let metadata = create_file(transaction, &name, &replacement).unwrap();
@@ -1326,7 +1651,7 @@ mod tests {
             &original.digest,
             original.revision,
             &original.skill_digest,
-            &definition(ID, 2),
+            definition_only(&definition(ID, 2)),
             PublicationFault::BeforeRenameHook(Arc::new(move |transaction, bundle| {
                 let name = format!("external-{}.yaml", uuid::Uuid::new_v4());
                 let metadata = create_file(transaction, &name, &replacement).unwrap();
@@ -1364,7 +1689,7 @@ mod tests {
             &original.digest,
             original.revision,
             &original.skill_digest,
-            &definition(ID, 2),
+            definition_only(&definition(ID, 2)),
             PublicationFault::AfterRenameHook(Arc::new(move |transaction, bundle| {
                 let name = format!("external-{}.yaml", uuid::Uuid::new_v4());
                 let metadata = create_file(transaction, &name, &replacement).unwrap();
