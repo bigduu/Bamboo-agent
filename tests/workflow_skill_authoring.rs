@@ -57,6 +57,11 @@ fn provider_response(request: &Request, files: &[PathBuf; 2]) -> ResponseTemplat
         .iter()
         .rposition(|marker| body.contains(marker))
     {
+        // The generic reviewer assignment requests evidence and verification.
+        // The curator must explicitly keep those arrays empty in its report.
+        assert!(body.contains(
+            "Keep reported_evidence, reported_verification, proposals, blockers, and open_decisions present and empty for every outcome."
+        ));
         let draft = json!({
             "decision":"draft", "description":"Read the project fixture",
             "definition":{
