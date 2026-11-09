@@ -4,8 +4,8 @@ use crate::skill_history::{is_skill_tool_name, SkillNameMatch};
 use crate::{BudgetStrategy, TokenBudget};
 use bamboo_domain::MessagePhase;
 use bamboo_domain::{
-    message_summary_history_recovery_blocked, validate_message_summary_tool_protocol,
-    CompressionEvent, CompressionEventKind, CompressionTriggerType, ConversationSummary, Message,
+    message_summary_tool_work_pending, validate_message_summary_tool_protocol, CompressionEvent,
+    CompressionEventKind, CompressionTriggerType, ConversationSummary, Message,
     MessageSummaryToolProtocolError, ModelContextResetReason, Session,
 };
 
@@ -89,7 +89,7 @@ pub enum CompressionPlanError {
     },
     /// The session changed after candidate selection and before finalization.
     CandidateSetChanged,
-    /// The final assistant batch is still waiting for tool results.
+    /// Tool work is still pending or the final assistant batch awaits results.
     MessageSummaryPendingToolResults,
     /// The active history contains malformed or protected tool protocol.
     MessageSummaryToolProtocol { reason: String },
@@ -578,7 +578,7 @@ fn message_summary_snapshot(session: &Session) -> Result<Vec<u8>, CompressionPla
         &session.messages,
         &session.conversation_summary,
         &session.compression_events,
-        message_summary_history_recovery_blocked(session),
+        message_summary_tool_work_pending(session),
     ))
     .map_err(|_| CompressionPlanError::CandidateSetChanged)
 }

@@ -10,8 +10,12 @@ use actix_web::{http::StatusCode, test, web, App};
 use bamboo_agent_core::{tools::ToolSchema, Message, Session};
 use bamboo_config::ContextManagementStrategy;
 use bamboo_domain::{
-    CompressionEventKind, CompressionTriggerType, FunctionCall, ProviderModelRef, ToolCall,
+    ActorActivationFinish, CompressionEventKind, CompressionTriggerType, FunctionCall,
+    ProviderFamily, ProviderModelRef, ProviderProtocol, ProviderTranscriptAuthor,
+    ProviderTranscriptItem, ProviderTranscriptOrigin, ProviderTranscriptResetReason, ToolCall,
 };
+use bamboo_engine::execution::reserve_session_preparation;
+use bamboo_engine::session_app::repository::SessionAccess;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use serde_json::{json, Value};
 
@@ -274,6 +278,133 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
         assert_eq!(probe.summaries.load(Ordering::SeqCst), summary_calls);
         let unchanged = state.storage.load_session(ID).await.unwrap().unwrap();
         assert_previous_run(&unchanged, &durable);
+
+        if let Some(poll_id) = unanswered_poll {
+            let original_poll = unchanged
+                .messages
+                .iter()
+                .find(|message| message.id == poll_id)
+                .unwrap();
+            let failed_call = Message::assistant(
+                "Interrupted after compaction",
+                original_poll.tool_calls.clone(),
+            );
+            let failed_call_id = failed_call.id.clone();
+            let native_items = [
+                (
+                    ProviderTranscriptAuthor::Model,
+                    json!({
+                        "type": "tool_search_call", "id": "tsc_poll", "execution": "server",
+                        "call_id": "search_poll", "status": "completed",
+                        "arguments": { "paths": ["shell"] },
+                    }),
+                ),
+                (
+                    ProviderTranscriptAuthor::ToolResult,
+                    json!({
+                        "type": "tool_search_output", "id": "tso_poll", "execution": "server",
+                        "call_id": "search_poll", "status": "completed",
+                        "tools": [{ "type": "function", "name": "write_stdin" }],
+                    }),
+                ),
+                (
+                    ProviderTranscriptAuthor::Model,
+                    json!({
+                        "type": "function_call", "call_id": "previous-poll",
+                        "name": "write_stdin", "arguments": "{}",
+                    }),
+                ),
+            ]
+            .into_iter()
+            .map(|(author, payload)| {
+                ProviderTranscriptItem::try_from_payload(
+                    ProviderFamily::OpenAi,
+                    ProviderProtocol::OpenAiResponsesV1,
+                    ProviderTranscriptOrigin::Provider,
+                    author,
+                    payload,
+                )
+                .unwrap()
+            })
+            .collect();
+            // The session has already activated an Actor for compaction.
+            // Persist the interruption through its current fenced writer.
+            let mut preparation =
+                reserve_session_preparation(&state.agent, &state.agent_runners, ID)
+                    .await
+                    .unwrap();
+            preparation
+                .bind_root_actor(&state.agent, &unchanged)
+                .await
+                .unwrap();
+            let access = state
+                .as_ref()
+                .bind_response_writer(preparation.root_actor_writer())
+                .unwrap()
+                .unwrap();
+            let interrupted = access
+                .mutate_for_response(
+                    ID,
+                    Box::new(move |session| {
+                        session.add_message(failed_call);
+                        session
+                            .append_provider_transcript_group(&failed_call_id, None, native_items)
+                            .unwrap();
+                        session.metadata.insert(
+                            "responses.previous_response_id".into(),
+                            "response-before-retry".into(),
+                        );
+                        session.set_last_run_status("error");
+                        session.synchronize_terminal_runtime_status();
+                        Ok(())
+                    }),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            preparation.finish(ActorActivationFinish::Succeeded).await;
+            let native_epoch = interrupted.provider_transcript.epoch();
+
+            for removed in [1, 0] {
+                let retry = test::call_service(
+                    &app,
+                    test::TestRequest::post()
+                        .uri("/api/v1/sessions/compact-ordinary/messages/truncate")
+                        .set_json(json!({ "mode": "error_retry" }))
+                        .to_request(),
+                )
+                .await;
+                let status = retry.status();
+                let body: Value = test::read_body_json(retry).await;
+                assert_eq!(status, StatusCode::OK, "{body}");
+                assert_eq!(body["messages_removed"], removed, "{body}");
+                let retried = state.storage.load_session(ID).await.unwrap().unwrap();
+                let retained_poll = retried
+                    .messages
+                    .iter()
+                    .find(|message| message.id == poll_id)
+                    .unwrap();
+                assert_eq!(json!(retained_poll), json!(original_poll));
+                assert_eq!(
+                    json!(retried.compression_events),
+                    json!(unchanged.compression_events)
+                );
+                assert_eq!(
+                    json!(retried.conversation_summary),
+                    json!(unchanged.conversation_summary)
+                );
+                assert!(retried.messages.last().unwrap().tool_calls.is_none());
+                assert!(retried.token_usage.is_none());
+                assert!(!retried
+                    .metadata
+                    .contains_key("responses.previous_response_id"));
+                assert_eq!(
+                    retried.provider_transcript.last_reset_reason(),
+                    Some(ProviderTranscriptResetReason::ExplicitHistoryRewrite)
+                );
+                assert_eq!(retried.provider_transcript.epoch(), native_epoch + 1);
+            }
+        }
     }
 }
 

@@ -59,8 +59,7 @@ pub use inbox::*;
 pub use loop_control_request::{parse_loop_control_request, LoopControlRequest};
 pub use message_part::{ImageUrlRef, MessagePart};
 pub use message_summary::{
-    message_summary_history_recovery_blocked, validate_message_summary_tool_protocol,
-    MessageSummaryToolProtocolError,
+    validate_message_summary_tool_protocol, MessageSummaryToolProtocolError,
 };
 pub use model_context::*;
 pub use parent_question::*;
