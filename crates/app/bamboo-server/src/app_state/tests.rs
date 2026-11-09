@@ -641,11 +641,11 @@ async fn overlay_tools_require_session_context() {
 
     let sub_agent_result = state
         .tools_for(ToolSurface::Root)
-        .execute(&make_tool_call("SubAgent", json!({ "action": "list" })))
+        .execute(&make_tool_call("SubAgent", json!({ "intent": "inspect" })))
         .await;
     assert!(matches!(
         sub_agent_result,
-        Err(ToolError::Execution(msg)) if msg.contains("session_id")
+        Err(ToolError::Execution(msg)) if msg.contains("current session")
     ));
 }
 

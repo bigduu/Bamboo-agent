@@ -43,6 +43,7 @@ pub struct TicketWorkerPlan {
     assignment_id: String,
     session_id: String,
     supervisor_session_id: String,
+    managed_birth: Option<chrono::DateTime<chrono::Utc>>,
     run_id: String,
     session_birth: std::sync::OnceLock<WorkSessionIdentity>,
 }
@@ -105,6 +106,10 @@ impl TicketWorkerPlan {
             assignment_id: assignment_id.into(),
             session_id: receipt.session_id.clone(),
             supervisor_session_id: snapshot.binding.supervisor_session_id.clone(),
+            managed_birth: snapshot.intents[&assignment.dispatch_key]
+                .managed_admission
+                .as_ref()
+                .map(|admission| admission.target_created_at),
             run_id: receipt.run_id.clone(),
             session_birth: std::sync::OnceLock::new(),
         })
@@ -120,25 +125,41 @@ impl TicketWorkerPlan {
             .get_or_init(|| WorkSessionIdentity::from_session(session))
             != &identity
         {
-            return Err(Error::ScopeDenied("LocalPlan Child birth changed".into()));
+            return Err(Error::ScopeDenied("LocalPlan Session birth changed".into()));
         }
         self.project_session(session)
     }
 
     fn require_session_identity(&self, session: &Session) -> Result<()> {
-        if session.kind != SessionKind::Child
-            || session.id != self.session_id
-            || session.parent_session_id.as_deref() != Some(&self.supervisor_session_id)
+        if !self.matches_dispatch_session(session)
             || session
                 .agent_runtime_state
                 .as_ref()
                 .is_none_or(|s| s.run_id != self.run_id)
         {
             return Err(Error::ScopeDenied(
-                "LocalPlan requires its exact Child Run".into(),
+                "LocalPlan requires its exact Session Run".into(),
             ));
         }
         Ok(())
+    }
+
+    fn matches_dispatch_session(&self, session: &Session) -> bool {
+        session.id == self.session_id
+            && match self.managed_birth {
+                Some(birth) => {
+                    session.created_at == birth
+                        && session.kind == SessionKind::Root
+                        && session.parent_session_id.is_none()
+                        && session.root_session_id == self.session_id
+                        && session.authority_identity.is_ordinary()
+                        && session.conversation_reset.is_none()
+                }
+                None => {
+                    session.kind == SessionKind::Child
+                        && session.parent_session_id.as_deref() == Some(&self.supervisor_session_id)
+                }
+            }
     }
 
     fn project_workspace_context(
@@ -150,12 +171,12 @@ impl TicketWorkerPlan {
         self.service.authorize_tool(&self.authority, "Task")?;
         self.require_session_identity(session)?;
         let identity = WorkSessionIdentity::from_session(session);
-        if identity.parent_birth.is_none()
-            || identity.root != self.supervisor_session_id
-            || self.session_birth.get() != Some(&identity)
+        if self.session_birth.get() != Some(&identity)
+            || self.managed_birth.is_none()
+                && (identity.parent_birth.is_none() || identity.root != self.supervisor_session_id)
         {
             return Err(Error::ScopeDenied(
-                "Work workspace requires its bound Child birth".into(),
+                "Work workspace requires its bound Session birth".into(),
             ));
         }
         let dispatch = ticket_runtime::read_dispatch(session)?
@@ -167,9 +188,19 @@ impl TicketWorkerPlan {
             .intents
             .get(&assignment.dispatch_key)
             .ok_or_else(|| Error::ScopeDenied("Work dispatch intent missing".into()))?;
+        let exact_dispatch = if let Some(target) = &intent.immutable_spec.managed_root {
+            dispatch.receipt.is_none()
+                && bamboo_orchestration::managed_work::matches_root(
+                    target,
+                    &intent.immutable_spec,
+                    session,
+                )
+        } else {
+            dispatch.receipt.as_ref() == assignment.runtime.as_ref()
+                && session.id == ticket_runtime::ticket_child_id(&assignment.dispatch_key)
+        };
         if dispatch.assignment_id != self.assignment_id
-            || dispatch.receipt.as_ref() != assignment.runtime.as_ref()
-            || session.id != ticket_runtime::ticket_child_id(&assignment.dispatch_key)
+            || !exact_dispatch
             || intent.spec_hash
                 != bamboo_tickets::content_hash(&bamboo_tickets::canonical_bytes(
                     &intent.immutable_spec,
@@ -297,16 +328,10 @@ impl TicketWorkerPlan {
         tool_call_id: &str,
         args: &serde_json::Value,
     ) -> Result<TaskList> {
-        if session.kind != SessionKind::Child
-            || session.id != self.session_id
-            || session.parent_session_id.as_deref() != Some(&self.supervisor_session_id)
-            || tool_call_id.is_empty()
+        self.require_session_identity(session)?;
+        if tool_call_id.is_empty()
             || tool_call_id.len() > 128
             || session.metadata.get(TICKET_LOCAL_PLAN_KEY) != Some(&self.assignment_id)
-            || session
-                .agent_runtime_state
-                .as_ref()
-                .is_none_or(|s| s.run_id != self.run_id)
         {
             return Err(Error::ScopeDenied(
                 "LocalPlan execution identity changed".into(),

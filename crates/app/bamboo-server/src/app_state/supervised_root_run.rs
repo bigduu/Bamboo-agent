@@ -13,8 +13,8 @@ use bamboo_agent_core::{
 };
 use bamboo_domain::{
     AdmissionCommit, AdmissionGate, ManagedRootEvent, ManagedRootEventRead, SessionActivationPort,
-    SessionAuthorityIdentity, SessionCallerReference, SupervisorCurrentUserTarget,
-    SupervisorReference,
+    SessionAuthorityIdentity, SessionCallerReference, SessionInboxReceipt,
+    SupervisorCurrentUserTarget, SupervisorReference,
 };
 use bamboo_orchestration::managed_session::{
     read_when_verified, wait_for_outcome, ManagedRunHint, ManagedRunSignals,
@@ -27,12 +27,23 @@ use tokio::sync::{broadcast, RwLock};
 use super::{fresh_sync::FreshSyncRegistry, live_retry::LiveRetryBridge, AgentRunner, AgentStatus};
 
 pub(super) struct SupervisedRootRunController {
+    pub(super) approval_runtime: super::approval_handoff::ApprovalRuntime,
     pub(super) store: Arc<SessionStoreV2>,
     pub(super) inbox: Arc<FileSessionInbox>,
     pub(super) router: Arc<bamboo_engine::SessionActivationRouter>,
     pub(super) runners: Arc<RwLock<HashMap<String, AgentRunner>>>,
     pub(super) live_retry: Arc<LiveRetryBridge>,
     pub(super) fresh_sync: Arc<FreshSyncRegistry>,
+}
+
+fn original_supervisor(caller: &SessionCallerReference) -> Result<SupervisorReference, ToolError> {
+    let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity else {
+        return Err(ToolError::Execution("original Supervisor required".into()));
+    };
+    Ok(SupervisorReference {
+        session_id: caller.session_id.clone(),
+        incarnation_id: *incarnation_id,
+    })
 }
 
 fn busy() -> io::Error {
@@ -285,14 +296,7 @@ impl SupervisedRootRunController {
         expected: Option<&str>,
         gate: Option<AdmissionGate>,
     ) -> Result<ToolResult, ToolError> {
-        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
-        else {
-            return Err(ToolError::Execution("original Supervisor required".into()));
-        };
-        let supervisor = SupervisorReference {
-            session_id: caller.session_id.clone(),
-            incarnation_id: *incarnation_id,
-        };
+        let supervisor = original_supervisor(caller)?;
         let selected = target.clone();
         let expected = expected.map(str::to_owned);
         let router = self.router.clone();
@@ -322,12 +326,84 @@ impl SupervisedRootRunController {
 
 #[async_trait]
 impl SupervisedRootRunPort for SupervisedRootRunController {
+    async fn decide_approval(
+        &self,
+        caller: &SessionCallerReference,
+        target: String,
+        reference: &str,
+        decision: bamboo_tools::permission::PermissionDecisionKind,
+    ) -> Result<ToolResult, ToolError> {
+        let state = self
+            .approval_runtime
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .ok_or_else(|| ToolError::Execution("managed_approval_handoff_unavailable".into()))?;
+        let result = crate::handlers::agent::respond::decide_delegated_approval(
+            actix_web::web::Data::from(state),
+            &self.inbox,
+            caller,
+            target,
+            reference,
+            decision,
+        )
+        .await
+        .map_err(|error| ToolError::Execution(error.to_string()))?;
+        Ok(ToolResult::text(true, result.to_string()))
+    }
+
     async fn observe_run(
         &self,
         caller: &SessionCallerReference,
         target: &SupervisorCurrentUserTarget,
     ) -> Result<ToolResult, ToolError> {
-        self.control(caller, target, None, None).await
+        use bamboo_domain::Storage;
+        use bamboo_orchestration::managed_session::approval::PendingApproval;
+
+        let observed = self.control(caller, target, None, None).await?;
+        if observed.success {
+            let status: Value = serde_json::from_str(&observed.result)
+                .map_err(|error| ToolError::Execution(error.to_string()))?;
+            if status["status"] != "already_finished" {
+                return Ok(observed);
+            }
+        }
+        let supervisor = original_supervisor(caller)?;
+        let root = self
+            .store
+            .load_session(&target.session_id)
+            .await
+            .map_err(|error| ToolError::Execution(error.to_string()))?;
+        if let Some(root) = root.filter(|root| target.matches(root)) {
+            if let Some(approval) = PendingApproval::capture(&supervisor, &root) {
+                return Ok(ToolResult::text(
+                    true,
+                    approval.observation(&supervisor, &root).to_string(),
+                ));
+            }
+        }
+        Ok(observed)
+    }
+
+    async fn observe_admission(
+        &self,
+        caller: &SessionCallerReference,
+        target: &SupervisorCurrentUserTarget,
+        receipt: &SessionInboxReceipt,
+    ) -> Result<ToolResult, ToolError> {
+        let supervisor = original_supervisor(caller)?;
+        let admission = self
+            .inbox
+            .read_managed_root_admission(caller, &supervisor, target, receipt)
+            .await
+            .map_err(|error| {
+                tracing::debug!(%error, "Managed Root admission evidence unavailable");
+                ToolError::Execution("managed_root_admission_evidence_unavailable".into())
+            })?;
+        let response = match admission {
+            Some(admission) => json!({"status":"admission_verified", "admission":admission}),
+            None => json!({"status":"admission_unconfirmed"}),
+        };
+        Ok(ToolResult::text(true, response.to_string()))
     }
 
     async fn wait_run(
@@ -381,14 +457,7 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
         caller: &SessionCallerReference,
         targets: &[ManagedOutcomeTarget; 2],
     ) -> Result<ToolResult, ToolError> {
-        let SessionAuthorityIdentity::Supervisor { incarnation_id } = &caller.authority_identity
-        else {
-            return Err(ToolError::Execution("original Supervisor required".into()));
-        };
-        let supervisor = SupervisorReference {
-            session_id: caller.session_id.clone(),
-            incarnation_id: *incarnation_id,
-        };
+        let supervisor = original_supervisor(caller)?;
         // Subscribe before inspecting Main to cover completion during the read.
         // A signal is only a hint. The read revalidates the exact authority and ACK.
         let [first_signals, second_signals] = {
@@ -445,6 +514,43 @@ impl SupervisedRootRunPort for SupervisedRootRunController {
 // Observer feature's fixed historical subscription catalog.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
+    use bamboo_tools::permission::PermissionDecisionKind;
+
+    #[actix_web::test]
+    async fn subscribed_creation_retries_converge_and_wake_with_a_short_verified_handoff() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            None, false,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_creation_wakes_supervisor_after_permission_resume() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            Some(PermissionDecisionKind::AllowOnce),
+            false,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_creation_wakes_supervisor_after_permission_denial() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            Some(PermissionDecisionKind::DenyOnce),
+            false,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_creation_wakes_supervisor_after_two_sequential_permissions() {
+        super::super::observer_subscriptions::tests::exercise_subscribed_create_handoff(
+            Some(PermissionDecisionKind::AllowOnce),
+            true,
+        )
+        .await;
+    }
+
     #[actix_web::test]
     async fn material_notices_resume_the_native_supervisor_without_unchanged_model_polling() {
         super::super::observer_subscriptions::tests::exercise_material_root_notifications().await;
@@ -465,5 +571,27 @@ mod tests {
     #[actix_web::test]
     async fn managed_wait_returns_either_exact_recorded_outcome_and_can_read_it_after_restart() {
         super::super::observer_subscriptions::tests::exercise_managed_wait_outcomes().await;
+    }
+
+    #[actix_web::test]
+    async fn subscribed_background_exec_delivers_once_after_owned_host_restart() {
+        super::super::observer_subscriptions::tests::background_exec::exercise_background_exec_handoff()
+            .await;
+    }
+
+    #[actix_web::test]
+    async fn ordinary_approval_handoff_waits_for_deadline_and_keeps_forced_requests_with_owner() {
+        super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
+            PermissionDecisionKind::DenyOnce,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn ordinary_approval_handoff_can_allow_the_exact_workspace_edit_once() {
+        super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
+            PermissionDecisionKind::AllowOnce,
+        )
+        .await;
     }
 }

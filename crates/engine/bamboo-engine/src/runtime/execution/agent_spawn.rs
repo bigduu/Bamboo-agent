@@ -197,6 +197,19 @@ impl SessionExecutionReservation {
                 self.root_actor = Some(Box::new(RootActorExecution::start(binding)));
             }
         }
+        if !for_compaction
+            && crate::ticket_runtime::is_managed_work_root(session)
+            && self.root_actor.as_ref().is_some_and(|actor| {
+                let owner = &actor.binding.owner;
+                owner.fence.actor_id.as_str() == session.id
+                    && owner.fence.run_id == self.run_id
+                    && owner.created_at == session.created_at
+            })
+        {
+            if let Some(admission) = self.physical_admission.as_mut() {
+                admission.track_managed_work_root(session)?;
+            }
+        }
         self.bind_execution_persistence(agent, session)
     }
 
@@ -315,9 +328,19 @@ impl SessionExecutionReservation {
     /// Finish a valid adapter-owned pause only after its actual history
     /// publication barrier. Abandonment remains the rejected-startup fallback.
     pub async fn finish_root_actor(&mut self, outcome: bamboo_domain::ActorActivationFinish) {
-        if let Some(owner) = self.root_actor.take() {
-            (*owner).finish(outcome).await;
-        }
+        self.finish_root_actor_with_stop(outcome).await;
+    }
+
+    async fn finish_root_actor_with_stop(
+        &mut self,
+        outcome: bamboo_domain::ActorActivationFinish,
+    ) -> bool {
+        let Some(owner) = self.root_actor.take() else {
+            return false;
+        };
+        (*owner)
+            .finish(outcome, self.physical_admission.as_ref())
+            .await
     }
 
     /// Build the handoff owned by a router activation launch.
@@ -400,7 +423,8 @@ impl SessionExecutionReservation {
     pub(crate) async fn rollback_unpublished_activation(mut self) {
         self.armed = false;
         self.cancel_token.cancel();
-        self.finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+        let stopped = self
+            .finish_root_actor_with_stop(bamboo_domain::ActorActivationFinish::Cancelled)
             .await;
         let activation = std::mem::replace(
             &mut self.activation,
@@ -410,7 +434,19 @@ impl SessionExecutionReservation {
             activation,
             SessionExecutionActivationOwnership::UnpublishedActivation(_)
         ));
-        remove_runner_exact(&self.runners, &self.session_id, &self.run_id).await;
+        if stopped {
+            // Retain the exact terminal runner as the cancellation observer.
+            // It carries the verified no-launch proof, with no Router owner.
+            finalize_runner_exact(
+                &self.runners,
+                &self.session_id,
+                &self.run_id,
+                &Err(AgentError::Cancelled),
+            )
+            .await;
+        } else {
+            remove_runner_exact(&self.runners, &self.session_id, &self.run_id).await;
+        }
     }
 
     /// Adopt a router-published activation placeholder before any adapter-side
@@ -458,11 +494,8 @@ impl SessionExecutionReservation {
     pub async fn abandon(mut self) {
         self.armed = false;
         self.cancel_token.cancel();
-        if let Some(owner) = self.root_actor.take() {
-            (*owner)
-                .finish(bamboo_domain::ActorActivationFinish::Cancelled)
-                .await;
-        }
+        self.finish_root_actor(bamboo_domain::ActorActivationFinish::Cancelled)
+            .await;
         let activation = std::mem::replace(
             &mut self.activation,
             SessionExecutionActivationOwnership::Unrouted,
@@ -1295,6 +1328,16 @@ pub fn spawn_session_execution_with_upstream_retry(
         None
     };
     let task_outer = outer.clone();
+    let managed_root = crate::ticket_runtime::is_managed_work_root(&args.session);
+    let (work_completion, joined_work) = if managed_root && outer.is_some() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<(
+            crate::ticket_runtime::managed::ManagedWorkRun,
+            bamboo_tools::DrainedLocalTaskResources,
+        )>();
+        (Some(tx), Some((rx, args.agent.storage().clone())))
+    } else {
+        (None, None)
+    };
 
     let task = tokio::spawn(
         async move {
@@ -1454,6 +1497,7 @@ pub fn spawn_session_execution_with_upstream_retry(
                 session.set_last_run_status("running");
             }
             let prior_message_ids = session.messages.iter().map(|m| m.id.clone()).collect();
+            session.root_final_message_candidate = None;
             let (cancel_token, mut activation_registration) =
                 execution_reservation.disarm_for_execution();
 
@@ -1462,6 +1506,27 @@ pub fn spawn_session_execution_with_upstream_retry(
             // for session attribution / logging (same value the caller set).
             let model = model_roster.model.clone().unwrap_or_default();
 
+            let (work, work_error) = if managed_root {
+                match (agent.managed_work_runtime(), work_completion.as_ref()) {
+                    (Some(runtime), Some(_)) => {
+                        match runtime
+                            .admit(&agent, &mut session, &activation_run_id, &model_roster)
+                            .await
+                        {
+                            Ok(work) => (Some(work), None),
+                            Err(error) => (None, Some(AgentError::Tool(error.to_string()))),
+                        }
+                    }
+                    _ => (
+                        None,
+                        Some(AgentError::Tool(
+                            "managed Work native ownership unavailable".into(),
+                        )),
+                    ),
+                }
+            } else {
+                (None, None)
+            };
             let initial_message = initial_user_message_for_session(&session);
             let selected_skill_ids =
                 selected_skill_ids.or_else(|| selected_skill_ids_for_session(&session));
@@ -1499,7 +1564,7 @@ pub fn spawn_session_execution_with_upstream_retry(
             // newly armed safety-net wait, it must not resurrect a completed
             // child wait. Tagged tool waits are reconciled by the final writer.
             let inherited_child_wait = agent.persistence().inherited_child_wait();
-            let execute_request = build_execute_request(
+            let mut execute_request = build_execute_request(
                 initial_message,
                 mpsc_tx.clone(),
                 cancel_token,
@@ -1533,17 +1598,31 @@ pub fn spawn_session_execution_with_upstream_retry(
             // waiting parent. Map a panic to a terminal error instead.
             let result = {
                 use futures::FutureExt;
-                match std::panic::AssertUnwindSafe(agent.execute_with_inputs_and_upstream_retry(
-                    &mut session,
-                    execute_request,
-                    inputs,
-                    upstream_retry,
-                ))
-                .catch_unwind()
-                .await
-                {
+                let run = async {
+                    if let Some(error) = work_error {
+                        return Err(error);
+                    }
+                    if let Some(work) = &work {
+                        work.bind_request(&agent, &mut session, &mut execute_request)
+                            .map_err(|error| AgentError::Tool(error.to_string()))?;
+                    }
+                    let execution = agent.execute_with_inputs_and_upstream_retry(
+                        &mut session,
+                        execute_request,
+                        inputs,
+                        upstream_retry,
+                    );
+                    match &work {
+                        Some(work) => work.resources.scope(execution).await,
+                        None => execution.await,
+                    }
+                };
+                match std::panic::AssertUnwindSafe(run).catch_unwind().await {
                     Ok(result) => result,
                     Err(panic) => {
+                        if let Some(work) = &work {
+                            work.resources.record_unconfirmed("Work execution unwound");
+                        }
                         if let Some(outer) = &task_outer {
                             outer
                                 .unconfirmed("Root loop unwound; physical effects are unconfirmed");
@@ -1563,6 +1642,19 @@ pub fn spawn_session_execution_with_upstream_retry(
                         )))
                     }
                 }
+            };
+            let stopped_work = if let Some(work) = work {
+                match work.resources.close_and_drain().await {
+                    Ok(drained) => Some((work, drained)),
+                    Err(error) => {
+                        if let Some(outer) = &task_outer {
+                            outer.unconfirmed(format!("Work resources did not drain: {error}"));
+                        }
+                        None
+                    }
+                }
+            } else {
+                None
             };
 
             // Send terminal event for all error cases (including cancellation).
@@ -1607,6 +1699,9 @@ pub fn spawn_session_execution_with_upstream_retry(
             }
 
             session.synchronize_terminal_runtime_status();
+            if result.is_err() || suspended_non_terminal {
+                session.root_final_message_candidate = None;
+            }
 
             // Bespoke terminal bookkeeping (e.g. a scheduled-run status) runs
             // here — before persistence — so any closing message the hook
@@ -1704,6 +1799,7 @@ pub fn spawn_session_execution_with_upstream_retry(
                     .map(|inherited| inherited.wait()),
             )
             .await;
+            session.root_final_message_candidate = None;
             let history_committed = saved.is_ok();
             let completion_source =
                 super::child_completion::ChildCompletionSource::after_final_save(
@@ -1833,6 +1929,9 @@ pub fn spawn_session_execution_with_upstream_retry(
             }
 
             tracing::info!("[{}] Agent execution completed", session_id);
+            if let (Some(tx), Some(stopped)) = (work_completion, stopped_work) {
+                let _ = tx.send(stopped);
+            }
             if let Some(outer) = &task_outer {
                 outer.tail_completed();
             }
@@ -1840,7 +1939,15 @@ pub fn spawn_session_execution_with_upstream_retry(
         .instrument(session_span),
     );
     if let Some(outer) = outer {
-        outer.retain(task);
+        outer.retain_with_completion(task, || async move {
+            if let Some((rx, storage)) = joined_work {
+                if let Ok((work, drained)) = rx.await {
+                    if let Err(error) = work.publish_joined(storage.as_ref(), drained).await {
+                        tracing::warn!(%error, "managed Work completion retained for reconciliation");
+                    }
+                }
+            }
+        });
     } else if is_root {
         // Legacy/custom composition has no supported Root issuer. Still join
         // this actual task, but do not invent an observable physical receipt.
@@ -2035,9 +2142,20 @@ impl RootActorExecution {
         self.binding.persistence.clone()
     }
 
-    pub(super) async fn finish(self, outcome: bamboo_domain::ActorActivationFinish) {
-        if let Err(error) = self.finish_observed(outcome).await {
-            tracing::warn!(%error, "Root Actor closure unconfirmed");
+    async fn finish(
+        self,
+        outcome: bamboo_domain::ActorActivationFinish,
+        admission: Option<&super::root_execution_lifetime::RootRunAdmission>,
+    ) -> bool {
+        match self.finish_observed(outcome).await {
+            Ok(()) => {
+                outcome == bamboo_domain::ActorActivationFinish::Cancelled
+                    && admission.is_some_and(|admission| admission.record_prelaunch_stop())
+            }
+            Err(error) => {
+                tracing::warn!(%error, "Root Actor closure unconfirmed");
+                false
+            }
         }
     }
 

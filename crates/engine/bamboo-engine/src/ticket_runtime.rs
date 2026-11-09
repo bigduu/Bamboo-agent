@@ -5,13 +5,18 @@ use std::sync::Arc;
 use bamboo_domain::{Session, SessionAuthorityIdentity, SessionKind, Storage};
 use bamboo_tickets::{
     canonical_bytes, content_hash, AssignmentState, Authority, DispatchSpec, Error, Operation,
-    Principal, Result, RuntimeReceipt, ScopeBinding, TicketService, WorkState,
+    Principal, Result, RuntimeReceipt, ScopeBinding, SubmissionFacts, TicketService, WorkState,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::execution::spawn::SessionInboxRuntimeBinding;
 
 pub const TICKET_DISPATCH_KEY: &str = "ticket.runtime.dispatch.v1";
+
+pub(crate) fn is_managed_work_root(session: &Session) -> bool {
+    session.kind == SessionKind::Root && session.metadata.contains_key(TICKET_DISPATCH_KEY)
+}
+pub mod managed;
 mod result;
 pub use result::{
     checkpoint_owned_task_stop, checkpoint_owned_ticket_stop, checkpoint_ticket_result,
@@ -38,6 +43,8 @@ pub enum DispatchObservation {
     Missing,
     Pending {
         session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        first_input: Option<bamboo_domain::ObserverSupervisedRootInput>,
     },
     Admitted {
         receipt: RuntimeReceipt,
@@ -181,6 +188,50 @@ pub fn read_dispatch(session: &Session) -> Result<Option<TicketDispatchBinding>>
         .transpose()
 }
 
+/// Read the retained execution named by a ledger submission. The model never
+/// supplies a Session identity or a file path to this storage boundary.
+pub async fn load_handoff_session(
+    storage: &dyn Storage,
+    facts: &SubmissionFacts,
+) -> Result<Option<Session>> {
+    let receipt = &facts.submission.runtime;
+    if facts.managed_intent.is_none()
+        && receipt.session_id != ticket_child_id(&receipt.dispatch_key)
+    {
+        return Ok(None);
+    }
+    let Some(session) = storage
+        .load_execution_admission_snapshot(&receipt.session_id)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let Some(dispatch) = read_dispatch(&session)? else {
+        return Ok(None);
+    };
+    if let Some(intent) = &facts.managed_intent {
+        let exact = dispatch.binding == facts.binding
+            && dispatch.assignment_id == facts.assignment.id
+            && dispatch.dispatch_key == receipt.dispatch_key
+            && dispatch.spec_hash == receipt.spec_hash
+            && dispatch.receipt.is_none()
+            && bamboo_orchestration::managed_work::terminal_reply(intent, receipt, &session)?
+                .is_some();
+        return Ok(exact.then_some(session));
+    }
+    let exact = session.kind == SessionKind::Child
+        && session.id == receipt.session_id
+        && session.parent_session_id.as_deref() == Some(&facts.binding.supervisor_session_id)
+        && session.root_session_id == facts.binding.supervisor_session_id
+        && dispatch.binding == facts.binding
+        && dispatch.assignment_id == facts.assignment.id
+        && dispatch.dispatch_key == receipt.dispatch_key
+        && dispatch.spec_hash == receipt.spec_hash
+        && dispatch.receipt.as_ref() == Some(receipt)
+        && dispatch.receipt_created_at == Some(session.created_at);
+    Ok(exact.then_some(session))
+}
+
 /// Ticket owns this child's result/recovery lifecycle. A short Supervisor turn
 /// must not acquire the ordinary SubAgent orphan wait on its behalf. Inspect
 /// the canonical Host control plane; a model label or a cached replica cannot
@@ -241,6 +292,70 @@ pub async fn query_dispatch(
     .await?;
     if binding != expected.binding {
         return Err(Error::ScopeDenied("Supervisor binding changed".into()));
+    }
+    if let Some(target) = &spec.managed_root {
+        let session_id = target
+            .session_id()
+            .map_err(|error| Error::ScopeDenied(error.into()))?;
+        let (_, snapshot) = service.published()?;
+        let assignment = &snapshot.assignments[&spec.assignment_id];
+        let intent = &snapshot.intents[key];
+        let unknown = |reason: &str| DispatchObservation::OutcomeUnknown {
+            receipt: assignment.runtime.clone(),
+            reason: reason.into(),
+        };
+        let Some(root) = storage.load_runtime_control_plane(&session_id).await? else {
+            return Ok(
+                if assignment.runtime.is_none()
+                    && require_dispatch_permission(service, &expected).is_ok()
+                {
+                    DispatchObservation::Missing
+                } else {
+                    unknown("canonical managed Root unavailable")
+                },
+            );
+        };
+        if !bamboo_orchestration::managed_work::matches_root(target, spec, &root)
+            || read_dispatch(&root)?.as_ref() != Some(&expected)
+        {
+            return Ok(unknown("canonical managed Root dispatch changed"));
+        }
+        return Ok(match (&intent.managed_admission, &assignment.runtime) {
+            (None, None) if require_dispatch_permission(service, &expected).is_ok() => {
+                if matches!(
+                    root.last_run_status().as_deref(),
+                    Some("completed" | "error" | "cancelled" | "timeout" | "skipped")
+                ) {
+                    unknown("managed Root finished without a confirmed Work admission")
+                } else {
+                    DispatchObservation::Pending {
+                        session_id,
+                        first_input: None,
+                    }
+                }
+            }
+            (Some(admission), Some(receipt)) if admission.target_created_at == root.created_at => {
+                if assignment.process_stopped {
+                    DispatchObservation::Terminal {
+                        receipt: receipt.clone(),
+                        terminal_status: match assignment.state {
+                            AssignmentState::Submitted => "completed",
+                            AssignmentState::Cancelled => "cancelled",
+                            AssignmentState::Failed => "error",
+                            _ => "stopped",
+                        }
+                        .into(),
+                    }
+                } else if assignment.state == AssignmentState::OutcomeUnknown {
+                    unknown("managed Work outcome is unconfirmed")
+                } else {
+                    DispatchObservation::Admitted {
+                        receipt: receipt.clone(),
+                    }
+                }
+            }
+            _ => unknown("managed Root lifetime or admission is unconfirmed"),
+        });
     }
     let child = storage
         .load_runtime_control_plane(&ticket_child_id(key))
@@ -327,6 +442,7 @@ pub async fn query_dispatch(
     {
         Ok(DispatchObservation::Pending {
             session_id: child.id,
+            first_input: None,
         })
     } else {
         Ok(DispatchObservation::OutcomeUnknown {
@@ -455,21 +571,7 @@ pub async fn admit_ticket_run(
     Ok(())
 }
 
-pub(crate) fn execute_runtime_command(
-    service: &TicketService,
-    authority: &Authority,
-    id: &str,
-    operations: Vec<Operation>,
-) -> Result<bamboo_tickets::OperationReceipt> {
-    for attempt in 0..4 {
-        let command = service.prepare_command(authority, id, operations.clone())?;
-        match service.execute(authority, &command) {
-            Err(Error::RevisionConflict) if attempt < 3 => continue,
-            result => return result,
-        }
-    }
-    unreachable!()
-}
+pub(crate) use bamboo_orchestration::managed_work::execute_runtime_command;
 
 #[cfg(test)]
 mod tests;

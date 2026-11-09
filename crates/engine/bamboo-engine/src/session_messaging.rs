@@ -493,6 +493,7 @@ impl SessionMessenger {
         operation_id: uuid::Uuid,
         reserved_root: &Session,
         message: &str,
+        notify_on_material_event: bool,
     ) -> Result<SessionPeerDeliveryReceipt, SessionMessengerError> {
         let envelope =
             Self::root_first_input_envelope(caller, operation_id, reserved_root, message)?;
@@ -505,6 +506,7 @@ impl SessionMessenger {
                 operation_id,
                 reserved_root,
                 &envelope,
+                notify_on_material_event,
             )
             .await
             .map_err(|error| {

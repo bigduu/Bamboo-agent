@@ -190,7 +190,7 @@ pub(super) fn tool_policy_key(
         });
     let legacy_inspection = matches!(
         object.get("action").and_then(|value| value.as_str()),
-        Some("get" | "list" | "list_models")
+        Some("get" | "list_models")
     ) && ["intent", "target", "role", "reply_to"]
         .iter()
         .all(|key| !object.contains_key(*key));
@@ -782,7 +782,7 @@ mod tests {
             r#"{"intent":"inspect","target":"child","message":"messages"}"#,
             r#"{"intent":"inspect","target":"child","role":null,"reply_to":""}"#,
             r#"{"action":"get","child_session_id":"child"}"#,
-            r#"{"action":"list"}"#,
+            r#"{"intent":"inspect"}"#,
             r#"{"action":"list_models"}"#,
         ] {
             assert_eq!(
@@ -796,6 +796,7 @@ mod tests {
             r#"{"intent":"inspect","role":"implementer"}"#,
             r#"{"intent":"inspect","unknown":"value"}"#,
             r#"{"action":"get","target":"child"}"#,
+            r#"{"action":"list"}"#,
             r#"{"target":"child","message":"result"}"#,
             "not-json",
         ] {

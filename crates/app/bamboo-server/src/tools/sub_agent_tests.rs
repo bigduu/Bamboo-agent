@@ -6817,39 +6817,22 @@ async fn repeated_reconcile_during_queued_launch_admits_one_recovery() {
 }
 
 #[tokio::test]
-async fn list_returns_children() {
+async fn legacy_subagent_list_is_rejected_with_existing_children() {
     let harness = build_test_harness().await;
 
-    let result = invoke_completed(
+    let error = invoke_completed(
         &harness.tool,
         json!({"action": "list"}),
-        ToolExecutionContext {
-            executing_supervisor: None,
-            session_id: Some(harness.parent_session_id.as_str()),
-            root_session_id: None,
-            tool_call_id: "tool_call_list",
-            event_tx: None,
-            available_tool_schemas: None,
-            bypass_permissions: false,
-            auto_approve_permissions: false,
-            plan_read_only: false,
-            can_async_resume: false,
-            bash_completion_sink: None,
-            pre_parsed_args: None,
-        }
-        .to_tool_ctx(),
+        subagent_test_ctx(&harness.parent_session_id, "removed-list"),
     )
     .await
-    .expect("list should succeed");
+    .expect_err("the legacy action must not return child records");
 
-    let payload: serde_json::Value =
-        serde_json::from_str(&result.result).expect("tool result should be JSON");
-    let children = payload["children"]
-        .as_array()
-        .expect("list result should have children array");
-    assert_eq!(children.len(), 1);
-    assert_eq!(children[0]["child_session_id"], harness.child_session_id);
-    assert_eq!(payload["count"], 1);
+    assert!(
+        matches!(error, ToolError::InvalidArguments(ref detail)
+            if detail.contains("action=list has been removed") && detail.contains("session_control")),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]

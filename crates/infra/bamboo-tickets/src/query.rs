@@ -82,6 +82,8 @@ pub struct Overview {
 pub struct TicketView {
     pub ticket: Ticket,
     pub assignments: Vec<Assignment>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub managed_admissions: BTreeMap<String, bamboo_domain::ManagedRootAdmission>,
     pub requests: Vec<PendingRequest>,
     pub submissions: Vec<Submission>,
     /// Opt-in owner control facts; absence on an older producer is unsupported.
@@ -114,6 +116,18 @@ pub struct InspectOptions {
     pub depth: usize,
     pub budget_bytes: usize,
     pub fixed_commit: Option<String>,
+}
+
+/// Exact ledger facts for a handoff, including a retained superseded attempt.
+/// The Host uses the binding and receipt to read the corresponding execution.
+pub struct SubmissionFacts {
+    pub binding: ScopeBinding,
+    pub work_state: WorkState,
+    pub current: bool,
+    pub accepted: bool,
+    pub assignment: Assignment,
+    pub submission: Submission,
+    pub managed_intent: Option<DispatchIntent>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -357,6 +371,55 @@ impl TicketService {
         )
     }
 
+    pub fn work_submission_facts(
+        &self,
+        authority: &Authority,
+        work_id: &str,
+        submission_id: &str,
+        fixed_commit: Option<&str>,
+    ) -> Result<ReadEnvelope<SubmissionFacts>> {
+        authority.supervisor()?;
+        let (commit, snapshot) =
+            self.query_snapshot(authority, "submission", None, fixed_commit)?;
+        validate_authority(authority, &snapshot)?;
+        let missing =
+            || Error::InvalidTransition("submission absent for this Work at snapshot".into());
+        let work = snapshot
+            .tickets
+            .get(work_id)
+            .filter(|ticket| ticket.kind == TicketKind::Work)
+            .ok_or_else(missing)?;
+        let submission = snapshot
+            .submissions
+            .get(submission_id)
+            .filter(|submission| submission.work_id == work.id)
+            .ok_or_else(missing)?;
+        let assignment = snapshot
+            .assignments
+            .get(&submission.assignment_id)
+            .filter(|assignment| {
+                assignment.work_id == work.id
+                    && assignment.generation == submission.generation
+                    && assignment.contract_revision == submission.contract_revision
+                    && assignment.runtime.as_ref() == Some(&submission.runtime)
+            })
+            .ok_or_else(|| Error::ScopeDenied("submission assignment identity mismatch".into()))?;
+        let facts = SubmissionFacts {
+            binding: snapshot.binding.clone(),
+            work_state: work.state,
+            current: work.current_submission.as_deref() == Some(submission_id),
+            accepted: work.accepted_submission.as_deref() == Some(submission_id),
+            assignment: assignment.clone(),
+            submission: submission.clone(),
+            managed_intent: snapshot
+                .intents
+                .get(&assignment.dispatch_key)
+                .filter(|intent| intent.immutable_spec.managed_root.is_some())
+                .cloned(),
+        };
+        Ok(envelope(commit, &snapshot, authority, facts, 0, None))
+    }
+
     /// Ticket/contract is always present. The response declares selected
     /// sections so an omitted request/attempt history cannot look empty.
     pub fn work_inspect_sections(
@@ -400,7 +463,7 @@ impl TicketService {
                 .get(&id)
                 .ok_or_else(|| Error::InvalidTransition("inspect ID absent at snapshot".into()))?
                 .clone();
-            let assignments = snapshot
+            let assignments: Vec<_> = snapshot
                 .assignments
                 .values()
                 .filter(|a| {
@@ -439,9 +502,20 @@ impl TicketService {
             let controls = (ticket.kind == TicketKind::Work
                 && options.sections.contains(&InspectSection::Controls))
             .then(|| crate::controls::facts(&snapshot, &ticket));
+            let managed_admissions = assignments
+                .iter()
+                .filter_map(|assignment| {
+                    snapshot
+                        .intents
+                        .get(&assignment.dispatch_key)
+                        .and_then(|intent| intent.managed_admission.clone())
+                        .map(|admission| (assignment.id.clone(), admission))
+                })
+                .collect();
             data.push(TicketView {
                 ticket,
                 assignments,
+                managed_admissions,
                 requests,
                 submissions,
                 controls,
@@ -588,6 +662,34 @@ impl TicketService {
         authority: &Authority,
         command: &Command,
     ) -> Result<OperationReceipt> {
+        self.dispatch_with_root_selection(authority, command, None)
+    }
+
+    /// Trusted Host selection runs only for a new Start, on the exact spec
+    /// about to be published under the existing Work transaction.
+    pub fn dispatch_managed_work(
+        &self,
+        authority: &Authority,
+        command: &Command,
+        select_root: &dyn Fn(&DispatchSpec) -> Result<ManagedWorkRoot>,
+        validate_input: &dyn Fn(&WorkContextPacket) -> Result<()>,
+    ) -> Result<OperationReceipt> {
+        self.dispatch_with_root_selection(
+            authority,
+            command,
+            Some(crate::service::ManagedStart {
+                select_root,
+                validate_input,
+            }),
+        )
+    }
+
+    fn dispatch_with_root_selection(
+        &self,
+        authority: &Authority,
+        command: &Command,
+        managed_start: Option<crate::service::ManagedStart<'_>>,
+    ) -> Result<OperationReceipt> {
         if command.operations.iter().any(|op| {
             !matches!(
                 op,
@@ -603,7 +705,7 @@ impl TicketService {
                 "dispatch accepts start/steer/cancel/retry only".into(),
             ));
         }
-        self.execute(authority, command)
+        self.execute_with_root_selection(authority, command, managed_start)
     }
 }
 

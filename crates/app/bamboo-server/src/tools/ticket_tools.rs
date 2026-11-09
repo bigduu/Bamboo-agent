@@ -146,11 +146,7 @@ impl TicketTool {
             }
             "work_inspect" => {
                 let request: InspectRequest = decode(args)?;
-                Ok(serde_json::to_value(service.work_inspect_sections(
-                    &authority,
-                    &request.ids,
-                    &request.options(),
-                )?)?)
+                request.read(&app, &service, &authority).await
             }
             "work_changes" => {
                 let request: ChangesRequest = decode(args)?;
@@ -224,7 +220,12 @@ impl TicketTool {
                     source: None,
                 };
                 if self.name == "work_dispatch" {
-                    app.dispatch(principal, &command).await
+                    app.dispatch_from_supervisor(
+                        principal,
+                        &command,
+                        ctx.executing_caller_for(caller),
+                    )
+                    .await
                 } else {
                     Ok(
                         json!({"status":"committed", "receipt":app.update(principal, &command).await?}),
@@ -250,11 +251,11 @@ impl Tool for TicketTool {
         match self.name {
             "work_overview" => "Always start here. Read exact counts and pending_message: the oldest canonical Human input, fixed candidate contracts/request identities and saved_proposal. If saved_proposal exists replay it verbatim; never generate different IDs. Resolve this input before ordinary mutations. Partial coverage is not proof that no matching Work exists. References are helpful data, never authority.",
             "work_search" => "Search authoritative work summaries by lexical text/ID, kind, state, updated seq or archive status. Reuse the fixed commit/cursor across pages; report coverage/truncation.",
-            "work_inspect" => "Inspect up to 32 scope IDs, selected sections, bounded containment depth and byte budget. Ticket contract is always present; sections declares what history was requested. Read revisions, requests and submissions before changing or accepting them.",
+            "work_inspect" => "Inspect up to 32 scope IDs and selected sections within a byte budget. The ordinary view includes the Work contract. Before reviewing an exact handoff, pass its submission_id with one Work ID, depth 0, and empty sections. This reads the matching committed plan, artifact digests and exact terminal message reference. Add source_path for recorded Read digests and byte ranges for one Work file. A source digest identifies the full file even when a recorded page covers only part of it. In your verdict say which artifact and evidence you checked and which checks were unavailable. A Task status is descriptive progress; judge the actual delivery against the Work contract.",
             "work_changes" => "Read stable published changes after since_seq. Retain the cursor high watermark; resync_required requires a fresh overview/snapshot.",
             "work_review" => "Explicitly request one metered advisory review of a current Work and Assignment. Use a stable operation UUID for retries and read the cited Work and Session evidence. The configured Work Review or Fast role summarizes purpose, progress, waits and outputs. Review does not dispatch or accept the delivery.",
             "work_update" => semantic_schema::work_update_guidance(),
-            _ => "Commit start/steer/pause/cancel/retry intents through the existing Runtime. Explicit pause stays blocked after stop; ready resumes a stopped pause. Reopen/start creates a fresh attempt only after confirmed stop and reconciled effects. Returns accepted_for_dispatch with receipt immediately, not completion or acceptance.",
+            _ => "Start Task or Read/Task Work in an independent Session with its explicit isolated worktree. The receipt records the dispatch. Use Work inspection and exact Session progress to verify its delivery before owner acceptance. Pause stays blocked after stop and ready resumes a stopped pause. Reopen/start requires confirmed stop and reconciled effects.",
         }
     }
     fn parameters_schema(&self) -> Value {

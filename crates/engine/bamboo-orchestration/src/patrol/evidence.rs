@@ -3,8 +3,9 @@
 use super::Scope;
 use bamboo_domain::{ProjectManifest, ProjectStatus, WorkspaceBinding};
 use bamboo_tickets::{
-    AssignmentState, Contract, EffectState, Error, ProjectContextSnapshot, RequestKind,
-    RequestStatus, Result, RuntimeReceipt, Snapshot, WorkState,
+    Assignment, AssignmentState, Contract, DispatchSpec, EffectState, Error,
+    ProjectContextSnapshot, RequestKind, RequestStatus, Result, RuntimeReceipt, Snapshot,
+    WorkState,
 };
 use serde::Serialize;
 
@@ -130,15 +131,17 @@ pub enum WorkPatrolSourceOutcome<R, S> {
     Unsupported,
 }
 
-/// A bounded snapshot plan only. The Host must independently authorize its exact
-/// commit/Scope before and after every actual read. This is not a stored grant.
-pub struct EvidencePlan<R, S> {
-    evidence: UnmeteredWorkPatrolEvidence<R, S>,
-    context: ProjectContextSnapshot,
+/// The current Assignment's immutable Project adoption, independent of a Patrol
+/// evidence packet. The Host still authorizes the scope and reads the live Project.
+pub struct AdoptedProject<'a> {
+    assignment: &'a Assignment,
+    spec: &'a DispatchSpec,
+    hash: &'a str,
+    context: &'a ProjectContextSnapshot,
 }
 
-impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
-    pub fn prepare(snapshot: &Snapshot, scope: &Scope, commit: &str, since: u64) -> Result<Self> {
+impl<'a> AdoptedProject<'a> {
+    pub fn for_assignment(snapshot: &'a Snapshot, scope: &Scope) -> Result<Self> {
         super::host::project(snapshot, scope)
             .map_err(|_| Error::ScopeDenied("invalid evidence snapshot scope".into()))?;
         if super::host::current_assignment_id(snapshot, &scope.work_id)
@@ -149,9 +152,6 @@ impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
             return Err(Error::ScopeDenied(
                 "current evidence attempt required".into(),
             ));
-        }
-        if since > snapshot.seq {
-            return Err(Error::RevisionConflict);
         }
         let assignment = snapshot
             .assignments
@@ -170,13 +170,6 @@ impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
             .contexts
             .get(hash)
             .ok_or(Error::IdempotencyConflict)?;
-        if context.sources.len() + 2 > MAX_WORK_PATROL_EVIDENCE_REFS
-            || context.sources.iter().any(|(key, version)| {
-                key.len() > MAX_SOURCE_KEY_BYTES || version.len() > MAX_SOURCE_VERSION_BYTES
-            })
-        {
-            return Err(Error::ContextBudgetExceeded);
-        }
         let context_bytes = bamboo_tickets::canonical_bytes(context)?;
         if context_bytes.len() > bamboo_tickets::PROJECT_CONTEXT_BYTES_LIMIT {
             return Err(Error::ContextBudgetExceeded);
@@ -190,6 +183,48 @@ impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
             || bamboo_tickets::content_hash(&context_bytes) != *hash
         {
             return Err(Error::IdempotencyConflict);
+        }
+        Ok(Self {
+            assignment,
+            spec,
+            hash,
+            context,
+        })
+    }
+
+    pub fn context(&self) -> &ProjectContextSnapshot {
+        self.context
+    }
+
+    pub fn validate_project(&self, manifest: &ProjectManifest) -> Result<()> {
+        resource(self.context, manifest)
+    }
+}
+
+/// A bounded snapshot plan only. The Host must independently authorize its exact
+/// commit/Scope before and after every actual read. This is not a stored grant.
+pub struct EvidencePlan<R, S> {
+    evidence: UnmeteredWorkPatrolEvidence<R, S>,
+    context: ProjectContextSnapshot,
+}
+
+impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
+    pub fn prepare(snapshot: &Snapshot, scope: &Scope, commit: &str, since: u64) -> Result<Self> {
+        let AdoptedProject {
+            assignment,
+            spec,
+            hash,
+            context,
+        } = AdoptedProject::for_assignment(snapshot, scope)?;
+        if since > snapshot.seq {
+            return Err(Error::RevisionConflict);
+        }
+        if context.sources.len() + 2 > MAX_WORK_PATROL_EVIDENCE_REFS
+            || context.sources.iter().any(|(key, version)| {
+                key.len() > MAX_SOURCE_KEY_BYTES || version.len() > MAX_SOURCE_VERSION_BYTES
+            })
+        {
+            return Err(Error::ContextBudgetExceeded);
         }
         let mut sources: Vec<WorkPatrolSourceEvidence<R, S>> = Vec::new();
         for (key, version) in &context.sources {
@@ -242,7 +277,7 @@ impl<R: Serialize, S: Serialize> EvidencePlan<R, S> {
             since_cursor: since,
             through_cursor: snapshot.seq,
             execution_facts_revision: snapshot.execution_facts_revision(),
-            adopted_context_hash: hash.clone(),
+            adopted_context_hash: hash.to_owned(),
             adopted_context: WorkPatrolAdoptedContextEvidence {
                 project_revision: context.project_revision,
                 resource_revision: context.resource_revision,

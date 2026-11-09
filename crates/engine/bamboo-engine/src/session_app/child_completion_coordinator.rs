@@ -2396,6 +2396,16 @@ impl SessionActivationSpawner for ChildCompletionCoordinator {
             );
             return Ok(SessionActivationReserveOutcome::NoWork);
         }
+        if crate::ticket_runtime::is_managed_work_root(&session)
+            && !self
+                .agent
+                .managed_work_runtime()
+                .is_some_and(|runtime| runtime.require_launch_permission(&session).is_ok())
+        {
+            // A retained Inbox input cannot relaunch cancelled Work. The
+            // actual run still checks the ledger again before taking authority.
+            return Ok(SessionActivationReserveOutcome::NoWork);
+        }
 
         enum LaunchPlan {
             Root(Box<ResumeConfigSnapshot>),

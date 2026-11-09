@@ -1118,6 +1118,11 @@ pub struct SessionIndexEntry {
     /// can display the question dialog badge without loading session.json.
     #[serde(default)]
     pub has_pending_question: bool,
+    /// The latest run has a material subscriber while this Session has a
+    /// pending question. Its delivery hint can retire before the question clears.
+    /// Absent on older index rows or Sessions with no pending question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_material_run: Option<bool>,
     /// Latest canonical Human UI engagement mark, mirrored from
     /// `session.agent_runtime_state.last_human_input`. Absent means no human
     /// input was admitted through the interactive route since creation. This is
@@ -3400,6 +3405,31 @@ impl SessionStoreV2 {
         let mut items: Vec<_> = index.sessions.values().cloned().collect();
         items.sort_by_key(|b| std::cmp::Reverse(b.updated_at));
         items
+    }
+
+    pub async fn recent_index_entries_matching(
+        &self,
+        limit: usize,
+        matches: impl Fn(&SessionIndexEntry) -> bool,
+    ) -> Vec<SessionIndexEntry> {
+        let index = self.index.read().await;
+        let mut items: Vec<_> = index
+            .sessions
+            .values()
+            .filter(|entry| matches(entry))
+            .collect();
+        let newest = |left: &&SessionIndexEntry, right: &&SessionIndexEntry| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.id.cmp(&right.id))
+        };
+        if items.len() > limit {
+            items.select_nth_unstable_by(limit, newest);
+            items.truncate(limit);
+        }
+        items.sort_unstable_by(newest);
+        items.into_iter().cloned().collect()
     }
 
     pub async fn get_index_entry(&self, session_id: &str) -> Option<SessionIndexEntry> {
@@ -5848,24 +5878,26 @@ impl SessionStoreV2 {
             .filter(|value| !value.is_empty());
         let project_id = normalized_project_id(session);
         let session_id = session.id.clone();
-        let material_notification_hint = session
+        let outcomes = session
             .runtime_metadata
             .as_ref()
-            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref())
-            .and_then(|outcomes| {
+            .and_then(|metadata| metadata.supervised_root_outcomes.as_ref());
+        let material_notification_hint = outcomes.and_then(|outcomes| {
+            outcomes
+                .facts
+                .iter()
+                .rev()
+                .find_map(|fact| outcomes.material_hint_for(fact))
+        });
+        let has_pending_question = session.has_pending_question();
+        let pending_material_run = has_pending_question.then(|| {
+            outcomes.is_some_and(|outcomes| {
                 outcomes
                     .facts
-                    .iter()
-                    .rev()
-                    .flat_map(|fact| fact.inputs.iter().rev())
-                    .find(|input| {
-                        input
-                            .supervisor_origin
-                            .as_ref()
-                            .is_some_and(|origin| origin.material_notifications_requested())
-                    })
+                    .last()
+                    .is_some_and(|fact| outcomes.material_inputs(fact).next().is_some())
             })
-            .map(|input| input.receipt_id.to_string());
+        });
         let mut entry = SessionIndexEntry {
             id: session.id.clone(),
             kind: session.kind,
@@ -5892,7 +5924,8 @@ impl SessionStoreV2 {
             last_activity_at: session.updated_at,
             message_count: session.messages.len(),
             has_attachments,
-            has_pending_question: session.has_pending_question(),
+            has_pending_question,
+            pending_material_run,
             last_human_input,
             plan_mode,
             bypass_permissions,
@@ -7704,6 +7737,32 @@ impl SessionStoreV2 {
             } else {
                 durable_outcomes.cloned()
             };
+            if guards.input.is_none() {
+                if let (Some(outcomes), Some(response)) = (
+                    outcomes.as_mut(),
+                    bamboo_domain::consumed_pending_permission(durable, session),
+                ) {
+                    let reset = durable
+                        .conversation_reset_sha256()
+                        .map_err(|error| other_io_error(error.to_string()))?;
+                    outcomes
+                        .reserve_permission_resume(
+                            &root_actor.owner().fence,
+                            reset.as_deref(),
+                            &response,
+                        )
+                        .map_err(io::Error::other)?;
+                }
+            }
+            let current = if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
+                let mut current = session.clone();
+                if let Some(durable_outcomes) = durable_outcomes {
+                    rebase_supervised_input_transcript(&mut current, durable, durable_outcomes)?;
+                }
+                Some(current)
+            } else {
+                None
+            };
             if guards.root_outcome_finalized {
                 if guards.input.is_some() {
                     return Err(io::Error::new(
@@ -7756,20 +7815,32 @@ impl SessionStoreV2 {
                                 ));
                             }
                         };
-                        outcomes.finalize(&owner.fence, result).map_err(|error| {
-                            io::Error::new(
-                                io::ErrorKind::WouldBlock,
-                                bamboo_domain::SessionAuthorityConflict(error.into()),
-                            )
-                        })?;
+                        let final_main = current.as_ref().unwrap_or(session);
+                        if result == bamboo_domain::SupervisedRootOutcomeResult::Suspended
+                            && outcomes.facts.last().is_some_and(|fact| {
+                                fact.run_id == owner.fence.run_id && fact.result.is_none()
+                            })
+                        {
+                            if let Some(question) =
+                                bamboo_domain::pending_permission_occurrence(final_main)
+                            {
+                                outcomes
+                                    .record_question(&owner.fence, &question)
+                                    .map_err(io::Error::other)?;
+                            }
+                        }
+                        outcomes
+                            .finalize_from_main(&owner.fence, result, final_main)
+                            .map_err(|error| {
+                                io::Error::new(
+                                    io::ErrorKind::WouldBlock,
+                                    bamboo_domain::SessionAuthorityConflict(error.into()),
+                                )
+                            })?;
                     }
                 }
             }
-            if incoming_outcomes != outcomes.as_ref() || durable_outcomes.is_some() {
-                let mut current = session.clone();
-                if let Some(durable_outcomes) = durable_outcomes {
-                    rebase_supervised_input_transcript(&mut current, durable, durable_outcomes)?;
-                }
+            if let Some(mut current) = current {
                 if let Some(outcomes) = outcomes {
                     current
                         .runtime_metadata

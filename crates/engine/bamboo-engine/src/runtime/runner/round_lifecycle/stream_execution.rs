@@ -876,11 +876,20 @@ fn build_request_envelope_reconciled_for_loading_mode(
     // not participate in `build_compression_context_blocks`: a fork/copy must
     // never inherit a stale Session ID through generated summary text.
     let mut context_blocks = vec![build_session_identity_context_block(session)];
-    if let Some(block) =
-        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode)
-    {
-        context_blocks.push(block);
+    let mut orchestration =
+        build_root_orchestration_context_block_for_tools(session, tool_schemas, loading_mode);
+    if let Some(handoff) = bamboo_orchestration::managed_session::worker_handoff_context(
+        session,
+        config.guidance_active_run_id.as_deref(),
+    ) {
+        if let Some(block) = orchestration.as_mut() {
+            block.content.push_str("\n\n");
+            block.content.push_str(&handoff.content);
+        } else {
+            orchestration = Some(handoff);
+        }
     }
+    context_blocks.extend(orchestration);
     let newly_activated = activated_discoverable_tools(session)
         .difference(&activated)
         .cloned()

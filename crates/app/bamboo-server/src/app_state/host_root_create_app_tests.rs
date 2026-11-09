@@ -186,6 +186,18 @@ async fn finite_host_path_creates_independent_roots_for_all_roles_without_manage
         assert!(target.parent_session_id.is_none());
         assert_eq!(target.root_session_id, id);
         assert_eq!(
+            target
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            if is_supervisor {
+                bamboo_domain::SessionPermissionMode::Bypass
+            } else {
+                bamboo_domain::SessionPermissionMode::Default
+            }
+        );
+        assert_eq!(
             target.project_id_meta().as_deref(),
             Some(request.project_id.as_str())
         );

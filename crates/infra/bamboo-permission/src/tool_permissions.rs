@@ -1276,7 +1276,7 @@ pub fn check_permissions(
                     "SubAgent delete",
                     "SubAgent delete: remove a child session",
                 )])),
-                // wait / list / get / list_models → passive or read-only.
+                // Wait and read-only actions need no permission context.
                 _ => Ok(None),
             }
         }
@@ -1310,6 +1310,15 @@ pub fn check_permissions(
             // Read-only observations grant no execution authority. The Host
             // still validates the original Supervisor and its observation scope.
             if matches!(action, "scope" | "directory" | "wait_outcomes") {
+                return Ok(None);
+            }
+            if action == "decide_approval" {
+                let target = required_string_arg(args, "target_session_id")?;
+                bamboo_domain::validate_supervisor_target_id(target)
+                    .map_err(|error| PermissionError::CheckFailed(error.into()))?;
+                // The native Host owns the exact timed, one-shot authority.
+                // Requiring a second permission request here would delegate
+                // the approval of an approval.
                 return Ok(None);
             }
             if matches!(action, "observe_run" | "wait_run" | "cancel") {
@@ -3235,7 +3244,7 @@ mod tests {
             ("deploy_agent", json!({"action": "list"})),
             ("cluster", json!({"action": "list"})),
             ("cluster", json!({"action": "status", "node": "n1"})),
-            ("SubAgent", json!({"action": "list"})),
+            ("SubAgent", json!({"intent": "inspect"})),
             ("SubAgent", json!({"action": "wait"})),
             ("SubAgent", json!({"action": "get", "session_id": "c1"})),
             ("SubAgent", json!({"action": "list_models"})),

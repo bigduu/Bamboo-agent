@@ -357,12 +357,18 @@ impl TicketService {
             Err(Error::RevisionConflict)
         } else {
             validate_group(current, human, group).and_then(|()| {
-                apply_operations(&mut next, authority, &command.operations, store.root())
+                apply_operations(
+                    &mut next,
+                    authority,
+                    &command.operations,
+                    store.root(),
+                    None,
+                )
             })
         };
         match attempted.and_then(|ids| {
             validate_snapshot(&next)?;
-            validate_new_assignment_contexts(current, &next, &store)?;
+            validate_new_assignment_contexts(current, &next, &store, None)?;
             validate_answer_contexts(current, &next, &store)?;
             Ok(ids)
         }) {

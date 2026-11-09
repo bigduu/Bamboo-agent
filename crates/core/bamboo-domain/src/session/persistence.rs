@@ -564,6 +564,21 @@ pub trait RuntimeSessionPersistence: Send + Sync {
         Ok(None)
     }
 
+    /// Admit only the reserved first Work input through an existing owned
+    /// Root writer. This selector alone does not grant dispatch or tool rights.
+    async fn admit_managed_work_input(
+        &self,
+        _session: &mut Session,
+        _inbox: Arc<dyn crate::SessionInboxPort>,
+        _run_id: &str,
+        _expected: &crate::SessionMessageId,
+    ) -> io::Result<RootInboxAdmission> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "managed Work Inbox unsupported",
+        ))
+    }
+
     /// Atomically commit a staged archive transcript rewrite.
     ///
     /// `expected_base` is the exact pre-archive Session used for planning.

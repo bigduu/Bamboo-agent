@@ -316,7 +316,7 @@ fn adopt_root_publication(
         ));
     }
     ensure_conversation_generation_is_current(session, &committed)?;
-    // These three fields are #[serde(skip)] runtime-only state. The persisted
+    // These fields are #[serde(skip)] runtime-only state. The persisted
     // copy never carries `resolved_token_budget` or `force_manual_compression`,
     // so adopting it would erase the live round's values: downstream dispatch
     // then loses the resolved tool-output cap (native skill calls fail with
@@ -329,6 +329,9 @@ fn adopt_root_publication(
     adopted.resolved_token_budget = session.resolved_token_budget.clone();
     adopted.observed_runtime_session_version = session.observed_runtime_session_version;
     adopted.force_manual_compression = session.force_manual_compression.clone();
+    // Carry the exact answer of this live execution through the transcript
+    // checkpoint. The owned terminal writer seals it against committed Main.
+    adopted.root_final_message_candidate = session.root_final_message_candidate.take();
     *session = adopted;
     Ok(())
 }

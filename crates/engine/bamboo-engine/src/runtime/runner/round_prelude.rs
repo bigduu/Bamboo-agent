@@ -241,7 +241,11 @@ async fn refresh_round_boundary_inner(
     // and the current tool result is already complete. Publish the append now
     // so clients can render it before the next provider response begins.
     if let Some(event_tx) = event_tx {
-        for message in &turn_refresh.committed_messages {
+        for message in turn_refresh
+            .committed_messages
+            .iter()
+            .filter(|message| !bamboo_orchestration::managed_session::is_internal_handoff(message))
+        {
             let _ = event_tx
                 .send(AgentEvent::message_appended(&session.id, message))
                 .await;

@@ -123,6 +123,11 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
     if !args.is_object() {
         return Err(invalid("SubAgent arguments must be an object"));
     }
+    if args.get("action").and_then(Value::as_str) == Some("list") {
+        return Err(invalid(
+            "SubAgent action=list has been removed. Use session_control directory for managed Sessions or SubAgent intent=inspect for a paged child view.",
+        ));
+    }
     let compact_fields = ["intent", "target", "role", "reply_to"]
         .iter()
         .any(|key| args.get(key).is_some());
@@ -312,7 +317,7 @@ pub(super) fn normalize(mut args: Value) -> Result<NormalizedCall, ToolError> {
                 if cursor.as_ref().is_some_and(|cursor| cursor.is_empty()) {
                     return Err(invalid("Invalid tree inspection cursor"));
                 }
-                let mut args = json!({"action":"list"});
+                let mut args = json!({});
                 if let Some(cursor) = cursor {
                     args["cursor"] = json!(cursor);
                 }
@@ -1125,7 +1130,8 @@ mod tests {
                     Some(
                         Projection::ParentQuestionAsk
                         | Projection::ParentRequestReply
-                        | Projection::ForcedPermissionAudit,
+                        | Projection::ForcedPermissionAudit
+                        | Projection::Tree,
                     ) => None,
                     _ => check_permissions("SubAgent", &normalized.args).unwrap(),
                 };
@@ -1309,7 +1315,6 @@ mod tests {
     #[test]
     fn legacy_calls_are_unchanged_and_compact_runtime_parameters_are_rejected() {
         for args in [
-            json!({"action":"list"}),
             json!({"title":"task", "responsibility":"work", "prompt":"body"}),
             json!({"action":"create", "title":"task", "responsibility":"work", "prompt":"body", "subagent_type":"explorer"}),
         ] {
@@ -1318,6 +1323,7 @@ mod tests {
             assert_eq!(normalized.projection, None);
         }
         for args in [
+            json!({"action":"list"}),
             json!({"message":"task", "host":"physical"}),
             json!({"message":"task", "reply_to":"unsafe/request"}),
             json!({"action":"create", "intent":"chat"}),

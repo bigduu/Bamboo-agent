@@ -969,6 +969,14 @@ impl SessionActivationRouter {
             .and_then(|state| state.owner.as_ref().map(|owner| owner.run_id.clone()))
     }
 
+    pub async fn has_activation_owner_or_reservation(&self, target_session_id: &str) -> bool {
+        self.states
+            .lock()
+            .await
+            .get(target_session_id)
+            .is_some_and(|state| state.owner.is_some() || state.activation_reserved)
+    }
+
     /// Select a completion's successor fence under the current owner lock.
     /// Once a wait or Guardian transition belongs to this owner, later sibling
     /// callbacks keep that boundary even after the durable wait was cleared.

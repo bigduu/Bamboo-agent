@@ -2,6 +2,7 @@
 //! ordinary Work wait below is deliberately not a stand-in for Planner #1059.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 use super::*;
+use actix_web::web;
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{FunctionCall, ToolCall, ToolSchema};
 use bamboo_domain::{
@@ -13,6 +14,7 @@ use bamboo_engine::session_app::child_session::{
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
+use bamboo_tools::permission::PermissionDecisionKind;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
@@ -24,6 +26,9 @@ use std::{
 };
 use tokio::sync::Notify;
 
+#[path = "observer_background_exec_tests.rs"]
+pub(in crate::app_state) mod background_exec;
+
 const PROVIDER: &str = "subscription-fixture";
 const READER: &str = "subscription-reader";
 const PARENT: &str = "subscription-parent";
@@ -33,6 +38,17 @@ const OBSERVER: &str = "subscription-observer";
 const ROOT_A: &str = "subscription-source-a";
 const ROOT_B: &str = "subscription-source-b";
 const PRIVATE: &str = "SOURCE_PRIVATE_TRANSCRIPT";
+const SUBSCRIBED_FIRST_INPUT: &str = "Produce a short first-input handoff.";
+const SUBSCRIBED_PERMISSION_INPUT: &str = "Produce a handoff after the gated command.";
+const SUBSCRIBED_DENY_INPUT: &str = "Produce a handoff if the gated command is declined.";
+const SUBSCRIBED_REPEAT_INPUT: &str = "Produce a handoff after two individually gated commands.";
+const HANDOFF_SECOND_PERMISSION_CALL: &str = "handoff-second-permission-command";
+const HANDOFF_PERMISSION_CALL: &str = "handoff-permission-command";
+const HANDOFF_COMMAND_OUTPUT: &str = "handoff-approval-executed";
+const HANDOFF_HEAD: &str = "The independent task verified the requested source.";
+const HANDOFF_EVIDENCE: &str = "src/fixture.rs:42";
+const HANDOFF_RISK: &str = "The external integration was not exercised.";
+const HANDOFF_TAIL: &str = "DETAILS_STAY_IN_THE_EXECUTION_SESSION";
 const WAIT: Duration = Duration::from_secs(40);
 
 #[derive(Default)]
@@ -185,6 +201,78 @@ impl LLMProvider for Probe {
         _: Option<u32>,
         model: &str,
     ) -> Result<LLMStream, LLMError> {
+        if messages.iter().any(|message| {
+            message.role == bamboo_domain::Role::User
+                && message.content.contains(background_exec::INPUT)
+        }) {
+            return background_exec::stream(self, messages).await;
+        }
+        let subscribed_input = messages.iter().rev().find(|message| {
+            message.role == bamboo_domain::Role::User
+                && matches!(
+                    message.content.as_str(),
+                    SUBSCRIBED_FIRST_INPUT
+                        | SUBSCRIBED_PERMISSION_INPUT
+                        | SUBSCRIBED_DENY_INPUT
+                        | SUBSCRIBED_REPEAT_INPUT
+                )
+        });
+        if let Some(input) = subscribed_input.map(|message| message.content.as_str()) {
+            assert!(
+                messages.iter().any(|message| {
+                    message.content.contains("Managed Session Delivery Summary")
+                        && message.content.contains("<!-- bamboo-handoff:v1 -->")
+                }),
+                "the exact subscribed Worker Run must receive the delivery contract"
+            );
+            if self.source_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.source_entered[0].notify_one();
+                self.source_release[0].notified().await;
+            }
+            if input != SUBSCRIBED_FIRST_INPUT {
+                let calls = [HANDOFF_PERMISSION_CALL, HANDOFF_SECOND_PERMISSION_CALL];
+                let call_count = if input == SUBSCRIBED_REPEAT_INPUT {
+                    2
+                } else {
+                    1
+                };
+                for &id in &calls[..call_count] {
+                    if let Some(result) = messages
+                        .iter()
+                        .find(|message| message.tool_call_id.as_deref() == Some(id))
+                    {
+                        assert_eq!(
+                            result.content.contains(HANDOFF_COMMAND_OUTPUT),
+                            input != SUBSCRIBED_DENY_INPUT,
+                            "unexpected gated command result: {}",
+                            result.content
+                        );
+                    } else {
+                        return Ok(Box::pin(futures::stream::iter([
+                            Ok(LLMChunk::ToolCalls(vec![ToolCall {
+                                id: id.into(),
+                                tool_type: "function".into(),
+                                function: FunctionCall {
+                                    name: "exec_command".into(),
+                                    arguments: json!({
+                                        "cmd": format!("pwd -P && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
+                                    }).to_string(),
+                                },
+                            }])),
+                            Ok(LLMChunk::Done),
+                        ])));
+                    }
+                }
+            }
+            let answer = format!(
+                "{}\n<!-- bamboo-handoff:v1 -->\n- **Task** Verify fixture\n- **Conclusion** {HANDOFF_HEAD}\n- **Evidence** `{HANDOFF_EVIDENCE}`\n- **Risk** {HANDOFF_RISK}\n<!-- /bamboo-handoff:v1 -->\n{HANDOFF_TAIL}",
+                "界".repeat(500),
+            );
+            return Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token(answer)),
+                Ok(LLMChunk::Done),
+            ])));
+        }
         if model != SOURCE {
             assert!(messages
                 .iter()
@@ -331,7 +419,7 @@ impl LLMProvider for Probe {
     }
 }
 
-async fn host(home: &std::path::Path, probe: Arc<Probe>) -> AppState {
+async fn host(home: &std::path::Path, probe: Arc<Probe>) -> web::Data<AppState> {
     *probe.diagnostic_home.lock().unwrap() = Some(home.into());
     let mut config = Config::from_data_dir(Some(home.into()));
     config.provider = PROVIDER.into();
@@ -350,12 +438,12 @@ async fn host(home: &std::path::Path, probe: Arc<Probe>) -> AppState {
         HashMap::from([(PROVIDER.into(), probe as Arc<dyn LLMProvider>)]),
         PROVIDER.into(),
     ));
-    state
+    web::Data::new(state)
 }
 
 struct Fixture {
     home: tempfile::TempDir,
-    state: AppState,
+    state: web::Data<AppState>,
     probe: Arc<Probe>,
     reference: SupervisorReference,
 }
@@ -999,9 +1087,47 @@ async fn admit_native_source(
 }
 
 pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
+    use bamboo_config::{
+        LifecycleHookGroup, LifecycleHookHandler, LifecycleHooksConfig,
+        DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+    };
+    use bamboo_domain::{Role, SessionInboxReceipt, SessionMessageId, SupervisorCurrentUserTarget};
+    use bamboo_engine::model_config_helper::GOLD_CONFIG_METADATA_KEY;
     use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+    use sha2::{Digest, Sha256};
+
+    fn answer_after(session: &Session, receipt: &str) -> Value {
+        use bamboo_domain::{MessagePhase, Role};
+        let input = session
+            .messages
+            .iter()
+            .position(|m| m.id == receipt)
+            .unwrap();
+        let mut answers = session.messages[input + 1..]
+            .iter()
+            .take_while(|message| message.role != Role::User)
+            .filter(|message| message.phase == Some(MessagePhase::FinalAnswer));
+        let answer = answers.next().expect("canonical reply after this input");
+        assert!(answers.next().is_none());
+        assert_eq!(answer.content, "Synthetic original Root finished.");
+        json!({
+            "message_id": answer.id,
+            "content_sha256": hex::encode(Sha256::digest(answer.content.as_bytes())),
+        })
+    }
 
     let f = Fixture::new_with_native_source(true).await;
+    f.state.config.write().await.lifecycle_hooks = LifecycleHooksConfig {
+        enabled: true,
+        stop: vec![LifecycleHookGroup {
+            hooks: vec![LifecycleHookHandler::command(
+                r#"printf '%s' '{"additional_context":"Retained Stop hook context."}'"#,
+                DEFAULT_LIFECYCLE_HOOK_TIMEOUT_MS,
+            )],
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
     let workspace = f.home.path().join("second-source-workspace");
     std::fs::create_dir(&workspace).unwrap();
     let mut second = load(&f.state, ROOT_B).await;
@@ -1010,6 +1136,18 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     second.set_provider_name(PROVIDER);
     second.workspace = Some(workspace.to_string_lossy().into());
     second.set_workspace_path_meta(workspace.to_string_lossy());
+    // With an active Goal, the terminal answer is committed before Stop runs.
+    // A zero continuation budget keeps this fixture on its single provider turn.
+    second.metadata.insert(
+        GOLD_CONFIG_METADATA_KEY.into(),
+        json!({
+            "enabled": true,
+            "auto_continue_enabled": true,
+            "goal": "Complete the managed assignment",
+            "max_auto_continuations": 0,
+        })
+        .to_string(),
+    );
     f.state.storage.save_session(&second).await.unwrap();
     f.state
         .permission_checker
@@ -1029,7 +1167,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     let first = managed_target(&f.state, &f.reference, ROOT_A).await;
     let second = managed_target(&f.state, &f.reference, ROOT_B).await;
     f.probe.hold_sources.store(true, Ordering::SeqCst);
-    let (_, second_input) = tokio::join!(
+    let (first_input, second_input) = tokio::join!(
         admit_native_source(&f, &first, "managed-wait-first", "managed wait first"),
         admit_native_source(&f, &second, "managed-wait-second", "managed wait second"),
     );
@@ -1045,6 +1183,58 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     let router = &f.state.session_activation_router;
     let first_run = router.current_run_id(ROOT_A).await.unwrap();
     let second_run = router.current_run_id(ROOT_B).await.unwrap();
+    let admission_request = |target: &SupervisorCurrentUserTarget, delivery: &Value| {
+        json!({
+            "action":"observe_run",
+            "target_session_id":target.session_id,
+            "target_ref":target,
+            "input_receipt":{"receipt_id":delivery["receipt_id"],"generation":delivery["generation"]},
+        })
+    };
+    for (target, input, run) in [
+        (&first, &first_input, &first_run),
+        (&second, &second_input, &second_run),
+    ] {
+        let id = format!("managed-admission-{}", target.session_id);
+        let admission = invoke_managed_control(
+            &f.state,
+            &f.reference,
+            &id,
+            admission_request(target, input),
+        )
+        .await;
+        assert_eq!(
+            admission,
+            json!({
+                "status":"admission_verified",
+                "admission":{
+                    "target_session_id":target.session_id,
+                    "target_created_at":target.created_at,
+                    "run_id":run,
+                    "input":{
+                        "receipt_id":input["receipt_id"],"generation":input["generation"],
+                        "operation_id":input["operation_id"]
+                    },
+                }
+            })
+        );
+    }
+    let unconfirmed = json!({"status":"admission_unconfirmed"});
+    let mut wrong_generation = admission_request(&first, &first_input);
+    wrong_generation["input_receipt"]["generation"] =
+        json!(first_input["generation"].as_u64().unwrap() + 1);
+    for (operation, request) in [
+        ("managed-admission-wrong-generation", wrong_generation),
+        (
+            "managed-admission-cross-target",
+            admission_request(&second, &first_input),
+        ),
+    ] {
+        assert_eq!(
+            invoke_managed_control(&f.state, &f.reference, operation, request).await,
+            unconfirmed
+        );
+    }
     let request = |first_cursor, second_cursor| {
         json!({
             "action":"wait_outcomes",
@@ -1095,6 +1285,15 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
         result["outcome"]["inputs"][0]["receipt_id"],
         second_input["receipt_id"]
     );
+    let second_main = load(&f.state, ROOT_B).await;
+    let hook_context = second_main.messages.last().unwrap();
+    assert_eq!(hook_context.role, Role::System);
+    assert!(hook_context.content.contains("Retained Stop hook context."));
+    let second_answer = answer_after(&second_main, second_input["receipt_id"].as_str().unwrap());
+    assert_eq!(result["outcome"]["final_message"], second_answer);
+    assert!(!result
+        .to_string()
+        .contains("Synthetic original Root finished."));
     assert_eq!(
         router.current_run_id(ROOT_A).await.as_deref(),
         Some(first_run.as_str())
@@ -1112,6 +1311,11 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     })
     .await
     .expect("both native runs release ownership before reopening");
+    let first_answer = answer_after(
+        &load(&f.state, ROOT_A).await,
+        first_input["receipt_id"].as_str().unwrap(),
+    );
+    assert_ne!(first_answer["message_id"], second_answer["message_id"]);
     let successor = run_native_source(&f, "unselected successor", 3).await;
     assert_ne!(successor.1, first_run);
 
@@ -1123,6 +1327,41 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     } = f;
     drop(state);
     let cold = host(home.path(), Arc::new(Probe::default())).await;
+    let next_delivery = json!({"receipt_id":successor.0,"generation":successor.2});
+    for (operation, input, run) in [
+        ("managed-admission-original", &first_input, &first_run),
+        ("managed-admission-successor", &next_delivery, &successor.1),
+    ] {
+        let recovered = invoke_managed_control(
+            &cold,
+            &reference,
+            operation,
+            admission_request(&first, input),
+        )
+        .await;
+        assert_eq!(recovered["status"], "admission_verified");
+        assert_eq!(recovered["admission"]["run_id"], *run);
+        assert_eq!(
+            recovered["admission"]["input"]["receipt_id"],
+            input["receipt_id"]
+        );
+    }
+    let supervisor = load(&cold, &reference.session_id).await;
+    let caller = SessionCallerReference::from(&supervisor);
+    let mut stale_target = first.clone();
+    stale_target.created_at -= chrono::Duration::seconds(1);
+    let exact_receipt = SessionInboxReceipt {
+        id: SessionMessageId::parse(first_input["receipt_id"].as_str().unwrap()).unwrap(),
+        generation: first_input["generation"].as_u64().unwrap(),
+    };
+    let retained_inbox = FileSessionInbox::new(
+        cold.session_store.clone(),
+        bamboo_domain::SessionInboxLimits::default(),
+    );
+    assert!(retained_inbox
+        .read_managed_root_admission(&caller, &reference, &stale_target, &exact_receipt)
+        .await
+        .is_err());
     let recovered = invoke_managed_control(
         &cold,
         &reference,
@@ -1132,7 +1371,16 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     .await;
     assert_eq!(recovered["outcome"]["target_session_id"], ROOT_A);
     assert_eq!(recovered["outcome"]["run_id"], first_run);
+    assert_eq!(recovered["outcome"]["final_message"], first_answer);
     let first_cursor = recovered["outcome"]["sequence"].as_u64().unwrap();
+    let mut next_request = request(first_cursor, second_cursor);
+    next_request["outcome_targets"][0]["expected_run_id"] = json!(successor.1);
+    let next =
+        invoke_managed_control(&cold, &reference, "managed-wait-successor", next_request).await;
+    assert_eq!(next["outcome"]["run_id"], successor.1);
+    let next_answer = answer_after(&load(&cold, ROOT_A).await, &successor.0);
+    assert_ne!(next_answer["message_id"], first_answer["message_id"]);
+    assert_eq!(next["outcome"]["final_message"], next_answer);
     let consumed = invoke_managed_control(
         &cold,
         &reference,
@@ -1146,6 +1394,7 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     let sibling =
         invoke_managed_control(&cold, &reference, "managed-wait-stale-sibling", stale_first).await;
     assert_eq!(sibling["outcome"]["run_id"], second_run);
+    assert_eq!(sibling["outcome"]["final_message"], second_answer);
 
     // Temporarily withhold only the genuine ACK in this isolated fixture.
     // The Main result already exists and the cold Host has no runner signal.
@@ -1162,6 +1411,16 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
     assert_eq!(receipts.len(), 1);
     let parked = home.path().join("parked-ack");
     std::fs::rename(&receipts[0], &parked).unwrap();
+    assert_eq!(
+        invoke_managed_control(
+            &cold,
+            &reference,
+            "managed-admission-pending-ack",
+            admission_request(&second, &second_input),
+        )
+        .await,
+        unconfirmed
+    );
     let pending = invoke_managed_control(
         &cold,
         &reference,
@@ -1175,10 +1434,22 @@ pub(in crate::app_state) async fn exercise_managed_wait_outcomes() {
             .is_err()
     );
     std::fs::rename(&parked, &receipts[0]).unwrap();
-    let verified = tokio::time::timeout(WAIT, pending)
-        .await
-        .expect("restored ACK wakes the wait");
+    let restored_admission = invoke_managed_control(
+        &cold,
+        &reference,
+        "managed-admission-restored-ack",
+        admission_request(&second, &second_input),
+    );
+    // The deadline above can leave the pinned outcome read holding a storage
+    // guard needed by the admission query. Keep polling both after ACK restore.
+    let (verified, restored_admission) =
+        tokio::time::timeout(WAIT, async { tokio::join!(pending, restored_admission) })
+            .await
+            .expect("restored ACK wakes both reads");
+    assert_eq!(restored_admission["status"], "admission_verified");
+    assert_eq!(restored_admission["admission"]["run_id"], second_run);
     assert_eq!(verified["outcome"]["run_id"], second_run);
+    assert_eq!(verified["outcome"]["final_message"], second_answer);
     assert_eq!(
         verified["outcome"]["inputs"][0]["receipt_id"],
         second_input["receipt_id"]
@@ -1333,6 +1604,800 @@ async fn settle_material_notices(f: &Fixture) {
     })
     .await
     .expect("unchanged sources must finish their finite proof I/O");
+}
+
+pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
+    decision: Option<PermissionDecisionKind>,
+    repeat: bool,
+) {
+    use actix_web::{http::StatusCode, test, App};
+    use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
+
+    let f = Fixture::new_with_native_source(true).await;
+    let workspace = f.home.path().join("subscribed-dispatch");
+    std::fs::create_dir(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let workspace = bamboo_config::paths::path_to_display_string(&workspace);
+    let project = f
+        .state
+        .project_store
+        .create_with_project_path("Subscribed dispatch", None, &workspace, Vec::new())
+        .unwrap();
+    let permissions = f.state.permission_checker.permission_config().unwrap();
+    permissions.set_default_session_permission_mode(SessionPermissionMode::Auto);
+    if decision.is_some() {
+        permissions.set_ask_rules(["exec_command".into()]);
+    }
+    permissions
+        .grant_typed_scoped_session_permission(
+            &f.reference.session_id,
+            PermissionType::ExecuteCommand,
+            PermissionMatcher {
+                id: "subscribed-dispatch-create".into(),
+                kind: PermissionMatcherKind::ExactResource,
+                value: format!("session_control create {} {workspace}", project.id),
+            },
+        )
+        .unwrap();
+    let args = json!({
+        "action":"create",
+        "request":{
+            "operation_id":uuid::Uuid::new_v4(),
+            "expected_state_revision":0,
+            "project_id":project.id,
+            "workspace_path":workspace,
+            "title":"Subscribed dispatch",
+            "message":if repeat { SUBSCRIBED_REPEAT_INPUT } else { match decision {
+                Some(PermissionDecisionKind::AllowOnce) => SUBSCRIBED_PERMISSION_INPUT,
+                Some(PermissionDecisionKind::DenyOnce) => SUBSCRIBED_DENY_INPUT,
+                None => SUBSCRIBED_FIRST_INPUT,
+                _ => unreachable!("fixture uses the supported test decisions"),
+            }},
+            "notify_on_material_event":true,
+        }
+    });
+    *f.probe.parent_dispatch.lock().unwrap() = Some(
+        ["dispatch", "dispatch-retry"]
+            .into_iter()
+            .map(|id| ToolCall {
+                id: id.into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "session_control".into(),
+                    arguments: args.to_string(),
+                },
+            })
+            .collect(),
+    );
+    f.state
+        .session_messenger
+        .send(bamboo_domain::SessionMessageEnvelope::user_input(
+            &f.reference.session_id,
+            "Dispatch a subscribed Session and report its eventual result.",
+        ))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, f.probe.source_entered[0].notified())
+        .await
+        .expect("the created Root's first input must reach its provider");
+    drive_material_notices(&f, 2).await;
+    let parent = load(&f.state, &f.reference.session_id).await;
+    let result = |id| {
+        let message = parent
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(id))
+            .expect("native Supervisor creation result");
+        assert_eq!(message.tool_success, Some(true), "{}", message.content);
+        serde_json::from_str::<Value>(&message.content).unwrap()
+    };
+    let created = result("dispatch");
+    let retried = result("dispatch-retry");
+    for key in ["target_session_id", "receipt_id", "generation"] {
+        assert_eq!(created[key], retried[key]);
+    }
+    assert_eq!(created["notify_on_material_event"], true);
+    assert_eq!(retried["replayed"], true);
+    let target = created["target_session_id"].as_str().unwrap();
+    let reference = managed_target(&f.state, &f.reference, target).await;
+    assert_eq!(created["current_user_target"], json!(reference));
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+
+    let app = test::init_service(
+        App::new()
+            .app_data(f.state.clone())
+            .configure(crate::routes::configure_routes),
+    )
+    .await;
+    let session_uri = format!("/api/v1/sessions/{target}");
+    let worker = load(&f.state, target).await;
+    assert_eq!(
+        worker
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .effective_permission_mode(),
+        SessionPermissionMode::Bypass
+    );
+    let read_cards = || async {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/supervisor/default/approvals")
+                .peer_addr("127.0.0.1:8080".parse().unwrap())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        test::read_body_json::<Value, _>(response).await
+    };
+    let decisions_uri = format!("{session_uri}/permission-decisions");
+    let submit = |body: &Value| {
+        test::TestRequest::post()
+            .uri(&decisions_uri)
+            .peer_addr("127.0.0.1:8080".parse().unwrap())
+            .set_json(body)
+            .to_request()
+    };
+
+    f.probe.source_release[0].notify_one();
+    drive_material_notices(&f, 3).await;
+    settle_material_notices(&f).await;
+    let calls = [HANDOFF_PERMISSION_CALL, HANDOFF_SECOND_PERMISSION_CALL];
+    let calls = &calls[..if repeat { 2 } else { 1 }];
+    let expected_calls = if let Some(decision) = decision {
+        let mut previous = None;
+        for (index, &expected_call) in calls.iter().enumerate() {
+            let suspended = tokio::time::timeout(WAIT, async {
+                loop {
+                    let current = load(&f.state, target).await;
+                    if let Some(occurrence) = bamboo_domain::pending_permission_occurrence(&current)
+                        .filter(|occurrence| previous.as_ref() != Some(occurrence))
+                    {
+                        if f.state
+                            .session_activation_router
+                            .current_run_id(target)
+                            .await
+                            .is_none()
+                        {
+                            break (current, occurrence);
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("next typed permission occurrence must park");
+            let (root, occurrence) = suspended;
+            assert_eq!(occurrence.tool_call_id, expected_call);
+            let facts = &root
+                .runtime_metadata
+                .as_ref()
+                .unwrap()
+                .supervised_root_outcomes
+                .as_ref()
+                .unwrap()
+                .facts;
+            let parked = facts.last().unwrap();
+            assert_eq!(
+                parked.result,
+                Some(bamboo_domain::SupervisedRootOutcomeResult::Suspended)
+            );
+            assert_eq!(parked.questions.len(), 1);
+            assert_eq!(parked.resumed_from, (index > 0).then_some(index as u64));
+            let observed = invoke_managed_control(
+                &f.state,
+                &f.reference,
+                "observe-approval",
+                json!({"action":"observe_run", "target_session_id":target, "target_ref":reference}),
+            )
+            .await;
+            assert_eq!(observed["status"], "awaiting_response");
+            assert_eq!(observed["tool_name"], "exec_command");
+            assert_eq!(observed["approval_card"], true);
+            if index == 0 {
+                let parent = load(&f.state, &f.reference.session_id).await;
+                assert!(parent.messages.iter().any(|message| {
+                    message
+                        .content
+                        .starts_with("# Managed Session approval required")
+                        && message.content.contains(observed["link"].as_str().unwrap())
+                        && bamboo_engine::session_app::execute::is_hidden_from_ui(message)
+                }));
+            }
+            let cards = read_cards().await;
+            let [card] = cards["approvals"].as_array().unwrap().as_slice() else {
+                panic!("exactly one managed approval card");
+            };
+            assert_eq!(card["session_id"], target);
+            assert_eq!(card["created_at"], json!(root.created_at));
+            assert_eq!(card["title"], "Subscribed dispatch");
+            assert_eq!(card["workspace_path"], workspace);
+            let pending = &card["pending"];
+            let request = &pending["permission_request"];
+            assert_eq!(request["request_id"], occurrence.tool_call_id);
+            assert_eq!(
+                request["request_generation"],
+                json!(occurrence.permission_generation)
+            );
+            assert_eq!(request["reason_code"], "configured_always_ask");
+            let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
+            assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
+            assert!(request["operation_summary"]
+                .as_str()
+                .unwrap()
+                .contains(command));
+            if index == 0 {
+                let independent = managed_target(&f.state, &f.reference, ROOT_A).await;
+                admit_native_source(
+                    &f,
+                    &independent,
+                    "during-approval",
+                    "Check an independent task.",
+                )
+                .await;
+                settled(&f.state, ROOT_A).await;
+                assert_eq!(
+                    bamboo_domain::pending_permission_occurrence(&load(&f.state, target).await)
+                        .as_ref(),
+                    Some(&occurrence)
+                );
+            }
+            let submission = json!({
+                "request_id": request["request_id"],
+                "request_generation": request["request_generation"],
+                "expected_policy_revision": request["policy_revision"],
+                "decision": decision,
+            });
+            let older_generation = previous
+                .as_ref()
+                .and_then(|occurrence| occurrence.permission_generation.as_deref())
+                .unwrap_or("older-generation");
+            for (field, invalid) in [
+                ("request_generation", json!(older_generation)),
+                (
+                    "expected_policy_revision",
+                    json!(request["policy_revision"].as_u64().unwrap() + 1),
+                ),
+            ] {
+                let mut stale = submission.clone();
+                stale[field] = invalid;
+                let response = test::call_service(&app, submit(&stale)).await;
+                assert_eq!(response.status(), StatusCode::CONFLICT, "{field}");
+            }
+            let response = test::call_service(&app, submit(&submission)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let receipt: Value = test::read_body_json(response).await;
+            assert_eq!(receipt["auto_resume_status"], "started");
+            assert_eq!(receipt["receipt"]["decision"]["decision"], json!(decision));
+            previous = Some(occurrence);
+        }
+        drive_material_notices(&f, 4).await;
+        settle_material_notices(&f).await;
+        assert_eq!(read_cards().await["approvals"], json!([]));
+        4
+    } else {
+        3
+    };
+    let worker = load(&f.state, target).await;
+    if decision == Some(PermissionDecisionKind::AllowOnce) {
+        for &id in calls {
+            let result = worker
+                .messages
+                .iter()
+                .find(|message| message.tool_call_id.as_deref() == Some(id))
+                .expect("approved command result");
+            let result: Value =
+                serde_json::from_str(&result.content).expect("structured exec result");
+            assert_eq!(result["exit_code"], 0);
+            let output = result["output"].as_str().unwrap();
+            assert_eq!(output.lines().next(), Some(workspace.as_str()));
+        }
+    }
+    assert_eq!(
+        worker
+            .agent_runtime_state
+            .as_ref()
+            .unwrap()
+            .effective_permission_mode(),
+        SessionPermissionMode::Bypass,
+    );
+    assert_eq!(
+        f.probe.source_calls.load(Ordering::SeqCst),
+        1 + 2 * usize::from(decision.is_some()) + usize::from(repeat),
+    );
+    let facts = worker
+        .runtime_metadata
+        .as_ref()
+        .unwrap()
+        .supervised_root_outcomes
+        .as_ref()
+        .unwrap();
+    let fact = facts.facts.last().unwrap();
+    if decision.is_some() {
+        assert_eq!(facts.facts.len(), if repeat { 3 } else { 2 });
+        for pair in facts.facts.windows(2) {
+            let [suspended, resumed] = pair else {
+                unreachable!()
+            };
+            assert_ne!(suspended.run_id, resumed.run_id);
+            assert_eq!(resumed.resumed_from, Some(suspended.sequence));
+            assert!(resumed.inputs.is_empty());
+            assert_eq!(suspended.questions.len(), 1);
+        }
+    } else {
+        assert_eq!(facts.facts.len(), 1);
+        assert_eq!(fact.inputs.len(), 1);
+    }
+    let reference = fact.verified_final_message(&worker).unwrap();
+    assert!(worker.messages.iter().any(|message| {
+        message.id == reference.message_id && message.content.ends_with(HANDOFF_TAIL)
+    }));
+    let parent = load(&f.state, &f.reference.session_id).await;
+    let notices: Vec<_> = parent
+        .messages
+        .iter()
+        .filter(|message| {
+            message.content.starts_with("# Managed Session handoff")
+                && message.content.contains("- Recorded outcome: completed\n")
+        })
+        .collect();
+    let [notice] = notices.as_slice() else {
+        panic!("exactly one durable handoff");
+    };
+    assert!(notice.content.contains(HANDOFF_HEAD), "{}", notice.content);
+    assert!(notice.content.contains("dispatch a bounded reproduction"));
+    assert!(notice.content.contains(HANDOFF_EVIDENCE));
+    assert!(notice.content.contains(HANDOFF_RISK));
+    assert!(!notice.content.contains('界'));
+    assert!(bamboo_engine::session_app::execute::is_hidden_from_ui(
+        notice
+    ));
+    assert!(notice.content.contains(&reference.message_id));
+    assert!(notice.content.contains(&fact.run_id));
+    assert!(notice.content.len() < 1_600);
+    assert!(!notice.content.contains(HANDOFF_TAIL));
+    assert!(f.probe.parent_inputs.lock().unwrap()[expected_calls - 1]
+        .iter()
+        .any(|message| message.id == notice.id && message.content == notice.content));
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
+    if decision.is_some() {
+        let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.run_id == fact.run_id)
+            .unwrap();
+        let mut reprojected: bamboo_domain::SessionMessageEnvelope =
+            serde_json::from_value(notice.metadata.as_ref().unwrap()["session_message"].clone())
+                .unwrap();
+        let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) =
+            &mut reprojected.body
+        else {
+            panic!("resumed handoff must be a typed runtime instruction");
+        };
+        assert_eq!(
+            instruction.data.as_ref().unwrap()["final_message"],
+            json!(reference)
+        );
+        assert!(!instruction
+            .content
+            .as_ref()
+            .unwrap()
+            .text
+            .contains(HANDOFF_HEAD));
+        let presentation = instruction.provider_message.as_mut().unwrap();
+        assert!(presentation.content.text.contains(HANDOFF_HEAD));
+        presentation.content = bamboo_domain::SessionMessageContent::text(
+            "Committed result text unavailable after a history change",
+        );
+        let (permanent, _, _) = f
+            .state
+            .observer_subscriptions
+            .inbox
+            .admitted_receipt_for_testing(&reprojected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(permanent.id.as_str(), notice.id);
+        let replayed = f
+            .state
+            .observer_subscriptions
+            .inbox
+            .deliver_managed_root_notification(&selected, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replayed.delivery, permanent);
+        assert!(!replayed.pending);
+        assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
+    }
+    if decision.is_none() {
+        assert_eq!(
+            fact.inputs[0]
+                .supervisor_origin
+                .as_ref()
+                .and_then(|origin| origin.handoff_format()),
+            Some(bamboo_domain::ManagedRootHandoffFormat::PresentationSummary),
+        );
+        let selected = bamboo_orchestration::managed_session::notification_candidates(&worker)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let marker = &notice.metadata.as_ref().unwrap()["session_message"];
+        let mut reprojected: bamboo_domain::SessionMessageEnvelope =
+            serde_json::from_value(marker.clone()).unwrap();
+        let bamboo_domain::SessionMessageBody::RuntimeInstruction(instruction) =
+            &mut reprojected.body
+        else {
+            panic!("subscribed result has a typed runtime instruction");
+        };
+        assert_eq!(
+            instruction.data.as_ref().unwrap()["final_message"],
+            json!(reference)
+        );
+        assert!(!instruction
+            .content
+            .as_ref()
+            .unwrap()
+            .text
+            .contains(HANDOFF_HEAD));
+        assert!(instruction
+            .provider_message
+            .take()
+            .unwrap()
+            .content
+            .text
+            .contains(HANDOFF_HEAD));
+        let (receipt, _, _) = f
+            .state
+            .observer_subscriptions
+            .inbox
+            .admitted_receipt_for_testing(&reprojected)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.id.as_str(), notice.id);
+        let retry = f
+            .state
+            .observer_subscriptions
+            .inbox
+            .deliver_managed_root_notification(&selected, Utc::now())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry.delivery.id.as_str(), notice.id);
+        assert!(!retry.pending);
+        assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), expected_calls);
+
+        permissions
+            .grant_typed_scoped_session_permission(
+                &f.reference.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "subscribed-dispatch-followup".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control followup {target}"),
+                },
+            )
+            .unwrap();
+        let reference = managed_target(&f.state, &f.reference, target).await;
+        let followed = invoke_managed_control(
+            &f.state,
+            &f.reference,
+            "second-subscribed-dispatch",
+            json!({"action":"followup","target_session_id":target,
+                "target_ref":reference, "operation_id":"second-subscribed-dispatch",
+                "message":SUBSCRIBED_FIRST_INPUT,"notify_on_material_event":true}),
+        )
+        .await;
+        assert_eq!(followed["admitted"], true);
+        drive_material_notices(&f, expected_calls + 1).await;
+        settle_material_notices(&f).await;
+        let parent = load(&f.state, &f.reference.session_id).await;
+        let delivery = parent
+            .messages
+            .iter()
+            .rev()
+            .find(|message| {
+                message.content.contains("Worker summary:")
+                    && message.content.contains(HANDOFF_HEAD)
+            })
+            .unwrap();
+        let target = load(&f.state, target).await;
+        let last = target
+            .runtime_metadata
+            .unwrap()
+            .supervised_root_outcomes
+            .unwrap()
+            .facts
+            .pop()
+            .unwrap();
+        assert!(delivery
+            .content
+            .contains(&last.final_message.unwrap().message_id));
+    }
+    f.state.shutdown().await;
+}
+
+pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
+    final_decision: PermissionDecisionKind,
+) {
+    use crate::handlers::agent::respond::{capture_approval_handoff, decide_delegated_approval};
+    use bamboo_orchestration::managed_session::approval_handoff::DELAY;
+    use bamboo_tools::permission::{
+        PermissionMode, PermissionReasonCode, PermissionRequest, PermissionType, RiskLevel,
+    };
+
+    let f = Fixture::new_with_native_source(true).await;
+    let state = &f.state;
+    let now = Utc::now();
+    let parked_at = now - DELAY - chrono::TimeDelta::seconds(1);
+    let snapshot = state.permission_section.snapshot();
+    let mut candidate = snapshot.data.as_ref().clone();
+    candidate.supervisor_approval_handoff_since = Some(parked_at);
+    state
+        .permission_section
+        .commit(snapshot.revision, candidate)
+        .unwrap();
+    let snapshot = state.permission_section.snapshot();
+    let config = state.permission_checker.permission_config().unwrap();
+    config.publish_persistent_policy(snapshot.revision, snapshot.data.as_ref());
+
+    let mut target = load(state, ROOT_A).await;
+    let workspace = state
+        .app_data_dir
+        .join("workspaces")
+        .join("approval-fixture");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let workspace = workspace.canonicalize().unwrap();
+    let workspace_name = bamboo_config::paths::path_to_display_string(&workspace);
+    target.workspace = Some(workspace_name.clone());
+    target.set_workspace_path_meta(workspace_name.clone());
+    config.set_session_workspace(ROOT_A, Some(workspace_name));
+    target
+        .agent_runtime_state
+        .get_or_insert_with(Default::default)
+        .set_permission_mode(SessionPermissionMode::Default);
+    target.set_last_run_status("suspended");
+    let file = workspace.join("handoff-test.txt");
+    let file = bamboo_config::paths::path_to_display_string(&file);
+    let workspace = bamboo_config::paths::path_to_display_string(&workspace);
+    let call = "write-with-handoff";
+    target
+        .metadata
+        .insert("session.origin.v1".into(), "supervisor_created".into());
+    let tool_call = ToolCall {
+        id: call.into(),
+        tool_type: "function".into(),
+        function: FunctionCall {
+            name: "Write".into(),
+            arguments: json!({"file_path":file,"content":"test\n"}).to_string(),
+        },
+    };
+    target.add_message(Message::assistant("", Some(vec![tool_call.clone()])));
+    let request = PermissionRequest {
+        request_id: call.into(),
+        request_generation: "write-handoff-generation".into(),
+        session_id: target.id.clone(),
+        workspace_path: Some(workspace.clone()),
+        tool_name: "Write".into(),
+        permission_type: PermissionType::WriteFile,
+        resource: file.clone(),
+        operation_summary: "Write one file in the workspace".into(),
+        risk_level: RiskLevel::Medium,
+        reason_code: PermissionReasonCode::RiskThreshold,
+        effective_mode: PermissionMode::Default,
+        bypass_requested: false,
+        auto_approve_requested: false,
+        policy_revision: snapshot.revision,
+        matched_rule: None,
+        allowed_decisions: PermissionRequest::forced_decisions(),
+        suggested_matchers: vec![],
+    };
+    let mut parked = Message::tool_result(
+        call,
+        json!({
+            "status":"awaiting_permission_approval",
+            "permission_type":"write_file",
+            "resource": file,
+            "permission_request":request,
+        })
+        .to_string(),
+    );
+    use bamboo_agent_core::tools::{PendingToolOperation, PENDING_TOOL_OPERATION_METADATA_KEY};
+    let operation = PendingToolOperation::capture_with_contract(
+        SessionCallerReference::from(&target),
+        &parked.id,
+        &tool_call,
+        "Write",
+        &request.request_generation,
+        None,
+        true,
+    );
+    parked.metadata = Some(json!({
+        "permission_request": request,
+        (PENDING_TOOL_OPERATION_METADATA_KEY): operation.metadata_value(),
+    }));
+    parked.created_at = parked_at;
+    target.add_message(parked);
+    target.set_pending_question_with_source(
+        call.into(),
+        "Write".into(),
+        "Write the test file?".into(),
+        vec!["Approve".into(), "Deny".into()],
+        false,
+        bamboo_domain::PendingQuestionSource::PauseTool,
+    );
+    state.save_and_cache_session(&mut target).await;
+    let target = load(state, ROOT_A).await;
+    let (handoff, current_request) = capture_approval_handoff(state, &f.reference, &target)
+        .expect("a pending, exact native workspace edit is eligible");
+    assert_eq!(handoff.due_at, parked_at + DELAY);
+    let outside = f.home.path().canonicalize().unwrap().join("outside.txt");
+    let outside = bamboo_config::paths::path_to_display_string(&outside);
+    let mut misleading = current_request.clone();
+    misleading.resource = format!(" {outside}");
+    #[cfg(unix)]
+    std::fs::create_dir_all(
+        std::path::Path::new(&workspace)
+            .join(&misleading.resource)
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        bamboo_orchestration::managed_session::approval_handoff::ApprovalHandoff::capture(
+            &f.reference,
+            &target,
+            &misleading,
+            &json!({"file_path":misleading.resource}),
+            &config,
+            &state.app_data_dir,
+            parked_at,
+        )
+        .is_none(),
+        "the path approved by policy must be the path executed by the native tool"
+    );
+    let mut reparked = target.clone();
+    let tool_result = reparked.messages.last_mut().unwrap();
+    tool_result.metadata.as_mut().unwrap()[bamboo_domain::PERMISSION_REPARKED_AT_KEY] = json!(now);
+    let (fresh, request) = capture_approval_handoff(state, &f.reference, &reparked).unwrap();
+    assert_eq!(fresh.due_at, now + DELAY);
+    assert!(fresh.notice(&f.reference, &request, now).is_none());
+    let mut control = target.clone();
+    let git_dir = std::path::Path::new(&workspace).join(".git");
+    std::fs::create_dir(&git_dir).unwrap();
+    let control_workspace = bamboo_config::paths::path_to_display_string(&git_dir);
+    control.set_workspace_path_meta(control_workspace.clone());
+    let mut control_request = current_request.clone();
+    control_request.workspace_path = Some(control_workspace);
+    control_request.resource =
+        bamboo_config::paths::path_to_display_string(&git_dir.join("config"));
+    assert!(
+        bamboo_orchestration::managed_session::approval_handoff::ApprovalHandoff::capture(
+            &f.reference,
+            &control,
+            &control_request,
+            &json!({"file_path":control_request.resource}),
+            &config,
+            &state.app_data_dir,
+            parked_at,
+        )
+        .is_none()
+    );
+    let caller = SessionCallerReference::from(&load(state, &f.reference.session_id).await);
+    let decision = |kind| {
+        decide_delegated_approval(
+            state.clone(),
+            &f.state.observer_subscriptions.inbox,
+            &caller,
+            ROOT_A.into(),
+            &handoff.reference,
+            kind,
+        )
+    };
+    assert!(decision(PermissionDecisionKind::DenyOnce).await.is_err());
+
+    let mut cursor = None;
+    crate::app_state::approval_handoff::sweep(
+        state,
+        &mut cursor,
+        handoff.due_at - chrono::TimeDelta::seconds(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    config.set_ask_rules(["session_control".into()]);
+    assert!(capture_approval_handoff(state, &f.reference, &target).is_none());
+    crate::app_state::approval_handoff::sweep(state, &mut cursor, now)
+        .await
+        .unwrap();
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 0);
+    config.set_ask_rules(Vec::new());
+    let notice = handoff.notice(&f.reference, &current_request, now).unwrap();
+    state
+        .session_inbox
+        .deliver_runtime_for_target(&notice, caller.created_at)
+        .await
+        .unwrap();
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    crate::app_state::approval_handoff::sweep(state, &mut cursor, now)
+        .await
+        .unwrap();
+    drive_material_notices(&f, 1).await;
+    settle_material_notices(&f).await;
+    // The stable Inbox proof is reused when the sweep restarts.
+    crate::app_state::approval_handoff::sweep(state, &mut None, now)
+        .await
+        .unwrap();
+    settle_material_notices(&f).await;
+    assert_eq!(f.probe.parent_calls.load(Ordering::SeqCst), 1);
+    {
+        let inputs = f.probe.parent_inputs.lock().unwrap();
+        let notice = inputs[0]
+            .iter()
+            .find(|message| message.content.contains(&handoff.reference))
+            .expect("the original Supervisor received the timed review");
+        assert!(notice.content.contains(&file));
+        assert!(bamboo_orchestration::managed_session::is_internal_handoff(
+            notice
+        ));
+        assert!(bamboo_engine::session_app::execute::is_hidden_from_ui(
+            notice
+        ));
+    }
+
+    // Revalidation happens at the decision, even after a due notice exists.
+    config.set_ask_rules(["Write".into()]);
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    config.set_ask_rules([format!(
+        r#"session_control(*"approval_reference":"{}"*)"#,
+        handoff.reference,
+    )]);
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    config.set_ask_rules(Vec::new());
+    assert!(decision(PermissionDecisionKind::AllowGlobal).await.is_err());
+
+    state
+        .approval_runtime
+        .set(Arc::downgrade(&state.clone().into_inner()))
+        .expect("bind the native decision port");
+    let result = invoke_managed_control(
+        state,
+        &f.reference,
+        "timed-decision",
+        json!({"action":"decide_approval", "target_session_id":ROOT_A,
+            "approval_reference":handoff.reference, "decision":final_decision}),
+    )
+    .await;
+    assert_eq!(
+        result["receipt"]["decision"]["decision"],
+        json!(final_decision)
+    );
+    assert!(load(state, ROOT_A).await.pending_question.is_none());
+    assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());
+    if final_decision == PermissionDecisionKind::AllowOnce {
+        assert_eq!(result["auto_resume_status"], "started", "{result}");
+        let completed = settled(state, ROOT_A).await;
+        let tool_result = completed
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id.as_deref() == Some(call))
+            .unwrap();
+        assert_eq!(
+            tool_result.tool_success,
+            Some(true),
+            "{}",
+            tool_result.content
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
+    } else {
+        assert!(!std::path::Path::new(&file).exists());
+    }
+    state.shutdown().await;
 }
 
 pub(in crate::app_state) async fn exercise_material_root_notifications() {

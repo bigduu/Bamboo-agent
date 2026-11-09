@@ -338,7 +338,7 @@ async fn ordinary_local_child_warm_reader_rechecks_source_disabled_policy_and_ca
         let mut ctx = ToolExecutionContext::none(&nested.id);
         ctx.session_id = Some(&child.id);
         assert!(retained
-            .check_permissions_for_resolved(&nested, "SubAgent", &json!({"action":"list"}), &ctx)
+            .check_permissions_for_resolved(&nested, "SubAgent", &json!({"intent":"inspect"}), &ctx)
             .await
             .is_ok());
         for name in ["load_skill", "read_skill_resource"] {

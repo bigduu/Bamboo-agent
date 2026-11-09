@@ -635,11 +635,12 @@ impl AppState {
 
         // Build one creation service before shared tools. Both the generic
         // caller port and Supervisor controls retain this same durable writer.
+        let project_context_source = Arc::new(
+            crate::project_context::ProjectStoreContextSource::new(project_store.clone()),
+        );
         let project_context_resolver = Arc::new(
             bamboo_engine::project_context::ProjectContextResolver::new_with_workspace_resolver(
-                Arc::new(crate::project_context::ProjectStoreContextSource::new(
-                    project_store.clone(),
-                )),
+                project_context_source.clone(),
                 workspace_resolver.clone(),
             ),
         );
@@ -654,6 +655,7 @@ impl AppState {
             messenger: session_messenger.clone(),
             account: account_sink.clone(),
         });
+        tickets.bind_managed_work_host(root_creator.clone(), provider_registry.clone());
         let diagnostics = Arc::new(crate::tools::diagnostics::DiagnosticsSource::default());
         let workflow_workspace_scope_guard =
             Arc::new(crate::workflow::WorkflowWorkspaceScopeGuard::default());
@@ -804,7 +806,15 @@ impl AppState {
         let agent = Arc::new(
             agent_builder
                 .build()
-                .expect("agent runtime should be fully configured"),
+                .expect("agent runtime should be fully configured")
+                .with_managed_work_runtime(
+                    bamboo_engine::ticket_runtime::managed::ManagedWorkRuntime {
+                        service: tickets.managed_work_service(),
+                        inbox: file_session_inbox.clone(),
+                        config: config.clone(),
+                        projects: project_context_source,
+                    },
+                ),
         );
 
         // Only Host-owned Connect and Schedule use the mutable default
@@ -1234,7 +1244,9 @@ impl AppState {
             data_dir.join("browser-profiles"),
         ));
         let fresh_sync = Arc::new(super::fresh_sync::FreshSyncRegistry::default());
+        let approval_runtime = super::approval_handoff::ApprovalRuntime::default();
         let root_run = Arc::new(super::supervised_root_run::SupervisedRootRunController {
+            approval_runtime: approval_runtime.clone(),
             store: session_store.clone(),
             inbox: file_session_inbox.clone(),
             router: session_activation_router.clone(),
@@ -1242,6 +1254,7 @@ impl AppState {
             live_retry: live_retry.clone(),
             fresh_sync: fresh_sync.clone(),
         });
+        tickets.bind_managed_work_runs(root_run.clone());
         let (tools, canonical_subagent_tool) = build_root_tools(
             tools_with_task.clone(),
             schedule_store.clone(),
@@ -1569,6 +1582,7 @@ impl AppState {
             persistence,
             session_inbox,
             observer_subscriptions,
+            approval_runtime,
             session_activation_router,
             session_messenger,
             spawn_scheduler,

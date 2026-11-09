@@ -583,6 +583,22 @@ impl Agent {
         Self::from_runtime(Arc::new(runtime))
     }
 
+    #[doc(hidden)]
+    pub fn with_managed_work_runtime(
+        &self,
+        work: crate::ticket_runtime::managed::ManagedWorkRuntime,
+    ) -> Self {
+        let mut runtime = (*self.runtime).clone();
+        runtime.managed_work = Some(Arc::new(work));
+        Self::from_runtime(Arc::new(runtime))
+    }
+
+    pub(crate) fn managed_work_runtime(
+        &self,
+    ) -> Option<&crate::ticket_runtime::managed::ManagedWorkRuntime> {
+        self.runtime.managed_work.as_deref()
+    }
+
     /// Mark this execution's legacy image fallback as derived by the Host
     /// from configuration. The shared agent and caller-owned runs stay unchanged.
     #[doc(hidden)]

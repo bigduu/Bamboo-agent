@@ -56,13 +56,8 @@ pub fn evaluate_client_sync(
     None
 }
 
-/// Returns true if the message is flagged `metadata.hidden_from_ui == true`.
-///
-/// Such messages are runtime-injected (e.g. child-completion resume, retry
-/// resume, conclusion-with-options resume) and are filtered out of any
-/// client-facing view. Both `GET /history` and the execute sync snapshot
-/// must use this exact predicate so the client and server agree on the
-/// visible message_count and last_message_id.
+/// Internal runtime messages stay in the model transcript. History, live
+/// message publication and execute sync share this presentation predicate.
 pub fn is_hidden_from_ui(message: &Message) -> bool {
     message
         .metadata
@@ -70,6 +65,7 @@ pub fn is_hidden_from_ui(message: &Message) -> bool {
         .and_then(|metadata| metadata.get("hidden_from_ui"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false)
+        || bamboo_orchestration::managed_session::is_internal_handoff(message)
 }
 
 impl ServerExecuteSnapshot {

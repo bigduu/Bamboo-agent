@@ -342,6 +342,21 @@ async fn start_work(
     execution: bamboo_tickets::ExecutionWorkspace,
     allowed_tools: BTreeSet<String>,
 ) -> (String, ProjectId) {
+    Box::pin(start_work_with_sources(
+        state,
+        execution,
+        allowed_tools,
+        BTreeMap::new(),
+    ))
+    .await
+}
+
+async fn start_work_with_sources(
+    state: &crate::AppState,
+    execution: bamboo_tickets::ExecutionWorkspace,
+    allowed_tools: BTreeSet<String>,
+    sources: BTreeMap<String, String>,
+) -> (String, ProjectId) {
     let project = state.project_store.create("Evidence", None).unwrap();
     let project = state
         .project_store
@@ -398,7 +413,7 @@ async fn start_work(
                         workspace_binding: project.workspace_bindings[0].clone(),
                         contract_revision: 1,
                         contract,
-                        sources: BTreeMap::new(),
+                        sources,
                     },
                 },
                 Operation::Ready {
@@ -1310,6 +1325,10 @@ async fn work_review_fixture(reasoning_only: bool) {
     use bamboo_agent_core::tools::{ExecutingSupervisorObservation, ToolOutcome};
     use bamboo_agent_core::ToolExecutionContext;
     use bamboo_domain::{SessionCallerReference, TokenUsage, DEFAULT_SUPERVISOR_SESSION_ID};
+    use bamboo_orchestration::patrol::{
+        evidence::{EvidencePlan, MAX_WORK_PATROL_EVIDENCE_REFS},
+        host::scope_for_assignment,
+    };
     use bamboo_orchestration::work_review::{settle_review, WorkReviewEvidence, WorkReviewUsage};
     use bamboo_tickets::{
         Authority, ExecutionBudgetPurpose, ExecutionTokenUsage, FaultPoint, WorkTokenLimits,
@@ -1329,10 +1348,14 @@ async fn work_review_fixture(reasoning_only: bool) {
         Some(data.join("worktree/native-result.txt")),
     ))
     .await;
-    let (work, project) = Box::pin(start_work(
+    let sources = (0..MAX_WORK_PATROL_EVIDENCE_REFS)
+        .map(|index| (format!("source/{index}"), "pinned-version".into()))
+        .collect();
+    let (work, project) = Box::pin(start_work_with_sources(
         &state,
         workspace(&data),
         BTreeSet::from(["Task".into(), "Write".into()]),
+        sources,
     ))
     .await;
     tokio::time::timeout(WAIT, async {
@@ -1349,6 +1372,13 @@ async fn work_review_fixture(reasoning_only: bool) {
     let assignment_id = snapshot.tickets[&work].active_assignment.as_ref().unwrap();
     let assignment = &snapshot.assignments[assignment_id];
     let receipt = assignment.runtime.as_ref().unwrap();
+    let scope =
+        scope_for_assignment(&service, &runtime, project.as_str(), &work, assignment_id).unwrap();
+    let (commit, snapshot) = service.published().unwrap();
+    assert!(matches!(
+        EvidencePlan::<(), ()>::prepare(&snapshot, &scope, &commit, 0),
+        Err(bamboo_tickets::Error::ContextBudgetExceeded)
+    ));
     let worker = Authority::from_verified_host(
         snapshot.binding.clone(),
         Principal::Worker {

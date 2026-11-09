@@ -7,14 +7,17 @@ description = "Bounded host-authorized Ready Work orchestration over the canonic
 license = "MIT"
 
 [dependencies]
+chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 bamboo-domain = { path = "../../core/bamboo-domain" }
+bamboo-permission = { path = "../../infra/bamboo-permission" }
 bamboo-tickets = { path = "../../infra/bamboo-tickets" }
 async-trait = "0.1"
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 tracing = "0.1"
+url = "2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util", "rt-multi-thread"] }
