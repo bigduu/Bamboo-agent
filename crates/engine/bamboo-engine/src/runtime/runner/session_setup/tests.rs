@@ -375,6 +375,145 @@ async fn session_setup_publishes_current_skill_allowlist_before_tool_execution()
 }
 
 #[tokio::test]
+async fn oversized_workspace_bundles_do_not_block_model_setup() {
+    let directory = tempfile::tempdir().unwrap();
+    let workspace = directory.path().join("workspace");
+    let skills = workspace.join(".bamboo/skills");
+    for id in ["healthy-skill", "oversized-skill", "oversized-workflow"] {
+        let root = skills.join(id);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: Test bundle {id}\n---\nInstructions\n"),
+        )
+        .unwrap();
+        if id != "healthy-skill" {
+            std::fs::create_dir(root.join("scripts")).unwrap();
+            std::fs::File::create(root.join("scripts/large.bin"))
+                .unwrap()
+                .set_len(11_600_174)
+                .unwrap();
+        }
+    }
+    std::fs::write(
+        skills.join("oversized-workflow/workflow.yaml"),
+        "id: oversized-workflow\nname: Test workflow\ndescription: Runs tools\nversion: '1'\ncomposition:\n  type: call\n  tool: read_file\n  args: {}\n",
+    )
+    .unwrap();
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("global-skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.unwrap();
+    for (session_id, selection) in [
+        ("ordinary-chat", None),
+        ("healthy-selection", Some(vec!["healthy-skill".to_string()])),
+    ] {
+        let mut session = Session::new(session_id, "model");
+        session.set_workspace_path_meta(workspace.to_string_lossy());
+        let config = crate::runtime::config::AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            selected_skill_ids: selection,
+            ..Default::default()
+        };
+        let context = super::legacy_instruction::prepare_context(
+            &mut session,
+            "Hello",
+            &config,
+            session_id,
+            &crate::runtime::runner::logging::DebugLogger::new(false),
+            false,
+        )
+        .await
+        .expect("bundle-local failures must not block model setup");
+        if config.selected_skill_ids.is_some() {
+            assert!(context.contains("explicitly selected `healthy-skill`"));
+        }
+        assert!(!context.contains("oversized-skill"));
+        assert!(!context.contains("oversized-workflow"));
+    }
+    let store = manager.store_for_workspace(Some(&workspace)).await.unwrap();
+    for (catalog, id) in [
+        (store.skill_catalog_snapshot().await, "oversized-skill"),
+        (
+            store.workflow_catalog_snapshot().await,
+            "oversized-workflow",
+        ),
+    ] {
+        let entry = catalog.entries.iter().find(|entry| entry.id == id).unwrap();
+        assert_eq!(entry.status, bamboo_skills::WorkflowStatus::Invalid);
+        assert!(entry
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("11600174 > 8388608 bytes"));
+    }
+}
+
+#[tokio::test]
+async fn oversized_replacement_preserves_restorable_legacy_activation() {
+    let directory = tempfile::tempdir().unwrap();
+    let skills = SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    };
+    let root = skills.skills_dir.join("retained-skill");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("SKILL.md"),
+        "---\nname: retained-skill\ndescription: Retained skill\n---\nOriginal instructions\n",
+    )
+    .unwrap();
+    let first = Arc::new(SkillManager::with_config(skills.clone()));
+    first.initialize().await.unwrap();
+    std::fs::File::create(root.join("large.bin"))
+        .unwrap()
+        .set_len(11_600_174)
+        .unwrap();
+
+    let session_id = "restorable-after-oversize";
+    let mut session = Session::new(session_id, "model");
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(first),
+        selected_skill_ids: Some(vec!["retained-skill".to_string()]),
+        ..Default::default()
+    };
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+    let context = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Hello",
+        &config,
+        session_id,
+        &logger,
+        false,
+    )
+    .await
+    .expect("legacy activation uses the last good bundle");
+    assert!(context.contains("explicitly selected `retained-skill`"));
+    record_test_activation_from_pinned_snapshot(&mut session, "retained-skill");
+    drop(config);
+
+    let restarted = Arc::new(SkillManager::with_config(skills));
+    restarted.initialize().await.unwrap();
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(restarted.clone()),
+        ..Default::default()
+    };
+    let context = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Continue",
+        &config,
+        session_id,
+        &logger,
+        true,
+    )
+    .await
+    .expect("restored activation must reach model setup");
+    assert!(context.contains("Explicit Workflow Already Activated"));
+    assert!(restarted.store().activation_was_restored(session_id).await);
+}
+
+#[tokio::test]
 async fn pre_execute_explicit_snapshot_restores_after_restart_without_suspended_runtime() {
     let directory = tempfile::tempdir().expect("tempdir");
     let config = SkillStoreConfig {

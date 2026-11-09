@@ -58,7 +58,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
 use tracing::info;
 
@@ -74,9 +73,9 @@ use crate::progressive::source::{
 use crate::store::builtin::{archive_exact_legacy_materialization, load_builtin_skill_bundles};
 use crate::store::parser::render_skill_markdown;
 use crate::store::storage::{
-    discover_plugin_skill_dirs, ensure_skills_dir, load_captured_records,
-    open_skill_file_no_follow, write_skill_file, FailedSkillRecord, LoadedSkillRecord,
-    SkillDirectorySource, SkillDiscoveryDir,
+    discover_plugin_skill_dirs, ensure_skills_dir, load_captured_records, read_skill_file_bounded,
+    write_skill_file, FailedSkillRecord, LoadedSkillRecord, SkillDirectorySource,
+    SkillDiscoveryDir,
 };
 use crate::types::{
     SkillDefinition, SkillError, SkillFilter, SkillId, SkillResult, SkillStoreConfig,
@@ -175,7 +174,8 @@ impl PreparedSkillInputStore {
         let store = &self.store;
         let _operation = store.retained_budget.selected.operation()?;
         let _publication = store.snapshot_publish_lock.read().await;
-        let catalog = store.skill_catalog.read().await;
+        let skill_catalog = store.skill_catalog.read().await;
+        let catalog = &skill_catalog.snapshot;
         let definitions = store.skills.read().await;
         let bindings = store.instruction_sources.read().await;
         let resources = store.skill_resources.read().await;
@@ -662,118 +662,117 @@ fn stable_workspace_hash(path: &Path) -> u64 {
         })
 }
 
+#[derive(Debug, Clone, Default)]
+struct SkillCatalogPublication {
+    snapshot: WorkflowCatalogSnapshot,
+    legacy_resource_fallbacks: HashSet<SkillId>,
+}
+
+struct PreviousCatalog<'a> {
+    roots: &'a HashMap<SkillId, PathBuf>,
+    definitions: &'a HashMap<SkillId, SkillDefinition>,
+    resources: &'a HashMap<SkillId, SkillResourceSnapshot>,
+    catalog: &'a WorkflowCatalogSnapshot,
+    legacy_resource_fallbacks: &'a HashSet<SkillId>,
+}
+
+impl PreviousCatalog<'_> {
+    fn bundle(
+        &self,
+        entry: &WorkflowCatalogEntry,
+        root: &Path,
+    ) -> Option<(
+        &WorkflowCatalogEntry,
+        &SkillDefinition,
+        &SkillResourceSnapshot,
+    )> {
+        let id = &entry.id;
+        if self.roots.get(id)?.as_path() != root {
+            return None;
+        }
+        let old_entry = self
+            .catalog
+            .entries
+            .iter()
+            .find(|old| old.id == *id && old.source == entry.source)?;
+        Some((
+            old_entry,
+            self.definitions.get(id)?,
+            self.resources.get(id)?,
+        ))
+    }
+}
+
+fn definition_bytes(definition: Option<&SkillDefinition>) -> usize {
+    definition
+        .and_then(|definition| serde_json::to_vec(definition).ok())
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
 async fn snapshot_skill_resources(
-    roots: &HashMap<SkillId, PathBuf>,
-    definitions: &HashMap<SkillId, SkillDefinition>,
-    catalog_entries: &[WorkflowCatalogEntry],
-    previous: &HashMap<SkillId, SkillResourceSnapshot>,
+    roots: &mut HashMap<SkillId, PathBuf>,
+    definitions: &mut HashMap<SkillId, SkillDefinition>,
+    catalog_entries: &mut [WorkflowCatalogEntry],
+    previous: PreviousCatalog<'_>,
     limits: SkillSnapshotLimits,
     captures: &HashMap<SkillId, Arc<CapturedSkill>>,
-) -> SkillResult<HashMap<SkillId, SkillResourceSnapshot>> {
+) -> SkillResult<(HashMap<SkillId, SkillResourceSnapshot>, HashSet<SkillId>)> {
     let mut snapshots = HashMap::with_capacity(roots.len());
+    let mut legacy_resource_fallbacks = HashSet::new();
     let mut publication_bytes = 0usize;
     let mut publication_resource_count = 0usize;
-    for (skill_id, root) in roots {
-        let definition_bytes = definitions
-            .get(skill_id)
-            .and_then(|definition| serde_json::to_vec(definition).ok())
-            .map(|bytes| bytes.len())
-            .unwrap_or(0);
-        let reuses_last_known_good = catalog_entries
-            .iter()
-            .find(|entry| entry.id == *skill_id)
-            .is_some_and(|entry| entry.status == WorkflowStatus::Invalid);
-        if reuses_last_known_good {
-            if let Some(resources) = previous.get(skill_id) {
-                let resource_bytes = resources.values().map(|bytes| bytes.len()).sum::<usize>();
-                let skill_bytes = definition_bytes.saturating_add(resource_bytes);
-                if skill_bytes > limits.max_skill_bytes {
-                    return Err(SkillError::Storage(format!(
-                        "workflow '{skill_id}' snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
-                        limits.max_skill_bytes
-                    )));
+    for entry in catalog_entries {
+        let skill_id = entry.id.clone();
+        let Some(root) = roots.get(&skill_id) else {
+            continue;
+        };
+        let captured = if entry.status == WorkflowStatus::Valid {
+            Some(
+                snapshot_bundle_resources(
+                    root,
+                    definition_bytes(definitions.get(&skill_id)),
+                    limits,
+                    captures.get(&skill_id).map(Arc::as_ref),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let (resources, skill_bytes) = match captured {
+            Some(Ok(snapshot)) => snapshot,
+            rejected => {
+                // An invalid winner still shadows lower-priority sources. Only
+                // the same source's complete last-known-good bundle may be reused.
+                let old_bundle = previous.bundle(entry, root);
+                if let Some(Err(error)) = rejected {
+                    if let Some((old_entry, definition, _)) = old_bundle {
+                        // Preserve legacy admission only when the last publication
+                        // could already admit this exact bundle.
+                        if old_entry.status == WorkflowStatus::Valid
+                            || previous.legacy_resource_fallbacks.contains(&skill_id)
+                        {
+                            legacy_resource_fallbacks.insert(skill_id.clone());
+                        }
+                        let shadowed = std::mem::take(&mut entry.shadowed_candidates);
+                        *entry = old_entry.clone();
+                        entry.shadowed_candidates = shadowed;
+                        definitions.insert(skill_id.clone(), definition.clone());
+                    }
+                    entry.status = WorkflowStatus::Invalid;
+                    entry.last_error = Some(error.to_string());
                 }
-                publication_bytes = publication_bytes.saturating_add(skill_bytes);
-                publication_resource_count =
-                    publication_resource_count.saturating_add(resources.len());
-                if publication_bytes > limits.max_publication_bytes
-                    || publication_resource_count > MAX_WORKFLOW_RESOURCES_PER_PUBLICATION
-                {
-                    return Err(SkillError::Storage(
-                        "workflow catalog publication exceeds snapshot limits".to_string(),
-                    ));
-                }
-                snapshots.insert(skill_id.clone(), resources.clone());
-                continue;
+                let Some((_, definition, resources)) = old_bundle else {
+                    roots.remove(&skill_id);
+                    definitions.remove(&skill_id);
+                    continue;
+                };
+                let bytes = definition_bytes(Some(definition))
+                    .saturating_add(resources.values().map(|bytes| bytes.len()).sum());
+                (resources.clone(), bytes)
             }
-        }
-        let skill_markdown_bytes = tokio::fs::metadata(root.join("SKILL.md"))
-            .await
-            .map(|metadata| metadata.len() as usize)
-            .unwrap_or(0);
-        if skill_markdown_bytes > limits.max_file_bytes {
-            return Err(SkillError::Storage(format!(
-                "workflow '{skill_id}' SKILL.md exceeds per-file limit ({skill_markdown_bytes} > {} bytes)",
-                limits.max_file_bytes
-            )));
-        }
-        let paths = crate::resource_helpers::list_skill_resource_paths_bounded(
-            root,
-            MAX_WORKFLOW_RESOURCES_PER_SKILL,
-            MAX_WORKFLOW_RESOURCE_PATH_BYTES,
-        )?;
-        let mut resources = HashMap::with_capacity(paths.len());
-        let mut resource_bytes = 0usize;
-        for relative_path in paths {
-            if let Some(bytes) = captures
-                .get(skill_id)
-                .and_then(|capture| capture.policies.get(&relative_path))
-            {
-                resource_bytes = resource_bytes.saturating_add(bytes.len());
-                resources.insert(relative_path, bytes.clone());
-                continue;
-            }
-            let resource = root.join(&relative_path);
-            let file_bytes = tokio::fs::metadata(&resource).await?.len() as usize;
-            if file_bytes > limits.max_file_bytes {
-                return Err(SkillError::Storage(format!(
-                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit ({file_bytes} > {} bytes)",
-                    limits.max_file_bytes
-                )));
-            }
-            let file = open_skill_file_no_follow(&resource).await?;
-            let mut bytes = Vec::with_capacity(file_bytes.min(limits.max_file_bytes));
-            file.take(limits.max_file_bytes.saturating_add(1) as u64)
-                .read_to_end(&mut bytes)
-                .await?;
-            if bytes.len() > limits.max_file_bytes {
-                return Err(SkillError::Storage(format!(
-                    "workflow '{skill_id}' resource '{relative_path}' exceeds per-file limit ({} > {} bytes)",
-                    bytes.len(),
-                    limits.max_file_bytes
-                )));
-            }
-            resource_bytes = resource_bytes.saturating_add(bytes.len());
-            let projected_skill_bytes = definition_bytes
-                .saturating_add(skill_markdown_bytes)
-                .saturating_add(resource_bytes);
-            if projected_skill_bytes > limits.max_skill_bytes {
-                return Err(SkillError::Storage(format!(
-                    "workflow '{skill_id}' snapshot exceeds per-skill limit ({projected_skill_bytes} > {} bytes)",
-                    limits.max_skill_bytes
-                )));
-            }
-            resources.insert(relative_path, std::sync::Arc::new(bytes));
-        }
-        let skill_bytes = definition_bytes
-            .saturating_add(skill_markdown_bytes)
-            .saturating_add(resource_bytes);
-        if skill_bytes > limits.max_skill_bytes {
-            return Err(SkillError::Storage(format!(
-                "workflow '{skill_id}' snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
-                limits.max_skill_bytes
-            )));
-        }
+        };
         publication_bytes = publication_bytes.saturating_add(skill_bytes);
         if publication_bytes > limits.max_publication_bytes {
             return Err(SkillError::Storage(format!(
@@ -787,9 +786,68 @@ async fn snapshot_skill_resources(
                 "workflow catalog resource count exceeds limit ({publication_resource_count} > {MAX_WORKFLOW_RESOURCES_PER_PUBLICATION})"
             )));
         }
-        snapshots.insert(skill_id.clone(), std::sync::Arc::new(resources));
+        snapshots.insert(skill_id, resources);
     }
-    Ok(snapshots)
+    Ok((snapshots, legacy_resource_fallbacks))
+}
+
+async fn snapshot_bundle_resources(
+    root: &Path,
+    definition_bytes: usize,
+    limits: SkillSnapshotLimits,
+    capture: Option<&CapturedSkill>,
+) -> SkillResult<(SkillResourceSnapshot, usize)> {
+    let skill_markdown_bytes = tokio::fs::metadata(root.join("SKILL.md"))
+        .await
+        .map(|metadata| metadata.len() as usize)
+        .unwrap_or(0);
+    if skill_markdown_bytes > limits.max_file_bytes {
+        return Err(SkillError::Storage(format!(
+            "SKILL.md exceeds per-file limit ({skill_markdown_bytes} > {} bytes)",
+            limits.max_file_bytes
+        )));
+    }
+    let paths = crate::resource_helpers::list_skill_resource_paths_bounded(
+        root,
+        MAX_WORKFLOW_RESOURCES_PER_SKILL,
+        MAX_WORKFLOW_RESOURCE_PATH_BYTES,
+    )?;
+    let mut resources = HashMap::with_capacity(paths.len());
+    let mut resource_bytes = 0usize;
+    for relative_path in paths {
+        if let Some(bytes) = capture.and_then(|capture| capture.policies.get(&relative_path)) {
+            resource_bytes = resource_bytes.saturating_add(bytes.len());
+            resources.insert(relative_path, bytes.clone());
+            continue;
+        }
+        let bytes = read_skill_file_bounded(
+            &root.join(&relative_path),
+            "resource",
+            limits.max_file_bytes,
+        )
+        .await?;
+        resource_bytes = resource_bytes.saturating_add(bytes.len());
+        let projected_skill_bytes = definition_bytes
+            .saturating_add(skill_markdown_bytes)
+            .saturating_add(resource_bytes);
+        if projected_skill_bytes > limits.max_skill_bytes {
+            return Err(SkillError::Storage(format!(
+                "snapshot exceeds per-skill limit ({projected_skill_bytes} > {} bytes)",
+                limits.max_skill_bytes
+            )));
+        }
+        resources.insert(relative_path, std::sync::Arc::new(bytes));
+    }
+    let skill_bytes = definition_bytes
+        .saturating_add(skill_markdown_bytes)
+        .saturating_add(resource_bytes);
+    if skill_bytes > limits.max_skill_bytes {
+        return Err(SkillError::Storage(format!(
+            "snapshot exceeds per-skill limit ({skill_bytes} > {} bytes)",
+            limits.max_skill_bytes
+        )));
+    }
+    Ok((Arc::new(resources), skill_bytes))
 }
 
 fn skill_metadata_flag(skill: &SkillDefinition, name: &str) -> bool {
@@ -1143,7 +1201,7 @@ pub struct SkillStore {
     /// Activations retain these snapshots after a watcher publishes a newer bundle.
     skill_resources: RwLock<HashMap<SkillId, SkillResourceSnapshot>>,
     /// Policy metadata for prompt/explicit Skill activation only.
-    skill_catalog: RwLock<WorkflowCatalogSnapshot>,
+    skill_catalog: RwLock<SkillCatalogPublication>,
     /// Current valid Instruction source bindings, committed with the catalog.
     instruction_sources: RwLock<HashMap<SkillId, SourceBinding>>,
     #[cfg(test)]
@@ -1418,7 +1476,7 @@ impl SkillStore {
             skills: RwLock::new(HashMap::new()),
             skill_roots: RwLock::new(HashMap::new()),
             skill_resources: RwLock::new(HashMap::new()),
-            skill_catalog: RwLock::new(WorkflowCatalogSnapshot::default()),
+            skill_catalog: RwLock::new(SkillCatalogPublication::default()),
             instruction_sources: RwLock::new(HashMap::new()),
             #[cfg(test)]
             projection_hook: Mutex::new(None),
@@ -1628,12 +1686,12 @@ impl SkillStore {
                 skill_failed,
                 &previous_skills,
                 &previous_roots,
-                &previous_skill_catalog,
+                &previous_skill_catalog.snapshot,
                 revision,
                 Some(&captures),
             )
             .await;
-        let (resolved_workflows, resolved_workflow_roots, mut workflow_entries, _) = self
+        let (mut resolved_workflows, mut resolved_workflow_roots, mut workflow_entries, _) = self
             .resolve_catalog(
                 workflow_loaded,
                 workflow_failed,
@@ -1656,26 +1714,41 @@ impl SkillStore {
         if let Some(hook) = self.source_snapshot_hook.lock().unwrap().take() {
             hook();
         }
-        let mut resolved_resources = snapshot_skill_resources(
-            &resolved_roots,
-            &resolved_skills,
-            &skill_entries,
-            &previous_resources,
+        let (mut resolved_resources, legacy_resource_fallbacks) = snapshot_skill_resources(
+            &mut resolved_roots,
+            &mut resolved_skills,
+            &mut skill_entries,
+            PreviousCatalog {
+                roots: &previous_roots,
+                definitions: &previous_skills,
+                resources: &previous_resources,
+                catalog: &previous_skill_catalog.snapshot,
+                legacy_resource_fallbacks: &previous_skill_catalog.legacy_resource_fallbacks,
+            },
             self.snapshot_limits,
             &winner_captures,
         )
         .await?;
-        let resolved_workflow_resources = snapshot_skill_resources(
-            &resolved_workflow_roots,
-            &resolved_workflows,
-            &workflow_entries,
-            &previous_workflow_resources,
+        let (resolved_workflow_resources, _) = snapshot_skill_resources(
+            &mut resolved_workflow_roots,
+            &mut resolved_workflows,
+            &mut workflow_entries,
+            PreviousCatalog {
+                roots: &previous_workflow_roots,
+                definitions: &previous_workflows,
+                resources: &previous_workflow_resources,
+                catalog: &previous_catalog,
+                legacy_resource_fallbacks: &HashSet::new(),
+            },
             self.snapshot_limits,
             &HashMap::new(),
         )
         .await?;
         let mut resolved_sources = HashMap::new();
         for entry in &mut skill_entries {
+            if entry.status != WorkflowStatus::Valid {
+                continue;
+            }
             let Some(captured) = winner_captures.get(&entry.id) else {
                 continue;
             };
@@ -1708,6 +1781,7 @@ impl SkillStore {
                             resolved_resources.remove(&entry.id);
                         }
                         if let Some(previous) = previous_skill_catalog
+                            .snapshot
                             .entries
                             .iter()
                             .find(|previous| previous.id == entry.id)
@@ -1764,7 +1838,7 @@ impl SkillStore {
         // namespaces across unrelated updates.
         preserve_catalog_entry_revisions(
             &mut skill_entries,
-            &previous_skill_catalog,
+            &previous_skill_catalog.snapshot,
             &skill_definition_changed,
         );
         preserve_catalog_entry_revisions(
@@ -1780,7 +1854,7 @@ impl SkillStore {
             revision,
             entries: workflow_entries,
         };
-        let mut comparable_previous_skill_catalog = previous_skill_catalog.clone();
+        let mut comparable_previous_skill_catalog = previous_skill_catalog.snapshot.clone();
         comparable_previous_skill_catalog.revision = revision;
         let mut comparable_previous = previous_catalog.clone();
         comparable_previous.revision = revision;
@@ -1788,6 +1862,7 @@ impl SkillStore {
             && resolved_roots == previous_roots
             && resolved_resources == previous_resources
             && next_skill_catalog == comparable_previous_skill_catalog
+            && legacy_resource_fallbacks == previous_skill_catalog.legacy_resource_fallbacks
             && resolved_sources == previous_sources
             && resolved_workflows == previous_workflows
             && resolved_workflow_roots == previous_workflow_roots
@@ -1839,7 +1914,10 @@ impl SkillStore {
         *skills_guard = resolved_skills;
         *roots_guard = resolved_roots;
         *resources_guard = resolved_resources;
-        *skill_catalog_guard = next_skill_catalog.clone();
+        *skill_catalog_guard = SkillCatalogPublication {
+            snapshot: next_skill_catalog.clone(),
+            legacy_resource_fallbacks,
+        };
         *sources_guard = resolved_sources;
         *workflows_guard = resolved_workflows;
         *workflow_roots_guard = resolved_workflow_roots;
@@ -1856,7 +1934,7 @@ impl SkillStore {
         drop(skills_guard);
         drop(_snapshot_guard);
         self.publish_catalog_events(
-            &previous_skill_catalog,
+            &previous_skill_catalog.snapshot,
             &next_skill_catalog,
             &skill_definition_changed,
         );
@@ -2157,7 +2235,8 @@ impl SkillStore {
         let store = mode_store.as_deref().unwrap_or(self);
         store.reload().await?;
         let _publication = store.snapshot_publish_lock.read().await;
-        let catalog = store.skill_catalog.read().await;
+        let skill_catalog = store.skill_catalog.read().await;
+        let catalog = &skill_catalog.snapshot;
         let definitions = store.skills.read().await;
         let bindings = store.instruction_sources.read().await;
         let resources = store.skill_resources.read().await;
@@ -2396,7 +2475,7 @@ impl SkillStore {
     /// the public Workflow catalog, but from its independent namespace.
     pub async fn skill_catalog_snapshot(&self) -> WorkflowCatalogSnapshot {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
-        self.skill_catalog.read().await.clone()
+        self.skill_catalog.read().await.snapshot.clone()
     }
 
     #[cfg(test)]
@@ -2441,7 +2520,7 @@ impl SkillStore {
     ) -> (WorkflowCatalogSnapshot, WorkflowCatalogSnapshot) {
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         (
-            self.skill_catalog.read().await.clone(),
+            self.skill_catalog.read().await.snapshot.clone(),
             self.catalog.read().await.clone(),
         )
     }
@@ -2575,7 +2654,16 @@ impl SkillStore {
         skills.sort_by_key(|skill| skill.name.clone());
         let roots = store.skill_roots.read().await.clone();
         let resources = store.skill_resources.read().await.clone();
-        let catalog = store.skill_catalog.read().await.clone();
+        let skill_catalog = store.skill_catalog.read().await;
+        let mut catalog = skill_catalog.snapshot.clone();
+        for entry in &mut catalog.entries {
+            // Keep the live resource diagnostic separate from the previously
+            // admitted identity stored in a restorable legacy activation.
+            if skill_catalog.legacy_resource_fallbacks.contains(&entry.id) {
+                entry.status = WorkflowStatus::Valid;
+                entry.last_error = None;
+            }
+        }
         Ok((skills, roots, resources, catalog))
     }
 
@@ -3977,7 +4065,7 @@ impl SkillStore {
 
         let _snapshot_guard = self.snapshot_publish_lock.read().await;
         let skills = self.skills.read().await;
-        let catalog = self.skill_catalog.read().await.clone();
+        let catalog = self.skill_catalog.read().await.snapshot.clone();
 
         let mut result: Vec<SkillDefinition> = skills
             .values()
@@ -5665,6 +5753,21 @@ Use this skill for testing.
         )
         .await
         .expect("unrelated workflow yaml");
+        let invalid = write_skill(&skills_dir, "invalid-flow", "invalid", "Unavailable")
+            .await
+            .expect("invalid workflow skill");
+        fs::write(
+            invalid.join("workflow.yaml"),
+            orchestration_yaml("invalid-flow", 5),
+        )
+        .await
+        .expect("valid definition with oversized resource");
+        fs::File::create(invalid.join("large.bin"))
+            .await
+            .unwrap()
+            .set_len((super::MAX_WORKFLOW_FILE_BYTES + 1) as u64)
+            .await
+            .unwrap();
         let store = SkillStore::new(SkillStoreConfig {
             skills_dir,
             ..Default::default()
@@ -5672,6 +5775,17 @@ Use this skill for testing.
         store.initialize().await.expect("initialize");
 
         let catalog = store.workflow_catalog_snapshot().await;
+        let invalid = catalog
+            .entries
+            .iter()
+            .find(|entry| entry.id == "invalid-flow")
+            .unwrap();
+        assert_eq!(invalid.status, WorkflowStatus::Invalid);
+        assert!(invalid
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("per-file limit"));
         let entry = catalog
             .entries
             .iter()
@@ -6677,6 +6791,14 @@ Use this skill for testing.
             .pin_current_activation("invalid-new", &ids, None)
             .await
             .expect("pin retained LKG");
+        let pinned = store
+            .export_activation_snapshot("invalid-new")
+            .await
+            .unwrap();
+        assert_eq!(
+            pinned.skills["lkg-demo"].catalog_entry.status,
+            WorkflowStatus::Invalid
+        );
         assert_eq!(
             store
                 .get_pinned_skill_with_root("invalid-new", "lkg-demo")
@@ -6944,7 +7066,7 @@ Use this skill for testing.
     }
 
     #[tokio::test]
-    async fn oversized_reload_keeps_previous_publication_and_retained_budget_is_reusable() {
+    async fn oversized_reload_isolates_bundle_and_preserves_last_known_good_bytes() {
         let directory = tempfile::tempdir().expect("tempdir");
         let skills_dir = directory.path().join("skills");
         let skill_dir = write_skill(&skills_dir, "bounded-bytes", "bounded", "prompt N")
@@ -6978,9 +7100,39 @@ Use this skill for testing.
         fs::write(skill_dir.join("references/value.txt"), vec![b'b'; 129])
             .await
             .expect("oversize resource");
-        let error = store.reload().await.expect_err("oversize reload rejected");
-        assert!(error.to_string().contains("per-file limit"));
-        assert_eq!(store.skill_catalog_snapshot().await, catalog_n);
+        let skills_root = skill_dir.parent().unwrap();
+        write_skill(skills_root, "bounded-bytes", "bounded", "prompt N+1")
+            .await
+            .expect("replacement definition paired with oversized resource");
+        write_skill(skills_root, "healthy", "healthy", "ready")
+            .await
+            .expect("unrelated skill");
+        store.reload().await.expect("publish healthy entries");
+        let invalid = store.skill_catalog_snapshot().await;
+        let invalid_entry = invalid
+            .entries
+            .iter()
+            .find(|entry| entry.id == "bounded-bytes")
+            .unwrap();
+        assert_eq!(invalid_entry.status, WorkflowStatus::Invalid);
+        assert!(invalid_entry
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("per-file limit"));
+        let original = catalog_n
+            .entries
+            .iter()
+            .find(|entry| entry.id == "bounded-bytes")
+            .unwrap();
+        assert_eq!(invalid_entry.content_digest, original.content_digest);
+        assert_eq!(
+            store.get_skill("bounded-bytes").await.unwrap().prompt,
+            "prompt N"
+        );
+        assert_eq!(store.get_skill("healthy").await.unwrap().prompt, "ready");
+        store.reload().await.expect("repeat invalid reload");
+        assert_eq!(store.skill_catalog_snapshot().await, invalid);
         assert_eq!(
             store
                 .get_pinned_skill_with_root("bounded-active", "bounded-bytes")
@@ -6995,7 +7147,7 @@ Use this skill for testing.
         store
             .pin_current_activation("bounded-lkg", &ids, None)
             .await
-            .expect("new activation uses live LKG after failed reload");
+            .expect("new legacy activation uses only the published LKG");
         assert_eq!(
             store
                 .read_pinned_skill_resource(
@@ -7012,6 +7164,10 @@ Use this skill for testing.
             .await
             .expect("bounded resource");
         store.reload().await.expect("recovered publication");
+        assert_eq!(
+            store.get_skill("bounded-bytes").await.unwrap().prompt,
+            "prompt N+1"
+        );
         store
             .pin_current_activation("bounded-reused", &ids, None)
             .await
