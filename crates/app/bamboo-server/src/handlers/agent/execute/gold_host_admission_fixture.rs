@@ -188,3 +188,137 @@ async fn host_execute_explicit_gold_rechecks_managed_session_target() {
     }
     *state.config.write().await = initial;
 }
+
+struct GoalClarificationProvider {
+    needs_user_input: bool,
+    foreground: std::sync::Mutex<Vec<Vec<bamboo_agent_core::Message>>>,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for GoalClarificationProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[bamboo_agent_core::Message],
+        tools: &[bamboo_agent_core::tools::ToolSchema],
+        _: Option<u32>,
+        _: &str,
+    ) -> Result<LLMStream, LLMError> {
+        use bamboo_agent_core::tools::{FunctionCall, ToolCall};
+        use serde_json::json;
+
+        let mut foreground = self.foreground.lock().unwrap();
+        let chunk = if tools
+            .iter()
+            .any(|schema| schema.function.name == "report_gold_evaluation")
+        {
+            let verdict = if foreground.len() > 1 {
+                json!({"decision":"achieved", "confidence":"high", "reasoning":"fixture verified"})
+            } else if self.needs_user_input {
+                json!({"decision":"need_input", "confidence":"high", "reasoning":"only the user has the source file",
+                    "missing_information":["the user-owned source file"]})
+            } else {
+                json!({"decision":"need_input", "confidence":"low", "reasoning":"the user did not choose a test runner",
+                    "next_action":"Ask the user to choose a runner"})
+            };
+            LLMChunk::ToolCalls(vec![ToolCall {
+                id: "goal-clarification-verdict".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "report_gold_evaluation".into(),
+                    arguments: verdict.to_string(),
+                },
+            }])
+        } else {
+            foreground.push(messages.to_vec());
+            LLMChunk::Token(
+                if foreground.len() > 1 {
+                    "Verified with the test runner already configured in the fixture."
+                } else if self.needs_user_input {
+                    "Please supply the source file only you have."
+                } else {
+                    "Which test runner should I use?"
+                }
+                .into(),
+            )
+        };
+        Ok(Box::pin(futures::stream::iter([
+            Ok(chunk),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[actix_web::test]
+async fn host_goal_continues_past_optional_clarification_and_waits_for_required_input() {
+    use serde_json::json;
+
+    for needs_user_input in [false, true] {
+        let provider = Arc::new(GoalClarificationProvider {
+            needs_user_input,
+            foreground: Default::default(),
+        });
+        let (_home, state, _) = state_with_provider(None, provider.clone()).await;
+        state
+            .session_activation_router
+            .set_spawner(Arc::new(ManualHttpOnly))
+            .await;
+        let id = "host-goal-clarification";
+        state
+            .storage
+            .save_session(&owned_http_session(&state, id))
+            .await
+            .unwrap();
+        let app = test::init_service(
+            actix_web::App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+
+        let response = test::call_service(&app, test::TestRequest::post().uri("/api/v1/chat")
+            .set_json(json!({"session_id":id,"model":"test-model","message":"/goal Verify the fixture"})).to_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let chat: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(chat["goal_command"]["should_execute"], true);
+
+        let mut events = state.get_session_event_sender(id).await.subscribe();
+        let response = test::call_service(
+            &app,
+            test::TestRequest::post()
+                .uri(&format!("/api/v1/execute/{id}"))
+                .set_json(json!({"model":"test-model"}))
+                .to_request(),
+        )
+        .await;
+        let status = response.status();
+        let execute: serde_json::Value = test::read_body_json(response).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{execute}");
+        wait_for_owned_terminal(&state, id, execute["run_id"].as_str().unwrap(), &mut events).await;
+
+        let reloaded = state.storage.load_session(id).await.unwrap().unwrap();
+        let goal: serde_json::Value =
+            serde_json::from_str(&reloaded.metadata["goal.state"]).unwrap();
+        let foreground = provider.foreground.lock().unwrap();
+        assert_eq!(foreground.len(), if needs_user_input { 1 } else { 2 });
+        assert!(foreground[0]
+            .iter()
+            .any(|message| message.content.contains("Begin working toward it now.")));
+        assert_eq!(goal["eval_history"][0]["decision"], "need_input");
+        if needs_user_input {
+            assert_eq!(goal["status"], "need_input");
+            assert_eq!(goal["continuation_count"], 0);
+        } else {
+            let nudge = foreground[1]
+                .iter()
+                .find(|message| {
+                    message
+                        .content
+                        .contains("The double-check did not establish that user input is required.")
+                })
+                .expect("the main model receives the continuation");
+            assert!(!nudge.content.contains("Ask the user to choose a runner"));
+            assert_eq!(goal["status"], "complete");
+            assert_eq!(goal["continuation_count"], 1);
+        }
+    }
+}
