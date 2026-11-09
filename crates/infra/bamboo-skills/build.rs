@@ -120,6 +120,13 @@ fn main() -> io::Result<()> {
     // These canonical, crate-local resources also survive `cargo package`.
     // They join the same builtin table and existing permission-aware reader.
     product_manual::embed(&manifest_dir, &out_dir, &mut file)?;
+    for relative in ["skill-curator/SKILL.md", "skill-curator/workflow.yaml"] {
+        println!("cargo:rerun-if-changed=assets/{relative}");
+        writeln!(
+            file,
+            "    ({relative:?}, include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/assets/{relative}\"))),",
+        )?;
+    }
     writeln!(file, "];")?;
     // Preserve the existing public byte-table shape; modes are a companion.
     writeln!(

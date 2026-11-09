@@ -302,7 +302,7 @@ mod tests {
                 assert!(!super::BUILTIN_SKILL_EXECUTABLE_FILES.contains(relative));
                 continue; // Generated metadata is never executable.
             }
-            let source = if relative.starts_with("bamboo-manual/") {
+            let source = if !root.join(relative).is_file() {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join("assets")
                     .join(relative)

@@ -55,6 +55,7 @@ enum WorkflowInvoker {
     Explicit,
     Automatic,
     Schedule,
+    Curator,
 }
 
 /// Server-owned access boundary for workflow runs. Session, workspace trust and
@@ -330,6 +331,23 @@ impl WorkflowRunAccess {
         .await
     }
 
+    pub(crate) async fn start_skill_curator(
+        &self,
+        session_id: &str,
+        args: Value,
+    ) -> Result<WorkflowRunSnapshot, WorkflowRunError> {
+        let definition = skill_curator_definition()?;
+        self.start_for_invoker(
+            session_id,
+            &definition.id,
+            definition.revision,
+            args,
+            None,
+            WorkflowInvoker::Curator,
+        )
+        .await
+    }
+
     pub async fn start_from_tool(
         &self,
         session_id: &str,
@@ -430,7 +448,28 @@ impl WorkflowRunAccess {
                 "instruction workflows must be activated with load_skill".to_string(),
             ));
         }
-        let automatic = invoker != WorkflowInvoker::Explicit;
+        if invoker == WorkflowInvoker::Curator {
+            if context
+                .project_id
+                .as_ref()
+                .map(bamboo_domain::ProjectId::as_str)
+                != args.get("project_id").and_then(Value::as_str)
+                || context.project_id.is_none()
+                || entry.source != bamboo_skills::WorkflowSource::Builtin
+            {
+                return Err(WorkflowRunError::Preflight(
+                    "Workflow authoring project or builtin changed".into(),
+                ));
+            }
+        } else if workflow_id == bamboo_skills::SKILL_CURATOR_ID {
+            return Err(WorkflowRunError::Preflight(
+                "Start Skill Curator from the Workflow authoring panel".into(),
+            ));
+        }
+        let automatic = matches!(
+            invoker,
+            WorkflowInvoker::Automatic | WorkflowInvoker::Schedule
+        );
         if automatic && !context.automatic_opted_in {
             return Err(WorkflowRunError::Preflight(
                 "model-started orchestration requires explicit session opt-in".to_string(),
@@ -453,6 +492,11 @@ impl WorkflowRunAccess {
         let mut definition = bundle.root().cloned().ok_or_else(|| {
             WorkflowRunError::Preflight("pinned workflow root is missing".to_string())
         })?;
+        if invoker == WorkflowInvoker::Curator && definition != skill_curator_definition()? {
+            return Err(WorkflowRunError::Preflight(
+                "Pinned Skill Curator differs from the builtin definition".into(),
+            ));
+        }
         if invoker == WorkflowInvoker::Schedule {
             ensure_scheduled_readonly_workflow(&bundle, &definition)?;
         }
@@ -819,6 +863,11 @@ fn ensure_workflow_cancel_allowed(snapshot: &WorkflowRunSnapshot) -> Result<(), 
     }
 }
 
+pub(crate) fn skill_curator_definition() -> Result<WorkflowRunDefinition, WorkflowRunError> {
+    serde_yaml::from_str(bamboo_skills::SKILL_CURATOR_WORKFLOW)
+        .map_err(|_| WorkflowRunError::Storage("Builtin Skill Curator is invalid".into()))
+}
+
 fn ensure_scheduled_readonly_workflow(
     bundle: &WorkflowDefinitionBundle,
     definition: &WorkflowRunDefinition,
@@ -869,6 +918,11 @@ fn ensure_scheduled_readonly_workflow(
 fn ensure_workflow_restart_as_new_run_allowed(
     snapshot: &WorkflowRunSnapshot,
 ) -> Result<(), WorkflowRunError> {
+    if snapshot.definition.id == bamboo_skills::SKILL_CURATOR_ID {
+        return Err(WorkflowRunError::Preflight(
+            "Create a new proposal from the Workflow authoring panel".into(),
+        ));
+    }
     match (snapshot.status, snapshot.suspension.as_ref()) {
         (WorkflowRunStatus::Suspended, Some(WorkflowSuspensionContext::Recovery { .. })) => Ok(()),
         (status, _) if status.is_terminal() => Err(WorkflowRunError::Terminal),
@@ -902,7 +956,7 @@ fn ensure_completed_prefix_allowed(snapshot: &WorkflowRunSnapshot) -> Result<(),
     Ok(())
 }
 
-fn readonly_workflow_tool(name: &str) -> bool {
+pub(crate) fn readonly_workflow_tool(name: &str) -> bool {
     SAFE_UNTRUSTED_WORKFLOW_TOOLS
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(name))

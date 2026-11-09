@@ -68,6 +68,29 @@ A filesystem save can succeed while a subsequent catalog refresh is unavailable;
 publication error means the caller must GET and reconcile before retrying. It
 is not evidence that the old bytes survived.
 
+## Project teaching
+
+Lotus opens **Teach a workflow** from the current session's Workflow Runs
+panel. A user can describe a new read-only procedure or select an existing
+project-authored definition to revise.
+
+- `POST /sessions/{session_id}/workflow-proposals` accepts `instruction` and
+  an optional `workflow_id` for a revision. The host captures the durable
+  Project and the existing definition, then starts the embedded Skill Curator
+  through the normal Workflow Run engine.
+- `GET /sessions/{session_id}/workflow-proposals/{run_id}` reports run state.
+  A successful run projects a validated draft, a clarification, or an unchanged
+  definition. Drafts include the pinned Project and any previous definition
+  and edit tokens so the client can render a revision comparison.
+- The user's save action calls the existing create or update API with
+  `expected_project_id`. The server checks this against the durable Session
+  assignment under the Session scope lock. Revisions also require the original
+  revision and both digests. The run control remains a separate action.
+
+The curator uses one read-only Agent step with a bounded typed Child report.
+Teaching is explicit in the panel. Its scope is small, project-owned, read-only
+orchestration definitions.
+
 ## Boundaries
 
 - The canonical location is the existing owned Skill bundle, containing generated
@@ -114,7 +137,5 @@ is not evidence that the old bytes survived.
   adopts retained entries or automatically removes them. An uncertain error is
   not proof of crash durability or that the old bytes stayed at their old path.
 
-This API is the first authoring foundation. An Agent-facing mutation tool and a
-minimal creation/editing UI remain separate consumer work; the API alone is not
-an end-to-end natural-language authoring editor. DAG runtime visualization uses
-[the topology contract](WORKFLOW-RUN-TOPOLOGY.md), not definition-file access.
+DAG runtime visualization uses [the topology contract](WORKFLOW-RUN-TOPOLOGY.md)
+to show the plan pinned to a run.
