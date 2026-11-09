@@ -3294,7 +3294,7 @@ async fn supervisor_delegation_first_legacy_selection_refuses_before_setup_side_
 }
 
 #[test]
-fn supervisor_existing_session_first_subagent_schema_preserves_ordinary_contract() {
+fn supervisor_task_routing_subagent_schema_preserves_ordinary_contract() {
     use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
     let config = crate::runtime::config::AgentLoopConfig::default();
     let tools = StaticToolExecutor {
@@ -3310,7 +3310,7 @@ fn supervisor_existing_session_first_subagent_schema_preserves_ordinary_contract
         assert!(schemas[0]
             .function
             .description
-            .contains("existing managed Sessions"));
+            .contains(bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE));
         assert!(schemas[0]
             .function
             .description
@@ -3330,5 +3330,5 @@ fn supervisor_existing_session_first_subagent_schema_preserves_ordinary_contract
     assert!(!ordinary_schemas[0]
         .function
         .description
-        .contains("existing managed Sessions"));
+        .contains(bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE));
 }
