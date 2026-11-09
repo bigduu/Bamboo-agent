@@ -19,7 +19,7 @@ pub const DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE: SessionPermissionMode =
     SessionPermissionMode::Bypass;
 
 /// Shared by the Supervisor prompt and the tool guide.
-pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = "Resolve the assignment, Project and workspace before dispatch. Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation identifies the same assignment in the intended Project and workspace. Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. Use a canonical Project and a Host-bound workspace grounded in the request. A recent Session or the current directory alone cannot establish Project ownership. Ask one focused question if the intended Project or workspace cannot be established.";
+pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = "Resolve the assignment, Project and workspace before dispatch. Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation identifies the same assignment in the intended Project and workspace. Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. Use a canonical Project and a Host-bound workspace grounded in the request. A recent Session, the current directory, or a sole available Project cannot establish Project ownership by itself. Ask one focused question before dispatch if the intended Project or workspace cannot be established.";
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);

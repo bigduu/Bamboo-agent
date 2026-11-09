@@ -236,14 +236,19 @@ fn resolve_catalog_with_activation(
 
     if session.supervisor_incarnation_id().is_some() {
         let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
-        for schema in tool_schemas
-            .iter_mut()
-            .filter(|schema| schema.function.name == "SubAgent")
-        {
-            schema.function.description = format!(
-                "Supervisor: delegate execution to an authorized independent Session. {routing} Use session_history list and bounded inspect to verify a candidate when needed. Use SubAgent only for auxiliary planning, review or verification; keep main execution in the independent Root. If no suitable authorized target or creation route is available, report the actual recoverable blocker. {}",
-                schema.function.description,
-            );
+        for schema in &mut tool_schemas {
+            let description = &mut schema.function.description;
+            match schema.function.name.as_str() {
+                "SubAgent" => {
+                    *description = format!(
+                        "Supervisor: delegate execution to an authorized independent Session. {routing} Use session_history list and bounded inspect to verify a candidate when needed. Use SubAgent only for auxiliary planning, review or verification; keep main execution in the independent Root. If no suitable authorized target or creation route is available, report the actual recoverable blocker. {description}"
+                    );
+                }
+                "session_control" | "session_message" | "spawn_session" => {
+                    *description = format!("{routing} {description}");
+                }
+                _ => {}
+            }
         }
     }
 
@@ -793,7 +798,18 @@ mod live_disabled_tests {
                     let root = schemas.iter().find(|s| s.function.name == "spawn_session");
                     assert!(root.is_some());
                     if let Some(root) = root {
-                        assert_eq!(root.function.description, expected.function.description);
+                        let description = &root.function.description;
+                        if supervisor {
+                            let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
+                            assert_eq!(
+                                description
+                                    .strip_prefix(routing)
+                                    .and_then(|s| s.strip_prefix(' ')),
+                                Some(expected.function.description.as_str()),
+                            );
+                        } else {
+                            assert_eq!(*description, expected.function.description);
+                        }
                         assert_eq!(root.function.parameters, expected.function.parameters);
                     }
                     for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {

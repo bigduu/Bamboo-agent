@@ -142,7 +142,7 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
                 "note":"Formal Work retains its own feature, binding and health checks. Initialize only with the current canonical can_initialize payload; this observation never initializes Work or changes worker permissions."
             },
-            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No Project selection or Session attachment is required. Creation still validates the selected Project and bound workspace, and workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
+            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. Creation still validates the selected Project and bound workspace, and workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
         }).to_string()))
     }
 
