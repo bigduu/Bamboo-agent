@@ -270,9 +270,8 @@ fn completed_batches_can_reuse_a_tool_call_identifier() {
 }
 
 #[test]
-fn incomplete_or_orphan_tools_reject_the_whole_pass_without_mutation() {
+fn orphan_or_mismatched_results_reject_the_whole_pass_without_mutation() {
     for messages in [
-        vec![tool_call("pending", "pending prose", "Read")],
         vec![Message::tool_result("orphan", "orphan payload")],
         vec![
             tool_call("duplicate", "calling", "Read"),
@@ -299,6 +298,44 @@ fn incomplete_or_orphan_tools_reject_the_whole_pass_without_mutation() {
         ));
         assert_eq!(serde_json::to_value(&session).unwrap(), original);
     }
+}
+
+#[test]
+fn unresolved_tools_wait_for_a_new_user_turn_and_no_live_wait() {
+    let mut session = Session::new("message-summary-pending-tool", "test-model");
+    session.add_message(Message::user("original request"));
+    session.add_message(tool_call("pending", "checking", "write_stdin"));
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryPendingToolResults)
+    ));
+
+    let mut resume = Message::user("resume the current turn");
+    resume.metadata = Some(serde_json::json!({"runtime_kind": "retry_resume"}));
+    session.add_message(resume);
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryToolProtocol { .. })
+    ));
+
+    session.add_message(Message::user("new user turn"));
+    let plan = candidate(&session).expect("a later user request supersedes the unanswered call");
+    session.pending_question = Some(bamboo_domain::PendingQuestion {
+        tool_call_id: "pending".into(),
+        tool_name: "write_stdin".into(),
+        question: "May this command continue?".into(),
+        options: vec![],
+        allow_custom: true,
+        source: bamboo_domain::PendingQuestionSource::default(),
+    });
+    assert!(matches!(
+        candidate(&session),
+        Err(CompressionPlanError::MessageSummaryToolProtocol { .. })
+    ));
+    assert!(matches!(
+        finalize_compression_candidate_plan(&session, plan, "summary".into()),
+        Err(CompressionPlanError::CandidateSetChanged)
+    ));
 }
 
 #[test]

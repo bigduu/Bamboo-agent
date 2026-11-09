@@ -9,7 +9,9 @@ use std::{
 use actix_web::{http::StatusCode, test, web, App};
 use bamboo_agent_core::{tools::ToolSchema, Message, Session};
 use bamboo_config::ContextManagementStrategy;
-use bamboo_domain::{CompressionEventKind, CompressionTriggerType, ProviderModelRef};
+use bamboo_domain::{
+    CompressionEventKind, CompressionTriggerType, FunctionCall, ProviderModelRef, ToolCall,
+};
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use serde_json::{json, Value};
 
@@ -168,6 +170,22 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
         ),
     ] {
         let (_home, state, probe, mut before) = fixture(strategy).await;
+        let unanswered_poll = (strategy == ContextManagementStrategy::MessageSummary).then(|| {
+            let poll = Message::assistant(
+                "",
+                Some(vec![ToolCall {
+                    id: "previous-poll".into(),
+                    tool_type: "function".into(),
+                    function: FunctionCall {
+                        name: "write_stdin".into(),
+                        arguments: r#"{"session_id":"previous-shell","chars":""}"#.into(),
+                    },
+                }]),
+            );
+            let id = poll.id.clone();
+            before.messages.insert(2, poll);
+            id
+        });
         before.set_last_run_status(prior_status);
         if prior_status != "completed" {
             before.set_last_run_error("Previous chat diagnostic");
@@ -210,6 +228,14 @@ async fn compact_session_dispatches_every_strategy_and_commits_without_a_chat_tu
                 .find(|message| message.id == original.id)
                 .unwrap();
             assert_eq!(saved.content, original.content);
+            assert_eq!(json!(saved.tool_calls), json!(original.tool_calls));
+            if unanswered_poll.as_deref() == Some(original.id.as_str()) {
+                assert!(saved.compressed);
+                assert_eq!(
+                    saved.compressed_by_event_id.as_deref(),
+                    Some(event.id.as_str())
+                );
+            }
         }
         assert_eq!(
             durable

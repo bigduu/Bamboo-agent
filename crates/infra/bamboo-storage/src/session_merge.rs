@@ -2146,15 +2146,15 @@ impl LockedSessionStore {
     where
         F: FnOnce(&Session) + Send,
     {
-        if staged
-            .compression_events
-            .last()
-            .is_some_and(|event| event.kind == bamboo_domain::CompressionEventKind::MessageSummary)
-        {
-            validate_staged_message_summary_transition(expected_base, staged)?;
-        } else {
-            validate_staged_retrieval_window_transition(expected_base, staged)?;
-        }
+        let archives_unanswered_calls =
+            if staged.compression_events.last().is_some_and(|event| {
+                event.kind == bamboo_domain::CompressionEventKind::MessageSummary
+            }) {
+                validate_staged_message_summary_transition(expected_base, staged)?
+            } else {
+                validate_staged_retrieval_window_transition(expected_base, staged)?;
+                false
+            };
         let _guard = self.acquire_lock(&staged.id).await;
         let latest = self.storage.load_session(&staged.id).await?;
 
@@ -2166,6 +2166,14 @@ impl LockedSessionStore {
                 apply_authoritative_metadata(staged, latest);
                 adopt_fresher_disk_permission_posture(staged, latest);
                 return Ok(RetrievalWindowCheckpointOutcome::Rebased);
+            }
+            if archives_unanswered_calls
+                && bamboo_domain::message_summary_history_recovery_blocked(latest)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "message-summary checkpoint found pending Session work while archiving unanswered calls",
+                ));
             }
 
             ensure_model_context_checkpoint_is_current(staged, latest)?;
@@ -3648,7 +3656,7 @@ fn validate_staged_retrieval_window_transition(
 fn validate_staged_message_summary_transition(
     expected: &Session,
     staged: &Session,
-) -> std::io::Result<()> {
+) -> std::io::Result<bool> {
     use bamboo_domain::{CompressionEventKind, ModelContextResetReason, Role};
 
     if expected.id != staged.id || expected.messages.len() != staged.messages.len() {
@@ -3676,6 +3684,12 @@ fn validate_staged_message_summary_transition(
             "message-summary checkpoint has an invalid archive event",
         ));
     }
+    let archives_unanswered_calls = bamboo_domain::validate_message_summary_tool_protocol(expected)
+        .map_err(|error| {
+            invalid_retrieval_window_checkpoint(format!(
+                "message-summary checkpoint blocked: {error}"
+            ))
+        })?;
     let latest_user_id = expected
         .messages
         .iter()
@@ -3684,8 +3698,6 @@ fn validate_staged_message_summary_transition(
         .map(|message| message.id.as_str());
     let mut canonical = expected.clone();
     let mut newly_archived = 0usize;
-    let mut calls = std::collections::HashSet::new();
-    let mut results = std::collections::HashSet::new();
     for (before, canonical_message) in expected.messages.iter().zip(&mut canonical.messages) {
         if before.compressed {
             continue;
@@ -3701,43 +3713,9 @@ fn validate_staged_message_summary_transition(
         let should_archive = before.role != Role::System
             && Some(before.id.as_str()) != latest_user_id
             && (!before.never_compress || generated_recovery);
-        if has_tool_protocol && (before.never_compress || !should_archive) {
+        if has_tool_protocol && !should_archive {
             return Err(invalid_retrieval_window_checkpoint(
                 "message-summary checkpoint cannot retain active tool protocol",
-            ));
-        }
-        if has_calls {
-            if before.role != Role::Assistant {
-                return Err(invalid_retrieval_window_checkpoint(
-                    "message-summary checkpoint has tool calls outside an assistant message",
-                ));
-            }
-            for call in before.tool_calls.iter().flatten() {
-                if call.id.is_empty() || !calls.insert(call.id.as_str()) {
-                    return Err(invalid_retrieval_window_checkpoint(
-                        "message-summary checkpoint has empty or duplicate tool call identifiers",
-                    ));
-                }
-            }
-        }
-        if before.role == Role::Tool {
-            let id = before
-                .tool_call_id
-                .as_deref()
-                .filter(|id| !id.is_empty())
-                .ok_or_else(|| {
-                    invalid_retrieval_window_checkpoint(
-                        "message-summary checkpoint has an uncorrelated tool result",
-                    )
-                })?;
-            if !results.insert(id) {
-                return Err(invalid_retrieval_window_checkpoint(
-                    "message-summary checkpoint has duplicate tool results",
-                ));
-            }
-        } else if before.tool_call_id.is_some() {
-            return Err(invalid_retrieval_window_checkpoint(
-                "message-summary checkpoint has a tool result identifier outside a tool message",
             ));
         }
         if should_archive {
@@ -3751,9 +3729,9 @@ fn validate_staged_message_summary_transition(
             newly_archived += 1;
         }
     }
-    if calls != results || newly_archived == 0 || event.messages_compressed != newly_archived {
+    if newly_archived == 0 || event.messages_compressed != newly_archived {
         return Err(invalid_retrieval_window_checkpoint(
-            "message-summary checkpoint must archive complete tool chains with an exact event count",
+            "message-summary checkpoint must archive eligible history with an exact event count",
         ));
     }
     if let Some(summary) = staged.conversation_summary.as_ref() {
@@ -3786,7 +3764,7 @@ fn validate_staged_message_summary_transition(
             "message-summary checkpoint changed raw history, protected anchors, or state outside the compression projection and provider reset",
         ));
     }
-    Ok(())
+    Ok(archives_unanswered_calls)
 }
 
 fn retrieval_window_base_matches(expected: &Session, durable: &Session) -> std::io::Result<bool> {
@@ -7265,6 +7243,40 @@ mod tests {
             .all(|message| message.compressed));
         assert_eq!(saved.messages[6].content, "Current user request");
         assert!(!saved.messages[6].compressed);
+    }
+
+    #[tokio::test]
+    async fn message_summary_checkpoint_refuses_a_new_durable_wait_for_an_unanswered_call() {
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let (mut expected, mut staged) = message_summary_fixture("message-summary-new-wait");
+        expected.messages.remove(3);
+        staged.messages.remove(3);
+        staged.compression_events[0].messages_compressed -= 1;
+        staged.conversation_summary.as_mut().unwrap().message_count -= 1;
+
+        let mut durable = expected.clone();
+        durable.pending_question = Some(bamboo_domain::PendingQuestion {
+            tool_call_id: "summary-tool-call".into(),
+            tool_name: "skills_read".into(),
+            question: "May this tool continue?".into(),
+            options: vec![],
+            allow_custom: true,
+            source: bamboo_domain::PendingQuestionSource::default(),
+        });
+        storage.save_session(&durable).await.unwrap();
+
+        let error = store
+            .checkpoint_retrieval_window_and_publish(&expected, &mut staged, |_| {
+                panic!("a blocked archive must not publish")
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        let saved = storage.load_session(&expected.id).await.unwrap().unwrap();
+        assert_eq!(saved.pending_question, durable.pending_question);
+        assert!(saved.compression_events.is_empty());
+        assert!(saved.messages.iter().all(|message| !message.compressed));
     }
 
     #[tokio::test]

@@ -253,10 +253,26 @@ async fn message_summary_waits_for_every_result_in_the_active_batch() {
 #[tokio::test]
 async fn automatic_message_summary_compresses_once_after_the_last_tool_result() {
     use super::super::super::maybe_apply_mid_turn_context_compression;
+    use bamboo_agent_core::Storage;
 
     let mut session = message_summary_session();
     session.force_manual_compression = None;
     let mut calls = session.messages[2].tool_calls.clone().unwrap();
+    let abandoned_poll = Message::assistant(
+        "",
+        Some(vec![ToolCall {
+            id: "abandoned-poll".into(),
+            tool_type: "function".into(),
+            function: FunctionCall {
+                name: "write_stdin".into(),
+                arguments: r#"{"session_id":"previous-shell","chars":""}"#.into(),
+            },
+        }]),
+    );
+    let previous_turn_end = session.messages.len() - 1;
+    session
+        .messages
+        .insert(previous_turn_end, abandoned_poll.clone());
     let mut second = calls[0].clone();
     second.id = "last-call".into();
     calls.push(second);
@@ -272,7 +288,17 @@ async fn automatic_message_summary_compresses_once_after_the_last_tool_result() 
             > budget.compression_trigger_context_tokens()
     );
     let (provider, requests) = prompt_capture_llm();
-    let config = message_summary_config(provider);
+    let mut config = message_summary_config(provider);
+    let directory = tempfile::tempdir().unwrap();
+    let storage = Arc::new(
+        bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+            .await
+            .unwrap(),
+    );
+    storage.save_session(&session).await.unwrap();
+    config.persistence = Some(Arc::new(bamboo_storage::LockedSessionStore::new(
+        storage.clone(),
+    )));
     let llm = noop_llm();
     let (tx, mut rx) = mpsc::channel(32);
 
@@ -343,6 +369,23 @@ async fn automatic_message_summary_compresses_once_after_the_last_tool_result() 
         })
         .collect::<Vec<_>>();
     assert_eq!(statuses, ["started", "completed"]);
+
+    let saved = storage.load_session(&session.id).await.unwrap().unwrap();
+    assert_eq!(saved.compression_events.len(), 1);
+    assert_eq!(saved.compression_events[0].id, applied.id);
+    assert_eq!(saved.messages.len(), session.messages.len());
+    let mut saved_poll = saved.messages[previous_turn_end].clone();
+    assert!(saved_poll.compressed);
+    assert_eq!(
+        saved_poll.compressed_by_event_id.take(),
+        Some(applied.id.clone())
+    );
+    saved_poll.compressed = false;
+    assert_eq!(
+        serde_json::to_value(&saved_poll).unwrap(),
+        serde_json::to_value(&abandoned_poll).unwrap(),
+        "archive the exact historical call without fabricating a result"
+    );
 }
 
 #[tokio::test]
