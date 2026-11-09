@@ -1428,7 +1428,7 @@ async fn handle_goal_command(
     // / set-prompt — not just set-prompt. Otherwise a finished goal's status and
     // its double-check eval history linger in `goal.state` and keep being
     // surfaced to the frontend (and over the history API) after the goal is
-    // turned off or cleared. The suspension reset + clarification turn below are
+    // turned off or cleared. The suspension reset and kickoff turn below are
     // specific to `/goal <prompt>` and stay gated on `should_resume`.
     if let Some(mut session) = state.load_session_merged(session_id).await {
         // Drop ALL `gold.*` runtime snapshot keys by prefix — last_evaluation /
@@ -1452,17 +1452,15 @@ async fn handle_goal_command(
             }
             session.metadata.remove("runtime.suspend_reason");
 
-            // Read the goal text back so we can echo it into the discussion turn.
+            // Read the goal text back for the kickoff turn.
             let goal_text = parse_session_gold_config(new_json.as_deref())
                 .as_ref()
                 .and_then(|cfg| cfg.effective_goal().map(str::to_string))
                 .unwrap_or_default();
 
-            // Inject a runtime instruction that asks the agent to discuss the
-            // goal with the user before executing. The instruction itself is
-            // hidden from the UI; the agent's visible reply IS the discussion.
+            // Kick off work without turning an ordinary ambiguity into a stop.
             let instruction = format!(
-                "The user has set a session goal:\n\n{goal_text}\n\nBefore taking any action, briefly confirm your understanding of this goal, surface any ambiguities or assumptions, and outline how you plan to achieve it. If anything is genuinely unclear or you need a decision from the user, ask them now. Otherwise, state your plan and begin working toward the goal."
+                "The user has set a session goal. Begin working toward it now.\n\n<objective>\n{goal_text}\n</objective>\n\nResolve uncertainty by checking the available context and using reasonable, reversible assumptions. Make progress on any independent steps first. Ask a focused question only when a specific answer from the user is essential to further safe progress. Follow required approval and permission steps."
             );
             let mut resume_msg = bamboo_domain::Message::user(instruction);
             resume_msg.metadata = Some(serde_json::json!({

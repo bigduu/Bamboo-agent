@@ -64,7 +64,7 @@ fn write_skill(root: &std::path::Path, id: &str) {
 }
 
 #[tokio::test]
-async fn catalog_projection_rejects_invalid_lkg_failed_refresh_and_changed_raw_inputs() {
+async fn catalog_projection_excludes_invalid_bundles_and_tracks_changed_raw_inputs() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("skills");
     write_skill(&root, "catalog-source");
@@ -121,7 +121,9 @@ async fn catalog_projection_rejects_invalid_lkg_failed_refresh_and_changed_raw_i
     assert!(store
         .progressive_catalog_for_mode(None, &access("catalog-source"))
         .await
-        .is_err());
+        .unwrap()
+        .entries
+        .is_empty());
     assert!(store.get_skill("catalog-source").await.is_ok());
 }
 
@@ -373,7 +375,7 @@ async fn current_input_final_source_check_denies_raw_physical_auxiliary_and_poli
 }
 
 #[tokio::test]
-async fn current_input_all_selection_validation_denies_lkg_and_rejected_generation() {
+async fn current_input_all_selection_validation_denies_invalid_bundles() {
     let (directory, store, selection, access) = input_store_fixture().await;
     let path = directory.path().join("skills/current-input/SKILL.md");
     std::fs::write(
@@ -407,6 +409,10 @@ async fn current_input_all_selection_validation_denies_lkg_and_rejected_generati
         vec![b'x'; 8 * 1024 * 1024 + 1],
     )
     .unwrap();
-    assert!(store.prepare_current_input_store(None).await.is_err());
+    let prepared = store.prepare_current_input_store(None).await.unwrap();
+    assert!(prepared
+        .with_current_inputs(&access, &[selection], |_| Box::pin(async { Ok(()) }))
+        .await
+        .is_err());
     assert_eq!(store.selected_budget().usage(), (0, 0, 0));
 }
