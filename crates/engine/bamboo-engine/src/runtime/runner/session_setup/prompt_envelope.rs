@@ -946,6 +946,8 @@ fn supervisor_task_routing_policy_keeps_children_auxiliary_and_scope_explicit() 
             .unwrap()
             .content;
         for concept in [
+            "dispatch and report only the requested assignments",
+            "its own fresh Host notification",
             "same assignment",
             "new independent Session for a separate assignment or requested context isolation",
             "intended Project and workspace",

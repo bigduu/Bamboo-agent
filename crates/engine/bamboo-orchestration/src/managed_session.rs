@@ -19,7 +19,18 @@ pub const DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE: SessionPermissionMode =
     SessionPermissionMode::Bypass;
 
 /// Shared by the Supervisor prompt and the tool guide.
-pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = "Resolve the assignment, Project and workspace before dispatch. Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation identifies the same assignment in the intended Project and workspace. Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. Use a canonical Project and a Host-bound workspace grounded in the request. A recent Session, the current directory, or a sole available Project cannot establish Project ownership by itself. Ask one focused question before dispatch if the intended Project or workspace cannot be established.";
+pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
+    "On a new user request, dispatch and report only the requested assignments. ",
+    "Resume or report another assignment only when the user asks or while handling its own fresh Host notification. ",
+    "Conversation history alone does not reactivate old work. ",
+    "Resolve the assignment, Project and workspace before dispatch. ",
+    "Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation ",
+    "identifies the same assignment in the intended Project and workspace. ",
+    "Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. ",
+    "Use a canonical Project and a Host-bound workspace grounded in the request. ",
+    "A recent Session, the current directory, or a sole available Project cannot establish Project ownership by itself. ",
+    "Ask one focused question before dispatch if the intended Project or workspace cannot be established."
+);
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);
 const FIRST_ACK_RECHECK: Duration = Duration::from_millis(250);
