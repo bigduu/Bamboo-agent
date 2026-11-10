@@ -667,7 +667,7 @@ mod tests {
         let first = content_slice(&child, false, Some(&message_id), None, Some(99)).unwrap();
         assert!(first["text"].as_str().unwrap().len() <= 99);
         let initial = initial_message_cursor(&child.id, 0, &child.messages[0]);
-        child.add_message(Message::assistant("Result of a later run"));
+        child.add_message(Message::assistant("Result of a later run", None));
         assert_eq!(
             content_slice(&child, false, None, Some(&initial), Some(99)).unwrap(),
             first,
