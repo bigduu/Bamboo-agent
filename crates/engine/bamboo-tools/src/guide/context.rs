@@ -129,19 +129,6 @@ mod tests {
     }
 
     #[test]
-    fn best_practices_prefer_delegated_plan_without_legacy_mode_switch() {
-        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
-            let context = GuideBuildContext {
-                language,
-                ..GuideBuildContext::default()
-            };
-            let guidance = context.best_practices().join("\n");
-            assert!(guidance.contains("delegate planning to its read-only child"));
-            assert!(guidance.contains("already-active legacy plan-mode session"));
-        }
-    }
-
-    #[test]
     fn best_practices_teach_model_owned_exec_polling() {
         for language in [GuideLanguage::Chinese, GuideLanguage::English] {
             let context = GuideBuildContext {

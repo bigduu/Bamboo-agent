@@ -3401,9 +3401,7 @@ fn selected_root_orchestration_prompt_is_provider_visible_on_start_and_resume_on
         .filter(|message| message.content.contains("context_type: root_orchestration"))
         .collect::<Vec<_>>();
     assert_eq!(first_blocks.len(), 1);
-    assert!(first_blocks[0]
-        .content
-        .contains("delegate a read-only Plan"));
+    assert!(first_blocks[0].content.contains("read-only explorer role"));
     assert!(first_blocks[0]
         .content
         .contains("Inspect authoritative child progress"));

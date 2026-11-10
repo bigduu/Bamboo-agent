@@ -938,24 +938,25 @@ struct TurnOutcome {
 /// per-run `max_subagents` budget.
 const SUBAGENT_TOOL_NAME: &str = "SubAgent";
 
-/// True when `call` creates one new child session.
-///
-/// A `SubAgent` call counts only when its `action` is `"create"`, or when the action is
-/// absent/unparsable (the tool's legacy create default). All other SubAgent
-/// actions manage existing children and do not consume the spawn budget.
+/// Count attempts to create a Child in the legacy and compact SubAgent forms.
 fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
     if call.function.name != SUBAGENT_TOOL_NAME {
         return false;
     }
-    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("action")
-                .and_then(|a| a.as_str())
-                .map(str::to_string)
-        })
-        .is_none_or(|action| action == "create")
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return true;
+    };
+    if let Some(action) = args["action"].as_str() {
+        return action == "create";
+    }
+    match args["intent"].as_str() {
+        Some("inspect" | "wait" | "control" | "ask_parent") => false,
+        Some("chat") | None => {
+            args["target"].as_str().is_none_or(str::is_empty)
+                && args["reply_to"].as_str().is_none_or(str::is_empty)
+        }
+        Some(_) => true,
+    }
 }
 
 /// A per-run resource guardrail that has just tripped: which budget, its
@@ -10905,6 +10906,17 @@ mod tests {
             !is_child_spawn_call(&call("Bash", r#"{"action":"create"}"#)),
             "a differently named tool is never counted, regardless of args"
         );
+        assert!(is_child_spawn_call(&call(
+            "SubAgent",
+            r#"{"message":"Read only","role":"explorer"}"#,
+        )));
+        for args in [
+            r#"{"intent":"inspect","target":"child","message":"result"}"#,
+            r#"{"intent":"wait","target":"child"}"#,
+            r#"{"intent":"chat","target":"child","message":"Continue"}"#,
+        ] {
+            assert!(!is_child_spawn_call(&call("SubAgent", args)), "{args}");
+        }
     }
 
     #[test]

@@ -720,7 +720,8 @@ fn typed_child_resume_message(
     });
     let hint = match (projection["view"].as_str(), projection["available"].as_bool()) {
         (Some("planner_artifact"), Some(true)) => format!(
-            "For the saved Child report, call SubAgent with {inspection} and follow returned cursors. The planner result grants no execution approval."
+            "For the sealed planner report, call SubAgent with intent=inspect, target={} and a JSON message with view=message and cursor set to transcript_cursor above. Follow returned cursors. The planner result grants no execution approval.",
+            completion.child_session_id
         ),
         (Some("planner_artifact"), _) => "The saved planner result is unavailable.".into(),
         _ => format!(

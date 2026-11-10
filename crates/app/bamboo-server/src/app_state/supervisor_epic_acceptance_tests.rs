@@ -317,7 +317,8 @@ impl Probe {
                     "SubAgent",
                     &result_id,
                     json!({
-                        "intent":"inspect", "target":SAVED_PLANNER, "message":"result"
+                        "intent":"inspect", "target":SAVED_PLANNER,
+                        "message":json!({"view":"message", "cursor":reference["transcript_cursor"]}).to_string()
                     }),
                 );
             };
