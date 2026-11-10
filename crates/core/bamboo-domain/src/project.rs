@@ -162,6 +162,13 @@ pub struct ProjectSidebar {
     pub hidden_legacy: bool,
 }
 
+/// A server-verified Section assignment for one lifetime of a Root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSidebarSectionBinding {
+    pub section_id: String,
+    pub root_birth_token: String,
+}
+
 /// Authoritative `${BAMBOO_DATA_DIR}/projects/<id>/project.json`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProjectManifest {
@@ -179,6 +186,9 @@ pub struct ProjectManifest {
     /// null so clients can distinguish support from an older backend.
     #[serde(default)]
     pub sidebar: Option<ProjectSidebar>,
+    /// Root IDs mapped to the lifetimes authorized by the sidebar CAS.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub sidebar_section_bindings: BTreeMap<String, ProjectSidebarSectionBinding>,
     #[serde(default)]
     pub status: ProjectStatus,
     /// Canonical user source/work folder used when an assigned session has no
@@ -221,6 +231,7 @@ impl ProjectManifest {
             description,
             section: None,
             sidebar: None,
+            sidebar_section_bindings: BTreeMap::new(),
             status: ProjectStatus::Active,
             project_path: None,
             project_path_status: ProjectPathStatus::NeedsConfiguration,
@@ -244,6 +255,12 @@ impl ProjectManifest {
 
     pub fn workspace_count(&self) -> usize {
         usize::from(self.project_path.is_some()) + self.workspace_bindings.len()
+    }
+
+    /// Keep the public Project representation free of server-owned bindings.
+    pub fn into_public_view(mut self) -> Self {
+        self.sidebar_section_bindings.clear();
+        self
     }
 }
 

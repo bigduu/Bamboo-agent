@@ -1,15 +1,22 @@
 //! Native Jiandu memory through the public Host entry points.
 
-use actix_web::{test, web, App};
+use actix_web::{
+    body::MessageBody,
+    dev::{Service, ServiceResponse},
+    http::{header, StatusCode},
+    test, web, App,
+};
 use async_trait::async_trait;
 use bamboo_agent_core::tools::ToolSchema;
-use bamboo_domain::{Message, ProjectSidebar, ProjectSidebarSection, Session, WorkspaceBinding};
+use bamboo_domain::{
+    Message, ProjectId, ProjectManifest, ProjectSidebar, ProjectSidebarSection, Session,
+    WorkspaceBinding, DEFAULT_SUPERVISOR_SESSION_ID,
+};
 use bamboo_llm::{LLMError, LLMProvider, LLMStream};
 use bamboo_memory::memory_store::{
     DurableMemoryType, MemoryRetrievalInput, MemoryScope, ProjectMemoryRef,
 };
 use bamboo_memory::memory_store::{MemoryStore, ProjectMemoryRead};
-use bamboo_server::handlers::agent::metrics;
 use bamboo_server::AppState;
 use bamboo_tickets::{
     canonical_bytes, Contract, Error, Operation, Principal, ProjectContextSnapshot, TicketKind,
@@ -42,11 +49,11 @@ impl LLMProvider for NoModelProvider {
     }
 }
 
-#[actix_web::test]
-async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_available() {
-    const FIRST: &str = "section:2d567c47-a081-4a8d-9c9e-246bce470c9f";
-    const SECOND: &str = "section:28f595c0-21dc-4a86-8b83-5f8b258386fa";
+const FIRST: &str = "section:2d567c47-a081-4a8d-9c9e-246bce470c9f";
+const SECOND: &str = "section:28f595c0-21dc-4a86-8b83-5f8b258386fa";
 
+async fn section_memory_fixture() -> (tempfile::TempDir, web::Data<AppState>, Arc<NoModelProvider>)
+{
     let temp = tempfile::tempdir().unwrap();
     let provider = Arc::new(NoModelProvider::default());
     let mut config: bamboo_llm::Config = serde_json::from_value(json!({
@@ -68,6 +75,76 @@ async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_
         .await
         .unwrap(),
     );
+    (temp, state, provider)
+}
+
+fn memory_request(session_id: &str, args: Value) -> actix_http::Request {
+    let parameters: Vec<_> = args
+        .as_object()
+        .unwrap()
+        .iter()
+        .map(|(name, value)| json!({"name":name,"value":value.to_string()}))
+        .collect();
+    test::TestRequest::post()
+        .uri("/v1/tools/execute")
+        .set_json(json!({
+            "tool_name": "memory",
+            "session_id": session_id,
+            "parameters": parameters,
+        }))
+        .to_request()
+}
+
+async fn execute_memory<B: MessageBody>(
+    app: &impl Service<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    request: actix_http::Request,
+) -> Result<Value, String> {
+    let response = test::call_service(app, request).await;
+    let status = response.status();
+    let body = test::read_body(response).await;
+    if !status.is_success() {
+        return Err(String::from_utf8_lossy(&body).into_owned());
+    }
+    let response: Value = serde_json::from_slice(&body).unwrap();
+    let payload: Value = serde_json::from_str(response["result"].as_str().unwrap()).unwrap();
+    let result = payload["result"].as_str().unwrap();
+    if payload["success"] == true {
+        Ok(serde_json::from_str::<Value>(result).unwrap())
+    } else {
+        Err(result.to_owned())
+    }
+}
+
+fn write_memory(scope: &str, content: &str) -> Value {
+    json!({"action":"write","scope":scope,"type":"reference","title":content,"content":content})
+}
+
+async fn patch_at_current_revision<B: MessageBody>(
+    app: &impl Service<actix_http::Request, Response = ServiceResponse<B>, Error = actix_web::Error>,
+    uri: &str,
+    body: Value,
+) -> Value {
+    let current = test::call_service(app, test::TestRequest::get().uri(uri).to_request()).await;
+    assert_eq!(current.status(), StatusCode::OK);
+    let etag = current.headers().get(header::ETAG).unwrap().clone();
+    let response = test::call_service(
+        app,
+        test::TestRequest::patch()
+            .uri(uri)
+            .insert_header((header::IF_MATCH, etag))
+            .set_json(body)
+            .to_request(),
+    )
+    .await;
+    let status = response.status();
+    let body = test::read_body(response).await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    serde_json::from_slice(&body).unwrap()
+}
+
+#[actix_web::test]
+async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_available() {
+    let (_temp, state, provider) = section_memory_fixture().await;
     let projects = &state.project_store;
     let project = projects.create("Section memory fixture", None).unwrap();
     let mut root = Session::new("section-root", "fixture-model");
@@ -108,68 +185,24 @@ async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_
         .unwrap();
 
     let app = test::init_service(
-        App::new().app_data(state.clone()).service(
-            web::scope("/api/v1")
-                .configure(bamboo_server::handlers::tools::config)
-                .route(
-                    "/agent/metrics/memory/summary",
-                    web::get().to(metrics::memory_summary),
-                )
-                .route(
-                    "/agent/metrics/memory/timeline",
-                    web::get().to(metrics::memory_timeline),
-                ),
-        ),
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
     )
     .await;
     for view in ["summary", "timeline"] {
         let response = test::call_service(
             &app,
             test::TestRequest::get()
-                .uri(&format!(
-                    "/api/v1/agent/metrics/memory/{view}?scope=section"
-                ))
+                .uri(&format!("/api/v1/metrics/memory/{view}?scope=section"))
                 .to_request(),
         )
         .await;
-        assert_eq!(response.status(), actix_web::http::StatusCode::BAD_REQUEST);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
-    let execute = |session_id: &str, args: Value| {
-        let parameters: Vec<_> = args
-            .as_object()
-            .unwrap()
-            .iter()
-            .map(|(name, value)| json!({"name":name,"value":value.to_string()}))
-            .collect();
-        let request = test::TestRequest::post()
-            .uri("/api/v1/tools/execute")
-            .set_json(json!({
-                "tool_name": "memory",
-                "session_id": session_id,
-                "parameters": parameters,
-            }))
-            .to_request();
-        let app = &app;
-        async move {
-            let response = test::call_service(app, request).await;
-            let status = response.status();
-            let body = test::read_body(response).await;
-            if !status.is_success() {
-                return Err(String::from_utf8_lossy(&body).into_owned());
-            }
-            let response: Value = serde_json::from_slice(&body).unwrap();
-            let payload: Value =
-                serde_json::from_str(response["result"].as_str().unwrap()).unwrap();
-            let result = payload["result"].as_str().unwrap();
-            if payload["success"] == true {
-                Ok(serde_json::from_str::<Value>(result).unwrap())
-            } else {
-                Err(result.to_owned())
-            }
-        }
-    };
-    let write = |scope: &str, content: &str| json!({"action":"write","scope":scope,"type":"reference","title":content,"content":content});
-    let section = execute(&root.id, write("section", "firstsectionneedle"))
+    let execute =
+        |session_id: &str, args: Value| execute_memory(&app, memory_request(session_id, args));
+    let section = execute(&root.id, write_memory("section", "firstsectionneedle"))
         .await
         .unwrap();
     assert_eq!(section["memory"]["section_id"], FIRST);
@@ -195,16 +228,20 @@ async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_
     .unwrap_err()
     .contains("section_id comes from Bamboo"));
 
-    let shared = execute(&unsectioned.id, write("project", "projectwideneedle"))
-        .await
-        .unwrap();
+    let shared = execute(
+        &unsectioned.id,
+        write_memory("project", "projectwideneedle"),
+    )
+    .await
+    .unwrap();
     assert!(shared["memory"].get("section_id").is_none());
-    assert!(
-        execute(&unsectioned.id, write("section", "unassignedsectionneedle"))
-            .await
-            .unwrap_err()
-            .contains("Keep Section-only context in Session notes")
-    );
+    assert!(execute(
+        &unsectioned.id,
+        write_memory("section", "unassignedsectionneedle")
+    )
+    .await
+    .unwrap_err()
+    .contains("Keep Section-only context in Session notes"));
     assert_eq!(
         execute(&root.id, json!({"action":"query","scope":"project"}))
             .await
@@ -239,7 +276,7 @@ async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_
             .unwrap()["content"],
         "session continuity"
     );
-    let global_fact = execute(&global.id, write("global", "globalneedle"))
+    let global_fact = execute(&global.id, write_memory("global", "globalneedle"))
         .await
         .unwrap();
     let global_hits = execute(
@@ -265,7 +302,7 @@ async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_
         execute(&root.id, lookup.clone()).await.unwrap()["memory"]["body"],
         "firstsectionneedle"
     );
-    let second = execute(&sibling.id, write("section", "secondsectionneedle"))
+    let second = execute(&sibling.id, write_memory("section", "secondsectionneedle"))
         .await
         .unwrap();
     projects
@@ -314,6 +351,153 @@ async fn native_section_memory_follows_server_assignment_and_keeps_other_scopes_
         .unwrap()
         .unwrap();
     assert_eq!(retained.body, "firstsectionneedle");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
+}
+
+#[actix_web::test]
+async fn recreated_supervisor_requires_explicit_section_reassignment() {
+    let (temp, state, provider) = section_memory_fixture().await;
+    let app = test::init_service(
+        App::new()
+            .app_data(state.clone())
+            .configure(bamboo_server::configure_routes),
+    )
+    .await;
+    let create_project = |name: &str| {
+        let workspace = temp.path().join(name);
+        std::fs::create_dir(&workspace).unwrap();
+        let request = test::TestRequest::post()
+            .uri("/api/v1/projects")
+            .set_json(json!({"name":name,"project_path":workspace}))
+            .to_request();
+        let app = &app;
+        async move {
+            let response = test::call_service(app, request).await;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            test::read_body_json::<ProjectManifest, _>(response).await
+        }
+    };
+    let project = create_project("Lifetime fixture").await;
+    let import_project = create_project("Browser import fixture").await;
+    let project_uri = format!("/api/v1/projects/{}", project.id);
+    let supervisor = DEFAULT_SUPERVISOR_SESSION_ID;
+    let session_uri = format!("/api/v1/sessions/{supervisor}");
+    let open_supervisor = || async {
+        let receipt: Value = test::call_and_read_body_json(
+            &app,
+            test::TestRequest::post()
+                .uri("/api/v1/supervisor/default")
+                .peer_addr("127.0.0.1:12345".parse().unwrap())
+                .to_request(),
+        )
+        .await;
+        assert_eq!(receipt["session_id"], supervisor);
+        assert_eq!(receipt["created"], true);
+        receipt["incarnation_id"].clone()
+    };
+    let bind_project =
+        |id: &ProjectId| patch_at_current_revision(&app, &session_uri, json!({"project_id":id}));
+    let mut incarnation = open_supervisor().await;
+    let sidebar = |section_id: Option<&str>, name: &str| ProjectSidebar {
+        sections: vec![ProjectSidebarSection {
+            id: FIRST.into(),
+            name: name.into(),
+        }],
+        session_sections: BTreeMap::from([(supervisor.into(), section_id.map(str::to_owned))]),
+        hidden_legacy: false,
+    };
+    bind_project(&import_project.id).await;
+    let old_browser_snapshot = sidebar(Some(FIRST), "Browser Section");
+    bind_project(&project.id).await;
+    // A Project saved before the Host had birth-bound assignments.
+    state
+        .project_store
+        .update(&project.id, project.revision, |project| {
+            project.sidebar = Some(sidebar(Some(FIRST), "First"));
+            Ok(())
+        })
+        .unwrap();
+    let save_sidebar = |snapshot: ProjectSidebar| {
+        patch_at_current_revision(&app, &project_uri, json!({"sidebar":snapshot}))
+    };
+    let execute = |args: Value| execute_memory(&app, memory_request(supervisor, args));
+    let section = execute(write_memory("section", "Section lifetime fixture"))
+        .await
+        .unwrap();
+    let shared = execute(write_memory("project", "Project lifetime fixture"))
+        .await
+        .unwrap();
+    let get_section = json!({"action":"get","id":section["memory"]["id"]});
+    let get_project = json!({"action":"get","id":shared["memory"]["id"]});
+    let inspect_section = json!({"action":"inspect","scope":"section"});
+
+    // The first deletion leaves an unbound legacy row. The second leaves a
+    // saved binding for an old birth token.
+    for name in ["Renamed", "Renamed again"] {
+        let response = test::call_service(
+            &app,
+            test::TestRequest::delete().uri(&session_uri).to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let replacement = open_supervisor().await;
+        bind_project(&project.id).await;
+        assert_ne!(replacement, incarnation);
+        incarnation = replacement;
+        assert!(execute(get_section.clone())
+            .await
+            .unwrap_err()
+            .contains("memory not found"));
+        save_sidebar(sidebar(Some(FIRST), name)).await;
+        assert!(execute(inspect_section.clone())
+            .await
+            .unwrap_err()
+            .contains("Keep Section-only context in Session notes"));
+        assert_eq!(
+            execute(get_project.clone()).await.unwrap()["memory"]["body"],
+            "Project lifetime fixture",
+        );
+
+        save_sidebar(sidebar(None, name)).await;
+        let reassigned = save_sidebar(sidebar(Some(FIRST), name)).await;
+        assert!(reassigned.get("sidebar_section_bindings").is_none());
+        assert_eq!(
+            execute(get_section.clone()).await.unwrap()["memory"]["body"],
+            "Section lifetime fixture",
+        );
+    }
+    let listed: Value = test::call_and_read_body_json(
+        &app,
+        test::TestRequest::get()
+            .uri("/api/v1/projects")
+            .to_request(),
+    )
+    .await;
+    let entry = listed["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == project.id.as_str())
+        .unwrap();
+    assert!(entry.get("sidebar_section_bindings").is_none());
+    bind_project(&import_project.id).await;
+    assert!(state
+        .project_store
+        .get(&import_project.id)
+        .unwrap()
+        .sidebar
+        .is_none());
+    let imported = patch_at_current_revision(
+        &app,
+        &format!("/api/v1/projects/{}", import_project.id),
+        json!({"import_sidebar":old_browser_snapshot}),
+    )
+    .await;
+    assert_eq!(imported["sidebar"]["session_sections"][supervisor], FIRST);
+    assert!(execute(inspect_section)
+        .await
+        .unwrap_err()
+        .contains("Keep Section-only context in Session notes"));
     assert_eq!(provider.calls.load(Ordering::SeqCst), 0);
 }
 

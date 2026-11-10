@@ -48,7 +48,10 @@ impl MemoryTool {
             }
             current = parent;
         }
-        if current.id != root_id || current.parent_session_id.is_some() || current.spawn_depth != 0
+        if current.id != root_id
+            || current.kind != SessionKind::Root
+            || current.parent_session_id.is_some()
+            || current.spawn_depth != 0
         {
             return None;
         }
@@ -69,6 +72,19 @@ impl MemoryTool {
             .sections
             .iter()
             .find(|section| section.id == section_id)?;
+        let birth_token = current.root_mode_birth_token();
+        let authorized = match project.sidebar_section_bindings.get(&root_id) {
+            Some(binding) => {
+                binding.section_id == section.id && binding.root_birth_token == birth_token
+            }
+            None => storage
+                .first_root_lifetime_matches(&root_id, &birth_token)
+                .await
+                .ok()?,
+        };
+        if !authorized {
+            return None;
+        }
         SectionId::parse(section.id.as_str()).ok()
     }
 }

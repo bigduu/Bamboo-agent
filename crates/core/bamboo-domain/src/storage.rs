@@ -953,6 +953,16 @@ pub trait Storage: Send + Sync {
         self.load_session(session_id).await
     }
 
+    /// Prove a live Root with this birth token has no earlier lifetime.
+    /// Used for legacy Project sidebar assignments saved without a birth token.
+    async fn first_root_lifetime_matches(
+        &self,
+        _session_id: &str,
+        _birth_token: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
+    }
+
     /// Recover an interrupted two-session Task control-plane transaction for
     /// this exact, lexically ordered session pair before either snapshot is
     /// read. Backends without a recovery journal have nothing to do.

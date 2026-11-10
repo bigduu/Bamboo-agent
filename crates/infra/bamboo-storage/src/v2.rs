@@ -8806,6 +8806,26 @@ impl Storage for SessionStoreV2 {
         self.load_runtime_control_plane_unchecked(session_id).await
     }
 
+    async fn first_root_lifetime_matches(
+        &self,
+        session_id: &str,
+        birth_token: &str,
+    ) -> io::Result<bool> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        if self.root_revocation(session_id).await?.is_some() {
+            return Ok(false);
+        }
+        Ok(self
+            .load_runtime_control_plane_unchecked(session_id)
+            .await?
+            .is_some_and(|root| {
+                root.id == session_id
+                    && root.kind == SessionKind::Root
+                    && root.root_mode_birth_token() == birth_token
+            }))
+    }
+
     async fn recover_task_control_plane_transaction(
         &self,
         first_session_id: &str,
