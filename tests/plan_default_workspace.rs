@@ -1,4 +1,4 @@
-//! Metadata-only first chat reaches Plan without an explicit workspace.
+//! A read-only Child inherits the first chat’s metadata-only workspace.
 //! A real compiled worker runs pathless Glob and sends its result to the provider.
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -78,7 +78,11 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
     } else if rendered.contains("Ultra Root thinking mode") {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
-                json!({"tool_calls":[{"index":0,"id":"default-workspace-plan","type":"function","function":{"name":"Plan","arguments":json!({"task":REQUIRED,"title":"Inspect the default workspace"}).to_string()}}]}),
+                json!({"tool_calls":[{"index":0,"id":"default-workspace-plan","type":"function","function":{"name":"SubAgent","arguments":json!({"role":"explorer","message":REQUIRED}).to_string()}}]}),
+                "tool_calls",
+            ),
+            1 => (
+                json!({"tool_calls":[{"index":0,"id":"default-workspace-plan-wait","type":"function","function":{"name":"SubAgent","arguments":json!({"intent":"wait"}).to_string()}}]}),
                 "tool_calls",
             ),
             _ => (
@@ -96,7 +100,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
 }
 
 #[test]
-fn first_chat_metadata_workspace_reaches_plan_and_actual_worker_glob() {
+fn first_chat_metadata_workspace_reaches_explorer_and_actual_worker_glob() {
     // The full debug AppState/route fixture exceeds libtest's default stack.
     // Increase only the host test thread; the real child has its normal stack.
     std::thread::Builder::new()
@@ -156,7 +160,7 @@ async fn run_workspace_fixture() {
         "features":{"provider_model_ref":true},
         "providers":{"openai":{"api_key":"fixture-key","base_url":base_url,"model":"root-test"}},
         "defaults":{"chat":{"provider":"openai","model":"root-test"},
-                    "subagent_models":{"planner":{"provider":"openai","model":"planner-test"}}},
+                    "subagent_models":{"explorer":{"provider":"openai","model":"planner-test"}}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime", "worker_bin":env!("CARGO_BIN_EXE_bamboo"), "worker_args":["subagent-worker"], "fabric_dir":home_path.join("fabric"), "max_concurrent":1}
     });
     std::fs::write(
@@ -171,7 +175,7 @@ async fn run_workspace_fixture() {
     );
     {
         let live = state.config.read().await;
-        let planner = &live.defaults.as_ref().unwrap().subagent_models["planner"];
+        let planner = &live.defaults.as_ref().unwrap().subagent_models["explorer"];
         assert_eq!(planner.model, "planner-test");
         assert_eq!(
             live.subagents().worker_bin.as_deref(),
@@ -255,7 +259,7 @@ async fn run_workspace_fixture() {
         }
     })
     .await
-    .expect("real Plan must wait for the real provider worker");
+    .expect("the Root must wait for the real provider worker");
     assert_eq!(waiting_root.root_thinking_mode(), RootThinkingMode::Ultra);
     let child = state
         .storage
@@ -276,7 +280,7 @@ async fn run_workspace_fixture() {
     );
     assert_eq!(
         probe.root_calls.load(Ordering::SeqCst),
-        1,
+        2,
         "Root has not synthesized an unfinished child"
     );
     probe.release_child.store(true, Ordering::SeqCst);

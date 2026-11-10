@@ -22,7 +22,6 @@ struct ProviderProbe {
     root_calls: AtomicUsize,
     release_child: AtomicBool,
     child_ready: Notify,
-    workspace: Mutex<std::path::PathBuf>,
 }
 
 fn chunk(delta: Value, finish_reason: Option<&str>) -> String {
@@ -56,7 +55,11 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
     } else if rendered.contains("Ultra Root thinking mode") {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
-                json!({"tool_calls":[{"index":0,"id":"ordinary-plan","type":"function","function":{"name":"Plan","arguments":json!({"task":REQUIRED,"title":"Bounded Child effort plan","workspace":probe.workspace.lock().unwrap().clone()}).to_string()}}]}),
+                json!({"tool_calls":[{"index":0,"id":"ordinary-plan","type":"function","function":{"name":"SubAgent","arguments":json!({"role":"explorer","message":REQUIRED}).to_string()}}]}),
+                "tool_calls",
+            ),
+            1 => (
+                json!({"tool_calls":[{"index":0,"id":"ordinary-plan-wait","type":"function","function":{"name":"SubAgent","arguments":json!({"intent":"wait"}).to_string()}}]}),
                 "tool_calls",
             ),
             _ => (
@@ -105,7 +108,6 @@ async fn run_effort_fixture() {
     let _restore_jiandu = RestoreJiandu(old_jiandu);
     std::env::set_var("BAMBOO_JIANDU_DATA_DIR", &jiandu);
     let probe = web::Data::new(ProviderProbe::default());
-    *probe.workspace.lock().unwrap() = home_path.clone();
     let server_probe = probe.clone();
     let server = HttpServer::new(move || {
         App::new()
@@ -131,7 +133,7 @@ async fn run_effort_fixture() {
         "features":{"provider_model_ref":true},
         "providers":{"openai":{"api_key":"fixture-key","base_url":base_url,"model":"root-test"}},
         "defaults":{"chat":{"provider":"openai","model":"root-test","reasoning_effort":"high"},
-                    "subagent_models":{"planner":{"provider":"openai","model":"planner-test","reasoning_effort":"low"}}},
+                    "subagent_models":{"explorer":{"provider":"openai","model":"planner-test","reasoning_effort":"low"}}},
         "subagents":{"runtime":"actor","executor":"bamboo_runtime", "worker_bin":env!("CARGO_BIN_EXE_bamboo"), "worker_args":["subagent-worker"], "fabric_dir":home_path.join("fabric"), "max_concurrent":1}
     });
     std::fs::write(
@@ -146,7 +148,7 @@ async fn run_effort_fixture() {
     );
     {
         let live = state.config.read().await;
-        let planner = &live.defaults.as_ref().unwrap().subagent_models["planner"];
+        let planner = &live.defaults.as_ref().unwrap().subagent_models["explorer"];
         assert_eq!(planner.model, "planner-test");
         assert_eq!(planner.reasoning_effort, Some(ReasoningEffort::Low));
         assert_eq!(
@@ -215,7 +217,7 @@ async fn run_effort_fixture() {
         }
     })
     .await
-    .expect("real Plan must wait for the real provider worker");
+    .expect("the Root must wait for the real provider worker");
     assert_eq!(waiting_root.root_thinking_mode(), RootThinkingMode::Ultra);
     assert_eq!(waiting_root.reasoning_effort, Some(ReasoningEffort::High));
     let child = state
@@ -233,7 +235,7 @@ async fn run_effort_fixture() {
     );
     assert_eq!(
         probe.root_calls.load(Ordering::SeqCst),
-        1,
+        2,
         "Root has not synthesized an unfinished child"
     );
     probe.release_child.store(true, Ordering::SeqCst);
@@ -272,7 +274,7 @@ async fn run_effort_fixture() {
         .iter()
         .filter(|request| request.to_string().contains("Ultra Root thinking mode"))
         .collect();
-    assert!(root_requests.len() >= 2);
+    assert!(root_requests.len() >= 3);
     for request in root_requests {
         assert_eq!(request["reasoning_effort"], "high");
         assert!(request.to_string().contains(REQUIRED));

@@ -49,12 +49,11 @@ aggregates require it to pass. Do not add a second automatic owner for those
 tests.
 Keep the standalone default storage authority families' serial selection in its
 owning shard, reusing its compiled library-test executable without repeating cases.
-Planner's 12 Plan and 10 artifact library cases are excluded from the ordinary
-parallel harness and run once serially using each package's same compiled
-canonical test executable. Preserve each default dependency graph and fail the
-existing feature gate on a missing, repeated or failed case. The independent
-Delegated Planner workflow retains its distinct API-only real CLI and original
-Clippy configurations; it does not repeat these library cases.
+The nine retained Planner artifact and recovery library cases run once
+serially from the canonical engine test executable, outside its ordinary
+parallel harness. Fail the feature gate on a missing, repeated or failed
+case. Retained Planner Analysis owns the original API-only Clippy
+configurations. The retired `Plan` tool's CLI acceptance is historical.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 For root and docs Markdown-only PRs, run Quick Checks and skip product tests;
 Markdown under source packages may be compiled into the application and must

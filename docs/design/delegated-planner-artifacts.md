@@ -1,5 +1,10 @@
 # Delegated Plan: selected context and versioned results
 
+This describes the original `Plan` function and its acceptance. After its
+retirement, saved planner sessions and artifacts retain their normal completion
+and recovery path. The parent can inspect the Child's saved result with
+`SubAgent` using `intent=inspect` and `message=result`.
+
 `Plan` keeps the #1028 read-only Child and existing parent wait. With an explicit
 `context_packet` v1 it uses the already supported fresh local Bamboo worker
 route. Unsupported routes fail before Child persistence. The parent role,

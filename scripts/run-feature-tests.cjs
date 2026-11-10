@@ -19,29 +19,10 @@ const ROOT_BIRTH_CASES = ["root_birth_existing_root_progress_and_scope_reads_rem
   "root_birth_cancel_retains_exclusive_owner_and_pending_proof_stays_closed"];
 // Planner library cases have one canonical default compiler and serial owner.
 const PLANNER_SERIAL = {
-  "bamboo-server-tools": {
-    "target": "bamboo_server_tools",
-    "filter": "plan::tests::",
-    "names": [
-      "plan::tests::actor_runtime_is_required_for_typed_read_only_enforcement",
-      "plan::tests::assignment_forbids_implementation_and_interactive_questions",
-      "plan::tests::invalid_selected_context_never_saves_a_child_or_arms_a_wait",
-      "plan::tests::planner_enqueue_failure_rolls_back_wait_and_deletes_unstarted_child",
-      "plan::tests::planner_wait_is_armed_before_the_child_is_enqueued",
-      "plan::tests::selected_context_uses_canonical_child_binding_without_changing_parent_authority",
-      "plan::tests::suspension_contract_tests::disabled_suspension_blocks_normalized_subagent_launch_and_wait_before_ports",
-      "plan::tests::suspension_contract_tests::disabled_suspension_blocks_plan_before_any_child_port_or_wait",
-      "plan::tests::suspension_contract_tests::disabled_suspension_keeps_subagent_read_and_cancel_authority_paths",
-      "plan::tests::suspension_contract_tests::ordinary_plan_keeps_original_create_wait_enqueue_order",
-      "plan::tests::title_defaults_to_a_bounded_task_summary",
-      "plan::tests::unsupported_selected_context_route_fails_before_persist_without_legacy_fallback"
-    ]
-  },
   "bamboo-engine": {
     "target": "bamboo_engine",
     "filter": "planner_artifact",
     "names": [
-      "runtime::runner::loop_execution::pipeline::tests::planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it",
       "session_app::child_completion_coordinator::tests::planner_artifact_completion_publishes_before_durable_resume_and_deduplicates",
       "session_app::child_completion_coordinator::tests::planner_artifact_real_boot_recovery_keeps_unconfirmed_wait_and_report_private",
       "session_app::child_completion_coordinator::tests::planner_artifact_terminal_sibling_recovery_publishes_the_same_bounded_reference",

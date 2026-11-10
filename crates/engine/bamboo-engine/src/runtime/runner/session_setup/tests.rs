@@ -1869,7 +1869,6 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
             "default::ask_agent",
             "default::deploy_agent",
             "default::cluster",
-            "Plan",
             "exec_command",
             "write_stdin",
             "load_skill",
@@ -1897,7 +1896,6 @@ async fn root_and_child_model_catalogs_use_subagent_without_physical_deployment_
         assert!(!names.contains(hidden), "{hidden}");
     }
     for ordinary in [
-        "Plan",
         "exec_command",
         "write_stdin",
         "load_skill",

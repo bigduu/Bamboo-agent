@@ -82,23 +82,16 @@ pub(crate) fn resolve_tool_schemas_for_round(
     resolve_available_tool_schemas_for_session(config, tools, session)
 }
 
-/// A persisted session already inside the legacy PlanMode state machine keeps
-/// `ExitPlanMode` as its recovery path. New sessions use delegated `Plan` only.
-fn prefer_delegated_plan_tool(
+/// Only an already active legacy Plan Mode session needs its exit handshake.
+fn retain_legacy_plan_exit(
     session: &Session,
     catalog: &mut std::collections::BTreeMap<String, ClassifiedToolSchema>,
 ) {
-    if !catalog.contains_key("Plan") {
-        return;
-    }
-
     let legacy_plan_active = session
         .agent_runtime_state
         .as_ref()
         .is_some_and(|state| state.plan_mode.is_some());
-    if legacy_plan_active {
-        catalog.remove("Plan");
-    } else {
+    if !legacy_plan_active {
         catalog.remove("ExitPlanMode");
     }
 }
@@ -318,7 +311,7 @@ fn resolve_catalog_with_activation(
         })
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
-    prefer_delegated_plan_tool(session, &mut by_execution_name);
+    retain_legacy_plan_exit(session, &mut by_execution_name);
     // Root and Child models delegate through the logical SubAgent facade. Keep the
     // physical broker/deployment tools registered for existing direct callers,
     // but omit their schemas (including namespaced aliases) from every Root/Child
@@ -383,7 +376,7 @@ mod live_disabled_tests {
     }
 
     fn plan_catalog() -> std::collections::BTreeMap<String, ClassifiedToolSchema> {
-        ["Plan", "ExitPlanMode", "Read"]
+        ["ExitPlanMode", "Read"]
             .into_iter()
             .map(schema)
             .filter_map(ClassifiedToolSchema::new)
@@ -392,20 +385,20 @@ mod live_disabled_tests {
     }
 
     #[test]
-    fn delegated_plan_hides_legacy_exit_for_inactive_sessions() {
+    fn legacy_plan_exit_is_hidden_in_inactive_sessions() {
         let session = Session::new("s", "m");
         let mut catalog = plan_catalog();
 
-        prefer_delegated_plan_tool(&session, &mut catalog);
+        retain_legacy_plan_exit(&session, &mut catalog);
 
         assert_eq!(
             catalog.keys().map(String::as_str).collect::<Vec<_>>(),
-            vec!["Plan", "Read"]
+            vec!["Read"]
         );
     }
 
     #[test]
-    fn delegated_plan_preserves_exit_for_an_active_legacy_session() {
+    fn legacy_plan_exit_is_available_in_active_sessions() {
         let mut session = Session::new("s", "m");
         let runtime = session
             .agent_runtime_state
@@ -418,23 +411,12 @@ mod live_disabled_tests {
         });
         let mut catalog = plan_catalog();
 
-        prefer_delegated_plan_tool(&session, &mut catalog);
+        retain_legacy_plan_exit(&session, &mut catalog);
 
         assert_eq!(
             catalog.keys().map(String::as_str).collect::<Vec<_>>(),
             vec!["ExitPlanMode", "Read"]
         );
-    }
-
-    #[test]
-    fn legacy_exit_remains_when_plan_is_not_available() {
-        let session = Session::new("s", "m");
-        let mut catalog = plan_catalog();
-        catalog.remove("Plan");
-
-        prefer_delegated_plan_tool(&session, &mut catalog);
-
-        assert!(catalog.contains_key("ExitPlanMode"));
     }
 
     struct TwoTools;

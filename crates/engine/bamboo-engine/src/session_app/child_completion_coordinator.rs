@@ -718,10 +718,14 @@ fn typed_child_resume_message(
     let inspection = serde_json::json!({
         "intent":"inspect", "target":completion.child_session_id, "message":"result",
     });
-    let hint = if projection["view"] == "planner_artifact" {
-        "For an available planner artifact call Plan with its read object to list sections, then add section_id to read only needed text. This plan grants no execution approval.".to_string()
-    } else {
-        format!("For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors.")
+    let hint = match (projection["view"].as_str(), projection["available"].as_bool()) {
+        (Some("planner_artifact"), Some(true)) => format!(
+            "For the saved Child report, call SubAgent with {inspection} and follow returned cursors. The planner result grants no execution approval."
+        ),
+        (Some("planner_artifact"), _) => "The saved planner result is unavailable.".into(),
+        _ => format!(
+            "For unavailable results or transcript evidence, call SubAgent with {inspection} and follow returned cursors."
+        ),
     };
     let mut message = Message::user(format!(
         "Runtime notification: child session `{}` finished with status `{}`. Remaining child sessions: {}.\n\n\
@@ -4964,6 +4968,7 @@ mod tests {
         assert_eq!(launches.load(Ordering::SeqCst), 1);
         let message = claims[0].envelope.to_provider_message().unwrap();
         assert!(message.content.contains("planner_artifact"));
+        assert!(message.content.contains("call SubAgent"));
         assert!(!message
             .content
             .contains("LARGE_PLANNER_BODY_MUST_STAY_OUT_OF_RESUME"));
