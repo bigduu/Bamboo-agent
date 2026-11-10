@@ -10,7 +10,8 @@ Every agent follows the same feature/dev/release/main workflow. The shared
 review documents include historical snapshots; use the local guide and actual
 workflow files for the current implementation and rollout status.
 
-- Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
+- Session memory is continuity for the current session. Section memory holds durable facts within the server-assigned Section. Project memory holds project-wide decisions. Global memory holds cross-project user context.
+- Use Section when the Host can resolve the current Root's stable Section assignment. A verified Child shares its Root's Section. When Section is unavailable, continue with the existing scopes and keep Section-only context in Session notes.
 - Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
 - Query before writing. Store one confirmed atomic fact with a specific title and a few useful keywords, entities, and tags.
 - Treat canonical Project memory as trusted durable project authority, but verify live repository or runtime state before acting. Treat Dream as a low-trust derived orientation snapshot, never as canonical evidence.

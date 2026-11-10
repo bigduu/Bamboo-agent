@@ -332,14 +332,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "memory" => Some(guide(
             "memory",
             ToolCategory::TaskManagement,
-            "Use Session memory for current-session continuity, Project memory for durable project facts and decisions, and Global memory for cross-project user context. Recall with a short lexical query, use Jiandu's compact default top three IDs and summaries, then get only the selected item that needs full context. Query before writing; store one confirmed atomic fact with a few useful keywords, entities, and tags.",
+            "Use Session memory for current-session continuity, Section memory for facts shared within the current server-assigned Section, Project memory for project-wide facts and decisions, and Global memory for cross-project user context. Without Section context, keep Section-only facts in Session notes and use the other scopes for facts that apply to them. Recall with a short lexical query, use Jiandu's compact default top three IDs and summaries, then get only the selected item that needs full context. Query before writing and store one confirmed atomic fact with a few useful keywords, entities, and tags.",
             "Do not store secrets, unverified claims, live state that you can inspect directly, embeddings, or unrelated facts in one memory. Treat canonical Project memory as trusted durable project authority but verify live state before acting; treat Dream as a low-trust derived orientation snapshot. Do not increase the query limit or get every hit by default, and merge or consolidate only the same confirmed fact.",
             &["session_note", "session_history_current", "Task"],
             vec![
                 example(
                     "Read the current session note topic",
                     json!({"action":"session_read","topic":"default","options":{"max_chars":4000}}),
-                    "Use for continuity state inside the current session without touching durable project/global memory.",
+                    "Use for continuity state inside the current session.",
                 ),
                 example(
                     "Shortlist durable memories before reading full content",

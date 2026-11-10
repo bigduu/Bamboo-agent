@@ -14,8 +14,8 @@ use std::path::Path;
 use actix_web::{http::StatusCode, web, HttpRequest, HttpResponse, Result};
 use bamboo_agent_core::AgentEvent;
 use bamboo_domain::{
-    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar, ProjectStatus,
-    SessionKind, WorkspaceBinding,
+    LegacySessionProjectInput, ProjectId, ProjectManifest, ProjectSidebar,
+    ProjectSidebarSectionBinding, ProjectStatus, SessionKind, WorkspaceBinding,
 };
 use bamboo_projects::{
     canonicalize_workspace_path, plan_legacy_migration, resolve_git_common_dir, ProjectStoreError,
@@ -137,7 +137,7 @@ fn apply_sidebar_snapshot(
     project: &mut ProjectManifest,
     requested: Option<&ProjectSidebar>,
     importing: bool,
-    valid_roots: &HashSet<String>,
+    valid_roots: &BTreeMap<String, Option<String>>,
 ) -> bamboo_projects::ProjectStoreResult<()> {
     if importing && project.sidebar.is_some() {
         return Err(ProjectStoreError::Validation(
@@ -171,7 +171,7 @@ fn apply_sidebar_snapshot(
         }
         sidebar
             .session_sections
-            .retain(|id, _| valid_roots.contains(id));
+            .retain(|id, _| valid_roots.contains_key(id));
     } else if requested.is_some() {
         for (id, target) in &sidebar.session_sections {
             let old = previous.and_then(|previous| previous.session_sections.get(id));
@@ -180,7 +180,7 @@ fn apply_sidebar_snapshot(
             if old == Some(target) || (target.is_none() && old.is_some()) {
                 continue;
             }
-            if !valid_roots.contains(id) {
+            if !valid_roots.contains_key(id) {
                 return Err(ProjectStoreError::Validation(
                     "sidebar assignment requires an existing root session in this Project".into(),
                 ));
@@ -188,6 +188,29 @@ fn apply_sidebar_snapshot(
         }
     }
     bamboo_projects::validate_project_sidebar(&sidebar, project.section.as_deref())?;
+    project.sidebar_section_bindings.retain(|id, binding| {
+        sidebar.session_sections.get(id).and_then(Option::as_deref)
+            == Some(binding.section_id.as_str())
+    });
+    for (id, birth_token) in valid_roots {
+        let Some(root_birth_token) = birth_token else {
+            continue;
+        };
+        if let Some(section_id) = sidebar
+            .session_sections
+            .get(id)
+            .and_then(Option::as_ref)
+            .filter(|section_id| section_id.as_str() != "legacy")
+        {
+            project.sidebar_section_bindings.insert(
+                id.clone(),
+                ProjectSidebarSectionBinding {
+                    section_id: section_id.clone(),
+                    root_birth_token: root_birth_token.clone(),
+                },
+            );
+        }
+    }
     project.sidebar = Some(sidebar);
     Ok(())
 }
@@ -413,18 +436,24 @@ fn project_path_validation_error(
     }
 }
 
-fn with_etag(project: &ProjectManifest, status: StatusCode) -> HttpResponse {
+fn with_etag(project: ProjectManifest, status: StatusCode) -> HttpResponse {
     HttpResponse::build(status)
         .insert_header((
             actix_web::http::header::ETAG,
             format!("\"{}\"", project.revision),
         ))
-        .json(project)
+        .json(project.into_public_view())
 }
 
 pub async fn list_projects(state: web::Data<AppState>) -> Result<HttpResponse> {
     match state.project_store.list() {
-        Ok(projects) => Ok(HttpResponse::Ok().json(serde_json::json!({ "projects": projects }))),
+        Ok(projects) => {
+            let projects: Vec<_> = projects
+                .into_iter()
+                .map(ProjectManifest::into_public_view)
+                .collect();
+            Ok(HttpResponse::Ok().json(serde_json::json!({ "projects": projects })))
+        }
         Err(error) => Ok(project_error(error)),
     }
 }
@@ -458,7 +487,7 @@ pub async fn create_project(
             revision: project.revision,
         },
     );
-    Ok(with_etag(&project, StatusCode::CREATED))
+    Ok(with_etag(project, StatusCode::CREATED))
 }
 
 pub async fn get_project(
@@ -470,7 +499,7 @@ pub async fn get_project(
         Err(response) => return Ok(*response),
     };
     match state.project_store.get(&id) {
-        Ok(project) => Ok(with_etag(&project, StatusCode::OK)),
+        Ok(project) => Ok(with_etag(project, StatusCode::OK)),
         Err(error) => Ok(project_error(error)),
     }
 }
@@ -519,7 +548,7 @@ pub async fn patch_project(
             "sidebar snapshots cannot be mixed with other Project metadata mutations".into(),
         )));
     }
-    let mut valid_roots = HashSet::new();
+    let mut valid_roots = BTreeMap::new();
     if let Some(sidebar) = requested_sidebar {
         let current = match state.project_store.get(&id) {
             Ok(current) => current,
@@ -567,7 +596,10 @@ pub async fn patch_project(
                             || session.root_session_id == session.id)
                         && session.project_id_meta().as_deref() == Some(id.as_str()) =>
                 {
-                    valid_roots.insert(session_id.clone());
+                    // Browser migration carries only IDs and may describe a
+                    // previous Root. Only an explicit assignment binds a birth.
+                    let birth_token = (!importing).then(|| session.root_mode_birth_token());
+                    valid_roots.insert(session_id.clone(), birth_token);
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -619,7 +651,7 @@ pub async fn patch_project(
             revision: project.revision,
         },
     );
-    Ok(with_etag(&project, StatusCode::OK))
+    Ok(with_etag(project, StatusCode::OK))
 }
 
 pub async fn bind_workspace(
@@ -655,7 +687,7 @@ pub async fn bind_workspace(
             revision: project.revision,
         },
     );
-    Ok(with_etag(&project, StatusCode::OK))
+    Ok(with_etag(project, StatusCode::OK))
 }
 
 pub async fn unbind_workspace(
@@ -686,7 +718,7 @@ pub async fn unbind_workspace(
             revision: project.revision,
         },
     );
-    Ok(with_etag(&project, StatusCode::OK))
+    Ok(with_etag(project, StatusCode::OK))
 }
 
 pub async fn project_resources(
@@ -727,7 +759,7 @@ pub async fn archive_project(
             revision: project.revision,
         },
     );
-    Ok(with_etag(&project, StatusCode::OK))
+    Ok(with_etag(project, StatusCode::OK))
 }
 
 pub async fn unarchive_project(
@@ -754,7 +786,7 @@ pub async fn unarchive_project(
             revision: project.revision,
         },
     );
-    Ok(with_etag(&project, StatusCode::OK))
+    Ok(with_etag(project, StatusCode::OK))
 }
 
 pub async fn legacy_dry_run(

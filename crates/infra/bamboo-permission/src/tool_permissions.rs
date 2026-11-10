@@ -706,10 +706,9 @@ pub fn check_permissions(
             );
             let project_memory_dir = bamboo_config::paths::path_to_display_string(
                 // The permission classifier has no trusted session context, so
-                // it cannot resolve the exact opaque Project id. Gate durable
-                // writes at the conservative first-class Project root; runtime
-                // resolution narrows assigned writes to
-                // projects/<id>/memory/v1 and rejects Unassigned Project writes.
+                // it cannot resolve the exact Project or Section. Section uses
+                // the Project write gate. The memory tool validates the
+                // assignment and binds the actual scope before writing.
                 &bamboo_dir.join("projects"),
             );
             let context = |resource: String| {
@@ -725,15 +724,14 @@ pub fn check_permissions(
                     context(project_memory_dir.clone()),
                 ]
             };
-            let scoped_durable_contexts = || match args
+            let scope = args
                 .get("scope")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-            {
+                .map(str::to_ascii_lowercase);
+            let scoped_durable_contexts = || match scope.as_deref() {
                 Some("global") => vec![context(global_memory_dir.clone())],
-                Some("project") => vec![context(project_memory_dir.clone())],
+                Some("project" | "section") => vec![context(project_memory_dir.clone())],
                 // Invalid/missing scope fails closed at the permission boundary.
                 // The tool may later reject the arguments, but no durable write
                 // can be authorized by a resource from only one possible scope.
@@ -746,13 +744,14 @@ pub fn check_permissions(
                 "write" | "rebuild" => Some(scoped_durable_contexts()),
                 // These actions identify existing memories by id(s), so the
                 // classifier cannot know whether execution will mutate the
-                // Global store or the assigned Project store.
+                // Global store or a scope in the assigned Project.
                 "merge" | "split" | "consolidate" => Some(ambiguous_durable_contexts()),
                 "purge"
-                    if args
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| !id.trim().is_empty()) =>
+                    if scope.as_deref() != Some("section")
+                        && args
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.trim().is_empty()) =>
                 {
                     Some(ambiguous_durable_contexts())
                 }
@@ -3711,13 +3710,15 @@ mod tests {
             .resource
             .ends_with("/memory/v1/scopes/global"));
 
-        let project_write =
-            check_permissions("memory", &json!({"action": "write", "scope": "project"}))
-                .unwrap()
-                .unwrap();
-        assert_eq!(project_write.len(), 1);
-        assert_eq!(project_write[0].permission_type, PermissionType::WriteFile);
-        assert!(project_write[0].resource.ends_with("/projects"));
+        for scope in ["project", "section"] {
+            let project_write =
+                check_permissions("memory", &json!({"action": "write", "scope": scope}))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(project_write.len(), 1);
+            assert_eq!(project_write[0].permission_type, PermissionType::WriteFile);
+            assert!(project_write[0].resource.ends_with("/projects"));
+        }
 
         let ambiguous_write = check_permissions("memory", &json!({"action": "write"}))
             .unwrap()
@@ -3779,6 +3780,15 @@ mod tests {
         assert!(scoped_purge[0]
             .resource
             .ends_with("/memory/v1/scopes/global"));
+
+        let section_purge = check_permissions(
+            "memory",
+            &json!({"action": "purge", "scope": "section", "id": "memory-1"}),
+        )
+        .unwrap()
+        .expect("a purge explicitly scoped to Section must use the Project gate");
+        assert_eq!(section_purge.len(), 1);
+        assert!(section_purge[0].resource.ends_with("/projects"));
 
         // Read-only actions stay ungated.
         for action in [

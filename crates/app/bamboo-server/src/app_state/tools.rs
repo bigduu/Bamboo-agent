@@ -120,10 +120,10 @@ pub(super) fn build_base_tools(
         project_tool,
     ));
 
-    let memory_tool = Arc::new(crate::tools::MemoryTool::with_store(
-        session_repo.clone(),
-        memory_store,
-    ));
+    let memory_tool = Arc::new(
+        crate::tools::MemoryTool::with_store(session_repo.clone(), memory_store)
+            .with_project_store(project_store.clone()),
+    );
     let with_memory: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_project,
         memory_tool,
