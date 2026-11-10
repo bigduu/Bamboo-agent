@@ -357,12 +357,20 @@ jobs:
         id: build
         run: node "${{ runner.temp }}/bamboo-release-controller/scripts/sidecar-build.cjs"
       - name: Transport this platform's verified executable within the same run
+        id: native_transport
+        continue-on-error: true
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
-        with:
+        with: &verified-native-output
           name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}
           path: ${{ runner.temp }}/bamboo-executable-output/*
           if-no-files-found: error
           retention-days: 3
+          overwrite: false
+      # The verified bytes still exist on this runner after a transport error.
+      - name: Retry transport of the verified executable
+        if: steps.native_transport.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with: *verified-native-output
 
   publish-executables:
     if: >-
