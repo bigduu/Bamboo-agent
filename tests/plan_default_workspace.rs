@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 
 #[path = "support/read_only_child_host.rs"]
 mod read_only_child_host;
-use read_only_child_host::Host;
+use read_only_child_host::{reported_result, Host};
 
 const MARKER: &str = "plan-default-1347.marker";
 const REQUIRED: &str = "PLAN_WORKSPACE_REQUIRED: inspect only; preserve the user constraints";
@@ -74,7 +74,9 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
                 .workspace_tool_observed
                 .store(observed, Ordering::SeqCst);
             (
-                json!({"content":"PLAN_WORKSPACE_VERIFIED: completed read-only workspace inspection"}),
+                reported_result(
+                    "PLAN_WORKSPACE_VERIFIED: completed read-only workspace inspection",
+                ),
                 "stop",
             )
         }

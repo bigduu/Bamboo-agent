@@ -3,6 +3,7 @@
 use bamboo_agent_core::storage::Storage;
 use bamboo_domain::Session;
 use bamboo_storage::SessionStoreV2;
+use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -21,7 +22,8 @@ impl Host {
             .local_addr()
             .unwrap()
             .port();
-        let log = std::fs::File::create(data.join("host.log")).unwrap();
+        let log_path = data.join("host.log");
+        let log = std::fs::File::create(&log_path).unwrap();
         let process = Command::new(env!("CARGO_BIN_EXE_bamboo"))
             .args([
                 "serve",
@@ -35,7 +37,7 @@ impl Host {
             .current_dir(data)
             .env("HOME", data.join("home"))
             .env("BAMBOO_JIANDU_DATA_DIR", data.join("jiandu"))
-            .env("RUST_LOG", "warn")
+            .env("RUST_LOG", "info")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
             .spawn()
@@ -50,19 +52,22 @@ impl Host {
                 .build()
                 .unwrap(),
         };
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let listener = format!("Unified server running on http://127.0.0.1:{port}");
+        tokio::time::timeout(Duration::from_secs(120), async {
             loop {
+                let log = std::fs::read(&log_path).unwrap();
+                let log = String::from_utf8_lossy(&log);
                 assert!(
                     host.process.try_wait().unwrap().is_none(),
-                    "CLI Host exited: {}",
-                    std::fs::read_to_string(data.join("host.log")).unwrap()
+                    "CLI Host exited: {log}",
                 );
-                if host
-                    .client
-                    .get(format!("{}/health", host.base))
-                    .send()
-                    .await
-                    .is_ok_and(|response| response.status().is_success())
+                if log.lines().any(|line| line.ends_with(&listener))
+                    && host
+                        .client
+                        .get(format!("{}/health", host.base))
+                        .send()
+                        .await
+                        .is_ok_and(|response| response.status().is_success())
                 {
                     break;
                 }
@@ -70,11 +75,11 @@ impl Host {
             }
         })
         .await
-        .expect("CLI Host became ready");
+        .expect("CLI Host must bind its own listener and become ready");
         host
     }
 
-    pub async fn post(&self, route: &str, body: serde_json::Value) -> reqwest::Response {
+    pub async fn post(&self, route: &str, body: Value) -> reqwest::Response {
         self.client
             .post(format!("{}/{}", self.base, route))
             .json(&body)
@@ -92,6 +97,20 @@ impl Host {
             .unwrap()
             .unwrap()
     }
+}
+
+pub fn reported_result(summary: &str) -> Value {
+    let report = json!({
+        "version": 1,
+        "outcome": "completed",
+        "summary": summary,
+        "reported_evidence": [],
+        "reported_verification": [],
+        "proposals": [],
+        "blockers": [],
+        "open_decisions": [],
+    });
+    json!({"content": report.to_string()})
 }
 
 impl Drop for Host {

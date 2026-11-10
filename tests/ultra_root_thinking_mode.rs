@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 
 #[path = "support/read_only_child_host.rs"]
 mod read_only_child_host;
-use read_only_child_host::Host;
+use read_only_child_host::{reported_result, Host};
 
 const REQUIRED: &str = "ULTRA_REQUIRED: inspect only; preserve the user constraints";
 
@@ -51,7 +51,7 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
             wake.await;
         }
         (
-            json!({"content":"PLAN_PROVIDER_EVIDENCE: verified the read-only scope"}),
+            reported_result("PLAN_PROVIDER_EVIDENCE: verified the read-only scope"),
             "stop",
         )
     } else if rendered.contains("Ultra Root thinking mode") {
