@@ -236,6 +236,22 @@ fn resolve_catalog_with_activation(
 
     if session.supervisor_incarnation_id().is_some() {
         let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
+        let has_project_create = session.allows_model_tool_execution("session_control")
+            && tool_schemas.iter().any(|schema| {
+                schema.function.name == "session_control"
+                    && schema.function.parameters["oneOf"]
+                        .as_array()
+                        .is_some_and(|actions| {
+                            actions
+                                .iter()
+                                .any(|action| action["properties"]["action"]["const"] == "create")
+                        })
+            })
+            && !disabled_tools.iter().any(|reference| {
+                resolve_disabled_tool_reference_name(reference, |name| name == "session_control")
+                    .as_deref()
+                    == Some("session_control")
+            });
         for schema in &mut tool_schemas {
             let description = &mut schema.function.description;
             match schema.function.name.as_str() {
@@ -243,6 +259,22 @@ fn resolve_catalog_with_activation(
                     *description = format!(
                         "Supervisor: delegate execution to an authorized independent Session. {routing} Use session_history list and bounded inspect to verify a candidate when needed. Use SubAgent only for auxiliary planning, review or verification; keep main execution in the independent Root. If no suitable authorized target or creation route is available, report the actual recoverable blocker. {description}"
                     );
+                }
+                "spawn_session" if has_project_create => {
+                    // The Supervisor's default model route is standalone.
+                    // Keep the shared wire parser for old calls and exact retries.
+                    *description =
+                        bamboo_orchestration::managed_session::SUPERVISOR_STANDALONE_SPAWN_GUIDANCE
+                            .into();
+                    if let Some(properties) = schema
+                        .function
+                        .parameters
+                        .get_mut("properties")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        properties.remove("project_id");
+                        properties.remove("workspace_path");
+                    }
                 }
                 "session_control" | "session_message" | "spawn_session" => {
                     *description = format!("{routing} {description}");
@@ -309,6 +341,24 @@ fn resolve_catalog_with_activation(
     });
 
     catalog
+}
+
+/// Recognize the dedicated placement route in the filtered model catalog.
+pub(crate) fn offers_standalone_supervisor_spawn(
+    session: &Session,
+    schemas: &[ToolSchema],
+) -> bool {
+    session.supervisor_incarnation_id().is_some()
+        && schemas.iter().any(|schema| {
+            schema.function.name == "spawn_session"
+                && schema.function.parameters["properties"]
+                    .as_object()
+                    .is_some_and(|properties| {
+                        properties.contains_key("operation_id")
+                            && !properties.contains_key("project_id")
+                            && !properties.contains_key("workspace_path")
+                    })
+        })
 }
 
 #[cfg(test)]
@@ -800,17 +850,50 @@ mod live_disabled_tests {
                     if let Some(root) = root {
                         let description = &root.function.description;
                         if supervisor {
-                            let routing = bamboo_orchestration::managed_session::SUPERVISOR_SESSION_ROUTING_GUIDANCE;
                             assert_eq!(
-                                description
-                                    .strip_prefix(routing)
-                                    .and_then(|s| s.strip_prefix(' ')),
-                                Some(expected.function.description.as_str()),
+                                description,
+                                bamboo_orchestration::managed_session::SUPERVISOR_STANDALONE_SPAWN_GUIDANCE,
+                            );
+                            let properties =
+                                root.function.parameters["properties"].as_object().unwrap();
+                            assert!(!properties.contains_key("project_id"));
+                            assert!(!properties.contains_key("workspace_path"));
+                            assert!(properties.contains_key("operation_id"));
+                            assert_eq!(
+                                root.function.parameters["required"],
+                                expected.function.parameters["required"]
                             );
                         } else {
                             assert_eq!(*description, expected.function.description);
+                            assert_eq!(root.function.parameters, expected.function.parameters);
                         }
-                        assert_eq!(root.function.parameters, expected.function.parameters);
+                    }
+                    if supervisor {
+                        let without_control = AgentLoopConfig {
+                            disabled_tools: BTreeSet::from(["session_control".into()]),
+                            ..Default::default()
+                        };
+                        let schemas = resolve_available_tool_schemas_for_session(
+                            &without_control,
+                            tools.as_ref(),
+                            &session,
+                        );
+                        let spawn = schemas
+                            .iter()
+                            .find(|schema| schema.function.name == "spawn_session")
+                            .unwrap();
+                        assert_eq!(spawn.function.parameters, expected.function.parameters);
+
+                        let without_bash = AgentLoopConfig {
+                            disabled_tools: BTreeSet::from(["Bash".into()]),
+                            ..Default::default()
+                        };
+                        let schemas = resolve_available_tool_schemas_for_session(
+                            &without_bash,
+                            tools.as_ref(),
+                            &session,
+                        );
+                        assert!(offers_standalone_supervisor_spawn(&session, &schemas));
                     }
                     for reference in ["spawn_session", "spawnSession", "default::spawn_session"] {
                         let config = AgentLoopConfig {

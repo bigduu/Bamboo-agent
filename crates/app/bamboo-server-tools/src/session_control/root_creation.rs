@@ -12,8 +12,10 @@ use std::sync::Arc;
 pub struct SupervisedRootCreateRequest {
     pub operation_id: uuid::Uuid,
     pub expected_state_revision: u64,
-    pub project_id: ProjectId,
-    pub workspace_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<ProjectId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_path: Option<String>,
     pub message: String,
     #[serde(default)]
     pub title: Option<String>,
@@ -23,9 +25,16 @@ pub struct SupervisedRootCreateRequest {
 
 impl SupervisedRootCreateRequest {
     pub fn validate(&self) -> Result<(), ToolError> {
+        if self.project_id.is_some() != self.workspace_path.is_some() {
+            return Err(ToolError::InvalidArguments(
+                "provide both project_id and workspace_path for Project work, or omit both for a standalone Session".into(),
+            ));
+        }
         if self.operation_id.is_nil()
-            || self.workspace_path.trim().is_empty()
-            || self.workspace_path.len() > 4096
+            || self
+                .workspace_path
+                .as_ref()
+                .is_some_and(|path| path.trim().is_empty() || path.len() > 4096)
             || self.message.trim().is_empty()
             || self.message.len() > bamboo_engine::session_messaging::MAX_SUPERVISOR_FOLLOWUP_BYTES
             || self.title.as_ref().is_some_and(|title| {
@@ -33,7 +42,7 @@ impl SupervisedRootCreateRequest {
             })
         {
             return Err(ToolError::InvalidArguments(
-                "create requires a non-nil operation UUID, explicit workspace (1..=4096 UTF-8 bytes), instruction (1..=16384 UTF-8 bytes), and optional non-empty title (at most 256 characters/1024 bytes)".into(),
+                "create requires a non-nil operation UUID, instruction (1..=16384 UTF-8 bytes), optional workspace (1..=4096 UTF-8 bytes), and optional non-empty title (at most 256 characters/1024 bytes)".into(),
             ));
         }
         Ok(())
@@ -152,19 +161,45 @@ pub(super) fn request_schema() -> Value {
         "properties": {
             "operation_id":{"type":"string", "format":"uuid", "description":"Fresh non-nil UUID for one creation. Reuse exactly this UUID and every request field after an uncertain response; never allocate another operation to recover it."},
             "expected_state_revision":{"type":"integer", "minimum":0, "description":"Exact management state_revision returned by scope. A new operation must reload scope after a conflict; exact retries keep the original request."},
-            "project_id":{"type":"string", "minLength":1, "description":"An explicit existing Project in the caller's current Host-configured creation scope. Creation never grants another Project."},
-            "workspace_path":{"type":"string", "minLength":1, "maxLength":4096, "description":"Explicit existing workspace already bound to this Project by the Host; no caller workspace inheritance, path registration, or worktree creation."},
+            "project_id":{"type":["string","null"], "minLength":1, "description":"Omit with workspace_path for a standalone Supervisor assignment. For Project work, provide an explicit existing Project in the caller's Host-configured scope."},
+            "workspace_path":{"type":["string","null"], "minLength":1, "maxLength":4096, "description":"Omit with project_id to use the new Session's own workspace. For Project work, provide an existing workspace already bound to that Project by the Host."},
             "message":{"type":"string", "minLength":1, "maxLength":16384, "description":"One explicit first instruction, at most 16 KiB UTF-8. No private caller history is copied."},
             "title":{"type":["string","null"], "minLength":1, "maxLength":256},
             "notify_on_material_event":{"type":"boolean", "default":false, "description":"Set true for new Supervisor work when scope.create_material_notifications is true. Subscribe on the initial instruction to durable blocker and Worker summary notices from its exact Run. Keep this flag on exact retries."}
         },
-        "required":["operation_id","expected_state_revision","project_id","workspace_path","message"]
+        "required":["operation_id","expected_state_revision","message"]
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn standalone_location_is_optional_and_bound_requests_keep_their_wire_encoding() {
+        let mut bound = json!({
+            "operation_id":uuid::Uuid::new_v4(), "expected_state_revision":1,
+            "project_id":"explicit-project", "workspace_path":"/explicit/worker",
+            "message":"inspect", "title":null
+        });
+        let parsed: SupervisedRootCreateRequest = serde_json::from_value(bound.clone()).unwrap();
+        parsed.validate().unwrap();
+        assert_eq!(serde_json::to_value(parsed).unwrap(), bound);
+
+        bound["project_id"] = Value::Null;
+        let incomplete: SupervisedRootCreateRequest =
+            serde_json::from_value(bound.clone()).unwrap();
+        assert!(incomplete.validate().is_err());
+
+        bound["workspace_path"] = Value::Null;
+        let standalone: SupervisedRootCreateRequest =
+            serde_json::from_value(bound.clone()).unwrap();
+        standalone.validate().unwrap();
+        let fields = bound.as_object_mut().unwrap();
+        fields.remove("project_id");
+        fields.remove("workspace_path");
+        assert_eq!(serde_json::to_value(standalone).unwrap(), bound);
+    }
 
     #[test]
     fn creation_request_rejects_authority_fields_empty_values_and_utf8_overflow() {

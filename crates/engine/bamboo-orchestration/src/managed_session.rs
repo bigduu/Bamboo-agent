@@ -18,19 +18,48 @@ pub use handoff::{
 pub const DEFAULT_SUPERVISOR_EXECUTION_PERMISSION_MODE: SessionPermissionMode =
     SessionPermissionMode::Bypass;
 
+pub const SUPERVISOR_STANDALONE_SPAWN_GUIDANCE: &str = concat!(
+    "Start one independent execution Session in its own workspace, with no Project. ",
+    "Use this default for new standalone tasks such as researching or installing a local utility. ",
+    "For a task that needs a specific Project, use session_control create with the verified Project and its bound workspace. ",
+    "Use the current scope revision and a stable operation UUID. Subscribe to material notifications when available. ",
+    "Retry an uncertain dispatch with the exact same request and operation UUID. Admission alone does not establish completion."
+);
+
+pub fn validate_standalone_spawn_arguments(arguments: &str) -> Result<(), &'static str> {
+    let arguments = serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .filter(serde_json::Value::is_object)
+        .ok_or("spawn_session requires a JSON object")?;
+    if ["project_id", "workspace_path"]
+        .iter()
+        .any(|field| arguments.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(concat!(
+            "standalone_spawn_requires_unassigned: This spawn_session route creates a Session in its own workspace. ",
+            "For a standalone task, retry the same operation UUID and instruction with both project_id and workspace_path omitted. ",
+            "Only if this assignment needs a verified Project and its bound workspace, use session_control create. ",
+            "A Project from another task or conversation history cannot be used. ",
+            "For an exact retry of an existing Project-bound operation, send the unchanged request through session_control create."
+        ));
+    }
+    Ok(())
+}
+
 /// Shared by the Supervisor prompt and the tool guide.
 pub const SUPERVISOR_SESSION_ROUTING_GUIDANCE: &str = concat!(
+    "Project is optional. For new standalone work, use spawn_session in its own workspace and omit both project_id and workspace_path. ",
+    "When a new assignment requires a specific Project, use session_control create with its verified Project and bound workspace. ",
     "On a new user request, dispatch and report only the requested assignments. ",
     "Resume or report another assignment only when the user asks or while handling its own fresh Host notification. ",
     "Conversation history alone does not reactivate old work. ",
-    "Before any dispatch, identify the assignment and its Project and workspace. ",
+    "Before dispatch, identify the assignment and the workspace it needs. ",
     "Reuse an independent Session only when a bounded authoritative observation or the user's explicit continuation ",
     "identifies the same assignment in the intended Project and workspace. ",
     "Start a new independent Session for a separate assignment or requested context isolation, even within the same Project. ",
-    "For new work, require evidence tied to that assignment: the user explicitly identifies its Project, or a named repository or workspace matches a canonical Host record. ",
+    "Assign a Project only when the user explicitly identifies it for that assignment or a named repository or workspace matches a canonical Host record. ",
     "The Project of another assignment, the current directory, or a sole available Project does not count. ",
-    "An unrelated installation or investigation without a Project match is ambiguous. ",
-    "If either the intended Project or its workspace is unclear, ask one focused question and end this turn before any dispatch."
+    "If the assignment requires a specific repository or workspace and you cannot identify it, ask one focused question before dispatching that assignment."
 );
 
 pub const MAX_FINALIZATION_WAIT: Duration = Duration::from_secs(60);

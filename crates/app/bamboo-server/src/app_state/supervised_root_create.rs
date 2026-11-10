@@ -2,11 +2,15 @@
 //! publication flow. Supervisor management and finite Host creation retain
 //! distinct final authority and Inbox ports; neither is a second create chain.
 
-use std::sync::Arc;
+use std::{io, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
 use bamboo_agent_core::tools::{ToolError, ToolResult};
+use bamboo_agent_core::workspace_state::{
+    preview_default_session_workspace_dir, preview_pin_workspace_path,
+};
 use bamboo_domain::{Session, SessionActivationDisposition, Storage, SupervisorReference};
+use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
 use bamboo_engine::ticket_runtime::{self, TicketDispatchBinding};
 use bamboo_engine::{SessionMessenger, SessionMessengerError, SessionRepository};
 use bamboo_server_tools::session_control::root_creation::{
@@ -102,6 +106,33 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
     }
 
     async fn scope(&self, supervisor: &SupervisorReference) -> Result<ToolResult, ToolError> {
+        self.creation_scope(supervisor, false).await
+    }
+
+    async fn create(
+        &self,
+        supervisor: &SupervisorReference,
+        request: SupervisedRootCreateRequest,
+    ) -> Result<ToolResult, ToolError> {
+        request.validate()?;
+        // A response timeout or cancelled originating tool future must not drop
+        // the operation claim between the three existing durable boundaries.
+        let service = self.clone();
+        let supervisor = supervisor.clone();
+        tokio::spawn(async move { service.create_inner(&supervisor, request).await })
+            .await
+            .map_err(|error| {
+                ToolError::Execution(format!("supervised Root creation task failed: {error}"))
+            })?
+    }
+}
+
+impl SupervisedRootCreator {
+    pub(super) async fn creation_scope(
+        &self,
+        supervisor: &SupervisorReference,
+        observed: bool,
+    ) -> Result<ToolResult, ToolError> {
         let scope = self
             .store
             .inspect_supervisor_current_user_scope(supervisor)
@@ -135,36 +166,17 @@ impl SupervisedRootCreatePort for SupervisedRootCreator {
             "orchestration_revision":scope.orchestration_revision,
             "allowed_projects":legacy.allowed_projects, "legacy_scope_is_authorization":false,
             "projects":projects, "requires_project_authorization":false,
-            "create_route_exposed":true, "project_scope_configured":true,
+            "create_route_exposed":true, "project_scope_configured":true, "create_unassigned":observed,
             "create_material_notifications":self.messenger.inbox().supports_root_creation_material_notifications(),
             "code":"current_user_scope_ready", "owner_action":null,
             "work_scope":{
                 "availability":"not_observed", "status_path":"/api/v1/tickets/scope",
                 "note":"Formal Work retains its own feature, binding and health checks. Initialize only with the current canonical can_initialize payload; this observation never initializes Work or changes worker permissions."
             },
-            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. Creation still validates the selected Project and bound workspace, and workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
+            "note":"The canonical Supervisor manages Projects/Sessions in this application's current user domain by default, independently of Standard/Ultra. No per-Project access approval or Session attachment is required. For a standalone assignment omit both Project and workspace on an observed creation call. The Host selects the new Session's own workspace. Project-bound creation validates the selected Project and bound workspace. Workers keep their own tool/approval permissions. Legacy lists are compatibility metadata, never an OS/file grant."
         }).to_string()))
     }
 
-    async fn create(
-        &self,
-        supervisor: &SupervisorReference,
-        request: SupervisedRootCreateRequest,
-    ) -> Result<ToolResult, ToolError> {
-        request.validate()?;
-        // A response timeout or cancelled originating tool future must not drop
-        // the operation claim between the three existing durable boundaries.
-        let service = self.clone();
-        let supervisor = supervisor.clone();
-        tokio::spawn(async move { service.create_inner(&supervisor, request).await })
-            .await
-            .map_err(|error| {
-                ToolError::Execution(format!("supervised Root creation task failed: {error}"))
-            })?
-    }
-}
-
-impl SupervisedRootCreator {
     pub(super) async fn create_managed_work(
         &self,
         service: &bamboo_tickets::TicketService,
@@ -173,6 +185,11 @@ impl SupervisedRootCreator {
         request: SupervisedRootCreateRequest,
     ) -> Result<ToolResult, ToolError> {
         request.validate()?;
+        if request.project_id.is_none() {
+            return Err(ToolError::InvalidArguments(
+                "managed Work Root creation requires a Project and workspace".into(),
+            ));
+        }
         let target = spec
             .managed_root
             .as_ref()
@@ -331,11 +348,11 @@ impl SupervisedRootCreator {
             operation
         });
         let id = operation.session_id.clone();
-        let workspace =
+        let workspace = if let Some(path) = request.workspace_path.as_deref() {
             match crate::project_context::validate_explicit_session_workspace_with_resolver(
                 &self.projects,
-                Some(&request.project_id),
-                &request.workspace_path,
+                request.project_id.as_ref(),
+                path,
                 &self.workspace,
             ) {
                 Ok(workspace) => workspace,
@@ -348,7 +365,21 @@ impl SupervisedRootCreator {
                         error,
                     ))
                 }
-            };
+            }
+        } else {
+            match self.standalone_workspace(&id) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    return Ok(blocked(
+                        operation_id,
+                        replayed.then_some(id.as_str()),
+                        "workspace",
+                        "workspace_invalid",
+                        error,
+                    ));
+                }
+            }
+        };
         if let Err(error) = authority.validate_workspace(&request, &workspace) {
             return Ok(blocked(
                 operation_id,
@@ -381,6 +412,18 @@ impl SupervisedRootCreator {
                     "workspace",
                     "project_context_unavailable",
                     error,
+                ));
+            }
+            if request.project_id.is_none()
+                && candidate.workspace_path_meta().as_deref()
+                    != Some(bamboo_config::paths::path_to_display_string(&workspace).as_str())
+            {
+                return Ok(blocked(
+                    operation_id,
+                    replayed.then_some(id.as_str()),
+                    "workspace",
+                    "workspace_invalid",
+                    "Standalone Session workspace changed during resolution",
                 ));
             }
         }
@@ -564,7 +607,7 @@ impl SupervisedRootCreator {
         let mut candidate = build_new_session(
             &CreateSessionInput {
                 id: operation.session_id.clone(),
-                project_id: Some(request.project_id.clone()),
+                project_id: request.project_id.clone(),
                 title: request.title.clone(),
                 title_generated: None,
                 system_prompt: None,
@@ -587,6 +630,12 @@ impl SupervisedRootCreator {
                 builtin_fallback_prompt: super::DEFAULT_BASE_PROMPT,
             },
         );
+        if request.project_id.is_none() {
+            candidate.metadata.insert(
+                WORKSPACE_SOURCE_METADATA_KEY.into(),
+                WorkspaceSource::Session.as_str().into(),
+            );
+        }
         // The existing reservation supplies an immutable retry birth as well
         // as the UUID. A recreated or unrelated lifetime can never match it.
         candidate.created_at = operation.created_at;
@@ -602,6 +651,23 @@ impl SupervisedRootCreator {
         candidate
     }
 
+    fn standalone_workspace(&self, id: &str) -> io::Result<PathBuf> {
+        let config = self
+            .workspace
+            .workspace_root_config()
+            .ok_or_else(|| io::Error::other("Session workspace root is unavailable"))?;
+        let root = preview_pin_workspace_path(&config.root, &config.root, true);
+        let workspace = preview_default_session_workspace_dir(&root, id);
+        match std::fs::symlink_metadata(&workspace) {
+            Ok(metadata) if metadata.is_dir() => Ok(workspace),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(workspace),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "Session workspace is not a plain directory",
+            )),
+        }
+    }
+
     async fn publish_created(&self, id: &str) -> std::io::Result<()> {
         self.store
             .recover_root_session_from_disk(id)
@@ -614,9 +680,22 @@ impl SupervisedRootCreator {
             .ok_or_else(|| std::io::Error::other("reserved Root is unavailable"))?;
         let workspace = session
             .workspace_path_meta()
-            .ok_or_else(|| std::io::Error::other("reserved Root has no workspace"))?;
+            .ok_or_else(|| io::Error::other("reserved Root has no workspace"))?;
+        let (workspace, source) = if session.project_id_meta().is_none() {
+            let expected = self.standalone_workspace(id)?;
+            if bamboo_config::paths::path_to_display_string(&expected) != workspace {
+                return Err(io::Error::other("reserved Session workspace changed"));
+            }
+            self.workspace.materialize_resolved_workspace(&expected)?;
+            if expected.canonicalize()? != expected {
+                return Err(io::Error::other("reserved Session workspace changed"));
+            }
+            (expected, WorkspaceSource::Session)
+        } else {
+            (workspace.into(), WorkspaceSource::Explicit)
+        };
         self.workspace
-            .publish_resolved_workspace(id, workspace.into(), "explicit");
+            .publish_resolved_workspace(id, workspace, source.as_str());
         let event = bamboo_agent_core::AgentEvent::SessionCreated {
             session_id: id.into(),
             project_id: session.project_id_meta(),

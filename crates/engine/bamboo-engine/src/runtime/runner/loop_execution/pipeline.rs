@@ -4294,6 +4294,7 @@ async fn run_pipeline_inner(
             let handler_result = match injected_handler_error {
                 Some(error) => Err(error),
                 None => {
+                    tool_policy_guard.set_supervisor_spawn_route(llm_output.standalone_supervisor_spawn);
                     handle_tool_calls_path(
                         &frame,
                         stream_output,

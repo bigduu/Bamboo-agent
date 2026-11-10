@@ -67,13 +67,13 @@ async fn caller(f: &Fixture, role: &str) -> (Session, Vec<ActorAncestorObservati
         );
     }
     let mut parent = Session::new("host-caller", "caller-model");
-    parent.set_project_id_meta(f.request.project_id.as_str());
+    parent.set_project_id_meta(f.project_id().as_str());
     f.creator.store.save_session(&parent).await.unwrap();
     if role == "root" {
         return (parent, vec![]);
     }
     let mut child = Session::new_child_of("host-child", &parent, "caller-model", "short task");
-    child.set_project_id_meta(f.request.project_id.as_str());
+    child.set_project_id_meta(f.project_id().as_str());
     f.creator.store.save_session(&child).await.unwrap();
     (
         child,
@@ -87,9 +87,9 @@ async fn caller(f: &Fixture, role: &str) -> (Session, Vec<ActorAncestorObservati
 
 fn request(f: &Fixture) -> SupervisedRootCreateRequest {
     let mut request = f.request.clone();
-    request.workspace_path = bamboo_config::paths::path_to_display_string(
-        &std::fs::canonicalize(&request.workspace_path).unwrap(),
-    );
+    request.workspace_path = Some(bamboo_config::paths::path_to_display_string(
+        &std::fs::canonicalize(f.workspace()).unwrap(),
+    ));
     request
 }
 
@@ -115,8 +115,8 @@ async fn install(
                     request.operation_id,
                     HostSessionCreateScope {
                         operation_id: request.operation_id,
-                        project_id: request.project_id.clone(),
-                        workspace_path: request.workspace_path.clone(),
+                        project_id: request.project_id.clone().unwrap(),
+                        workspace_path: request.workspace_path.clone().unwrap(),
                         created_target_rights,
                     },
                 )]),
@@ -199,11 +199,11 @@ async fn finite_host_path_creates_independent_roots_for_all_roles_without_manage
         );
         assert_eq!(
             target.project_id_meta().as_deref(),
-            Some(request.project_id.as_str())
+            Some(request.project_id.as_ref().unwrap().as_str())
         );
         assert_eq!(
             target.workspace_path_meta().as_deref(),
-            Some(request.workspace_path.as_str())
+            request.workspace_path.as_deref()
         );
         assert_eq!(
             target.authority_identity,
@@ -751,13 +751,21 @@ async fn ungranted_operation_project_workspace_and_new_revision_refuse_before_re
     install(&f, &source, ancestors, &request, 1, BTreeSet::new()).await;
     let mock = Arc::new(FirstInputMock::default());
     let port = f.creator.with_host_first_input(mock.clone());
-    for change in 0..4 {
+    for change in 0..5 {
         let mut denied = request.clone();
         match change {
             0 => denied.operation_id = uuid::Uuid::new_v4(),
-            1 => denied.project_id = "ungranted-project".parse().unwrap(),
-            2 => denied.workspace_path.push_str("-ungranted"),
-            _ => denied.expected_state_revision += 1,
+            1 => denied.project_id = Some("ungranted-project".parse().unwrap()),
+            2 => denied
+                .workspace_path
+                .as_mut()
+                .unwrap()
+                .push_str("-ungranted"),
+            3 => denied.expected_state_revision += 1,
+            _ => {
+                denied.project_id = None;
+                denied.workspace_path = None;
+            }
         }
         let result = port.create(&original, denied.clone()).await.unwrap();
         assert!(!result.success);

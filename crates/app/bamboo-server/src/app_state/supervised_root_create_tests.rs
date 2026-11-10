@@ -291,6 +291,148 @@ async fn supervisor_ultra_creates_independent_root_and_retries_once() {
     assert_create_is_independent_and_exact_retry(true).await;
 }
 
+#[actix_web::test]
+async fn supervisor_creates_and_continues_standalone_roots_without_inheriting_a_project_workspace()
+{
+    for ultra in [false, true] {
+        let f = Fixture::new(ultra).await;
+        f.state.config.write().await.default_work_area =
+            Some(bamboo_config::DefaultWorkAreaConfig {
+                path: Some(f.workspace.clone()),
+            });
+        let scope = f.invoke(json!({"action":"scope"})).await;
+        assert_eq!(scope["create_unassigned"], true);
+        let operation = uuid::Uuid::new_v4();
+        let permissions = f.state.permission_checker.permission_config().unwrap();
+        permissions
+            .grant_typed_scoped_session_permission(
+                &f.supervisor.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "standalone-creation".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control create [unassigned] {operation}"),
+                },
+            )
+            .unwrap();
+        let mut request = json!({
+            "operation_id":operation, "expected_state_revision":scope["state_revision"],
+            "message":"Check the installation instructions for a local utility.",
+            "title":"Check local utility installation",
+            "notify_on_material_event":scope["create_material_notifications"]
+        });
+        let count = f.state.session_store.list_index_entries().await.len();
+        let created = if ultra {
+            f.invoke(json!({"action":"create", "request":request.clone()}))
+                .await
+        } else {
+            f.invoke_named("spawn_session", request.clone()).await
+        };
+        assert_eq!(created["admitted"], true);
+        assert!(created["project_id"].is_null());
+        let id = created["target_session_id"].as_str().unwrap();
+        let root = f
+            .state
+            .storage
+            .load_root_authority(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.kind, SessionKind::Root);
+        assert!(root.project_id_meta().is_none());
+        assert!(root.parent_session_id.is_none());
+        assert!(root.authority_identity.is_ordinary());
+        assert_eq!(
+            root.agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Bypass
+        );
+        let workspace = f
+            .home
+            .path()
+            .join("workspaces")
+            .join(id)
+            .canonicalize()
+            .unwrap();
+        let workspace = bamboo_config::paths::path_to_display_string(&workspace);
+        assert_eq!(
+            root.workspace_path_meta().as_deref(),
+            Some(workspace.as_str())
+        );
+        assert_ne!(workspace, f.workspace);
+
+        let directory = f
+            .invoke(json!({"action":"directory", "query":"Check local utility installation"}))
+            .await;
+        let entries = directory["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["session_id"], id);
+        assert_eq!(entries[0]["origin"], "supervisor_created");
+        assert_eq!(entries[0]["project_id"], Value::Null);
+
+        request["project_id"] = Value::Null;
+        request["workspace_path"] = Value::Null;
+        let replay = if ultra {
+            f.invoke_named("spawn_session", request).await
+        } else {
+            f.invoke(json!({"action":"create", "request":request}))
+                .await
+        };
+        assert_eq!(replay["target_session_id"], id);
+        assert_eq!(replay["receipt_id"], created["receipt_id"]);
+        assert_eq!(
+            f.state.session_inbox.inspect(id).await.unwrap().generation,
+            1
+        );
+
+        let ToolOutcome::Completed(conflict) = f
+            .dispatch_named("session_control", f.request(operation), true)
+            .await
+            .unwrap()
+        else {
+            panic!("expected exact retry conflict");
+        };
+        assert!(!conflict.success);
+        let conflict: Value = serde_json::from_str(&conflict.result).unwrap();
+        assert_eq!(conflict["code"], "idempotency_conflict");
+
+        let current = f
+            .state
+            .storage
+            .load_root_authority(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let target = bamboo_domain::SupervisorCurrentUserTarget::capture(&current).unwrap();
+        permissions
+            .grant_typed_scoped_session_permission(
+                &f.supervisor.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "standalone-followup".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control followup {id}"),
+                },
+            )
+            .unwrap();
+        let followup = f
+            .invoke(json!({
+                "action":"followup", "target_session_id":id, "target_ref":target,
+                "operation_id":uuid::Uuid::new_v4(), "message":"Continue the same check."
+            }))
+            .await;
+        assert_eq!(followup["target_session_id"], id);
+        assert_eq!(followup["admitted"], true);
+        assert_eq!(
+            f.state.session_store.list_index_entries().await.len(),
+            count + 1
+        );
+        f.state.shutdown().await;
+    }
+}
+
 async fn assert_v2_spawn_uses_root_port_in_both_modes(ultra: bool) {
     let f = Fixture::new(ultra).await;
     let request = f.request(uuid::Uuid::new_v4())["request"].clone();
