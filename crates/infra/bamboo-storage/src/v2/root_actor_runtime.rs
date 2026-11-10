@@ -386,6 +386,7 @@ impl SessionStoreV2 {
             .await?
             .filter(|latest| latest.created_at == session.created_at)
             .ok_or_else(|| conflict("Root finalization source changed"))?;
+        crate::session_merge::adopt_durable_background_exec_wait(&mut reconciled, &latest);
         if let Some(registered_at) =
             crate::session_merge::adopt_finalized_child_wait(&mut reconciled, &latest, false)
         {

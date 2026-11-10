@@ -13,13 +13,19 @@ no pending question, second job store, process, permission grant, or command ret
 If durable persistence or a capable completion hook is unavailable, the current
 finite diagnostic policy still applies.
 
+A Human follow-up that repeatedly polls the same quiet handle yields back to
+the existing wait. It keeps the original monitor and waits for the actual
+completion. At a provider boundary, a newly admitted terminal result supersedes
+quiet observations for that handle so the model can act on the result.
+
 The monitor waits for the same drained terminal capture as `write_stdin` without
 provider requests. It takes a bounded snapshot without advancing the pull cursor.
 Completion is admitted to SessionInbox as `background_exec_completed` before the
 corresponding wait is cleared. SessionMessenger delivers it at the next safe
 boundary or reserves a successor execution. Clearing a completed exec wait uses
 the latest locked Session so an active Human conversation keeps its messages and
-runtime status. Exact retries use the same completion identity. Normal exec
+runtime status. Runtime checkpoints reconcile a previously committed wait
+against that durable state before saving a runner's older snapshot. Exact retries use the same completion identity. Normal exec
 completion never invokes legacy Bash PostToolUse hooks a second time.
 
 The existing shell-wait backstop covers completion during suspension finalization

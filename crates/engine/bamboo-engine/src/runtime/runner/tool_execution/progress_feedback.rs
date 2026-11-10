@@ -122,6 +122,17 @@ impl ProgressFeedbackBudget {
         FeedbackDecision::Continue(Some(feedback))
     }
 
+    /// A terminal Inbox result supersedes the last quiet observation for that
+    /// exact exec, without refunding the episode or clearing other evidence.
+    pub(super) fn observe_exec_completion(&mut self, handle: &str) {
+        if self.active.as_ref().is_some_and(|episode| {
+            matches!(&episode.evidence.facts,
+                ProgressEvidence::QuietCommand { session_id, .. } if session_id == handle)
+        }) {
+            self.active = None;
+        }
+    }
+
     /// Only newly admitted real Human input may call this. Hidden notifications,
     /// provider retries, model claims and changed observations must not call it.
     pub(crate) fn reset_for_human_input(&mut self) {
@@ -400,6 +411,30 @@ mod tests {
         ] {
             assert!(!is_required_progress_feedback(text));
         }
+    }
+
+    #[test]
+    fn terminal_exec_observation_retires_only_its_own_quiet_episode() {
+        let mut budget = ProgressFeedbackBudget::default();
+        continued(budget.next_round(Some(quiet()), false));
+        for _ in 1..RECOVERY_ROUND_LIMIT {
+            continued(budget.next_round(None, false));
+        }
+
+        let mut unrelated = budget.clone();
+        unrelated.observe_exec_completion("different-handle");
+        assert_eq!(
+            exhausted(unrelated.next_round(None, false)).0["exhaustion"],
+            "recovery_round_limit"
+        );
+
+        budget.observe_exec_completion("owned-handle");
+        assert_eq!(
+            budget.next_round(None, false),
+            FeedbackDecision::Continue(None)
+        );
+        let packet = continued(budget.next_round(Some(files()), false));
+        assert_eq!(packet["recovery"]["episode"], 2);
     }
 
     #[test]
