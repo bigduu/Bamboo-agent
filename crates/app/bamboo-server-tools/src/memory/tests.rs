@@ -580,11 +580,17 @@ fn memory_schema_teaches_the_llm_native_recall_and_authority_contract() {
     assert!(description.contains("query before write/merge"));
     assert!(description.contains("one atomic confirmed fact"));
     assert!(description.contains("trusted scope authority"));
+    assert!(description.contains("without a section"));
     assert!(description.contains("verify live state"));
     assert!(description.contains("embedding-free"));
 
     let schema = tool.parameters_schema();
     let properties = &schema["properties"];
+    assert_eq!(
+        properties["scope"]["enum"],
+        json!(["session", "project", "global", "section"])
+    );
+    assert!(properties.get("section_id").is_none());
     assert_eq!(
         properties["query"]["maxLength"],
         json!(MAX_MEMORY_QUERY_CHARS)

@@ -209,9 +209,12 @@ pub(crate) async fn build_memory_summary(
         .map(ToOwned::to_owned);
 
     match query.scope {
-        Some(MemoryScope::Session) => Err(io::Error::new(
+        Some(scope @ (MemoryScope::Session | MemoryScope::Section)) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session scope is not supported for memory metrics summary",
+            format!(
+                "{} scope is not supported for memory metrics summary",
+                scope.as_str()
+            ),
         )),
         Some(MemoryScope::Global) => {
             let result = store.inspect_scope(MemoryScope::Global, None).await?;
@@ -312,9 +315,12 @@ async fn collect_memory_documents(
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned);
     match query.scope {
-        Some(MemoryScope::Session) => Err(io::Error::new(
+        Some(scope @ (MemoryScope::Session | MemoryScope::Section)) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "session scope is not supported for memory metrics timeline",
+            format!(
+                "{} scope is not supported for memory metrics timeline",
+                scope.as_str()
+            ),
         )),
         Some(MemoryScope::Global) => store.list_memory_documents(MemoryScope::Global, None).await,
         Some(MemoryScope::Project) => {
@@ -472,10 +478,10 @@ pub async fn memory_summary(
     state: web::Data<AppState>,
     query: web::Query<MemoryMetricsQuery>,
 ) -> impl Responder {
-    if matches!(query.scope, Some(MemoryScope::Session)) {
+    if let Some(scope @ (MemoryScope::Session | MemoryScope::Section)) = query.scope {
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value(
-                "session scope is not supported for memory metrics summary"
+                format!("{} scope is not supported for memory metrics summary", scope.as_str())
             ),
         }));
     }
@@ -502,10 +508,10 @@ pub async fn memory_timeline(
     state: web::Data<AppState>,
     query: web::Query<MemoryMetricsQuery>,
 ) -> impl Responder {
-    if matches!(query.scope, Some(MemoryScope::Session)) {
+    if let Some(scope @ (MemoryScope::Session | MemoryScope::Section)) = query.scope {
         return HttpResponse::BadRequest().json(serde_json::json!({
             "error": crate::error::error_value(
-                "session scope is not supported for memory metrics timeline"
+                format!("{} scope is not supported for memory metrics timeline", scope.as_str())
             ),
         }));
     }

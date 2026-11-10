@@ -2999,11 +2999,7 @@ async fn run_auto_dream_once_for_scope(
     require_auto_dream_enabled: bool,
     project_resolver: Option<&ProjectContextResolver>,
 ) -> Result<Option<AutoDreamRunResult>, String> {
-    let scope_label = match scope {
-        MemoryScope::Global => "global",
-        MemoryScope::Project => "project",
-        MemoryScope::Session => "session",
-    };
+    let scope_label = scope.as_str();
 
     let config_snapshot = ctx.config.read().await.clone();
     let memory_cfg = config_snapshot.memory().clone().unwrap_or_default();
@@ -3046,8 +3042,10 @@ async fn run_auto_dream_once_for_scope(
                 .ok_or_else(|| "project Dream generation requires a project_key".to_string())?;
             collect_candidate_sessions_for_project(ctx, project_key, since).await
         }
-        MemoryScope::Session => {
-            return Err("session-scoped Dream generation is not supported".to_string())
+        MemoryScope::Session | MemoryScope::Section => {
+            return Err(format!(
+                "{scope_label}-scoped Dream generation is not supported"
+            ))
         }
     };
     if sessions.is_empty() {
@@ -3168,7 +3166,7 @@ async fn run_auto_dream_once_for_scope(
             model,
             notebook_body.trim(),
         ),
-        MemoryScope::Session => unreachable!("session scope handled above"),
+        MemoryScope::Session | MemoryScope::Section => unreachable!("scope handled above"),
     };
 
     let snapshot = memory
