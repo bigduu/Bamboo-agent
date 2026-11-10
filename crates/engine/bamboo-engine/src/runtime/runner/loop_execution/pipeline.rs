@@ -1515,9 +1515,9 @@ async fn maybe_suspend_for_outstanding_bash(
     Some(outcome)
 }
 
-/// Transfer the trusted quiet-poll observation to the host without spending
-/// another model recovery round. Stage the notice and wait together: failed
-/// persistence must neither publish a handoff nor start a detached monitor.
+/// Yield an owned quiet command to background monitoring without spending
+/// another model recovery round. A new handoff commits its notice and wait
+/// together before the monitor starts.
 async fn maybe_background_quiet_exec(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1525,10 +1525,18 @@ async fn maybe_background_quiet_exec(
     event_tx: &mpsc::Sender<AgentEvent>,
     handle: &str,
 ) -> Result<bool, AgentError> {
-    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config)
-        || runtime.waiting_for_bash.is_some()
-    {
+    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config) {
         return Ok(false);
+    }
+    if let Some(wait) = runtime.waiting_for_bash.as_ref() {
+        // A Human follow-up may poll an exec already handed off in a previous
+        // turn. Let terminal wait reconciliation restore this suspension if
+        // the durable monitor still owns it.
+        return Ok(matches!(wait.bash_ids.as_slice(), [id] if id == handle)
+            && session
+                .metadata
+                .get("runtime.background_exec_id")
+                .is_some_and(|id| id == handle));
     }
     let (Some(persistence), Some(hook)) = (
         config.persistence.as_ref(),
@@ -3588,7 +3596,7 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        let (prompt_memory_exposure, observation) =
+        let (prompt_memory_exposure, observation, admitted_messages) =
             crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                 session,
                 &mut state.runtime_state,
@@ -3621,6 +3629,26 @@ async fn run_pipeline_inner(
         );
         if fresh_human_input || resumed_progress_question {
             tool_policy_guard.reset_observation_progress();
+        }
+        for message in admitted_messages {
+            let Some(handle) =
+                tool_policy_guard.observe_background_exec_completion(&session.id, &message)
+            else {
+                continue;
+            };
+            if state
+                .runtime_state
+                .waiting_for_bash
+                .as_ref()
+                .is_some_and(|wait| matches!(wait.bash_ids.as_slice(), [id] if id == handle))
+            {
+                if let Some(saved) = session.agent_runtime_state.as_ref() {
+                    state
+                        .runtime_state
+                        .waiting_for_bash
+                        .clone_from(&saved.waiting_for_bash);
+                }
+            }
         }
         // Consume only after the complete real tool batch and newly admitted
         // Human input. The same-model facts are mandatory for each bounded

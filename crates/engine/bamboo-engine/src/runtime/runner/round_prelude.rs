@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::runtime::config::AgentLoopConfig;
 use crate::runtime::task_context::TaskLoopContext;
 use bamboo_agent_core::tools::ToolExecutor;
-use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
+use bamboo_agent_core::{AgentError, AgentEvent, Message, Role, Session};
 use bamboo_domain::AgentRuntimeState;
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::MetricsCollector;
@@ -117,7 +117,7 @@ pub(crate) async fn refresh_round_boundary_and_prompt_context(
         None,
     )
     .await
-    .map(|(memory, _)| memory)
+    .map(|(memory, _, _)| memory)
 }
 
 pub(crate) async fn refresh_round_boundary_with_observation(
@@ -133,6 +133,7 @@ pub(crate) async fn refresh_round_boundary_with_observation(
     (
         PromptMemoryExposureProvenance,
         crate::runtime::managers::lifecycle::InputObservation,
+        Vec<Message>,
     ),
     AgentError,
 > {
@@ -162,6 +163,7 @@ async fn refresh_round_boundary_inner(
     (
         PromptMemoryExposureProvenance,
         crate::runtime::managers::lifecycle::InputObservation,
+        Vec<Message>,
     ),
     AgentError,
 > {
@@ -298,7 +300,11 @@ async fn refresh_round_boundary_inner(
         &session.id,
         session.messages.len(),
     )?;
-    Ok((prompt_memory_exposure, observation))
+    Ok((
+        prompt_memory_exposure,
+        observation,
+        turn_refresh.committed_messages,
+    ))
 }
 
 // ---- round_state functions ----
@@ -563,7 +569,7 @@ async fn prepare_round_inner(
         llm: auxiliary.background_model_provider.unwrap_or(llm),
         background_model_name: auxiliary.background_model_name,
     };
-    let (_, observation) = refresh_round_boundary_inner(
+    let (_, observation, _) = refresh_round_boundary_inner(
         session,
         runtime_state,
         config,

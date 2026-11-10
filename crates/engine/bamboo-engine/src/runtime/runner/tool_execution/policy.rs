@@ -384,6 +384,36 @@ impl ToolPolicyGuard {
         self.quiet_polls.pending_handle()
     }
 
+    /// Only the provider boundary's newly admitted Inbox records are eligible.
+    pub(crate) fn observe_background_exec_completion<'a>(
+        &mut self,
+        session_id: &str,
+        message: &'a bamboo_agent_core::Message,
+    ) -> Option<&'a str> {
+        let envelope = message.metadata.as_ref()?.get("session_message")?;
+        let body = &envelope["body"];
+        let data = &body["data"];
+        let handle = data["exec_session_id"].as_str()?;
+        if envelope["source"]["type"] == "runtime"
+            && envelope["source"]["subsystem"] == "background_exec"
+            && envelope["kind"] == "runtime_instruction"
+            && envelope["target_session_id"] == session_id
+            && envelope["correlation_id"] == handle
+            && body["instruction"] == "background_exec_completed"
+            && data["session_id"] == session_id
+            && matches!(
+                data["status"].as_str(),
+                Some("completed" | "killed" | "error")
+            )
+        {
+            self.quiet_polls.forget_handle(handle);
+            self.progress_feedback.observe_exec_completion(handle);
+            Some(handle)
+        } else {
+            None
+        }
+    }
+
     /// Consume one completed batch. Only actual raw evidence can end a recovery
     /// episode; hidden wakeups and model claims cannot refund its finite budget.
     pub(crate) fn feedback_for_next_round(

@@ -119,11 +119,7 @@ impl QuietPollGuard {
                             .is_some_and(|n| n >= 3)
                 });
         if !quiet {
-            self.readouts.remove(&id);
-            if self.pending.as_deref() == Some(id.as_str()) {
-                self.pending = None;
-                self.last_quiet = None;
-            }
+            self.forget_handle(&id);
             return;
         }
         if self.readouts.len() >= MAX_HANDLES && !self.readouts.contains_key(&id) {
@@ -162,6 +158,14 @@ impl QuietPollGuard {
         let id = self.pending.take()?;
         self.readouts.remove(&id);
         self.last_quiet.take()
+    }
+
+    pub(super) fn forget_handle(&mut self, handle: &str) {
+        self.readouts.remove(handle);
+        if self.pending.as_deref() == Some(handle) {
+            self.pending = None;
+            self.last_quiet = None;
+        }
     }
 
     pub(super) fn take_observed_progress(&mut self) -> bool {

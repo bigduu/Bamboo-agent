@@ -1623,7 +1623,7 @@ mod tests {
             let (tx, mut rx) = tokio::sync::mpsc::channel(128);
             let cancel = tokio_util::sync::CancellationToken::new();
             let memory = if rich {
-                let (memory, observation) =
+                let (memory, observation, _) =
                     crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                         &mut session,
                         &mut runtime,
