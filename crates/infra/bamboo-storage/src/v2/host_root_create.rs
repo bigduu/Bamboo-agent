@@ -25,7 +25,7 @@ fn root_first_input_request(
     operation_id: Uuid,
     candidate: &Session,
     envelope: &bamboo_domain::SessionMessageEnvelope,
-) -> io::Result<(bamboo_domain::ProjectId, String)> {
+) -> io::Result<(Option<bamboo_domain::ProjectId>, String)> {
     use bamboo_domain::{SessionMessageBody, SessionMessageKind, SessionMessageSource};
     let project = super::supervisor_management::new_root_candidate_project(candidate)?;
     let workspace = candidate
@@ -111,6 +111,7 @@ impl SessionStoreV2 {
     ) -> io::Result<HostCreatedRootDeliveryGuards> {
         let (project, workspace) =
             root_first_input_request(caller, operation_id, candidate, envelope)?;
+        let project = project.ok_or_else(|| denied("target has no Project"))?;
         let scope = self.host_scope_registry.retain(token, caller).await?;
         let binding = scope.token().binding();
         binding
@@ -157,7 +158,8 @@ impl SessionStoreV2 {
         if candidate.id != reserved_id || candidate.id == caller.session_id {
             return Err(denied("host_session_create_reservation_changed"));
         }
-        let project = super::supervisor_management::new_root_candidate_project(candidate)?;
+        let project = super::supervisor_management::new_root_candidate_project(candidate)?
+            .ok_or_else(|| denied("target has no Project"))?;
         let workspace = candidate
             .workspace_path_meta()
             .ok_or_else(|| denied("host_session_create_workspace_missing"))?;

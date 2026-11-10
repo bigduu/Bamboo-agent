@@ -358,7 +358,9 @@ impl CreationAuthority {
                 original_caller,
             } => {
                 self.current_revision(creator).await?;
-                let result = SupervisedRootCreatePort::scope(creator, reference).await?;
+                let result = creator
+                    .creation_scope(reference, original_caller.is_some())
+                    .await?;
                 if let Some(caller) = original_caller {
                     creator.check_original_caller(caller).await?;
                 }
@@ -417,6 +419,11 @@ impl CreationAuthority {
                         .map_err(|error| {
                             CreationAuthorizationError::blocked("scope_denied", error)
                         })?;
+                } else if request.project_id.is_none() {
+                    return Err(CreationAuthorizationError::blocked(
+                        "scope_denied",
+                        "Standalone creation requires the original executing Supervisor",
+                    ));
                 }
                 let scope = creator
                     .store
@@ -440,7 +447,7 @@ impl CreationAuthority {
                     .binding()
                     .creates
                     .get(&request.operation_id)
-                    .filter(|scope| scope.project_id == request.project_id)
+                    .filter(|scope| Some(&scope.project_id) == request.project_id.as_ref())
                     .ok_or_else(|| {
                         CreationAuthorizationError::blocked(
                             "scope_denied",
@@ -467,9 +474,15 @@ impl CreationAuthority {
             // Keep the original request bytes for idempotency. A legacy retry
             // may use an alias of the same already-bound physical workspace.
             let workspace = bamboo_config::paths::path_to_display_string(canonical_workspace);
+            let project = request.project_id.as_ref().ok_or_else(|| {
+                CreationAuthorizationError::blocked(
+                    "scope_denied",
+                    "Host creation requires a Project",
+                )
+            })?;
             token
                 .binding()
-                .create(request.operation_id, &request.project_id, &workspace)
+                .create(request.operation_id, project, &workspace)
                 .map_err(|error| CreationAuthorizationError::blocked("scope_denied", error))?;
         }
         Ok(())
