@@ -114,10 +114,10 @@ tests; they add no feature-only catalog entry:
 
 The two engine functions cover eight role/tag/buffering arrangements and two
 new-orphan negative arrangements. Those are two test functions, not ten. The
-Host function composes all original seven rows using canonical Store, FileInbox
-and Host with controlled provider input: two Project Roots, a finite Tracker,
-an actual held read-only Planner, immutable plan sections, one original-worker
-followup and cold restart. Supervisor uses current-user discovery without
+Host function uses canonical Store, FileInbox and Host with controlled provider
+input: two Project Roots, a finite Tracker, a held read-only Planner from a
+saved session fixture, its bounded result, one original-worker followup and
+cold restart. Supervisor uses current-user discovery without
 manual grants; Tracker does not inherit that global management scope. Reports
 may drive an intermediate Supervisor reply but must preserve the entire old
 Planner wait, USER input and the Planner's completion obligation.

@@ -3134,12 +3134,7 @@ mod hook_tests {
                 .unwrap();
                 let allowed = matches!(
                     name,
-                    "SubAgent"
-                        | "Plan"
-                        | "Task"
-                        | "session_control"
-                        | "session_history"
-                        | "work_dispatch"
+                    "SubAgent" | "Task" | "session_control" | "session_history" | "work_dispatch"
                 );
                 assert_eq!(outcome.result.is_ok(), allowed, "ultra={ultra}: {name}");
                 if !allowed {
@@ -3149,7 +3144,6 @@ mod hook_tests {
             }
             let expected = vec![
                 "SubAgent",
-                "Plan",
                 "Task",
                 "session_control",
                 "session_history",

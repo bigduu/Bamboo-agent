@@ -685,7 +685,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.function.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["Read", "SubAgent", "Plan", "Task"]
+            vec!["Read", "SubAgent", "Task"]
         );
     }
 

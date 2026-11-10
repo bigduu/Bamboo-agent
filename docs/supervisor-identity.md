@@ -106,8 +106,8 @@ an observation rather than a grant. If no suitable authorized Root exists,
 report the missing scope or target, or create a Root only when separately
 authorized.
 
-Use `SubAgent` for bounded auxiliary planning, review or verification and `Plan`
-for a read-only planning child. `work_dispatch` retains the existing Work
+Use `SubAgent` for bounded auxiliary planning, review or verification. Select
+the explorer role for a read-only Child. `work_dispatch` retains the existing Work
 authority. The default `session_message` adapter keeps Ordinary/Child sends
 within their task tree; the trusted Supervisor adapter may use an explicitly
 attached followup with `delivery_intent=trigger_turn` under the same independent
@@ -225,6 +225,6 @@ observation, not a retained grant for a later command. Command admission must
 retain a final relationship/target authorization fence through durable Inbox
 acceptance; inspecting a link alone does not authorize a later followup.
 
-Followups, cancellation, Tracker subscriptions and Plan delegation still need
+Followups, cancellation, Tracker subscriptions and Child delegation still need
 their own trusted admission checks. Like the existing Session store, this is not
 an OS sandbox against arbitrary data-directory changes by the same OS user.

@@ -6,7 +6,7 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 19] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
     "exec_command",
     "write_stdin",
     "Edit",
@@ -15,7 +15,6 @@ pub const BUILTIN_GUIDE_NAMES: [&str; 19] = [
     "Glob",
     "Grep",
     "session_note",
-    "Plan",
     "Read",
     "request_permissions",
     "Sleep",
@@ -212,23 +211,11 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::TaskManagement,
             "Create or update the shared task list for the current root session tree (root + child sessions share the same task list).",
             "Do not use for trivial one-step requests.",
-            &["Plan"],
+            &[],
             vec![example(
                 "Update shared task statuses",
                 json!({"tasks":[{"content":"Run tests","status":"in_progress","activeForm":"Running tests"}]}),
                 "Keep exactly one item in_progress whenever possible.",
-            )],
-        )),
-        "Plan" => Some(guide(
-            "Plan",
-            ToolCategory::TaskManagement,
-            "Delegate a complex planning request to one runtime-enforced read-only planner child. The root remains the normal orchestrator and resumes automatically with the planner result.",
-            "Do not use for a trivial lookup or as a substitute for implementation after the approach is already clear.",
-            &["Task", "SubAgent"],
-            vec![example(
-                "Delegate an implementation plan",
-                json!({"task":"Inspect the current authentication flow and return an ordered migration plan with affected files, tests, risks, and explicit non-goals.","title":"Plan authentication migration","fork_last_messages":2}),
-                "The planner runs read-only; the parent waits internally and resumes without a mode-switch question.",
             )],
         )),
         "ExitPlanMode" => Some(guide(

@@ -40,12 +40,10 @@ The shared `observer-api-lint.yml` owns the five-library API-only Clippy check.
 reusing compatible compiled output and running the shared serde case once. The
 original subscription workflow remains available for manual diagnosis.
 
-The canonical feature driver owns Planner's 12 Plan and 10 artifact library
-cases. It excludes only those ordinary library cases from the parallel run and
-executes each once with one test thread from the same package's already compiled
-binary. Each library keeps its own default dependency graph; no second Cargo
-compile is introduced. The independent Delegated Planner workflow still owns
-the distinct API-only real CLI pair and its original Clippy graphs.
+The canonical feature driver runs the nine retained Planner artifact and
+recovery cases serially from its compiled default engine test binary. Retained
+Planner Analysis runs the two original API-only Clippy configurations. The
+CLI cases that invoked the retired `Plan` tool remain historical evidence.
 
 ## Release: build the final artifacts
 

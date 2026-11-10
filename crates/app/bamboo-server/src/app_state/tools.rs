@@ -4,7 +4,7 @@
 //! ```text
 //! base_tools (builtin + MCP + memory + scoped session messaging + skills + context controls
 //!             + Host-routed session_history + current history + fresh independent Root spawn)
-//!   └─> root_tools (base + Plan + SubAgent + scheduler + Supervisor controls)
+//!   └─> root_tools (base + SubAgent + scheduler + Supervisor controls)
 //! ```
 
 use std::collections::HashMap;
@@ -425,18 +425,6 @@ pub(super) fn build_root_tools(
         crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool.clone()),
     );
 
-    // Planning is delegated to one runtime-enforced read-only child. This keeps
-    // the root session in its normal orchestrator posture and reuses the same
-    // durable child/wait/completion path as `SubAgent`.
-    let plan_tool = Arc::new(
-        crate::tools::PlanTool::new(adapter.clone(), adapter.clone())
-            .with_artifact_home(session_store.bamboo_home_dir().to_path_buf()),
-    );
-    let tools_with_plan: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        tools_with_sub_agent,
-        plan_tool,
-    ));
-
     // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
     // do not get this management tool by default.
@@ -450,7 +438,7 @@ pub(super) fn build_root_tools(
         workspace_resolver,
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_plan, schedule_tasks_tool),
+        crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
     );
 
     // Session discovery and fresh Root creation already belong to the shared
