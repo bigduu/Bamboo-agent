@@ -209,8 +209,8 @@ impl TicketApplication {
         let request = SupervisedRootCreateRequest {
             operation_id: target.operation_id,
             expected_state_revision: target.scope_revision,
-            project_id: target.project_id.clone(),
-            workspace_path: workspace.worktree.clone(),
+            project_id: Some(target.project_id.clone()),
+            workspace_path: Some(workspace.worktree.clone()),
             message: managed_work::first_instruction(
                 service,
                 spec,

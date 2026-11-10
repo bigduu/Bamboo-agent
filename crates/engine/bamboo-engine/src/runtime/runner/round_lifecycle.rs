@@ -167,6 +167,7 @@ pub(crate) async fn context_tool_schemas_for_session<'a>(
 
 pub(crate) struct RoundLlmExecutionOutput {
     pub stream_output: StreamHandlingOutput,
+    pub standalone_supervisor_spawn: bool,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     /// Canonical usage for this single billed provider attempt.
@@ -332,6 +333,11 @@ pub(crate) async fn execute_llm_round(
 
     Ok(RoundLlmExecutionOutput {
         stream_output,
+        standalone_supervisor_spawn:
+            super::session_setup::tool_schemas::offers_standalone_supervisor_spawn(
+                session,
+                tool_schemas,
+            ),
         prompt_tokens,
         completion_tokens,
         attempt_usage,

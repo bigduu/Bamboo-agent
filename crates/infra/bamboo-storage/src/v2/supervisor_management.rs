@@ -47,21 +47,27 @@ fn target_id_is_valid(target: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn target_project(target: &Session) -> io::Result<ProjectId> {
+fn root_project(target: &Session) -> io::Result<Option<ProjectId>> {
     if !target.authority_identity.is_ordinary() || target.kind != SessionKind::Root {
         return Err(denied("a target must be an independent Ordinary Root"));
     }
     target
         .project_id_meta()
-        .ok_or_else(|| denied("target has no Project"))?
-        .parse::<ProjectId>()
-        .map_err(|_| denied("target has an invalid Project"))
+        .map(|id| {
+            id.parse()
+                .map_err(|_| denied("target has an invalid Project"))
+        })
+        .transpose()
+}
+
+fn target_project(target: &Session) -> io::Result<ProjectId> {
+    root_project(target)?.ok_or_else(|| denied("target has no Project"))
 }
 
 /// Shared canonical candidate check for both existing Supervisor creation and
 /// explicitly scoped Host creation. Neither route can create an elevated Root.
-pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<ProjectId> {
-    let project = target_project(candidate)?;
+pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<Option<ProjectId>> {
+    let project = root_project(candidate)?;
     candidate
         .check_execution_compatibility()
         .map_err(|error| denied(&error.to_string()))?;
@@ -90,7 +96,7 @@ pub(super) fn new_root_candidate_project(candidate: &Session) -> io::Result<Proj
 pub(super) fn reserved_root_matches(target: &Session, candidate: &Session) -> bool {
     target.id == candidate.id
         && target.created_at == candidate.created_at
-        && target_project(target).ok() == target_project(candidate).ok()
+        && matches!((root_project(target), root_project(candidate)), (Ok(target), Ok(candidate)) if target == candidate)
         && target.workspace_path_meta() == candidate.workspace_path_meta()
         && target.metadata_version == 0
         && target.root_session_id == target.id
@@ -1074,7 +1080,9 @@ impl SessionStoreV2 {
     ) -> io::Result<SupervisorManagementReceipt> {
         reference_is_valid(supervisor)?;
         target_id_is_valid(&candidate.id)?;
-        new_root_candidate_project(candidate)?;
+        if new_root_candidate_project(candidate)?.is_none() && original_caller.is_none() {
+            return Err(denied("target has no Project"));
+        }
         if original_caller.is_some_and(|caller| caller.session_id != supervisor.session_id) {
             return Err(denied("current-user original caller mismatch"));
         }

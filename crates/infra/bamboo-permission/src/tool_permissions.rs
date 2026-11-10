@@ -471,12 +471,40 @@ fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, Per
 pub fn framework_root_spawn_permissions(
     args: &Value,
 ) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
-    let project = required_string_arg(args, "project_id")?;
-    let workspace = required_string_arg(args, "workspace_path")?;
+    root_creation_permissions(args, "spawn_session")
+}
+
+fn root_creation_permissions(
+    args: &Value,
+    action: &str,
+) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
+    let (resource, description) = if args.get("project_id").is_none_or(Value::is_null)
+        && args.get("workspace_path").is_none_or(Value::is_null)
+    {
+        let operation = uuid::Uuid::parse_str(required_string_arg(args, "operation_id")?)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| {
+                PermissionError::CheckFailed(
+                    "standalone Root creation requires an operation UUID".into(),
+                )
+            })?;
+        (
+            format!("session_control create [unassigned] {operation}"),
+            "create a standalone independent Root in its own workspace and submit its first instruction",
+        )
+    } else {
+        let project = required_string_arg(args, "project_id")?;
+        let workspace = required_string_arg(args, "workspace_path")?;
+        (
+            format!("session_control create {project} {workspace}"),
+            "create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+        )
+    };
     Ok(Some(vec![PermissionContext::new(
         PermissionType::ExecuteCommand,
-        format!("session_control create {project} {workspace}"),
-        "spawn_session: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+        resource,
+        format!("{action}: {description}"),
     )]))
 }
 
@@ -1352,13 +1380,7 @@ pub fn check_permissions(
                             "session_control create requires request".into(),
                         )
                     })?;
-                let project = required_string_arg(request, "project_id")?;
-                let workspace = required_string_arg(request, "workspace_path")?;
-                return Ok(Some(vec![PermissionContext::new(
-                    PermissionType::ExecuteCommand,
-                    format!("session_control create {project} {workspace}"),
-                    "session_control create: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
-                )]));
+                return root_creation_permissions(request, "session_control create");
             }
             if action != "followup" {
                 return Err(PermissionError::CheckFailed(
@@ -1619,6 +1641,28 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[test]
+    fn standalone_creation_uses_the_same_operation_bound_permission_for_both_entrypoints() {
+        let operation = uuid::Uuid::new_v4();
+        let mut args = json!({"operation_id":operation, "message":"private instruction"});
+        let spawn = framework_root_spawn_permissions(&args).unwrap().unwrap();
+        let control = check_permissions(
+            "session_control",
+            &json!({"action":"create", "request":args.clone()}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spawn[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(
+            spawn[0].resource,
+            format!("session_control create [unassigned] {operation}")
+        );
+        assert_eq!(control[0].resource, spawn[0].resource);
+        args["operation_id"] = json!(uuid::Uuid::new_v4());
+        let other = framework_root_spawn_permissions(&args).unwrap().unwrap();
+        assert_ne!(other[0].resource, spawn[0].resource);
     }
 
     #[test]
