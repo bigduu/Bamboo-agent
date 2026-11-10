@@ -361,6 +361,26 @@ test("main promotion requires an unchanged cut and completed three-platform rele
   for (const override of [{ BASE_SHA: "" }, { GITHUB_SHA: "" }]) assert.notEqual(run(routes, override).status, 0);
 });
 
+test("native executable transport retries the same files only after a failed upload", () => {
+  const native = job(read(".github/workflows/publish-crate.yml"), "executables");
+  const steps = native.split("\n      - ").slice(1);
+  const transport = steps.find(step => step.startsWith("name: Transport this platform's verified executable"));
+  const retry = steps.find(step => step.startsWith("name: Retry transport of the verified executable"));
+  assert.ok(transport && retry, "Require the first upload and its retry");
+  assert.equal(steps.indexOf(retry), steps.indexOf(transport) + 1);
+  assert.match(transport, /\n        id: native_transport\n        continue-on-error: true/);
+  assert.match(transport, /\n        with: &verified-native-output\n          name: bamboo-executable-\$\{\{ matrix\.target \}\}-attempt-\$\{\{ github\.run_attempt \}\}/);
+  assert.match(transport, /\n          path: \$\{\{ runner\.temp \}\}\/bamboo-executable-output\/\*/);
+  assert.match(transport, /\n          overwrite: false/);
+  const action = step => step.match(/\n        uses: (actions\/upload-artifact@[a-f0-9]{40}) /)?.[1];
+  assert.equal(steps.filter(action).length, 2);
+  assert.ok(action(transport));
+  assert.equal(action(retry), action(transport));
+  assert.match(retry, /\n        if: steps\.native_transport\.outcome == 'failure'\n/);
+  assert.match(retry, /\n        with: \*verified-native-output/);
+  assert.doesNotMatch(retry, /continue-on-error:|\n        run:/);
+});
+
 test("Docker receives the completed publisher's matching run and attempt", () => {
   const publisher = read(".github/workflows/publish-crate.yml");
   const docker = read(".github/workflows/docker-publish.yml");
