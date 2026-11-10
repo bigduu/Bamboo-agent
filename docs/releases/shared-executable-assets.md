@@ -58,6 +58,12 @@ replacement uploads. An interrupted final upload can reuse identical assets;
 a conflicting asset blocks publication. The manifest uploads last. A public
 crate Release without this manifest is not a complete desktop binary release.
 
+A failed native artifact upload gets one retry in the same job while the
+verified executable and receipt still exist on the runner. Both upload steps
+use the same path and artifact name with overwrite disabled. If the retry
+fails, the native job fails and finalization stops. A later workflow attempt
+cannot rebuild a target whose original build step already succeeded.
+
 The final job depends on both the completed crate publisher and the native
 matrix. Native completion cannot finalize a failed crate closure. Preparation
 transport is selected by its original successful attempt, so failed-only reruns
