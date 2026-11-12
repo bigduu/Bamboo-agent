@@ -1098,6 +1098,12 @@ mod session_message_assembly_tests {
         let mut child = Session::new_child_of("history-child", &caller, "model", "child");
         child.set_project_id_meta("caller-project");
         child.add_message(Message::assistant("saved child output", None));
+        let mut connect = Session::new("history-connect", "model");
+        connect.metadata.insert(
+            bamboo_domain::CONNECT_SESSION_ORIGIN_KEY.into(),
+            "fake:external-chat:sender".into(),
+        );
+        connect.add_message(Message::user("Connect chat history"));
         target.add_message(Message::system("internal system instructions"));
         let mut archived = Message::user("an archived question");
         archived.compressed = true;
@@ -1107,7 +1113,7 @@ mod session_message_assembly_tests {
         let mut hidden = Message::assistant("hidden runtime output", None);
         hidden.metadata = Some(json!({"hidden_from_ui":true}));
         target.add_message(hidden);
-        for session in [&caller, &target, &child] {
+        for session in [&caller, &target, &child, &connect] {
             state.storage.save_session(session).await.unwrap();
         }
 
@@ -1142,6 +1148,24 @@ mod session_message_assembly_tests {
         .await
         .unwrap();
         assert_eq!(child_page["messages"][0]["content"], "saved child output");
+        let connect_own = history(
+            tools.as_ref(),
+            &connect,
+            true,
+            json!({"action":"read_messages","session_id":connect.id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connect_own["messages"][0]["content"],
+            "Connect chat history"
+        );
+        for request in [inspect.clone(), read.clone()] {
+            let error = history(tools.as_ref(), &connect, true, request)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Connect chat"), "{error}");
+        }
 
         assert!(history(tools.as_ref(), &caller, false, inspect.clone())
             .await

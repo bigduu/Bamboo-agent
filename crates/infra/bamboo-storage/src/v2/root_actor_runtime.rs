@@ -251,7 +251,9 @@ impl SessionStoreV2 {
                 .check_conversation_generation(&current)
                 .map_err(conflict)?;
             let schedule = observed.metadata.get("created_by_schedule_id");
-            let connect = observed.metadata.get("created_by_connect_key");
+            let connect = observed
+                .metadata
+                .get(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY);
             let pending_result = |session: &Session| -> io::Result<Option<serde_json::Value>> {
                 let Some(question) = observed.pending_question.as_ref() else {
                     return Ok(None);
@@ -283,8 +285,14 @@ impl SessionStoreV2 {
                         .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY)
                 || schedule != current.metadata.get("created_by_schedule_id")
                 || schedule != proposed.metadata.get("created_by_schedule_id")
-                || connect != current.metadata.get("created_by_connect_key")
-                || connect != proposed.metadata.get("created_by_connect_key")
+                || connect
+                    != current
+                        .metadata
+                        .get(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
+                || connect
+                    != proposed
+                        .metadata
+                        .get(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
                 || observed.id != current.id
                 || observed.created_at != current.created_at
                 || observed.kind != current.kind

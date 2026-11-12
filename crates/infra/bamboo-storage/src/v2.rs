@@ -1838,7 +1838,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "assignment_prompt",
     "clarification_resume_pending",
     "conclusion_with_options_resume_pending",
-    "created_by_connect_key",
+    bamboo_domain::CONNECT_SESSION_ORIGIN_KEY,
     "created_by_schedule_id",
     "disabled_tools",
     "external_memory_rendered",

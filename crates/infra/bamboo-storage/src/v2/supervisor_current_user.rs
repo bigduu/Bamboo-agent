@@ -199,9 +199,7 @@ impl SessionStoreV2 {
             .current_user_target_source(&caller.session_id, wait)
             .await?
             .ok_or_else(|| denied("current-user history caller is unavailable"))?;
-        if !caller.matches_session(&source) {
-            return Err(denied("current-user history caller changed"));
-        }
+        validate_peer_history_caller(caller, &source)?;
         let (_, target) = self
             .current_user_target_source(target_id, wait)
             .await?
@@ -218,9 +216,7 @@ impl SessionStoreV2 {
         let current = self
             .peer_delivery_control_session(&caller.session_id, &caller.root_session_id)
             .await?;
-        if !caller.matches_session(&current) {
-            return Err(denied("current-user history caller changed"));
-        }
+        validate_peer_history_caller(caller, &current)?;
         self.peer_delivery_session(target_id, &target_root).await
     }
 
@@ -524,6 +520,24 @@ impl SessionStoreV2 {
             next_after,
         })
     }
+}
+
+fn validate_peer_history_caller(
+    caller: &bamboo_domain::SessionCallerReference,
+    source: &Session,
+) -> io::Result<()> {
+    if !caller.matches_session(source) {
+        return Err(denied("current-user history caller changed"));
+    }
+    if source
+        .metadata
+        .contains_key(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
+    {
+        return Err(denied(
+            "current-user peer history is unavailable to a Connect chat",
+        ));
+    }
+    Ok(())
 }
 
 fn current_user_scope(

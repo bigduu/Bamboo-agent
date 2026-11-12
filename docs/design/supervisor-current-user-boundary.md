@@ -34,7 +34,10 @@ Message pages include archived dialogue and preserve the persisted order.
 The canonical Store verifies the original caller and target under its existing
 lifecycle and ancestry locks. An installed finite Host scope takes precedence
 for ordinary callers. Children and Observers use their existing scoped routes.
-The cross-Session reader returns user and assistant text and has read-only access.
+Connect chats remain bound to their external sender and use finite Host scope
+for peer inspection. The Store checks their durable origin before allowing an
+application-user read. The cross-Session reader returns user and assistant text
+and has read-only access.
 
 ## Default management and legacy migration
 

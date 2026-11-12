@@ -355,13 +355,13 @@ pub(super) async fn handle_get_meta(
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum MessageReadView {
     Session,
     VisibleDialogue,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_read_messages(
     tool: &SessionInspectorTool,
     loaded_session: Option<bamboo_agent_core::Session>,

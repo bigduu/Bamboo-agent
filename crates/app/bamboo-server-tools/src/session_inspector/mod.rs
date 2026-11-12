@@ -187,7 +187,7 @@ impl Tool for SessionInspectorTool {
                 "Read-only history and discovery. A canonical Supervisor can list all Sessions in the application's current-user domain with bounded pages/cursors, inspect persisted progress, and read bounded Root/Child history without Project authorization or attachment. Directory entries and inspect include current_user_target: preserve it as target_ref for a later followup; the final sender separately checks caller and target lifetime/generation/ancestry. Query matches IDs or Projects; stale cursors require a fresh page. Persisted progress is not verified live or input-specific completion. Ordinary viewers retain current-Session paging/search and their existing same-tree or finite Host rights. This viewer has no execution or file authority."
             }
             SessionHistoryAccess::HostRouted => {
-                "Read-only Session history. An ordinary Root in the application's current-user data domain can use inspect for saved progress and read_messages for visible conversation text from a known session_id, including archived messages. An explicitly installed Host scope limits ordinary callers to its granted operations. A canonical Supervisor uses its current-user discovery route. export_context/read_context require their own authority. Use session_history_current for current-Session search and paging. Results are persisted observations and grant no control over the target."
+                "Read-only Session history. An ordinary Root in the application's current-user data domain can use inspect for saved progress and read_messages for visible conversation text from a known session_id, including archived messages. An installed Host scope limits ordinary callers to its granted operations. Connect chats use finite Host scope for peer inspection. A canonical Supervisor uses its current-user discovery route. export_context/read_context require their own authority. Use session_history_current for current-Session search and paging. Results describe persisted state."
             }
             SessionHistoryAccess::Authorized => {
                 "Read-only discovery of explicitly Host-authorized Sessions. list returns metadata-only pages (limit <=20, query matches target ID/Project); reuse the returned cursor with the same query and limit. inspect returns bounded persisted progress and a visible assistant excerpt, never verified live or input-specific completion. Caller identity and grants come from the installed Host adapter. Missing/stale authority is a blocker; this surface never falls back to all local Sessions, attaches history or sends work. Use session_message(action=send) with its own Host authority for delivery; this listing is not a sending grant."
@@ -548,7 +548,7 @@ impl Tool for SessionInspectorTool {
                     SessionInspectorArgs::GetMeta { .. }
                     | SessionInspectorArgs::ReadMessages { .. } => {
                         if ctx.executing_supervisor_for(caller_session_id).is_none() {
-                            return Err(ToolError::Execution("session_discovery_bounded_scope: another Session's metadata is unavailable; use inspect".into()));
+                            return Err(ToolError::Execution("session_discovery_bounded_scope: use inspect for another Session's metadata".into()));
                         }
                         host_discovery::require_absent_host_for_legacy_history(
                             self.storage.as_ref(),
@@ -558,7 +558,7 @@ impl Tool for SessionInspectorTool {
                         legacy_supervisor_history = true;
                     }
                     _ => {
-                        return Err(ToolError::Execution("session_discovery_bounded_scope: peer cache/export is unavailable; use authorized list/inspect".into()));
+                        return Err(ToolError::Execution("session_discovery_bounded_scope: use authorized list/inspect for another Session".into()));
                     }
                 }
             }
