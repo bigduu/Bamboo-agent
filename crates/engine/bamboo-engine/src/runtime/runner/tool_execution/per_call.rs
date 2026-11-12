@@ -472,26 +472,6 @@ async fn execute_tool_call_only_with_execution_name_inner(
         return Ok(ToolExecutionOutcome::rejected_before_dispatch(policy_error));
     }
 
-    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
-        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
-            Ok(target) => Some(target),
-            Err(error) => {
-                return Ok(ToolExecutionOutcome {
-                    output_cap: None,
-                    permission_replay_origin: None,
-                    result: Err(error.to_string()),
-                    needs_human: None,
-                    portable_tool: None,
-                    post_tool_hook_eligible: false,
-                    managed_running_violation: false,
-                    tool_duration: std::time::Duration::ZERO,
-                })
-            }
-        }
-    } else {
-        None
-    };
-
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
@@ -523,6 +503,19 @@ async fn execute_tool_call_only_with_execution_name_inner(
             warning
         );
     }
+
+    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
+        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
+            Ok(target) => Some(target),
+            Err(error) => {
+                return Ok(ToolExecutionOutcome::rejected_before_dispatch(
+                    error.to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     tracing::debug!(
         "[{}][round:{}] Starting tool execution: tool_call_id={}, tool_name={}, raw_args_len={}",
@@ -3402,6 +3395,70 @@ mod hook_tests {
             }
         }
         assert_eq!(executor.entered(), ["probe", "probe", "probe"]);
+    }
+
+    #[tokio::test]
+    async fn malformed_view_image_is_rejected_before_resolving_vision_provider() {
+        let executor = Arc::new(NameRecordingExecutor::new(&["ViewImage"]));
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let callable = effective_callable_set(
+            &["ViewImage"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = resolutions.clone();
+        let config = AgentLoopConfig {
+            vision_model_resolver: Some(Arc::new(move || {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(AgentError::LLM("unavailable test Vision provider".into())) })
+            })),
+            ..Default::default()
+        };
+        let session = Session::new("vision-arguments", "text-only");
+        for (arguments, expected_error, expected_resolutions) in [
+            ("{malformed", "complete JSON object", 0),
+            (
+                r#"{"path":"test.png"}"#,
+                "unavailable test Vision provider",
+                1,
+            ),
+        ] {
+            let mut call = probe_call("ViewImage");
+            call.function.arguments = arguments.into();
+            let outcome = execute_model_requested_tool_call_only(
+                &callable,
+                ToolExecutionOnlyContext {
+                    await_quiet_exec: false,
+                    session_behavior_version: None,
+                    vision_support: false,
+                    output_cap: None,
+                    executing_caller: None,
+                    executing_supervisor: None,
+                    tool_call: &call,
+                    event_tx: &event_tx,
+                    metrics_collector: None,
+                    session_id: &session.id,
+                    root_session_id: &session.id,
+                    root_orchestration_only: false,
+                    round_id: "vision-arguments",
+                    round: 0,
+                    tools: &tools,
+                    config: &config,
+                    hook_session: None,
+                    hook_runtime_state: None,
+                    session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(outcome.result.unwrap_err().contains(expected_error));
+            assert_eq!(resolutions.load(Ordering::SeqCst), expected_resolutions);
+        }
+        assert!(executor.entered().is_empty());
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]
