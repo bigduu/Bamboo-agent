@@ -27,8 +27,13 @@ impl RootActorWriteProof {
         &self.owner
     }
 
-    // Pure reads at the final boundary; never ensure/repair/claim authority.
     pub(super) fn validate(&self) -> io::Result<Session> {
+        self.validate_with_lease_expiry()
+            .map(|(session, _)| session)
+    }
+
+    // Pure reads at the final boundary; never ensure/repair/claim authority.
+    fn validate_with_lease_expiry(&self) -> io::Result<(Session, DateTime<Utc>)> {
         let id = &self.owner.fence.actor_id;
         let regular = |name: &str| {
             actor_transcript::regular_bytes(&self.directory.join(name)).map_err(conflict)
@@ -80,7 +85,25 @@ impl RootActorWriteProof {
         {
             return Err(conflict("execution birth or running owner changed"));
         }
-        Ok(overlay_runtime_sidecar(main, Some(side)))
+        Ok((
+            overlay_runtime_sidecar(main, Some(side)),
+            activation.lease_expires_at,
+        ))
+    }
+
+    pub(super) fn validate_inbox_cleanup(
+        &self,
+        validate_input: impl FnOnce(&Session) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let (durable, lease_expires_at) = self.validate_with_lease_expiry()?;
+        validate_input(&durable)?;
+        drop(durable);
+        // The retained guards pin the fence while transcript validation runs.
+        // Check its deadline again before removing the committed claim.
+        if lease_expires_at <= Utc::now() {
+            return Err(conflict("Root lease expired before Inbox cleanup"));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_candidate(&self, incoming: &Session) -> io::Result<()> {

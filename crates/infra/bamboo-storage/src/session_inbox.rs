@@ -764,6 +764,8 @@ pub struct FileSessionInbox {
     observer_cursor_pause: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
     #[cfg(any(test, feature = "test-utils"))]
     observer_fault_failure: Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(feature = "test-utils")]
+    root_ack_cleanup_expiry: Arc<Mutex<Option<Arc<tokio::sync::Notify>>>>,
     /// Runtime-owned path registry. Clones of this adapter share it, while
     /// independent AppState/SDK runtimes remain fully isolated.
     operation_locks: Arc<Mutex<HashMap<PathBuf, Weak<AsyncMutex<()>>>>>,
@@ -814,6 +816,8 @@ impl FileSessionInbox {
             observer_cursor_pause: None,
             #[cfg(any(test, feature = "test-utils"))]
             observer_fault_failure: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            #[cfg(feature = "test-utils")]
+            root_ack_cleanup_expiry: Arc::default(),
             operation_locks: Arc::new(Mutex::new(HashMap::new())),
             scoped_runtime: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -1996,6 +2000,22 @@ impl FileSessionInbox {
         resume: Arc<tokio::sync::Notify>,
     ) {
         self.observer_cursor_pause = Some((reached, resume));
+    }
+
+    /// Cross the Inbox lease boundary after the next owned Root receipt commits.
+    #[cfg(feature = "test-utils")]
+    pub fn expire_next_root_ack_cleanup_for_testing(&self) -> Arc<tokio::sync::Notify> {
+        let expired = Arc::new(tokio::sync::Notify::new());
+        let previous = self
+            .root_ack_cleanup_expiry
+            .lock()
+            .unwrap()
+            .replace(expired.clone());
+        assert!(
+            previous.is_none(),
+            "a Root ACK expiry fixture is already armed"
+        );
+        expired
     }
 
     /// Read the real permanent receipt and validate this envelope's existing
@@ -3654,7 +3674,20 @@ impl FileSessionInbox {
             ));
         }
 
-        match authority.remove(&cur_path).await {
+        #[cfg(feature = "test-utils")]
+        if let Some(lease) = expected_lease.filter(|_| self.root_owner.is_some()) {
+            let expired = self.root_ack_cleanup_expiry.lock().unwrap().take();
+            if let Some(expired) = expired {
+                let deadline = lease.expires_at_for_testing();
+                if let Ok(remaining) = (deadline - Utc::now()).to_std() {
+                    tokio::time::sleep(remaining + std::time::Duration::from_millis(1)).await;
+                }
+                assert!(Utc::now() >= deadline, "the Inbox lease must have expired");
+                expired.notify_one();
+            }
+        }
+
+        match authority.remove_committed_claim(&cur_path).await {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
             Err(error) => Err(SessionInboxError::Storage(format!(
