@@ -471,13 +471,13 @@ async fn message_summary_model_failure_preserves_history_and_retry_request() {
         .contains_key("responses.previous_response_id"));
 }
 
-async fn run_deepseek_message_summary_retry(
+async fn run_chat_message_summary_retry(
     session: &mut Session,
+    model: &str,
     fallback: ResponseTemplate,
 ) -> (Result<bool, AgentError>, Session) {
     use bamboo_agent_core::Storage;
 
-    const MODEL: &str = "deepseek-v4.1-flash";
     let server = MockServer::start().await;
     let calls = AtomicUsize::new(0);
     Mock::given(method("POST"))
@@ -485,16 +485,20 @@ async fn run_deepseek_message_summary_retry(
         .respond_with(move |request: &Request| {
             let body: serde_json::Value = request.body_json().unwrap();
             match calls.fetch_add(1, Ordering::Relaxed) {
-                0 => deepseek_summary_stream("The chosen design is recorded."),
-                1 => deepseek_summary_stream(""),
-                2 if body.get("reasoning_effort").is_none() && body["enable_thinking"] == false => {
+                0 => chat_summary_stream("The chosen design is recorded."),
+                1 => chat_summary_stream(""),
+                2 if body["reasoning_effort"] == "none" => ResponseTemplate::new(400)
+                    .set_body_json(serde_json::json!({
+                        "message": "The value of reasoning_effort should be one of low, medium, high, xhigh, and max.",
+                    })),
+                3 if body.get("reasoning_effort").is_none() && body["enable_thinking"] == false => {
                     fallback.clone()
                 }
                 _ => ResponseTemplate::new(400)
                     .set_body_string("expected enable_thinking=false without reasoning_effort"),
             }
         })
-        .expect(3)
+        .expect(4)
         .mount(&server)
         .await;
 
@@ -502,7 +506,7 @@ async fn run_deepseek_message_summary_retry(
     tokio::fs::write(
         directory.path().join("model_limits.json"),
         serde_json::to_vec(&serde_json::json!([{
-            "model_pattern": MODEL,
+            "model_pattern": model,
             "max_context_tokens": 32_000,
             "max_output_tokens": 1_000,
         }]))
@@ -521,7 +525,7 @@ async fn run_deepseek_message_summary_retry(
         .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
     let mut config = message_summary_config(Arc::new(provider));
     config.app_data_dir = Some(directory.path().to_path_buf());
-    config.summarization_model_name = Some(MODEL.into());
+    config.summarization_model_name = Some(model.into());
     config.persistence = Some(Arc::new(bamboo_storage::LockedSessionStore::new(
         storage.clone(),
     )));
@@ -533,26 +537,33 @@ async fn run_deepseek_message_summary_retry(
         .iter()
         .map(|request| request.body_json::<serde_json::Value>().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(bodies.len(), 3, "map, empty reduce, one retry");
+    assert_eq!(
+        bodies.len(),
+        4,
+        "map, empty reduce, rejected disable, corrected disable"
+    );
     for body in &bodies {
-        assert_eq!(body["model"], MODEL);
+        assert_eq!(body["model"], model);
     }
     for body in &bodies[..2] {
         assert_eq!(body["reasoning_effort"], "low");
         assert!(body.get("enable_thinking").is_none());
     }
-    assert_eq!(bodies[2]["enable_thinking"], false);
-    assert!(bodies[2].get("reasoning_effort").is_none());
-    assert_eq!(bodies[2]["messages"], bodies[1]["messages"]);
-    assert!(bodies[1]["max_completion_tokens"].as_u64().unwrap() > 0);
-    assert_eq!(
-        bodies[2]["max_completion_tokens"],
-        bodies[1]["max_completion_tokens"]
-    );
+    assert_eq!(bodies[2]["reasoning_effort"], "none");
+    assert_eq!(bodies[3]["enable_thinking"], false);
+    assert!(bodies[3].get("reasoning_effort").is_none());
+    for body in &bodies[2..] {
+        assert_eq!(body["messages"], bodies[1]["messages"]);
+        assert!(bodies[1]["max_completion_tokens"].as_u64().unwrap() > 0);
+        assert_eq!(
+            body["max_completion_tokens"],
+            bodies[1]["max_completion_tokens"]
+        );
+    }
     (result, saved)
 }
 
-fn deepseek_summary_stream(text: &str) -> ResponseTemplate {
+fn chat_summary_stream(text: &str) -> ResponseTemplate {
     let chunk = serde_json::json!({
         "choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
     });
@@ -562,11 +573,12 @@ fn deepseek_summary_stream(text: &str) -> ResponseTemplate {
 }
 
 #[tokio::test]
-async fn deepseek_message_summary_retry_disables_thinking_and_commits_on_success() {
+async fn chat_message_summary_retry_corrects_disable_and_commits_on_success() {
     let mut session = message_summary_session();
-    let (result, saved) = run_deepseek_message_summary_retry(
+    let (result, saved) = run_chat_message_summary_retry(
         &mut session,
-        deepseek_summary_stream("Final summary from the fallback request."),
+        "summary-primary",
+        chat_summary_stream("Final summary from the fallback request."),
     )
     .await;
     assert!(result.unwrap());
@@ -579,7 +591,7 @@ async fn deepseek_message_summary_retry_disables_thinking_and_commits_on_success
 }
 
 #[tokio::test]
-async fn deepseek_message_summary_retry_failure_preserves_persisted_history() {
+async fn chat_message_summary_retry_failure_preserves_persisted_history() {
     let mut session = message_summary_session();
     session.messages[1].compressed = true;
     session.conversation_summary = Some(bamboo_domain::ConversationSummary::new(
@@ -590,9 +602,11 @@ async fn deepseek_message_summary_retry_failure_preserves_persisted_history() {
     let messages = serde_json::to_value(&session.messages).unwrap();
     let summary = serde_json::to_value(&session.conversation_summary).unwrap();
     let pending = session.force_manual_compression.clone();
-    let (result, saved) = run_deepseek_message_summary_retry(
+    let (result, saved) = run_chat_message_summary_retry(
         &mut session,
-        ResponseTemplate::new(400).set_body_string("mock rejected the summary retry"),
+        "summary-secondary",
+        ResponseTemplate::new(400)
+            .set_body_string("Invalid reasoning_effort 'none': mock rejected the summary retry"),
     )
     .await;
     let error = result.unwrap_err().to_string();

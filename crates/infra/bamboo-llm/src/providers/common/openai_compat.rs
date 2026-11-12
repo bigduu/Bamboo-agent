@@ -7,7 +7,7 @@
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePart, Role};
 use futures::{stream, StreamExt};
-use reqwest::Response;
+use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,7 +15,6 @@ use std::sync::Arc;
 
 use super::sse::{llm_stream_from_sse_multi, sse_error_is_present};
 use super::tool_schema::sanitize_openai_function_parameters_schema;
-use super::DASHSCOPE_DEEPSEEK_V41_FLASH_MODEL;
 use crate::provider::{LLMError, LLMStream, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::ReasoningEffort;
@@ -172,13 +171,8 @@ pub fn build_openai_compat_body(
 
     set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
-    match reasoning_effort {
-        Some(ReasoningEffort::Disabled) if model == DASHSCOPE_DEEPSEEK_V41_FLASH_MODEL => {
-            // DashScope rejects "none" for this model on Chat Completions.
-            body["enable_thinking"] = json!(false);
-        }
-        Some(effort) => body["reasoning_effort"] = json!(effort.as_str()),
-        None => {}
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort.as_str());
     }
 
     if let Some(parallel_tool_calls) = parallel_tool_calls {
@@ -186,6 +180,119 @@ pub fn build_openai_compat_body(
     }
 
     body
+}
+
+pub(crate) enum ChatCompletionsResponse {
+    Streaming(Response),
+    Rejected {
+        status: StatusCode,
+        body: String,
+        corrected_disable: bool,
+    },
+}
+
+/// Correct a rejected disable spelling once, on the same Chat Completions
+/// route. A metered Work reservation owns exactly one physical send.
+pub(crate) async fn send_chat_completions(
+    provider: &str,
+    request: impl Fn(&Value) -> RequestBuilder,
+    mut body: Value,
+    allow_disable_correction: bool,
+) -> Result<ChatCompletionsResponse> {
+    let retry = crate::retry::global();
+    let mut corrected_disable = false;
+    loop {
+        let response =
+            crate::retry::send_provider_request(&retry, provider, || request(&body)).await?;
+        let status = response.status();
+        if status.is_success() {
+            return Ok(ChatCompletionsResponse::Streaming(response));
+        }
+        let rejection = response.text().await?;
+        if allow_disable_correction
+            && !corrected_disable
+            && !crate::retry::work_request_budget_active()
+            && status == StatusCode::BAD_REQUEST
+            && correct_rejected_chat_disable(&mut body, &rejection)
+        {
+            tracing::info!(
+                "Retrying a rejected Chat Completions reasoning disable with enable_thinking=false"
+            );
+            corrected_disable = true;
+            continue;
+        }
+        return Ok(ChatCompletionsResponse::Rejected {
+            status,
+            body: rejection,
+            corrected_disable,
+        });
+    }
+}
+
+fn correct_rejected_chat_disable(body: &mut Value, rejection: &str) -> bool {
+    let Some(body) = body.as_object_mut() else {
+        return false;
+    };
+    if body.get("reasoning_effort").and_then(Value::as_str) != Some("none")
+        || body.contains_key("enable_thinking")
+    {
+        return false;
+    }
+
+    let parsed = serde_json::from_str::<Value>(rejection).ok();
+    let error = parsed
+        .as_ref()
+        .map(|root| root.get("error").unwrap_or(root));
+    let message = error
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+        })
+        .or_else(|| parsed.is_none().then_some(rejection))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let effort_param = error
+        .and_then(|error| error.get("param"))
+        .and_then(Value::as_str)
+        == Some("reasoning_effort");
+    if !effort_param && !message.contains("reasoning_effort") {
+        return false;
+    }
+
+    let invalid_value = effort_param
+        && matches!(
+            error
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str),
+            Some("invalid_value" | "unsupported_value")
+        );
+    let mentions_none = message
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word == "none");
+    let rejects_none = mentions_none
+        && ["unsupported", "not support", "invalid", "not allowed"]
+            .iter()
+            .any(|phrase| message.contains(phrase));
+    let lists_enabled_levels = !mentions_none
+        && message.contains("low")
+        && message.contains("high")
+        && [
+            "only support",
+            "be one of",
+            "valid values",
+            "allowed values",
+        ]
+        .iter()
+        .any(|phrase| message.contains(phrase));
+    if !(invalid_value || rejects_none || lists_enabled_levels) {
+        return false;
+    }
+
+    body.remove("reasoning_effort");
+    body.insert("enable_thinking".into(), json!(false));
+    true
 }
 
 // --- OpenAI-compatible streaming chunk parsing ---

@@ -13,8 +13,6 @@ use sha2::{Digest, Sha256};
 
 use crate::provider::LLMError;
 
-pub(super) const DASHSCOPE_DEEPSEEK_V41_FLASH_MODEL: &str = "deepseek-v4.1-flash";
-
 /// Bound caller/provider-controlled identifiers in operational logs while
 /// retaining stable correlation. Request bodies and returned errors stay intact.
 pub(crate) fn log_identity(value: &str) -> String {
