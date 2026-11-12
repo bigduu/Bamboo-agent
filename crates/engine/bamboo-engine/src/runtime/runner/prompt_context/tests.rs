@@ -205,18 +205,8 @@ async fn external_memory_includes_global_dream_fallback_and_session_note_when_pr
     assert!(system_prompt.contains("Session Memory Note"));
     assert!(system_prompt.contains("Session durable note"));
     assert!(!system_prompt.contains("### Project Durable Memory Index"));
-    assert!(system_prompt.contains("the `memory` tool only for durable project/global knowledge"));
-    assert!(system_prompt.contains("short, discriminative lexical query"));
-    assert!(system_prompt.contains("compact top-3 shortlist"));
-    assert!(system_prompt.contains("Query before writing"));
-    assert!(system_prompt.contains("`memory` action=merge"));
-    assert!(system_prompt.contains("one confirmed atomic fact"));
-    assert!(system_prompt.contains("Project scope"));
-    assert!(system_prompt.contains("Global scope"));
-    assert!(system_prompt.contains("Dream as low-trust orientation only"));
-    assert!(system_prompt.contains("Live-verify code"));
-    assert!(system_prompt.contains("Do NOT store secrets/tokens"));
-    assert!(system_prompt.contains("do not use or request embeddings"));
+    assert!(system_prompt.contains("Verify workspace and runtime claims against current evidence."));
+    assert!(system_prompt.contains("Treat Dream summaries as orientation."));
 }
 
 #[tokio::test]
@@ -266,7 +256,6 @@ async fn external_memory_includes_ledger_agenda_when_records_are_open() {
     assert!(system_prompt.contains("[OVERDUE] `rec_overdue`"));
     assert!(system_prompt.contains("Send the quarterly report"));
     assert!(system_prompt.contains("[OPEN] `rec_open`"));
-    assert!(system_prompt.contains("record it with the `ledger` tool"));
 
     // Flag off → the section disappears even with open records.
     let flags = crate::runtime::config::PromptMemoryFlags {
@@ -281,9 +270,7 @@ async fn external_memory_includes_ledger_agenda_when_records_are_open() {
         None,
     )
     .await;
-    let without = super::render_external_memory_section(&session)
-        .expect("external memory section should still render");
-    assert!(!without.contains("### Ledger Agenda"));
+    assert!(super::render_external_memory_section(&session).is_none());
     assert!(!jiandu_root.join("ledger").exists());
 }
 
@@ -370,7 +357,7 @@ async fn external_memory_includes_project_memory_index_and_omits_global_dream_fa
     assert!(system_prompt.contains("Release freeze begins next week"));
     assert!(!system_prompt.contains("### Global Dream Summary (fallback)"));
     assert!(!system_prompt.contains("Global fallback that should not appear"));
-    assert!(system_prompt.contains("### Session Memory Note (markdown)"));
+    assert!(!system_prompt.contains("### Session Memory Note (markdown)"));
 }
 
 #[tokio::test]
@@ -748,11 +735,27 @@ async fn external_memory_adds_stale_guidance_for_old_relevant_memory_hits() {
 }
 
 #[tokio::test]
-async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
+async fn external_memory_omits_block_when_no_match_exists() {
     let temp_dir = tempfile::tempdir().expect("temp dir");
-    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path());
+    let store = bamboo_memory::memory_store::MemoryStore::new(temp_dir.path().join("jiandu"));
+    let bamboo_root = temp_dir.path().join("bamboo");
     let workspace = temp_dir.path().join("workspace-recall-none");
     std::fs::create_dir_all(&workspace).expect("workspace dir");
+    store
+        .write_memory(
+            bamboo_memory::memory_store::MemoryScope::Global,
+            None,
+            bamboo_memory::memory_store::DurableMemoryType::Project,
+            "Cedarpath staging relay",
+            "Cedarpath deploys its relay at midnight.",
+            &["cedarpath".to_string(), "relay".to_string()],
+            Some("session-recall-seed"),
+            "main-model",
+            false,
+            None,
+        )
+        .await
+        .expect("save unrelated memory in another session");
 
     let mut session = bamboo_agent_core::Session::new("session-recall-none", "test-model");
     session.add_message(bamboo_agent_core::Message::system("Base prompt"));
@@ -761,12 +764,13 @@ async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
         workspace.to_string_lossy().to_string(),
     );
     session.add_message(bamboo_agent_core::Message::user(
-        "this query should not match anything relevant",
+        "Parabola coefficient derivative algebra",
     ));
 
-    let exposure = super::refresh_external_memory_context_with_store(
+    let exposure = super::refresh_external_memory_context_with_stores(
         &mut session,
         &store,
+        &bamboo_root,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
@@ -778,6 +782,7 @@ async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
     );
     assert_eq!(observation.all_compact_exposed_count, 0);
     assert!(observation.project_items.is_empty());
+    assert!(super::render_external_memory_section(&session).is_none());
 
     let invalid_root = temp_dir.path().join("not-a-directory");
     let invalid_index = invalid_root.join("memory/v1/scopes/global/indexes/lexical.json");
@@ -786,9 +791,10 @@ async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
     let invalid_store = bamboo_memory::memory_store::MemoryStore::new(&invalid_root);
     let mut error_session = bamboo_agent_core::Session::new("lookup-error", "test-model");
     error_session.add_message(bamboo_agent_core::Message::user("lookup error query"));
-    let lookup_error = super::refresh_external_memory_context_with_store(
+    let lookup_error = super::refresh_external_memory_context_with_stores(
         &mut error_session,
         &invalid_store,
+        &bamboo_root,
         crate::runtime::config::PromptMemoryFlags::default(),
         None,
     )
@@ -798,11 +804,6 @@ async fn external_memory_omits_relevant_memory_section_when_no_match_exists() {
         lookup_error.recall_outcome,
         bamboo_metrics::types::PromptMemoryRecallOutcome::LookupError
     );
-
-    let system_prompt = super::render_external_memory_section(&session)
-        .expect("external memory section should be rendered");
-
-    assert!(!system_prompt.contains("### Relevant Durable Memories"));
 }
 
 #[tokio::test]

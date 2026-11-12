@@ -13,6 +13,13 @@ no pending question, second job store, process, permission grant, or command ret
 If durable persistence or a capable completion hook is unavailable, the current
 finite diagnostic policy still applies.
 
+A Root with `no_human_approver` can wait in its active runner. When its only
+tool call is an empty `write_stdin` for a command with closed stdin, an explicit
+longer wait can continue past the first empty read. Repeated quiet reads can
+also use the remaining tool deadline to await the terminal capture. The
+same tool response carries the exit status and output when ready, or the running
+status when the deadline expires. Run cancellation also interrupts this wait.
+
 A Human follow-up that repeatedly polls the same quiet handle yields back to
 the existing wait. It keeps the original monitor and waits for the actual
 completion. At a provider boundary, a newly admitted terminal result supersedes

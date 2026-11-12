@@ -134,14 +134,14 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "write_stdin" => Some(guide(
             "write_stdin",
             ToolCategory::CommandExecution,
-            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait/poll; yield_time_ms is bounded to 250–30000 ms (default 10000). Running results retain session_id; final results omit it and include exit_code when available. Running polling metadata reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. False exit_observed means no exit has been observed, not verified liveness; true still waits for terminal output capture. After repeated empty readouts and sustained silence, a polling advisory asks you to do useful work or inspect one command-owned progress signal before polling again. Continue waiting when appropriate, or report a concrete blocker, retaining the handle for final status. In a Human-controlled Root, repeated unchanged observations produce bounded runtime feedback to this model. Decide whether the last evidence supports intentional polling or a stalled approach; use a real progress signal or change method. When durable background resumption is available, repeated quiet polling transfers the exact command to background monitoring: the conversation remains usable and its observed terminal result is delivered automatically. Otherwise finite diagnostic recovery ends with an incomplete-progress notice without a new Human question or cancelling the command. Handles are local to this Host; unread terminal results keep their existing five-minute expiry after completion, including after a bounded diagnostic run ends. Output is incremental and bounded by max_output_tokens (default 2000, maximum 8192); output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to the stdin pipe; include your own newline and use eof=true to close stdin. A lone Ctrl-C (\\u0003) stops the process.",
-            "Do not use a conversation ID or legacy Bash ID as session_id. Do not blindly repeat identical empty polls, infer completion from silence or an existing report, or stop/restart a command only because it is quiet. Do not poll a finished session or wait for an automatic completion message. Input requires an interactive stdin pipe and does not provide PTY terminal behavior.",
+            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait. Ordinary polls clamp yield_time_ms to 250–30000 ms and default to 10000 ms. A single unattended Root poll can wait longer within the tool deadline for a quiet command with no open stdin. Running results retain session_id. Final results omit it and include exit_code when available. Polling reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. A true exit_observed still requires terminal output capture. The quiet polling advisory suggests a longer wait when you need the exit result. Investigate a concrete failure when one is visible. In a Human-controlled Root, repeated quiet polling can transfer the command to durable background monitoring and deliver its terminal result automatically. Otherwise finite diagnostic recovery can report incomplete progress while retaining the handle. Unread terminal results expire five minutes after completion. Output is bounded by max_output_tokens (default 2000, maximum 8192). output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to stdin. Include your own newline and use eof=true to close the pipe. A lone Ctrl-C (\\u0003) stops the process.",
+            "Do not use a conversation ID or legacy Bash ID as session_id. Do not infer completion from silence or an existing report, stop a command only because it is quiet, or poll after receiving a terminal result. Expect automatic results only after an explicit background handoff. Input requires an interactive stdin pipe.",
             &["exec_command"],
             vec![
                 example(
                     "Pull a command's next output and exit status",
                     json!({"session_id":"<session_id-from-exec_command>","chars":"","yield_time_ms":1000}),
-                    "While status=running, use polling progress and follow any advisory before another empty poll. Preserve the handle until final status; a nonzero exit_code is a command outcome to inspect.",
+                    "While status=running, keep the handle and request a longer wait if you need the exit result. Inspect a nonzero exit_code.",
                 ),
                 example(
                     "Answer an interactive prompt and close input",
@@ -727,10 +727,15 @@ mod tests {
         assert!(exec.when_not_to_use.contains("stdin pipe, not a PTY"));
         assert!(exec.examples[0].parameters.get("cmd").is_some());
         let poll = builtin_guide_spec("write_stdin").unwrap();
-        assert!(poll.when_to_use.contains("final results omit it"));
-        assert!(poll.when_to_use.contains("include your own newline"));
+        assert!(poll.when_to_use.contains("Final results omit it"));
+        assert!(poll.when_to_use.contains("your own newline"));
         assert!(poll.when_to_use.contains("polling advisory"));
-        assert!(poll.when_to_use.contains("not verified liveness"));
+        assert!(poll
+            .when_to_use
+            .contains("A single unattended Root poll can wait longer"));
+        assert!(poll
+            .when_to_use
+            .contains("A true exit_observed still requires terminal output capture"));
         assert!(poll
             .when_not_to_use
             .contains("infer completion from silence"));

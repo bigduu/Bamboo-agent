@@ -1148,6 +1148,8 @@ fn build_request_envelope_reconciled_for_loading_mode(
     let mut real_transcript = system_remainder_messages;
     real_transcript.extend(conversation_messages);
     let cache_scope = serde_json::json!({
+        // Rebuild saved prompt prefixes that still contain unconditional memory guidance.
+        "external_memory_projection_version": 2,
         "model": model,
         "provider_boundary_sha256": &requested_provider_boundary_sha256,
         "system": &lane_system,
