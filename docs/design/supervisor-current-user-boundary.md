@@ -24,6 +24,21 @@ Bounded Session and Work views expose business observations. Previously created
 Planner Children keep their immutable revisions and durable result delivery
 from #2304. SubAgent inspection can read the saved Child result.
 
+## Ordinary Root history reads
+
+An executing ordinary Root can use `session_history.inspect` for saved progress
+and `session_history.read_messages` for visible dialogue from an ordinary Session
+in the same application user-data domain. Both actions take a target Session ID.
+Message pages include archived dialogue and preserve the persisted order.
+
+The canonical Store verifies the original caller and target under its existing
+lifecycle and ancestry locks. An installed finite Host scope takes precedence
+for ordinary callers. Children and Observers use their existing scoped routes.
+Connect chats remain bound to their external sender and use finite Host scope
+for peer inspection. The Store checks their durable origin before allowing an
+application-user read. The cross-Session reader returns user and assistant text
+and has read-only access.
+
 ## Default management and legacy migration
 
 The management/storage migration remains a separate required part of #1968;

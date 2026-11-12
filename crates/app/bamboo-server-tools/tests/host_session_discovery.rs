@@ -414,8 +414,9 @@ async fn metadata_and_bounded_progress_rights_remain_distinct_read_only_and_non_
 }
 
 #[tokio::test]
-async fn no_scope_or_known_id_never_exposes_global_or_peer_history_but_self_reads_remain() {
+async fn ordinary_root_can_read_bounded_peer_dialogue_without_global_discovery() {
     let fixture = Fixture::new().await;
+    let target = &fixture.targets[0];
     assert!(fixture
         .tool()
         .invoke(json!({"action":"list"}), Fixture::ctx(&fixture.caller))
@@ -424,11 +425,10 @@ async fn no_scope_or_known_id_never_exposes_global_or_peer_history_but_self_read
         .to_string()
         .contains("scope_required"));
     for request in [
-        json!({"action":"get_meta","session_id":fixture.targets[0].id}),
-        json!({"action":"read_messages","session_id":fixture.targets[0].id}),
-        json!({"action":"read_compressed_cache","session_id":fixture.targets[0].id}),
+        json!({"action":"get_meta","session_id":target.id}),
+        json!({"action":"read_compressed_cache","session_id":target.id}),
         json!({"action":"search","query":"private"}),
-        json!({"action":"export_context","session_id":fixture.targets[0].id}),
+        json!({"action":"export_context","session_id":target.id}),
         json!({"action":"list","grant":{"rights":["list_metadata"]}}),
     ] {
         assert!(fixture
@@ -437,6 +437,56 @@ async fn no_scope_or_known_id_never_exposes_global_or_peer_history_but_self_read
             .await
             .is_err());
     }
+    let progress = result(
+        fixture
+            .tool()
+            .invoke(
+                json!({"action":"inspect","session_id":target.id,"max_chars":4}),
+                Fixture::ctx(&fixture.caller),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(progress["session_id"], target.id);
+    assert_eq!(
+        progress["latest_visible_assistant_excerpt"]["content"],
+        "结果🎋结"
+    );
+    let peer = result(
+        fixture
+            .tool()
+            .invoke(
+                json!({"action":"read_messages","session_id":target.id,"include_system":true}),
+                Fixture::ctx(&fixture.caller),
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(peer["message_count_filtered"], 2);
+    assert_eq!(peer["messages"][0]["content"], "private target user");
+    assert_eq!(peer["messages"][1]["role"], "assistant");
+    for hidden in [
+        "private target system",
+        "private target reasoning",
+        "private hidden assistant",
+    ] {
+        assert!(!peer.to_string().contains(hidden));
+    }
+
+    let mut child = Session::new_child_of("unscoped-child", &fixture.caller, "model", "child");
+    child.set_project_id_meta(fixture.caller.project_id_meta().unwrap());
+    fixture.store.save_session(&child).await.unwrap();
+    for action in ["inspect", "read_messages"] {
+        assert!(fixture
+            .tool()
+            .invoke(
+                json!({"action":action,"session_id":target.id}),
+                Fixture::ctx(&child)
+            )
+            .await
+            .is_err());
+    }
+
     let own = result(
         fixture
             .tool()

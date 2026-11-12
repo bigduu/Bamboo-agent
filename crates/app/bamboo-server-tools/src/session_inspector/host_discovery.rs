@@ -210,9 +210,9 @@ impl SessionDiscoveryPort for HostSessionDiscovery {
     }
 }
 
-/// An installed Host token selects one route irrevocably for this call. Only
-/// never-installed absence permits the real original Supervisor compatibility
-/// reader. Denied/stale/revoked/unsupported scope never becomes another route.
+/// An installed Host token selects the finite route for ordinary callers.
+/// With no installation, an ordinary Root can inspect one current-user target.
+/// A denied, stale, revoked or unsupported scope never becomes another route.
 pub struct SessionDiscoveryRouter {
     storage: Arc<dyn Storage>,
     host: HostSessionDiscovery,
@@ -277,6 +277,18 @@ impl SessionDiscoveryPort for SessionDiscoveryRouter {
             .map_err(authority_unavailable)?
         {
             Some(token) => self.host.inspect_with_token(caller, &token, request).await,
+            None if caller.is_ordinary_root() => {
+                let session = self
+                    .storage
+                    .load_current_user_peer_session(caller, &request.session_id)
+                    .await
+                    .map_err(authority_unavailable)?;
+                Ok(progress_observation(
+                    &session,
+                    0,
+                    request.max_chars.unwrap_or(2_000),
+                ))
+            }
             None => {
                 require_legacy_supervisor(ctx)?;
                 let observation = self.supervisor.inspect(ctx, request).await?;
@@ -287,7 +299,7 @@ impl SessionDiscoveryPort for SessionDiscoveryRouter {
     }
 }
 
-fn original_caller(ctx: &ToolCtx) -> Result<&SessionCallerReference, ToolError> {
+pub(super) fn original_caller(ctx: &ToolCtx) -> Result<&SessionCallerReference, ToolError> {
     ctx.session_id()
         .and_then(|id| ctx.executing_caller_for(id))
         .ok_or_else(authority_required)

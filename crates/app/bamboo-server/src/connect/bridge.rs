@@ -16,6 +16,7 @@ use tokio_util::sync::CancellationToken;
 use bamboo_agent_core::tools::ToolExecutor;
 use bamboo_agent_core::{AgentEvent, Message, Session};
 use bamboo_domain::reasoning::ReasoningEffort;
+use bamboo_domain::CONNECT_SESSION_ORIGIN_KEY;
 use bamboo_engine::execution::runner_state::AgentRunner;
 use bamboo_engine::execution::{
     create_event_forwarder_with_root_actor, get_or_create_event_sender, reserve_session_execution,
@@ -330,7 +331,7 @@ fn create_connect_session(
     session.title_generated = true;
     session
         .metadata
-        .insert("created_by_connect_key".to_string(), key.to_string());
+        .insert(CONNECT_SESSION_ORIGIN_KEY.to_string(), key.to_string());
     session.metadata.insert(
         "base_system_prompt".to_string(),
         base_system_prompt.to_string(),
@@ -992,7 +993,16 @@ impl ConnectBridge {
         let existing_id = self.session_id_for_key(key).await;
         let session = match existing_id {
             Some(id) => match self.ctx.session_repo.load_merged(&id).await {
-                Some(session) => Ok(session),
+                Some(session)
+                    if session
+                        .metadata
+                        .get(CONNECT_SESSION_ORIGIN_KEY)
+                        .map(String::as_str)
+                        == Some(key) =>
+                {
+                    Ok(session)
+                }
+                Some(_) => Err("Connect could not verify the saved session's chat binding. Use /new to start a session for this chat.".to_string()),
                 None => self.create_and_register_session(key, &resolved).await,
             },
             None => self.create_and_register_session(key, &resolved).await,
@@ -2746,6 +2756,33 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    }
+
+    #[tokio::test]
+    async fn connect_rejects_a_mapped_session_without_its_chat_origin() {
+        let (ctx, _dir) = test_context().await;
+        let bridge = ConnectBridge::new(ctx, None);
+        let key = key_for("chat1", "u1");
+        let mut owner = Session::new("desktop-history", "gpt-4o-mini");
+        owner.add_message(Message::user("desktop history"));
+        bridge.ctx.session_repo.save(&mut owner).await.unwrap();
+        bridge.set_session_id_for_key(&key, &owner.id).await;
+
+        let platform = FakePlatform::new("fake");
+        let request = inbound("chat1", "u1", "1", "read history");
+        bridge
+            .run_prompt(&key, platform.clone(), &request.reply_ctx, &request.text)
+            .await;
+
+        assert!(platform.sent_texts().await[0].contains("chat binding"));
+        let saved = bridge
+            .ctx
+            .session_repo
+            .load_merged(&owner.id)
+            .await
+            .unwrap();
+        assert_eq!(saved.messages.len(), 1);
+        assert_eq!(saved.messages[0].content, "desktop history");
     }
 
     #[tokio::test]
