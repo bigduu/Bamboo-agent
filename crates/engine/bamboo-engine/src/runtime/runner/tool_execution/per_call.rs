@@ -773,12 +773,14 @@ async fn execute_tool_call_only_with_execution_name_inner(
         Ok(ToolOutcome::Completed(previous))
             if ctx.await_quiet_exec && execution_name == "write_stdin" =>
         {
+            let elapsed = tool_timer.elapsed();
             let remaining = std::time::Duration::from_secs(ctx.config.per_tool_timeout_secs)
-                .saturating_sub(tool_timer.elapsed());
-            let result = bamboo_tools::tools::write_stdin::continue_quiet_poll(
+                .saturating_sub(elapsed);
+            let result = bamboo_tools::tools::write_stdin::continue_empty_poll(
                 ctx.session_id,
                 &args,
                 &previous,
+                elapsed,
                 remaining,
             )
             .await

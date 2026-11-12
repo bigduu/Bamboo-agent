@@ -29,18 +29,18 @@ fn owned_exec(owner: &str, id: &str) -> Option<Arc<bash_runtime::ShellSession>> 
         .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
 }
 
-/// Continue a successful empty read of a quiet command within the caller's
-/// existing tool deadline. The foreground runner owns cancellation of the wait.
-pub async fn continue_quiet_poll(
+/// Honor a longer empty poll or continue a quiet one within the runner's
+/// tool deadline. The foreground runner owns cancellation of the wait.
+pub async fn continue_empty_poll(
     owner: &str,
     arguments: &Value,
     previous: &ToolResult,
+    elapsed: Duration,
     remaining: Duration,
 ) -> Option<ToolOutcome> {
     if remaining.is_zero() || !previous.success || !previous.images.is_empty() {
         return None;
     }
-    let deadline = tokio::time::Instant::now().checked_add(remaining)?;
     let args = WriteStdinArgs::deserialize(arguments).ok()?;
     let result: Value = serde_json::from_str(&previous.result).ok()?;
     if !args.chars.is_empty()
@@ -50,11 +50,22 @@ pub async fn continue_quiet_poll(
         || result["output"] != ""
         || result.get("output_omitted_bytes").is_some()
         || result.get("error").is_some()
-        || result["polling"]["state"] != "needs_diagnosis"
         || result["polling"]["exit_observed"] != false
     {
         return None;
     }
+    let remaining = match args
+        .yield_time_ms
+        .filter(|requested| *requested > yield_duration(Some(*requested)))
+    {
+        Some(requested) => remaining.min(Duration::from_millis(requested).saturating_sub(elapsed)),
+        None if result["polling"]["state"] == "needs_diagnosis" => remaining,
+        None => return None,
+    };
+    if remaining.is_zero() {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now().checked_add(remaining)?;
     let shell = owned_exec(owner, &args.session_id)?;
     let state = shell.polled.as_ref().expect("validated exec session");
     let _interaction = tokio::time::timeout_at(deadline, async {
@@ -88,14 +99,14 @@ impl Tool for WriteStdinTool {
     }
 
     fn description(&self) -> &str {
-        "Continue an exec_command session owned by this conversation. Empty chars waits/polls for incremental output and final exit status. Running results include polling elapsed/idle times, empty-readout count and exit_observed (false does not prove liveness). Follow a polling advisory by checking progress or doing useful work before polling again; silence does not prove completion. Nonempty chars writes exact bytes to an interactive stdin pipe; use eof=true to close it. A lone Ctrl-C (\\u0003) stops the process. Finished results omit session_id; nonzero exit codes are command outcomes."
+        "Wait on the session_id returned by exec_command. Empty chars reads output and the actual exit status. If the command is still running and its result is needed, continue with the same session_id and request a longer yield_time_ms. Nonempty chars writes exact bytes to an interactive stdin pipe, eof=true closes it, and a lone Ctrl-C (\\u0003) stops the command. A terminal result carries status and any exit code."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({"type":"object","properties":{
             "session_id":{"type":"string","description":"Running handle returned by exec_command"},
             "chars":{"type":"string","description":"Exact stdin bytes; empty or omitted waits/polls. A lone Ctrl-C stops the process"},
-            "yield_time_ms":{"type":"integer","description":"Wait before yielding again; default 10000, clamped to 250..30000 ms"},
+            "yield_time_ms":{"type":"integer","description":"Wait before yielding again, in milliseconds. Default 10000. An unattended empty poll can wait longer than 30000 within the runner's tool deadline."},
             "max_output_tokens":{"type":"integer","description":"Output string budget, default 2000, capped at 8192; four JSON-encoded bytes per token including quotes and escapes. Status/session/exit metadata is additional"},
             "eof":{"type":"boolean","description":"Close the stdin pipe after sending chars"}
         },"required":["session_id"],"additionalProperties":false})
