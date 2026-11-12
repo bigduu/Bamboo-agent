@@ -179,7 +179,7 @@ impl Tool for MemoryTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Recall with query, inspect a selected result with get, then use a mutation only when needed. Query before write or merge to avoid duplicates.",
+                    "description": "Recall with query, inspect a selected result with get, then use a mutation only when needed. Query before write or merge to avoid duplicates. Keep secrets and tokens out of all memory writes.",
                     "enum": [
                         "session_read",
                         "session_append",

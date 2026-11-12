@@ -10,6 +10,8 @@ use super::*;
 
 const LAST_POLL: &str = "poll-5";
 const OUTPUT: &str = "quiet command completed";
+const CLI_TIMEOUT_SECS: u64 = 20;
+const QUIET_AGE_SECS: u64 = 90;
 
 struct QuietExecProvider {
     gate: PathBuf,
@@ -49,8 +51,8 @@ impl LLMProvider for QuietExecProvider {
             0 => {
                 let gate = self.gate.to_string_lossy().replace('\'', "'\\''");
                 let command = format!(
-                    "n=0; while [ ! -f '{gate}' ] && [ \"$n\" -lt 1000 ]; do \
-                     sleep 0.01; n=$((n+1)); done; [ -f '{gate}' ] || exit 90; \
+                    "n=0; while [ ! -f '{gate}' ] && [ \"$n\" -lt 800 ]; do \
+                     sleep 0.05; n=$((n+1)); done; [ -f '{gate}' ] || exit 90; \
                      printf '%s' '{OUTPUT}'; exit 7"
                 );
                 call(
@@ -63,7 +65,7 @@ impl LLMProvider for QuietExecProvider {
                 if round == 1 {
                     // Age the actual captured process without a 90-second wall-clock sleep.
                     tokio::time::pause();
-                    tokio::time::advance(Duration::from_secs(90)).await;
+                    tokio::time::advance(Duration::from_secs(QUIET_AGE_SECS)).await;
                     tokio::time::resume();
                 }
                 let start = tool_result(messages, "start");
@@ -137,12 +139,15 @@ async fn run_quiet_exec(should_time_out: bool) {
             reasoning_effort: None,
             skill_mode: None,
             provider: None,
-            timeout_secs: should_time_out.then_some(5),
+            // Give the checkpointed setup rounds time to reach the quiet wait.
+            timeout_secs: should_time_out.then_some(CLI_TIMEOUT_SECS),
         },
         state,
     );
     tokio::pin!(run);
-    let result = tokio::time::timeout(Duration::from_secs(110), async {
+    // The fixture advances Tokio time while the CLI deadline uses wall time.
+    let fixture_timeout = Duration::from_secs(QUIET_AGE_SECS + CLI_TIMEOUT_SECS + 20);
+    let result = tokio::time::timeout(fixture_timeout, async {
         let handle = loop {
             let event = tokio::select! {
                 result = &mut run => panic!("headless exited before waiting: {result:?}"),
@@ -159,13 +164,13 @@ async fn run_quiet_exec(should_time_out: bool) {
                 _ => {}
             }
         };
+        // Both cases must enter the quiet wait beyond the requested 250 ms.
+        tokio::select! {
+            result = &mut run => panic!("headless exited with a live command: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(750)) => {}
+        }
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
         if !should_time_out {
-            // The next model turn must stay parked beyond the requested 250 ms.
-            tokio::select! {
-                result = &mut run => panic!("headless exited with a live command: {result:?}"),
-                _ = tokio::time::sleep(Duration::from_millis(750)) => {}
-            }
-            assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
             tokio::fs::write(&provider.gate, b"release").await.unwrap();
         }
         let result = run.await;
@@ -184,7 +189,7 @@ async fn run_quiet_exec(should_time_out: bool) {
     .expect("headless run should finish");
     if should_time_out {
         assert!(result.unwrap_err().contains("cancelled"));
-        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(started.elapsed() >= Duration::from_secs(CLI_TIMEOUT_SECS));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
     } else {
         assert!(result.is_ok(), "{result:?}");
