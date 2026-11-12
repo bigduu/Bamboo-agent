@@ -11,6 +11,7 @@ use crate::runtime::stream::handler::StreamHandlingOutput;
 use bamboo_agent_core::tools::ToolSchema;
 use bamboo_agent_core::{AgentError, AgentEvent, Role, Session};
 use bamboo_config::ContextManagementStrategy;
+use bamboo_domain::{ProviderTranscriptItemKind, ReasoningEffort};
 use bamboo_llm::LLMProvider;
 use bamboo_metrics::TokenUsage as MetricsTokenUsage;
 
@@ -40,6 +41,22 @@ pub(in crate::runtime::runner) fn is_openai_client_tool_search_boundary(
             && item.kind() == bamboo_domain::ProviderTranscriptItemKind::OpenAiToolSearchCall
             && item.payload()["execution"].as_str() == Some("client")
     })
+}
+
+fn rejected_output_limit(output: &StreamHandlingOutput, finish_reason: &str) -> bool {
+    matches!(
+        finish_reason,
+        "max_tokens" | "max_output_tokens" | "length" | "MAX_TOKENS"
+    ) && (output.content.trim().is_empty()
+        || !output.tool_calls.is_empty()
+        || output.provider_transcript_items.iter().any(|item| {
+            item.kind().is_discovery()
+                || matches!(
+                    item.kind(),
+                    ProviderTranscriptItemKind::OpenAiFunctionCall
+                        | ProviderTranscriptItemKind::AnthropicToolUse
+                )
+        }))
 }
 
 fn request_tool_schemas_for_loading_mode<'a>(
@@ -250,6 +267,7 @@ pub(crate) async fn execute_llm_round(
     tool_schemas: &[ToolSchema],
     observation_progress_hint: Option<&str>,
     prompt_memory_exposure: Option<PromptMemoryExposureFrame<'_>>,
+    reasoning_effort_override: Option<ReasoningEffort>,
 ) -> Result<RoundLlmExecutionOutput, AgentError> {
     // Clear the previous receipt even when preflight or admission fails.
     let host_gold_attempt = config.host_gold_run.as_ref().map(|run| run.begin());
@@ -283,7 +301,7 @@ pub(crate) async fn execute_llm_round(
         model,
         provider_name: config.provider_name.as_deref(),
         provider_type: config.provider_type.as_deref(),
-        reasoning_effort: config.reasoning_effort,
+        reasoning_effort: reasoning_effort_override.or(config.reasoning_effort),
         max_context_tokens: prepared.budget.max_context_tokens,
         max_output_tokens: prepared.budget.max_output_tokens,
         observation_progress_hint,
@@ -298,24 +316,42 @@ pub(crate) async fn execute_llm_round(
         tool_schemas,
         &frame,
     );
-    let (stream_output, llm_duration, prompt_tokens) = match host_gold_attempt.as_ref() {
-        Some(attempt) => {
-            bamboo_llm::provider::scope_main_dispatch(attempt.observer(), execution).await?
-        }
-        None => execution.await?,
-    };
+    let (stream_output, llm_duration, prompt_tokens, finish_reason) =
+        match host_gold_attempt.as_ref() {
+            Some(attempt) => {
+                bamboo_llm::provider::scope_main_dispatch(attempt.observer(), execution).await?
+            }
+            None => execution.await?,
+        };
 
     // This is a terminal validation error, but the completed stream was still
     // billed. Return it alongside the canonical attempt usage so the runner can
     // account for the attempt before ending the round.
     let openai_client_search_boundary =
         is_openai_client_tool_search_boundary(&stream_output.provider_transcript_items);
-    let terminal_validation_error = (stream_output.tool_calls.is_empty()
+    let empty_answer = stream_output.tool_calls.is_empty()
         && stream_output.content.trim().is_empty()
-        && !openai_client_search_boundary)
-        .then(|| AgentError::EmptyAssistantResponse {
+        && !openai_client_search_boundary;
+    let terminal_validation_error = if rejected_output_limit(&stream_output, finish_reason) {
+        Some(AgentError::OutputTokenLimit {
+            finish_reason,
             response_id: stream_output.response_id.clone(),
-        });
+            reasoning_only: empty_answer
+                && !stream_output.reasoning_content.trim().is_empty()
+                && stream_output.provider_transcript_items.iter().all(|item| {
+                    matches!(
+                        item.kind(),
+                        ProviderTranscriptItemKind::OpenAiReasoning
+                            | ProviderTranscriptItemKind::AnthropicThinking
+                            | ProviderTranscriptItemKind::AnthropicRedactedThinking
+                    )
+                }),
+        })
+    } else {
+        empty_answer.then(|| AgentError::EmptyAssistantResponse {
+            response_id: stream_output.response_id.clone(),
+        })
+    };
 
     let completion_tokens =
         estimate_completion_tokens(&stream_output.content, &stream_output.tool_calls);
@@ -677,6 +713,7 @@ mod tests {
             &tools,
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -719,6 +756,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
             None,
             None,
         )
@@ -766,6 +804,7 @@ mod tests {
             "sticky-round-tools",
             "chat-model",
             &tools,
+            None,
             None,
             None,
         )

@@ -728,7 +728,7 @@ async fn execute_llm_stream_sets_session_usage_and_emits_budget_event() {
     let llm = mock_llm(vec![LLMChunk::Token("hi".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -1614,7 +1614,7 @@ async fn explicit_activation_pending_suppresses_answer_tokens() {
         })
         .collect::<Vec<_>>();
 
-    let (stream_output, _, _) = execute_llm_stream(
+    let (stream_output, _, _, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -2140,7 +2140,7 @@ async fn execute_llm_stream_emits_final_budget_event_with_provider_usage() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -2331,7 +2331,7 @@ async fn execute_llm_stream_includes_task_block_in_full_request() {
     let llm = mock_llm(vec![LLMChunk::Token("ok".to_string()), LLMChunk::Done]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4523,7 +4523,7 @@ async fn execute_llm_stream_ignores_previous_response_id_under_stateless_store_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4689,7 +4689,7 @@ async fn execute_llm_stream_includes_external_memory_volatile_block() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4787,7 +4787,7 @@ async fn execute_llm_stream_includes_plan_mode_and_runtime_volatile_blocks() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4876,7 +4876,7 @@ async fn execute_llm_stream_sends_full_request_with_summary_when_compression_is_
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -4979,7 +4979,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot() {
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -5091,7 +5091,7 @@ async fn execute_llm_stream_disables_previous_response_id_for_copilot_instance_p
     ]);
     let llm_dyn: Arc<dyn LLMProvider> = llm.clone();
 
-    let (_stream_output, _duration, _prompt_tokens) = execute_llm_stream(
+    let (_stream_output, _duration, _prompt_tokens, _finish_reason) = execute_llm_stream(
         &mut session,
         &config,
         &llm_dyn,
@@ -6124,6 +6124,7 @@ async fn run_vision_round(
         "test-model",
         &[],
         hint,
+        None,
         None,
     )
     .await

@@ -185,6 +185,7 @@ fn interruption_kind(error: &AgentError) -> &'static str {
         AgentError::Cancelled => "cancelled",
         AgentError::StreamTimeout(_) => "stream_timeout",
         AgentError::LLMOverflow(_) => "llm_overflow",
+        AgentError::OutputTokenLimit { .. } => "output_token_limit",
         AgentError::EmptyAssistantResponse { .. } => "empty_assistant_response",
         AgentError::LLM(_) | AgentError::LLMNonRetryable(_) => "llm_error",
         _ => "execution_error",
@@ -1487,6 +1488,7 @@ pub(super) async fn execute_llm_stream(
         crate::runtime::stream::handler::StreamHandlingOutput,
         u128,
         u64,
+        &'static str,
     ),
     AgentError,
 > {
@@ -1817,16 +1819,20 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
+    let completion = bamboo_llm::provider::CompletionDiagnostics::default();
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
             crate::runtime::stream::handler::await_stream_bootstrap_observed(
-                llm.chat_stream_ir(
-                    &prepared_envelope.ir,
-                    tool_schemas,
-                    Some(max_output_tokens),
-                    model,
-                    Some(&planned.request_options),
+                bamboo_llm::provider::scope_completion_diagnostics(
+                    completion.clone(),
+                    llm.chat_stream_ir(
+                        &prepared_envelope.ir,
+                        tool_schemas,
+                        Some(max_output_tokens),
+                        model,
+                        Some(&planned.request_options),
+                    ),
                 ),
                 cancel_token,
                 session_id,
@@ -2192,32 +2198,28 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if continuation_enabled {
-        if let Some(response_id) = stream_output
-            .response_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            session.metadata.insert(
-                SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
-                response_id.to_string(),
-            );
-        } else {
-            session
-                .metadata
-                .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    let finish_reason = completion.finish_reason();
+    if !super::rejected_output_limit(&stream_output, finish_reason) {
+        let response_id = stream_output.response_id.as_deref().map(str::trim);
+        match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
+            Some(id) => {
+                session.metadata.insert(
+                    SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
+                    id.to_string(),
+                );
+            }
+            None => {
+                session
+                    .metadata
+                    .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+            }
         }
-    } else {
-        session
-            .metadata
-            .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
     let prompt_tokens = super::token_estimation::estimate_prompt_tokens(&prepared_context.messages);
 
-    Ok((stream_output, llm_duration, prompt_tokens))
+    Ok((stream_output, llm_duration, prompt_tokens, finish_reason))
 }
 
 #[cfg(test)]
