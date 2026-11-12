@@ -8094,6 +8094,14 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn load_current_user_peer_session(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.current_user_peer_session(caller, target_id).await
+    }
+
     async fn load_host_scoped_context_target(
         &self,
         token: &bamboo_domain::HostSessionScopeToken,

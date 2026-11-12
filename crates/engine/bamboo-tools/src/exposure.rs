@@ -153,7 +153,7 @@ pub fn expandable_tool_short_description(name: &str) -> Option<&'static str> {
         "memory" => Some("Manage Bamboo's unified memory system for session notes and durable project/global memories."),
         "scheduler" => Some("Manage Bamboo scheduled automation jobs for recurring or delayed work."),
         "SubAgent" => Some("Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work."),
-        "session_history" => Some("Search, page, and read complete turns around hits in the current Bamboo Session's stored messages, including compressed history. Root schemas may also offer cross-session list/inspect/search/export actions. Distinct from `memory` (durable knowledge)."),
+        "session_history" => Some("Read stored Session history, including archived messages. When the Host allows current-user peer history, an ordinary Root can use inspect or read_messages with another Session ID."),
         "ExitPlanMode" => Some("Ask for confirmation before leaving plan mode."),
         _ => None,
     }

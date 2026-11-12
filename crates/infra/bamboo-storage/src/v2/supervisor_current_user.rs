@@ -180,6 +180,50 @@ impl SessionStoreV2 {
         Ok(Some((target, observation)))
     }
 
+    pub(in crate::v2) async fn current_user_peer_session(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        if !caller.is_ordinary_root() {
+            return Err(denied(
+                "current-user peer history requires an ordinary Root",
+            ));
+        }
+        let _scope = self
+            .host_scope_registry
+            .retain_never_installed(&caller.session_id)
+            .await?;
+        let wait = SessionLockWait::Wait;
+        let (source, source_observation) = self
+            .current_user_target_source(&caller.session_id, wait)
+            .await?
+            .ok_or_else(|| denied("current-user history caller is unavailable"))?;
+        if !caller.matches_session(&source) {
+            return Err(denied("current-user history caller changed"));
+        }
+        let (_, target) = self
+            .current_user_target_source(target_id, wait)
+            .await?
+            .ok_or_else(|| denied("current-user history target is unavailable"))?;
+        let target_root = target.identity.root_session_id.clone();
+        let _guards = self
+            .lock_host_scope_control_observations(&[source_observation, target], wait)
+            .await?;
+        for root_id in [&caller.root_session_id, &target_root] {
+            self.load_root_authority_unchecked(root_id)
+                .await?
+                .ok_or_else(|| denied("current-user history Root is unavailable"))?;
+        }
+        let current = self
+            .peer_delivery_control_session(&caller.session_id, &caller.root_session_id)
+            .await?;
+        if !caller.matches_session(&current) {
+            return Err(denied("current-user history caller changed"));
+        }
+        self.peer_delivery_session(target_id, &target_root).await
+    }
+
     pub(crate) async fn lock_current_user_target(
         &self,
         reference: &SupervisorReference,

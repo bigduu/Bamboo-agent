@@ -20,6 +20,7 @@ use discovery::{
     AuthorizedSessionInspectRequest, AuthorizedSessionListRequest, SessionDiscoveryPort,
     SupervisorSessionDiscovery,
 };
+use handlers::MessageReadView;
 
 const SESSION_HISTORY_TOOL_NAME: &str = "session_history";
 const SESSION_HISTORY_CURRENT_TOOL_NAME: &str = "session_history_current";
@@ -31,7 +32,7 @@ enum SessionHistoryAccess {
     SelfOnly,
     /// Preserve the complete Root viewer in addition to self-history reads.
     Full,
-    /// Self reads plus Host-routed list/inspect. No ordinary raw peer history.
+    /// Self reads, scoped discovery and bounded current-user peer history.
     HostRouted,
     /// Only metadata discovery and bounded progress through an installed grant adapter.
     Authorized,
@@ -186,7 +187,7 @@ impl Tool for SessionInspectorTool {
                 "Read-only history and discovery. A canonical Supervisor can list all Sessions in the application's current-user domain with bounded pages/cursors, inspect persisted progress, and read bounded Root/Child history without Project authorization or attachment. Directory entries and inspect include current_user_target: preserve it as target_ref for a later followup; the final sender separately checks caller and target lifetime/generation/ancestry. Query matches IDs or Projects; stale cursors require a fresh page. Persisted progress is not verified live or input-specific completion. Ordinary viewers retain current-Session paging/search and their existing same-tree or finite Host rights. This viewer has no execution or file authority."
             }
             SessionHistoryAccess::HostRouted => {
-                "Read-only Session discovery. A canonical Supervisor uses the current-user domain resolver regardless of legacy Project lists, attachments or old finite Host scope; its original identity and source generation are checked on every operation. Other callers retain explicitly installed Host scopes: list/inspect provide bounded metadata/progress, and export_context/read_context require their independent ReadContextView right and fixed selectors. Revoked/unsupported ordinary scopes never fall back to broader access. IDs, Projects and cursors grant nothing. Use current-Session paging/search for current history. This tool attaches no history, sends no input and grants no raw file or execution authority."
+                "Read-only Session history. An ordinary Root in the application's current-user data domain can use inspect for saved progress and read_messages for visible conversation text from a known session_id, including archived messages. An explicitly installed Host scope limits ordinary callers to its granted operations. A canonical Supervisor uses its current-user discovery route. export_context/read_context require their own authority. Use session_history_current for current-Session search and paging. Results are persisted observations and grant no control over the target."
             }
             SessionHistoryAccess::Authorized => {
                 "Read-only discovery of explicitly Host-authorized Sessions. list returns metadata-only pages (limit <=20, query matches target ID/Project); reuse the returned cursor with the same query and limit. inspect returns bounded persisted progress and a visible assistant excerpt, never verified live or input-specific completion. Caller identity and grants come from the installed Host adapter. Missing/stale authority is a blocker; this surface never falls back to all local Sessions, attaches history or sends work. Use session_message(action=send) with its own Host authority for delivery; this listing is not a sending grant."
@@ -320,7 +321,7 @@ impl Tool for SessionInspectorTool {
                 "read_context"
             ]);
             schema["properties"]["session_id"]["description"] = json!(
-                "inspect requires InspectBoundedProgress; export_context/read_context separately require ReadContextView. An original managed Supervisor may use its independent never-installed-Host compatibility route. read_context accepts only exact revision, status/brief, offset<=120 and limit1..40. Other actions are self-only, except existing managed get_meta/read_messages for a real Supervisor with never-installed Host scope."
+                "For an ordinary Root with no finite Host scope, inspect and read_messages accept another ordinary Session ID in the same user-data domain. Peer read_messages pages contain visible user and assistant text (up to 20 messages, 1000 characters each). Scoped inspect requires InspectBoundedProgress; export_context/read_context require ReadContextView or an existing authorized route. read_context accepts only exact revision, status/brief, offset<=120 and limit1..40."
             );
             schema["properties"]["query"]["description"] = json!(
                 "Target ID/Project filter for list, or text in current-Session search_current."
@@ -512,13 +513,16 @@ impl Tool for SessionInspectorTool {
         let guarded_self =
             self.access == SessionHistoryAccess::SelfOnly && ctx.executing_caller.is_some();
         let mut legacy_supervisor_history = false;
+        let mut peer_history = None;
         if routed || guarded_self || ctx.executing_supervisor_for(caller_session_id).is_some() {
             host_discovery::validate_original_caller(self.storage.as_ref(), &ctx).await?;
         }
         if routed {
             let other_target = match &parsed {
+                SessionInspectorArgs::ReadMessages { session_id, .. } => {
+                    session_id.trim() != caller_session_id
+                }
                 SessionInspectorArgs::GetMeta { session_id }
-                | SessionInspectorArgs::ReadMessages { session_id, .. }
                 | SessionInspectorArgs::ReadCompressedCache { session_id, .. }
                 | SessionInspectorArgs::ExportContext { session_id } => {
                     session_id != caller_session_id
@@ -529,22 +533,33 @@ impl Tool for SessionInspectorTool {
                 return Err(ToolError::Execution("session_discovery_bounded_scope: global history search is unavailable; use authorized list/inspect or search_current".into()));
             }
             if other_target {
-                if matches!(
-                    &parsed,
-                    SessionInspectorArgs::GetMeta { .. }
-                        | SessionInspectorArgs::ReadMessages { .. }
-                ) {
-                    if ctx.executing_supervisor_for(caller_session_id).is_none() {
-                        return Err(ToolError::Execution("session_discovery_bounded_scope: another Session's raw history/metadata is unavailable; use authorized list/inspect".into()));
+                match &parsed {
+                    SessionInspectorArgs::ReadMessages { session_id, .. }
+                        if ctx.executing_supervisor_for(caller_session_id).is_none() =>
+                    {
+                        let caller = host_discovery::original_caller(&ctx)?;
+                        peer_history = Some(
+                            self.storage
+                                .load_current_user_peer_session(caller, session_id.trim())
+                                .await
+                                .map_err(discovery::authority_unavailable)?,
+                        );
                     }
-                    host_discovery::require_absent_host_for_legacy_history(
-                        self.storage.as_ref(),
-                        &ctx,
-                    )
-                    .await?;
-                    legacy_supervisor_history = true;
-                } else {
-                    return Err(ToolError::Execution("session_discovery_bounded_scope: peer raw history/cache/export is unavailable; use authorized list/inspect".into()));
+                    SessionInspectorArgs::GetMeta { .. }
+                    | SessionInspectorArgs::ReadMessages { .. } => {
+                        if ctx.executing_supervisor_for(caller_session_id).is_none() {
+                            return Err(ToolError::Execution("session_discovery_bounded_scope: another Session's metadata is unavailable; use inspect".into()));
+                        }
+                        host_discovery::require_absent_host_for_legacy_history(
+                            self.storage.as_ref(),
+                            &ctx,
+                        )
+                        .await?;
+                        legacy_supervisor_history = true;
+                    }
+                    _ => {
+                        return Err(ToolError::Execution("session_discovery_bounded_scope: peer cache/export is unavailable; use authorized list/inspect".into()));
+                    }
                 }
             }
         }
@@ -620,7 +635,7 @@ impl Tool for SessionInspectorTool {
                 .ok_or_else(|| ToolError::Execution("managed history target is missing".into()))?;
             let result = match parsed {
                 SessionInspectorArgs::ReadMessages { session_id, from_end, offset, limit, truncate_chars, include_system, include_tool, include_tool_calls, include_image_urls } => {
-                    handlers::handle_read_messages(self, Some(session), session_id, from_end, offset, limit, truncate_chars, include_system, include_tool, include_tool_calls, include_image_urls).await?
+                    handlers::handle_read_messages(self, Some(session), session_id, from_end, offset, limit, truncate_chars, include_system, include_tool, include_tool_calls, include_image_urls, MessageReadView::Session).await?
                 }
                 SessionInspectorArgs::GetMeta { .. } => bamboo_agent_core::tools::ToolResult::text(true, json!({"session":{
                     "id":session.id,"kind":session.kind,"root_session_id":session.root_session_id,
@@ -739,9 +754,14 @@ impl Tool for SessionInspectorTool {
                 include_tool_calls,
                 include_image_urls,
             } => {
+                let view = if peer_history.is_some() {
+                    MessageReadView::VisibleDialogue
+                } else {
+                    MessageReadView::Session
+                };
                 handlers::handle_read_messages(
                     self,
-                    None,
+                    peer_history,
                     session_id,
                     from_end,
                     offset,
@@ -751,6 +771,7 @@ impl Tool for SessionInspectorTool {
                     include_tool,
                     include_tool_calls,
                     include_image_urls,
+                    view,
                 )
                 .await
             }
