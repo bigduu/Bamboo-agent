@@ -170,7 +170,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Bamboo's unified memory tool. Use session_* for continuity notes. For durable memory, start with a short lexical query. Omitting limit returns a compact top-3 shortlist with actionable ids and no bodies. Then get only selected ids. Query before write/merge, and persist one atomic confirmed fact with bounded tags, keywords, and entities. Query Section first for Section-specific work when Bamboo has assigned a Section. Without a Section, use Project or Global for facts of those scopes and Session notes for Section-only context. Bamboo's Project and Section assignments are the trusted scope authority. Verify live state when a fact may have changed. Retrieval is embedding-free. A blank query remains a management listing."
+        "Recall past decisions and preferences and handle explicit requests to remember or forget. Use session_* for continuity notes. For durable memory, start with a short lexical query. Omitting limit returns a compact top-3 shortlist with actionable ids and no bodies. Then get only selected ids. Query before write/merge, and persist one atomic confirmed fact with bounded tags, keywords, and entities. Query Section first for Section-specific work when Bamboo has assigned a Section. Without a Section, use Project or Global for facts of those scopes and Session notes for Section-only context. Bamboo's Project and Section assignments are the trusted scope authority. Verify live state when a fact may have changed. Retrieval is embedding-free. A blank query remains a management listing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

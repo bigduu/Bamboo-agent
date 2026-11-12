@@ -207,16 +207,6 @@ pub(super) fn strip_existing_external_memory(prompt: &str) -> String {
     )
 }
 
-/// Extract the marker-free body from a freshly-rendered external-memory section.
-fn extract_external_memory_inner(full_section: &str) -> String {
-    full_section
-        .trim()
-        .strip_prefix(EXTERNAL_MEMORY_START_MARKER)
-        .and_then(|rest| rest.strip_suffix(EXTERNAL_MEMORY_END_MARKER))
-        .map(|inner| inner.trim().to_string())
-        .unwrap_or_default()
-}
-
 /// The rendered external-memory section body for this round (marker-free), or
 /// `None` when there is nothing to surface. Read from the session field populated
 /// by the async refresh.
@@ -463,13 +453,14 @@ async fn refresh_external_memory_context_with_store_resolver_and_ledger(
         &render_parts,
     );
 
-    let inner = extract_external_memory_inner(&render_parts.full_section);
-    if inner.trim().is_empty() {
+    let rendered = render_parts.full_section.trim();
+    if rendered.is_empty() {
         session.metadata.remove(EXTERNAL_MEMORY_RENDERED_KEY);
     } else {
-        session
-            .metadata
-            .insert(EXTERNAL_MEMORY_RENDERED_KEY.to_string(), inner);
+        session.metadata.insert(
+            EXTERNAL_MEMORY_RENDERED_KEY.to_string(),
+            rendered.to_string(),
+        );
     }
     persist_prompt_memory_observability(session, &observability);
 
@@ -933,76 +924,23 @@ fn build_external_memory_render_parts(
         .unwrap_or_default();
     let context_pressure_warning = render_context_pressure_warning(session).unwrap_or_default();
 
+    let memory_sections = [
+        &session_note_section,
+        &ledger_agenda_section,
+        &relevant_memory_section,
+        &project_memory_index_section,
+        &project_dream_section,
+        &global_dream_fallback_section,
+    ];
     let mut section = String::new();
-    section.push_str("\n\n");
-    section.push_str(EXTERNAL_MEMORY_START_MARKER);
-    section.push('\n');
-    section.push_str("## External Memory (Persistent)\n\n");
-    section.push_str("You have access to layered persistent memory for this conversation:\n");
-    section.push_str(
-        "- **Session Memory Note**: current-session continuity for this session/workstream\n",
-    );
-    section.push_str(
-        "- **Ledger Agenda**: the user's open prospective records (todos, events, reminders) that are overdue or coming up\n",
-    );
-    section.push_str(
-        "- **Relevant Durable Memories**: turn-specific historical memories shortlisted for the current user request\n",
-    );
-    section.push_str(
-        "- **Project Durable Memory Index**: canonical cross-session project memory when project scope is confidently known\n",
-    );
-    section.push_str(
-        "- **Project Dream Summary**: synthesized project-scoped orientation when available\n",
-    );
-    section.push_str(
-        "- **Global Dream Summary (fallback)**: synthesized auxiliary orientation, lower-trust than durable memory and current observed state\n\n",
-    );
-    section.push_str(
-        "Priority order for decisions: current observed state from tools/files > session note > ledger agenda > relevant durable memories > project durable memory index > project Dream > global Dream fallback. This order reflects working-context recency, not factual authority: a session note ranks high because it is the live workstream, so if it conflicts with canonical durable/project memory on an established fact, verify before preferring the note.\n",
-    );
-    section.push_str(
-        "If indexed or recalled memory appears to describe files, symbols, configs, or runtime state, verify it against current tools/files before asserting it as fact.\n\n",
-    );
-    section.push_str(
-        "Two distinct surfaces: use the `session_note` tool for current-session notes (usage shown below), and the `memory` tool only for durable project/global knowledge that should persist across sessions.\n\n",
-    );
-    section.push_str("- If you learn durable information that will help later in other sessions (preferences, confirmed project decisions, stable references, non-derivable context), store it with the `memory` tool instead of only leaving it in session_note.\n");
-    section.push_str("- When the user states a commitment, deadline, appointment, or recurring routine, record it with the `ledger` tool (action=upsert; set due_at/remind_at so reminders actually fire) instead of keeping it only in the session task list. Mark records done/cancelled with action=transition, and answer \"what's on my plate\" questions from action=agenda/query.\n");
-    section.push_str("- Proactively recall: when the user refers to their own preferences, past decisions, or subjective/personal context you don't already know — including first-person questions about themselves ('what do I...', 'did I...', '我...?') — call `memory` action=query BEFORE answering. Do not reply that you don't know without querying first.\n");
-    section.push_str("- For durable recall, prefer `memory` action=query first with a short, discriminative lexical query containing specific names, decisions, or keywords. Auto-injected recall is only a compact top-3 shortlist; for a selected item, call `memory` action=get with its stable id before using its details.\n");
-    section.push_str("- Query before writing. If the same fact already exists, call `memory` action=get and then `memory` action=merge; otherwise write exactly one confirmed atomic fact. Use Project scope for project knowledge and Global scope only for genuinely cross-project knowledge.\n");
-    section.push_str("- Give each durable memory a specific, descriptive title that summarizes its own content; recall is keyword-based, so a misleading title makes the memory unfindable.\n");
-    section.push_str("- Treat Dream as low-trust orientation only. Live-verify code, files, configuration, and runtime state before relying on memory claims.\n");
-    section.push_str("- Do NOT store secrets/tokens. Jiandu recall is lexical and model-keyword-driven; do not use or request embeddings.\n");
-    section.push_str(
-        "- Keep the session note concise and factual. If it gets too long, compress it (rewrite a shorter version) and replace it.\n\n",
-    );
-    section.push_str("Session-memory tool usage:\n");
-    section.push_str(&format!(
-        "- Append: call `{EXTERNAL_MEMORY_TOOL_NAME}` with `{{\"action\":\"append\",\"content\":\"...\"}}`\n"
-    ));
-    section.push_str(&format!(
-        "- Replace (for compression): call `{EXTERNAL_MEMORY_TOOL_NAME}` with `{{\"action\":\"replace\",\"content\":\"...\"}}`\n"
-    ));
-    section.push_str(&format!(
-        "- Read full note (if truncated): call `{EXTERNAL_MEMORY_TOOL_NAME}` with `{{\"action\":\"read\"}}`\n"
-    ));
-    section.push_str(
-        "- Use separate topics: add `\"topic\":\"my-topic\"` to keep unrelated workstreams isolated\n",
-    );
-    section.push_str(&format!(
-        "- List topics: call `{EXTERNAL_MEMORY_TOOL_NAME}` with `{{\"action\":\"list_topics\"}}`\n\n"
-    ));
-
-    section.push_str(&session_note_section);
-    section.push_str(&ledger_agenda_section);
-    section.push_str(&relevant_memory_section);
-    section.push_str(&project_memory_index_section);
-    section.push_str(&project_dream_section);
-    section.push_str(&global_dream_fallback_section);
+    if memory_sections.iter().any(|part| !part.is_empty()) {
+        section.push_str("## External Memory (Persistent)\n\n");
+        section.push_str("Verify workspace and runtime claims against current evidence. Resolve conflicts between session notes and durable facts before relying on either. Treat Dream summaries as orientation.\n\n");
+        for part in memory_sections {
+            section.push_str(part);
+        }
+    }
     section.push_str(&context_pressure_warning);
-    section.push('\n');
-    section.push_str(EXTERNAL_MEMORY_END_MARKER);
 
     ExternalMemoryRenderParts {
         session_note_section,
@@ -1147,14 +1085,11 @@ fn persist_prompt_memory_observability(
 }
 
 fn render_session_note_section(snippets: &[TopicSnippet]) -> String {
-    let mut section = String::new();
-
     if snippets.is_empty() {
-        section.push_str("### Session Memory Note (markdown)\n");
-        section.push_str("````md\n_(empty)_\n````\n\n");
-        return section;
+        return String::new();
     }
 
+    let mut section = String::new();
     if snippets.len() == 1 && snippets[0].name == "default" {
         let s = &snippets[0];
         section.push_str("### Session Memory Note (markdown)\n");
