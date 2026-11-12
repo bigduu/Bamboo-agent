@@ -570,8 +570,7 @@ impl SessionStoreV2 {
         // The committed receipt fixes the exact claim under these same guards.
         // Its cleanup still requires the live Root and the canonical checkpoint.
         let cleanup = filesystem.with_check(Arc::new(move || {
-            let durable = root_proof.validate()?;
-            cleanup_input.validate_transcript(&durable)
+            root_proof.validate_inbox_cleanup(|durable| cleanup_input.validate_transcript(durable))
         }));
         let filesystem = cleanup
             .clone()

@@ -556,6 +556,35 @@ async fn root_owned_ack_cleans_up_committed_claim_after_only_inbox_lease_expires
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_owned_ack_rechecks_root_deadline_after_input_proof() {
+    let f = Fixture::new(LeaseDuration::seconds(2)).await;
+    let claim = f.claim(LeaseDuration::seconds(2)).await;
+    f.checkpoint(&claim).await.unwrap();
+    let proof = super::root_actor_runtime::RootActorWriteProof::new(f.directory(), f.owner.clone());
+    let deadline = f.root_expires_at;
+    let error = tokio::task::spawn_blocking(move || {
+        proof.validate_inbox_cleanup(|durable| {
+            assert!(
+                Utc::now() < deadline,
+                "Root starts cleanup with a live lease"
+            );
+            assert!(durable.messages.iter().any(|message| {
+                bamboo_domain::is_matching_session_message(message, &claim.claim.envelope)
+            }));
+            tokio::runtime::Handle::current().block_on(expire(deadline));
+            Ok(())
+        })
+    })
+    .await
+    .unwrap()
+    .expect_err("Root expiry during canonical proof must fence cleanup");
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(error
+        .to_string()
+        .contains("Root lease expired before Inbox cleanup"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_owned_renew_fences_old_token_and_release_preserves_input_without_failure() {
     let f = Fixture::new(LeaseDuration::seconds(30)).await;
     let first = f.claim(LeaseDuration::seconds(2)).await;
