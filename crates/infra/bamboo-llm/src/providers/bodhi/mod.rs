@@ -22,6 +22,7 @@ use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, tools_to_openai_compat_json,
 };
+use crate::providers::common::request_overrides;
 use crate::providers::common::sse::llm_stream_from_sse;
 use bamboo_config::KeywordMaskingConfig;
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
@@ -262,7 +263,13 @@ impl BodhiProvider {
             parallel_tool_calls,
         );
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            None,
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            model,
+        )?;
 
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/chat/completions");
@@ -324,7 +331,13 @@ impl BodhiProvider {
             None,
         );
         apply_required_tool_choice(&mut body, required_tool);
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            None,
+            request_overrides::ENDPOINT_MESSAGES,
+            model,
+        )?;
 
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/messages");
@@ -385,7 +398,13 @@ impl BodhiProvider {
         // Serialize then run the last-moment scan over the body Value before send.
         let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
         apply_required_tool_choice(&mut request_json, required_tool);
-        crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut request_json,
+            &self.masking_config,
+            None,
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            model,
+        )?;
 
         let headers = self.build_headers()?;
         let url = self.proxy_url(&format!(

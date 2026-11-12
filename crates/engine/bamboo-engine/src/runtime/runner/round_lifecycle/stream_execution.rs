@@ -33,7 +33,7 @@ use bamboo_domain::{
     CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
     ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
-use bamboo_llm::provider::ResponsesRequestOptions;
+use bamboo_llm::provider::{CompletionDiagnostics, OutputLimitRecovery, ResponsesRequestOptions};
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
     ProviderVisibleToolFootprint, ProviderVisibleToolSegmentKind, Segment, SegmentRole,
@@ -54,6 +54,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_name: Option<&'a str>,
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub output_limit_recovery: Option<OutputLimitRecovery>,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
     pub observation_progress_hint: Option<&'a str>,
@@ -1488,7 +1489,7 @@ pub(super) async fn execute_llm_stream(
         crate::runtime::stream::handler::StreamHandlingOutput,
         u128,
         u64,
-        &'static str,
+        CompletionDiagnostics,
     ),
     AgentError,
 > {
@@ -1819,7 +1820,7 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
-    let completion = bamboo_llm::provider::CompletionDiagnostics::default();
+    let completion = CompletionDiagnostics::for_agent_round(frame.output_limit_recovery);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
@@ -2072,8 +2073,10 @@ pub(super) async fn execute_llm_stream(
     );
     observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
 
+    let output_limited = super::rejected_output_limit(&stream_output, completion.finish_reason());
     if config.features_final_evidence_check
         && !activation_pending
+        && !output_limited
         && !stream_output.tool_calls.is_empty()
     {
         if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {
@@ -2198,8 +2201,7 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    let finish_reason = completion.finish_reason();
-    if !super::rejected_output_limit(&stream_output, finish_reason) {
+    if !output_limited {
         let response_id = stream_output.response_id.as_deref().map(str::trim);
         match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
             Some(id) => {
@@ -2219,7 +2221,7 @@ pub(super) async fn execute_llm_stream(
     let llm_duration = llm_started_at.elapsed().as_millis();
     let prompt_tokens = super::token_estimation::estimate_prompt_tokens(&prepared_context.messages);
 
-    Ok((stream_output, llm_duration, prompt_tokens, finish_reason))
+    Ok((stream_output, llm_duration, prompt_tokens, completion))
 }
 
 #[cfg(test)]

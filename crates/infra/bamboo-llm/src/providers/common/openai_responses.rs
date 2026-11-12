@@ -1195,6 +1195,7 @@ pub struct ResponsesSseParser {
     logged_summary: bool,
     emitted_response_id: Option<String>,
     retain_protocol_events: bool,
+    collect_output_limit: bool,
     /// Once a protocol terminal is observed, every later frame is ignored.
     ///
     /// Responses usage and `Done` are cumulative terminal data, so accepting a
@@ -1245,6 +1246,8 @@ impl ResponsesSseParser {
             logged_summary: false,
             emitted_response_id: None,
             retain_protocol_events: false,
+            collect_output_limit: crate::provider::current_completion_diagnostics()
+                .is_some_and(|diagnostics| diagnostics.is_agent_round()),
             terminal_seen: false,
         }
     }
@@ -2336,21 +2339,35 @@ impl ResponsesSseParser {
             return Ok(Vec::new());
         }
 
-        let response_status = v
-            .get("response")
-            .and_then(|response| response.get("status"))
-            .and_then(Value::as_str);
+        let response = v.get("response").unwrap_or(&v);
+        let response_status = response.get("status").and_then(Value::as_str);
         let top_level_error = v.get("error").is_some_and(super::sse::sse_error_is_present);
-        if top_level_error
-            || matches!(response_status, Some("failed" | "incomplete" | "cancelled"))
-            || matches!(
-                event_type.as_str(),
-                "response.failed"
-                    | "response.incomplete"
-                    | "response.cancelled"
-                    | "response.error"
-                    | "error"
+        let output_limited = self.collect_output_limit
+            && !self.retain_protocol_events
+            && !top_level_error
+            && !response
+                .get("error")
+                .is_some_and(super::sse::sse_error_is_present)
+            && matches!(
+                (event_type.as_str(), response_status),
+                ("response.incomplete", None | Some("incomplete"))
+                    | ("response.completed", Some("incomplete"))
             )
+            && response
+                .pointer("/incomplete_details/reason")
+                .and_then(Value::as_str)
+                == Some("max_output_tokens");
+        if !output_limited
+            && (top_level_error
+                || matches!(response_status, Some("failed" | "incomplete" | "cancelled"))
+                || matches!(
+                    event_type.as_str(),
+                    "response.failed"
+                        | "response.incomplete"
+                        | "response.cancelled"
+                        | "response.error"
+                        | "error"
+                ))
         {
             self.terminal_seen = true;
             let terminal_type = if event_type.is_empty() {
@@ -2371,11 +2388,16 @@ impl ResponsesSseParser {
                 data: Box::new(v.clone()),
             });
         }
-        if let Some(chunk) = self.maybe_emit_response_id(event_type.as_str(), &v) {
+        let id_event = if output_limited {
+            "response.completed"
+        } else {
+            event_type.as_str()
+        };
+        if let Some(chunk) = self.maybe_emit_response_id(id_event, &v) {
             chunks.push(chunk);
         }
 
-        if event_type == "response.completed" {
+        if output_limited || event_type == "response.completed" {
             self.terminal_seen = true;
             chunks.extend(self.completed_provider_transcript_items(&v));
             chunks.extend(self.completed_output_chunks(&v));
