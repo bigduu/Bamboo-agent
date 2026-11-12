@@ -221,6 +221,21 @@ pub(super) struct ToolExecutionOutcome {
     pub tool_duration: std::time::Duration,
 }
 
+impl ToolExecutionOutcome {
+    fn rejected_before_dispatch(error: String) -> Self {
+        Self {
+            output_cap: None,
+            permission_replay_origin: None,
+            result: Err(error),
+            needs_human: None,
+            portable_tool: None,
+            post_tool_hook_eligible: false,
+            managed_running_violation: false,
+            tool_duration: std::time::Duration::ZERO,
+        }
+    }
+}
+
 pub(super) enum ShellAccountingOutcome {
     Ordinary,
     Pending,
@@ -318,16 +333,7 @@ pub(super) async fn execute_model_requested_tool_call_only(
             ctx.tool_call.id,
             ctx.tool_call.function.name,
         );
-        return Ok(ToolExecutionOutcome {
-            output_cap: None,
-            permission_replay_origin: None,
-            result: Err(message),
-            needs_human: None,
-            portable_tool: None,
-            post_tool_hook_eligible: false,
-            managed_running_violation: false,
-            tool_duration: std::time::Duration::ZERO,
-        });
+        return Ok(ToolExecutionOutcome::rejected_before_dispatch(message));
     };
 
     execute_tool_call_only_with_execution_name(&execution_name, ctx).await
@@ -463,41 +469,27 @@ async fn execute_tool_call_only_with_execution_name_inner(
             ctx.tool_call.function.name,
             policy_error
         );
-        return Ok(ToolExecutionOutcome {
-            output_cap: None,
-            permission_replay_origin: None,
-            needs_human: None,
-            portable_tool: None,
-            post_tool_hook_eligible: false,
-            managed_running_violation: false,
-            result: Err(policy_error),
-            tool_duration: std::time::Duration::ZERO,
-        });
+        return Ok(ToolExecutionOutcome::rejected_before_dispatch(policy_error));
     }
-
-    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
-        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
-            Ok(target) => Some(target),
-            Err(error) => {
-                return Ok(ToolExecutionOutcome {
-                    output_cap: None,
-                    permission_replay_origin: None,
-                    result: Err(error.to_string()),
-                    needs_human: None,
-                    portable_tool: None,
-                    post_tool_hook_eligible: false,
-                    managed_running_violation: false,
-                    tool_duration: std::time::Duration::ZERO,
-                })
-            }
-        }
-    } else {
-        None
-    };
 
     let raw_arguments = ctx.tool_call.function.arguments.trim();
     let (args, parse_warning) = parse_tool_args_best_effort(&ctx.tool_call.function.arguments);
     if let Some(warning) = parse_warning {
+        // An explicit empty object is valid for no-argument tools. An empty
+        // fallback after malformed input cannot authorize a default action.
+        if args.as_object().is_some_and(|object| object.is_empty()) {
+            tracing::warn!(
+                "[{}][round:{}] Unrecoverable tool arguments rejected before ToolStart: tool_call_id={}, tool_name={}, args_len={}",
+                ctx.session_id,
+                ctx.round,
+                ctx.tool_call.id,
+                execution_name,
+                raw_arguments.len()
+            );
+            return Ok(ToolExecutionOutcome::rejected_before_dispatch(format!(
+                "Invalid JSON arguments for tool '{execution_name}'. Rewrite the call with a complete JSON object."
+            )));
+        }
         let (args_preview, warning) =
             parse_warning_log_details(execution_name, raw_arguments, &warning);
         tracing::warn!(
@@ -511,6 +503,19 @@ async fn execute_tool_call_only_with_execution_name_inner(
             warning
         );
     }
+
+    let vision_target = if execution_name == "ViewImage" && !ctx.vision_support {
+        match crate::runtime::runner::image_fallback::resolve_vision_target(ctx.config).await {
+            Ok(target) => Some(target),
+            Err(error) => {
+                return Ok(ToolExecutionOutcome::rejected_before_dispatch(
+                    error.to_string(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
 
     tracing::debug!(
         "[{}][round:{}] Starting tool execution: tool_call_id={}, tool_name={}, raw_args_len={}",
@@ -3344,14 +3349,14 @@ mod hook_tests {
     }
 
     #[tokio::test]
-    async fn malformed_namespaced_browser_call_starts_with_fixed_display_name() {
+    async fn repairable_namespaced_browser_call_starts_with_fixed_display_name() {
         let concrete_tools = Arc::new(NameRecordingExecutor::new(&["browser"]));
         let tools: Arc<dyn ToolExecutor> = concrete_tools;
         let (event_tx, mut event_rx) = mpsc::channel(16);
         let callable =
             effective_callable_set(&["browser"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
         let mut call = probe_call("private-selector::browser");
-        call.function.arguments = "{malformed".to_string();
+        call.function.arguments = r#"{"action":"inspect""#.into();
         let _ = execute_without_hooks(&callable, &tools, &call, &event_tx).await;
         let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(events.iter().any(|event| matches!(
@@ -3360,6 +3365,100 @@ mod hook_tests {
                 if tool_name == "browser" && !arguments.to_string().contains("private-selector")
         )));
         assert_eq!(call.function.name, "private-selector::browser");
+    }
+
+    #[tokio::test]
+    async fn unrecoverable_tool_arguments_never_dispatch_defaults() {
+        let executor = Arc::new(NameRecordingExecutor::new(&["probe"]));
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let callable =
+            effective_callable_set(&["probe"], CapabilityLoadingMode::LegacyFullCatalog, &[]);
+
+        for (arguments, should_dispatch) in [
+            ("{malformed", false),
+            ("{", false),
+            ("{}", true),
+            ("", true),
+            (r#"{"flag":true"#, true),
+        ] {
+            let mut call = probe_call("probe");
+            call.function.arguments = arguments.into();
+            let outcome = execute_without_hooks(&callable, &tools, &call, &event_tx).await;
+            let started = std::iter::from_fn(|| event_rx.try_recv().ok())
+                .any(|event| matches!(event, AgentEvent::ToolStart { .. }));
+            assert_eq!(started, should_dispatch, "{arguments:?}");
+            assert_eq!(outcome.result.is_ok(), should_dispatch, "{arguments:?}");
+            if !should_dispatch {
+                assert!(!outcome.post_tool_hook_eligible);
+                assert!(outcome.result.unwrap_err().contains("complete JSON object"));
+            }
+        }
+        assert_eq!(executor.entered(), ["probe", "probe", "probe"]);
+    }
+
+    #[tokio::test]
+    async fn malformed_view_image_is_rejected_before_resolving_vision_provider() {
+        let executor = Arc::new(NameRecordingExecutor::new(&["ViewImage"]));
+        let tools: Arc<dyn ToolExecutor> = executor.clone();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let callable = effective_callable_set(
+            &["ViewImage"],
+            CapabilityLoadingMode::LegacyFullCatalog,
+            &[],
+        );
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolver_calls = resolutions.clone();
+        let config = AgentLoopConfig {
+            vision_model_resolver: Some(Arc::new(move || {
+                resolver_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Err(AgentError::LLM("unavailable test Vision provider".into())) })
+            })),
+            ..Default::default()
+        };
+        let session = Session::new("vision-arguments", "text-only");
+        for (arguments, expected_error, expected_resolutions) in [
+            ("{malformed", "complete JSON object", 0),
+            (
+                r#"{"path":"test.png"}"#,
+                "unavailable test Vision provider",
+                1,
+            ),
+        ] {
+            let mut call = probe_call("ViewImage");
+            call.function.arguments = arguments.into();
+            let outcome = execute_model_requested_tool_call_only(
+                &callable,
+                ToolExecutionOnlyContext {
+                    await_quiet_exec: false,
+                    session_behavior_version: None,
+                    vision_support: false,
+                    output_cap: None,
+                    executing_caller: None,
+                    executing_supervisor: None,
+                    tool_call: &call,
+                    event_tx: &event_tx,
+                    metrics_collector: None,
+                    session_id: &session.id,
+                    root_session_id: &session.id,
+                    root_orchestration_only: false,
+                    round_id: "vision-arguments",
+                    round: 0,
+                    tools: &tools,
+                    config: &config,
+                    hook_session: None,
+                    hook_runtime_state: None,
+                    session_flags: ToolExecutionSessionFlags::from_session(&session),
+                    available_tool_schemas: &[],
+                },
+            )
+            .await
+            .unwrap();
+            assert!(outcome.result.unwrap_err().contains(expected_error));
+            assert_eq!(resolutions.load(Ordering::SeqCst), expected_resolutions);
+        }
+        assert!(executor.entered().is_empty());
+        assert!(event_rx.try_recv().is_err());
     }
 
     #[tokio::test]

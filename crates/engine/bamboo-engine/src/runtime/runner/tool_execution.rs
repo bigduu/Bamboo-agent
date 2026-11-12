@@ -2056,6 +2056,37 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn unrecoverable_tool_arguments_return_an_error_without_aborting_sibling() {
+        let session = permission_session("malformed-parallel", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "never",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 1),
+        ));
+        let mut malformed = named_call("parallel-b", "parallel_b");
+        malformed.function.arguments = "{malformed".into();
+        let calls = [named_call("parallel-a", "parallel_a"), malformed];
+        let (result, session, _, events) =
+            run_permission_boundary_calls(storage, executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(executor.entered("parallel_a"));
+        assert!(!executor.entered("parallel_b"));
+        assert!(events.iter().all(
+            |event| !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "parallel-b")
+        ));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-a")
+                && message.content.contains("parallel_a complete")
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-b")
+                && message.content.contains("complete JSON object")
+        }));
+    }
+
     #[test]
     fn read_tools_are_parallel_safe() {
         let tools = builtin_tools();
