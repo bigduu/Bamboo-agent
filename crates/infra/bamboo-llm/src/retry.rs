@@ -198,6 +198,43 @@ pub async fn send_provider_request<F>(
 where
     F: Fn() -> RequestBuilder,
 {
+    send_provider_request_with_remaining_attempt(config, provider, build)
+        .await
+        .map(|(response, _)| response)
+}
+
+/// Authority to make one corrected physical send under the original bootstrap
+/// policy. Consuming this value cannot start another transient retry loop.
+pub(crate) struct RemainingInitialRequestAttempt {
+    deadline: Option<Instant>,
+    attempt_timeout: Duration,
+}
+
+impl RemainingInitialRequestAttempt {
+    pub(crate) async fn send(
+        self,
+        build: impl FnOnce() -> RequestBuilder,
+    ) -> Result<Option<Response>, LLMError> {
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Ok(None);
+        }
+        claim_work_physical_request()?;
+        let _managed_request = ManagedRequestScope::enter();
+        let response = send_managed_attempt(self.deadline, self.attempt_timeout, build)
+            .await
+            .result?;
+        check_work_text_response(response).map(Some)
+    }
+}
+
+pub(crate) async fn send_provider_request_with_remaining_attempt(
+    config: &RetryConfig,
+    provider: &str,
+    build: impl Fn() -> RequestBuilder,
+) -> Result<(Response, Option<RemainingInitialRequestAttempt>), LLMError> {
     claim_work_physical_request()?;
     // Take the policy once instead of trusting a second independent read of the
     // limits: a configuration change between those reads would combine two
@@ -209,7 +246,41 @@ where
     } else {
         *config
     };
-    let response = send_managed_request(&retry, provider, limits, build).await?;
+    let (response, remaining_attempt) = send_managed_request(&retry, provider, limits, build).await;
+    Ok((check_work_text_response(response?)?, remaining_attempt))
+}
+
+async fn send_managed_request(
+    config: &RetryConfig,
+    provider: &str,
+    limits: InitialRequestLimits,
+    build: impl Fn() -> RequestBuilder,
+) -> (
+    Result<Response, LLMError>,
+    Option<RemainingInitialRequestAttempt>,
+) {
+    let continuous = continuous_request_retries();
+    let deadline = (!continuous).then(|| Instant::now() + limits.total_budget);
+    let _managed_request = ManagedRequestScope::enter();
+    let (response, attempts) = retry_initial_request(
+        config,
+        provider,
+        continuous,
+        0,
+        || send_managed_attempt(deadline, limits.attempt_timeout, &build),
+        |_, _| {},
+    )
+    .await;
+    let remaining_attempt = (!work_request_budget_active()
+        && (continuous || attempts < config.max_attempts.max(1)))
+    .then_some(RemainingInitialRequestAttempt {
+        deadline,
+        attempt_timeout: limits.attempt_timeout,
+    });
+    (response, remaining_attempt)
+}
+
+fn check_work_text_response(response: Response) -> Result<Response, LLMError> {
     if crate::work_text::active() && !response.status().is_success() {
         return Err(LLMError::Api(format!(
             "Work text request returned {}",
@@ -220,66 +291,48 @@ where
 }
 
 // The timeout owns only the headers future, never the successful SSE body.
-// Anthropic separately shares one budget across its compatibility fallbacks.
-async fn send_managed_request<F>(
-    config: &RetryConfig,
-    provider: &str,
-    limits: InitialRequestLimits,
-    build: F,
-) -> Result<Response, LLMError>
-where
-    F: Fn() -> RequestBuilder,
-{
-    let continuous = continuous_request_retries();
-    let deadline = (!continuous).then(|| Instant::now() + limits.total_budget);
-    let _managed_request = ManagedRequestScope::enter();
-    retry_initial_request(
-        config,
-        provider,
-        continuous,
-        0,
-        || async {
-            let started = Instant::now();
-            if deadline.is_some_and(|deadline| started >= deadline) {
-                return RetryAttempt::final_result(Err(LLMError::RequestFailed(
-                    "initial upstream request time budget exhausted".into(),
-                )));
-            }
-            let attempt_deadline = deadline
-                .map(|deadline| deadline.min(started + limits.attempt_timeout))
-                .unwrap_or(started + limits.attempt_timeout);
-            match tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await {
-                Ok(Ok(response)) => RetryAttempt {
-                    retry: is_retryable_status(response.status()),
-                    status: Some(response.status()),
-                    retry_after: parse_retry_after_with_date(&response),
-                    deadline,
-                    observation: None,
-                    result: Ok(response),
-                },
-                Ok(Err(error)) => RetryAttempt {
-                    retry: matches!(&error, LLMError::Http(error) if is_retryable_reqwest_error(error)),
-                    status: None,
-                    retry_after: None,
-                    deadline,
-                    observation: None,
-                    result: Err(error),
-                },
-                Err(_) => RetryAttempt {
-                    retry: true,
-                    status: None,
-                    retry_after: None,
-                    deadline,
-                    observation: None,
-                    result: Err(LLMError::RequestFailed(
-                        "initial response headers timed out".into(),
-                    )),
-                },
-            }
+async fn send_managed_attempt(
+    deadline: Option<Instant>,
+    attempt_timeout: Duration,
+    build: impl FnOnce() -> RequestBuilder,
+) -> RetryAttempt<Result<Response, LLMError>> {
+    let started = Instant::now();
+    if deadline.is_some_and(|deadline| started >= deadline) {
+        return RetryAttempt::final_result(Err(LLMError::RequestFailed(
+            "initial upstream request time budget exhausted".into(),
+        )));
+    }
+    let attempt_deadline = deadline
+        .map(|deadline| deadline.min(started + attempt_timeout))
+        .unwrap_or(started + attempt_timeout);
+    match tokio::time::timeout_at(attempt_deadline, crate::work_text::send(build())).await {
+        Ok(Ok(response)) => RetryAttempt {
+            retry: is_retryable_status(response.status()),
+            status: Some(response.status()),
+            retry_after: parse_retry_after_with_date(&response),
+            deadline,
+            observation: None,
+            result: Ok(response),
         },
-        |_, _| {},
-    )
-    .await
+        Ok(Err(error)) => RetryAttempt {
+            retry: matches!(&error, LLMError::Http(error) if is_retryable_reqwest_error(error)),
+            status: None,
+            retry_after: None,
+            deadline,
+            observation: None,
+            result: Err(error),
+        },
+        Err(_) => RetryAttempt {
+            retry: true,
+            status: None,
+            retry_after: None,
+            deadline,
+            observation: None,
+            result: Err(LLMError::RequestFailed(
+                "initial response headers timed out".into(),
+            )),
+        },
+    }
 }
 
 pub async fn observe_initial_http_retries<F: Future>(
@@ -628,6 +681,7 @@ where
         |_, _| {},
     )
     .await
+    .0
 }
 
 struct RetryAttempt<T> {
@@ -671,7 +725,7 @@ async fn retry_initial_request<T, F, Fut, D>(
     initial_index: u32,
     attempt: F,
     decide: D,
-) -> T
+) -> (T, u32)
 where
     F: Fn() -> Fut,
     Fut: Future<Output = RetryAttempt<T>>,
@@ -720,7 +774,7 @@ where
         };
         decide(&mut outcome, decision);
         let RetryDecision::Retry(delay) = decision else {
-            return outcome.result;
+            return (outcome.result, index.saturating_add(1));
         };
         if let Some(status) = outcome.status {
             let _ = INITIAL_HTTP_RETRY_OBSERVER.try_with(|observer| observer.record(status, delay));
@@ -1222,6 +1276,7 @@ where
         |outcome, decision| budget.decide(outcome, decision),
     )
     .await
+    .0
 }
 
 #[cfg(test)]
@@ -1312,6 +1367,19 @@ mod tests {
             .await;
         assert!(matches!(retry, Err(LLMError::RequestFailed(_))));
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn remaining_initial_attempt_cannot_send_after_the_original_deadline() {
+        let remainder = RemainingInitialRequestAttempt {
+            deadline: Some(Instant::now()),
+            attempt_timeout: Duration::from_secs(60),
+        };
+        let response = remainder
+            .send(|| panic!("expired bootstrap must not build a corrected request"))
+            .await
+            .unwrap();
+        assert!(response.is_none());
     }
 
     #[tokio::test]
