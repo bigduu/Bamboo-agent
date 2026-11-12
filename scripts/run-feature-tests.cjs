@@ -160,7 +160,9 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // #2611 keeps Local Read retry-window and strict Remote whole-read cases in
 // default Engine, plus the >64-page native fixture in its default Agent owner.
 // No feature declaration, additive context or twenty-case selection changes.
-const FEATURE_SOURCE_SHA256 = "ed4d2a90d80552c9abe2274b6a04431d331ea812a33fbe6acbffb4e41214be3e";
+// #2657 uses packages-0 for Storage and server-app-state for parallel dispatch.
+// The dispatch fixture uses Storage's existing test-utils dev dependency.
+const FEATURE_SOURCE_SHA256 = "cce154edb7c899c6a4e2d0f70db428bfa7ce8fb2e6bfe65e3e3ac5e4e978bdbb";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

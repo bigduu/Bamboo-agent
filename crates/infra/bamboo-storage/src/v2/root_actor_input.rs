@@ -565,12 +565,17 @@ impl SessionStoreV2 {
             directory: directory.clone(),
             claim: claim.clone(),
         };
-        let ack_input = input.clone();
-        let filesystem = filesystem.with_check(Arc::new(move || {
+        let ack_input = Arc::new(input.clone());
+        let cleanup_input = ack_input.clone();
+        // The committed receipt fixes the exact claim under these same guards.
+        // Its cleanup still requires the live Root and the canonical checkpoint.
+        let cleanup = filesystem.with_check(Arc::new(move || {
             let durable = root_proof.validate()?;
-            ack_input.validate(true)?;
-            ack_input.validate_transcript(&durable)
+            cleanup_input.validate_transcript(&durable)
         }));
+        let filesystem = cleanup
+            .clone()
+            .with_check(Arc::new(move || ack_input.validate(true)));
         let mutable = Arc::get_mut(&mut guards).expect("new Root writer has no borrowers");
         mutable.input = Some(input);
         mutable._input_filesystem = Some(filesystem.clone());
@@ -594,7 +599,14 @@ impl SessionStoreV2 {
         }
         // No provider boundary or new lease driver between Main and ACK.
         inbox
-            .ack_owned_with_filesystem(&directory, &session.id, claim, Utc::now(), filesystem)
+            .ack_owned_with_filesystem(
+                &directory,
+                &session.id,
+                claim,
+                Utc::now(),
+                filesystem,
+                Some(&cleanup),
+            )
             .await
             .map_err(conflict)
     }

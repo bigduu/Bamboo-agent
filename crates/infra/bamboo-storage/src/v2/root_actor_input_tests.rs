@@ -495,6 +495,67 @@ async fn root_owned_full_checkpoint_commits_typed_input_cursor_and_ack_before_re
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn root_owned_ack_cleans_up_committed_claim_after_only_inbox_lease_expires() {
+    for root_expires in [false, true] {
+        let f = Fixture::new(if root_expires {
+            LeaseDuration::seconds(2)
+        } else {
+            LeaseDuration::seconds(30)
+        })
+        .await;
+        let claim = f.claim(LeaseDuration::seconds(2)).await;
+        let cur = f.directory().join("inbox/cur").join(&claim.claim.claim_id);
+        let deadline = if root_expires {
+            f.root_expires_at
+        } else {
+            claim.lease.expires_at
+        };
+        let expected_cur = cur.clone();
+        let inbox_expiry = claim.lease.expires_at;
+        let hooked = f
+            .raw
+            .with_owned_filesystem_hook_for_test(Arc::new(move |event, path| {
+                if event == "remove" && path == expected_cur {
+                    assert!(
+                        Utc::now() < inbox_expiry,
+                        "Inbox lease was live at receipt publication"
+                    );
+                    tokio::runtime::Handle::current().block_on(expire(deadline));
+                }
+                Ok(())
+            }));
+        let bound =
+            f.a.bind_root_actor_inbox(&f.owner, Arc::new(hooked))
+                .unwrap();
+        let result =
+            f.a.save_root_actor_input(&f.owner, &f.candidate(&claim), bound, &claim, f.publisher())
+                .await;
+        assert!(
+            Utc::now() >= deadline,
+            "the real cur cleanup crossed the lease boundary"
+        );
+        assert!(f.raw.was_admitted(ROOT, &f.input.id).await.unwrap());
+        if root_expires {
+            assert!(result.is_err(), "an expired Root cannot remove cur");
+            assert!(cur.exists());
+        } else {
+            result.expect("the live Root can clean up its already-admitted claim");
+            assert!(!cur.exists());
+        }
+        let durable = f.b.load_session(ROOT).await.unwrap().unwrap();
+        assert_eq!(durable.created_at, f.base.created_at);
+        assert_eq!(
+            durable
+                .messages
+                .iter()
+                .filter(|message| bamboo_domain::is_matching_session_message(message, &f.input))
+                .count(),
+            1
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn root_owned_renew_fences_old_token_and_release_preserves_input_without_failure() {
     let f = Fixture::new(LeaseDuration::seconds(30)).await;
     let first = f.claim(LeaseDuration::seconds(2)).await;
