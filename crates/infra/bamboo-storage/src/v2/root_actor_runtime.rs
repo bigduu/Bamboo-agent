@@ -97,6 +97,7 @@ impl RootActorWriteProof {
     ) -> io::Result<()> {
         let (durable, lease_expires_at) = self.validate_with_lease_expiry()?;
         validate_input(&durable)?;
+        drop(durable);
         // The retained guards pin the fence while transcript validation runs.
         // Check its deadline again before removing the committed claim.
         if lease_expires_at <= Utc::now() {
