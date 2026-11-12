@@ -78,7 +78,9 @@ fn telemetry_error_outcome(error: &AgentError) -> bamboo_infrastructure::telemet
         AgentError::StreamTimeout(_) => Outcome::Timeout,
         AgentError::LLMOverflow(_) => Outcome::ContextOverflow,
         AgentError::EmptyAssistantResponse { .. } => Outcome::EmptyResponse,
-        AgentError::LLM(_) | AgentError::LLMNonRetryable(_) => Outcome::ProviderError,
+        AgentError::LLM(_)
+        | AgentError::LLMNonRetryable(_)
+        | AgentError::OutputTokenLimit { .. } => Outcome::ProviderError,
         _ => Outcome::ExecutionError,
     }
 }

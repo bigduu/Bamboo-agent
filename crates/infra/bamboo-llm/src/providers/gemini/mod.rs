@@ -253,7 +253,13 @@ impl LLMProvider for GeminiProvider {
         );
         apply_required_tool_choice(&mut request_json, required_tool);
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut request_json,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            model,
+        )?;
         tracing::info!(
             "[session_hash={}] Gemini request protocol=streamGenerateContent model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
             log_identity(session_log_id),

@@ -368,7 +368,7 @@ async fn bounded_managed_headers_timeout_finishes_without_needing_cancellation()
         .await;
     let client = reqwest::Client::builder().no_proxy().build().unwrap();
     let observer = Arc::new(InitialHttpRetryObserver::default());
-    let result = tokio::time::timeout(
+    let (result, _) = tokio::time::timeout(
         Duration::from_secs(2),
         observe_initial_http_retries(
             observer.clone(),
@@ -420,6 +420,7 @@ async fn managed_headers_timeout_never_becomes_a_successful_body_deadline() {
         || client.post(format!("http://{address}")),
     )
     .await
+    .0
     .unwrap();
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(2), response.text())

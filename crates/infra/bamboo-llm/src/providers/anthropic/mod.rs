@@ -461,7 +461,13 @@ impl AnthropicProvider {
         );
         apply_required_tool_choice(&mut body, required_tool);
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            model,
+        )?;
         // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
         // body (top-level content blocks AND inside tool_result content arrays), so
         // we can tell with certainty whether a screenshot reaches the wire vs being
@@ -832,9 +838,11 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     }
 
     if let Some(effort) = reasoning_effort {
-        // Effort controls depth, not activation. Enable the protocol's adaptive
-        // mode without deriving a budget or changing the selected effort.
-        body["output_config"] = json!({"effort": effort.as_str()});
+        // Messages represents explicit disable with thinking.type. The effort
+        // field is reserved for the enabled reasoning levels.
+        if effort != ReasoningEffort::Disabled {
+            body["output_config"] = json!({"effort": effort.as_str()});
+        }
         body["thinking"] = json!({
             "type": if effort == ReasoningEffort::Disabled { "disabled" } else { "adaptive" }
         });
@@ -4691,7 +4699,12 @@ mod anthropic_request_building {
                     Some(effort),
                     None,
                 );
-                assert_eq!(body["output_config"]["effort"], effort.as_str());
+                let wire_effort = (effort != ReasoningEffort::Disabled).then(|| effort.as_str());
+                assert_eq!(
+                    body.pointer("/output_config/effort")
+                        .and_then(Value::as_str),
+                    wire_effort
+                );
                 assert_eq!(body["max_tokens"], max_tokens);
                 assert_eq!(
                     body["thinking"]["type"],

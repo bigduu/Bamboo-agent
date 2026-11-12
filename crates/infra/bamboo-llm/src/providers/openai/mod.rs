@@ -23,8 +23,9 @@ use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema}
 
 use super::common::model_fetcher;
 use super::common::openai_compat::{
-    build_openai_compat_body, openai_compat_chat_stream_from_sse,
-    parse_openai_compat_sse_data_strict_multi, tools_to_openai_compat_json,
+    build_openai_compat_body, looks_like_responses_only_error, openai_compat_chat_stream_from_sse,
+    parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
+    ChatCompletionsResponse,
 };
 use super::common::openai_responses::{
     build_responses_body_with_capability_loading, retain_provider_transcript_family,
@@ -233,21 +234,6 @@ impl OpenAIProvider {
             || normalized.eq_ignore_ascii_case("https://api.openai.com/v1")
     }
 
-    fn looks_like_responses_only_error(status: reqwest::StatusCode, body: &str) -> bool {
-        if !(status == 400
-            || status == 404
-            || status == 405
-            || status == 409
-            || status == 415
-            || status == 422)
-        {
-            return false;
-        }
-
-        let b = body.to_ascii_lowercase();
-        b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn chat_stream_via_responses(
         &self,
@@ -309,7 +295,13 @@ impl OpenAIProvider {
             body["tool_choice"] = json!({"type": "function", "name": name});
         }
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_RESPONSES,
+            model,
+        )?;
         self.observe_responses_wire(&body, responses_options, session_log_id);
         let prompt_cache_affinity_hint = body
             .get("prompt_cache_key")
@@ -402,7 +394,13 @@ impl OpenAIProvider {
                 if let Some(name) = required_tool {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                request_overrides::mask_and_prepare_agent_request(
+                    &mut fallback_body,
+                    &self.masking_config,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_RESPONSES,
+                    model,
+                )?;
                 self.observe_responses_wire(
                     &fallback_body,
                     Some(&fallback_options),
@@ -704,7 +702,13 @@ impl LLMProvider for OpenAIProvider {
         if let Some(name) = required_tool {
             body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
         }
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            model,
+        )?;
         tracing::info!(
             "[session_hash={}] OpenAI request protocol=chat_completions model_hash={} reasoning_effort={} wire_reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
             log_identity(session_log_id),
@@ -723,23 +727,29 @@ impl LLMProvider for OpenAIProvider {
 
         let headers =
             self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
-        // Retry the initial request on transient failures (issue #18); the
-        // returned body is unread, so SSE streaming below is unaffected.
         let chat_url = format!("{}/chat/completions", self.base_url);
-        let response =
-            crate::retry::send_provider_request(&crate::retry::global(), "OpenAI", || {
+        let response = match send_chat_completions(
+            &crate::retry::global(),
+            "OpenAI",
+            |body| {
                 self.client
                     .post(&chat_url)
                     .headers(headers.clone())
-                    .json(&body)
-            })
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await?;
-
-            if Self::looks_like_responses_only_error(status, &text) {
+                    .json(body)
+            },
+            body,
+            !self.is_official_base_url()
+                && request_purpose == "compression"
+                && request_reasoning_effort == Some(ReasoningEffort::Disabled),
+        )
+        .await?
+        {
+            ChatCompletionsResponse::Streaming(response) => response,
+            ChatCompletionsResponse::Rejected {
+                status,
+                body,
+                corrected_disable: false,
+            } if looks_like_responses_only_error(status, &body) => {
                 tracing::info!(
                     "OpenAI chat/completions rejected model_hash {}; retrying via /responses",
                     log_identity(model)
@@ -762,9 +772,10 @@ impl LLMProvider for OpenAIProvider {
                     )
                     .await;
             }
-
-            return Err(LLMError::Api(format!("HTTP {}: {}", status, text)));
-        }
+            ChatCompletionsResponse::Rejected { status, body, .. } => {
+                return Err(LLMError::Api(format!("HTTP {status}: {body}")));
+            }
+        };
 
         let model_for_log = model.to_string();
         let requested_reasoning = reasoning_effort;

@@ -20,8 +20,10 @@ use crate::provider::{
 use crate::providers::common::model_fetcher;
 use crate::providers::common::openai_compat::{
     build_openai_compat_body, openai_compat_chat_stream_from_sse,
-    parse_openai_compat_sse_data_strict_multi, tools_to_openai_compat_json,
+    parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
+    ChatCompletionsResponse,
 };
+use crate::providers::common::request_overrides;
 use crate::providers::common::sse::llm_stream_from_sse;
 use bamboo_config::KeywordMaskingConfig;
 use bamboo_domain::{Message, ReasoningEffort, ToolSchema};
@@ -155,9 +157,8 @@ impl LLMProvider for BodhiProvider {
         model: &str,
         options: Option<&LLMRequestOptions>,
     ) -> Result<LLMStream> {
-        let reasoning_effort = options
-            .and_then(|o| o.reasoning_effort)
-            .or(self.default_reasoning_effort);
+        let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
+        let reasoning_effort = request_reasoning_effort.or(self.default_reasoning_effort);
         let parallel_tool_calls = options.and_then(|o| o.parallel_tool_calls);
         let required_tool = crate::provider::required_tool_from_options(options, tools)?;
         let request_purpose = options
@@ -185,6 +186,8 @@ impl LLMProvider for BodhiProvider {
                     reasoning_effort,
                     parallel_tool_calls,
                     required_tool,
+                    request_purpose == "compression"
+                        && request_reasoning_effort == Some(ReasoningEffort::Disabled),
                 )
                 .await
             }
@@ -251,6 +254,7 @@ impl BodhiProvider {
         reasoning_effort: Option<ReasoningEffort>,
         parallel_tool_calls: Option<bool>,
         required_tool: Option<&str>,
+        allow_disable_correction: bool,
     ) -> Result<LLMStream> {
         let mut body = build_openai_compat_body(
             model,
@@ -262,27 +266,33 @@ impl BodhiProvider {
             parallel_tool_calls,
         );
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            None,
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            model,
+        )?;
 
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/chat/completions");
 
-        // Retry the initial request on transient failures (issue #18); the
-        // returned body is unread, so SSE streaming below is unaffected.
-        let response =
-            crate::retry::send_provider_request(&crate::retry::global(), "Bodhi", || {
-                self.client.post(&url).headers(headers.clone()).json(&body)
-            })
-            .await?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await?;
-            return Err(LLMError::Api(format!(
-                "Bodhi/OpenAI proxy HTTP {}: {}",
-                status, text
-            )));
-        }
+        let response = match send_chat_completions(
+            &crate::retry::global(),
+            "Bodhi",
+            |body| self.client.post(&url).headers(headers.clone()).json(body),
+            body,
+            allow_disable_correction,
+        )
+        .await?
+        {
+            ChatCompletionsResponse::Streaming(response) => response,
+            ChatCompletionsResponse::Rejected { status, body, .. } => {
+                return Err(LLMError::Api(format!(
+                    "Bodhi/OpenAI proxy HTTP {status}: {body}"
+                )));
+            }
+        };
 
         let completion_diagnostics = crate::provider::current_completion_diagnostics();
         let stream = openai_compat_chat_stream_from_sse(response, move |event, data| {
@@ -324,7 +334,13 @@ impl BodhiProvider {
             None,
         );
         apply_required_tool_choice(&mut body, required_tool);
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            None,
+            request_overrides::ENDPOINT_MESSAGES,
+            model,
+        )?;
 
         let headers = self.build_headers()?;
         let url = self.proxy_url("v1/messages");
@@ -385,7 +401,13 @@ impl BodhiProvider {
         // Serialize then run the last-moment scan over the body Value before send.
         let mut request_json = serde_json::to_value(&request).map_err(LLMError::Json)?;
         apply_required_tool_choice(&mut request_json, required_tool);
-        crate::masking::mask_outbound_body(&mut request_json, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut request_json,
+            &self.masking_config,
+            None,
+            request_overrides::ENDPOINT_STREAM_GENERATE_CONTENT,
+            model,
+        )?;
 
         let headers = self.build_headers()?;
         let url = self.proxy_url(&format!(
