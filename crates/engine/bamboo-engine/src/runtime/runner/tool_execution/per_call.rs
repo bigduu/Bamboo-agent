@@ -77,6 +77,9 @@ fn tool_start_name_for_display(tool_name: &str) -> String {
 }
 
 pub(super) struct ToolExecutionOnlyContext<'a> {
+    /// Continue an empty poll within the active runner when the model has
+    /// requested only that poll and there is no interactive approver.
+    pub await_quiet_exec: bool,
     pub vision_support: bool,
     pub session_behavior_version: Option<u32>,
     pub tool_call: &'a ToolCall,
@@ -764,6 +767,26 @@ async fn execute_tool_call_only_with_execution_name_inner(
         ))
         .await
         .map(ToolOutcome::enforce_suspension_restriction);
+    // Await the same admitted command before completing the tool lifecycle.
+    // The outer runner's cancellation still covers this tool future.
+    let observed_dispatch = match observed_dispatch {
+        Ok(ToolOutcome::Completed(previous))
+            if ctx.await_quiet_exec && execution_name == "write_stdin" =>
+        {
+            let remaining = std::time::Duration::from_secs(ctx.config.per_tool_timeout_secs)
+                .saturating_sub(tool_timer.elapsed());
+            let result = bamboo_tools::tools::write_stdin::continue_quiet_poll(
+                ctx.session_id,
+                &args,
+                &previous,
+                remaining,
+            )
+            .await
+            .unwrap_or(ToolOutcome::Completed(previous));
+            Ok(result)
+        }
+        outcome => outcome,
+    };
     use bamboo_infrastructure::telemetry::Outcome as TraceOutcome;
     let trace_outcome = match &observed_dispatch {
         Ok(ToolOutcome::Completed(result)) if !result.success => TraceOutcome::ToolError,
@@ -1754,6 +1777,7 @@ mod task_progress_tests {
                 execute_tool_call_only_with_execution_name(
                     execution_name,
                     ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
@@ -2599,6 +2623,7 @@ mod hook_tests {
         let outcome = execute_model_requested_tool_call_only(
             callable,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -2788,6 +2813,7 @@ mod hook_tests {
             let execution = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    await_quiet_exec: false,
                     session_behavior_version: None,
                     vision_support: true,
                     output_cap: cap,
@@ -2935,6 +2961,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             effective_callable_set,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -3109,6 +3136,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
@@ -3194,6 +3222,7 @@ mod hook_tests {
                     let outcome = execute_model_requested_tool_call_only(
                         &callable,
                         ToolExecutionOnlyContext {
+                            await_quiet_exec: false,
                             session_behavior_version: None,
                             vision_support: true,
                             output_cap: None,
@@ -3360,6 +3389,7 @@ mod hook_tests {
         let unloaded = execute_model_requested_tool_call_only(
             &effective_callable_set,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -3724,6 +3754,7 @@ mod hook_tests {
         let trace = bamboo_infrastructure::telemetry::test_support::TraceTest::default();
         let outcome = trace
             .scope(execute_tool_call_only(ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -3793,6 +3824,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
@@ -3877,6 +3909,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
@@ -3937,6 +3970,7 @@ mod hook_tests {
         let outcome = bamboo_tools::with_approval_proxy(
             Some(reviewer_proxy),
             execute_tool_call_only(ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -4502,6 +4536,7 @@ mod hook_tests {
                     execute_model_requested_tool_call_only(
                         &callable,
                         ToolExecutionOnlyContext {
+                            await_quiet_exec: false,
                             session_behavior_version: Some(2),
                             vision_support: true,
                             output_cap: None,
@@ -4742,6 +4777,7 @@ mod hook_tests {
             let mut session = Session::new(session_id, "model");
             let session_flags = ToolExecutionSessionFlags::from_session(&session);
             let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: Some(97),
@@ -4807,6 +4843,7 @@ mod hook_tests {
         let mut runtime_state = AgentRuntimeState::new(&session.id);
 
         let outcome = execute_tool_call_only(ToolExecutionOnlyContext {
+            await_quiet_exec: false,
             session_behavior_version: None,
             vision_support: true,
             output_cap: None,
@@ -4896,6 +4933,7 @@ mod hook_tests {
         execute_model_requested_tool_call_only(
             &callable,
             ToolExecutionOnlyContext {
+                await_quiet_exec: false,
                 session_behavior_version: None,
                 vision_support: true,
                 output_cap: None,
@@ -5161,6 +5199,7 @@ mod hook_tests {
                         let outcome = execute_model_requested_tool_call_only(
                             &callable,
                             ToolExecutionOnlyContext {
+                                await_quiet_exec: false,
                                 session_behavior_version: version,
                                 vision_support: true,
                                 output_cap: None,
@@ -5243,6 +5282,7 @@ mod hook_tests {
                 let outcome = execute_model_requested_tool_call_only(
                     &callable,
                     ToolExecutionOnlyContext {
+                        await_quiet_exec: false,
                         session_behavior_version: None,
                         vision_support: true,
                         output_cap: None,
@@ -5323,6 +5363,7 @@ mod hook_tests {
             let outcome = execute_model_requested_tool_call_only(
                 &callable,
                 ToolExecutionOnlyContext {
+                    await_quiet_exec: false,
                     session_behavior_version: Some(2),
                     vision_support: true,
                     output_cap: None,

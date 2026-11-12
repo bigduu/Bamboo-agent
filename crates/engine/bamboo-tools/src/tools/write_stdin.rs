@@ -1,7 +1,9 @@
+use std::{sync::Arc, time::Duration};
+
 use async_trait::async_trait;
-use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome};
+use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use super::{
     bash_runtime,
@@ -20,6 +22,54 @@ struct WriteStdinArgs {
     max_output_tokens: Option<usize>,
     #[serde(default)]
     eof: bool,
+}
+
+fn owned_exec(owner: &str, id: &str) -> Option<Arc<bash_runtime::ShellSession>> {
+    bash_runtime::get_shell(id)
+        .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
+}
+
+/// Continue a successful empty read of a quiet command within the caller's
+/// existing tool deadline. The foreground runner owns cancellation of the wait.
+pub async fn continue_quiet_poll(
+    owner: &str,
+    arguments: &Value,
+    previous: &ToolResult,
+    remaining: Duration,
+) -> Option<ToolOutcome> {
+    if remaining.is_zero() || !previous.success || !previous.images.is_empty() {
+        return None;
+    }
+    let deadline = tokio::time::Instant::now().checked_add(remaining)?;
+    let args = WriteStdinArgs::deserialize(arguments).ok()?;
+    let result: Value = serde_json::from_str(&previous.result).ok()?;
+    if !args.chars.is_empty()
+        || args.eof
+        || result["session_id"].as_str() != Some(args.session_id.as_str())
+        || result["status"] != "running"
+        || result["output"] != ""
+        || result.get("output_omitted_bytes").is_some()
+        || result.get("error").is_some()
+        || result["polling"]["state"] != "needs_diagnosis"
+        || result["polling"]["exit_observed"] != false
+    {
+        return None;
+    }
+    let shell = owned_exec(owner, &args.session_id)?;
+    let state = shell.polled.as_ref().expect("validated exec session");
+    let _interaction = tokio::time::timeout_at(deadline, async {
+        let guard = state.interaction.lock().await;
+        // An interactive command may need the next model turn to send input.
+        if shell.stdin_is_open().await {
+            return None;
+        }
+        owned_exec(owner, &args.session_id).map(|_| guard)
+    })
+    .await
+    .ok()??;
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    let wait_ms = u64::try_from(remaining.as_millis()).ok()?;
+    Some(poll_result(&shell, wait_ms, args.max_output_tokens).await)
 }
 
 #[derive(Default)]
@@ -60,8 +110,7 @@ impl Tool for WriteStdinTool {
             ToolError::InvalidArguments(format!("Invalid write_stdin args: {error}"))
         })?;
         let owner = owner_session(&ctx)?;
-        let shell = bash_runtime::get_shell(&parsed.session_id)
-            .filter(|shell| shell.polled.is_some() && shell.session_id.as_deref() == Some(owner))
+        let shell = owned_exec(owner, &parsed.session_id)
             .ok_or_else(|| {
                 ToolError::Execution("Exec session not found or not owned by this session (unread completed results expire after five minutes; handles do not survive Host restart)".into())
             })?;

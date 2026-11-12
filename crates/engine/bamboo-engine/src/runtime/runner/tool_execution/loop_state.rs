@@ -4,6 +4,7 @@ use super::RoundToolExecutionResult;
 
 #[derive(Debug)]
 pub(super) struct RoundExecutionState {
+    pub single_tool_call: bool,
     pub awaiting_clarification: bool,
     pub waiting_for_children: bool,
     pub round_status: MetricsRoundStatus,
@@ -13,6 +14,7 @@ pub(super) struct RoundExecutionState {
 impl Default for RoundExecutionState {
     fn default() -> Self {
         Self {
+            single_tool_call: false,
             awaiting_clarification: false,
             waiting_for_children: false,
             round_status: MetricsRoundStatus::Success,

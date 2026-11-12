@@ -9,7 +9,11 @@ pub(crate) fn quiet_poll_guard_active(
     runtime: &AgentRuntimeState,
     config: &AgentLoopConfig,
 ) -> bool {
-    session.kind == SessionKind::Root && !runtime.no_human_approver
+    !runtime.no_human_approver && quiet_exec_wait_scope(session, config)
+}
+
+pub(super) fn quiet_exec_wait_scope(session: &Session, config: &AgentLoopConfig) -> bool {
+    session.kind == SessionKind::Root
         && session.pending_question.is_none()
         && !crate::runtime::loop_control::suspension::active(config)
         // Ending an owned local task must not inadvertently stop its command.

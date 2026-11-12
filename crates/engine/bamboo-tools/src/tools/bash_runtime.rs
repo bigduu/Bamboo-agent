@@ -208,6 +208,10 @@ impl ShellSession {
     pub async fn close_stdin(&self) -> bool {
         self.stdin.lock().await.take().is_some()
     }
+
+    pub(super) async fn stdin_is_open(&self) -> bool {
+        self.stdin.lock().await.is_some()
+    }
 }
 
 fn sessions() -> &'static DashMap<String, Arc<ShellSession>> {
