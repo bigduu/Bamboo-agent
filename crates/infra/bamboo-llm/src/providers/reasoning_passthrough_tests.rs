@@ -20,6 +20,8 @@ const EFFORTS: [Option<ReasoningEffort>; 7] = [
     Some(ReasoningEffort::Max),
 ];
 
+const DEEPSEEK_FLASH: &str = "deepseek-v4.1-flash";
+
 const ROUTES: [(&str, &str, &str, &str); 7] = [
     ("openai-chat", "/chat/completions", "/reasoning_effort", "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"),
     ("openai-responses", "/responses", "/reasoning/effort", "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_test\"}}\n\n"),
@@ -43,7 +45,7 @@ fn provider(
                 .with_client(client)
                 .with_reasoning_effort(default)
                 .with_responses_only_models(if route == "openai-responses" {
-                    vec!["custom-route".to_string()]
+                    vec!["custom-route".to_string(), DEEPSEEK_FLASH.to_string()]
                 } else {
                     vec![]
                 }),
@@ -215,6 +217,72 @@ async fn every_selected_effort_reaches_each_final_native_and_proxy_request() {
                 let body: Value = serde_json::from_slice(&requests[0].body).unwrap();
                 assert_effort(&body, pointer, effort);
             }
+        }
+    }
+}
+
+#[tokio::test]
+async fn deepseek_flash_uses_protocol_specific_thinking_disable() {
+    for (route, endpoint, pointer, sse) in ROUTES.into_iter().filter(|(route, ..)| {
+        matches!(
+            *route,
+            "openai-responses" | "anthropic" | "bodhi-openai" | "bodhi-anthropic"
+        )
+    }) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(endpoint))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let provider = provider(route, &server, None);
+        for effort in [ReasoningEffort::Low, ReasoningEffort::Disabled] {
+            let options = LLMRequestOptions {
+                reasoning_effort: Some(effort),
+                ..Default::default()
+            };
+            let mut stream = provider
+                .chat_stream_with_options(
+                    &[Message::user("Summarize the conversation")],
+                    &[],
+                    Some(128),
+                    DEEPSEEK_FLASH,
+                    Some(&options),
+                )
+                .await
+                .unwrap();
+            while let Some(chunk) = stream.next().await {
+                chunk.unwrap();
+            }
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2, "{route}");
+        let low: Value = requests[0].body_json().unwrap();
+        let disabled: Value = requests[1].body_json().unwrap();
+        assert_effort(&low, pointer, Some(ReasoningEffort::Low));
+        match route {
+            "anthropic" | "bodhi-anthropic" => {
+                assert_eq!(disabled.pointer("/thinking/type"), Some(&json!("disabled")));
+                assert!(disabled.get("output_config").is_none());
+                assert_eq!(disabled["max_tokens"], 128);
+            }
+            "bodhi-openai" => {
+                assert_eq!(disabled["enable_thinking"], false);
+                assert!(disabled.get("reasoning_effort").is_none());
+                assert_eq!(disabled["max_completion_tokens"], 128);
+            }
+            "openai-responses" => {
+                assert_effort(&disabled, pointer, Some(ReasoningEffort::Disabled));
+                assert!(disabled.get("enable_thinking").is_none());
+                assert_eq!(disabled["max_output_tokens"], 128);
+            }
+            _ => unreachable!(),
         }
     }
 }

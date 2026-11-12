@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use super::sse::{llm_stream_from_sse_multi, sse_error_is_present};
 use super::tool_schema::sanitize_openai_function_parameters_schema;
+use super::DASHSCOPE_DEEPSEEK_V41_FLASH_MODEL;
 use crate::provider::{LLMError, LLMStream, Result};
 use crate::types::LLMChunk;
 use bamboo_domain::ReasoningEffort;
@@ -171,8 +172,13 @@ pub fn build_openai_compat_body(
 
     set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
-    if let Some(reasoning_effort) = reasoning_effort {
-        body["reasoning_effort"] = json!(reasoning_effort.as_str());
+    match reasoning_effort {
+        Some(ReasoningEffort::Disabled) if model == DASHSCOPE_DEEPSEEK_V41_FLASH_MODEL => {
+            // DashScope rejects "none" for this model on Chat Completions.
+            body["enable_thinking"] = json!(false);
+        }
+        Some(effort) => body["reasoning_effort"] = json!(effort.as_str()),
+        None => {}
     }
 
     if let Some(parallel_tool_calls) = parallel_tool_calls {

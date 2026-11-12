@@ -17,7 +17,7 @@ pub use stream::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
-use crate::providers::common::log_identity;
+use crate::providers::common::{log_identity, DASHSCOPE_DEEPSEEK_V41_FLASH_MODEL};
 use async_trait::async_trait;
 use bamboo_domain::{
     resolve_tool_reference_name, CapabilityLoadingClass, CapabilityLoadingMode,
@@ -834,7 +834,9 @@ fn build_anthropic_request_with_cache_blocks_native_mode(
     if let Some(effort) = reasoning_effort {
         // Effort controls depth, not activation. Enable the protocol's adaptive
         // mode without deriving a budget or changing the selected effort.
-        body["output_config"] = json!({"effort": effort.as_str()});
+        if effort != ReasoningEffort::Disabled || model != DASHSCOPE_DEEPSEEK_V41_FLASH_MODEL {
+            body["output_config"] = json!({"effort": effort.as_str()});
+        }
         body["thinking"] = json!({
             "type": if effort == ReasoningEffort::Disabled { "disabled" } else { "adaptive" }
         });
