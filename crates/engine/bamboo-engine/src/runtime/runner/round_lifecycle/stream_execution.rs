@@ -33,7 +33,7 @@ use bamboo_domain::{
     CompressionTriggerType, ModelContextEventKind, ModelContextResetReason, ProviderFamily,
     ProviderProtocol, ReasoningEffort, MAX_MODEL_CONTEXT_RENDERED_BYTES,
 };
-use bamboo_llm::provider::ResponsesRequestOptions;
+use bamboo_llm::provider::{CompletionDiagnostics, OutputLimitRecovery, ResponsesRequestOptions};
 use bamboo_llm::{
     CacheTtl, Continuation, LLMProvider, LLMRequestOptions, PromptCachePlan, PromptIR,
     ProviderVisibleToolFootprint, ProviderVisibleToolSegmentKind, Segment, SegmentRole,
@@ -54,6 +54,7 @@ pub(in crate::runtime::runner) struct LlmStreamFrame<'a> {
     pub provider_name: Option<&'a str>,
     pub provider_type: Option<&'a str>,
     pub reasoning_effort: Option<ReasoningEffort>,
+    pub output_limit_recovery: Option<OutputLimitRecovery>,
     pub max_context_tokens: u32,
     pub max_output_tokens: u32,
     pub observation_progress_hint: Option<&'a str>,
@@ -185,6 +186,7 @@ fn interruption_kind(error: &AgentError) -> &'static str {
         AgentError::Cancelled => "cancelled",
         AgentError::StreamTimeout(_) => "stream_timeout",
         AgentError::LLMOverflow(_) => "llm_overflow",
+        AgentError::OutputTokenLimit { .. } => "output_token_limit",
         AgentError::EmptyAssistantResponse { .. } => "empty_assistant_response",
         AgentError::LLM(_) | AgentError::LLMNonRetryable(_) => "llm_error",
         _ => "execution_error",
@@ -1487,6 +1489,7 @@ pub(super) async fn execute_llm_stream(
         crate::runtime::stream::handler::StreamHandlingOutput,
         u128,
         u64,
+        CompletionDiagnostics,
     ),
     AgentError,
 > {
@@ -1817,16 +1820,20 @@ pub(super) async fn execute_llm_stream(
             None,
         )
     };
+    let completion = CompletionDiagnostics::for_agent_round(frame.output_limit_recovery);
     let bootstrap_result = {
         let bootstrap = observation.scope(bamboo_llm::retry::with_upstream_retry(
             config.upstream_retry,
             crate::runtime::stream::handler::await_stream_bootstrap_observed(
-                llm.chat_stream_ir(
-                    &prepared_envelope.ir,
-                    tool_schemas,
-                    Some(max_output_tokens),
-                    model,
-                    Some(&planned.request_options),
+                bamboo_llm::provider::scope_completion_diagnostics(
+                    completion.clone(),
+                    llm.chat_stream_ir(
+                        &prepared_envelope.ir,
+                        tool_schemas,
+                        Some(max_output_tokens),
+                        model,
+                        Some(&planned.request_options),
+                    ),
                 ),
                 cancel_token,
                 session_id,
@@ -2066,8 +2073,10 @@ pub(super) async fn execute_llm_stream(
     );
     observation.finish(bamboo_infrastructure::telemetry::Outcome::Success);
 
+    let output_limited = super::rejected_output_limit(&stream_output, completion.finish_reason());
     if config.features_final_evidence_check
         && !activation_pending
+        && !output_limited
         && !stream_output.tool_calls.is_empty()
     {
         if stream_output.visible_message.is_none() && !stream_output.reasoning_content.is_empty() {
@@ -2192,32 +2201,27 @@ pub(super) async fn execute_llm_stream(
         }
     }
 
-    if continuation_enabled {
-        if let Some(response_id) = stream_output
-            .response_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            session.metadata.insert(
-                SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
-                response_id.to_string(),
-            );
-        } else {
-            session
-                .metadata
-                .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+    if !output_limited {
+        let response_id = stream_output.response_id.as_deref().map(str::trim);
+        match response_id.filter(|id| continuation_enabled && !id.is_empty()) {
+            Some(id) => {
+                session.metadata.insert(
+                    SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY.to_string(),
+                    id.to_string(),
+                );
+            }
+            None => {
+                session
+                    .metadata
+                    .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
+            }
         }
-    } else {
-        session
-            .metadata
-            .remove(SESSION_RESPONSES_PREVIOUS_RESPONSE_ID_KEY);
     }
 
     let llm_duration = llm_started_at.elapsed().as_millis();
     let prompt_tokens = super::token_estimation::estimate_prompt_tokens(&prepared_context.messages);
 
-    Ok((stream_output, llm_duration, prompt_tokens))
+    Ok((stream_output, llm_duration, prompt_tokens, completion))
 }
 
 #[cfg(test)]

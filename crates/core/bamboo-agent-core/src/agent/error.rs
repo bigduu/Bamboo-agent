@@ -223,6 +223,15 @@ pub enum AgentError {
         response_id: Option<String>,
     },
 
+    /// The provider reached its output ceiling before yielding a usable round.
+    #[error("LLM reached its output token limit (finish_reason={finish_reason}, response_id={response_id:?})")]
+    OutputTokenLimit {
+        finish_reason: &'static str,
+        response_id: Option<String>,
+        /// A completed attempt with reasoning and no visible answer or tool activity.
+        reasoning_only: bool,
+    },
+
     /// LLM request exceeded provider context/input limits and requires
     /// host-side overflow recovery before retry.
     #[error("LLM overflow: {0}")]

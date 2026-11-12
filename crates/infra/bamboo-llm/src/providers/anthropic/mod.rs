@@ -461,7 +461,13 @@ impl AnthropicProvider {
         );
         apply_required_tool_choice(&mut body, required_tool);
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_MESSAGES,
+            model,
+        )?;
         // DIAGNOSTIC: count image blocks actually present in the OUTGOING request
         // body (top-level content blocks AND inside tool_result content arrays), so
         // we can tell with certainty whether a screenshot reaches the wire vs being
