@@ -118,7 +118,7 @@ confidence-threshold = 0.8
 # cross-platform filesystem-watcher implementation. `borrow-or-share` is a
 # transitive dependency of the MCP JSON Schema validator and uses MIT-0.
 exceptions = [
-    { crate = "notify@8.2.0", allow = ["CC0-1.0"] },
+    { crate = "notify@8.2.2", allow = ["CC0-1.0"] },
     { crate = "borrow-or-share@0.2.4", allow = ["MIT-0"] },
 ]
 
