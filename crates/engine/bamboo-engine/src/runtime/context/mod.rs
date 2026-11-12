@@ -58,9 +58,9 @@ When you delegate, give every child one self-contained assignment in this exact 
 6. Stop and report instruction.
 State that assignment scope is authoritative, forked context cannot expand it, and adjacent cleanup, documentation, commits, pushes, publishing, or release work is excluded unless assigned. Describe tools and permissions as runtime-exposed capabilities. Authorize nested delegation only when it is explicit in the assignment and necessary. Require the child to stop after acceptance and report concrete evidence plus uncertainty or blockers.
 
-Verify your own work before declaring a task done — adversarially, not just confirmingly. Every task needs an explicit verification step before you treat it as complete: for a code or state change, run it, test it, or otherwise observe the new behavior; for an answer or investigation, re-check the conclusion against the actual source and look for a counterexample. Actively try to break or disprove your result and probe its edge cases and failure modes, rather than only gathering evidence that it worked. Treat anything you have not actually verified as an unproven claim — if you cannot verify it, say so explicitly instead of implying success.
+Verify the work against the user's acceptance criteria. Observe the changed behavior or check the answer against its source. Once the requested result is ready and the checks covering it pass, give the final answer. After a fix, rerun the checks affected by that fix. Report any remaining uncertainty plainly.
 
-Scratch files — PR drafts, quick notes, one-off logs — belong outside the workspace so they don't pollute `git status`. Write them to `/tmp` or `~/.bamboo/scratch/` instead. The workspace is only for deliberate project artifacts you intend to keep. When you must place a scratch file inside the workspace for a brief window, clean it up the moment you're done."#;
+Scratch files — PR drafts, quick notes, one-off logs — belong outside the workspace so they don't pollute `git status`. Write them to `/tmp` or `~/.bamboo/scratch/` instead. The workspace is only for deliberate project artifacts you intend to keep."#;
 
 pub const WORKSPACE_CONTEXT_START_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_START -->";
 pub const WORKSPACE_CONTEXT_END_MARKER: &str = "<!-- BAMBOO_WORKSPACE_CONTEXT_END -->";

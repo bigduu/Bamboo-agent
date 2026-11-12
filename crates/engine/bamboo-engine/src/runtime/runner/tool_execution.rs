@@ -287,6 +287,9 @@ async fn execute_and_apply_single_tool_call(
             let dispatch = per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
+                    await_quiet_exec: state.single_tool_call
+                        && runtime_state.no_human_approver
+                        && no_progress::quiet_exec_wait_scope(session, config),
                     session_behavior_version,
                     vision_support,
                     output_cap: None,
@@ -682,7 +685,10 @@ async fn execute_round_tool_calls_inner(
     let available_tool_schemas: Vec<ToolSchema> = tools.list_tools();
     let available_tool_schemas = available_tool_schemas.as_slice();
 
-    let mut state = RoundExecutionState::default();
+    let mut state = RoundExecutionState {
+        single_tool_call: tool_calls.len() == 1,
+        ..RoundExecutionState::default()
+    };
     // Live admission may narrow placement further. Keep any restriction
     // captured from the request that produced these model calls.
     policy_guard.standalone_supervisor_spawn |=
@@ -891,6 +897,7 @@ async fn execute_round_tool_calls_inner(
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
                                 per_call::ToolExecutionOnlyContext {
+                                    await_quiet_exec: false,
                                     session_behavior_version,
                                     vision_support,
                                     output_cap,

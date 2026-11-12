@@ -2985,7 +2985,9 @@ fn build_stable_prompt_frame_contains_only_invariant_system_content() {
     assert!(stable
         .stable_instructions
         .contains("Investigate before you conclude"));
-    assert!(stable.stable_instructions.contains("Verify your own work"));
+    assert!(stable
+        .stable_instructions
+        .contains("Verify the work against the user's acceptance criteria."));
     assert!(stable.stable_prefix_messages.is_empty());
 }
 
