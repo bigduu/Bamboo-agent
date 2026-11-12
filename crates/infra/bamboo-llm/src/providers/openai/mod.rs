@@ -23,7 +23,7 @@ use bamboo_domain::{CapabilityLoadingMode, Message, ReasoningEffort, ToolSchema}
 
 use super::common::model_fetcher;
 use super::common::openai_compat::{
-    build_openai_compat_body, openai_compat_chat_stream_from_sse,
+    build_openai_compat_body, looks_like_responses_only_error, openai_compat_chat_stream_from_sse,
     parse_openai_compat_sse_data_strict_multi, send_chat_completions, tools_to_openai_compat_json,
     ChatCompletionsResponse,
 };
@@ -232,21 +232,6 @@ impl OpenAIProvider {
         let normalized = self.base_url.trim_end_matches('/');
         normalized.eq_ignore_ascii_case("https://api.openai.com")
             || normalized.eq_ignore_ascii_case("https://api.openai.com/v1")
-    }
-
-    fn looks_like_responses_only_error(status: reqwest::StatusCode, body: &str) -> bool {
-        if !(status == 400
-            || status == 404
-            || status == 405
-            || status == 409
-            || status == 415
-            || status == 422)
-        {
-            return false;
-        }
-
-        let b = body.to_ascii_lowercase();
-        b.contains("/responses") || b.contains("responses api") || b.contains("use responses")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -726,6 +711,7 @@ impl LLMProvider for OpenAIProvider {
             self.build_headers(request_overrides::ENDPOINT_CHAT_COMPLETIONS, Some(model))?;
         let chat_url = format!("{}/chat/completions", self.base_url);
         let response = match send_chat_completions(
+            &crate::retry::global(),
             "OpenAI",
             |body| {
                 self.client
@@ -734,7 +720,8 @@ impl LLMProvider for OpenAIProvider {
                     .json(body)
             },
             body,
-            request_purpose == "compression"
+            !self.is_official_base_url()
+                && request_purpose == "compression"
                 && request_reasoning_effort == Some(ReasoningEffort::Disabled),
         )
         .await?
@@ -744,7 +731,7 @@ impl LLMProvider for OpenAIProvider {
                 status,
                 body,
                 corrected_disable: false,
-            } if Self::looks_like_responses_only_error(status, &body) => {
+            } if looks_like_responses_only_error(status, &body) => {
                 tracing::info!(
                     "OpenAI chat/completions rejected model_hash {}; retrying via /responses",
                     log_identity(model)

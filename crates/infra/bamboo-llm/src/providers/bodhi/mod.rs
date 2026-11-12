@@ -271,6 +271,7 @@ impl BodhiProvider {
         let url = self.proxy_url("v1/chat/completions");
 
         let response = match send_chat_completions(
+            &crate::retry::global(),
             "Bodhi",
             |body| self.client.post(&url).headers(headers.clone()).json(body),
             body,

@@ -232,7 +232,7 @@ async fn chat_compression_corrects_only_a_supported_disable_rejection() {
                       "message": "Unsupported value: 'none'."}
         });
         let unrelated = json!({"error": {"param": "messages", "code": "invalid_value",
-                                        "message": "Invalid request messages"}});
+                                        "message": "Invalid messages; request reasoning_effort was 'none'"}});
         for (status, rejection, purpose, metered, corrects) in [
             (400, &effort_error, "compression", false, true),
             (400, &effort_error, "compression", true, false),
@@ -303,6 +303,58 @@ async fn chat_compression_corrects_only_a_supported_disable_rejection() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn explicit_responses_route_takes_precedence_over_chat_disable_correction() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(body_partial_json(json!({"reasoning_effort": "none"})))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error": {
+                "param": "reasoning_effort",
+                "code": "unsupported_value",
+                "message": "Unsupported reasoning_effort 'none' on Chat Completions; use the Responses API"
+            }
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/responses"))
+        .and(body_partial_json(json!({"reasoning": {"effort": "none"}})))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(ROUTES[1].3),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = provider("openai-chat", &server, None);
+    let options = LLMRequestOptions {
+        reasoning_effort: Some(ReasoningEffort::Disabled),
+        request_purpose: Some("compression".into()),
+        ..Default::default()
+    };
+    let mut stream = provider
+        .chat_stream_with_options(
+            &[Message::user("Summarize the conversation")],
+            &[],
+            Some(128),
+            "custom-route",
+            Some(&options),
+        )
+        .await
+        .unwrap();
+    while let Some(chunk) = stream.next().await {
+        chunk.unwrap();
+    }
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[1].url.path(), "/responses");
 }
 
 #[tokio::test]
