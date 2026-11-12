@@ -1838,7 +1838,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "assignment_prompt",
     "clarification_resume_pending",
     "conclusion_with_options_resume_pending",
-    "created_by_connect_key",
+    bamboo_domain::CONNECT_SESSION_ORIGIN_KEY,
     "created_by_schedule_id",
     "disabled_tools",
     "external_memory_rendered",
@@ -8092,6 +8092,14 @@ impl Storage for SessionStoreV2 {
     ) -> io::Result<Session> {
         self.load_host_scoped_target_impl(token, caller, target_id)
             .await
+    }
+
+    async fn load_current_user_peer_session(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.current_user_peer_session(caller, target_id).await
     }
 
     async fn load_host_scoped_context_target(
