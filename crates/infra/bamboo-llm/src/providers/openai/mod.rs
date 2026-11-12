@@ -295,7 +295,13 @@ impl OpenAIProvider {
             body["tool_choice"] = json!({"type": "function", "name": name});
         }
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_RESPONSES,
+            model,
+        )?;
         self.observe_responses_wire(&body, responses_options, session_log_id);
         let prompt_cache_affinity_hint = body
             .get("prompt_cache_key")
@@ -388,7 +394,13 @@ impl OpenAIProvider {
                 if let Some(name) = required_tool {
                     fallback_body["tool_choice"] = json!({"type": "function", "name": name});
                 }
-                crate::masking::mask_outbound_body(&mut fallback_body, &self.masking_config);
+                request_overrides::mask_and_prepare_agent_request(
+                    &mut fallback_body,
+                    &self.masking_config,
+                    self.request_overrides.as_ref(),
+                    request_overrides::ENDPOINT_RESPONSES,
+                    model,
+                )?;
                 self.observe_responses_wire(
                     &fallback_body,
                     Some(&fallback_options),
@@ -690,7 +702,13 @@ impl LLMProvider for OpenAIProvider {
         if let Some(name) = required_tool {
             body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
         }
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            model,
+        )?;
         tracing::info!(
             "[session_hash={}] OpenAI request protocol=chat_completions model_hash={} reasoning_effort={} wire_reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
             log_identity(session_log_id),
