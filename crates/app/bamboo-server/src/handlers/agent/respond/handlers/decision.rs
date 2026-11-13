@@ -1454,6 +1454,7 @@ mod tests {
         request.operation_summary = "Type into focused browser element".to_string();
         request.suggested_matchers[0].value = original_resource.to_string();
         let mut session = parked_permission_session(&request);
+        session.agent_runtime_state = Some(bamboo_domain::AgentRuntimeState::default());
         session.messages.insert(
             0,
             Message::assistant(
@@ -1475,6 +1476,7 @@ mod tests {
         );
         let initial = decision_test_host(dir.path()).await;
         initial.save_and_cache_session(&mut session).await;
+        initial.shutdown().await;
         drop(initial);
 
         let restarted = decision_test_host(dir.path()).await;
@@ -1523,14 +1525,21 @@ mod tests {
         )
         .await
         .expect("redacted preview still permits the exact parked approval");
-        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let status = response.status();
         let body = actix_web::body::to_bytes(response.into_body())
             .await
             .expect("approval body");
+        assert_eq!(
+            status,
+            actix_web::http::StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
         let body: serde_json::Value = serde_json::from_slice(&body).expect("approval JSON");
         assert_eq!(body["success"], true);
         assert_eq!(body["replayed"], false);
         assert_eq!(body["receipt"]["decision"]["decision"], "allow_once");
+        restarted.shutdown().await;
     }
 
     fn unrelated_rule() -> DurablePermissionRule {
