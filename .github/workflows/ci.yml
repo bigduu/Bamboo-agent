@@ -158,6 +158,7 @@ jobs:
           HEAD_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name }}
         run: |
           python3 - <<'PYTHON'
+          import base64
           import json
           import os
           import re
@@ -241,9 +242,22 @@ jobs:
           tag = api(f"git/ref/tags/{urllib.parse.quote(published['tag_name'], safe='')}")
           require(tag["object"]["type"] == "commit" and tag["object"]["sha"] == head,
                   "Formal version tag must point to the exact release source")
-          for name in ["bamboo-aarch64-apple-darwin", "bamboo-x86_64-unknown-linux-gnu",
-                       "bamboo-x86_64-pc-windows-msvc.exe", "bamboo-sidecars-v2.json",
-                       "bamboo-executables-provenance-v2.json", "release-provenance.json"]:
+          policy = api(f"contents/scripts/sidecar-release.cjs?ref={head}")
+          require(policy["type"] == "file" and policy["encoding"] == "base64" and 0 < policy["size"] <= 128 * 1024,
+                  "Missing frozen executable policy")
+          policy_bytes = base64.b64decode("".join(policy["content"].splitlines()), validate=True)
+          require(len(policy_bytes) == policy["size"], "Frozen executable policy size differs")
+          markers = [match.group(1) for line in policy_bytes.decode("utf-8").splitlines()
+                     if (match := re.fullmatch(r"// BAMBOO_SHARED_EXECUTABLES_V([0-9]+)", line))]
+          require(len(markers) == 1 and markers[0] in {"2", "3"}, "Unknown frozen executable contract")
+          contract = markers[0]
+          names = {"bamboo-aarch64-apple-darwin", "bamboo-x86_64-unknown-linux-gnu",
+                   "bamboo-x86_64-pc-windows-msvc.exe", f"bamboo-sidecars-v{contract}.json",
+                   f"bamboo-executables-provenance-v{contract}.json", "release-provenance.json"}
+          if contract == "3":
+              names.update({"bamboo-aarch64-unknown-linux-gnu", "bamboo-aarch64-pc-windows-msvc.exe",
+                            "bamboo-browser-host-v1.tar.gz"})
+          for name in sorted(names):
               assets = [asset for asset in published["assets"] if asset["name"] == name]
               require(len(assets) == 1 and assets[0]["state"] == "uploaded" and assets[0]["size"] > 0,
                       f"Completed release asset is missing: {name}")
@@ -306,7 +320,7 @@ jobs:
 
   feature-tests:
     name: Feature Unit and E2E
-    needs: [validation-source, feature-shards]
+    needs: [validation-source, feature-shards, arm64-feature]
     if: always() && !cancelled() && needs.validation-source.outputs.docs_only != 'true' && (github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.base_ref == 'dev'))
     runs-on: ubuntu-latest
     steps:
@@ -314,10 +328,12 @@ jobs:
         env:
           SOURCE_RESULT: ${{ needs.validation-source.result }}
           SHARDS_RESULT: ${{ needs.feature-shards.result }}
+          ARM64_RESULT: ${{ needs.arm64-feature.result }}
         run: |
           set -euo pipefail
           test "$SOURCE_RESULT" = success
           test "$SHARDS_RESULT" = success
+          test "$ARM64_RESULT" = success
 
   feature-shards:
     name: Feature Unit and E2E (${{ matrix.shard }})
@@ -412,6 +428,78 @@ jobs:
             ${{ runner.temp }}/bamboo-feature-profile.log
           if-no-files-found: ignore
           retention-days: 7
+
+  arm64-feature:
+    name: ARM64 Embedded Frontend (${{ matrix.target }})
+    needs: validation-source
+    if: needs.validation-source.outputs.feature == 'true' && needs.validation-source.outputs.docs_only == 'false'
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+    env:
+      BAMBOO_TEST_TARGET: ${{ matrix.target }}
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target/arm64-feature
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          architecture: arm64
+          package-manager-cache: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          shared-key: bamboo-arm64-frontend-${{ matrix.target }}
+          workspaces: . -> target/arm64-feature
+          cache-workspace-crates: false
+          save-if: ${{ (github.event_name == 'pull_request' && github.base_ref == 'dev') && env.BAMBOO_RELEASE_CACHE_WRITE_ALLOWED == 'true' }}
+      - name: Verify native ARM64 host and exact feature source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ARCH" = ARM64
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
+          node - <<'NODE'
+          const assert = require('node:assert/strict')
+          const { execFileSync } = require('node:child_process')
+          const { nativeTarget } = require('./scripts/sidecar-build.cjs')
+          const target = process.env.BAMBOO_TEST_TARGET
+          assert.equal(nativeTarget(), target, 'Node must be native ARM64')
+          const rustc = execFileSync('rustc', ['-vV'], { encoding: 'utf8' })
+          assert.ok(rustc.split(/\r?\n/).includes('host: ' + target), rustc)
+          NODE
+          node scripts/frontend-package.cjs verify
+      - name: Run the real Bamboo embedded frontend on ARM64
+        shell: bash
+        run: |
+          set -euo pipefail
+          case_name=real_bamboo_binary_serves_the_required_embedded_frontend
+          cargo test --locked --target "$BAMBOO_TEST_TARGET" --test frontend_packaging -- --exact "$case_name" \
+            | tee "$RUNNER_TEMP/bamboo-arm64-frontend.log"
+          tr -d '\r' < "$RUNNER_TEMP/bamboo-arm64-frontend.log" | grep -Fx "test $case_name ... ok"
+          node - <<'NODE'
+          const path = require('node:path')
+          const { binaryArchitecture } = require('./scripts/sidecar-release.cjs')
+          const target = process.env.BAMBOO_TEST_TARGET
+          const binary = process.platform === 'win32' ? 'bamboo.exe' : 'bamboo'
+          binaryArchitecture(path.join(process.env.CARGO_TARGET_DIR, target, 'debug', binary), target)
+          NODE
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain --untracked-files=all)"
 
   browser-runtime-tests:
     name: Browser Runtime Unit and E2E (${{ matrix.shard }})

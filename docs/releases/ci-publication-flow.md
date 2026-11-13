@@ -119,6 +119,13 @@ or treat a local/policy check as completed production recovery.
 
 ## Main and consumers
 
+The frozen source selects the native executable contract. The five-target v3
+contract requires Linux ARM64 and Windows ARM64 feature evidence through the
+existing feature aggregate and requires both binaries in the completed Release.
+Verify each architecture and the original output identity. The v2 contract
+keeps its existing three targets. See [shared executable assets](shared-executable-assets.md)
+for the complete target and recovery rules.
+
 Promote the release only after its required artifacts are published and checked.
 Main stores the stable source and version/tag references without another product
 build, Unit/E2E run or publication. Documentation and Docker consumers use the
@@ -186,7 +193,7 @@ From the main merge to complete assets, elapsed time was about 2 hours 24 minute
 excluding pre-merge acceptance.
 
 That historical source required all four v1 targets; its longest native job was
-macOS Intel. New v2 releases have three targets. Compare each source contract
+macOS Intel. The v2 contract has three targets and v3 has five. Compare each source contract
 separately and retain exact source/run/attempt/platform details when measuring
 the new workflow. These timings explain the optimization; they do not claim a
 measured speedup for an unpublished candidate.

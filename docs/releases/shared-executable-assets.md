@@ -8,9 +8,9 @@ and select it with `bamboo serve --static-dir`; that explicit directory takes
 priority over the embedded frontend. Desktop acceptance must check the real
 executable's version, health endpoints, static asset bytes and SPA fallback.
 
-Publication retains the successful same-repository main-push CI prerequisite,
-the protected-source authorization, the existing version allocator and crate
-validation, and the single `bamboo-crate-publication` queue. One authenticated
+Publication requires an accepted protected-Dev cut and its original feature
+CI, the existing version allocator and crate validation, and the single
+`bamboo-crate-publication` queue. One authenticated
 preparation reserves the source/version/frontend and transports its preserved
 frontend manifest and ZIP before fan-out. Crate publication and the executable
 jobs then run concurrently. Native workers verify the two bounded regular files
@@ -18,15 +18,18 @@ against the preparation's independent hash output, without draft-Release API
 access or publication credentials. They stamp all local crates with that reserved
 version, reject external dependency lock changes, and build
 the standard release executable once on each native runner selected by the
-accepted source contract. New v2 releases have these three targets:
+accepted source contract. The v3 contract requires all five targets:
 
 | Target | Runner | Raw executable asset |
 | --- | --- | --- |
 | `aarch64-apple-darwin` | `macos-latest` | `bamboo-aarch64-apple-darwin` |
+| `aarch64-unknown-linux-gnu` | `ubuntu-22.04-arm` | `bamboo-aarch64-unknown-linux-gnu` |
+| `aarch64-pc-windows-msvc` | `windows-11-arm` | `bamboo-aarch64-pc-windows-msvc.exe` |
 | `x86_64-unknown-linux-gnu` | `ubuntu-22.04` | `bamboo-x86_64-unknown-linux-gnu` |
 | `x86_64-pc-windows-msvc` | `windows-latest` | `bamboo-x86_64-pc-windows-msvc.exe` |
 
-macOS Intel is omitted from v2. ARM-only Homebrew distribution is retained.
+Homebrew continues to distribute macOS ARM64. V2 sources and signed assets
+keep their original three targets (macOS ARM64, Linux x64, and Windows x64).
 Historical v1 sources and signed assets keep their original four targets,
 including `x86_64-apple-darwin` on `macos-15-intel`. Before allocating a version,
 the workflow verifies one consistent supported ABI across the accepted source's
@@ -45,12 +48,13 @@ embedded CI build of another source or version is not substituted as an asset.
 Before any version reservation or crate upload, source preflight requires the
 complete producer files and shared executable ABI marker. A delayed or rerun
 successful main CI event from an older source therefore fails before creating
-a release identity, rather than publishing crates and later discovering that
-its source cannot build the required executable assets.
+a release identity. Each ARM64 feature job runs the real embedded frontend
+test with a native Rust toolchain and verifies the resulting ELF or PE machine
+type. Both jobs must pass before the feature aggregate succeeds.
 
-All public assets belong to `bigduu/Bamboo-agent` and tag `v<version>`. Three
-v2 raw executables, `bamboo-browser-host-v1.tar.gz`,
-`bamboo-executables-provenance-v2.json`, and `bamboo-sidecars-v2.json` are added
+All public assets belong to `bigduu/Bamboo-agent` and tag `v<version>`. Five
+v3 raw executables, `bamboo-browser-host-v1.tar.gz`,
+`bamboo-executables-provenance-v3.json`, and `bamboo-sidecars-v3.json` are added
 to that same Release. The final job authenticates the completed crate receipt
 using the existing protected Environment, verifies the tag/source and all required
 same-run build receipts, and verifies each uploaded asset's bytes. It refuses
@@ -96,9 +100,9 @@ The current build must regenerate and verify its embedded frontend evidence.
 Historical v1 and frozen restore-only releases do not write new caches. A cache
 hit does not change compiler flags, wrapper restrictions or final asset identity.
 
-The new manifest schema is version 2. `version` is the allocated version without
+The five-target manifest schema is version 3. `version` is the allocated version without
 `v`, and `sourceRevision` is the complete accepted Git SHA. `artifacts` contains
-exactly the three v2 targets above. Each entry contains `target`,
+exactly the five v3 targets above. Each entry contains `target`,
 `buildMode: "embedded"`, `embeddedFrontend: true`, `format: "raw"`, `assetName`,
 lowercase `sha256`, and integer `sizeBytes`. The `browserHost` entry contains
 its `assetName`, `sha256`, `sizeBytes`, and an exact `files` list with the path,
@@ -113,12 +117,11 @@ file entries, with no directory, PAX, symlink, hardlink or extra members. It is
 a Release asset so desktop packaging needs no Bamboo source checkout. The
 existing browser runtime dependency lock remains authoritative.
 
-The frozen v1 schema, asset names and four-target recovery remain supported.
-Recovery validates each schema independently of the current constructor, keeps
-the signed original manifest serialization and native receipts, and verifies
-the original bytes before completing a missing manifest upload. V1 and v2
-identities cannot be mixed or used to complete each other's target set. No old
-release, tag, asset or receipt is converted to v2.
+The frozen v1 and v2 schemas, asset names and original target sets remain
+supported. Recovery validates each schema independently of the current
+constructor, keeps the signed original manifest serialization and native
+receipts, and verifies the original bytes before completing a missing manifest
+upload. Each release keeps the asset set of its frozen source.
 
 A consumer pins the manifest schema/name, SHA-256 and exact version/source, validates
 all target/mode/hash/size fields, downloads only assets of that same repository
