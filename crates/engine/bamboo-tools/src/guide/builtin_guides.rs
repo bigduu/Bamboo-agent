@@ -134,7 +134,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
         "write_stdin" => Some(guide(
             "write_stdin",
             ToolCategory::CommandExecution,
-            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait. Ordinary polls clamp yield_time_ms to 250–30000 ms and default to 10000 ms. A single unattended Root poll can wait longer within the tool deadline for a quiet command with no open stdin. Running results retain session_id. Final results omit it and include exit_code when available. Polling reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. A true exit_observed still requires terminal output capture. The quiet polling advisory suggests a longer wait when you need the exit result. Investigate a concrete failure when one is visible. In a Human-controlled Root, repeated quiet polling can transfer the command to durable background monitoring and deliver its terminal result automatically. Otherwise finite diagnostic recovery can report incomplete progress while retaining the handle. Unread terminal results expire five minutes after completion. Output is bounded by max_output_tokens (default 2000, maximum 8192). output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to stdin. Include your own newline and use eof=true to close the pipe. A lone Ctrl-C (\\u0003) stops the process.",
+            "Pull output and completion from an exec_command session owned by this conversation. Use chars=\"\" to wait. Ordinary polls clamp yield_time_ms to 250–30000 ms and default to 10000 ms. A single unattended Root poll can wait longer within the tool deadline for a quiet command with no open stdin. Running results retain session_id. Final results omit it and include exit_code when available. Polling reports state, elapsed_ms, output_idle_ms, consecutive_empty_readouts and exit_observed. A true exit_observed still requires terminal output capture. Investigate a concrete failure when one is visible. In a Human-controlled Root, repeated quiet polling can transfer the command to durable background monitoring and deliver its terminal result automatically. Otherwise finite diagnostic recovery can report incomplete progress while retaining the handle. Unread terminal results expire five minutes after completion. Output is bounded by max_output_tokens (default 2000, maximum 8192). output_omitted_bytes reports discarded bytes. For interactive=true sessions, nonempty chars writes exact bytes to stdin. Include your own newline and use eof=true to close the pipe. A lone Ctrl-C (\\u0003) stops the process.",
             "Do not use a conversation ID or legacy Bash ID as session_id. Do not infer completion from silence or an existing report, stop a command only because it is quiet, or poll after receiving a terminal result. Expect automatic results only after an explicit background handoff. Input requires an interactive stdin pipe.",
             &["exec_command"],
             vec![
@@ -729,7 +729,9 @@ mod tests {
         let poll = builtin_guide_spec("write_stdin").unwrap();
         assert!(poll.when_to_use.contains("Final results omit it"));
         assert!(poll.when_to_use.contains("your own newline"));
-        assert!(poll.when_to_use.contains("polling advisory"));
+        assert!(poll
+            .when_to_use
+            .contains("Running results retain session_id"));
         assert!(poll
             .when_to_use
             .contains("A single unattended Root poll can wait longer"));

@@ -17,11 +17,10 @@ const MAX_CAPTURE_BYTES: usize = 256 * 1024;
 const MAX_OUTPUT_TOKENS: usize = 8192;
 const DEFAULT_OUTPUT_TOKENS: usize = 2000;
 const MAX_COMMAND_BYTES: usize = 64 * 1024;
-// Advisory only: silence never changes process lifetime or terminal status.
-const QUIET_POLL_ADVISORY_AFTER: Duration = Duration::from_secs(90);
-const QUIET_POLL_ADVISORY_READOUTS: usize = 3;
+const QUIET_POLL_DIAGNOSIS_AFTER: Duration = Duration::from_secs(90);
 const QUIET_POLL_DIAGNOSIS_READOUTS: usize = 6;
-const QUIET_POLL_ADVISORY: &str = "No new output across repeated polls. If you need the exit result, use this session_id with an empty write_stdin and request a longer wait. Investigate a concrete failure when one is visible.";
+const QUIET_POLL_ADVISORY_POLLS: usize = 3;
+const QUIET_POLL_ADVISORY: &str = "No new output after three consecutive empty polls for this session. Before polling again, assess whether changing the approach would complete the task more efficiently.";
 
 #[derive(Debug, Clone)]
 struct CapturedOutput {
@@ -32,6 +31,10 @@ struct CapturedOutput {
     started_at: Instant,
     last_output_at: Instant,
     consecutive_empty_readouts: usize,
+    // Raw readouts still drive diagnostics. A write_stdin call can take two
+    // readouts before delivering its single result.
+    consecutive_empty_polls: usize,
+    pending_empty_poll: Option<Arc<str>>,
 }
 
 impl Default for CapturedOutput {
@@ -45,8 +48,54 @@ impl Default for CapturedOutput {
             started_at: now,
             last_output_at: now,
             consecutive_empty_readouts: 0,
+            consecutive_empty_polls: 0,
+            pending_empty_poll: None,
         }
     }
+}
+
+impl CapturedOutput {
+    fn reset_poll_advisory(&mut self) {
+        self.consecutive_empty_polls = 0;
+        self.pending_empty_poll = None;
+    }
+
+    fn record_empty_poll(&mut self) -> Option<&'static str> {
+        self.consecutive_empty_polls = self.consecutive_empty_polls.saturating_add(1);
+        (self.consecutive_empty_polls == QUIET_POLL_ADVISORY_POLLS).then_some(QUIET_POLL_ADVISORY)
+    }
+
+    fn finish_pending_empty_poll(&mut self, call_id: &str) -> Option<&'static str> {
+        if self.pending_empty_poll.as_deref() == Some(call_id) {
+            self.pending_empty_poll = None;
+            self.record_empty_poll()
+        } else {
+            None
+        }
+    }
+
+    fn poll_advisory(&mut self, poll: EmptyPoll<'_>) -> Option<&'static str> {
+        match poll {
+            EmptyPoll::Deliver => {
+                self.pending_empty_poll = None;
+                self.record_empty_poll()
+            }
+            // A displaced or canceled call may have taken an internal
+            // readout but cannot claim the newer call's result.
+            EmptyPoll::Defer(call_id) => {
+                self.pending_empty_poll = Some(Arc::clone(call_id));
+                None
+            }
+            EmptyPoll::Continue(call_id) => self.finish_pending_empty_poll(call_id),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum EmptyPoll<'a> {
+    Deliver,
+    Defer(&'a Arc<str>),
+    Continue(&'a str),
 }
 
 /// Per-handle pull cursor and bounded capture. Process ownership remains in
@@ -94,6 +143,7 @@ impl PolledShellState {
         let mut output = self.output.lock().await;
         output.last_output_at = Instant::now();
         output.consecutive_empty_readouts = 0;
+        output.reset_poll_advisory();
         output.bytes.extend_from_slice(bytes);
         let mut excess = output.bytes.len().saturating_sub(MAX_CAPTURE_BYTES);
         if excess > 0 {
@@ -168,13 +218,37 @@ impl PolledShellState {
         self.output.lock().await.consecutive_empty_readouts = 0;
     }
 
+    pub(super) async fn reset_poll_advisory(&self) {
+        self.output.lock().await.reset_poll_advisory();
+    }
+
+    pub(super) async fn finish_empty_poll(&self, call_id: &str) -> Option<&'static str> {
+        let mut output = self.output.lock().await;
+        if self.process_exited() || output.error.is_some() || output.completion.is_some() {
+            output.reset_poll_advisory();
+            return None;
+        }
+        output.finish_pending_empty_poll(call_id)
+    }
+
+    #[cfg(test)]
     async fn take(&self, shell_id: &str, max_output_tokens: Option<usize>) -> ExecSessionResult {
+        self.take_poll(shell_id, max_output_tokens, None).await
+    }
+
+    async fn take_poll(
+        &self,
+        shell_id: &str,
+        max_output_tokens: Option<usize>,
+        poll: Option<EmptyPoll<'_>>,
+    ) -> ExecSessionResult {
         let mut output = self.output.lock().await;
         Self::take_locked(
             &mut output,
             shell_id,
             max_output_tokens,
             self.process_exited(),
+            poll,
         )
     }
 
@@ -183,10 +257,19 @@ impl PolledShellState {
         shell_id: &str,
         max_output_tokens: Option<usize>,
         exit_observed: bool,
+        poll: Option<EmptyPoll<'_>>,
     ) -> ExecSessionResult {
         // Count captured bytes, including bytes omitted by either cap, rather
         // than the rendered string. A tiny response cap can hide real output.
         let had_output = !output.bytes.is_empty() || output.omitted_bytes > 0;
+        let advisory =
+            if had_output || exit_observed || output.error.is_some() || output.completion.is_some()
+            {
+                output.reset_poll_advisory();
+                None
+            } else {
+                poll.and_then(|poll| output.poll_advisory(poll))
+            };
         let polling = output.completion.is_none().then(|| {
             output.consecutive_empty_readouts = if had_output {
                 0
@@ -197,7 +280,7 @@ impl PolledShellState {
             let idle = now.duration_since(output.last_output_at);
             ExecSessionProgress {
                 terminal_result_ttl_ms: bash_runtime::COMPLETED_SESSION_TTL_SECS * 1000,
-                state: if idle >= QUIET_POLL_ADVISORY_AFTER
+                state: if idle >= QUIET_POLL_DIAGNOSIS_AFTER
                     && output.consecutive_empty_readouts >= QUIET_POLL_DIAGNOSIS_READOUTS
                 {
                     "needs_diagnosis"
@@ -208,9 +291,7 @@ impl PolledShellState {
                 output_idle_ms: duration_ms(idle),
                 consecutive_empty_readouts: output.consecutive_empty_readouts,
                 exit_observed,
-                advisory: (idle >= QUIET_POLL_ADVISORY_AFTER
-                    && output.consecutive_empty_readouts >= QUIET_POLL_ADVISORY_READOUTS)
-                    .then_some(QUIET_POLL_ADVISORY),
+                advisory,
             }
         });
         let bytes = std::mem::take(&mut output.bytes);
@@ -268,6 +349,7 @@ impl BackgroundExecJob {
                 &self.shell.id,
                 Some(1024),
                 state.process_exited(),
+                None,
             );
             return bamboo_agent_core::BashCompletionInfo {
                 session_id: self.session_id().to_owned(),
@@ -448,14 +530,17 @@ pub(crate) fn owner_session(ctx: &ToolCtx) -> Result<&str, ToolError> {
     })
 }
 
-pub(crate) async fn poll_result(
+pub(super) async fn poll_result(
     shell: &bash_runtime::ShellSession,
     yield_time_ms: u64,
     max_output_tokens: Option<usize>,
+    empty_poll: Option<EmptyPoll<'_>>,
 ) -> ToolOutcome {
     let state = shell.polled.as_ref().expect("validated exec session");
     state.wait(yield_time_ms).await;
-    let result = state.take(&shell.id, max_output_tokens).await;
+    let result = state
+        .take_poll(&shell.id, max_output_tokens, empty_poll)
+        .await;
     if result.session_id.is_none() {
         bash_runtime::remove_shell(&shell.id);
     }
@@ -533,6 +618,7 @@ async fn take_initial_result(
         &shell.id,
         max_output_tokens,
         state.process_exited(),
+        None,
     );
     if let Some(status) = terminal {
         result.session_id = None;

@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use bamboo_agent_core::{Tool, ToolCtx, ToolError, ToolOutcome, ToolResult};
@@ -7,10 +7,19 @@ use serde_json::{json, Value};
 
 use super::{
     bash_runtime,
-    exec_command::{owner_session, poll_result, yield_duration},
+    exec_command::{owner_session, poll_result, yield_duration, EmptyPoll},
 };
 
 const MAX_INPUT_BYTES: usize = 64 * 1024;
+
+tokio::task_local! {
+    static DEFER_EMPTY_POLL_ADVISORY: ();
+}
+
+/// The runner will resolve the logical result through [`continue_empty_poll`].
+pub async fn defer_empty_poll_advisory<F: Future>(dispatch: F) -> F::Output {
+    DEFER_EMPTY_POLL_ADVISORY.scope((), dispatch).await
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -30,19 +39,24 @@ fn owned_exec(owner: &str, id: &str) -> Option<Arc<bash_runtime::ShellSession>> 
 }
 
 /// Honor a longer empty poll or continue a quiet one within the runner's
-/// tool deadline. The foreground runner owns cancellation of the wait.
+/// tool deadline. A deferred poll counts only when this call delivers a result.
 pub async fn continue_empty_poll(
     owner: &str,
+    tool_call_id: &str,
     arguments: &Value,
-    previous: &ToolResult,
+    mut previous: ToolResult,
     elapsed: Duration,
     remaining: Duration,
-) -> Option<ToolOutcome> {
-    if remaining.is_zero() || !previous.success || !previous.images.is_empty() {
-        return None;
+) -> ToolOutcome {
+    if !previous.success || !previous.images.is_empty() {
+        return ToolOutcome::Completed(previous);
     }
-    let args = WriteStdinArgs::deserialize(arguments).ok()?;
-    let result: Value = serde_json::from_str(&previous.result).ok()?;
+    let (Ok(args), Ok(mut result)) = (
+        WriteStdinArgs::deserialize(arguments),
+        serde_json::from_str::<Value>(&previous.result),
+    ) else {
+        return ToolOutcome::Completed(previous);
+    };
     if !args.chars.is_empty()
         || args.eof
         || result["session_id"].as_str() != Some(args.session_id.as_str())
@@ -52,35 +66,53 @@ pub async fn continue_empty_poll(
         || result.get("error").is_some()
         || result["polling"]["exit_observed"] != false
     {
-        return None;
+        return ToolOutcome::Completed(previous);
     }
-    let remaining = match args
+    let Some(shell) = owned_exec(owner, &args.session_id) else {
+        return ToolOutcome::Completed(previous);
+    };
+    let state = shell.polled.as_ref().expect("validated exec session");
+    let wait = match args
         .yield_time_ms
         .filter(|requested| *requested > yield_duration(Some(*requested)))
     {
         Some(requested) => remaining.min(Duration::from_millis(requested).saturating_sub(elapsed)),
         None if result["polling"]["state"] == "needs_diagnosis" => remaining,
-        None => return None,
+        None => Duration::ZERO,
     };
-    if remaining.is_zero() {
-        return None;
-    }
-    let deadline = tokio::time::Instant::now().checked_add(remaining)?;
-    let shell = owned_exec(owner, &args.session_id)?;
-    let state = shell.polled.as_ref().expect("validated exec session");
-    let _interaction = tokio::time::timeout_at(deadline, async {
-        let guard = state.interaction.lock().await;
-        // An interactive command may need the next model turn to send input.
-        if shell.stdin_is_open().await {
-            return None;
+    let deadline = if wait.is_zero() {
+        None
+    } else {
+        tokio::time::Instant::now().checked_add(wait)
+    };
+    if let Some(deadline) = deadline {
+        if let Ok(Some(_interaction)) = tokio::time::timeout_at(deadline, async {
+            let guard = state.interaction.lock().await;
+            // An interactive command may need the next model turn to send input.
+            if shell.stdin_is_open().await {
+                return None;
+            }
+            owned_exec(owner, &args.session_id).map(|_| guard)
+        })
+        .await
+        {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if let Ok(wait_ms) = u64::try_from(remaining.as_millis()) {
+                return poll_result(
+                    &shell,
+                    wait_ms,
+                    args.max_output_tokens,
+                    Some(EmptyPoll::Continue(tool_call_id)),
+                )
+                .await;
+            }
         }
-        owned_exec(owner, &args.session_id).map(|_| guard)
-    })
-    .await
-    .ok()??;
-    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    let wait_ms = u64::try_from(remaining.as_millis()).ok()?;
-    Some(poll_result(&shell, wait_ms, args.max_output_tokens).await)
+    }
+    if let Some(advisory) = state.finish_empty_poll(tool_call_id).await {
+        result["polling"]["advisory"] = json!(advisory);
+        previous.result = result.to_string();
+    }
+    ToolOutcome::Completed(previous)
 }
 
 #[derive(Default)]
@@ -134,6 +166,16 @@ impl Tool for WriteStdinTool {
         // Serialize writes and the implicit output cursor, including callers
         // that already obtained an Arc while another poll was completing.
         let _interaction = state.interaction.lock().await;
+        let empty_poll = if parsed.chars.is_empty() && !parsed.eof {
+            Some(if DEFER_EMPTY_POLL_ADVISORY.try_with(|_| ()).is_ok() {
+                EmptyPoll::Defer(&ctx.tool_call_id)
+            } else {
+                EmptyPoll::Deliver
+            })
+        } else {
+            state.reset_poll_advisory().await;
+            None
+        };
         let mut wait_ms = yield_duration(parsed.yield_time_ms);
         if parsed.chars == "\u{3}" {
             shell.kill().await.map_err(ToolError::Execution)?;
@@ -155,6 +197,6 @@ impl Tool for WriteStdinTool {
             shell.close_stdin().await;
             state.reset_empty_readouts().await;
         }
-        Ok(poll_result(&shell, wait_ms, parsed.max_output_tokens).await)
+        Ok(poll_result(&shell, wait_ms, parsed.max_output_tokens, empty_poll).await)
     }
 }
