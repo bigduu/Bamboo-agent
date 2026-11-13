@@ -248,14 +248,15 @@ test('preparation output freezes one signed reservation and accepts later attemp
   }
 })
 
-test('crate fan-out resumes the same version using fresh signed progress and sealed frontend bytes', async () => {
+for (const contractVersion of [2, 3]) test('crate fan-out v' + contractVersion + ' resumes the same version using fresh signed progress and sealed frontend bytes', async () => {
   const initial = makeReceipt()
-  const prepared = createPreparation({ release: release(initial), receipt: initial }, preparationIdentity, 2)
+  const prepared = createPreparation({ release: release(initial), receipt: initial }, preparationIdentity, contractVersion)
   const progress = makeReceipt({ completed: true, packageChecksums: Object.fromEntries(crates.map(name => [name, checksum])) })
   const entry = release(progress, { draft: false })
   const { context, calls } = fixture({ releases: async () => [entry], registry: async () => ({ checksum }),
     ensureFrontend: async (_release, _receipt, options) => { assert.deepEqual(options, { sealed: true }); calls.push('sealed-frontend') } })
-  const resumed = await resumePrepared(context, prepared, { ...preparationIdentity, runAttempt: 2 }, 2)
+  const resumed = await resumePrepared(context, prepared, { ...preparationIdentity, runAttempt: 2 }, contractVersion)
+  await assert.rejects(resumePrepared(context, prepared, preparationIdentity, contractVersion === 2 ? 3 : 2))
   assert.equal(resumed.release.id, entry.id)
   assert.deepEqual(resumed.receipt, progress)
   assert.deepEqual(calls, ['tag', 'sealed-frontend'])
