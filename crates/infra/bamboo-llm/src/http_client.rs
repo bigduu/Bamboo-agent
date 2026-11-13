@@ -9,6 +9,8 @@ use crate::provider::LLMError;
 use bamboo_config::Config;
 use reqwest::{Client, ClientBuilder, NoProxy, Proxy};
 
+const BAMBOO_USER_AGENT: &str = concat!("Bamboo/", env!("CARGO_PKG_VERSION"));
+
 pub fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
     let http_proxy = config.http_proxy.trim();
     let https_proxy = config.https_proxy.trim();
@@ -55,7 +57,9 @@ fn client_builder(config: &Config) -> Result<ClientBuilder, LLMError> {
     // stream for minutes). Mid-stream stalls — where the connection stays open
     // but no chunks arrive — are instead bounded by the inter-chunk idle
     // timeout in `consume_llm_stream_internal` (issue #28).
-    let mut builder = Client::builder().connect_timeout(Duration::from_secs(30));
+    let mut builder = Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .user_agent(BAMBOO_USER_AGENT);
     if let Some(proxy) = build_proxy(config)? {
         builder = builder.proxy(proxy);
     }
@@ -65,6 +69,28 @@ fn client_builder(config: &Config) -> Result<ClientBuilder, LLMError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_client_sends_bamboo_user_agent() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("user-agent", BAMBOO_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = build_http_client(&Config::default())
+            .unwrap()
+            .get(format!("{}/models", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+    }
 
     #[test]
     fn proxy_attaches_no_proxy_loopback_list() {

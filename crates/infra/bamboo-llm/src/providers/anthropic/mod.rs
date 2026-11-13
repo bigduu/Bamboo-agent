@@ -59,6 +59,8 @@ fn anthropic_auth_error(status: reqwest::StatusCode, body: String) -> LLMError {
 
 const ANTHROPIC_TOOL_SEARCH_TYPE: &str = "tool_search_tool_regex_20251119";
 const ANTHROPIC_TOOL_SEARCH_NAME: &str = "tool_search_tool_regex";
+pub(super) const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+const EXTENDED_CACHE_TTL_BETA: &str = "extended-cache-ttl-2025-04-11";
 /// Per-response resource ceilings for the optional provider-native transcript
 /// lane. The normalized token/tool stream is intentionally independent of
 /// these budgets and continues when native capture is discarded.
@@ -110,6 +112,31 @@ pub(crate) fn apply_required_tool_choice(body: &mut Value, required_tool: Option
             "name": name,
             "disable_parallel_tool_use": true
         });
+    }
+}
+
+pub(super) fn apply_cache_ttl_header(headers: &mut HeaderMap, plan: Option<&PromptCachePlan>) {
+    if !plan.is_some_and(|plan| plan.ttl == CacheTtl::Extended) {
+        return;
+    }
+    let already_present = headers
+        .get_all("anthropic-beta")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|beta| beta.trim() == EXTENDED_CACHE_TTL_BETA);
+    if !already_present {
+        let value = headers
+            .get_all("anthropic-beta")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .filter(|value| !value.trim().is_empty())
+            .chain(std::iter::once(EXTENDED_CACHE_TTL_BETA))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Ok(value) = reqwest::header::HeaderValue::from_str(&value) {
+            headers.insert("anthropic-beta", value);
+        }
     }
 }
 
@@ -212,7 +239,10 @@ impl AnthropicProvider {
             HeaderValue::from_str(&self.api_key)
                 .map_err(|e| LLMError::Auth(format!("Invalid API key: {}", e)))?,
         );
-        headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        headers.insert(
+            "anthropic-version",
+            HeaderValue::from_static(ANTHROPIC_API_VERSION),
+        );
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         request_overrides::apply_overrides_to_header_map(
             &mut headers,
@@ -412,9 +442,6 @@ impl AnthropicProvider {
             .or(self.default_reasoning_effort);
         let request_reasoning_effort = options.and_then(|o| o.reasoning_effort);
         let cache_plan = options.and_then(|o| o.cache.as_ref());
-        let extended_cache_ttl = cache_plan
-            .map(|plan| plan.ttl == CacheTtl::Extended)
-            .unwrap_or(false);
         let reasoning_source = if request_reasoning_effort.is_some() {
             "request"
         } else if self.default_reasoning_effort.is_some() {
@@ -528,13 +555,7 @@ impl AnthropicProvider {
             log_identity(request_purpose)
         );
         let mut headers = self.build_headers(request_overrides::ENDPOINT_MESSAGES, Some(model))?;
-        if extended_cache_ttl {
-            // 1-hour prompt cache TTL is gated behind a beta header.
-            headers.insert(
-                "anthropic-beta",
-                reqwest::header::HeaderValue::from_static("extended-cache-ttl-2025-04-11"),
-            );
-        }
+        apply_cache_ttl_header(&mut headers, cache_plan);
 
         // Retry the *initial* request establishment on transient failures
         // (429/5xx, connect/timeout). The closure rebuilds a fresh request each
@@ -7129,6 +7150,109 @@ mod anthropic_provider_tests {
     const THINKING_TOOL_CHOICE_ERROR: &str =
         r#"{"error":{"message":"Thinking mode does not support this tool_choice"}}"#;
     const ANTHROPIC_SSE_OK: &str = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+
+    #[tokio::test]
+    async fn messages_preserve_configured_header_values_with_extended_cache_ttl() {
+        let server = MockServer::start().await;
+        for endpoint in ["/messages", "/proxy/anthropic/v1/messages"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(ANTHROPIC_SSE_OK),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+
+        for (provider_type, configured_beta, expected_beta) in [
+            (
+                "anthropic",
+                "feature-one, extended-cache-ttl-2025-04-11, feature-two",
+                "feature-one, extended-cache-ttl-2025-04-11, feature-two",
+            ),
+            (
+                "bodhi",
+                "feature-one, feature-two",
+                "feature-one, feature-two, extended-cache-ttl-2025-04-11",
+            ),
+        ] {
+            let instance = serde_json::from_value(json!({
+                "provider_type": provider_type,
+                "target_provider": "anthropic",
+                "api_key": "fixture-key",
+                "base_url": server.uri(),
+                "enabled": true,
+                "request_overrides": {
+                    "common": { "headers": { "User-Agent": "Fixture/1.0" } },
+                    "endpoints": { "messages": { "headers": { "user-agent": "Fixture/2.0" } } },
+                    "rules": [{
+                        "model_pattern": "claude-test",
+                        "endpoint": "messages",
+                        "scope": { "headers": {
+                            "User-Agent": "Fixture/3.0",
+                            "Anthropic-Version": "2026-10-21",
+                            "anthropic-beta": configured_beta
+                        } }
+                    }]
+                }
+            }))
+            .unwrap();
+            let provider = crate::provider_factory::create_provider_from_instance(
+                &bamboo_config::Config::default(),
+                &instance,
+                std::env::temp_dir(),
+            )
+            .await
+            .unwrap();
+            let _stream = provider
+                .chat_stream_with_options(
+                    &[Message::user("hello")],
+                    &[load_skill_tool()],
+                    Some(64),
+                    "claude-test",
+                    Some(&LLMRequestOptions {
+                        cache: Some(PromptCachePlan {
+                            cache_tools: true,
+                            ttl: CacheTtl::Extended,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .unwrap();
+
+            let _stream = provider
+                .chat_stream(&[Message::user("hello")], &[], Some(64), "other-model")
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let [configured, other_model] = &requests[requests.len() - 2..] else {
+                unreachable!("each provider sends two requests");
+            };
+            assert_eq!(configured.headers["user-agent"], "Fixture/3.0");
+            assert_eq!(configured.headers["anthropic-version"], "2026-10-21");
+            assert_eq!(configured.headers["anthropic-beta"], expected_beta);
+            assert_eq!(other_model.headers["user-agent"], "Fixture/2.0");
+            assert_eq!(other_model.headers["anthropic-version"], "2023-06-01");
+            assert!(!other_model.headers.contains_key("anthropic-beta"));
+            let body: Value = serde_json::from_slice(&configured.body).unwrap();
+            assert_eq!(body["tools"][0]["cache_control"]["ttl"], "1h");
+            match provider_type {
+                "anthropic" => {
+                    assert_eq!(configured.headers["x-api-key"], "fixture-key");
+                    assert!(!configured.headers.contains_key("authorization"));
+                }
+                _ => {
+                    assert_eq!(configured.headers["authorization"], "Bearer fixture-key");
+                    assert!(!configured.headers.contains_key("x-api-key"));
+                }
+            }
+        }
+    }
 
     struct ThinkingToolChoiceResponder;
 
