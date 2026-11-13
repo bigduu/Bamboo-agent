@@ -40,6 +40,7 @@ use crate::provider::{
 };
 use crate::providers::common::model_fetcher;
 use crate::providers::common::request_overrides;
+use crate::providers::common::tool_schema::sanitize_anthropic_tool_input_schema;
 use crate::types::LLMChunk;
 use bamboo_config::{KeywordMaskingConfig, RequestOverridesConfig};
 use bamboo_domain::ReasoningEffort;
@@ -1531,7 +1532,7 @@ fn tool_to_anthropic_json(tool: &ToolSchema) -> Value {
     json!({
         "name": tool.function.name,
         "description": tool.function.description,
-        "input_schema": crate::providers::common::tool_schema::canonicalize_json_value(&tool.function.parameters),
+        "input_schema": sanitize_anthropic_tool_input_schema(&tool.function.parameters),
     })
 }
 
@@ -2882,12 +2883,16 @@ mod anthropic_request_building {
 
     #[tokio::test]
     async fn progressive_footprint_keeps_initial_array_and_each_reference_occurrence_ordered() {
-        let tools = vec![
+        let mut tools = vec![
             tool_schema("Read"),
             tool_schema("alpha_tool"),
             tool_schema("beta_tool"),
             tool_schema("Workspace"),
         ];
+        tools[2].function.parameters = json!({
+            "type": "object",
+            "allOf": [{"properties": {"query": {"type": "string"}}, "required": ["query"]}]
+        });
         let ir = anthropic_ir_with_reference_groups(&[
             ("search_1", &["beta_tool", "Read", "alpha_tool"]),
             ("search_2", &["beta_tool"]),
@@ -2933,6 +2938,15 @@ mod anthropic_request_building {
         assert_eq!(
             expanded,
             vec!["beta_tool", "Read", "alpha_tool", "beta_tool"]
+        );
+        let beta: Value = serde_json::from_str(&footprint.segments[2].serialized).unwrap();
+        assert_eq!(
+            beta["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            })
         );
     }
 
@@ -3259,7 +3273,7 @@ mod anthropic_request_building {
 
     #[test]
     fn progressive_tools_keep_full_catalog_defer_only_non_core_and_cache_search() {
-        let tools = [
+        let mut tools = [
             "exec_command",
             "Read",
             "Glob",
@@ -3271,6 +3285,13 @@ mod anthropic_request_building {
         .into_iter()
         .map(tool_schema)
         .collect::<Vec<_>>();
+        tools[2].function.parameters = json!({
+            "type": "object",
+            "anyOf": [
+                {"properties": {"pattern": {"type": "string"}}, "required": ["pattern"]},
+                {"properties": {"prefix": {"type": "string"}}, "required": ["prefix"]}
+            ]
+        });
         let body = super::build_anthropic_request_with_cache_blocks_native_mode(
             &[Message::user("inspect")],
             &[],
@@ -3296,6 +3317,13 @@ mod anthropic_request_building {
         assert_eq!(rendered[1]["name"], "Read");
         assert_eq!(rendered[2]["name"], "Glob");
         assert_eq!(rendered[2]["defer_loading"], true);
+        assert_eq!(
+            rendered[2]["input_schema"],
+            json!({
+                "type": "object",
+                "properties": {"pattern": {"type": "string"}, "prefix": {"type": "string"}}
+            })
+        );
         assert_eq!(rendered[3]["name"], "Exec_Command");
         assert_eq!(
             rendered[3]["defer_loading"], true,
@@ -3321,6 +3349,10 @@ mod anthropic_request_building {
         );
         assert_eq!(legacy["tools"].as_array().unwrap().len(), tools.len());
         assert_eq!(legacy["tools"][5]["name"], "discover_capabilities");
+        assert_eq!(
+            legacy["tools"][2]["input_schema"],
+            rendered[2]["input_schema"]
+        );
         assert!(legacy.to_string().find("defer_loading").is_none());
         assert!(legacy
             .to_string()
@@ -7122,6 +7154,93 @@ mod anthropic_provider_tests {
                 parameters: serde_json::json!({"type": "object"}),
             },
         }
+    }
+
+    #[tokio::test]
+    async fn direct_and_bodhi_anthropic_requests_accept_composed_tool_schemas() {
+        let server = MockServer::start().await;
+        for endpoint in ["/messages", "/proxy/anthropic/v1/messages"] {
+            Mock::given(method("POST"))
+                .and(path(endpoint))
+                .respond_with(|request: &Request| {
+                    let body: Value = serde_json::from_slice(&request.body).unwrap();
+                    let schema = &body["tools"][0]["input_schema"];
+                    if ["oneOf", "anyOf", "allOf"]
+                        .iter()
+                        .any(|keyword| schema.get(keyword).is_some())
+                    {
+                        return ResponseTemplate::new(400).set_body_json(json!({
+                            "error": {
+                                "type": "invalid_request_error",
+                                "message": "tools.0.custom.input_schema: input_schema does not support oneOf, allOf, or anyOf at the top level"
+                            }
+                        }));
+                    }
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(ANTHROPIC_SSE_OK)
+                })
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let parameters = json!({
+            "type": "object",
+            "oneOf": [
+                {
+                    "properties": {"location": {"type": "string"}},
+                    "required": ["location"]
+                },
+                {
+                    "properties": {"zip_code": {"type": "string"}},
+                    "required": ["zip_code"]
+                }
+            ],
+            "allOf": [{
+                "properties": {"units": {"type": "string", "enum": ["metric", "imperial"]}},
+                "required": ["units"]
+            }]
+        });
+        let tools = [ToolSchema {
+            schema_type: "function".into(),
+            function: FunctionSchema {
+                name: "mcp__example__get_weather".into(),
+                description: "Read the weather by location or zip code.".into(),
+                parameters: parameters.clone(),
+            },
+        }];
+        let messages = [Message::user("Check the weather")];
+        let direct = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let proxy = crate::providers::bodhi::BodhiProvider::new("test-key")
+            .with_base_url(server.uri())
+            .with_target_provider("anthropic");
+        for provider in [&direct as &dyn LLMProvider, &proxy] {
+            let _stream = provider
+                .chat_stream(&messages, &tools, Some(64), "claude-opus-5-5")
+                .await
+                .expect("the endpoint accepts the compatible schema");
+        }
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            let tool = &body["tools"][0];
+            assert_eq!(tool["name"], "mcp__example__get_weather");
+            assert_eq!(
+                tool["input_schema"],
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "location": {"type": "string"},
+                        "zip_code": {"type": "string"},
+                        "units": {"type": "string", "enum": ["metric", "imperial"]}
+                    },
+                    "required": ["units"]
+                })
+            );
+        }
+        assert_eq!(tools[0].function.parameters, parameters);
     }
 
     #[tokio::test]
