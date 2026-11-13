@@ -2124,6 +2124,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
 pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
     final_decision: PermissionDecisionKind,
     restart_after_commit: bool,
+    revoke_before_claim: bool,
 ) {
     use crate::handlers::agent::respond::{capture_approval_handoff, decide_delegated_approval};
     use bamboo_orchestration::managed_session::approval_handoff::DELAY;
@@ -2408,6 +2409,60 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
         .approval_runtime
         .set(Arc::downgrade(&state.clone().into_inner()))
         .expect("bind the native decision port");
+    if revoke_before_claim {
+        let (reached, release) = state
+            .session_store
+            .pause_full_save_before_filesystem_commit_for_test(ROOT_A);
+        let revoke = async {
+            reached.wait().await;
+            let guard = state.permission_io_lock.lock();
+            tokio::pin!(guard);
+            assert!(futures::poll!(&mut guard).is_pending());
+            release.wait().await;
+            let _guard = guard.await;
+            config.set_ask_rules(["session_control".into()]);
+        };
+        let (result, ()) = tokio::time::timeout(WAIT, async {
+            tokio::join!(decision(final_decision), revoke)
+        })
+        .await
+        .expect("permission setting and first delegated response both finish");
+        let error = result.expect_err("revoked delegation cannot claim the committed response");
+        assert!(
+            error
+                .to_string()
+                .contains("Permission response was saved but execution could not be confirmed"),
+            "{error}"
+        );
+        assert!(!std::path::Path::new(&file).exists());
+        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 0);
+        assert!(state
+            .session_activation_router
+            .current_run_id(ROOT_A)
+            .await
+            .is_none());
+        let committed = load(state, ROOT_A).await;
+        assert!(committed.pending_question.is_none());
+        assert!(committed
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        let replay = decision(final_decision)
+            .await
+            .expect_err("same choice still requires current delegation");
+        assert!(matches!(replay, crate::error::AppError::Forbidden(_)));
+        config.set_ask_rules(Vec::new());
+        let retried = decision(final_decision).await.unwrap();
+        assert_eq!(retried["replayed"], true);
+        assert_eq!(
+            retried["receipt"]["decision"]["request_generation"],
+            current_request.request_generation
+        );
+        settled(state, ROOT_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
+        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+        state.shutdown().await;
+        return;
+    }
     let result = if restart_after_commit {
         state
             .session_store

@@ -95,7 +95,7 @@ pub async fn submit_response(
 struct TypedPermissionResponse<'a> {
     receipt: PermissionDecisionReceipt,
     guard: &'a bamboo_engine::session_app::respond::PendingResponseGuard,
-    approval: Option<bamboo_domain::storage::SupervisorApprovalCommit>,
+    approval: Option<Arc<bamboo_domain::storage::SupervisorApprovalCommit>>,
     permission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
@@ -116,7 +116,7 @@ pub(super) async fn submit_typed_permission_response(
         Some(TypedPermissionResponse {
             receipt: permission_receipt,
             guard: response_guard,
-            approval,
+            approval: approval.map(Arc::new),
             permission_guard,
         }),
     )
@@ -276,24 +276,25 @@ async fn submit_response_inner(
 
     let owner = handoff.root_actor_writer();
     let approval = permission
-        .as_mut()
-        .and_then(|permission| permission.approval.take());
+        .as_ref()
+        .and_then(|permission| permission.approval.clone());
     let permission_guard = permission
         .as_mut()
         .and_then(|permission| permission.permission_guard.take());
-    let bound_access: Result<Option<Arc<dyn SessionAccess>>, _> = if let Some(approval) = approval {
-        match owner {
-            Some(owner) => state
-                .session_repo
-                .bind_supervisor_approval_response_writer(owner, approval)
-                .map(|bound| Some(Arc::new(bound) as Arc<dyn SessionAccess>))
-                .map_err(|error| error.to_string()),
-            None => Err("delegated permission response requires its Root writer".into()),
-        }
-    } else {
-        SessionAccess::bind_response_writer(state.as_ref(), owner)
-            .map_err(|error| error.to_string())
-    };
+    let bound_access: Result<Option<Arc<dyn SessionAccess>>, _> =
+        if let Some(approval) = approval.as_ref() {
+            match owner {
+                Some(owner) => state
+                    .session_repo
+                    .bind_supervisor_approval_response_writer(owner, Arc::clone(approval))
+                    .map(|bound| Some(Arc::new(bound) as Arc<dyn SessionAccess>))
+                    .map_err(|error| error.to_string()),
+                None => Err("delegated permission response requires its Root writer".into()),
+            }
+        } else {
+            SessionAccess::bind_response_writer(state.as_ref(), owner)
+                .map_err(|error| error.to_string())
+        };
     let bound_access = match bound_access {
         Ok(access) => access,
         Err(error) => {
@@ -305,12 +306,12 @@ async fn submit_response_inner(
     };
     let response_access: &dyn SessionAccess = bound_access.as_deref().unwrap_or(state.as_ref());
 
-    let submission = if let Some(permission) = permission {
+    let submission = if let Some(permission) = permission.as_ref() {
         bamboo_engine::session_app::respond::submit_resumable_permission_response_checked_guarded(
             response_access,
             input,
             expected_tool_call_id,
-            permission.receipt,
+            permission.receipt.clone(),
             response_guard,
         )
         .await
@@ -364,6 +365,28 @@ async fn submit_response_inner(
     };
 
     drop(permission_guard);
+
+    let committed_approval = match permission
+        .and_then(|permission| {
+            permission.approval.map(|approval| {
+                super::decision::committed_delegation_after_submit(
+                    &state,
+                    &session,
+                    &approval,
+                    permission.receipt,
+                )
+            })
+        })
+        .transpose()
+    {
+        Ok(approval) => approval,
+        Err(error) => {
+            handoff.abandon().await;
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value(error.to_string()),
+            })));
+        }
+    };
 
     if stop_progress_pause {
         // The same guarded CAS consumed the runtime question and saved the
@@ -463,17 +486,22 @@ async fn submit_response_inner(
 
     // Build resume config snapshot from server config via the single-source-of-
     // truth resolver (provider-name derivation + global auxiliary models + gold).
-    let auto_resume_outcome =
-        match resume_committed_response(&resume_port, &config_snapshot, session, handoff, None)
-            .await
-        {
-            Ok(outcome) => outcome,
-            Err(error) => {
-                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
-                    "error": crate::error::error_value(error.to_string()),
-                })))
-            }
-        };
+    let auto_resume_outcome = match resume_committed_response(
+        &resume_port,
+        &config_snapshot,
+        session,
+        handoff,
+        committed_approval,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value(error.to_string()),
+            })))
+        }
+    };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,

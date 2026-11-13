@@ -364,16 +364,8 @@ async fn decide_delegated_approval_inner(
         let origin = delegated_origin(&session)
             .filter(|origin| origin.caller == *caller && origin.reference == reference)
             .ok_or_else(|| AppError::Forbidden("Approval occurrence changed".into()))?;
-        return retry_delegated_approval(
-            &state,
-            inbox,
-            caller,
-            &supervisor,
-            &session,
-            origin,
-            decision,
-        )
-        .await;
+        return retry_delegated_approval(&state, inbox, &supervisor, &session, origin, decision)
+            .await;
     }
     let (handoff, _) = super::pending::capture_approval_handoff(&state, &supervisor, &session)
         .filter(|(handoff, _)| handoff.reference == reference)
@@ -452,7 +444,7 @@ fn delegated_origin(session: &bamboo_domain::Session) -> Option<SupervisorApprov
     Some(origin)
 }
 
-fn allows_delegated_retry(
+fn allows_committed_delegation(
     state: &AppState,
     supervisor: &bamboo_domain::SupervisorReference,
     origin: &SupervisorApprovalResponseOrigin,
@@ -481,7 +473,6 @@ fn allows_delegated_retry(
 async fn retry_delegated_approval(
     state: &web::Data<AppState>,
     inbox: &bamboo_storage::FileSessionInbox,
-    caller: &bamboo_domain::SessionCallerReference,
     supervisor: &bamboo_domain::SupervisorReference,
     session: &bamboo_domain::Session,
     origin: SupervisorApprovalResponseOrigin,
@@ -499,7 +490,7 @@ async fn retry_delegated_approval(
                 == Some(receipt.decision.request_generation.as_str())
     })
     .ok_or_else(denied)?;
-    if !allows_delegated_retry(state, supervisor, &origin, decision)
+    if !allows_committed_delegation(state, supervisor, &origin, decision)
         || !inbox
             .verify_admitted_runtime_instruction(&origin.notice)
             .await
@@ -508,12 +499,46 @@ async fn retry_delegated_approval(
         return Err(denied());
     }
     drop(permission);
-    let expected_receipt = receipt.clone();
+    let approval = committed_delegation(state, supervisor.clone(), origin, receipt.clone());
+    replay_committed_decision(state, session, receipt, Some(approval)).await
+}
+
+pub(super) fn committed_delegation_after_submit(
+    state: &web::Data<AppState>,
+    session: &bamboo_domain::Session,
+    expected: &SupervisorApprovalCommit,
+    receipt: PermissionDecisionReceipt,
+) -> std::io::Result<Arc<SupervisorApprovalCommit>> {
+    let origin = delegated_origin(session)
+        .filter(|origin| {
+            origin.caller == expected.caller
+                && origin.target == expected.target
+                && origin.reference == expected.reference
+                && origin.notice == expected.notice
+                && origin.occurrence.tool_call_id == receipt.decision.request_id
+                && origin.occurrence.permission_generation.as_deref()
+                    == Some(receipt.decision.request_generation.as_str())
+        })
+        .ok_or_else(|| std::io::Error::other("Committed delegation does not match its approval"))?;
+    Ok(committed_delegation(
+        state,
+        expected.supervisor.clone(),
+        origin,
+        receipt,
+    ))
+}
+
+fn committed_delegation(
+    state: &web::Data<AppState>,
+    supervisor: bamboo_domain::SupervisorReference,
+    origin: SupervisorApprovalResponseOrigin,
+    receipt: PermissionDecisionReceipt,
+) -> Arc<SupervisorApprovalCommit> {
     let approval_state = state.clone();
     let approval_supervisor = supervisor.clone();
-    let approval = SupervisorApprovalCommit {
-        caller: caller.clone(),
-        supervisor: supervisor.clone(),
+    Arc::new(SupervisorApprovalCommit {
+        caller: origin.caller.clone(),
+        supervisor,
         target: origin.target.clone(),
         reference: origin.reference.clone(),
         notice: origin.notice.clone(),
@@ -523,14 +548,19 @@ async fn retry_delegated_approval(
                     bamboo_domain::is_matching_session_message(message, &origin.notice)
                 });
             if !received
-                || !allows_delegated_retry(&approval_state, &approval_supervisor, &origin, decision)
+                || !allows_committed_delegation(
+                    &approval_state,
+                    &approval_supervisor,
+                    &origin,
+                    receipt.decision.decision,
+                )
                 || delegated_origin(current).as_ref() != Some(&origin)
                 || super::pending::persisted_permission_decision_receipt(
                     current,
-                    &expected_receipt.decision.request_id,
+                    &receipt.decision.request_id,
                 )
                 .as_ref()
-                    != Some(&expected_receipt)
+                    != Some(&receipt)
             {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
@@ -539,8 +569,7 @@ async fn retry_delegated_approval(
             }
             Ok(())
         }),
-    };
-    replay_committed_decision(state, session, receipt, Some(Arc::new(approval))).await
+    })
 }
 
 async fn apply_permission_decision(

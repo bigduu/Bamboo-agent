@@ -1282,8 +1282,8 @@ impl LockedSessionStore {
 
     /// Restrict this private response writer to the original delegated
     /// approval. Its storage CAS must retain the approval's authority.
-    pub fn bind_supervisor_approval(mut self, approval: SupervisorApprovalCommit) -> Self {
-        self.supervisor_approval = Some(Arc::new(approval));
+    pub fn bind_supervisor_approval(mut self, approval: Arc<SupervisorApprovalCommit>) -> Self {
+        self.supervisor_approval = Some(approval);
         self
     }
 

@@ -335,7 +335,7 @@ impl SessionRepository {
     pub fn bind_supervisor_approval_response_writer(
         &self,
         owner: bamboo_domain::RootActorRuntimeWrite,
-        approval: bamboo_domain::storage::SupervisorApprovalCommit,
+        approval: Arc<bamboo_domain::storage::SupervisorApprovalCommit>,
     ) -> std::io::Result<Self> {
         self.bind_root_response_writer_inner(owner, Some(approval))
     }
@@ -343,7 +343,7 @@ impl SessionRepository {
     fn bind_root_response_writer_inner(
         &self,
         owner: bamboo_domain::RootActorRuntimeWrite,
-        approval: Option<bamboo_domain::storage::SupervisorApprovalCommit>,
+        approval: Option<Arc<bamboo_domain::storage::SupervisorApprovalCommit>>,
     ) -> std::io::Result<Self> {
         let directory = self.root_actor_directory.clone().ok_or_else(|| {
             root_actor_binding_error("Root response requires its Host Actor directory")

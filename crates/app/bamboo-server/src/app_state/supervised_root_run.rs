@@ -584,6 +584,7 @@ mod tests {
         super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
             PermissionDecisionKind::DenyOnce,
             false,
+            false,
         )
         .await;
     }
@@ -593,6 +594,7 @@ mod tests {
         super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
             PermissionDecisionKind::AllowOnce,
             false,
+            false,
         )
         .await;
     }
@@ -601,6 +603,17 @@ mod tests {
     async fn ordinary_approval_handoff_resumes_exact_commit_after_restart() {
         super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
             PermissionDecisionKind::AllowOnce,
+            true,
+            false,
+        )
+        .await;
+    }
+
+    #[actix_web::test]
+    async fn initial_delegated_approval_rechecks_policy_before_claim() {
+        super::super::observer_subscriptions::tests::exercise_ordinary_approval_handoff(
+            PermissionDecisionKind::AllowOnce,
+            false,
             true,
         )
         .await;
