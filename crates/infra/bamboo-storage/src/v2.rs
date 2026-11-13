@@ -772,6 +772,7 @@ fn overlay_runtime_sidecar(main: Session, sidecar: Option<Session>) -> Session {
     match sidecar {
         Some(mut side) => {
             side.observe_main_session_version(main.session_version);
+            crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
             let admission = main
                 .runtime_metadata
                 .as_ref()
@@ -1797,6 +1798,8 @@ pub struct SessionStoreV2 {
     runtime_task_durability_events: std::sync::Mutex<Vec<RuntimeTaskDurabilityEvent>>,
     #[cfg(any(test, feature = "test-utils"))]
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
+    #[cfg(feature = "test-utils")]
+    full_save_fault: std::sync::Mutex<Option<(String, bool)>>,
     #[cfg(test)]
     root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
     #[cfg(test)]
@@ -2144,6 +2147,8 @@ impl SessionStoreV2 {
             runtime_task_durability_events: std::sync::Mutex::new(Vec::new()),
             #[cfg(any(test, feature = "test-utils"))]
             full_save_pause: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            full_save_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             root_publication_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -2994,6 +2999,26 @@ impl SessionStoreV2 {
             pause.reached.wait().await;
             pause.release.wait().await;
         }
+    }
+
+    /// Interrupt the next full save for a test-owned Session at the Main boundary.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_full_save_at_main_for_test(&self, session_id: &str, after_main: bool) {
+        *self.full_save_fault.lock().unwrap() = Some((session_id.into(), after_main));
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_full_save_fault(&self, session_id: &str, after_main: bool) -> io::Result<()> {
+        let mut fault = self.full_save_fault.lock().unwrap();
+        if fault
+            .as_ref()
+            .is_some_and(|(id, after)| id == session_id && *after == after_main)
+        {
+            *fault = None;
+            return Err(io::Error::other("injected full save interruption at Main"));
+        }
+        Ok(())
     }
 
     pub fn bamboo_home_dir(&self) -> &Path {
@@ -7960,8 +7985,12 @@ impl SessionStoreV2 {
         if supervisor_proof_prepared {
             self.maybe_fail_supervisor_proof(supervisor_proof::SupervisorProofFault::Runtime)?;
         }
+        #[cfg(feature = "test-utils")]
+        self.check_full_save_fault(&session.id, false)?;
         self.write_default_bytes(&path, session_bytes, guards)
             .await?;
+        #[cfg(feature = "test-utils")]
+        self.check_full_save_fault(&session.id, true)?;
         if root_proof_prepared {
             self.maybe_fail_root_tool_proof(root_context::RootToolProofFault::Main)?;
         }
@@ -8301,8 +8330,28 @@ impl Storage for SessionStoreV2 {
         inherited: Option<&bamboo_domain::InheritedChildWait>,
         publish: bamboo_domain::storage::RootActorRuntimePublisher,
     ) -> io::Result<()> {
-        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, publish)
+        self.save_root_actor_bound_startup_impl(owner, session, expected, inherited, None, publish)
             .await
+    }
+
+    async fn save_supervisor_approval_response(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&bamboo_domain::InheritedChildWait>,
+        approval: &bamboo_domain::storage::SupervisorApprovalCommit,
+        publish: bamboo_domain::storage::RootActorRuntimePublisher,
+    ) -> io::Result<()> {
+        self.save_root_actor_bound_startup_impl(
+            owner,
+            session,
+            expected,
+            inherited,
+            Some(approval),
+            publish,
+        )
+        .await
     }
 
     async fn root_mode_operation(

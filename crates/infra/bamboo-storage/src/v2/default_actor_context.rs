@@ -29,17 +29,20 @@ pub(crate) struct DefaultWriterPhysicalGuards {
     _session: Option<SessionWriteGuard>,
     _root_session: Option<SessionWriteGuard>,
     _supervisor: Option<Arc<super::supervisor_management::SupervisorFollowupGuard>>,
-    _creation: Option<RootCreationPhysicalGuards>,
+    authority: Option<RetainedWriterAuthority>,
     _task: Option<TaskGuard>,
     _lifecycle: Option<LifecycleGuard>,
 }
 
-enum RootCreationPhysicalGuards {
-    Supervised {
+enum RetainedWriterAuthority {
+    SupervisedCreation {
         _guard: Arc<super::supervisor_management::SupervisorManagementGuards>,
     },
-    HostScoped {
+    HostScopedCreation {
         _guard: Arc<super::host_session_scope::HostScopedSessionGuards>,
+    },
+    SupervisorApproval {
+        guard: Box<super::CurrentUserTargetGuard>,
     },
 }
 
@@ -121,7 +124,7 @@ impl DefaultWriterGuards {
                 _session: Some(session),
                 _root_session: None,
                 _supervisor: None,
-                _creation: None,
+                authority: None,
                 _task: Some(TaskGuard::Shared { _guard: task }),
                 _lifecycle: Some(lifecycle),
             }),
@@ -135,14 +138,14 @@ impl DefaultWriterGuards {
             ._lifecycle
             .as_ref()
             .is_some_and(LifecycleGuard::retains_exclusive)
-            || match self.physical._creation.as_ref() {
-                Some(RootCreationPhysicalGuards::Supervised { _guard }) => {
+            || match self.physical.authority.as_ref() {
+                Some(RetainedWriterAuthority::SupervisedCreation { _guard }) => {
                     _guard.retains_exclusive_lifecycle()
                 }
-                Some(RootCreationPhysicalGuards::HostScoped { _guard }) => {
+                Some(RetainedWriterAuthority::HostScopedCreation { _guard }) => {
                     _guard.retains_exclusive_lifecycle()
                 }
-                None => false,
+                _ => false,
             }
     }
 
@@ -168,7 +171,7 @@ impl DefaultWriterGuards {
                 _session: Some(session),
                 _root_session: None,
                 _supervisor: None,
-                _creation: None,
+                authority: None,
                 _task: Some(TaskGuard::Exclusive { _guard: task }),
                 _lifecycle: Some(LifecycleGuard::Exclusive { _guard: lifecycle }),
             }),
@@ -197,29 +200,50 @@ impl DefaultWriterGuards {
                 _session: None,
                 _root_session: None,
                 _supervisor: Some(Arc::new(authority)),
-                _creation: None,
+                authority: None,
                 _task: None,
                 _lifecycle: None,
             }),
         })
     }
 
+    pub(super) fn supervisor_approval(
+        authority: super::CurrentUserTargetGuard,
+        root_actor: super::root_actor_runtime::RootActorWriteProof,
+    ) -> Arc<Self> {
+        Self::with_retained_authority(
+            RetainedWriterAuthority::SupervisorApproval {
+                guard: Box::new(authority),
+            },
+            Some(root_actor),
+        )
+    }
+
     pub(super) fn supervised_creation(
         authority: Arc<super::supervisor_management::SupervisorManagementGuards>,
     ) -> Arc<Self> {
-        Self::root_creation(RootCreationPhysicalGuards::Supervised { _guard: authority })
+        Self::with_retained_authority(
+            RetainedWriterAuthority::SupervisedCreation { _guard: authority },
+            None,
+        )
     }
 
     pub(super) fn host_creation(
         authority: Arc<super::host_session_scope::HostScopedSessionGuards>,
     ) -> Arc<Self> {
-        Self::root_creation(RootCreationPhysicalGuards::HostScoped { _guard: authority })
+        Self::with_retained_authority(
+            RetainedWriterAuthority::HostScopedCreation { _guard: authority },
+            None,
+        )
     }
 
-    fn root_creation(authority: RootCreationPhysicalGuards) -> Arc<Self> {
+    fn with_retained_authority(
+        authority: RetainedWriterAuthority,
+        root_actor: Option<super::root_actor_runtime::RootActorWriteProof>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             root_mode_context: None,
-            root_actor: None,
+            root_actor,
             child_actor: None,
             child_input: None,
             root_origin: None,
@@ -234,7 +258,7 @@ impl DefaultWriterGuards {
                 _session: None,
                 _root_session: None,
                 _supervisor: None,
-                _creation: Some(authority),
+                authority: Some(authority),
                 _task: None,
                 _lifecycle: None,
             }),
@@ -246,8 +270,13 @@ impl DefaultWriterGuards {
     }
 
     pub(super) fn retains_tree_for(&self, root_id: &str) -> bool {
-        match self.physical._creation.as_ref() {
-            Some(RootCreationPhysicalGuards::HostScoped { _guard }) => _guard.holds_tree(root_id),
+        match self.physical.authority.as_ref() {
+            Some(RetainedWriterAuthority::HostScopedCreation { _guard }) => {
+                _guard.holds_tree(root_id)
+            }
+            Some(RetainedWriterAuthority::SupervisorApproval { guard }) => {
+                guard._authority.holds_tree(root_id)
+            }
             _ => false,
         }
     }

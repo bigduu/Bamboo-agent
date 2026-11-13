@@ -2361,6 +2361,27 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
     config.set_ask_rules(Vec::new());
     assert!(decision(PermissionDecisionKind::AllowGlobal).await.is_err());
 
+    if final_decision == PermissionDecisionKind::DenyOnce {
+        state
+            .session_store
+            .interrupt_full_save_at_main_for_test(ROOT_A, false);
+        let error = decision(PermissionDecisionKind::AllowOnce)
+            .await
+            .expect_err("the delegated response did not reach Main");
+        assert!(error
+            .to_string()
+            .contains("injected full save interruption"));
+        assert_eq!(
+            bamboo_domain::pending_permission_occurrence(&load(state, ROOT_A).await),
+            Some(handoff.pending.occurrence.clone())
+        );
+        assert!(config
+            .decision_receipt(ROOT_A, call, &current_request.request_generation)
+            .is_none());
+        assert!(config.temporary_grants().is_empty());
+        assert!(!std::path::Path::new(&file).exists());
+    }
+
     state
         .approval_runtime
         .set(Arc::downgrade(&state.clone().into_inner()))
@@ -2376,6 +2397,10 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
     assert_eq!(
         result["receipt"]["decision"]["decision"],
         json!(final_decision)
+    );
+    assert_eq!(
+        result["receipt"]["decision"]["request_generation"],
+        json!(current_request.request_generation)
     );
     assert!(load(state, ROOT_A).await.pending_question.is_none());
     assert!(decision(PermissionDecisionKind::AllowOnce).await.is_err());

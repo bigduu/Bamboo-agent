@@ -4,9 +4,11 @@ use std::sync::Arc;
 
 use actix_web::{body::MessageBody, web, HttpResponse};
 use bamboo_config::ConfigStoreError;
+use bamboo_domain::storage::SupervisorApprovalCommit;
+use bamboo_orchestration::managed_session::approval_handoff::is_once;
 use bamboo_tools::permission::{
-    DurablePermissionRule, PermissionDecision, PermissionDecisionKind, PermissionMatcher,
-    PermissionRuleEffect, PermissionRuleScope, PermissionRuleSource,
+    DurablePermissionRule, PermissionDecision, PermissionDecisionKind, PermissionDecisionReceipt,
+    PermissionMatcher, PermissionRuleEffect, PermissionRuleScope, PermissionRuleSource,
 };
 
 use crate::{app_state::AppState, error::AppError};
@@ -17,7 +19,7 @@ use super::super::types::RespondRequest;
 struct PermissionDecisionResponse {
     success: bool,
     replayed: bool,
-    receipt: bamboo_tools::permission::PermissionDecisionReceipt,
+    receipt: PermissionDecisionReceipt,
     #[serde(skip_serializing_if = "Option::is_none")]
     resume: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -249,14 +251,27 @@ pub async fn submit_permission_decision(
     session_id: web::Path<String>,
     payload: web::Json<PermissionDecision>,
 ) -> Result<HttpResponse, AppError> {
-    apply_permission_decision(
-        state,
-        session_id.into_inner(),
-        payload.into_inner(),
-        None,
-        None,
-    )
-    .await
+    let session_id = session_id.into_inner();
+    let decision = payload.into_inner();
+    if is_once(decision.decision) {
+        // Once submitted, the same transaction owns the checkpoint, receipt
+        // publication and resume handoff even if the HTTP client disconnects.
+        let (status, body) = tokio::spawn(async move {
+            let response =
+                apply_permission_decision(state, session_id, decision, None, None).await?;
+            let status = response.status();
+            let body = response.into_body().try_into_bytes().map_err(|_| {
+                AppError::InternalError(anyhow::anyhow!("Expected a JSON decision response"))
+            })?;
+            Ok::<_, AppError>((status, body))
+        })
+        .await
+        .map_err(|error| AppError::InternalError(error.into()))??;
+        return Ok(HttpResponse::build(status)
+            .content_type("application/json")
+            .body(body));
+    }
+    apply_permission_decision(state, session_id, decision, None, None).await
 }
 
 /// Apply a single overdue decision after proving the Supervisor's delivered handoff.
@@ -339,75 +354,6 @@ fn supervisor_reference(
     ))
 }
 
-struct DelegatedApprovalProof<'a> {
-    caller: &'a bamboo_domain::SessionCallerReference,
-    supervisor: bamboo_domain::SupervisorReference,
-    target: bamboo_domain::SupervisorCurrentUserTarget,
-    notice: bamboo_domain::SessionMessageEnvelope,
-    occurrence: bamboo_domain::ResponseOccurrence,
-    request: bamboo_tools::permission::PermissionRequest,
-}
-
-impl DelegatedApprovalProof<'_> {
-    async fn with_current_authority<T, F>(
-        &self,
-        state: &web::Data<AppState>,
-        effect: F,
-    ) -> Result<T, AppError>
-    where
-        T: Send + 'static,
-        F: FnOnce() -> std::io::Result<T> + Send + 'static,
-    {
-        let state_for_guard = state.clone();
-        let supervisor_for_guard = self.supervisor.clone();
-        let expected_notice = self.notice.clone();
-        let occurrence = self.occurrence.clone();
-        let request = self.request.clone();
-        state
-            .session_store
-            .with_unscoped_supervisor_root_state(
-                self.caller,
-                &self.supervisor,
-                &self.target,
-                move |source, current| {
-                    let received = source
-                        .messages
-                        .iter()
-                        .rev()
-                        .find(|message| message.id == expected_notice.id.as_str())
-                        .is_some_and(|message| {
-                            bamboo_domain::is_matching_session_message(message, &expected_notice)
-                        });
-                    if !received {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "Supervisor handoff receipt no longer matches Main",
-                        ));
-                    }
-                    let still_eligible = super::pending::capture_approval_handoff(
-                        &state_for_guard,
-                        &supervisor_for_guard,
-                        current,
-                    )
-                    .is_some_and(|(handoff, current_request)| {
-                        handoff.pending.occurrence == occurrence && current_request == request
-                    });
-                    if !still_eligible {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::PermissionDenied,
-                            "Parked approval changed",
-                        ));
-                    }
-                    effect()
-                },
-            )
-            .await
-            .map_err(|error| {
-                AppError::Forbidden(format!("Managed approval authority changed: {error}"))
-            })
-    }
-}
-
 async fn apply_permission_decision(
     state: web::Data<AppState>,
     session_id: String,
@@ -437,22 +383,26 @@ async fn apply_permission_decision(
     // response source across policy mutation and pending-question consume.
     // This prevents a remembered rule from being committed for a question
     // that another responder replaced between preflight and the final CAS.
-    let mut response_guard =
+    let response_guard =
         bamboo_engine::session_app::respond::acquire_pending_response_guard(&session_id).await;
     let mut permission_guard = Some(Arc::clone(&state.permission_io_lock).lock_owned().await);
     // The cache may predate another producer's behavior contract. Inspect
     // canonical storage under the existing response/permission guards before
     // installing any Once, Session or durable rule, or recording a receipt.
-    let session = state
-        .storage
-        .load_session(&session_id)
-        .await
-        .map_err(|error| {
-            AppError::InternalError(anyhow::anyhow!(
-                "Failed to inspect Session compatibility: {error}"
-            ))
-        })?
-        .ok_or_else(|| AppError::NotFound("session".to_string()))?;
+    let session = if is_once(decision.decision) {
+        state
+            .storage
+            .load_execution_admission_snapshot(&session_id)
+            .await
+    } else {
+        state.storage.load_session(&session_id).await
+    }
+    .map_err(|error| {
+        AppError::InternalError(anyhow::anyhow!(
+            "Failed to inspect Session compatibility: {error}"
+        ))
+    })?
+    .ok_or_else(|| AppError::NotFound("session".to_string()))?;
     if expected_approval.is_some_and(|(target, occurrence)| {
         !target.matches_session(&session)
             || bamboo_domain::pending_permission_occurrence(&session).as_ref() != Some(occurrence)
@@ -466,7 +416,7 @@ async fn apply_permission_decision(
     {
         return Ok(response);
     }
-    let delegation = if let Some((caller, inbox)) = delegated_by {
+    let approval = if let Some((caller, inbox)) = delegated_by {
         let supervisor = supervisor_reference(caller)?;
         let (handoff, request) =
             super::pending::capture_approval_handoff(&state, &supervisor, &session)
@@ -501,17 +451,58 @@ async fn apply_permission_decision(
             .map_err(|_| AppError::Forbidden("Managed approval target changed".into()))?;
         decision.expected_policy_revision = Some(request.policy_revision);
         config.register_pending_request(request.clone());
-        Some(DelegatedApprovalProof {
-            caller,
+        let approval_state = state.clone();
+        let approval_config = Arc::clone(&config);
+        let original_supervisor = supervisor.clone();
+        let occurrence = handoff.pending.occurrence;
+        let decision_kind = decision.decision;
+        Some(SupervisorApprovalCommit {
+            caller: caller.clone(),
             supervisor,
             target,
-            notice: envelope,
-            occurrence: handoff.pending.occurrence,
-            request,
+            validate: Box::new(move |source, current| {
+                let received = source
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|message| message.id == envelope.id.as_str())
+                    .is_some_and(|message| {
+                        bamboo_domain::is_matching_session_message(message, &envelope)
+                    });
+                if !received {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Supervisor handoff receipt no longer matches Main",
+                    ));
+                }
+                let eligible = super::pending::capture_approval_handoff(
+                    &approval_state,
+                    &original_supervisor,
+                    current,
+                )
+                .is_some_and(|(handoff, current_request)| {
+                    handoff.pending.occurrence == occurrence
+                        && current_request == request
+                        && handoff.allows_supervisor_control(
+                            &approval_config,
+                            &original_supervisor,
+                            &current.id,
+                            decision_kind,
+                        )
+                });
+                if !eligible {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "Parked approval changed",
+                    ));
+                }
+                Ok(())
+            }),
         })
     } else {
         None
     };
+    let mut prepared_once = None;
     let existing = config.decision_receipt(
         &session_id,
         &decision.request_id,
@@ -520,9 +511,6 @@ async fn apply_permission_decision(
     let replayed = if let Some(receipt) = existing.as_ref() {
         if !same_durable_decision_semantics(&receipt.decision, &decision) {
             return Ok(resolved_decision_conflict(&receipt.decision, &decision));
-        }
-        if let Some(proof) = &delegation {
-            proof.with_current_authority(&state, || Ok(())).await?;
         }
         // A provider may legally reuse a tool-call id in a later round. Even
         // an exact replay receipt for the old generation must not consume that
@@ -690,40 +678,13 @@ async fn apply_permission_decision(
 
             match decision.decision {
                 PermissionDecisionKind::AllowOnce | PermissionDecisionKind::DenyOnce => {
-                    let apply_once = |config: &bamboo_tools::permission::PermissionConfig,
-                                      request: &bamboo_tools::permission::PermissionRequest,
-                                      decision: &PermissionDecision|
-                     -> Result<(), String> {
-                        if decision.decision == PermissionDecisionKind::AllowOnce {
-                            config.grant_once_for_generation(
-                                &request.session_id,
-                                &request.request_id,
-                                &request.request_generation,
-                                request.permission_type,
-                                request.resource.clone(),
-                            )?;
-                        }
-                        config.record_decision(&request.session_id, decision.clone())?;
-                        Ok(())
-                    };
-                    if let Some(proof) = &delegation {
-                        let config = config.clone();
-                        let decision = decision.clone();
-                        let guard = permission_guard
-                            .take()
-                            .expect("permission mutation lock is held");
-                        let (returned_response, returned_permission) = proof
-                            .with_current_authority(&state, move || {
-                                apply_once(&config, &request, &decision)
-                                    .map_err(std::io::Error::other)?;
-                                Ok((response_guard, guard))
-                            })
-                            .await?;
-                        response_guard = returned_response;
-                        permission_guard = Some(returned_permission);
-                    } else {
-                        apply_once(&config, &request, &decision).map_err(AppError::BadRequest)?;
-                    }
+                    // The response checkpoint commits the receipt and answer.
+                    // Approved replay restores the exact grant from that receipt.
+                    prepared_once = Some(PermissionDecisionReceipt {
+                        session_id: session_id.clone(),
+                        decision: decision.clone(),
+                        decided_at: chrono::Utc::now(),
+                    });
                 }
                 PermissionDecisionKind::AllowSession => {
                     let matcher = selected_matcher(&request, &decision)?;
@@ -793,8 +754,7 @@ async fn apply_permission_decision(
                     permission_guard = Some(returned_guard);
                 }
             }
-            if !bamboo_orchestration::managed_session::approval_handoff::is_once(decision.decision)
-            {
+            if !is_once(decision.decision) {
                 config
                     .record_decision(&session_id, decision.clone())
                     .map_err(AppError::BadRequest)?;
@@ -802,24 +762,25 @@ async fn apply_permission_decision(
             false
         }
     };
-    let receipt = config
-        .decision_receipt(
-            &session_id,
-            &decision.request_id,
-            &decision.request_generation,
-        )
-        .expect("decision receipt was recorded or observed");
-    drop(permission_guard.take());
+    let receipt = prepared_once.unwrap_or_else(|| {
+        config
+            .decision_receipt(
+                &session_id,
+                &decision.request_id,
+                &decision.request_generation,
+            )
+            .expect("decision receipt was recorded or observed")
+    });
+    // Keep the policy revision stable through the Once checkpoint. Remembered
+    // decisions have already finished their own policy mutation.
+    if !is_once(decision.decision) {
+        drop(permission_guard.take());
+    }
 
     // A replay after the original response completed is a successful no-op. If
     // the first attempt committed policy but failed before saving the pending
     // answer, retry the ordinary response path to finish resume safely.
-    if replayed
-        && state
-            .load_session(&session_id)
-            .await
-            .is_some_and(|session| session.pending_question.is_none())
-    {
+    if replayed && session.pending_question.is_none() {
         return Ok(HttpResponse::Ok().json(PermissionDecisionResponse {
             success: true,
             replayed: true,
@@ -836,32 +797,82 @@ async fn apply_permission_decision(
         | PermissionDecisionKind::AllowGlobal => "Approve",
         PermissionDecisionKind::DenyOnce | PermissionDecisionKind::DenySession => "Deny",
     };
-    let response = super::submit::submit_typed_permission_response(
-        state,
-        web::Path::from(session_id),
-        web::Json(RespondRequest {
-            response: legacy_response.to_string(),
-            // Permission request identity is the originating tool-call id.
-            // Keep that exact CAS on replay so receipt A can never answer a
-            // newer pending permission B.
-            expected_tool_call_id: Some(expected_tool_call_id),
-            model: None,
-            provider: None,
-            model_ref: None,
-            reasoning_effort: None,
-        }),
-        receipt.clone(),
-        &response_guard,
-    )
-    .await
-    .map_err(|error| AppError::InternalError(anyhow::anyhow!(error.to_string())))?;
+    let (status, response_body) = {
+        let response = super::submit::submit_typed_permission_response(
+            state.clone(),
+            web::Path::from(session_id),
+            web::Json(RespondRequest {
+                response: legacy_response.to_string(),
+                // The tool call and receipt generation bind the response CAS.
+                expected_tool_call_id: Some(expected_tool_call_id),
+                model: None,
+                provider: None,
+                model_ref: None,
+                reasoning_effort: None,
+            }),
+            receipt.clone(),
+            &response_guard,
+            approval,
+        )
+        .await
+        .map_err(|error| AppError::InternalError(anyhow::anyhow!(error.to_string())))?;
+        let status = response.status();
+        let body = response.into_body().try_into_bytes().map_err(|_| {
+            AppError::InternalError(anyhow::anyhow!("Expected a JSON response submission body"))
+        })?;
+        (status, body)
+    };
 
-    if !response.status().is_success() {
-        return Ok(response);
+    if !status.is_success() {
+        if is_once(decision.decision)
+            && status == actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        {
+            // A later storage phase can fail after Main committed. The
+            // canonical receipt also identifies a concurrent winning choice.
+            let current = state
+                .storage
+                .load_execution_admission_snapshot(&session.id)
+                .await?
+                .filter(|current| {
+                    current.created_at == session.created_at
+                        && session.check_conversation_generation(current).is_ok()
+                        && bamboo_domain::consumed_pending_permission(&session, current).is_some()
+                });
+            let saved = current.as_ref().and_then(|current| {
+                super::pending::persisted_permission_decision_receipt(
+                    current,
+                    &receipt.decision.request_id,
+                )
+                .filter(|saved| {
+                    saved.decision.request_generation == receipt.decision.request_generation
+                })
+            });
+            if let Some(saved) = saved {
+                config
+                    .record_decision_receipt(saved.clone())
+                    .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+                if !same_durable_decision_semantics(&saved.decision, &decision) {
+                    return Ok(resolved_decision_conflict(&saved.decision, &decision));
+                }
+                return Ok(HttpResponse::Ok().json(PermissionDecisionResponse {
+                    success: true,
+                    replayed: replayed || saved != receipt,
+                    receipt: saved,
+                    resume: None,
+                    auto_resume_status: None,
+                }));
+            }
+        }
+        return Ok(HttpResponse::build(status)
+            .content_type("application/json")
+            .body(response_body));
     }
-    let response_body = response.into_body().try_into_bytes().map_err(|_| {
-        AppError::InternalError(anyhow::anyhow!("Expected a JSON response submission body"))
-    })?;
+    if is_once(decision.decision) {
+        config
+            .record_decision_receipt(receipt.clone())
+            .map_err(|error| AppError::InternalError(anyhow::anyhow!(error)))?;
+    }
+    drop(permission_guard.take());
     let resume: serde_json::Value = serde_json::from_slice(&response_body).map_err(|error| {
         AppError::InternalError(anyhow::anyhow!(
             "successful response submission returned invalid JSON: {error}"
@@ -890,6 +901,9 @@ mod tests {
     use super::*;
     use bamboo_agent_core::{FunctionCall, Message, PendingQuestionSource, Session, ToolCall};
     use bamboo_engine::execution::{AgentRunner, AgentStatus};
+    use bamboo_engine::session_app::respond::{
+        PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
+    };
     use bamboo_tools::permission::{
         PermissionMatcherKind, PermissionMode, PermissionReasonCode, PermissionRequest,
         PermissionType, RiskLevel,
@@ -1650,6 +1664,188 @@ mod tests {
         assert_eq!(body["auto_resume_status"], "started");
         assert_eq!(body["resume"]["auto_resume_status"], "started");
         assert!(body["resume"].get("accepted").is_none());
+    }
+
+    #[actix_web::test]
+    async fn failed_once_response_commit_preserves_the_exact_pending_decision() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = web::Data::new(AppState::new(dir.path().into()).await.unwrap());
+        let request = test_permission_request(
+            "permission-commit-failure",
+            "permission-request",
+            0,
+            PermissionRequest::forced_decisions(),
+        );
+        let mut session = parked_permission_session(&request);
+        state.save_and_cache_session(&mut session).await;
+        let occurrence = bamboo_domain::pending_permission_occurrence(&session).unwrap();
+        let config = state.permission_checker.permission_config().unwrap();
+        let decision = PermissionDecision {
+            request_id: request.request_id.clone(),
+            request_generation: request.request_generation.clone(),
+            decision: PermissionDecisionKind::AllowOnce,
+            matcher_id: None,
+            expected_policy_revision: Some(request.policy_revision),
+            confirm_global: false,
+        };
+
+        state
+            .session_store
+            .interrupt_full_save_at_main_for_test(&session.id, false);
+        let response = submit_permission_decision(
+            state.clone(),
+            web::Path::from(session.id.clone()),
+            web::Json(decision.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let pending = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bamboo_domain::pending_permission_occurrence(&pending),
+            Some(occurrence.clone())
+        );
+        let question = super::super::pending::get_pending_question(
+            state.clone(),
+            web::Path::from(session.id.clone()),
+        )
+        .await
+        .unwrap();
+        let question = actix_web::body::to_bytes(question.into_body())
+            .await
+            .unwrap();
+        let question: serde_json::Value = serde_json::from_slice(&question).unwrap();
+        assert_eq!(
+            question["permission_request"]["request_generation"],
+            request.request_generation
+        );
+        assert_eq!(question["has_pending_question"], true);
+        assert!(
+            super::super::pending::persisted_permission_decision_receipt(
+                &pending,
+                &request.request_id
+            )
+            .is_none()
+        );
+        for key in [
+            PERMISSION_REEXECUTE_METADATA_KEY,
+            PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
+            bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY,
+        ] {
+            assert!(!pending.metadata.contains_key(key), "{key}");
+        }
+        assert!(
+            config
+                .decision_receipt(
+                    &session.id,
+                    &request.request_id,
+                    &request.request_generation
+                )
+                .is_none(),
+            "a failed response must leave the decision available"
+        );
+        assert!(config.temporary_grants().is_empty());
+        drop(config);
+        state.shutdown().await;
+        drop(state);
+
+        let reopened = web::Data::new(AppState::new(dir.path().into()).await.unwrap());
+        let mut deny = decision.clone();
+        deny.decision = PermissionDecisionKind::DenyOnce;
+        reopened
+            .session_store
+            .interrupt_full_save_at_main_for_test(&session.id, true);
+        let response = submit_permission_decision(
+            reopened.clone(),
+            web::Path::from(session.id.clone()),
+            web::Json(deny.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let answered = reopened
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(answered.pending_question.is_none());
+        let receipt = super::super::pending::persisted_permission_decision_receipt(
+            &answered,
+            &request.request_id,
+        )
+        .unwrap();
+        assert_eq!(receipt.decision, deny);
+        assert!(answered.messages.last().unwrap().content.contains("Deny"));
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["receipt"], serde_json::to_value(&receipt).unwrap());
+        assert!(
+            body.get("resume").is_none(),
+            "the late fault abandoned the reservation"
+        );
+        let question = super::super::pending::get_pending_question(
+            reopened.clone(),
+            web::Path::from(session.id.clone()),
+        )
+        .await
+        .unwrap();
+        let question = actix_web::body::to_bytes(question.into_body())
+            .await
+            .unwrap();
+        let question: serde_json::Value = serde_json::from_slice(&question).unwrap();
+        assert_eq!(question["has_pending_question"], false);
+        let response = submit_permission_decision(
+            reopened.clone(),
+            web::Path::from(session.id.clone()),
+            web::Json(deny.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["replayed"], true);
+        assert_eq!(body["receipt"], serde_json::to_value(&receipt).unwrap());
+        reopened.shutdown().await;
+        drop(reopened);
+
+        let reopened = web::Data::new(AppState::new(dir.path().into()).await.unwrap());
+        let response = submit_permission_decision(
+            reopened.clone(),
+            web::Path::from(session.id.clone()),
+            web::Json(deny),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["replayed"], true);
+        assert_eq!(body["receipt"], serde_json::to_value(receipt).unwrap());
+        let conflicting = submit_permission_decision(
+            reopened.clone(),
+            web::Path::from(session.id),
+            web::Json(decision),
+        )
+        .await
+        .unwrap();
+        assert_eq!(conflicting.status(), actix_web::http::StatusCode::CONFLICT);
+        reopened.shutdown().await;
     }
 
     #[actix_web::test]

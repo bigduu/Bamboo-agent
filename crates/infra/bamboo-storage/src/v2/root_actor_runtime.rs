@@ -2,7 +2,9 @@
 //! The capability belongs to one execution, never the default snapshot writer.
 
 use super::*;
-use bamboo_domain::storage::{RootActorRuntimePublisher, RootActorRuntimeWrite};
+use bamboo_domain::storage::{
+    RootActorRuntimePublisher, RootActorRuntimeWrite, SupervisorApprovalCommit,
+};
 use bamboo_domain::{ActorActivationStatus, ActorDirectoryEntry, SessionAuthorityConflict};
 
 pub(super) fn conflict(reason: impl std::fmt::Display) -> io::Error {
@@ -247,6 +249,7 @@ impl SessionStoreV2 {
         session: &mut Session,
         expected: &Session,
         inherited: Option<&bamboo_domain::InheritedChildWait>,
+        approval: Option<&SupervisorApprovalCommit>,
         publish: RootActorRuntimePublisher,
     ) -> io::Result<()> {
         let total_started = Instant::now();
@@ -254,18 +257,36 @@ impl SessionStoreV2 {
         if let Some(wait) = inherited {
             wait.validate_session(session)?;
         }
-        let lifecycle = self.lock_default_writer_lifecycle().await?;
-        let task = self.lock_runtime_task_sidecar_shared().await?;
-        let session_write = self
-            .acquire_session_write_lock(&session.id, SaveKind::Full)
-            .await?;
         let proof = RootActorWriteProof::new(self.sessions_dir.join(&session.id), owner.clone());
-        let guards = DefaultWriterGuards::shared_with_root_actor(
-            lifecycle,
-            task,
-            session_write,
-            Some(proof.clone()),
-        );
+        let guards = if let Some(approval) = approval {
+            if approval.target.session_id != session.id || owner.fence.actor_id != session.id {
+                return Err(conflict(
+                    "delegated approval does not match its Root writer",
+                ));
+            }
+            let (authority, source, current) = self
+                .lock_supervisor_approval(&approval.caller, &approval.supervisor, &approval.target)
+                .await?;
+            if bamboo_domain::consumed_pending_permission(&current, session).is_none() {
+                return Err(conflict(
+                    "delegated approval no longer consumes its exact occurrence",
+                ));
+            }
+            (approval.validate)(&source, &current)?;
+            DefaultWriterGuards::supervisor_approval(authority, proof.clone())
+        } else {
+            let lifecycle = self.lock_default_writer_lifecycle().await?;
+            let task = self.lock_runtime_task_sidecar_shared().await?;
+            let session_write = self
+                .acquire_session_write_lock(&session.id, SaveKind::Full)
+                .await?;
+            DefaultWriterGuards::shared_with_root_actor(
+                lifecycle,
+                task,
+                session_write,
+                Some(proof.clone()),
+            )
+        };
         let observed = expected.clone();
         let proposed = session.clone();
         Self::default_writer_job(&guards, move || {

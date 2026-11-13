@@ -71,7 +71,13 @@ pub async fn submit_response(
     session_id: web::Path<String>,
     req: web::Json<RespondRequest>,
 ) -> Result<HttpResponse> {
-    submit_response_inner(state, session_id, req, ResponseEndpoint::Legacy, None, None).await
+    submit_response_inner(state, session_id, req, ResponseEndpoint::Legacy, None).await
+}
+
+struct TypedPermissionResponse<'a> {
+    receipt: bamboo_tools::permission::PermissionDecisionReceipt,
+    guard: &'a bamboo_engine::session_app::respond::PendingResponseGuard,
+    approval: Option<bamboo_domain::storage::SupervisorApprovalCommit>,
 }
 
 pub(super) async fn submit_typed_permission_response(
@@ -80,14 +86,18 @@ pub(super) async fn submit_typed_permission_response(
     req: web::Json<RespondRequest>,
     permission_receipt: bamboo_tools::permission::PermissionDecisionReceipt,
     response_guard: &bamboo_engine::session_app::respond::PendingResponseGuard,
+    approval: Option<bamboo_domain::storage::SupervisorApprovalCommit>,
 ) -> Result<HttpResponse> {
     submit_response_inner(
         state,
         session_id,
         req,
         ResponseEndpoint::TypedPermission,
-        Some(response_guard),
-        Some(permission_receipt),
+        Some(TypedPermissionResponse {
+            receipt: permission_receipt,
+            guard: response_guard,
+            approval,
+        }),
     )
     .await
 }
@@ -97,12 +107,11 @@ async fn submit_response_inner(
     session_id: web::Path<String>,
     req: web::Json<RespondRequest>,
     response_endpoint: ResponseEndpoint,
-    existing_response_guard: Option<&bamboo_engine::session_app::respond::PendingResponseGuard>,
-    permission_receipt: Option<bamboo_tools::permission::PermissionDecisionReceipt>,
+    mut permission: Option<TypedPermissionResponse<'_>>,
 ) -> Result<HttpResponse> {
     let session_id = session_id.into_inner();
     let user_response = req.response.clone();
-    let typed_permission_response = permission_receipt.is_some();
+    let typed_permission_response = permission.is_some();
 
     tracing::info!("[{}] Received user response: {}", session_id, user_response);
 
@@ -110,12 +119,14 @@ async fn submit_response_inner(
     // compare-and-consume, and detached dispatch for every response source.
     // A duplicate waits here, then observes the consumed question without
     // allocating or replacing runner state.
-    let acquired_response_guard = if existing_response_guard.is_none() {
+    let acquired_response_guard = if permission.is_none() {
         Some(bamboo_engine::session_app::respond::acquire_pending_response_guard(&session_id).await)
     } else {
         None
     };
-    let response_guard = existing_response_guard
+    let response_guard = permission
+        .as_ref()
+        .map(|permission| permission.guard)
         .or(acquired_response_guard.as_ref())
         .expect("a response guard is supplied or acquired");
 
@@ -245,28 +256,43 @@ async fn submit_response_inner(
     // exact handoff must reach its detached owner without a cancellation point.
     let config_snapshot = state.config.read().await.clone();
 
-    let bound_access =
-        match bamboo_engine::session_app::repository::SessionAccess::bind_response_writer(
-            state.as_ref(),
-            handoff.root_actor_writer(),
-        ) {
-            Ok(access) => access,
-            Err(error) => {
-                handoff.abandon().await;
-                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+    use bamboo_engine::session_app::repository::SessionAccess;
+    let owner = handoff.root_actor_writer();
+    let approval = permission
+        .as_mut()
+        .and_then(|permission| permission.approval.take());
+    let bound_access: Result<Option<std::sync::Arc<dyn SessionAccess>>, _> = if let Some(approval) =
+        approval
+    {
+        match owner {
+            Some(owner) => state
+                .session_repo
+                .bind_supervisor_approval_response_writer(owner, approval)
+                .map(|bound| Some(std::sync::Arc::new(bound) as std::sync::Arc<dyn SessionAccess>))
+                .map_err(|error| error.to_string()),
+            None => Err("delegated permission response requires its Root writer".into()),
+        }
+    } else {
+        SessionAccess::bind_response_writer(state.as_ref(), owner)
+            .map_err(|error| error.to_string())
+    };
+    let bound_access = match bound_access {
+        Ok(access) => access,
+        Err(error) => {
+            handoff.abandon().await;
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": crate::error::error_value(format!("Response writer unavailable: {error}"))
             })));
-            }
-        };
-    let response_access: &dyn bamboo_engine::session_app::repository::SessionAccess =
-        bound_access.as_deref().unwrap_or(state.as_ref());
+        }
+    };
+    let response_access: &dyn SessionAccess = bound_access.as_deref().unwrap_or(state.as_ref());
 
-    let submission = if let Some(permission_receipt) = permission_receipt {
+    let submission = if let Some(permission) = permission {
         bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
             response_access,
             input,
             expected_tool_call_id,
-            permission_receipt,
+            permission.receipt,
             response_guard,
         )
         .await
@@ -353,9 +379,9 @@ async fn submit_response_inner(
     // Record session grants for any permission prompt the user approved, so the
     // resumed run's re-attempt of the gated operation passes the checker without
     // prompting again. `state.permission_checker` shares the same PermissionConfig
-    // the tool executor checks against. Typed decisions already installed their
-    // exact scope/generation before the response CAS; only the legacy endpoint
-    // creates the compatibility `(session, request_id)` grant here.
+    // the tool executor checks against. Typed replay uses the committed receipt
+    // to restore its exact authorization. The legacy endpoint creates the
+    // compatibility `(session, request_id)` grant here.
     for (perm_type, resource) in &permission_grants {
         if !typed_permission_response {
             if let Some(request_id) = session

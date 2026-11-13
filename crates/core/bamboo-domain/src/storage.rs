@@ -157,6 +157,20 @@ pub struct ChildActorRuntimeSave<'a> {
 /// treats the result as unknown; it cannot use its candidate as committed data.
 pub type RootActorRuntimePublisher = std::sync::Arc<dyn Fn(&Session) + Send + Sync>;
 
+/// Original Supervisor and target observations for a delegated permission
+/// response. The final writer rechecks these and the approval contract while
+/// retaining its canonical authority locks.
+pub struct SupervisorApprovalCommit {
+    pub caller: crate::SessionCallerReference,
+    pub supervisor: SupervisorReference,
+    pub target: crate::SupervisorCurrentUserTarget,
+    /// Validate the retained source and target snapshots without reentering storage.
+    pub validate: SupervisorApprovalValidator,
+}
+
+pub type SupervisorApprovalValidator =
+    Box<dyn Fn(&Session, &Session) -> std::io::Result<()> + Send + Sync>;
+
 /// The final sink receives a fresh owner check while the physical authority
 /// guards remain owned by the publication job. Check immediately before each
 /// final effect, including after any journal scan performed by the sink.
@@ -464,6 +478,24 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             crate::SessionAuthorityConflict("conditional Root bound startup is unsupported".into()),
+        ))
+    }
+
+    /// Commit a delegated permission answer while the original Supervisor's
+    /// authority and the reserved Root writer are both current.
+    async fn save_supervisor_approval_response(
+        &self,
+        owner: &RootActorRuntimeWrite,
+        session: &mut Session,
+        expected: &Session,
+        inherited: Option<&crate::InheritedChildWait>,
+        approval: &SupervisorApprovalCommit,
+        publish: RootActorRuntimePublisher,
+    ) -> std::io::Result<()> {
+        let _ = (owner, session, expected, inherited, approval, publish);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "guarded Supervisor approval response is unsupported",
         ))
     }
 

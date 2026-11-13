@@ -329,11 +329,10 @@ impl AppStateResumeRef {
         };
 
         // If the user just approved a permission prompt, the gated tool call was
-        // intercepted before it ran — its result is only a placeholder. The grant
-        // has already been recorded (by the respond handler) on the shared
-        // permission checker, so re-execute the tool now for real, write the
-        // output back, then start the loop. This happens off the /respond response
-        // path (in this spawned task) and streams via the same mpsc → forwarder,
+        // intercepted before it ran — its result is only a placeholder. Typed
+        // replay restores authorization from the committed receipt. Re-execute
+        // the tool, write back its output, then start the loop. This happens off
+        // the /respond path and streams via the same mpsc → forwarder,
         // so the re-run shows up live and the model sees genuine output instead of
         // inferring it. The common (non-permission) resume path is unchanged.
         let reexecute_tool_call_id = session
