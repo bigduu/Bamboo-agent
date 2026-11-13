@@ -1,5 +1,6 @@
 use crate::runtime::config::AgentLoopConfig;
 use bamboo_agent_core::Session;
+use bamboo_skills::runtime_metadata::validate_pinned_activation_metadata;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -182,7 +183,7 @@ pub(super) struct SkillContextLoadResult {
     pub(super) catalog_diagnostic: Option<bamboo_skills::WorkflowCatalogDiagnostic>,
     pub(super) durable_snapshot: Option<bamboo_skills::SkillActivationSnapshot>,
     pub(super) activation_diagnostic: Option<bamboo_skills::WorkflowActivationDiagnostic>,
-    pub(super) restored_active_context: bool,
+    pub(super) restored_active_skill_id: Option<String>,
 }
 
 fn degraded_activation_result(
@@ -411,9 +412,36 @@ pub(super) async fn load_skill_context(
             .as_ref()
             .map(|activation| activation.catalog_entries.clone())
             .unwrap_or_default();
-        let catalog_diagnostic = activation
-            .as_ref()
-            .map(|activation| activation.catalog_diagnostic.clone());
+        let catalog_diagnostic = activation.as_ref().map(|activation| {
+            // Retained pins store executable identities. The session also
+            // records the prompt budget and outcome for that same selection.
+            if continues_retained_activation
+                && retained_selection_source.as_deref() == Some("auto")
+                && validate_pinned_activation_metadata(
+                    &session.metadata,
+                    Some(&activation.descriptor),
+                    None,
+                ) == Ok(true)
+            {
+                if let Some(diagnostic) = session
+                    .metadata
+                    .get(bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY)
+                    .and_then(|raw| {
+                        serde_json::from_str::<bamboo_skills::WorkflowCatalogDiagnostic>(raw).ok()
+                    })
+                    .filter(|diagnostic| {
+                        diagnostic.automatic_outcome.is_some()
+                            && diagnostic.advertised_candidates == selected_skills.len()
+                            && diagnostic.final_chars <= diagnostic.char_budget
+                            && diagnostic.char_budget
+                                <= bamboo_skills::DEFAULT_WORKFLOW_CATALOG_MAX_CHARS
+                    })
+                {
+                    return diagnostic;
+                }
+            }
+            activation.catalog_diagnostic.clone()
+        });
         if let Some(selection) = session
             .metadata
             .get(bamboo_skills::WORKFLOW_SELECTION_METADATA_KEY)
@@ -500,9 +528,17 @@ pub(super) async fn load_skill_context(
                 serde_json::from_str::<bamboo_skills::DurableWorkflowActivation>(raw).ok()
             })
             .filter(|durable| {
+                let Some(activation) = activation.as_ref() else {
+                    return false;
+                };
                 durable.active.status == bamboo_skills::WorkflowActivationStatus::Active
-                    && selected_ids.len() == 1
-                    && selected_ids[0] == durable.active.id
+                    && (selected_ids.len() == 1
+                        || (continues_retained_activation
+                            && selection_source.as_deref() == Some("auto")
+                            && durable.snapshot.catalog_revision
+                                == activation.descriptor.catalog_revision
+                            && durable.snapshot.selected_skill_mode
+                                == activation.descriptor.selected_skill_mode))
                     && catalog_entries.iter().any(|entry| {
                         entry.id == durable.active.id
                             && entry.revision == durable.active.revision
@@ -510,40 +546,35 @@ pub(super) async fn load_skill_context(
                             && entry.kind == durable.active.kind
                     })
             });
-        let (context, restored_active_context) = if durable_active.is_some() {
-            (String::new(), true)
+        let restored_active_skill_id = durable_active
+            .as_ref()
+            .map(|durable| durable.active.id.clone());
+        let context = if durable_active.is_some() {
+            String::new()
         } else {
-            (
-                catalog_diagnostic
-                    .as_ref()
-                    .map(|diagnostic| {
-                        bamboo_skills::context::build_workflow_catalog_context(
-                            &selected_skills,
-                            &catalog_entries,
-                            diagnostic,
-                        )
-                    })
-                    .unwrap_or_default(),
-                false,
-            )
+            catalog_diagnostic
+                .as_ref()
+                .map(|diagnostic| {
+                    bamboo_skills::context::build_workflow_catalog_context(
+                        &selected_skills,
+                        &catalog_entries,
+                        diagnostic,
+                    )
+                })
+                .unwrap_or_default()
         };
-        // Automatic selection only advertises metadata. Keep its immutable candidate
-        // pin in process for load_skill, but do not serialize every candidate's
-        // resource tree into the session. The tool exports and narrows the pin to the
-        // one workflow the model actually activates. Explicit selection needs the
-        // candidate snapshot before the model invokes load_skill, while an
-        // already-active LKG remains durable across restarts.
-        let durable_snapshot = if activation.is_some()
-            && (selection_source.as_deref() == Some("explicit") || durable_active.is_some())
-        {
-            let store = resource_scope
-                .store(skill_manager)
-                .await
-                .map_err(|error| format!("Failed to resolve workflow snapshot store: {error}"))?;
-            store.export_activation_snapshot(session_id).await
-        } else {
-            None
-        };
+        // Automatic selection only advertises metadata. Keep its candidate pin
+        // in process and only persist the already-loaded workflow's snapshot.
+        // Explicit selection needs its snapshot before the first tool call.
+        let durable_snapshot =
+            if activation.is_some() && selection_source.as_deref() == Some("explicit") {
+                let store = resource_scope.store(skill_manager).await.map_err(|error| {
+                    format!("Failed to resolve workflow snapshot store: {error}")
+                })?;
+                store.export_activation_snapshot(session_id).await
+            } else {
+                durable_active.map(|durable| durable.snapshot)
+            };
         if durable_snapshot
             .as_ref()
             .and_then(|snapshot| serde_json::to_vec(snapshot).ok())
@@ -581,7 +612,7 @@ pub(super) async fn load_skill_context(
             catalog_diagnostic,
             durable_snapshot,
             activation_diagnostic: None,
-            restored_active_context,
+            restored_active_skill_id,
         })
     } else {
         tracing::info!("[{}] No skill manager configured", session_id);

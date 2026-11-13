@@ -2,6 +2,7 @@
 //! These helpers do not activate Skills or authorize reading their bodies.
 
 use crate::{SkillError, SkillResult, WorkflowSource};
+use bamboo_domain::CapabilityInvocationTarget;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -15,6 +16,8 @@ pub use render::{
     EXPLICIT_SKILL_PROMPT_BYTES,
 };
 pub(crate) mod source;
+
+use crate::capability_discovery::{AutomaticSkillOutcome, CapabilityDiscoveryIndex};
 
 /// Correlated borrowed data from one current publication. It is not a grant,
 /// activation snapshot or retained resource owner.
@@ -59,6 +62,48 @@ pub struct SkillCatalogEligibility {
 pub struct SkillCatalogSnapshot {
     pub entries: Vec<SkillCatalogMetadata>,
     pub identity: String,
+}
+
+/// Rank metadata from the current publication for prompt advertisement only.
+/// The caller must supply the authorized subset of that same publication.
+pub(crate) fn automatic_skill_prompt_candidates<'a>(
+    published: &'a [SkillCatalogMetadata],
+    eligible: &[SkillCatalogMetadata],
+    query: &str,
+) -> (Vec<&'a SkillCatalogMetadata>, AutomaticSkillOutcome) {
+    let allowed = eligible
+        .iter()
+        .map(|entry| (entry.package.as_str(), entry.identity.as_str()))
+        .collect::<BTreeSet<_>>();
+    let by_package = published
+        .iter()
+        .map(|entry| (entry.package.as_str(), entry))
+        .collect::<std::collections::HashMap<_, _>>();
+    let index = CapabilityDiscoveryIndex::for_progressive_skill_matching(published);
+    let (decision, matches) = index.match_automatic_skills(
+        query,
+        |candidate| {
+            let CapabilityInvocationTarget::Skill { skill_id, .. } = &candidate.invocation_target
+            else {
+                return false;
+            };
+            by_package.get(skill_id.as_str()).is_some_and(|entry| {
+                allowed.contains(&(skill_id.as_str(), entry.identity.as_str()))
+            })
+        },
+        |_| true,
+    );
+    let candidates = matches
+        .iter()
+        .filter_map(|candidate| {
+            let CapabilityInvocationTarget::Skill { skill_id, .. } = &candidate.invocation_target
+            else {
+                return None;
+            };
+            by_package.get(skill_id.as_str()).copied()
+        })
+        .collect();
+    (candidates, decision.outcome)
 }
 
 impl SkillCatalogSnapshot {

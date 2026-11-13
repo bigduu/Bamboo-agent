@@ -1271,6 +1271,117 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
 }
 
 #[tokio::test]
+async fn automatic_shortlist_recovers_from_degradation_and_keeps_the_active_skill() {
+    let directory = tempfile::tempdir().unwrap();
+    let skills_dir = directory.path().join("skills");
+    for (id, metadata) in [
+        ("pdf", ""),
+        ("docx", ""),
+        (
+            "degraded",
+            "metadata:\n  dynamic_context:\n    - id: read\n      tool: Read\n      stop_on_failure: true\n",
+        ),
+    ] {
+        let root = skills_dir.join(id);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: Generate portable documents\n{metadata}---\n{id} instructions\n"),
+        )
+        .unwrap();
+    }
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir,
+        ..Default::default()
+    }));
+    manager.initialize().await.unwrap();
+    let id = "automatic-shortlist";
+    let activation = manager
+        .resolve_and_pin_activation_for_request_with_mode_and_budget(
+            id,
+            &Default::default(),
+            None,
+            None,
+            Some("Generate portable documents"),
+            bamboo_skills::DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+        )
+        .await
+        .unwrap();
+    assert_eq!(activation.descriptor.skill_revisions.len(), 3);
+    let mut session = Session::new(id, "model");
+    session.metadata.extend([
+        (SKILL_RUNTIME_SELECTION_SOURCE_KEY.into(), "auto".into()),
+        (
+            SKILL_RUNTIME_ACTIVATION_GENERATION_KEY.into(),
+            activation.descriptor.catalog_revision.to_string(),
+        ),
+        (
+            SKILL_RUNTIME_SELECTED_SKILL_REVISIONS_KEY.into(),
+            serde_json::to_string(&activation.descriptor.skill_revisions).unwrap(),
+        ),
+    ]);
+    let storage: Arc<dyn Storage> = Arc::new(TestStorage::default());
+    let locked = Arc::new(bamboo_storage::LockedSessionStore::new(storage.clone()));
+    let repo = bamboo_engine::SessionRepository::new(Default::default(), storage, locked);
+    repo.save(&mut session).await.unwrap();
+    let tool = LoadSkillTool::new(
+        manager,
+        Arc::new(RwLock::new(Config::default())),
+        repo.clone(),
+    );
+    let mut context = bamboo_agent_core::tools::ToolCtx::none("shortlist-load");
+    context.session_id = Some(id.into());
+    let ToolOutcome::Completed(degraded) = tool
+        .invoke(serde_json::json!({"skill_id":"degraded"}), context.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("the first attempt should report degradation");
+    };
+    assert_eq!(
+        public_load_skill_receipt(&degraded)["activation_status"],
+        "degraded"
+    );
+    let ToolOutcome::Completed(first) = tool
+        .invoke(serde_json::json!({"skill_id":"pdf"}), context.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("first advertised Skill should complete");
+    };
+    assert_eq!(
+        public_load_skill_receipt(&first)["activation_status"],
+        "active"
+    );
+    let before = repo.try_load(id).await.unwrap().unwrap();
+    assert!(!before
+        .metadata
+        .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY));
+    let error = tool
+        .invoke(serde_json::json!({"skill_id":"docx"}), context.clone())
+        .await
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("An automatic Skill is already active"));
+    assert_eq!(
+        repo.try_load(id).await.unwrap().unwrap().metadata,
+        before.metadata
+    );
+    let ToolOutcome::Completed(retry) = tool
+        .invoke(serde_json::json!({"skill_id":"pdf"}), context)
+        .await
+        .unwrap()
+    else {
+        panic!("retry of the selected Skill should complete");
+    };
+    assert_eq!(
+        public_load_skill_receipt(&retry),
+        public_load_skill_receipt(&first)
+    );
+}
+
+#[tokio::test]
 async fn runtime_generation_marker_prevents_stale_metadata_from_repinning_live_catalog() {
     let temp_dir = tempfile::tempdir().expect("tempdir");
     let skills_dir = temp_dir.path().join("skills");

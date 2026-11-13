@@ -129,6 +129,10 @@ pub struct WorkflowCatalogDiagnostic {
     pub shortlisted: bool,
     #[serde(default)]
     pub omitted_ids: Vec<String>,
+    /// Bounded automatic matching outcome. Explicit and historical catalogs
+    /// may have no automatic decision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub automatic_outcome: Option<crate::capability_discovery::AutomaticSkillOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -745,6 +749,7 @@ mod tests {
                 compressed_descriptions: false,
                 shortlisted: false,
                 omitted_ids: Vec::new(),
+                automatic_outcome: None,
             },
             descriptor,
         };

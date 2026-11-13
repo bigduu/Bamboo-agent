@@ -481,11 +481,105 @@ async fn native_http_implicit_main_retains_current_user_across_nonew_pages() {
         .any(|m| m.content.contains("manual-only")));
 }
 
+#[actix_web::test]
+async fn native_http_automatic_skill_prompt_is_task_bounded_and_metadata_only() {
+    #[derive(Default)]
+    struct Provider(Mutex<Vec<(Vec<Message>, Vec<String>)>>);
+
+    #[async_trait]
+    impl LLMProvider for Provider {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            tools: &[ToolSchema],
+            _: Option<u32>,
+            _: &str,
+        ) -> Result<LLMStream, LLMError> {
+            self.0.lock().unwrap().push((
+                messages.to_vec(),
+                tools
+                    .iter()
+                    .map(|tool| tool.function.name.clone())
+                    .collect(),
+            ));
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LLMChunk::Token("Fixture completion".into())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    let _proof = HTTP_PROOF.lock().await;
+    let home = tempfile::tempdir().unwrap();
+    for (id, description, automatic) in [
+        ("pdf", "Generate portable documents with PDF pages", true),
+        ("docx", "Generate portable documents with Word pages", true),
+        ("manual-only", "Generate portable documents", false),
+    ] {
+        write_skill(home.path(), id, automatic);
+        std::fs::write(
+            home.path().join("skills").join(id).join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: {description}\n---\nPRIVATE_SKILL_BODY_{id}\n"),
+        )
+        .unwrap();
+    }
+    let provider = Arc::new(Provider::default());
+    let state = state(home.path(), provider.clone()).await;
+    for (id, request, expected) in [
+        ("native-mixed-pdf", "请帮我生成PDF文档", vec!["pdf"]),
+        (
+            "native-tied-formats",
+            "Generate portable documents",
+            vec!["pdf", "docx"],
+        ),
+        ("native-unrelated-skill", "with this", Vec::new()),
+        ("native-denied-skill", "manual-only", Vec::new()),
+    ] {
+        seed(&state, id).await;
+        let (status, receipt) = http(
+            &state,
+            "/api/v1/chat",
+            json!({"session_id":id,"message":request}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{receipt}");
+        let (status, body) = http(&state, &format!("/api/v1/execute/{id}"), json!({})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        assert!(matches!(done(&state, id).await, AgentStatus::Completed));
+
+        let mut requests = provider.0.lock().unwrap();
+        assert_eq!(requests.len(), 1, "{id}");
+        let (messages, tools) = requests.pop().unwrap();
+        assert!(tools.iter().any(|name| name == "skills_list"));
+        assert!(tools.iter().any(|name| name == "skills_read"));
+        assert!(!tools.iter().any(|name| name == "load_skill"));
+        assert!(messages
+            .iter()
+            .any(|message| message.role == Role::User && message.content == request));
+        assert!(messages.iter().all(|message| {
+            message.role != Role::Tool && !message.content.contains("PRIVATE_SKILL_BODY_")
+        }));
+        let prompt = messages
+            .iter()
+            .find(|message| message.content.contains("Check Skill applicability."))
+            .expect("applicability reaches the provider even without a candidate");
+        for skill in ["pdf", "docx", "manual-only"] {
+            assert_eq!(
+                prompt.content.contains(&format!("- {skill}:")),
+                expected.contains(&skill),
+                "{id}: {}",
+                prompt.content
+            );
+        }
+    }
+}
+
 fn bindings() -> &'static Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>> {
     static TAPS: std::sync::OnceLock<Mutex<BTreeMap<String, std::sync::Weak<NativeExecutor>>>> =
         std::sync::OnceLock::new();
     TAPS.get_or_init(Mutex::default)
 }
+
 pub(super) fn observe_bound(executor: &Arc<NativeExecutor>) {
     let mut taps = bindings().lock().unwrap();
     if let Some(slot) = taps.get_mut(&executor.run.policy.session_id) {
