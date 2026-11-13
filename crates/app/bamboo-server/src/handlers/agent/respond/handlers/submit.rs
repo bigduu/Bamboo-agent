@@ -1,8 +1,26 @@
+use std::{sync::Arc, time::Duration};
+
 use actix_web::{web, HttpResponse, Result};
 
 use crate::app_state::AppState;
 use bamboo_agent_core::AgentEvent;
-use bamboo_engine::session_app::respond::PlanModeTransition;
+use bamboo_domain::{
+    latest_response_occurrence, ResponseOccurrence, SessionCallerReference,
+    ONCE_RESPONSE_HANDOFF_KEY,
+};
+use bamboo_engine::session_app::{
+    execute::has_pending_clarification_resume,
+    repository::SessionAccess,
+    respond::{
+        PlanModeTransition, PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
+        PERMISSION_REEXECUTE_METADATA_KEY,
+    },
+    resume::{
+        reserve_committed_response_handoff, reserve_response_resume_handoff, ResponseResumeHandoff,
+    },
+    types::ResumeOutcome,
+};
+use bamboo_tools::permission::{PermissionDecisionKind, PermissionDecisionReceipt};
 
 use super::super::types::RespondRequest;
 
@@ -71,23 +89,36 @@ pub async fn submit_response(
     session_id: web::Path<String>,
     req: web::Json<RespondRequest>,
 ) -> Result<HttpResponse> {
-    submit_response_inner(state, session_id, req, ResponseEndpoint::Legacy, None, None).await
+    submit_response_inner(state, session_id, req, ResponseEndpoint::Legacy, None).await
+}
+
+struct TypedPermissionResponse<'a> {
+    receipt: PermissionDecisionReceipt,
+    guard: &'a bamboo_engine::session_app::respond::PendingResponseGuard,
+    approval: Option<Arc<bamboo_domain::storage::SupervisorApprovalCommit>>,
+    permission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 pub(super) async fn submit_typed_permission_response(
     state: web::Data<AppState>,
     session_id: web::Path<String>,
     req: web::Json<RespondRequest>,
-    permission_receipt: bamboo_tools::permission::PermissionDecisionReceipt,
+    permission_receipt: PermissionDecisionReceipt,
     response_guard: &bamboo_engine::session_app::respond::PendingResponseGuard,
+    approval: Option<bamboo_domain::storage::SupervisorApprovalCommit>,
+    permission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<HttpResponse> {
     submit_response_inner(
         state,
         session_id,
         req,
         ResponseEndpoint::TypedPermission,
-        Some(response_guard),
-        Some(permission_receipt),
+        Some(TypedPermissionResponse {
+            receipt: permission_receipt,
+            guard: response_guard,
+            approval: approval.map(Arc::new),
+            permission_guard,
+        }),
     )
     .await
 }
@@ -97,12 +128,11 @@ async fn submit_response_inner(
     session_id: web::Path<String>,
     req: web::Json<RespondRequest>,
     response_endpoint: ResponseEndpoint,
-    existing_response_guard: Option<&bamboo_engine::session_app::respond::PendingResponseGuard>,
-    permission_receipt: Option<bamboo_tools::permission::PermissionDecisionReceipt>,
+    mut permission: Option<TypedPermissionResponse<'_>>,
 ) -> Result<HttpResponse> {
     let session_id = session_id.into_inner();
     let user_response = req.response.clone();
-    let typed_permission_response = permission_receipt.is_some();
+    let typed_permission_response = permission.is_some();
 
     tracing::info!("[{}] Received user response: {}", session_id, user_response);
 
@@ -110,12 +140,14 @@ async fn submit_response_inner(
     // compare-and-consume, and detached dispatch for every response source.
     // A duplicate waits here, then observes the consumed question without
     // allocating or replacing runner state.
-    let acquired_response_guard = if existing_response_guard.is_none() {
+    let acquired_response_guard = if permission.is_none() {
         Some(bamboo_engine::session_app::respond::acquire_pending_response_guard(&session_id).await)
     } else {
         None
     };
-    let response_guard = existing_response_guard
+    let response_guard = permission
+        .as_ref()
+        .map(|permission| permission.guard)
         .or(acquired_response_guard.as_ref())
         .expect("a response guard is supplied or acquired");
 
@@ -213,22 +245,19 @@ async fn submit_response_inner(
     }
 
     let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
-    let mut handoff = match bamboo_engine::session_app::resume::reserve_response_resume_handoff(
-        &resume_port,
-        &session_id,
-        std::time::Duration::from_secs(15),
-    )
-    .await
-    {
-        Ok(handoff) => handoff,
-        Err(_) => {
-            return Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({
-                "error": crate::error::error_value(
-                    "The suspending run is still finalizing; the answer was not consumed"
-                )
-            })));
-        }
-    };
+    let mut handoff =
+        match reserve_response_resume_handoff(&resume_port, &session_id, Duration::from_secs(15))
+            .await
+        {
+            Ok(handoff) => handoff,
+            Err(_) => {
+                return Ok(HttpResponse::ServiceUnavailable().json(serde_json::json!({
+                    "error": crate::error::error_value(
+                        "The suspending run is still finalizing; the answer was not consumed"
+                    )
+                })));
+            }
+        };
 
     let input = bamboo_engine::session_app::types::RespondInput {
         session_id: session_id.clone(),
@@ -245,28 +274,44 @@ async fn submit_response_inner(
     // exact handoff must reach its detached owner without a cancellation point.
     let config_snapshot = state.config.read().await.clone();
 
-    let bound_access =
-        match bamboo_engine::session_app::repository::SessionAccess::bind_response_writer(
-            state.as_ref(),
-            handoff.root_actor_writer(),
-        ) {
-            Ok(access) => access,
-            Err(error) => {
-                handoff.abandon().await;
-                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+    let owner = handoff.root_actor_writer();
+    let approval = permission
+        .as_ref()
+        .and_then(|permission| permission.approval.clone());
+    let permission_guard = permission
+        .as_mut()
+        .and_then(|permission| permission.permission_guard.take());
+    let bound_access: Result<Option<Arc<dyn SessionAccess>>, _> =
+        if let Some(approval) = approval.as_ref() {
+            match owner {
+                Some(owner) => state
+                    .session_repo
+                    .bind_supervisor_approval_response_writer(owner, Arc::clone(approval))
+                    .map(|bound| Some(Arc::new(bound) as Arc<dyn SessionAccess>))
+                    .map_err(|error| error.to_string()),
+                None => Err("delegated permission response requires its Root writer".into()),
+            }
+        } else {
+            SessionAccess::bind_response_writer(state.as_ref(), owner)
+                .map_err(|error| error.to_string())
+        };
+    let bound_access = match bound_access {
+        Ok(access) => access,
+        Err(error) => {
+            handoff.abandon().await;
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
                 "error": crate::error::error_value(format!("Response writer unavailable: {error}"))
             })));
-            }
-        };
-    let response_access: &dyn bamboo_engine::session_app::repository::SessionAccess =
-        bound_access.as_deref().unwrap_or(state.as_ref());
+        }
+    };
+    let response_access: &dyn SessionAccess = bound_access.as_deref().unwrap_or(state.as_ref());
 
-    let submission = if let Some(permission_receipt) = permission_receipt {
-        bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
+    let submission = if let Some(permission) = permission.as_ref() {
+        bamboo_engine::session_app::respond::submit_resumable_permission_response_checked_guarded(
             response_access,
             input,
             expected_tool_call_id,
-            permission_receipt,
+            permission.receipt.clone(),
             response_guard,
         )
         .await
@@ -319,6 +364,30 @@ async fn submit_response_inner(
         }
     };
 
+    drop(permission_guard);
+
+    let committed_approval = match permission
+        .and_then(|permission| {
+            permission.approval.map(|approval| {
+                super::decision::committed_delegation_after_submit(
+                    &state,
+                    &session,
+                    &approval,
+                    permission.receipt,
+                )
+            })
+        })
+        .transpose()
+    {
+        Ok(approval) => approval,
+        Err(error) => {
+            handoff.abandon().await;
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value(error.to_string()),
+            })));
+        }
+    };
+
     if stop_progress_pause {
         // The same guarded CAS consumed the runtime question and saved the
         // stopped session. A detached owner publishes through the existing
@@ -353,9 +422,9 @@ async fn submit_response_inner(
     // Record session grants for any permission prompt the user approved, so the
     // resumed run's re-attempt of the gated operation passes the checker without
     // prompting again. `state.permission_checker` shares the same PermissionConfig
-    // the tool executor checks against. Typed decisions already installed their
-    // exact scope/generation before the response CAS; only the legacy endpoint
-    // creates the compatibility `(session, request_id)` grant here.
+    // the tool executor checks against. Typed replay uses the committed receipt
+    // to restore its exact authorization. The legacy endpoint creates the
+    // compatibility `(session, request_id)` grant here.
     for (perm_type, resource) in &permission_grants {
         if !typed_permission_response {
             if let Some(request_id) = session
@@ -417,23 +486,22 @@ async fn submit_response_inner(
 
     // Build resume config snapshot from server config via the single-source-of-
     // truth resolver (provider-name derivation + global auxiliary models + gold).
-    let resume_config =
-        bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
-            &config_snapshot,
-            &state.provider_registry,
-            &session,
-            None,
-        );
-
-    let auto_resume_outcome =
-        bamboo_engine::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
-            &resume_port,
-            &session_id,
-            session,
-            resume_config,
-            handoff,
-        )
-        .await;
+    let auto_resume_outcome = match resume_committed_response(
+        &resume_port,
+        &config_snapshot,
+        session,
+        handoff,
+        committed_approval,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                "error": crate::error::error_value(error.to_string()),
+            })))
+        }
+    };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -442,6 +510,137 @@ async fn submit_response_inner(
         "auto_resume_status": auto_resume_outcome.status_str(),
         "run_id": auto_resume_outcome.run_id()
     })))
+}
+
+async fn resume_committed_response(
+    resume_port: &crate::app_state::resume_adapter::AppStateResumeRef,
+    config: &bamboo_config::Config,
+    session: bamboo_agent_core::Session,
+    handoff: ResponseResumeHandoff,
+    approval: Option<Arc<bamboo_domain::SupervisorApprovalCommit>>,
+) -> std::io::Result<ResumeOutcome> {
+    let session_id = session.id.clone();
+    let resume_config =
+        bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
+            config,
+            &resume_port.0.provider_registry,
+            &session,
+            None,
+        );
+    if session.metadata.contains_key(ONCE_RESPONSE_HANDOFF_KEY) {
+        let (execution_reservation, event_sender) = handoff.into_parts();
+        let run_id = execution_reservation.run_id().to_string();
+        resume_port
+            .dispatch_once_response(
+                bamboo_engine::session_app::resume::ResumeSpawnRequest {
+                    session_id,
+                    session,
+                    execution_reservation,
+                    event_sender,
+                    config: resume_config,
+                },
+                approval,
+            )
+            .await?;
+        return Ok(ResumeOutcome::Started { run_id });
+    }
+    Ok(bamboo_engine::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
+        resume_port,
+        &session_id,
+        session,
+        resume_config,
+        handoff,
+    )
+    .await)
+}
+
+fn needs_once_response_handoff(
+    session: &bamboo_agent_core::Session,
+    receipt: &PermissionDecisionReceipt,
+) -> bool {
+    let decision = &receipt.decision;
+    let marker = session
+        .metadata
+        .get(ONCE_RESPONSE_HANDOFF_KEY)
+        .and_then(|raw| serde_json::from_str::<ResponseOccurrence>(raw).ok());
+    let Some(occurrence) = marker else {
+        return false;
+    };
+    let replay_call = session.metadata.get(PERMISSION_REEXECUTE_METADATA_KEY);
+    let replay_generation = session
+        .metadata
+        .get(PERMISSION_REEXECUTE_GENERATION_METADATA_KEY);
+    let replay_matches = match decision.decision {
+        PermissionDecisionKind::AllowOnce => {
+            replay_call == Some(&decision.request_id)
+                && replay_generation == Some(&decision.request_generation)
+        }
+        PermissionDecisionKind::DenyOnce => replay_call.is_none() && replay_generation.is_none(),
+        _ => false,
+    };
+    session.pending_question.is_none()
+        && has_pending_clarification_resume(session)
+        && replay_matches
+        && occurrence.permission_generation.as_deref() == Some(decision.request_generation.as_str())
+        && latest_response_occurrence(session, &decision.request_id).as_ref() == Some(&occurrence)
+        && super::pending::persisted_permission_decision_receipt(session, &decision.request_id)
+            .as_ref()
+            == Some(receipt)
+}
+
+/// Finish an undispatched durable Once answer. The caller owns the response
+/// guard; the exact runner reservation and a fresh canonical read fence resume.
+pub(super) async fn recover_committed_once_response(
+    state: &web::Data<AppState>,
+    session: &bamboo_agent_core::Session,
+    receipt: &PermissionDecisionReceipt,
+    approval: Option<Arc<bamboo_domain::storage::SupervisorApprovalCommit>>,
+) -> std::io::Result<Option<ResumeOutcome>> {
+    if !needs_once_response_handoff(session, receipt) {
+        return Ok(None);
+    }
+    let session_id = &session.id;
+    let expected = SessionCallerReference::from(session);
+    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
+    let handoff = match reserve_committed_response_handoff(&resume_port, session_id).await? {
+        Ok(handoff) => handoff,
+        Err(outcome) => return Ok(Some(outcome)),
+    };
+    let current = match handoff.root_actor_writer() {
+        Some(owner) => state
+            .storage
+            .confirm_root_response_checkpoint(&owner, approval.as_deref())
+            .await
+            .map(Some),
+        None if approval.is_some() => Err(std::io::Error::other(
+            "delegated permission recovery requires its Root writer",
+        )),
+        None => {
+            state
+                .storage
+                .load_execution_admission_snapshot(session_id)
+                .await
+        }
+    };
+    let current = match current {
+        Ok(current) => current,
+        Err(error) => {
+            handoff.abandon().await;
+            return Err(error);
+        }
+    };
+    let Some(current) = current.filter(|current| {
+        expected.matches_session(current)
+            && current.check_execution_compatibility().is_ok()
+            && needs_once_response_handoff(current, receipt)
+    }) else {
+        handoff.abandon().await;
+        return Ok(None);
+    };
+    let config = state.config.read().await.clone();
+    resume_committed_response(&resume_port, &config, current, handoff, approval)
+        .await
+        .map(Some)
 }
 
 #[cfg(test)]

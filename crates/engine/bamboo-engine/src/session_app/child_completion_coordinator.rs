@@ -88,8 +88,8 @@ fn write_runtime_state(session: &mut Session, runtime_state: &AgentRuntimeState)
 /// Re-read and prepare an activation target under the same per-session
 /// persistence lock that commits the generic suspension clear.
 ///
-/// The boolean is false for an unanswered human question or a respected
-/// child/Bash wait in the latest durable snapshot; leave activation unreserved.
+/// The boolean is false while a human response is pending or has its own
+/// successor, or while a child/Bash wait is respected.
 async fn prepare_session_inbox_activation(
     persistence: &LockedSessionStore,
     session_id: &str,
@@ -102,7 +102,11 @@ async fn prepare_session_inbox_activation(
             // Inbox steering never answers a human question. Check under the
             // same final writer lock, including when an earlier user envelope
             // has already advanced the prefix's interrupt watermark.
-            if latest.has_pending_question() {
+            if latest.has_pending_question()
+                || latest
+                    .metadata
+                    .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+            {
                 return;
             }
             let mut runtime_state = read_runtime_state(latest);

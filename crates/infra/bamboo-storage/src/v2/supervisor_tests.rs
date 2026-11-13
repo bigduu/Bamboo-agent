@@ -15,6 +15,111 @@ async fn fixture() -> (SessionStoreV2, TempDir) {
     (store, home)
 }
 
+#[tokio::test]
+async fn independent_supervisor_writers_cannot_replace_an_unclaimed_permission_answer() {
+    let (first, home) = fixture().await;
+    bootstrap(&first).await;
+    let mut parked = authority(&first).await;
+    let invocation = Message::assistant("Call pending tool", None);
+    parked.add_message(invocation);
+    parked.add_message(Message::tool_result(
+        "call",
+        serde_json::json!({"permission_request":{"request_generation":"original"}}).to_string(),
+    ));
+    parked.set_pending_question_with_source(
+        "call".into(),
+        "Write".into(),
+        "Allow?".into(),
+        vec!["Approve".into(), "Deny".into()],
+        false,
+        bamboo_domain::PendingQuestionSource::PauseTool,
+    );
+    first.save_session(&parked).await.unwrap();
+    let second = SessionStoreV2::new(home.path().into()).await.unwrap();
+    let stale = second.load_session(&parked.id).await.unwrap().unwrap();
+    let occurrence = bamboo_domain::pending_permission_occurrence(&parked).unwrap();
+    let answer = |mut session: Session, kind: &str| {
+        session.clear_pending_question();
+        session.metadata.insert(
+            bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY.into(),
+            serde_json::to_string(&occurrence).unwrap(),
+        );
+        session.metadata.insert(
+            bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY.into(),
+            serde_json::to_string(&[&occurrence]).unwrap(),
+        );
+        session
+            .metadata
+            .insert("clarification_resume_pending".into(), "true".into());
+        let result = session.messages.last_mut().unwrap();
+        result.content = kind.into();
+        result.metadata = Some(serde_json::json!({
+            "permission_request":{"request_generation":"original"},
+            "permission_decision_receipt":{"decision":kind}
+        }));
+        session
+    };
+    let winner = answer(parked, "deny_once");
+    first.save_session(&winner).await.unwrap();
+    let before = files(&first).await;
+    let mut without_invocation = winner.clone();
+    without_invocation.messages.remove(0);
+    let mut without_resume = winner.clone();
+    without_resume
+        .metadata
+        .remove("clarification_resume_pending");
+    for candidate in [
+        answer(stale.clone(), "allow_once"),
+        without_invocation,
+        without_resume,
+    ] {
+        let error = second.save_session(&candidate).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(files(&first).await, before);
+    }
+    let error = second.clear_session(&winner.id).await.unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(files(&first).await, before);
+    second
+        .claim_once_response_handoff(&winner, None, None)
+        .await
+        .unwrap();
+    let current = second.load_session(&winner.id).await.unwrap().unwrap();
+    assert_eq!(current.messages.last().unwrap().content, "deny_once");
+    assert!(!current
+        .metadata
+        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+    reject_without_writes(&second, &stale).await;
+    let mut stale_answer = answer(stale, "allow_once");
+    stale_answer
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    stale_answer
+        .metadata
+        .insert("permission.reexecute_tool_call_id".into(), "call".into());
+    stale_answer.metadata.insert(
+        "permission.reexecute_request_generation".into(),
+        "original".into(),
+    );
+    reject_without_writes(&second, &stale_answer).await;
+
+    let mut later = current;
+    later.add_message(Message::tool_result("call", "Please clarify."));
+    later.set_pending_question_with_source(
+        "call".into(),
+        "ask_user".into(),
+        "Continue?".into(),
+        vec!["Yes".into(), "No".into()],
+        false,
+        bamboo_domain::PendingQuestionSource::PauseTool,
+    );
+    second.save_session(&later).await.unwrap();
+    assert_eq!(
+        authority(&second).await.pending_question,
+        later.pending_question
+    );
+}
+
 fn directory(store: &SessionStoreV2) -> PathBuf {
     store
         .sessions_root_dir()

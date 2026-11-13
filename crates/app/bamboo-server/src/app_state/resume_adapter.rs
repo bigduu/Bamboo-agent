@@ -27,7 +27,7 @@ use bamboo_engine::session_app::respond::{
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
 };
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 use super::session_events::get_or_create_event_sender;
 use super::AppState;
@@ -40,6 +40,27 @@ use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
 /// `bamboo_engine::session_app::resume::ResumeExecutionPort` directly on
 /// `actix_web::web::Data<AppState>`.
 pub struct AppStateResumeRef(pub actix_web::web::Data<AppState>);
+
+impl AppStateResumeRef {
+    /// Start the successor independently of the client, and report whether
+    /// the physical claim reached Main before either the tool or model starts.
+    pub(crate) async fn dispatch_once_response(
+        &self,
+        request: ResumeSpawnRequest,
+        approval: Option<std::sync::Arc<bamboo_domain::SupervisorApprovalCommit>>,
+    ) -> std::io::Result<()> {
+        let (ack, claimed) = oneshot::channel();
+        let owner = Self(self.0.clone());
+        tokio::spawn(async move {
+            owner
+                .spawn_resume_with_origin(request, true, approval, Some(ack))
+                .await;
+        });
+        claimed.await.map_err(|_| {
+            std::io::Error::other("Permission response was saved but its execution could not start; retry the same decision")
+        })?
+    }
+}
 
 #[cfg(test)]
 #[path = "supervisor_approval_tests.rs"]
@@ -95,7 +116,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         &self,
         request: ResumeSpawnRequest,
     ) -> Result<(), ResumeSpawnRequest> {
-        let owner = AppStateResumeRef(self.0.clone());
+        let owner = Self(self.0.clone());
         tokio::spawn(async move {
             ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
         });
@@ -106,7 +127,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         &self,
         request: ResumeSpawnRequest,
     ) -> Result<(), ResumeSpawnRequest> {
-        let owner = AppStateResumeRef(self.0.clone());
+        let owner = Self(self.0.clone());
         tokio::spawn(async move {
             ResumeExecutionPort::spawn_configured_resume_execution(&owner, request).await;
         });
@@ -114,16 +135,24 @@ impl ResumeExecutionPort for AppStateResumeRef {
     }
 
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, false).await;
+        self.spawn_resume_with_origin(request, false, None, None)
+            .await;
     }
 
     async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, true).await;
+        self.spawn_resume_with_origin(request, true, None, None)
+            .await;
     }
 }
 
 impl AppStateResumeRef {
-    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
+    async fn spawn_resume_with_origin(
+        &self,
+        request: ResumeSpawnRequest,
+        from_config: bool,
+        approval: Option<std::sync::Arc<bamboo_domain::SupervisorApprovalCommit>>,
+        claim_ack: Option<oneshot::Sender<std::io::Result<()>>>,
+    ) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -329,11 +358,10 @@ impl AppStateResumeRef {
         };
 
         // If the user just approved a permission prompt, the gated tool call was
-        // intercepted before it ran — its result is only a placeholder. The grant
-        // has already been recorded (by the respond handler) on the shared
-        // permission checker, so re-execute the tool now for real, write the
-        // output back, then start the loop. This happens off the /respond response
-        // path (in this spawned task) and streams via the same mpsc → forwarder,
+        // intercepted before it ran — its result is only a placeholder. Typed
+        // replay restores authorization from the committed receipt. Re-execute
+        // the tool, write back its output, then start the loop. This happens off
+        // the /respond path and streams via the same mpsc → forwarder,
         // so the re-run shows up live and the model sees genuine output instead of
         // inferring it. The common (non-permission) resume path is unchanged.
         let reexecute_tool_call_id = session
@@ -357,6 +385,17 @@ impl AppStateResumeRef {
                 // preparation step. Clear it only in the in-memory snapshot at
                 // the synchronous handoff to the spawned runner; the runner's
                 // first checkpoint durably acknowledges takeover.
+                let Some(execution_reservation) = claim_once_response_handoff(
+                    &state,
+                    &mut session,
+                    execution_reservation,
+                    approval.as_deref(),
+                    claim_ack,
+                )
+                .await
+                else {
+                    return;
+                };
                 consume_pending_clarification_resume(&mut session);
                 SpawnAgentExecution {
                     state: state.clone(),
@@ -489,6 +528,19 @@ impl AppStateResumeRef {
                     ApprovalReplayDecision::BlockedByRootToolAuthority
                         | ApprovalReplayDecision::BlockedByUnavailableTool
                 );
+                let Some(reservation) = claim_once_response_handoff(
+                    &state,
+                    &mut session,
+                    execution_reservation,
+                    approval.as_deref(),
+                    claim_ack,
+                )
+                .await
+                else {
+                    return;
+                };
+                execution_reservation = reservation;
+
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 session
                     .metadata
@@ -767,6 +819,50 @@ impl AppStateResumeRef {
             .spawn_with_native_inputs(None, execution_binding);
         });
     }
+}
+
+async fn claim_once_response_handoff(
+    state: &AppState,
+    session: &mut bamboo_domain::Session,
+    reservation: bamboo_engine::execution::SessionExecutionReservation,
+    approval: Option<&bamboo_domain::SupervisorApprovalCommit>,
+    ack: Option<oneshot::Sender<std::io::Result<()>>>,
+) -> Option<bamboo_engine::execution::SessionExecutionReservation> {
+    let has_handoff = session
+        .metadata
+        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    let Some(ack) = ack else {
+        if has_handoff {
+            reservation.abandon().await;
+            return None;
+        }
+        return Some(reservation);
+    };
+    // Settings updates take this lock before the canonical Session guards.
+    // Recheck the delegated control policy in the storage validator while
+    // both are retained through Main publication.
+    let permission = if approval.is_some() {
+        Some(state.permission_io_lock.lock().await)
+    } else {
+        None
+    };
+    let owner = reservation.root_actor_writer();
+    let result = state
+        .storage
+        .claim_once_response_handoff(session, owner.as_ref(), approval)
+        .await;
+    drop(permission);
+    if let Err(error) = result {
+        tracing::warn!(session_id = %session.id, %error, "Once response handoff checkpoint failed");
+        reservation.abandon().await;
+        let _ = ack.send(Err(error));
+        return None;
+    }
+    session
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    let _ = ack.send(Ok(()));
+    Some(reservation)
 }
 
 /// Find the concrete approved invocation, newest-first and generation-bound.

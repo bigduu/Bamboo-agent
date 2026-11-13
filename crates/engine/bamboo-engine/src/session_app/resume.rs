@@ -158,6 +158,29 @@ pub async fn reserve_response_resume_handoff(
     session_id: &str,
     timeout: std::time::Duration,
 ) -> Result<ResponseResumeHandoff, ResumeOutcome> {
+    reserve_response_resume(port, session_id, timeout)
+        .await
+        .map_err(|(run_id, _)| ResumeOutcome::AlreadyRunning { run_id })
+}
+
+/// A committed response must distinguish a live incumbent from its own failed
+/// preparation. The latter released its reservation and can be retried.
+pub async fn reserve_committed_response_handoff(
+    port: &dyn ResumeExecutionPort,
+    session_id: &str,
+) -> std::io::Result<Result<ResponseResumeHandoff, ResumeOutcome>> {
+    match reserve_response_resume(port, session_id, std::time::Duration::ZERO).await {
+        Ok(handoff) => Ok(Ok(handoff)),
+        Err((_, Some(error))) => Err(error),
+        Err((run_id, None)) => Ok(Err(ResumeOutcome::AlreadyRunning { run_id })),
+    }
+}
+
+async fn reserve_response_resume(
+    port: &dyn ResumeExecutionPort,
+    session_id: &str,
+    timeout: std::time::Duration,
+) -> Result<ResponseResumeHandoff, (String, Option<std::io::Error>)> {
     let event_sender = port.get_or_create_event_sender(session_id).await;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
@@ -174,7 +197,7 @@ pub async fn reserve_response_resume_handoff(
                     tracing::debug!(%session_id, %error, "response successor is not ready; question retained");
                     execution_reservation.abandon().await;
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(ResumeOutcome::AlreadyRunning { run_id });
+                        return Err((run_id, Some(error)));
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
@@ -186,7 +209,7 @@ pub async fn reserve_response_resume_handoff(
             }
             SessionExecutionReserveOutcome::AlreadyRunning { run_id } => {
                 if tokio::time::Instant::now() >= deadline {
-                    return Err(ResumeOutcome::AlreadyRunning { run_id });
+                    return Err((run_id, None));
                 }
             }
         }

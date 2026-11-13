@@ -341,6 +341,14 @@ impl SessionStoreV2 {
         {
             return Ok(None);
         }
+        if crate::session_merge::has_uncommitted_response_marker(&side) {
+            let raw = String::from_utf8(read_regular(&directory.join("session.json")).await?)
+                .map_err(|_| invalid("invalid canonical session.json"))?;
+            compact_main::validate_full_main(raw.as_bytes())?;
+            let main = super::decode_main_control_plane(&raw, Some(&side))?;
+            validate_overlay(&main, Some(&side))?;
+            crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
+        }
         side.root_session_id = id.to_string();
         side.messages.clear();
         side.clear_stale_root_token_budget();
