@@ -24,6 +24,7 @@ pub async fn fetch_model_list(
         .send()
         .await
         .map_err(LLMError::Http)?;
+    crate::http_client::observe_provider_response(&response);
 
     if !response.status().is_success() {
         let status = response.status();

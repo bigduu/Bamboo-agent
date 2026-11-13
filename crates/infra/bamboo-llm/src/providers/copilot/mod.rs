@@ -86,7 +86,7 @@ impl CopilotProvider {
     /// Create new Copilot provider (without auth handler)
     pub fn new() -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
             token: None,
             token_expires_at: None,
             auth_handler: None,
@@ -105,7 +105,7 @@ impl CopilotProvider {
     /// Create provider with existing token
     pub fn with_token(token: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
             token: Some(token.into()),
             token_expires_at: None,
             auth_handler: None,
@@ -565,7 +565,10 @@ impl CopilotProvider {
         for attempt in 1..=COPILOT_TRANSPORT_MAX_ATTEMPTS {
             crate::retry::claim_work_physical_request()?;
             match build_request().send().await {
-                Ok(response) => return Ok(response),
+                Ok(response) => {
+                    crate::http_client::observe_provider_response(&response);
+                    return Ok(response);
+                }
                 Err(error) => {
                     if attempt >= COPILOT_TRANSPORT_MAX_ATTEMPTS
                         || !Self::is_retryable_transport_error(&error)
@@ -933,7 +936,7 @@ impl CopilotProvider {
 
     async fn fetch_model_info_from_api(&self) -> Result<Vec<ProviderModelInfo>> {
         let token = self.get_token_for_request().await?;
-        let url = "https://api.githubcopilot.com/models";
+        let url = self.model_endpoint("models");
 
         let mut request_headers = Self::build_headers_with_token(&token)?;
         request_overrides::apply_overrides_to_header_map(
@@ -944,7 +947,7 @@ impl CopilotProvider {
         );
         let mut response = self
             .send_with_transport_retry(
-                || self.client.get(url).headers(request_headers.clone()),
+                || self.client.get(&url).headers(request_headers.clone()),
                 "copilot models list",
                 None,
             )
@@ -965,7 +968,7 @@ impl CopilotProvider {
                         );
                         response = self
                             .send_with_transport_retry(
-                                || self.client.get(url).headers(refreshed_headers.clone()),
+                                || self.client.get(&url).headers(refreshed_headers.clone()),
                                 "copilot models list auth-refresh retry",
                                 None,
                             )
@@ -2334,6 +2337,63 @@ mod actual_model_consumer_tests {
             provider = provider.with_responses_only_models(vec![MODEL.into()]);
         }
         provider
+    }
+
+    #[tokio::test]
+    async fn copilot_uses_shared_header_overrides_on_chat_responses_and_models() {
+        for (endpoint, url, responses_only) in [
+            ("chat_completions", "/chat/completions", false),
+            ("responses", "/responses", true),
+            ("models", "/models", false),
+        ] {
+            let server = MockServer::start().await;
+            let (verb, response) = match endpoint {
+                "models" => (
+                    "GET",
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({"data": []})),
+                ),
+                "responses" => (
+                    "POST",
+                    ResponseTemplate::new(200)
+                        .set_body_string(RESPONSES_SSE)
+                        .insert_header("content-type", "text/event-stream"),
+                ),
+                _ => (
+                    "POST",
+                    ResponseTemplate::new(200)
+                        .set_body_string(CHAT_SSE)
+                        .insert_header("content-type", "text/event-stream"),
+                ),
+            };
+            Mock::given(method(verb))
+                .and(path(url))
+                .respond_with(response)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let overrides = serde_json::from_value(serde_json::json!({
+                "common": { "headers": { "User-Agent": "Fixture/1.0" } },
+                "endpoints": { (endpoint): { "headers": { "user-agent": "Fixture/2.0", "X-Gateway-Trace": "endpoint" } } }
+            })).unwrap();
+            let provider =
+                provider(server.uri(), responses_only).with_request_overrides(Some(overrides));
+            if endpoint == "models" {
+                provider.fetch_model_info_from_api().await.unwrap();
+            } else {
+                let stream = provider
+                    .chat_stream(&[Message::user("hello")], &[], Some(64), MODEL)
+                    .await
+                    .unwrap();
+                assert_completed_stream(stream).await;
+            }
+            let requests = server.received_requests().await.unwrap();
+            let [request] = requests.as_slice() else {
+                panic!("Copilot {endpoint} should send one request");
+            };
+            assert_eq!(request.headers["user-agent"], "Fixture/2.0");
+            assert_eq!(request.headers["x-gateway-trace"], "endpoint");
+            assert_eq!(request.headers["authorization"], "Bearer synthetic-token");
+        }
     }
 
     async fn assert_completed_stream(mut stream: LLMStream) {

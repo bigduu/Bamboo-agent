@@ -7,7 +7,9 @@ use std::time::Duration;
 
 use crate::provider::LLMError;
 use bamboo_config::Config;
-use reqwest::{Client, ClientBuilder, NoProxy, Proxy};
+use reqwest::{header::HeaderMap, Client, ClientBuilder, NoProxy, Proxy, Response};
+
+const BAMBOO_USER_AGENT: &str = concat!("Bamboo/", env!("CARGO_PKG_VERSION"));
 
 pub fn build_proxy(config: &Config) -> Result<Option<Proxy>, LLMError> {
     let http_proxy = config.http_proxy.trim();
@@ -39,6 +41,12 @@ pub fn build_http_client(config: &Config) -> Result<Client, LLMError> {
     Ok(client_builder(config)?.build()?)
 }
 
+pub(crate) fn default_http_client() -> Client {
+    provider_client_builder()
+        .build()
+        .expect("failed to initialize the provider HTTP client")
+}
+
 pub(crate) fn build_work_text_client(config: &Config) -> Result<Client, LLMError> {
     Ok(client_builder(config)?
         .redirect(reqwest::redirect::Policy::none())
@@ -47,6 +55,14 @@ pub(crate) fn build_work_text_client(config: &Config) -> Result<Client, LLMError
 }
 
 fn client_builder(config: &Config) -> Result<ClientBuilder, LLMError> {
+    let mut builder = provider_client_builder();
+    if let Some(proxy) = build_proxy(config)? {
+        builder = builder.proxy(proxy);
+    }
+    Ok(builder)
+}
+
+fn provider_client_builder() -> ClientBuilder {
     // `connect_timeout` bounds only TCP/TLS connection establishment. That is
     // safe for streaming: it never kills an in-flight streaming response. We
     // deliberately do NOT set an overall `.timeout()` here — this client is
@@ -55,16 +71,72 @@ fn client_builder(config: &Config) -> Result<ClientBuilder, LLMError> {
     // stream for minutes). Mid-stream stalls — where the connection stays open
     // but no chunks arrive — are instead bounded by the inter-chunk idle
     // timeout in `consume_llm_stream_internal` (issue #28).
-    let mut builder = Client::builder().connect_timeout(Duration::from_secs(30));
-    if let Some(proxy) = build_proxy(config)? {
-        builder = builder.proxy(proxy);
+    Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .user_agent(BAMBOO_USER_AGENT)
+}
+
+fn correlation_value<'a>(headers: &'a HeaderMap, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| {
+        headers
+            .get(*name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty() && value.len() <= 512)
+    })
+}
+
+/// Keep upstream and gateway IDs distinct and correlate without logging raw headers.
+pub(crate) fn observe_provider_response(response: &Response) {
+    use crate::providers::common::log_identity;
+
+    let headers = response.headers();
+    let request_id = correlation_value(
+        headers,
+        &[
+            "llm_provider-request-id",
+            "llm_provider-x-request-id",
+            "request-id",
+            "x-request-id",
+            "x-github-request-id",
+            "x-goog-request-id",
+        ],
+    );
+    let gateway_call_id = correlation_value(headers, &["x-litellm-call-id"]);
+    if request_id.is_some() || gateway_call_id.is_some() {
+        tracing::debug!(
+            status = response.status().as_u16(),
+            upstream_request_id_hash = request_id.map(log_identity),
+            gateway_call_id_hash = gateway_call_id.map(log_identity),
+            "LLM provider response headers received"
+        );
     }
-    Ok(builder)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_client_sends_bamboo_user_agent() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .and(header("user-agent", BAMBOO_USER_AGENT))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let response = build_http_client(&Config::default())
+            .unwrap()
+            .get(format!("{}/models", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert!(response.status().is_success());
+    }
 
     #[test]
     fn proxy_attaches_no_proxy_loopback_list() {

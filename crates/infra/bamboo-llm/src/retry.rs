@@ -576,24 +576,11 @@ fn is_retryable_reqwest_error(err: &reqwest::Error) -> bool {
     false
 }
 
-/// Parse delay-seconds without turning numeric overflow into a short backoff.
-/// The date parser below handles the HTTP-date and legacy RFC2822 forms.
-fn parse_retry_after(response: &Response) -> Option<Duration> {
-    let value = response
-        .headers()
-        .get(reqwest::header::RETRY_AFTER)?
-        .to_str()
-        .ok()?
-        .trim()
-        .to_string();
-    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    // A syntactically numeric value larger than u64 cannot be safely waited;
-    // saturating preserves a stop decision instead of ignoring the server hint.
-    Some(Duration::from_secs(
-        value.parse::<u64>().unwrap_or(u64::MAX),
-    ))
+fn retry_after_header(response: &Response) -> Option<&reqwest::header::HeaderValue> {
+    let headers = response.headers();
+    headers
+        .get(reqwest::header::RETRY_AFTER)
+        .or_else(|| headers.get("llm_provider-retry-after"))
 }
 
 /// Compute the exponential backoff delay for a given zero-based attempt index,
@@ -657,6 +644,7 @@ where
         || async {
             match build().send().await {
                 Ok(response) => {
+                    crate::http_client::observe_provider_response(&response);
                     let status = response.status();
                     let retry_after = parse_retry_after_with_date(&response);
                     RetryAttempt {
@@ -1012,27 +1000,27 @@ async fn read_connector_body(response: &mut Response) -> reqwest::Result<String>
 }
 
 fn parse_retry_after_with_date(response: &Response) -> Option<Duration> {
-    parse_retry_after(response).or_else(|| {
-        let value = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)?
-            .to_str()
-            .ok()?;
-        httpdate::parse_http_date(value)
-            .map(|date| {
-                date.duration_since(std::time::SystemTime::now())
+    let value = retry_after_header(response)?.to_str().ok()?.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        // Saturate on numeric overflow to avoid retrying before the server permits it.
+        return Some(Duration::from_secs(
+            value.parse::<u64>().unwrap_or(u64::MAX),
+        ));
+    }
+    httpdate::parse_http_date(value)
+        .map(|date| {
+            date.duration_since(std::time::SystemTime::now())
+                .unwrap_or_default()
+        })
+        // Preserve the previously accepted numeric-zone RFC2822 form.
+        .or_else(|_| {
+            chrono::DateTime::parse_from_rfc2822(value).map(|date| {
+                (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                    .to_std()
                     .unwrap_or_default()
             })
-            // Preserve the previously accepted numeric-zone RFC2822 form.
-            .or_else(|_| {
-                chrono::DateTime::parse_from_rfc2822(value).map(|date| {
-                    (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
-                        .to_std()
-                        .unwrap_or_default()
-                })
-            })
-            .ok()
-    })
+        })
+        .ok()
 }
 
 pub(crate) async fn send_anthropic_with_retry<F>(
@@ -1186,10 +1174,8 @@ where
             };
             let status = response.status();
             let retry_after = parse_retry_after_with_date(&response);
-            let retry_after_known = !response
-                .headers()
-                .contains_key(reqwest::header::RETRY_AFTER)
-                || retry_after.is_some();
+            let retry_after_known =
+                retry_after_header(&response).is_none() || retry_after.is_some();
             if is_retryable_status(status) && retry_after_known {
                 budget.record_live_candidate(retry_after);
             }
@@ -1380,6 +1366,44 @@ mod tests {
             .await
             .unwrap();
         assert!(response.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn managed_transport_respects_gateway_backoff_and_correlates_response_headers() {
+        use crate::providers::common::{log_identity, log_privacy_tests::EventCapture};
+
+        const UPSTREAM_ID: &str = "fixture-raw-provider-id";
+        const GATEWAY_ID: &str = "fixture-raw-gateway-id";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(429)
+                    .insert_header("llm_provider-retry-after", "86400")
+                    .insert_header("llm_provider-request-id", UPSTREAM_ID)
+                    .insert_header("x-litellm-call-id", GATEWAY_ID),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let capture = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(capture.clone());
+        tracing::callsite::rebuild_interest_cache();
+        let client = reqwest::Client::new();
+        let response = send_provider_request(&fast_config(2), "local-gateway", || {
+            client.post(server.uri())
+        })
+        .await
+        .unwrap();
+        assert_eq!(response.status(), 429);
+        assert_eq!(response.headers()["llm_provider-request-id"], UPSTREAM_ID);
+        capture.assert_private(
+            "LLM provider response headers received",
+            &[UPSTREAM_ID, GATEWAY_ID],
+        );
+        let text = capture.text();
+        assert!(text.contains(&log_identity(UPSTREAM_ID)));
+        assert!(text.contains(&log_identity(GATEWAY_ID)));
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

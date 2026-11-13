@@ -306,7 +306,8 @@ fn resolve_scope(
 
 fn merge_scope(dst: &mut RequestScopeOverride, src: &RequestScopeOverride) {
     for (key, value) in &src.headers {
-        dst.headers.insert(key.clone(), value.clone());
+        dst.headers
+            .insert(key.trim().to_ascii_lowercase(), value.clone());
     }
     dst.body_patch.extend(src.body_patch.clone());
 }

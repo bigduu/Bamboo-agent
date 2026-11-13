@@ -281,7 +281,8 @@ pub async fn create_provider_from_instance(
 
             provider = provider
                 .with_target_provider(target_provider)
-                .with_reasoning_effort(instance.reasoning_effort);
+                .with_reasoning_effort(instance.reasoning_effort)
+                .with_request_overrides(instance.request_overrides.clone());
 
             Ok(Arc::new(provider.with_masking(masking_config.clone())))
         }
