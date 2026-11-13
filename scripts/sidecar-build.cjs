@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// BAMBOO_SHARED_EXECUTABLES_V2
+// BAMBOO_SHARED_EXECUTABLES_V3
 // Build the standard release executable once per native target. The output is
 // shared by Bamboo users and Bodhi; no desktop-specific Cargo variant exists.
 const assert = require('node:assert/strict')
@@ -11,7 +11,8 @@ const { contractForVersion, boundSourceContract, artifactName, targetOutputKey, 
 
 function nativeTarget(platform = process.platform, arch = process.arch) {
   const targets = { 'darwin/arm64': 'aarch64-apple-darwin', 'darwin/x64': 'x86_64-apple-darwin',
-    'linux/x64': 'x86_64-unknown-linux-gnu', 'win32/x64': 'x86_64-pc-windows-msvc' }
+    'linux/arm64': 'aarch64-unknown-linux-gnu', 'linux/x64': 'x86_64-unknown-linux-gnu',
+    'win32/arm64': 'aarch64-pc-windows-msvc', 'win32/x64': 'x86_64-pc-windows-msvc' }
   assert.ok(targets[`${platform}/${arch}`], 'Unsupported native release runner')
   return targets[`${platform}/${arch}`]
 }
@@ -100,7 +101,7 @@ function nativeCachePolicy({ root, temporary, contractVersion, target, sourcePar
   // This namespace also isolates the producer ABI, target and source build profile.
   return { workspace: `${path.resolve(root)} -> ${path.relative(path.resolve(root), targetDirectory)}`,
     key: `bamboo-executable-deps-v${contractVersion}-${target}-${sha256(compatibility)}`,
-    save: contractVersion === 2 && !frozen }
+    save: contractVersion >= 2 && !frozen }
 }
 
 function evictWorkspaceArtifacts(metadata, targetDirectory, target) {
