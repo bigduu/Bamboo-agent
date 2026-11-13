@@ -132,7 +132,7 @@ jobs:
 
       - name: Test fast workflow and release policies
         if: needs.validation-source.outputs.docs_only == 'false'
-        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs
+        run: node --test scripts/ci-policy.test.cjs scripts/crate-release.test.cjs scripts/ci-routing.test.cjs scripts/sidecar-release.test.cjs scripts/test-groups.test.cjs scripts/run-feature-tests.test.cjs scripts/native-test-owner.test.cjs scripts/docker-publish.test.cjs
 
       - name: Test Supervisor driver and owned loopback process binding
         if: needs.validation-source.outputs.docs_only == 'false'

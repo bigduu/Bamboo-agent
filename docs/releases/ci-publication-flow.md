@@ -125,9 +125,16 @@ build, Unit/E2E run or publication. Documentation and Docker consumers use the
 original release or feature artifacts where applicable; they must not rebuild a
 successful output simply to consume it.
 
-After publication completes, Docker consumes the original Linux x64 binary.
-Linux ARM64 remains a separate image architecture and is built once from the
-same frozen source. Retried image jobs reuse their verified candidate digests.
+Docker uses the executable contract recorded in the frozen source. After a v3
+publication completes, both Linux images package their exact original release
+executables in the Bookworm runtime. The consumer verifies both binary hashes,
+runs their version and loader checks, and starts each image to check health
+and the embedded frontend before accepting its platform digest. The versioned
+index binds the verified digest for each architecture. Retried image jobs
+verify and reuse the original candidate by digest. Historical v2 releases
+supply the original Linux x64 executable and keep their frozen ARM64 image
+build path. Run `node --test scripts/docker-publish.test.cjs` for the focused
+release-selection and Docker packaging contracts.
 
 ## Rollout and historical releases
 
