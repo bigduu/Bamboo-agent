@@ -79,14 +79,13 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
-                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
+                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms for the wait. An explicit background handoff delivers the terminal result automatically. Unread completed results expire five minutes after completion, including during a diagnostic pause. Handles are local to the current Host run.",
+                "If a quiet command's exit result is needed, keep its session_id and request a longer wait. Verify completion from terminal status before finishing. Investigate concrete failures and keep quiet commands running while their results are needed. A Human-controlled Root can pause repeated polling and retain the handle for continuation.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 GIT_TOOL_GUIDANCE,
                 "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",
-                "Use Plan to delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
             ],
             GuideLanguage::English => &[
                 "Assist with defensive security tasks only; refuse offensive security requests, credential harvesting, and malware-oriented code changes.",
@@ -98,14 +97,13 @@ impl GuideBuildContext {
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
                 "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
                 "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms to bound each wait; completion does not send an automatic user notification. Unread completed results expire five minutes after completion, including during a diagnostic pause; handles do not survive Host restart. Poll required commands to a terminal result before finishing the task.",
-                "When polling reports sustained silence and repeated empty readouts, follow its advisory: do useful work or check one command-owned progress signal before polling again. Quiet output or an existing report does not prove completion; keep the handle, continue waiting when appropriate, and report a concrete blocker if progress cannot be established. A Human-controlled Root can pause polling after the reminder is repeatedly ignored, retaining the command handle for continuation. Do not stop/restart a command only because it is quiet.",
+                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms for the wait. An explicit background handoff delivers the terminal result automatically. Unread completed results expire five minutes after completion, including during a diagnostic pause. Handles are local to the current Host run.",
+                "If a quiet command's exit result is needed, keep its session_id and request a longer wait. Verify completion from terminal status before finishing. Investigate concrete failures and keep quiet commands running while their results are needed. A Human-controlled Root can pause repeated polling and retain the handle for continuation.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 GIT_TOOL_GUIDANCE,
                 "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
                 "For pull request requests: review all commits/diff since base branch, use gh to create PR with summary and test plan, and return the PR URL.",
                 "When referencing code locations in responses, use file_path:line_number format.",
-                "Use Plan to delegate planning to its read-only child and keep the root session in normal orchestration mode. Use ExitPlanMode only to leave an already-active legacy plan-mode session.",
             ],
         }
     }
@@ -131,19 +129,6 @@ mod tests {
     }
 
     #[test]
-    fn best_practices_prefer_delegated_plan_without_legacy_mode_switch() {
-        for language in [GuideLanguage::Chinese, GuideLanguage::English] {
-            let context = GuideBuildContext {
-                language,
-                ..GuideBuildContext::default()
-            };
-            let guidance = context.best_practices().join("\n");
-            assert!(guidance.contains("delegate planning to its read-only child"));
-            assert!(guidance.contains("already-active legacy plan-mode session"));
-        }
-    }
-
-    #[test]
     fn best_practices_teach_model_owned_exec_polling() {
         for language in [GuideLanguage::Chinese, GuideLanguage::English] {
             let context = GuideBuildContext {
@@ -153,9 +138,9 @@ mod tests {
             let guidance = context.best_practices().join("\n");
             assert!(guidance.contains("exec_command"));
             assert!(guidance.contains("write_stdin with empty chars"));
-            assert!(guidance.contains("does not send an automatic user notification"));
-            assert!(guidance.contains("follow its advisory"));
-            assert!(guidance.contains("does not prove completion"));
+            assert!(guidance.contains("An explicit background handoff"));
+            assert!(guidance.contains("request a longer wait"));
+            assert!(guidance.contains("Verify completion from terminal status"));
             assert!(!guidance.contains("Bash"));
         }
     }

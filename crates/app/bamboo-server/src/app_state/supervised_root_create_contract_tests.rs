@@ -78,8 +78,8 @@ impl Fixture {
         let request = SupervisedRootCreateRequest {
             operation_id: uuid::Uuid::new_v4(),
             expected_state_revision: 1,
-            project_id: project.id,
-            workspace_path: workspace.to_string_lossy().into_owned(),
+            project_id: Some(project.id),
+            workspace_path: Some(workspace.to_string_lossy().into_owned()),
             message: "Inspect only this explicit assignment".into(),
             title: Some("Independent task".into()),
             notify_on_material_event: false,
@@ -92,6 +92,14 @@ impl Fixture {
             supervisor,
             request,
         }
+    }
+
+    fn project_id(&self) -> &bamboo_domain::ProjectId {
+        self.request.project_id.as_ref().unwrap()
+    }
+
+    fn workspace(&self) -> &str {
+        self.request.workspace_path.as_deref().unwrap()
     }
 
     async fn open(
@@ -181,7 +189,7 @@ impl Fixture {
             .build_candidate(
                 &record,
                 &self.request,
-                std::path::Path::new(&self.request.workspace_path),
+                std::path::Path::new(self.workspace()),
                 None,
             )
             .await;
@@ -314,7 +322,7 @@ async fn invalid_project_workspace_and_stale_scope_have_no_root_or_link_side_eff
     ] {
         let mut request = f.request.clone();
         match case {
-            "foreign_project" => request.project_id = "outside-scope".parse().unwrap(),
+            "foreign_project" => request.project_id = Some("outside-scope".parse().unwrap()),
             "foreign_workspace" => {
                 let path = f.home.path().join("workspaces/foreign");
                 std::fs::create_dir_all(&path).unwrap();
@@ -327,13 +335,17 @@ async fn invalid_project_workspace_and_stale_scope_have_no_root_or_link_side_eff
                         Vec::new(),
                     )
                     .unwrap();
-                request.workspace_path = path.to_string_lossy().into_owned();
+                request.workspace_path = Some(path.to_string_lossy().into_owned());
             }
-            "missing_directory" => request.workspace_path.push_str("/missing"),
+            "missing_directory" => request
+                .workspace_path
+                .as_mut()
+                .unwrap()
+                .push_str("/missing"),
             "unbound_directory" => {
                 let path = f.home.path().join("workspaces/unbound");
                 std::fs::create_dir_all(&path).unwrap();
-                request.workspace_path = path.to_string_lossy().into_owned();
+                request.workspace_path = Some(path.to_string_lossy().into_owned());
             }
             "stale_scope" => request.expected_state_revision = 0,
             _ => unreachable!(),
@@ -573,8 +585,8 @@ async fn damaged_receipt_cannot_attach_a_historical_root_and_expiry_cannot_alloc
     let f = Fixture::new().await;
     let (mut record, _) = f.reserve().await;
     let mut historical = Session::new("unrelated-root", "original-model");
-    historical.set_project_id_meta(f.request.project_id.to_string());
-    historical.set_workspace_path_meta(&f.request.workspace_path);
+    historical.set_project_id_meta(f.project_id().to_string());
+    historical.set_workspace_path_meta(f.workspace());
     f.creator.store.save_session(&historical).await.unwrap();
     record.session_id = historical.id.clone();
     record.created_at = historical.created_at;
@@ -635,7 +647,7 @@ async fn damaged_receipt_cannot_attach_a_historical_root_and_expiry_cannot_alloc
 async fn scope_observation_keeps_default_access_with_legacy_empty_scope_without_creating() {
     let f = Fixture::new().await;
     let scoped = value(f.creator.scope(&f.supervisor).await.unwrap());
-    assert_eq!(scoped["allowed_projects"], json!([f.request.project_id]));
+    assert_eq!(scoped["allowed_projects"], json!([f.project_id()]));
     assert_eq!(scoped["code"], "current_user_scope_ready");
     assert_eq!(scoped["requires_project_authorization"], false);
     SupervisorSessionService::new(f.creator.store.clone())
@@ -663,7 +675,7 @@ async fn canonical_creation_rechecks_revocation_and_scope_cas_before_root_public
             .unwrap();
         if regrant {
             service
-                .configure_project_scope(&f.supervisor, 2, [f.request.project_id.clone()].into())
+                .configure_project_scope(&f.supervisor, 2, [f.project_id().clone()].into())
                 .await
                 .unwrap();
         }
@@ -950,8 +962,8 @@ impl bamboo_server_tools::session_control::root_creation::SessionRootCreatePort
     ) -> Result<ToolResult, bamboo_agent_core::tools::ToolError> {
         self.scope(caller).await?;
         request.validate()?;
-        if request.project_id != self.project_id
-            || request.workspace_path != self.workspace_path
+        if request.project_id.as_ref() != Some(&self.project_id)
+            || request.workspace_path.as_deref() != Some(self.workspace_path.as_str())
             || request.expected_state_revision != self.scope_revision
         {
             return Err(bamboo_agent_core::tools::ToolError::Execution(
@@ -988,8 +1000,8 @@ async fn generic_spawn_forwards_only_original_root_child_callers_to_an_explicit_
             let count = f.count().await;
             let port = Arc::new(CallerRootPortProbe {
                 caller: SessionCallerReference::from(&session),
-                project_id: f.request.project_id.clone(),
-                workspace_path: f.request.workspace_path.clone(),
+                project_id: f.project_id().clone(),
+                workspace_path: f.workspace().to_owned(),
                 scope_revision: f.request.expected_state_revision,
                 allowed: AtomicBool::new(true),
                 calls: AtomicUsize::new(0),
@@ -1115,11 +1127,8 @@ async fn versioned_spawn_uses_an_explicit_independent_checkout_and_recovers_firs
             "isolated fixture",
         ],
     );
-    native_git(
-        &main,
-        &["worktree", "add", "--detach", &f.request.workspace_path],
-    );
-    let worker = std::path::Path::new(&f.request.workspace_path);
+    native_git(&main, &["worktree", "add", "--detach", f.workspace()]);
+    let worker = std::path::Path::new(f.workspace());
     assert_ne!(
         native_git(&main, &["rev-parse", "--show-toplevel"]),
         native_git(worker, &["rev-parse", "--show-toplevel"])
@@ -1162,10 +1171,7 @@ async fn versioned_spawn_uses_an_explicit_independent_checkout_and_recovers_firs
     assert_eq!(root.kind, bamboo_domain::SessionKind::Root);
     assert!(root.parent_session_id.is_none());
     assert_eq!(root.session_version, Some(2));
-    assert_eq!(
-        root.workspace_path_meta().as_deref(),
-        Some(f.request.workspace_path.as_str())
-    );
+    assert_eq!(root.workspace_path_meta().as_deref(), Some(f.workspace()));
     let after = serde_json::to_value(
         f.creator
             .store
@@ -1260,14 +1266,15 @@ async fn versioned_spawn_disabled_stale_and_invalid_scope_refusals_have_no_side_
             "disabled" => {
                 f.creator.config.write().await.tools.disabled = vec!["default::spawnSession".into()]
             }
-            "foreign_project" => request.project_id = "foreign-project".parse().unwrap(),
+            "foreign_project" => request.project_id = Some("foreign-project".parse().unwrap()),
             "unbound_workspace" => {
-                request.workspace_path = f
-                    .home
-                    .path()
-                    .join("workspaces/unbound")
-                    .to_string_lossy()
-                    .into_owned()
+                request.workspace_path = Some(
+                    f.home
+                        .path()
+                        .join("workspaces/unbound")
+                        .to_string_lossy()
+                        .into_owned(),
+                )
             }
             "scope_cas" => request.expected_state_revision = 0,
             _ => unreachable!(),
@@ -1937,8 +1944,8 @@ async fn versioned_spawn_framework_owner_keeps_typed_approval_and_deny_before_si
         assert_eq!(request.tool_name, "spawn_session");
         assert_eq!(request.request_id, call.id);
         assert_eq!(request.session_id, session.id);
-        assert!(request.resource.contains(&f.request.project_id.to_string()));
-        assert!(request.resource.contains(&f.request.workspace_path));
+        assert!(request.resource.contains(&f.project_id().to_string()));
+        assert!(request.resource.contains(f.workspace()));
         let event = event_rx.try_recv().unwrap();
         assert!(
             matches!(event, bamboo_agent_core::AgentEvent::ToolApprovalRequested { tool_call_id, parameters, .. } if tool_call_id == call.id && parameters == args)

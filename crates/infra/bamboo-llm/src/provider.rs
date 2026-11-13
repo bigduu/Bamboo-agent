@@ -239,7 +239,28 @@ pub struct ResponsesRequestOptions {
 /// Request-scoped, payload-free completion diagnostics. Provider strings are
 /// untrusted: only recognized reason codes are retained, never arbitrary text.
 #[derive(Debug, Clone, Default)]
-pub struct CompletionDiagnostics(Arc<Mutex<Option<&'static str>>>);
+pub struct CompletionDiagnostics {
+    state: Arc<Mutex<CompletionDiagnosticState>>,
+    agent_round: bool,
+    recovery: Option<OutputLimitRecovery>,
+}
+
+/// The final wire controls that allow a single lower-effort agent attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimitRecovery {
+    pub(crate) endpoint: &'static str,
+    pub(crate) effort: ReasoningEffort,
+    pub(crate) output_limit: u64,
+}
+
+#[derive(Debug, Default)]
+struct CompletionDiagnosticState {
+    finish_reason: Option<&'static str>,
+    endpoint: Option<&'static str>,
+    changed_protocol: bool,
+    output_limit: Option<u64>,
+    recovery: Option<OutputLimitRecovery>,
+}
 
 tokio::task_local! {
     static COMPLETION_DIAGNOSTICS: CompletionDiagnostics;
@@ -260,11 +281,64 @@ pub(crate) fn current_completion_diagnostics() -> Option<CompletionDiagnostics> 
 }
 
 impl CompletionDiagnostics {
-    /// The sanitized provider reason, or `unavailable` if none was reported.
-    pub fn finish_reason(&self) -> &'static str {
-        self.0
+    pub fn for_agent_round(recovery: Option<OutputLimitRecovery>) -> Self {
+        Self {
+            agent_round: true,
+            recovery,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn is_agent_round(&self) -> bool {
+        self.agent_round
+    }
+
+    pub fn output_limit(&self) -> Option<u64> {
+        self.state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
+            .output_limit
+    }
+
+    pub fn output_limit_recovery(&self) -> Option<OutputLimitRecovery> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recovery
+    }
+
+    pub(crate) fn observe_agent_round_request(
+        &self,
+        endpoint: &'static str,
+        output_limit: Option<u64>,
+        candidate: Option<OutputLimitRecovery>,
+    ) -> Result<bool> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.output_limit = output_limit;
+        state.changed_protocol |= state.endpoint.is_some_and(|previous| previous != endpoint);
+        state.endpoint = Some(endpoint);
+        if let Some(expected) = self.recovery {
+            if candidate != Some(expected) || state.changed_protocol {
+                return Err(LLMError::RequestFailed(
+                    "Output-limit recovery no longer matches the original request controls".into(),
+                ));
+            }
+            return Ok(true);
+        }
+        if !state.changed_protocol {
+            state.recovery = candidate;
+        } else {
+            state.recovery = None;
+        }
+        Ok(false)
+    }
+
+    /// The sanitized provider reason, or `unavailable` if none was reported.
+    pub fn finish_reason(&self) -> &'static str {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .finish_reason
             .unwrap_or("unavailable")
     }
 
@@ -320,7 +394,10 @@ impl CompletionDiagnostics {
                 "completed" => "completed",
                 _ => "other",
             };
-            *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Some(safe);
+            self.state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .finish_reason = Some(safe);
         }
     }
 

@@ -7,7 +7,7 @@
 use bamboo_domain::ToolSchema;
 use bamboo_domain::{Message, MessagePart, Role};
 use futures::{stream, StreamExt};
-use reqwest::Response;
+use reqwest::{RequestBuilder, Response, StatusCode};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,7 @@ use std::sync::Arc;
 use super::sse::{llm_stream_from_sse_multi, sse_error_is_present};
 use super::tool_schema::sanitize_openai_function_parameters_schema;
 use crate::provider::{LLMError, LLMStream, Result};
+use crate::retry::{send_provider_request_with_remaining_attempt, RetryConfig};
 use crate::types::LLMChunk;
 use bamboo_domain::ReasoningEffort;
 
@@ -171,8 +172,8 @@ pub fn build_openai_compat_body(
 
     set_openai_compat_token_limit(&mut body, max_output_tokens, reasoning_effort.is_some());
 
-    if let Some(reasoning_effort) = reasoning_effort {
-        body["reasoning_effort"] = json!(reasoning_effort.as_str());
+    if let Some(effort) = reasoning_effort {
+        body["reasoning_effort"] = json!(effort.as_str());
     }
 
     if let Some(parallel_tool_calls) = parallel_tool_calls {
@@ -180,6 +181,141 @@ pub fn build_openai_compat_body(
     }
 
     body
+}
+
+pub(crate) enum ChatCompletionsResponse {
+    Streaming(Response),
+    Rejected {
+        status: StatusCode,
+        body: String,
+        corrected_disable: bool,
+    },
+}
+
+/// Correct a rejected disable spelling once, on the same Chat Completions
+/// route. A metered Work reservation owns exactly one physical send.
+pub(crate) async fn send_chat_completions(
+    retry: &RetryConfig,
+    provider: &str,
+    request: impl Fn(&Value) -> RequestBuilder,
+    mut body: Value,
+    allow_disable_correction: bool,
+) -> Result<ChatCompletionsResponse> {
+    let (response, remaining_attempt) =
+        send_provider_request_with_remaining_attempt(retry, provider, || request(&body)).await?;
+    let status = response.status();
+    if status.is_success() {
+        return Ok(ChatCompletionsResponse::Streaming(response));
+    }
+    let rejection = response.text().await?;
+    if let Some(attempt) = remaining_attempt.filter(|_| {
+        allow_disable_correction
+            && status == StatusCode::BAD_REQUEST
+            && !looks_like_responses_only_error(status, &rejection)
+            && correct_rejected_chat_disable(&mut body, &rejection)
+    }) {
+        if let Some(response) = attempt
+            .send(|| {
+                tracing::info!(
+                    "Retrying a rejected Chat Completions reasoning disable with enable_thinking=false"
+                );
+                request(&body)
+            })
+            .await?
+        {
+            let status = response.status();
+            if status.is_success() {
+                return Ok(ChatCompletionsResponse::Streaming(response));
+            }
+            return Ok(ChatCompletionsResponse::Rejected {
+                status,
+                body: response.text().await?,
+                corrected_disable: true,
+            });
+        }
+    }
+    Ok(ChatCompletionsResponse::Rejected {
+        status,
+        body: rejection,
+        corrected_disable: false,
+    })
+}
+
+pub(crate) fn looks_like_responses_only_error(status: StatusCode, body: &str) -> bool {
+    if !matches!(status.as_u16(), 400 | 404 | 405 | 409 | 415 | 422) {
+        return false;
+    }
+    let body = body.to_ascii_lowercase();
+    body.contains("/responses") || body.contains("responses api") || body.contains("use responses")
+}
+
+fn correct_rejected_chat_disable(body: &mut Value, rejection: &str) -> bool {
+    let Some(body) = body.as_object_mut() else {
+        return false;
+    };
+    if body.get("reasoning_effort").and_then(Value::as_str) != Some("none")
+        || body.contains_key("enable_thinking")
+    {
+        return false;
+    }
+
+    let parsed = serde_json::from_str::<Value>(rejection).ok();
+    let error = parsed
+        .as_ref()
+        .map(|root| root.get("error").unwrap_or(root));
+    let message = error
+        .and_then(|error| {
+            error
+                .get("message")
+                .and_then(Value::as_str)
+                .or_else(|| error.as_str())
+        })
+        .or_else(|| parsed.is_none().then_some(rejection))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let param = error
+        .and_then(|error| error.get("param"))
+        .filter(|p| !p.is_null());
+    let effort_param = param.and_then(Value::as_str) == Some("reasoning_effort");
+    if param.is_some() && !effort_param {
+        return false;
+    }
+    if !effort_param && !message.contains("reasoning_effort") {
+        return false;
+    }
+
+    let invalid_value = effort_param
+        && matches!(
+            error
+                .and_then(|error| error.get("code"))
+                .and_then(Value::as_str),
+            Some("invalid_value" | "unsupported_value")
+        );
+    let mentions_none = message
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| word == "none");
+    let rejects_none = mentions_none
+        && ["unsupported", "not support", "invalid", "not allowed"]
+            .iter()
+            .any(|phrase| message.contains(phrase));
+    let lists_enabled_levels = !mentions_none
+        && message.contains("low")
+        && message.contains("high")
+        && [
+            "only support",
+            "be one of",
+            "valid values",
+            "allowed values",
+        ]
+        .iter()
+        .any(|phrase| message.contains(phrase));
+    if !(invalid_value || rejects_none || lists_enabled_levels) {
+        return false;
+    }
+
+    body.remove("reasoning_effort");
+    body.insert("enable_thinking".into(), json!(false));
+    true
 }
 
 // --- OpenAI-compatible streaming chunk parsing ---
@@ -514,8 +650,68 @@ mod tests {
     use bamboo_domain::{FunctionCall, ToolCall};
     use bamboo_domain::{FunctionSchema, ToolSchema};
     use futures::{Future, StreamExt};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use wiremock::matchers::{body_partial_json, method};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     type MultiParser = fn(&str) -> Result<Vec<LLMChunk>>;
+
+    #[tokio::test]
+    async fn chat_disable_correction_spends_at_most_one_remaining_bootstrap_attempt() {
+        for (max_attempts, expected_status, corrected) in [(3, 400, false), (5, 503, true)] {
+            let server = MockServer::start().await;
+            let initial_attempts = AtomicUsize::new(0);
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"reasoning_effort": "none"})))
+                .respond_with(move |_: &wiremock::Request| {
+                    if initial_attempts.fetch_add(1, Ordering::SeqCst) < 2 {
+                        return ResponseTemplate::new(503);
+                    }
+                    ResponseTemplate::new(400).set_body_json(json!({
+                        "message": "The value of reasoning_effort should be one of low, medium, high, xhigh, and max."
+                    }))
+                })
+                .expect(3)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(body_partial_json(json!({"enable_thinking": false})))
+                .respond_with(ResponseTemplate::new(503))
+                .expect(u64::from(corrected))
+                .mount(&server)
+                .await;
+            let retry = super::RetryConfig {
+                max_attempts,
+                base_delay: Duration::ZERO,
+                max_delay: Duration::ZERO,
+            };
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let result = super::send_chat_completions(
+                &retry,
+                "test",
+                |body| client.post(server.uri()).json(body),
+                json!({"reasoning_effort": "none", "max_completion_tokens": 128}),
+                true,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(
+                result,
+                super::ChatCompletionsResponse::Rejected {status, corrected_disable, ..}
+                    if status == expected_status && corrected_disable == corrected
+            ));
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 3 + usize::from(corrected));
+            if corrected {
+                assert_eq!(
+                    requests[3].body_json::<serde_json::Value>().unwrap(),
+                    json!({"enable_thinking": false, "max_completion_tokens": 128}),
+                );
+            }
+        }
+    }
 
     async fn collect_chat_stream(body: &str, parse: MultiParser) -> Vec<Result<LLMChunk>> {
         let response = reqwest::Response::from(

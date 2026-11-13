@@ -659,7 +659,13 @@ impl CopilotProvider {
             body["tool_choice"] = json!({"type": "function", "name": name});
         }
         // Last-moment scan: mask every text value in the fully-assembled body.
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_RESPONSES,
+            model,
+        )?;
 
         tracing::debug!(
             "[session_hash={}] Copilot provider using Responses API model_hash={}",
@@ -1165,7 +1171,13 @@ impl LLMProvider for CopilotProvider {
         if let Some(name) = required_tool {
             body["tool_choice"] = json!({"type": "function", "function": {"name": name}});
         }
-        crate::masking::mask_outbound_body(&mut body, &self.masking_config);
+        request_overrides::mask_and_prepare_agent_request(
+            &mut body,
+            &self.masking_config,
+            self.request_overrides.as_ref(),
+            request_overrides::ENDPOINT_CHAT_COMPLETIONS,
+            upstream_model,
+        )?;
         tracing::info!(
             "[session_hash={}] Copilot request protocol=chat_completions model_hash={} reasoning_effort={} reasoning_source={} request_reasoning_enabled={} max_output_tokens={} purpose_hash={}",
             log_identity(session_log_id),

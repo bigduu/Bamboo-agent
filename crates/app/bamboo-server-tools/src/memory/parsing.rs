@@ -19,10 +19,11 @@ impl MemoryTool {
             .as_str()
         {
             "session" => Ok(MemoryScope::Session),
+            "section" => Ok(MemoryScope::Section),
             "project" => Ok(MemoryScope::Project),
             "global" => Ok(MemoryScope::Global),
             other => Err(ToolError::InvalidArguments(format!(
-                "invalid scope '{other}'; expected one of: session, project, global"
+                "invalid scope '{other}'; expected one of: session, section, project, global"
             ))),
         }
     }

@@ -31,7 +31,7 @@ use bamboo_engine::session_app::child_session::{
 };
 
 use crate::app_state::{AgentRunner, AgentStatus};
-use crate::tools::{ChildSessionAdapter, PlanTool, SubAgentTool};
+use crate::tools::{ChildSessionAdapter, SubAgentTool};
 use bamboo_agent_core::storage::Storage;
 use bamboo_agent_core::tools::{ToolCall, ToolExecutor, ToolSchema};
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
@@ -55,18 +55,6 @@ async fn invoke_completed(
         Ok(ToolOutcome::Completed(result)) => Ok(result),
         Ok(_) => panic!("expected a Completed outcome"),
         Err(e) => Err(e),
-    }
-}
-
-async fn invoke_plan_completed(
-    tool: &PlanTool,
-    args: serde_json::Value,
-    ctx: ToolCtx,
-) -> Result<ToolResult, ToolError> {
-    match tool.invoke(args, ctx).await {
-        Ok(ToolOutcome::Completed(result)) => Ok(result),
-        Ok(_) => panic!("expected a Completed outcome"),
-        Err(error) => Err(error),
     }
 }
 
@@ -993,10 +981,11 @@ impl ChildSessionPort for WaitOrderPort {
 
     async fn load_root_session(&self, root_id: &str) -> Result<Session, ChildSessionError> {
         let parent = self.inner.load_root_session(root_id).await?;
+        let load_index = self.parent_load_count.fetch_add(1, Ordering::SeqCst);
         if self
             .clear_wait_after_second_parent_load
             .load(Ordering::SeqCst)
-            && self.parent_load_count.fetch_add(1, Ordering::SeqCst) == 1
+            && load_index == 1
         {
             let child_id = parent
                 .agent_runtime_state
@@ -1283,6 +1272,76 @@ fn synchronous_launch_args(action: &str, child_id: &str, workspace: &str) -> ser
         }),
         other => panic!("unexpected synchronous action: {other}"),
     }
+}
+
+#[tokio::test]
+async fn disabled_suspension_blocks_normalized_subagent_launch_and_wait_before_parent_lookup() {
+    use bamboo_agent_core::tools::{with_suspension_disabled, FunctionCall};
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let port = Arc::new(WaitOrderPort::new(
+        harness.adapter.clone(),
+        harness.storage.clone(),
+    ));
+    let tools = crate::tools::OverlayToolExecutor::new(
+        Arc::new(bamboo_tools::BuiltinToolExecutor::new()),
+        Arc::new(SubAgentTool::new(port.clone(), harness.adapter.clone())),
+    );
+    let child = &harness.child_session_id;
+    let cases = [
+        json!({"message":"Perform the complete bounded task."}),
+        json!({"action":"create","title":"bounded","prompt":"Do the task.","auto_run":false}),
+        json!({"action":"run","child_session_id":child}),
+        json!({"action":"wait","child_session_ids":[child]}),
+        json!({"message":"Continue the task.","target":child}),
+        json!({"action":"update","child_session_id":child,"prompt":"Update the task.","auto_run":true}),
+        json!({"action":"update","child_session_id":child,"prompt":"Update the task.","auto_run":false}),
+        json!({"action":"send_message","child_session_id":child,"message":"Continue the task.","auto_run":false}),
+    ];
+    for name in ["SubAgent", "default::SubAgent", "sub_session_manager"] {
+        for args in &cases {
+            let call = ToolCall {
+                id: "suspension-child-call".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: name.into(),
+                    arguments: args.to_string(),
+                },
+            };
+            let ctx = ctx_for(&harness.parent_session_id, "suspension-child-call");
+            let result =
+                with_suspension_disabled(tools.execute_with_context_outcome(&call, ctx)).await;
+            assert!(
+                matches!(result, Err(ToolError::Execution(ref reason)) if reason.contains("suspension_disabled")),
+                "{name} {args}: {result:?}"
+            );
+        }
+    }
+    assert_eq!(port.parent_load_count.load(Ordering::SeqCst), 0);
+    assert_eq!(harness.activation.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn disabled_suspension_keeps_subagent_read_and_cancel_authority_paths() {
+    use bamboo_agent_core::tools::with_suspension_disabled;
+    let harness = build_test_harness_with_storage(None, None, true).await;
+    let ctx = || subagent_test_ctx(&harness.parent_session_id, "suspension-child-read");
+    for args in [
+        json!({"intent":"inspect"}),
+        json!({"action":"get","child_session_id":harness.child_session_id}),
+    ] {
+        let result = with_suspension_disabled(invoke_completed(&harness.tool, args, ctx()))
+            .await
+            .unwrap();
+        assert!(result.success);
+    }
+    let error = with_suspension_disabled(invoke_completed(
+        &harness.tool,
+        json!({"action":"cancel","child_session_id":"missing"}),
+        ctx(),
+    ))
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("missing"), "{error}");
 }
 
 #[tokio::test]
@@ -2131,7 +2190,7 @@ async fn cancelled_send_message_finishes_activation_failure_after_inbox_admissio
 // -----------------------------------------------------------------------
 
 #[tokio::test]
-async fn plan_workspace_selection_uses_durable_metadata_and_current_project_default() {
+async fn child_workspace_selection_uses_durable_metadata_and_current_project_default() {
     use bamboo_engine::project_context::{WorkspaceSource, WORKSPACE_SOURCE_METADATA_KEY};
     let harness = build_test_harness().await;
     let mut parent = harness
@@ -2219,9 +2278,8 @@ async fn plan_workspace_selection_uses_durable_metadata_and_current_project_defa
 }
 
 #[tokio::test]
-async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persistence() {
+async fn child_workspace_rejects_missing_invalid_and_foreign_paths() {
     let harness = build_test_harness_with_storage(None, None, false).await;
-    let tool = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
     let mut parent = harness
         .adapter
         .load_root_session(&harness.parent_session_id)
@@ -2240,7 +2298,7 @@ async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persist
     harness
         .project_store
         .create_with_project_path(
-            "Foreign Plan Project",
+            "Foreign Child Project",
             None,
             foreign.path().to_string_lossy(),
             Vec::new(),
@@ -2256,14 +2314,15 @@ async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persist
             }
         }
         harness.storage.save_session(&parent).await.unwrap();
-        let error = invoke_plan_completed(
-            &tool,
-            json!({"task":"Inspect without writes"}),
-            subagent_test_ctx(&parent.id, "tc_invalid_plan_workspace"),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        let error = harness
+            .adapter
+            .resolve_child_workspace(&parent, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ChildSessionError::InvalidArguments(_)),
+            "{error:?}"
+        );
         assert_eq!(
             std::fs::read_dir(&storage_dir).unwrap().count(),
             before,
@@ -2280,21 +2339,19 @@ async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persist
             .is_some_and(|runtime| runtime.waiting_for_children.is_some()));
     }
     // Explicit override remains subject to the same foreign ownership check.
-    let error = invoke_plan_completed(
-        &tool,
-        json!({"task":"Inspect", "workspace":foreign.path()}),
-        subagent_test_ctx(&parent.id, "tc_explicit_foreign_plan"),
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(error, ToolError::InvalidArguments(_)));
+    let error = harness
+        .adapter
+        .resolve_child_workspace(&parent, foreign.path().to_str())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ChildSessionError::InvalidArguments(_)));
     assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), before);
 
     // An assigned legacy path is not a canonical Project selection. Neither
     // a relative cwd nor an older valid path repairs an unconfigured Project.
     let unconfigured = harness
         .project_store
-        .create("Unconfigured Plan Project", None)
+        .create("Unconfigured Child Project", None)
         .unwrap();
     parent.set_project_id_meta(unconfigured.id.to_string());
     parent.metadata.remove("workspace_path");
@@ -2302,176 +2359,18 @@ async fn plan_rejects_missing_invalid_and_foreign_workspace_before_child_persist
     for legacy in [".", harness.workspace_path.to_str().unwrap()] {
         parent.workspace = Some(legacy.into());
         harness.storage.save_session(&parent).await.unwrap();
-        let error = invoke_plan_completed(
-            &tool,
-            json!({"task":"Inspect without writes"}),
-            subagent_test_ctx(&parent.id, "tc_assigned_legacy_plan"),
-        )
-        .await
-        .unwrap_err();
-        assert!(matches!(error, ToolError::InvalidArguments(_)), "{error:?}");
+        let error = harness
+            .adapter
+            .resolve_child_workspace(&parent, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, ChildSessionError::InvalidArguments(_)),
+            "{error:?}"
+        );
         assert!(error.to_string().contains("project_path"), "{error}");
         assert_eq!(std::fs::read_dir(&storage_dir).unwrap().count(), before);
     }
-}
-
-#[tokio::test]
-async fn plan_creates_one_typed_read_only_child_and_registers_a_noninteractive_wait() {
-    let resolver: crate::tools::SubagentModelResolver = Arc::new(|subagent_type: String| {
-        Box::pin(async move {
-            assert_eq!(subagent_type, "planner");
-            Some(bamboo_domain::ProviderModelRef::new(
-                "openai",
-                "gpt-planner",
-            ))
-        })
-    });
-    let harness = build_test_harness_with_storage(Some(resolver), None, false).await;
-
-    // A permissive root is useful regression pressure: Plan must preserve the
-    // root's posture while the child receives an independent read-only overlay.
-    let mut root = harness
-        .storage
-        .load_session(&harness.parent_session_id)
-        .await
-        .unwrap()
-        .unwrap();
-    root.agent_runtime_state
-        .get_or_insert_with(bamboo_domain::AgentRuntimeState::default)
-        .set_permission_mode(bamboo_domain::SessionPermissionMode::Auto);
-    harness.storage.save_session(&root).await.unwrap();
-    harness
-        .adapter
-        .session_store
-        .save_session(&root)
-        .await
-        .unwrap();
-
-    let tool = PlanTool::new(harness.adapter.clone(), harness.adapter.clone());
-    let result = invoke_plan_completed(
-        &tool,
-        json!({
-            "task": "Inspect the session execution path and design a safe migration.",
-            "title": "Plan session migration",
-            "workspace": harness.workspace_path.to_string_lossy(),
-            "fork_last_messages": 2
-        }),
-        subagent_test_ctx(&harness.parent_session_id, "tc_plan_delegate"),
-    )
-    .await
-    .expect("Plan should delegate to one child");
-
-    assert_eq!(
-        result.display_preference.as_deref(),
-        Some("runtime_control:waiting_for_children")
-    );
-    let payload: serde_json::Value = serde_json::from_str(&result.result).unwrap();
-    assert_eq!(payload["status"], "waiting_for_planner");
-    assert_eq!(payload["runtime_control"], "waiting_for_children");
-    assert_eq!(payload["wait_for"], "all");
-    assert_eq!(payload["subagent_type"], "planner");
-    assert_eq!(payload["model"], "gpt-planner");
-    assert_eq!(payload["read_only"], true);
-    assert!(
-        payload.get("awaiting_user_input").is_none(),
-        "delegated planning must never request a mode-switch response"
-    );
-    assert!(payload["note"]
-        .as_str()
-        .is_some_and(|note| note.contains("resume automatically")));
-    let child_id = payload["child_session_id"]
-        .as_str()
-        .expect("planner child id");
-
-    let child = harness
-        .storage
-        .load_session(child_id)
-        .await
-        .unwrap()
-        .expect("planner child persisted");
-    assert_eq!(child.subagent_type().as_deref(), Some("planner"));
-    assert_eq!(
-        child.metadata.get("runtime.kind").map(String::as_str),
-        Some("external")
-    );
-    assert_eq!(
-        child.metadata.get("external.protocol").map(String::as_str),
-        Some("actor")
-    );
-    assert_eq!(
-        child.metadata.get("external.agent_id").map(String::as_str),
-        Some(bamboo_engine::external_agents::config::LOCAL_ACTOR_AGENT_ID)
-    );
-    let child_runtime = child
-        .agent_runtime_state
-        .as_ref()
-        .expect("typed planner runtime state");
-    assert!(child_runtime.read_only);
-    assert_eq!(
-        child_runtime.effective_permission_mode(),
-        bamboo_domain::SessionPermissionMode::Auto,
-        "requested mode remains auditable even though read-only wins effectively"
-    );
-    assert_eq!(
-        bamboo_domain::PermissionAuditSnapshot::from_metadata(&child.metadata)
-            .expect("planner permission audit")
-            .resolution
-            .effective,
-        bamboo_domain::PermissionMode::Plan
-    );
-    assert!(
-        !child.metadata.contains_key("disabled_tools"),
-        "Plan caller must not be the authority that supplies its own denylist"
-    );
-    assert!(child
-        .metadata
-        .get("assignment_prompt")
-        .is_some_and(|prompt| prompt.contains("do not implement")));
-
-    let parent = harness
-        .storage
-        .load_session(&harness.parent_session_id)
-        .await
-        .unwrap()
-        .unwrap();
-    let root_runtime = parent
-        .agent_runtime_state
-        .as_ref()
-        .expect("root runtime state");
-    assert!(!root_runtime.read_only);
-    assert!(root_runtime.plan_mode.is_none());
-    assert_eq!(
-        root_runtime.effective_permission_mode(),
-        bamboo_domain::SessionPermissionMode::Auto
-    );
-    let wait = root_runtime
-        .waiting_for_children
-        .as_ref()
-        .expect("Plan registered a durable child wait");
-    assert_eq!(wait.child_session_ids, vec![child_id.to_string()]);
-    assert_eq!(
-        wait.registered_by_tool_call_id.as_deref(),
-        Some("tc_plan_delegate")
-    );
-
-    // This harness intentionally persists tool actions through JsonlStorage,
-    // so the independent SessionStoreV2 index does not receive the new child.
-    // The adapter's publication cache does, and lets us prove there was no
-    // hidden second planner creation in the same call.
-    let planner_children = harness
-        .adapter
-        .sessions_cache
-        .iter()
-        .filter(|entry| {
-            let session = entry.value().read();
-            session.parent_session_id.as_deref() == Some(harness.parent_session_id.as_str())
-                && session.subagent_type().as_deref() == Some("planner")
-        })
-        .count();
-    assert_eq!(
-        planner_children, 1,
-        "one Plan call creates exactly one child"
-    );
 }
 
 #[tokio::test]
@@ -3102,7 +3001,7 @@ fn spawn_depth_input(
 }
 
 #[tokio::test]
-async fn spawn_depth_zero_rejects_legacy_compact_plan_and_direct_creation_before_effects() {
+async fn spawn_depth_zero_rejects_legacy_compact_and_direct_creation_before_effects() {
     let h = build_test_harness_with_storage(None, None, true).await;
     h.adapter
         .config
@@ -3135,15 +3034,6 @@ async fn spawn_depth_zero_rejects_legacy_compact_plan_and_direct_creation_before
                 if message == "Invalid SubAgent request or inspection cursor; start a new inspection"));
         }
     }
-    let plan = PlanTool::new(h.adapter.clone(), h.adapter.clone());
-    let error = invoke_plan_completed(
-        &plan,
-        json!({"task":"Plan the bounded task","workspace":h.workspace_path}),
-        ctx_for(&parent.id, "depth-zero-plan").to_tool_ctx(),
-    )
-    .await
-    .unwrap_err();
-    assert!(error.to_string().contains("depth limit (0)"), "{error}");
     let error = child_session::create_child_action(
         h.adapter.as_ref(),
         spawn_depth_input(&h, parent, "depth-zero-direct"),

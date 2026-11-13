@@ -1,8 +1,11 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use serde_json::json;
 
 use bamboo_agent_core::tools::{Tool, ToolClass, ToolCtx, ToolError, ToolOutcome, ToolResult};
 use bamboo_agent_core::Session;
+use bamboo_engine::project_context::{ProjectContextResolver, SessionProjectIdentity};
 use bamboo_memory::memory_store::{
     normalize_retrieval_terms, normalize_tags, DurableMemoryDocument, DurableMemoryStatus,
     MemoryQueryOptions, MemoryRetrievalInput, MemoryScope, MemoryStore, DEFAULT_QUERY_LIMIT,
@@ -10,22 +13,27 @@ use bamboo_memory::memory_store::{
     MAX_MEMORY_ID_LEN, MAX_MEMORY_KEYWORDS, MAX_MEMORY_QUERY_CHARS, MAX_MEMORY_TAGS,
     MAX_MEMORY_TAG_CHARS, MAX_MEMORY_TITLE_LEN, MAX_QUERY_LIMIT, MAX_RETRIEVAL_TERM_CHARS,
 };
+use bamboo_projects::ProjectStore;
 use bamboo_tools::tools::session_memory::{
     execute_session_memory_action, SessionMemoryAction, MEMORY_SESSION_ACTION_NAMES,
 };
 
 mod args;
 mod parsing;
+mod section;
 
 #[cfg(test)]
 mod tests;
 
 use args::MemoryArgs;
 
+const SECTION_UNAVAILABLE: &str = "Section memory requires a current server-assigned Section. Use Project or Global for facts of those scopes. Keep Section-only context in Session notes.";
+
 #[derive(Clone)]
 pub struct MemoryTool {
     session_repo: bamboo_engine::SessionRepository,
     memory_store: MemoryStore,
+    project_store: Option<Arc<ProjectStore>>,
 }
 
 struct ResolvedMemoryAccess {
@@ -55,10 +63,7 @@ fn bound_retrieval_metadata(doc: &mut DurableMemoryDocument) -> bool {
 
 impl MemoryTool {
     pub fn with_defaults(session_repo: bamboo_engine::SessionRepository) -> Self {
-        Self {
-            session_repo,
-            memory_store: MemoryStore::with_defaults(),
-        }
+        Self::with_store(session_repo, MemoryStore::with_defaults())
     }
 
     pub fn new(
@@ -75,7 +80,13 @@ impl MemoryTool {
         Self {
             session_repo,
             memory_store,
+            project_store: None,
         }
+    }
+
+    pub fn with_project_store(mut self, project_store: Arc<ProjectStore>) -> Self {
+        self.project_store = Some(project_store);
+        self
     }
 
     async fn session_for_context(&self, session_id: Option<&str>) -> Option<Session> {
@@ -85,29 +96,27 @@ impl MemoryTool {
     async fn resolve_memory_access(
         &self,
         explicit: Option<&str>,
-        session_id: Option<&str>,
+        ctx: &ToolCtx,
         requested_scope: Option<MemoryScope>,
     ) -> Result<ResolvedMemoryAccess, ToolError> {
         let explicit = explicit
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string);
-        let session = self.session_for_context(session_id).await;
-        if let Some(session) = session.as_ref() {
-            if let bamboo_engine::project_context::SessionProjectIdentity::Invalid {
-                raw,
-                message,
-            } = bamboo_engine::project_context::ProjectContextResolver::session_project_identity(
-                session,
-            ) {
+        let session = self.session_for_context(ctx.session_id()).await;
+        let project = match session
+            .as_ref()
+            .map(ProjectContextResolver::session_project_identity)
+        {
+            Some(SessionProjectIdentity::Assigned(project_id)) => Some(project_id),
+            Some(SessionProjectIdentity::Invalid { raw, message }) => {
                 return Err(ToolError::InvalidArguments(format!(
                     "session carries an invalid Project identity '{raw}': {message}"
                 )));
             }
-        }
-        if let Some(project_id) = session.as_ref().and_then(
-            bamboo_engine::project_context::ProjectContextResolver::project_id_from_session,
-        ) {
+            _ => None,
+        };
+        if let Some(project_id) = project {
             if explicit
                 .as_deref()
                 .is_some_and(|requested| requested != project_id.as_str())
@@ -116,12 +125,27 @@ impl MemoryTool {
                     "project_key cannot override the session's assigned Project".to_string(),
                 ));
             }
+            let section_id = if matches!(requested_scope, Some(MemoryScope::Section) | None) {
+                self.section_for_context(ctx, &project_id).await
+            } else {
+                None
+            };
+            if requested_scope == Some(MemoryScope::Section) && section_id.is_none() {
+                return Err(ToolError::InvalidArguments(SECTION_UNAVAILABLE.to_string()));
+            }
+            let store = match section_id {
+                Some(section_id) => self.memory_store.for_section(&project_id, &section_id),
+                None => self.memory_store.for_project(&project_id),
+            };
             return Ok(ResolvedMemoryAccess {
-                store: self.memory_store.for_project(&project_id),
+                store,
                 project_key: Some(project_id.to_string()),
             });
         }
 
+        if requested_scope == Some(MemoryScope::Section) {
+            return Err(ToolError::InvalidArguments(SECTION_UNAVAILABLE.to_string()));
+        }
         if explicit.is_some() {
             return Err(ToolError::InvalidArguments(
                 "project_key requires the session to be assigned to that Project".to_string(),
@@ -146,7 +170,7 @@ impl Tool for MemoryTool {
     }
 
     fn description(&self) -> &str {
-        "Bamboo's unified memory tool. Use session_* for continuity notes. For durable memory, start with a short lexical query: omitting limit returns a compact top-3 shortlist with actionable ids and no bodies; then get only selected ids. Query before write/merge, and persist one atomic confirmed fact with bounded tags, keywords, and entities. The Session's assigned Project is trusted scope authority: project_key cannot grant or switch access. Verify live state when a fact may have changed. Retrieval is embedding-free; no embeddings are used. A blank query remains a management listing."
+        "Recall past decisions and preferences and handle explicit requests to remember or forget. Use session_* for continuity notes. For durable memory, start with a short lexical query. Omitting limit returns a compact top-3 shortlist with actionable ids and no bodies. Then get only selected ids. Query before write/merge, and persist one atomic confirmed fact with bounded tags, keywords, and entities. Query Section first for Section-specific work when Bamboo has assigned a Section. Without a Section, use Project or Global for facts of those scopes and Session notes for Section-only context. Bamboo's Project and Section assignments are the trusted scope authority. Verify live state when a fact may have changed. Retrieval is embedding-free. A blank query remains a management listing."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -155,7 +179,7 @@ impl Tool for MemoryTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "description": "Recall with query, inspect a selected result with get, then use a mutation only when needed. Query before write or merge to avoid duplicates.",
+                    "description": "Recall with query, inspect a selected result with get, then use a mutation only when needed. Query before write or merge to avoid duplicates. Keep secrets and tokens out of all memory writes.",
                     "enum": [
                         "session_read",
                         "session_append",
@@ -178,8 +202,8 @@ impl Tool for MemoryTool {
                 },
                 "scope": {
                     "type": "string",
-                    "enum": ["session", "project", "global"],
-                    "description": "Durable actions use project or global. Use session_* actions, not durable actions, for session continuity notes."
+                    "enum": ["session", "project", "global", "section"],
+                    "description": "Use section for a server-assigned Section, project for project-wide facts, and global for cross-project facts. Use session_* actions for session continuity."
                 },
                 "granularity": {
                     "type": "string",
@@ -343,6 +367,12 @@ impl Tool for MemoryTool {
             ToolError::Execution("memory requires a session_id in tool context".to_string())
         })?;
 
+        if args.get("section_id").is_some() {
+            return Err(ToolError::InvalidArguments(
+                "section_id comes from Bamboo's server-side assignment. Select the scope with scope=section."
+                    .to_string(),
+            ));
+        }
         let parsed: MemoryArgs = serde_json::from_value(args).map_err(|error| {
             ToolError::InvalidArguments(format!("Invalid memory args: {error}"))
         })?;
@@ -424,7 +454,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
                 let options = MemoryQueryOptions {
                     limit: options
@@ -477,7 +507,7 @@ impl Tool for MemoryTool {
                 options,
             } => {
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .resolve_memory_access(project_key.as_deref(), &ctx, None)
                     .await?;
                 let max_chars = options
                     .and_then(|value| value.max_chars)
@@ -539,7 +569,7 @@ impl Tool for MemoryTool {
                 }
                 let granularity = Self::parse_granularity(granularity.as_deref())?;
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
                 let doc = memory_access
                     .store
@@ -562,21 +592,24 @@ impl Tool for MemoryTool {
                     .map_err(|error| {
                         ToolError::Execution(format!("Failed to write memory: {error}"))
                     })?;
+                let mut result = json!({
+                    "action": "write",
+                    "memory": {
+                        "id": doc.frontmatter.id,
+                        "title": doc.frontmatter.title,
+                        "type": doc.frontmatter.r#type,
+                        "scope": doc.frontmatter.scope,
+                        "status": doc.frontmatter.status,
+                        "project_key": doc.frontmatter.project_key,
+                        "path": doc.path,
+                    }
+                });
+                if let Some(section_id) = doc.frontmatter.section_id {
+                    result["memory"]["section_id"] = json!(section_id);
+                }
                 Ok(ToolResult {
                     success: true,
-                    result: json!({
-                        "action": "write",
-                        "memory": {
-                            "id": doc.frontmatter.id,
-                            "title": doc.frontmatter.title,
-                            "type": doc.frontmatter.r#type,
-                            "scope": doc.frontmatter.scope,
-                            "status": doc.frontmatter.status,
-                            "project_key": doc.frontmatter.project_key,
-                            "path": doc.path,
-                        }
-                    })
-                    .to_string(),
+                    result: result.to_string(),
                     display_preference: Some("json".to_string()),
                     images: Vec::new(),
                 })
@@ -593,7 +626,7 @@ impl Tool for MemoryTool {
                 reason,
             } => {
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .resolve_memory_access(project_key.as_deref(), &ctx, None)
                     .await?;
                 let mode = Self::parse_merge_mode(mode.as_deref())?;
                 if matches!(mode.as_deref(), Some("contradict")) {
@@ -686,7 +719,7 @@ impl Tool for MemoryTool {
                     None => None,
                 };
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
                 let limit = options
                     .and_then(|value| value.limit)
@@ -730,7 +763,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .resolve_memory_access(project_key.as_deref(), &ctx, None)
                     .await?;
                 let mut split_pieces = Vec::with_capacity(pieces.len());
                 let mut retrieval = Vec::with_capacity(pieces.len());
@@ -794,7 +827,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
                 let min_sections = min_sections.unwrap_or(3);
                 let limit = options
@@ -837,7 +870,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
                 let min_score = min_score.unwrap_or(0.6);
                 let limit = options
@@ -888,7 +921,7 @@ impl Tool for MemoryTool {
                     None => None,
                 };
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), None)
+                    .resolve_memory_access(project_key.as_deref(), &ctx, None)
                     .await?;
                 let merged = bamboo_memory::memory_store::MemorySplitPiece {
                     title,
@@ -948,6 +981,15 @@ impl Tool for MemoryTool {
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
                 let requested_scope = match id {
+                    Some(_)
+                        if scope
+                            .as_deref()
+                            .is_some_and(|scope| scope.trim().eq_ignore_ascii_case("section")) =>
+                    {
+                        Some(MemoryScope::Section)
+                    }
+                    // Retain the legacy ID lookup when an older scope is also supplied.
+                    Some(_) if scope.is_some() => Some(MemoryScope::Global),
                     Some(_) => None,
                     None => {
                         let scope = Self::parse_scope(scope.as_deref())?;
@@ -960,26 +1002,29 @@ impl Tool for MemoryTool {
                     }
                 };
                 let memory_access = self
-                    .resolve_memory_access(
-                        project_key.as_deref(),
-                        Some(session_id),
-                        requested_scope,
-                    )
+                    .resolve_memory_access(project_key.as_deref(), &ctx, requested_scope)
                     .await?;
 
                 if let Some(id) = id {
-                    let Some(doc) = memory_access
-                        .store
-                        .archive_memory(
-                            id,
-                            memory_access.project_key.as_deref(),
-                            mode,
-                            reason.as_deref(),
-                        )
-                        .await
-                        .map_err(|error| {
-                            ToolError::Execution(format!("Failed to purge memory: {error}"))
-                        })?
+                    let archived = if requested_scope == Some(MemoryScope::Section) {
+                        memory_access
+                            .store
+                            .archive_section_memory(id, mode, reason.as_deref())
+                            .await
+                    } else {
+                        memory_access
+                            .store
+                            .archive_memory(
+                                id,
+                                memory_access.project_key.as_deref(),
+                                mode,
+                                reason.as_deref(),
+                            )
+                            .await
+                    };
+                    let Some(doc) = archived.map_err(|error| {
+                        ToolError::Execution(format!("Failed to purge memory: {error}"))
+                    })?
                     else {
                         return Err(ToolError::Execution(format!("memory not found: {}", id)));
                     };
@@ -1033,7 +1078,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
                 let result = memory_access
                     .store
@@ -1061,7 +1106,7 @@ impl Tool for MemoryTool {
                     ));
                 }
                 let memory_access = self
-                    .resolve_memory_access(project_key.as_deref(), Some(session_id), Some(scope))
+                    .resolve_memory_access(project_key.as_deref(), &ctx, Some(scope))
                     .await?;
                 memory_access
                     .store

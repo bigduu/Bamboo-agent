@@ -150,10 +150,10 @@ pub fn expandable_tool_short_description(name: &str) -> Option<&'static str> {
         "Sleep" => Some("Pause briefly when waiting for an external state change before polling again."),
         "ViewImage" => Some("Inspect a local PNG, JPEG, GIF, WebP, or retained conversation image reference; an optional prompt can focus the Vision-model description on the user's question."),
         "WebFetch" => Some("Fetch a webpage by URL when you need cleaned page text from a known target."),
-        "memory" => Some("Manage Bamboo's unified memory system for session notes and durable project/global memories."),
+        "memory" => Some("Recall past decisions and preferences, keep session notes, and handle explicit requests to remember or forget."),
         "scheduler" => Some("Manage Bamboo scheduled automation jobs for recurring or delayed work."),
         "SubAgent" => Some("Create, inspect, and manage child sessions for explicitly requested delegated, parallel, or sub-agent work."),
-        "session_history" => Some("Search, page, and read complete turns around hits in the current Bamboo Session's stored messages, including compressed history. Root schemas may also offer cross-session list/inspect/search/export actions. Distinct from `memory` (durable knowledge)."),
+        "session_history" => Some("Read stored Session history, including archived messages. When the Host allows current-user peer history, an ordinary Root can use inspect or read_messages with another Session ID."),
         "ExitPlanMode" => Some("Ask for confirmation before leaving plan mode."),
         _ => None,
     }

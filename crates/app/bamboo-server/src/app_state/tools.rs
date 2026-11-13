@@ -4,7 +4,7 @@
 //! ```text
 //! base_tools (builtin + MCP + memory + scoped session messaging + skills + context controls
 //!             + Host-routed session_history + current history + fresh independent Root spawn)
-//!   └─> root_tools (base + Plan + SubAgent + scheduler + Supervisor controls)
+//!   └─> root_tools (base + SubAgent + scheduler + Supervisor controls)
 //! ```
 
 use std::collections::HashMap;
@@ -120,10 +120,10 @@ pub(super) fn build_base_tools(
         project_tool,
     ));
 
-    let memory_tool = Arc::new(crate::tools::MemoryTool::with_store(
-        session_repo.clone(),
-        memory_store,
-    ));
+    let memory_tool = Arc::new(
+        crate::tools::MemoryTool::with_store(session_repo.clone(), memory_store)
+            .with_project_store(project_store.clone()),
+    );
     let with_memory: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
         with_project,
         memory_tool,
@@ -425,18 +425,6 @@ pub(super) fn build_root_tools(
         crate::tools::OverlayToolExecutor::new(base_tools, sub_agent_tool.clone()),
     );
 
-    // Planning is delegated to one runtime-enforced read-only child. This keeps
-    // the root session in its normal orchestrator posture and reuses the same
-    // durable child/wait/completion path as `SubAgent`.
-    let plan_tool = Arc::new(
-        crate::tools::PlanTool::new(adapter.clone(), adapter.clone())
-            .with_artifact_home(session_store.bamboo_home_dir().to_path_buf()),
-    );
-    let tools_with_plan: Arc<dyn ToolExecutor> = Arc::new(crate::tools::OverlayToolExecutor::new(
-        tools_with_sub_agent,
-        plan_tool,
-    ));
-
     // Root sessions can manage schedules via `scheduler`.
     // Background schedule runs intentionally use `tools_for_schedules` above and therefore
     // do not get this management tool by default.
@@ -450,7 +438,7 @@ pub(super) fn build_root_tools(
         workspace_resolver,
     ));
     let tools_with_schedule: Arc<dyn ToolExecutor> = Arc::new(
-        crate::tools::OverlayToolExecutor::new(tools_with_plan, schedule_tasks_tool),
+        crate::tools::OverlayToolExecutor::new(tools_with_sub_agent, schedule_tasks_tool),
     );
 
     // Session discovery and fresh Root creation already belong to the shared
@@ -1062,6 +1050,138 @@ mod session_message_assembly_tests {
     }
 
     #[tokio::test]
+    async fn ordinary_root_can_inspect_and_page_another_projects_visible_history() {
+        use bamboo_agent_core::tools::{with_executing_session_caller, ToolError};
+        use bamboo_agent_core::Message;
+        use bamboo_domain::SessionCallerReference;
+
+        async fn history(
+            tools: &dyn ToolExecutor,
+            caller: &Session,
+            original: bool,
+            args: serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
+            let call = ToolCall {
+                id: "current-user-peer-history".into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "session_history".into(),
+                    arguments: args.to_string(),
+                },
+            };
+            let bound = tools.for_session(caller).unwrap();
+            let mut ctx = ToolExecutionContext::none(&call.id);
+            ctx.session_id = Some(&caller.id);
+            let result = with_executing_session_caller(
+                original.then(|| Arc::new(SessionCallerReference::from(caller))),
+                bound.execute_with_context(&call, ctx),
+            )
+            .await?;
+            assert!(result.success, "{}", result.result);
+            Ok(serde_json::from_str(&result.result).unwrap())
+        }
+
+        let home = tempfile::tempdir().unwrap();
+        let state = super::super::AppState::new_with_provider(
+            home.path().into(),
+            Config::default(),
+            Arc::new(super::super::UnconfiguredProvider {
+                message: "History reads require no model call".into(),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut caller = Session::new("history-caller", "model");
+        caller.set_project_id_meta("caller-project");
+        let mut target = Session::new("history-target", "model");
+        target.set_project_id_meta("different-project");
+        let mut child = Session::new_child_of("history-child", &caller, "model", "child");
+        child.set_project_id_meta("caller-project");
+        child.add_message(Message::assistant("saved child output", None));
+        let mut connect = Session::new("history-connect", "model");
+        connect.metadata.insert(
+            bamboo_domain::CONNECT_SESSION_ORIGIN_KEY.into(),
+            "fake:external-chat:sender".into(),
+        );
+        connect.add_message(Message::user("Connect chat history"));
+        target.add_message(Message::system("internal system instructions"));
+        let mut archived = Message::user("an archived question");
+        archived.compressed = true;
+        let archived_id = archived.id.clone();
+        target.add_message(archived);
+        target.add_message(Message::assistant("saved progress", None));
+        let mut hidden = Message::assistant("hidden runtime output", None);
+        hidden.metadata = Some(json!({"hidden_from_ui":true}));
+        target.add_message(hidden);
+        for session in [&caller, &target, &child, &connect] {
+            state.storage.save_session(session).await.unwrap();
+        }
+
+        let tools = state.tools_for(crate::tools::ToolSurface::Root);
+        let inspect = json!({"action":"inspect","session_id":target.id,"max_chars":8000});
+        let progress = history(tools.as_ref(), &caller, true, inspect.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            progress["latest_visible_assistant_excerpt"]["content"],
+            "saved progress"
+        );
+        assert_eq!(progress["status_is_live"], false);
+        let mut read = json!({"action":"read_messages","session_id":target.id,"from_end":false,"limit":1,"include_system":true,"include_tool":true});
+        let page = history(tools.as_ref(), &caller, true, read.clone())
+            .await
+            .unwrap();
+        assert_eq!(page["message_count_filtered"], 2);
+        assert_eq!(page["messages"][0]["id"], archived_id);
+        assert_eq!(page["messages"][0]["content"], "an archived question");
+        read["offset"] = json!(1);
+        let next = history(tools.as_ref(), &caller, true, read.clone())
+            .await
+            .unwrap();
+        assert_eq!(next["messages"][0]["content"], "saved progress");
+        let child_page = history(
+            tools.as_ref(),
+            &caller,
+            true,
+            json!({"action":"read_messages","session_id":child.id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(child_page["messages"][0]["content"], "saved child output");
+        let connect_own = history(
+            tools.as_ref(),
+            &connect,
+            true,
+            json!({"action":"read_messages","session_id":connect.id}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            connect_own["messages"][0]["content"],
+            "Connect chat history"
+        );
+        for request in [inspect.clone(), read.clone()] {
+            let error = history(tools.as_ref(), &connect, true, request)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("Connect chat"), "{error}");
+        }
+
+        assert!(history(tools.as_ref(), &caller, false, inspect.clone())
+            .await
+            .is_err());
+        let mut stale = caller.clone();
+        stale.created_at += chrono::Duration::seconds(1);
+        assert!(history(tools.as_ref(), &stale, true, inspect.clone())
+            .await
+            .is_err());
+        assert!(history(tools.as_ref(), &child, true, inspect)
+            .await
+            .is_err());
+        assert!(history(tools.as_ref(), &child, true, read).await.is_err());
+    }
+
+    #[tokio::test]
     async fn root_installed_history_routes_explicit_host_scope_without_opening_raw_peer_history() {
         use bamboo_agent_core::tools::with_executing_session_caller;
         use bamboo_domain::{
@@ -1115,7 +1235,12 @@ mod session_message_assembly_tests {
             crate::tools::ToolSurface::WithTask,
         ] {
             let tools = state.tools_for(surface);
-            for (action, allowed) in [("list", true), ("get_meta", false)] {
+            for (action, allowed) in [
+                ("list", true),
+                ("inspect", false),
+                ("get_meta", false),
+                ("read_messages", false),
+            ] {
                 let args = if action == "list" {
                     json!({"action":"list"})
                 } else {
@@ -1147,6 +1272,16 @@ mod session_message_assembly_tests {
                 }
             }
         }
+        state
+            .session_store
+            .revoke_host_session_scope(&caller.id, 1)
+            .await
+            .unwrap();
+        assert!(state
+            .storage
+            .load_current_user_peer_session(&SessionCallerReference::from(&caller), &target.id)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

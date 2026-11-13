@@ -934,41 +934,29 @@ struct TurnOutcome {
 
 // ---- Per-run resource guardrails (issue #221) ----
 
-/// Child-spawning tool names owned by `bamboo-server-tools`.
-///
-/// Duplicated here as plain strings — the engine has no dependency on the
-/// server-tools crate that owns them — purely to COUNT spawn attempts for the
-/// per-run `max_subagents` budget guardrail below; they never affect dispatch.
-/// A tool rename must update both sites.
+/// Child-spawning tool owned by `bamboo-server-tools`. Used only for the
+/// per-run `max_subagents` budget.
 const SUBAGENT_TOOL_NAME: &str = "SubAgent";
-const PLAN_TOOL_NAME: &str = "Plan";
 
-/// True when `call` creates one new child session.
-///
-/// `Plan` creates one one-shot planner child except for its explicit artifact
-/// `read` action. Missing/unparsable Plan arguments stay conservatively counted.
-/// A `SubAgent` call counts only when its `action` is `"create"`, or when the action is
-/// absent/unparsable (the tool's legacy create default). All other SubAgent
-/// actions manage existing children and do not consume the spawn budget.
+/// Count attempts to create a Child in the legacy and compact SubAgent forms.
 fn is_child_spawn_call(call: &bamboo_agent_core::tools::ToolCall) -> bool {
-    match call.function.name.as_str() {
-        PLAN_TOOL_NAME => {
-            return !serde_json::from_str::<serde_json::Value>(&call.function.arguments).is_ok_and(
-                |value| value.get("action").and_then(|action| action.as_str()) == Some("read"),
-            );
-        }
-        SUBAGENT_TOOL_NAME => {}
-        _ => return false,
+    if call.function.name != SUBAGENT_TOOL_NAME {
+        return false;
     }
-    serde_json::from_str::<serde_json::Value>(&call.function.arguments)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("action")
-                .and_then(|a| a.as_str())
-                .map(str::to_string)
-        })
-        .is_none_or(|action| action == "create")
+    let Ok(args) = serde_json::from_str::<serde_json::Value>(&call.function.arguments) else {
+        return true;
+    };
+    if let Some(action) = args["action"].as_str() {
+        return action == "create";
+    }
+    match args["intent"].as_str() {
+        Some("inspect" | "wait" | "control" | "ask_parent") => false,
+        Some("chat") | None => {
+            args["target"].as_str().is_none_or(str::is_empty)
+                && args["reply_to"].as_str().is_none_or(str::is_empty)
+        }
+        Some(_) => true,
+    }
 }
 
 /// A per-run resource guardrail that has just tripped: which budget, its
@@ -1515,9 +1503,9 @@ async fn maybe_suspend_for_outstanding_bash(
     Some(outcome)
 }
 
-/// Transfer the trusted quiet-poll observation to the host without spending
-/// another model recovery round. Stage the notice and wait together: failed
-/// persistence must neither publish a handoff nor start a detached monitor.
+/// Yield an owned quiet command to background monitoring without spending
+/// another model recovery round. A new handoff commits its notice and wait
+/// together before the monitor starts.
 async fn maybe_background_quiet_exec(
     session: &mut Session,
     config: &AgentLoopConfig,
@@ -1525,10 +1513,18 @@ async fn maybe_background_quiet_exec(
     event_tx: &mpsc::Sender<AgentEvent>,
     handle: &str,
 ) -> Result<bool, AgentError> {
-    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config)
-        || runtime.waiting_for_bash.is_some()
-    {
+    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config) {
         return Ok(false);
+    }
+    if let Some(wait) = runtime.waiting_for_bash.as_ref() {
+        // A Human follow-up may poll an exec already handed off in a previous
+        // turn. Let terminal wait reconciliation restore this suspension if
+        // the durable monitor still owns it.
+        return Ok(matches!(wait.bash_ids.as_slice(), [id] if id == handle)
+            && session
+                .metadata
+                .get("runtime.background_exec_id")
+                .is_some_and(|id| id == handle));
     }
     let (Some(persistence), Some(hook)) = (
         config.persistence.as_ref(),
@@ -3588,7 +3584,7 @@ async fn run_pipeline_inner(
                 .unwrap_or_else(|| llm.clone()),
             background_model_name: state.auxiliary_models.background_model_name.clone(),
         };
-        let (prompt_memory_exposure, observation) =
+        let (prompt_memory_exposure, observation, admitted_messages) =
             crate::runtime::runner::round_prelude::refresh_round_boundary_with_observation(
                 session,
                 &mut state.runtime_state,
@@ -3621,6 +3617,26 @@ async fn run_pipeline_inner(
         );
         if fresh_human_input || resumed_progress_question {
             tool_policy_guard.reset_observation_progress();
+        }
+        for message in admitted_messages {
+            let Some(handle) =
+                tool_policy_guard.observe_background_exec_completion(&session.id, &message)
+            else {
+                continue;
+            };
+            if state
+                .runtime_state
+                .waiting_for_bash
+                .as_ref()
+                .is_some_and(|wait| matches!(wait.bash_ids.as_slice(), [id] if id == handle))
+            {
+                if let Some(saved) = session.agent_runtime_state.as_ref() {
+                    state
+                        .runtime_state
+                        .waiting_for_bash
+                        .clone_from(&saved.waiting_for_bash);
+                }
+            }
         }
         // Consume only after the complete real tool batch and newly admitted
         // Human input. The same-model facts are mandatory for each bounded
@@ -3702,6 +3718,7 @@ async fn run_pipeline_inner(
 
         // --- LLM call with retry ---
         let mut overflow_recovery_attempted = false;
+        let mut output_limit_recovery = None;
         let mut turn_outcome: Option<TurnOutcome> = None;
         // Whether this round produced any tool call. Per-round, so it belongs
         // inside the loop; captured from the provider output rather than
@@ -3792,10 +3809,15 @@ async fn run_pipeline_inner(
                         provenance: &prompt_memory_exposure,
                     },
                 ),
+                output_limit_recovery,
             )
             .await
             {
                 Ok(output) => output,
+                Err(error) if output_limit_recovery.is_some() => {
+                    terminal_error = Some(error);
+                    break;
+                }
                 Err(error) => {
                     if is_overflow_recoverable(&error) && !overflow_recovery_attempted {
                         overflow_recovery_attempted = true;
@@ -3884,6 +3906,7 @@ async fn run_pipeline_inner(
                                         provenance: &prompt_memory_exposure,
                                     },
                                 ),
+                                None,
                             )
                             .await
                             {
@@ -4025,6 +4048,29 @@ async fn run_pipeline_inner(
             // activation attempt that the fail-closed guard rejects below.
             round_activity.absorb_attempt(&stream_output, llm_output.attempt_usage);
             if let Some(error) = llm_output.terminal_validation_error {
+                if matches!(error, AgentError::OutputTokenLimit { .. }) {
+                    if let Some(visible) = stream_output.visible_message {
+                        let _ = event_tx
+                            .send(AgentEvent::VisibleMessageDiscard {
+                                message_id: visible.message_id,
+                            })
+                            .await;
+                    }
+                }
+                if matches!(error, AgentError::OutputTokenLimit { reasoning_only: true, .. })
+                    && output_limit_recovery.is_none()
+                    && attempt < MAX_LLM_TURN_ATTEMPTS
+                {
+                    if let Some(recovery) = llm_output.output_limit_recovery {
+                        let mut budget_state = state.runtime_state.clone();
+                        round_activity.commit_to_runtime(&mut budget_state);
+                        if check_run_budget_exceeded(&budget_state.round, &config.run_budget).is_none() {
+                            output_limit_recovery = Some(recovery);
+                            tracing::info!("Retrying an output-limited reasoning-only response with low effort");
+                            continue;
+                        }
+                    }
+                }
                 terminal_error = Some(error);
                 break;
             }
@@ -4294,6 +4340,7 @@ async fn run_pipeline_inner(
             let handler_result = match injected_handler_error {
                 Some(error) => Err(error),
                 None => {
+                    tool_policy_guard.set_supervisor_spawn_route(llm_output.standalone_supervisor_spawn);
                     handle_tool_calls_path(
                         &frame,
                         stream_output,
@@ -4924,7 +4971,7 @@ fn heuristic_complexity(
         "exec_command",
         "write_stdin",
     ];
-    let complex_tools = ["Agent", "Plan", "SubAgent", "TodoWrite"];
+    let complex_tools = ["Agent", "SubAgent", "TodoWrite"];
 
     let names: Vec<&str> = tool_calls
         .iter()
@@ -10116,6 +10163,383 @@ mod tests {
         assert_eq!(persisted_runtime.round.total_completion_tokens, 7);
     }
 
+    fn mock_messages_completion(
+        block: serde_json::Value,
+        delta: serde_json::Value,
+        finish_reason: &str,
+        output_tokens: Option<u64>,
+    ) -> wiremock::ResponseTemplate {
+        use serde_json::json;
+
+        let usage =
+            output_tokens.map_or_else(|| json!({}), |output| json!({"output_tokens":output}));
+        mock_completion_sse(&[
+            json!({"type":"message_start","message":{"usage":{
+                "input_tokens":31,"cache_creation_input_tokens":0,"cache_read_input_tokens":0
+            }}}),
+            json!({"type":"content_block_start","index":0,"content_block":block}),
+            json!({"type":"content_block_delta","index":0,"delta":delta}),
+            json!({"type":"content_block_stop","index":0}),
+            json!({"type":"message_delta","delta":{"stop_reason":finish_reason},
+                   "usage":usage}),
+            json!({"type":"message_stop"}),
+        ])
+    }
+
+    fn mock_completion_sse(events: &[serde_json::Value]) -> wiremock::ResponseTemplate {
+        let sse = events
+            .iter()
+            .map(|event| {
+                format!(
+                    "event: {}\ndata: {event}\n\n",
+                    event["type"].as_str().unwrap()
+                )
+            })
+            .collect::<String>();
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("content-type", "text/event-stream")
+            .set_body_string(sse)
+    }
+
+    #[derive(Default)]
+    struct OutputLimitExecutor(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for OutputLimitExecutor {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> Result<bamboo_agent_core::tools::ToolResult, bamboo_agent_core::tools::ToolError>
+        {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Err(bamboo_agent_core::tools::ToolError::Execution(
+                "unexpected dispatch".into(),
+            ))
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".into(),
+                function: bamboo_domain::FunctionSchema {
+                    name: "fixture_tool".into(),
+                    description: "Tool for the output limit fixture".into(),
+                    parameters: serde_json::json!({"type":"object"}),
+                },
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_output_token_limit_recovers_reasoning_and_blocks_truncated_tools() {
+        use bamboo_domain::ReasoningEffort;
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let reasoning_progress = "The reasoning reaches its limit.";
+        let make_thinking = |usage| {
+            mock_messages_completion(
+                json!({"type":"thinking","thinking":""}),
+                json!({"type":"thinking_delta","thinking":reasoning_progress}),
+                "max_tokens",
+                usage,
+            )
+        };
+        let thinking = make_thinking(Some(7));
+        let unreported_thinking = make_thinking(None);
+        let truncated_tool = mock_messages_completion(
+            json!({"type":"tool_use","id":"call_partial","name":"fixture_tool","input":{}}),
+            json!({"type":"input_json_delta","partial_json":"{"}),
+            "max_tokens",
+            Some(7),
+        );
+        let answer = mock_messages_completion(
+            json!({"type":"text","text":""}),
+            json!({"type":"text_delta","text":"The recovered answer."}),
+            "end_turn",
+            Some(3),
+        );
+
+        for (scenario, first, retry, succeeds) in [
+            ("recovery", &thinking, Some(&answer), true),
+            ("provider-default-effort", &thinking, Some(&answer), true),
+            ("repeated-limit", &thinking, Some(&thinking), false),
+            ("truncated-tool", &truncated_tool, None, false),
+            ("run-budget", &thinking, None, false),
+            ("missing-output-usage", &unreported_thinking, None, false),
+            ("unset-effort", &thinking, None, false),
+            ("pinned-effort", &thinking, None, false),
+        ] {
+            let server = MockServer::start().await;
+            let mut first_request = Mock::given(method("POST")).and(path("/messages"));
+            if scenario != "unset-effort" {
+                first_request =
+                    first_request.and(body_partial_json(json!({"output_config":{"effort":"max"}})));
+            }
+            first_request
+                .respond_with(first.clone())
+                .with_priority(2)
+                .expect(1)
+                .mount(&server)
+                .await;
+            if let Some(retry) = retry {
+                Mock::given(method("POST"))
+                    .and(path("/messages"))
+                    .and(body_partial_json(json!({"output_config":{"effort":"low"}})))
+                    .respond_with(retry.clone())
+                    .with_priority(1)
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let overrides = (scenario == "pinned-effort").then(|| {
+                serde_json::from_value(json!({"common":{"body_patch":[{
+                    "op":"set","path":"/output_config/effort","value":"max"
+                }]}}))
+                .unwrap()
+            });
+            let llm = bamboo_llm::AnthropicProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap())
+                .with_reasoning_effort(
+                    (scenario == "provider-default-effort").then_some(ReasoningEffort::Max),
+                )
+                .with_request_overrides(overrides);
+            let tools = Arc::new(OutputLimitExecutor::default());
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(dir.path().into());
+            config.reasoning_effort =
+                (!matches!(scenario, "unset-effort" | "provider-default-effort"))
+                    .then_some(ReasoningEffort::Max);
+            config.token_budget = Some(bamboo_compression::TokenBudget::with_safety_margin(
+                32_000,
+                256,
+                Default::default(),
+                0,
+            ));
+            if matches!(scenario, "run-budget" | "missing-output-usage") {
+                config.run_budget.max_total_tokens = Some(38);
+            }
+            let mut session = Session::new(scenario, "model");
+            session.add_message(Message::user("Answer the original request."));
+            let mut state = e2e_loop_state(scenario);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(llm),
+                tools.clone(),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(
+                requests.len(),
+                1 + usize::from(retry.is_some()),
+                "{scenario}"
+            );
+            let first: Value = requests[0].body_json().unwrap();
+            if scenario == "unset-effort" {
+                assert!(first.get("thinking").is_none());
+                assert!(first.pointer("/output_config/effort").is_none());
+            }
+            if retry.is_some() {
+                let second: Value = requests[1].body_json().unwrap();
+                let mut expected = first.clone();
+                expected["output_config"]["effort"] = json!("low");
+                assert_eq!(second, expected);
+            }
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+            let mut answer_tokens = String::new();
+            let mut saw_reasoning_progress = false;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    AgentEvent::Token { content } => answer_tokens.push_str(&content),
+                    AgentEvent::ReasoningToken { content } => {
+                        saw_reasoning_progress |= content.contains(reasoning_progress);
+                    }
+                    AgentEvent::ToolStart { .. } => panic!("unexpected tool start in {scenario}"),
+                    _ => {}
+                }
+            }
+            assert_eq!(saw_reasoning_progress, scenario != "truncated-tool");
+            if succeeds {
+                assert!(result.unwrap(), "{scenario}");
+                let last = session.messages.last().unwrap();
+                assert_eq!(last.content, "The recovered answer.");
+                assert_eq!(answer_tokens, last.content);
+                assert!(last.reasoning.is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(AgentError::OutputTokenLimit {
+                            finish_reason: "max_tokens",
+                            ..
+                        })
+                    ),
+                    "{scenario}: {result:?}"
+                );
+                assert_eq!(
+                    session.messages.last().unwrap().content,
+                    "Answer the original request."
+                );
+                assert!(answer_tokens.is_empty());
+            }
+            let round = &state.runtime_state.round;
+            assert_eq!(
+                round.total_prompt_tokens,
+                if retry.is_some() { 62 } else { 31 }
+            );
+            assert_eq!(
+                round.total_completion_tokens,
+                if succeeds {
+                    10
+                } else if retry.is_some() {
+                    14
+                } else if scenario == "missing-output-usage" {
+                    first["max_tokens"].as_u64().unwrap()
+                } else {
+                    7
+                },
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_responses_incomplete_accounts_usage_and_never_dispatches_truncated_tools() {
+        use bamboo_domain::ReasoningEffort;
+        use serde_json::{json, Value};
+        use wiremock::matchers::{body_partial_json, method, path};
+        use wiremock::{Mock, MockServer};
+
+        let recovery = mock_completion_sse(&[json!({
+            "type":"response.completed",
+            "response":{"id":"resp_answer","status":"completed","usage":{"input_tokens":29,"output_tokens":3},
+                "output":[{"id":"msg_answer","type":"message","content":[{"type":"output_text","text":"Recovered"}]}]}
+        })]);
+        for (scenario, recover) in [("responses-recovery", true), ("responses-truncated", false)] {
+            let server = MockServer::start().await;
+            let prefix = if recover {
+                json!({"type":"response.reasoning_summary_text.delta","item_id":"rs_limit","delta":"Reasoning progress"})
+            } else {
+                json!({"type":"response.output_text.delta","item_id":"msg_partial","delta":"Partial answer"})
+            };
+            let output = if recover {
+                json!([{"id":"rs_limit","type":"reasoning","summary":[]}])
+            } else {
+                json!([{"id":"fc_partial","type":"function_call","call_id":"call_partial",
+                        "name":"fixture_tool","arguments":"{"}])
+            };
+            let limited = mock_completion_sse(&[
+                prefix,
+                json!({"type":"response.incomplete",
+                    "response":{"id":"resp_limited","status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"},"output":output,
+                        "usage":{"input_tokens":29,"output_tokens":11,
+                                 "output_tokens_details":{"reasoning_tokens":10}}}}),
+            ]);
+            Mock::given(method("POST"))
+                .and(path("/responses"))
+                .and(body_partial_json(json!({"reasoning":{"effort":"max"}})))
+                .respond_with(limited)
+                .expect(1)
+                .mount(&server)
+                .await;
+            if recover {
+                Mock::given(method("POST"))
+                    .and(path("/responses"))
+                    .and(body_partial_json(json!({"reasoning":{"effort":"low"}})))
+                    .respond_with(recovery.clone())
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            let llm = bamboo_llm::OpenAIProvider::new("test-key")
+                .with_base_url(server.uri())
+                .with_responses_only_models(vec!["model".into()])
+                .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
+            let tools = Arc::new(OutputLimitExecutor::default());
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = canonical_usage_pipeline_config();
+            config.app_data_dir = Some(dir.path().into());
+            config.reasoning_effort = Some(ReasoningEffort::Max);
+            let mut session = Session::new(scenario, "model");
+            session.add_message(Message::user("Answer the original request."));
+            session
+                .metadata
+                .insert("responses.previous_response_id".into(), "resp_prior".into());
+            let mut state = e2e_loop_state(scenario);
+            let (tx, mut rx) = tokio::sync::mpsc::channel(128);
+            let result = super::run_pipeline(
+                &mut session,
+                &tx,
+                Arc::new(llm),
+                tools.clone(),
+                &CancellationToken::new(),
+                &config,
+                &mut state,
+            )
+            .await;
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), if recover { 2 } else { 1 });
+            assert_eq!(tools.0.load(Ordering::SeqCst), 0);
+            let mut discarded = None;
+            let mut visible = None;
+            while let Ok(event) = rx.try_recv() {
+                match event {
+                    AgentEvent::VisibleMessageStart { message_id, .. } => {
+                        visible = Some(message_id)
+                    }
+                    AgentEvent::VisibleMessageDiscard { message_id } => {
+                        discarded = Some(message_id)
+                    }
+                    AgentEvent::ToolStart { .. } => panic!("truncated Responses tool started"),
+                    _ => {}
+                }
+            }
+            if recover {
+                assert!(result.unwrap());
+                let mut expected: Value = requests[0].body_json().unwrap();
+                expected["reasoning"]["effort"] = json!("low");
+                assert_eq!(requests[1].body_json::<Value>().unwrap(), expected);
+                let last = session.messages.last().unwrap();
+                assert_eq!(last.content, "Recovered");
+                assert!(last.reasoning.is_none());
+                assert!(discarded.is_none());
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(AgentError::OutputTokenLimit {
+                            finish_reason: "max_output_tokens",
+                            response_id: Some(ref id),
+                            reasoning_only: false,
+                        }) if id == "resp_limited"
+                    ),
+                    "{result:?}"
+                );
+                assert_eq!(
+                    session.messages.last().unwrap().content,
+                    "Answer the original request."
+                );
+                assert_eq!(
+                    session.metadata["responses.previous_response_id"],
+                    "resp_prior"
+                );
+                assert!(visible.is_some());
+                assert_eq!(discarded, visible);
+            }
+            let round = &state.runtime_state.round;
+            assert_eq!(round.total_prompt_tokens, if recover { 58 } else { 29 });
+            assert_eq!(round.total_completion_tokens, if recover { 14 } else { 11 });
+        }
+    }
+
     #[tokio::test]
     async fn pipeline_post_llm_hook_abort_retains_usage_in_terminal_metrics_and_runtime() {
         let session_id = "canonical-post-llm-abort";
@@ -10853,80 +11277,7 @@ mod tests {
     }
 
     #[test]
-    fn planner_artifact_reads_preserve_child_spawn_budget_but_creates_exhaust_it() {
-        use crate::runtime::stream::handler::StreamHandlingOutput;
-
-        let call = |arguments: serde_json::Value| bamboo_agent_core::tools::ToolCall {
-            id: "plan-budget".into(),
-            tool_type: "function".into(),
-            function: bamboo_agent_core::tools::FunctionCall {
-                name: "Plan".into(),
-                arguments: arguments.to_string(),
-            },
-        };
-        let mut output = StreamHandlingOutput {
-            response_id: None,
-            visible_message: None,
-            content: String::new(),
-            reasoning_content: String::new(),
-            reasoning_signature: None,
-            token_count: 0,
-            tool_calls: [0, 512, 1024]
-                .into_iter()
-                .map(|offset| {
-                    call(serde_json::json!({
-                        "action":"read", "child_session_id":"existing-planner",
-                        "expected_child_created_at":"2026-10-26T00:00:00Z",
-                        "expected_assignment_sha256":"a".repeat(64),
-                        "revision":"b".repeat(64), "section_id":"s1", "offset":offset
-                    }))
-                })
-                .collect(),
-            output_tokens: 0,
-            thinking_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-            provider_usage: None,
-            input_tokens: 0,
-            provider_transcript_items: Vec::new(),
-        };
-        let mut reads = super::RoundActivity::default();
-        let usage = crate::runtime::runner::round_lifecycle::canonical_attempt_usage(&output, 0, 0);
-        reads.absorb_attempt(&output, usage);
-        reads.absorb_attempt(&output, usage);
-        let mut runtime = AgentRuntimeState::default();
-        reads.commit_to_runtime(&mut runtime);
-        assert_eq!(
-            runtime.round.total_tool_calls, 6,
-            "reads still count as tools"
-        );
-        assert_eq!(runtime.round.total_subagents_spawned, 0);
-        let budget = bamboo_config::RunBudgetConfig {
-            max_subagents: Some(2),
-            ..Default::default()
-        };
-        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
-
-        output.tool_calls = vec![call(
-            serde_json::json!({"action":"create","task":"Plan only"}),
-        )];
-        let mut create = super::RoundActivity::default();
-        create.absorb_attempt(&output, usage);
-        create.commit_to_runtime(&mut runtime);
-        assert_eq!(runtime.round.total_subagents_spawned, 1);
-        assert!(check_run_budget_exceeded(&runtime.round, &budget).is_none());
-        create.commit_to_runtime(&mut runtime);
-        let exceeded = check_run_budget_exceeded(&runtime.round, &budget).unwrap();
-        assert_eq!(exceeded.kind, "max_subagents");
-        assert_eq!(exceeded.actual, 2);
-        for arguments in [r#"{"task":"legacy create"}"#, "{"] {
-            output.tool_calls[0].function.arguments = arguments.into();
-            assert!(is_child_spawn_call(&output.tool_calls[0]));
-        }
-    }
-
-    #[test]
-    fn is_child_spawn_call_counts_plan_and_subagent_create_only() {
+    fn is_child_spawn_call_counts_subagent_creates_only() {
         let call = |name: &str, arguments: &str| bamboo_agent_core::tools::ToolCall {
             id: "id".to_string(),
             tool_type: "function".to_string(),
@@ -10936,8 +11287,8 @@ mod tests {
             },
         };
         assert!(
-            is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
-            "a default Plan call creates one planner child"
+            !is_child_spawn_call(&call("Plan", r#"{"task":"design it"}"#)),
+            "a retired Plan call cannot consume child capacity"
         );
         assert!(
             is_child_spawn_call(&call("SubAgent", r#"{"action":"create","prompt":"x"}"#)),
@@ -10962,6 +11313,17 @@ mod tests {
             !is_child_spawn_call(&call("Bash", r#"{"action":"create"}"#)),
             "a differently named tool is never counted, regardless of args"
         );
+        assert!(is_child_spawn_call(&call(
+            "SubAgent",
+            r#"{"message":"Read only","role":"explorer"}"#,
+        )));
+        for args in [
+            r#"{"intent":"inspect","target":"child","message":"result"}"#,
+            r#"{"intent":"wait","target":"child"}"#,
+            r#"{"intent":"chat","target":"child","message":"Continue"}"#,
+        ] {
+            assert!(!is_child_spawn_call(&call("SubAgent", args)), "{args}");
+        }
     }
 
     #[test]

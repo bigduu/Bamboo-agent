@@ -54,10 +54,9 @@ impl RootThinkingMode {
 /// Exact execution identities admitted for an orchestration-only Root.
 /// Unknown tools, external providers, and legacy aliases do not enter this
 /// list; callers first resolve a registered execution identity.
-pub const ROOT_ORCHESTRATION_TOOLS: [&str; 18] = [
+pub const ROOT_ORCHESTRATION_TOOLS: [&str; 17] = [
     "SubAgent",
     "spawn_session",
-    "Plan",
     "Task",
     "session_history_current",
     "session_history",
@@ -83,10 +82,9 @@ pub fn orchestration_only_allows_execution_name(execution_name: &str) -> bool {
 /// These are delegation or bounded business views, never raw workspace/file,
 /// process, Skill, Workflow or external-provider execution. Concrete Session
 /// ports still require their live Host instance proof; names grant nothing.
-pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 15] = [
+pub const SUPERVISOR_ORCHESTRATION_TOOLS: [&str; 14] = [
     "SubAgent",
     "spawn_session",
-    "Plan",
     "Task",
     "session_history_current",
     "session_history",
@@ -296,19 +294,14 @@ mod tests {
                 "mcp__vendor__Read",
                 "default::Read",
                 "vendor::Read",
+                "Plan",
             ] {
                 assert!(
                     !restored.allows_model_tool_execution(name),
                     "Supervisor mode={ultra} must delegate {name}"
                 );
             }
-            for name in [
-                "SubAgent",
-                "Plan",
-                "Task",
-                "session_control",
-                "session_history",
-            ] {
+            for name in ["SubAgent", "Task", "session_control", "session_history"] {
                 assert!(restored.allows_model_tool_execution(name), "{name}");
             }
             let child = Session::new_child_of("worker", &restored, "model", "worker");

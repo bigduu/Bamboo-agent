@@ -1838,7 +1838,7 @@ const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
     "assignment_prompt",
     "clarification_resume_pending",
     "conclusion_with_options_resume_pending",
-    "created_by_connect_key",
+    bamboo_domain::CONNECT_SESSION_ORIGIN_KEY,
     "created_by_schedule_id",
     "disabled_tools",
     "external_memory_rendered",
@@ -8094,6 +8094,14 @@ impl Storage for SessionStoreV2 {
             .await
     }
 
+    async fn load_current_user_peer_session(
+        &self,
+        caller: &bamboo_domain::SessionCallerReference,
+        target_id: &str,
+    ) -> io::Result<Session> {
+        self.current_user_peer_session(caller, target_id).await
+    }
+
     async fn load_host_scoped_context_target(
         &self,
         token: &bamboo_domain::HostSessionScopeToken,
@@ -8804,6 +8812,26 @@ impl Storage for SessionStoreV2 {
     async fn load_runtime_control_plane(&self, session_id: &str) -> io::Result<Option<Session>> {
         let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
         self.load_runtime_control_plane_unchecked(session_id).await
+    }
+
+    async fn first_root_lifetime_matches(
+        &self,
+        session_id: &str,
+        birth_token: &str,
+    ) -> io::Result<bool> {
+        let _lifecycle = self.lock_session_lifecycle_shared().await?;
+        let _runtime_task = self.lock_runtime_task_sidecar_shared().await?;
+        if self.root_revocation(session_id).await?.is_some() {
+            return Ok(false);
+        }
+        Ok(self
+            .load_runtime_control_plane_unchecked(session_id)
+            .await?
+            .is_some_and(|root| {
+                root.id == session_id
+                    && root.kind == SessionKind::Root
+                    && root.root_mode_birth_token() == birth_token
+            }))
     }
 
     async fn recover_task_control_plane_transaction(

@@ -20,9 +20,24 @@ catalog or retained permission approval does not override it. It grants no
 identity: canonical Supervisor incarnation and concrete Host Session ports
 remain required. Ordinary Roots and children keep their own existing policy.
 
-Bounded Session/Work views and exact runtime-owned Plan artifact sections are
-business observations, not general filesystem paths. #2304 retains its existing
-read-only Planner Child, immutable revision and durable result/auto-resume path.
+Bounded Session and Work views expose business observations. Previously created
+Planner Children keep their immutable revisions and durable result delivery
+from #2304. SubAgent inspection can read the saved Child result.
+
+## Ordinary Root history reads
+
+An executing ordinary Root can use `session_history.inspect` for saved progress
+and `session_history.read_messages` for visible dialogue from an ordinary Session
+in the same application user-data domain. Both actions take a target Session ID.
+Message pages include archived dialogue and preserve the persisted order.
+
+The canonical Store verifies the original caller and target under its existing
+lifecycle and ancestry locks. An installed finite Host scope takes precedence
+for ordinary callers. Children and Observers use their existing scoped routes.
+Connect chats remain bound to their external sender and use finite Host scope
+for peer inspection. The Store checks their durable origin before allowing an
+application-user read. The cross-Session reader returns user and assistant text
+and has read-only access.
 
 ## Default management and legacy migration
 

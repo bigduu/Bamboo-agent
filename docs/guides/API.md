@@ -222,7 +222,7 @@ activation receipt is not terminal completion.
 Root sessions can also select `"root_orchestration_only": true`. This durable
 execution mode supplies the same delegation guidance even when
 `root_orchestration_prompt` is unset. It limits the Root to these exact tool
-execution identities: `SubAgent`, `Plan`, `Task`, `session_history_current`,
+execution identities: `SubAgent`, `Task`, `session_history_current`,
 `session_message`, `Read`, `Grep`, `Glob`, `GetFileInfo`, `ViewImage`,
 `work_overview`, `work_search`, `work_inspect`, `work_changes`, `work_update`,
 and `work_dispatch`. Exposure still follows configuration and each tool's live

@@ -533,7 +533,6 @@ impl Fixture {
         // observation of this Supervisor's authority.
         for execution_name in [
             "SubAgent",
-            "Plan",
             "Task",
             "work_overview",
             "work_search",
@@ -550,6 +549,7 @@ impl Fixture {
             );
         }
         for execution_name in [
+            "Plan",
             "Read",
             "Grep",
             "Glob",

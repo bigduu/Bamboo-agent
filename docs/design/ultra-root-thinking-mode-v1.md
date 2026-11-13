@@ -33,8 +33,8 @@ The existing birth token, terminal epoch/receipt and dispatch fences are kept.
 
 ## Delegated execution evidence and limits
 
-The focused acceptance uses the production server and Root runner, Plan tool,
-wait-before-enqueue scheduler, actor provisioning and real `bamboo subagent-worker`
+The focused acceptance uses the production server and Root runner, SubAgent,
+the durable Child wait, actor provisioning and a real `bamboo subagent-worker`
 with `BambooRuntime`. Only the model endpoint is a loopback scripted SSE server.
 It observes an actual worker provider request while the Root durably waits,
 then permits the child to finish and observes Root resume/synthesis. It also
@@ -47,6 +47,6 @@ reach the worker: that pre-existing propagation gap is tracked in #1346.
 
 Ultra guidance reuses existing tools; it does not enforce a persistent N-agent,
 Plan or Review stage gate for every task. Required user goals, constraints and
-acceptance criteria remain part of the assignment. Existing unsupported Plan
-executor/placement routes fail closed; this slice adds no native Ultra, remote
+acceptance criteria remain part of the assignment. Unsupported Child
+executor and placement routes fail closed; this slice adds no native Ultra, remote
 propagation, new role, ContextPacket or lifecycle/recovery protocol.

@@ -1,6 +1,6 @@
 //! Host-wired model entry: an independent Root is not a SubAgent child.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use actix_web::{http::StatusCode, test, web, App};
 
@@ -9,12 +9,15 @@ use bamboo_agent_core::tools::{
     ToolError, ToolExecutionContext, ToolOutcome,
 };
 use bamboo_domain::{
-    RootModeOperationAction, RootModeOperationRequest, SessionCallerReference, SessionKind,
-    SupervisorReference,
+    ActorActivationStatus, ActorDirectoryPort, RootModeOperationAction, RootModeOperationRequest,
+    SessionCallerReference, SessionInboxPort, SessionKind, SessionMessageId, SupervisorReference,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
+use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
 use bamboo_tools::permission::{PermissionMatcher, PermissionMatcherKind, PermissionType};
 use serde_json::{json, Value};
+use tokio::{sync::mpsc, time::timeout};
+use tokio_util::sync::CancellationToken;
 
 use super::AppState;
 
@@ -28,14 +31,23 @@ struct Fixture {
 
 impl Fixture {
     async fn new(ultra: bool) -> Self {
+        Self::with_provider(
+            ultra,
+            Config::default(),
+            Arc::new(super::UnconfiguredProvider {
+                message: "no external model is available in this fixture".into(),
+            }),
+        )
+        .await
+    }
+
+    async fn with_provider(ultra: bool, config: Config, provider: Arc<dyn LLMProvider>) -> Self {
         let home = tempfile::tempdir().unwrap();
         let state = web::Data::new(
             Box::pin(AppState::new_with_provider(
                 home.path().to_path_buf(),
-                bamboo_llm::Config::default(),
-                Arc::new(super::UnconfiguredProvider {
-                    message: "no external model is available in this fixture".into(),
-                }),
+                config,
+                provider,
             ))
             .await
             .unwrap(),
@@ -289,6 +301,323 @@ async fn supervisor_standard_creates_independent_root_and_retries_once() {
 #[actix_web::test]
 async fn supervisor_ultra_creates_independent_root_and_retries_once() {
     assert_create_is_independent_and_exact_retry(true).await;
+}
+
+const PARALLEL_ROOT_INPUTS: [&str; 3] = [
+    "Check dispatch alpha.",
+    "Check dispatch beta.",
+    "Check dispatch gamma.",
+];
+
+struct ParallelRootProvider {
+    calls: mpsc::UnboundedSender<String>,
+    release_siblings: CancellationToken,
+}
+
+#[async_trait::async_trait]
+impl LLMProvider for ParallelRootProvider {
+    async fn chat_stream(
+        &self,
+        messages: &[bamboo_agent_core::Message],
+        _tools: &[bamboo_agent_core::tools::ToolSchema],
+        _max_tokens: Option<u32>,
+        _model: &str,
+    ) -> Result<LLMStream, LLMError> {
+        let mut inputs = messages.iter().filter(|message| {
+            message.role == bamboo_agent_core::Role::User
+                && PARALLEL_ROOT_INPUTS
+                    .iter()
+                    .any(|text| message.content.contains(*text))
+        });
+        let input = inputs
+            .next()
+            .expect("the provider receives the dispatched input");
+        assert!(inputs.next().is_none(), "one input per Root provider call");
+        self.calls.send(input.id.clone()).unwrap();
+        if !input.content.contains(PARALLEL_ROOT_INPUTS[2]) {
+            self.release_siblings.cancelled().await;
+        }
+        Ok(Box::pin(futures::stream::iter([
+            Ok(LLMChunk::Token("Dispatch checked.".into())),
+            Ok(LLMChunk::Done),
+        ])))
+    }
+}
+
+#[actix_web::test]
+async fn supervisor_parallel_dispatch_survives_first_input_ack_cleanup_expiry() {
+    let (sent, mut calls) = mpsc::unbounded_channel();
+    let release_siblings = CancellationToken::new();
+    let _release_on_drop = release_siblings.clone().drop_guard();
+    let mut config = Config::default();
+    config.provider = "openai".into();
+    config.providers_mut().openai = Some(bamboo_config::OpenAIConfig {
+        model: Some("dispatch-fixture".into()),
+        ..Default::default()
+    });
+    config
+        .memory_mut()
+        .get_or_insert_with(Default::default)
+        .auto_dream_enabled = false;
+    let provider: Arc<dyn LLMProvider> = Arc::new(ParallelRootProvider {
+        calls: sent,
+        release_siblings: release_siblings.clone(),
+    });
+    let f = Fixture::with_provider(false, config, provider.clone()).await;
+    f.state
+        .provider_registry
+        .replace_with(ProviderRegistry::new(
+            std::collections::HashMap::from([("openai".into(), provider)]),
+            "openai".into(),
+        ));
+    let count = f.state.session_store.list_index_entries().await.len();
+    let mut roots = Vec::new();
+    let wait = Duration::from_secs(20);
+    for input in &PARALLEL_ROOT_INPUTS[..2] {
+        let mut request = f.request(uuid::Uuid::new_v4());
+        request["request"]["message"] = json!(input);
+        roots.push(f.invoke(request).await);
+    }
+    let mut siblings = timeout(wait, async {
+        [calls.recv().await.unwrap(), calls.recv().await.unwrap()]
+    })
+    .await
+    .expect("both sibling Roots enter the provider before the third dispatch");
+    siblings.sort_unstable();
+    let mut expected = roots
+        .iter()
+        .map(|root| root["receipt_id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    expected.sort_unstable();
+    assert_eq!(siblings.as_slice(), expected.as_slice());
+
+    let inbox = f
+        .state
+        .session_inbox
+        .as_any()
+        .unwrap()
+        .downcast_ref::<bamboo_storage::FileSessionInbox>()
+        .unwrap();
+    let expired = inbox.expire_next_root_ack_cleanup_for_testing();
+    let mut request = f.request(uuid::Uuid::new_v4());
+    request["request"]["message"] = json!(PARALLEL_ROOT_INPUTS[2]);
+    let third = f.invoke(request.clone()).await;
+    let id = third["target_session_id"].as_str().unwrap();
+    let receipt = third["receipt_id"].as_str().unwrap();
+    timeout(wait, expired.notified())
+        .await
+        .expect("the real ACK crosses the Inbox lease boundary");
+    assert_eq!(
+        timeout(wait, calls.recv())
+            .await
+            .expect("the third Root reaches the provider"),
+        Some(receipt.to_owned())
+    );
+    let replay = f.invoke(request).await;
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(replay["target_session_id"], id);
+    assert_eq!(replay["receipt_id"], receipt);
+    roots.push(third);
+    release_siblings.cancel();
+
+    for root in &roots {
+        let id = root["target_session_id"].as_str().unwrap();
+        let receipt = root["receipt_id"].as_str().unwrap();
+        let run = f.state.agent_runners.read().await[id].run_id.clone();
+        let actor = timeout(wait, async {
+            loop {
+                let actor = f
+                    .state
+                    .session_store
+                    .inspect_actor(id)
+                    .await
+                    .unwrap()
+                    .activation
+                    .unwrap();
+                if actor.finished_at.is_some()
+                    && f.state
+                        .session_activation_router
+                        .current_run_id(id)
+                        .await
+                        .is_none()
+                {
+                    break actor;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the original Root retires its durable activation");
+        assert_eq!(actor.run_id, run);
+        assert_eq!(actor.status, ActorActivationStatus::Succeeded);
+        assert_eq!(actor.attempt, 1, "one activation for the original Root");
+        let durable = f.state.storage.load_session(id).await.unwrap().unwrap();
+        assert_eq!(
+            durable
+                .messages
+                .iter()
+                .filter(|message| message.id == receipt)
+                .count(),
+            1
+        );
+        assert!(inbox
+            .was_admitted(id, &SessionMessageId::parse(receipt).unwrap())
+            .await
+            .unwrap());
+        let backlog = inbox.inspect(id).await.unwrap();
+        assert_eq!(backlog.pending + backlog.claimed, 0);
+    }
+    assert_eq!(
+        f.state.session_store.list_index_entries().await.len(),
+        count + 3
+    );
+    assert!(
+        calls.try_recv().is_err(),
+        "each dispatch reaches the provider once"
+    );
+    f.state.shutdown().await;
+}
+
+#[actix_web::test]
+async fn supervisor_creates_and_continues_standalone_roots_without_inheriting_a_project_workspace()
+{
+    for ultra in [false, true] {
+        let f = Fixture::new(ultra).await;
+        f.state.config.write().await.default_work_area =
+            Some(bamboo_config::DefaultWorkAreaConfig {
+                path: Some(f.workspace.clone()),
+            });
+        let scope = f.invoke(json!({"action":"scope"})).await;
+        assert_eq!(scope["create_unassigned"], true);
+        let operation = uuid::Uuid::new_v4();
+        let permissions = f.state.permission_checker.permission_config().unwrap();
+        permissions
+            .grant_typed_scoped_session_permission(
+                &f.supervisor.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "standalone-creation".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control create [unassigned] {operation}"),
+                },
+            )
+            .unwrap();
+        let mut request = json!({
+            "operation_id":operation, "expected_state_revision":scope["state_revision"],
+            "message":"Check the installation instructions for a local utility.",
+            "title":"Check local utility installation",
+            "notify_on_material_event":scope["create_material_notifications"]
+        });
+        let count = f.state.session_store.list_index_entries().await.len();
+        let created = if ultra {
+            f.invoke(json!({"action":"create", "request":request.clone()}))
+                .await
+        } else {
+            f.invoke_named("spawn_session", request.clone()).await
+        };
+        assert_eq!(created["admitted"], true);
+        assert!(created["project_id"].is_null());
+        let id = created["target_session_id"].as_str().unwrap();
+        let root = f
+            .state
+            .storage
+            .load_root_authority(id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(root.kind, SessionKind::Root);
+        assert!(root.project_id_meta().is_none());
+        assert!(root.parent_session_id.is_none());
+        assert!(root.authority_identity.is_ordinary());
+        assert_eq!(
+            root.agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .effective_permission_mode(),
+            bamboo_domain::SessionPermissionMode::Bypass
+        );
+        let workspace = f
+            .home
+            .path()
+            .join("workspaces")
+            .join(id)
+            .canonicalize()
+            .unwrap();
+        let workspace = bamboo_config::paths::path_to_display_string(&workspace);
+        assert_eq!(
+            root.workspace_path_meta().as_deref(),
+            Some(workspace.as_str())
+        );
+        assert_ne!(workspace, f.workspace);
+
+        let directory = f
+            .invoke(json!({"action":"directory", "query":"Check local utility installation"}))
+            .await;
+        let entries = directory["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["session_id"], id);
+        assert_eq!(entries[0]["origin"], "supervisor_created");
+        assert_eq!(entries[0]["project_id"], Value::Null);
+
+        request["project_id"] = Value::Null;
+        request["workspace_path"] = Value::Null;
+        let replay = if ultra {
+            f.invoke_named("spawn_session", request).await
+        } else {
+            f.invoke(json!({"action":"create", "request":request}))
+                .await
+        };
+        assert_eq!(replay["target_session_id"], id);
+        assert_eq!(replay["receipt_id"], created["receipt_id"]);
+        assert_eq!(
+            f.state.session_inbox.inspect(id).await.unwrap().generation,
+            1
+        );
+
+        let ToolOutcome::Completed(conflict) = f
+            .dispatch_named("session_control", f.request(operation), true)
+            .await
+            .unwrap()
+        else {
+            panic!("expected exact retry conflict");
+        };
+        assert!(!conflict.success);
+        let conflict: Value = serde_json::from_str(&conflict.result).unwrap();
+        assert_eq!(conflict["code"], "idempotency_conflict");
+
+        let current = f
+            .state
+            .storage
+            .load_root_authority(id)
+            .await
+            .unwrap()
+            .unwrap();
+        let target = bamboo_domain::SupervisorCurrentUserTarget::capture(&current).unwrap();
+        permissions
+            .grant_typed_scoped_session_permission(
+                &f.supervisor.session_id,
+                PermissionType::ExecuteCommand,
+                PermissionMatcher {
+                    id: "standalone-followup".into(),
+                    kind: PermissionMatcherKind::ExactResource,
+                    value: format!("session_control followup {id}"),
+                },
+            )
+            .unwrap();
+        let followup = f
+            .invoke(json!({
+                "action":"followup", "target_session_id":id, "target_ref":target,
+                "operation_id":uuid::Uuid::new_v4(), "message":"Continue the same check."
+            }))
+            .await;
+        assert_eq!(followup["target_session_id"], id);
+        assert_eq!(followup["admitted"], true);
+        assert_eq!(
+            f.state.session_store.list_index_entries().await.len(),
+            count + 1
+        );
+        f.state.shutdown().await;
+    }
 }
 
 async fn assert_v2_spawn_uses_root_port_in_both_modes(ultra: bool) {

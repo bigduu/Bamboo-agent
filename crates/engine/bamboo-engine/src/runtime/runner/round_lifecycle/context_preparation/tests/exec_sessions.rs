@@ -213,6 +213,7 @@ async fn dispatch_and_pull_from_context(
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
+            output_limit_recovery: None,
             max_context_tokens: projected.input_tokens.saturating_sub(block_tokens) + 128,
             max_output_tokens: 128,
             observation_progress_hint: None,
@@ -228,7 +229,7 @@ async fn dispatch_and_pull_from_context(
     assert!(requests.lock().unwrap().is_empty());
     // Exactly fit the projected input plus output reservation. The dynamic
     // snapshot must participate in both projection and the final dispatch gate.
-    let (output, _, _) = execute_llm_stream(
+    let (output, _, _, _completion) = execute_llm_stream(
         session,
         config,
         &llm,
@@ -242,6 +243,7 @@ async fn dispatch_and_pull_from_context(
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
+            output_limit_recovery: None,
             max_context_tokens: projected.input_tokens + 128,
             max_output_tokens: 128,
             observation_progress_hint: None,
@@ -317,6 +319,7 @@ async fn dispatch_and_pull_from_context(
             provider_name: None,
             provider_type: None,
             reasoning_effort: None,
+            output_limit_recovery: None,
             max_context_tokens: projected.input_tokens + 128,
             max_output_tokens: 128,
             observation_progress_hint: None,

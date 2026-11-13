@@ -75,11 +75,12 @@ fn artifact(child: &Session, parent: &Session) -> Result<Artifact, ChildSessionE
     let source = ChildCompletionSource::from_committed_session(child)
         .filter(|source| source.status == "completed" && source.matches_parent(child, parent))
         .ok_or_else(|| invalid("stale_or_uncommitted_source"))?;
-    let message = child
+    let (message_index, message) = child
         .messages
         .iter()
-        .find(|m| Some(&m.id) == source.result_message_id.as_ref())
-        .filter(|m| plain_child_report_message(m))
+        .enumerate()
+        .find(|(_, message)| Some(&message.id) == source.result_message_id.as_ref())
+        .filter(|(_, message)| plain_child_report_message(message))
         .ok_or_else(|| invalid("report_not_current_final"))?;
     if message.content.len() > MAX_REPORT_BYTES {
         return Err(invalid("report_budget_exceeded"));
@@ -148,6 +149,7 @@ fn artifact(child: &Session, parent: &Session) -> Result<Artifact, ChildSessionE
         "assignment_sha256":binding.assignment_sha256,"revision":revision,
         "file":format!("plan/delegated/{revision}.md"),
         "summary":summary,"section_count":sections.len(),
+        "transcript_cursor":super::inspection::initial_message_cursor(&child.id, message_index, message),
         "execution_approved":false,"evidence_is_reported":true,
         "read":{"action":"read","child_session_id":child.id,
             "expected_child_created_at":child.created_at,

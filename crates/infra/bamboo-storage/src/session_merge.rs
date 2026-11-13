@@ -220,6 +220,7 @@ fn reconcile_runtime_checkpoint(
     apply_authoritative_metadata(session, latest);
     adopt_fresher_disk_permission_posture(session, latest);
     let _ = adopt_durable_tagged_child_wait(session, latest);
+    adopt_durable_background_exec_wait(session, latest);
     Ok((appended, adopted_response))
 }
 
@@ -602,6 +603,79 @@ pub(crate) fn adopt_durable_tagged_child_wait(
         }
     }
     Some(registered_at)
+}
+
+/// The handoff notice and wait are committed together. Once that notice exists
+/// in durable history, the monitor owns later clears of that exact wait. A
+/// stale runner checkpoint cannot re-arm it or replace a newer shell wait.
+pub(crate) fn adopt_durable_background_exec_wait(session: &mut Session, latest: &Session) {
+    const EXEC_ID: &str = "runtime.background_exec_id";
+    let (Some(runtime), Some(durable)) = (
+        session.agent_runtime_state.as_mut(),
+        latest.agent_runtime_state.as_ref(),
+    ) else {
+        return;
+    };
+    let Some([handle]) = runtime
+        .waiting_for_bash
+        .as_ref()
+        .map(|wait| wait.bash_ids.as_slice())
+    else {
+        return;
+    };
+    if session.id != latest.id
+        || session.created_at != latest.created_at
+        || runtime.waiting_for_bash == durable.waiting_for_bash
+        || !latest.messages.iter().rev().any(|message| {
+            message.role == bamboo_domain::Role::Assistant
+                && message.metadata.as_ref().is_some_and(|metadata| {
+                    metadata["runtime_kind"] == "background_exec_wait"
+                        && metadata["source"] == "runtime"
+                        && metadata["exec_session_id"] == handle.as_str()
+                })
+        })
+    {
+        return;
+    }
+
+    runtime
+        .waiting_for_bash
+        .clone_from(&durable.waiting_for_bash);
+    if let Some(handle) = latest.metadata.get(EXEC_ID).filter(|handle| {
+        runtime
+            .waiting_for_bash
+            .as_ref()
+            .is_some_and(|wait| matches!(wait.bash_ids.as_slice(), [id] if id == *handle))
+    }) {
+        session.metadata.insert(EXEC_ID.into(), handle.clone());
+    } else {
+        session.metadata.remove(EXEC_ID);
+    }
+    if runtime.waiting_for_bash.is_none() {
+        if session
+            .metadata
+            .get("runtime.suspend_reason")
+            .map(String::as_str)
+            == Some("waiting_for_bash")
+        {
+            session.metadata.remove("runtime.suspend_reason");
+        }
+        if runtime
+            .suspension
+            .as_ref()
+            .is_some_and(|s| s.reason == "waiting_for_bash")
+        {
+            runtime.suspension.clone_from(&durable.suspension);
+            if runtime.status == bamboo_domain::AgentStatusState::Suspended {
+                runtime.status = durable.status;
+            }
+        }
+    }
+    if let Some(mirror) = session.metadata.get_mut("agent.runtime.state") {
+        if let Ok(serialized) = serde_json::to_string(runtime) {
+            *mirror = serialized;
+        }
+    }
 }
 
 /// A synchronous SubAgent tool has already persisted its tagged wait before
@@ -2382,6 +2456,7 @@ impl LockedSessionStore {
             if let Some(registered_at) = adopt_durable_tagged_child_wait(session, latest) {
                 preserve_finalized_hidden_child_resumes(session, latest, registered_at);
             }
+            adopt_durable_background_exec_wait(session, latest);
             adopt_durable_consumed_clarification(session, latest);
             apply_authoritative_metadata(session, latest);
             let restored = bamboo_domain::restore_missing_admitted_inbox_messages(session, latest);
@@ -6493,6 +6568,69 @@ mod tests {
                 .map(String::as_str),
             Some("generation-1")
         );
+    }
+
+    #[tokio::test]
+    async fn finalized_background_exec_snapshot_preserves_a_newer_shell_wait() {
+        use bamboo_domain::{AgentRuntimeState, Message, WaitingForBashState};
+
+        let (_temp, storage) = make_storage().await;
+        let store = LockedSessionStore::new(storage.clone());
+        let mut session = fresh("background-exec-replacement");
+        session.agent_runtime_state = Some(AgentRuntimeState::default());
+        storage.save_session(&session).await.unwrap();
+
+        let mut notice = Message::assistant("Monitoring the command.", None);
+        notice.metadata = Some(serde_json::json!({
+            "runtime_kind": "background_exec_wait",
+            "source": "runtime",
+            "exec_session_id": "old-exec",
+        }));
+        session.add_message(notice);
+        session
+            .metadata
+            .insert("runtime.background_exec_id".into(), "old-exec".into());
+        let original = WaitingForBashState::for_bash(vec!["old-exec".into()], chrono::Utc::now());
+        session
+            .agent_runtime_state
+            .as_mut()
+            .unwrap()
+            .waiting_for_bash = Some(original.clone());
+        store.merge_save_runtime(&mut session).await.unwrap();
+        assert_eq!(
+            session
+                .agent_runtime_state
+                .as_ref()
+                .unwrap()
+                .waiting_for_bash,
+            Some(original)
+        );
+
+        let replacement =
+            WaitingForBashState::for_bash(vec!["new-bash".into()], chrono::Utc::now());
+        store
+            .update_runtime_config(&session.id, |durable| {
+                durable
+                    .agent_runtime_state
+                    .as_mut()
+                    .unwrap()
+                    .waiting_for_bash = Some(replacement.clone());
+                durable.metadata.remove("runtime.background_exec_id");
+            })
+            .await
+            .unwrap()
+            .unwrap();
+
+        store
+            .merge_save_finalized_runtime(&mut session)
+            .await
+            .unwrap();
+        let saved = storage.load_session(&session.id).await.unwrap().unwrap();
+        assert_eq!(
+            saved.agent_runtime_state.unwrap().waiting_for_bash,
+            Some(replacement)
+        );
+        assert!(!saved.metadata.contains_key("runtime.background_exec_id"));
     }
 
     #[tokio::test]

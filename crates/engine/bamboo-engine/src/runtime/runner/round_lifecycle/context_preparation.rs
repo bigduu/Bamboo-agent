@@ -560,14 +560,14 @@ fn emit_context_pressure_notification(
             "Context window is critically full (~{pct:.0}%). Retrieval-window archival is \
              imminent: older complete turns will be archived exactly and remain recoverable \
              through session_history_current. Use session_note for concise live decisions, \
-             paths, progress, and blockers. Do not copy raw transcript into Project or Global \
-             memory."
+             paths, progress, and blockers. Do not copy raw transcript into \
+             durable memory."
         ),
         (ContextManagementStrategy::RetrievalWindow, _) => format!(
             "Context window filling up (~{pct:.0}%). Retrieval-window management will archive \
              older complete turns exactly; recover them through session_history_current. Use \
              session_note for concise live decisions, paths, progress, and blockers. Do not \
-             copy raw transcript into Project or Global memory."
+             copy raw transcript into durable memory."
         ),
         (ContextManagementStrategy::Summary, "critical") => format!(
             "Context window is critically full (~{pct:.0}%). Auto-compression is imminent. \

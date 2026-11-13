@@ -21,7 +21,7 @@ const MAX_COMMAND_BYTES: usize = 64 * 1024;
 const QUIET_POLL_ADVISORY_AFTER: Duration = Duration::from_secs(90);
 const QUIET_POLL_ADVISORY_READOUTS: usize = 3;
 const QUIET_POLL_DIAGNOSIS_READOUTS: usize = 6;
-const QUIET_POLL_ADVISORY: &str = "No new output across repeated polls. Do other useful work or check a command-owned progress signal before polling again. Quiet output or an existing report does not prove completion. Continue waiting when appropriate, or report the concrete blocker; retain this handle for the final status.";
+const QUIET_POLL_ADVISORY: &str = "No new output across repeated polls. If you need the exit result, use this session_id with an empty write_stdin and request a longer wait. Investigate a concrete failure when one is visible.";
 
 #[derive(Debug, Clone)]
 struct CapturedOutput {
@@ -621,7 +621,7 @@ impl Tool for ExecCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command and wait up to yield_time_ms. A running command returns a session_id and polling progress; continue other work, then call write_stdin with that ID and empty chars to retrieve incremental output and its final exit code. Follow a quiet polling advisory before repeating empty polls; silence does not prove completion. Completion is delivered through these tool results. interactive=true keeps a stdin pipe open for later input; this is a pipe, not a terminal/PTY. Output is bounded and reports omitted bytes."
+        "Run a shell command and wait up to yield_time_ms. Keep builds and tests you need to verify attached to this call. A running command returns a session_id. Use empty write_stdin on that handle to wait for output and the exit code. Preserve the command's own exit status when piping test output. interactive=true keeps a stdin pipe open for input. Output is bounded and reports omitted bytes."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

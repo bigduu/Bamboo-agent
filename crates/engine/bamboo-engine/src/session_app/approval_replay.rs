@@ -1435,6 +1435,7 @@ mod tests {
                 "write_stdin",
                 "load_skill",
                 "workflow_run",
+                "Plan",
             ] {
                 assert_eq!(
                     refresh_approval_replay_posture(
@@ -1449,7 +1450,7 @@ mod tests {
                     "{ultra}: {name}"
                 );
             }
-            for name in ["Plan", "SubAgent", "session_control"] {
+            for name in ["SubAgent", "session_control"] {
                 assert!(
                     matches!(
                         refresh_approval_replay_posture(

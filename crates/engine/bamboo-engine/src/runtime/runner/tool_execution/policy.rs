@@ -254,6 +254,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ToolPolicyPrecheckViolation {
+    StandaloneSpawnArguments(&'static str),
     RoundToolLimit {
         limit: usize,
         tool_name: String,
@@ -273,6 +274,7 @@ impl ToolPolicyPrecheckViolation {
 
     pub(super) fn into_message(self) -> String {
         match self {
+            Self::StandaloneSpawnArguments(message) => message.into(),
             Self::RoundToolLimit { limit, tool_name } => format!(
                 "Tool policy blocked '{}': per-round tool call limit ({limit}) reached",
                 tool_name
@@ -300,6 +302,7 @@ pub(crate) struct ToolPolicyGuard {
     executed_calls: usize,
     consecutive_failures: HashMap<ToolCircuitKey, usize>,
     observation_progress: ObservationProgress,
+    pub(super) standalone_supervisor_spawn: bool,
     pub(super) child_inspections: super::child_inspection::ChildInspectionProgress,
     pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
     progress_feedback: super::progress_feedback::ProgressFeedbackBudget,
@@ -316,6 +319,7 @@ impl ToolPolicyGuard {
             executed_calls: 0,
             consecutive_failures: HashMap::new(),
             observation_progress: ObservationProgress::default(),
+            standalone_supervisor_spawn: false,
             child_inspections: super::child_inspection::ChildInspectionProgress::default(),
             quiet_polls: super::quiet_poll::QuietPollGuard::default(),
             progress_feedback: super::progress_feedback::ProgressFeedbackBudget::default(),
@@ -333,6 +337,10 @@ impl ToolPolicyGuard {
         // Preserve each SubAgent circuit across model turns. Other tools keep
         // their existing per-round circuit behavior.
         self.consecutive_failures.retain(|key, _| key.run_scoped());
+    }
+
+    pub(crate) fn set_supervisor_spawn_route(&mut self, standalone: bool) {
+        self.standalone_supervisor_spawn = standalone;
     }
 
     pub(crate) fn delegation_failure_message(&self) -> Option<String> {
@@ -374,6 +382,36 @@ impl ToolPolicyGuard {
     /// Exact trusted handle, before the feedback packet shortens display IDs.
     pub(crate) fn quiet_command_for_background(&self) -> Option<&str> {
         self.quiet_polls.pending_handle()
+    }
+
+    /// Only the provider boundary's newly admitted Inbox records are eligible.
+    pub(crate) fn observe_background_exec_completion<'a>(
+        &mut self,
+        session_id: &str,
+        message: &'a bamboo_agent_core::Message,
+    ) -> Option<&'a str> {
+        let envelope = message.metadata.as_ref()?.get("session_message")?;
+        let body = &envelope["body"];
+        let data = &body["data"];
+        let handle = data["exec_session_id"].as_str()?;
+        if envelope["source"]["type"] == "runtime"
+            && envelope["source"]["subsystem"] == "background_exec"
+            && envelope["kind"] == "runtime_instruction"
+            && envelope["target_session_id"] == session_id
+            && envelope["correlation_id"] == handle
+            && body["instruction"] == "background_exec_completed"
+            && data["session_id"] == session_id
+            && matches!(
+                data["status"].as_str(),
+                Some("completed" | "killed" | "error")
+            )
+        {
+            self.quiet_polls.forget_handle(handle);
+            self.progress_feedback.observe_exec_completion(handle);
+            Some(handle)
+        } else {
+            None
+        }
     }
 
     /// Consume one completed batch. Only actual raw evidence can end a recovery
@@ -446,6 +484,13 @@ impl ToolPolicyGuard {
                 limit: self.max_consecutive_failures_per_tool,
                 run_scoped: key.run_scoped(),
             });
+        }
+
+        if self.standalone_supervisor_spawn && admitted_execution_name == Some("spawn_session") {
+            bamboo_orchestration::managed_session::validate_standalone_spawn_arguments(
+                &tool_call.function.arguments,
+            )
+            .map_err(ToolPolicyPrecheckViolation::StandaloneSpawnArguments)?;
         }
 
         Ok(())

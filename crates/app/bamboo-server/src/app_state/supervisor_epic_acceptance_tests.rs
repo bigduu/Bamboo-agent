@@ -19,7 +19,7 @@ use bamboo_domain::{
     SessionPermissionMode, SupervisorReference,
 };
 use bamboo_engine::session_app::child_session::{
-    create_child_action, ChildSessionPort, CreateChildInput,
+    create_child_action, planner_artifact, ChildSessionPort, CreateChildInput,
 };
 use bamboo_engine::session_app::supervisor::SupervisorSessionService;
 use bamboo_llm::{Config, LLMChunk, LLMError, LLMProvider, LLMStream, ProviderRegistry};
@@ -44,6 +44,7 @@ const WORKER: &str = "epic-original-worker";
 const BLOCKED_MODEL: &str = "epic-original-blocked-worker";
 const QUESTION_TOOL: &str = "epic_fixture_ask_user";
 const OBSERVER: &str = "epic-fixed-tracker";
+const SAVED_PLANNER: &str = "epic-saved-planner";
 const ROOT_A: &str = "epic-existing-a";
 const ROOT_B: &str = "epic-existing-b";
 const CONTROL_ROOT: &str = "epic-negative-control";
@@ -308,30 +309,23 @@ impl Probe {
             assert_eq!(reference["available"], true);
             assert_eq!(reference["execution_approved"], false);
             let prefix = if cold { "epic-cold" } else { "epic-plan" };
-            let index_id = format!("{prefix}-index");
-            let section_id = format!("{prefix}-section");
+            let result_id = format!("{prefix}-result");
             let followup_id = format!("{prefix}-followup");
-            let read = reference["read"].clone();
-            let Some(index) = tool_json(messages, &index_id) else {
-                return call("Plan", &index_id, read);
+            assert_eq!(reference["read"]["child_session_id"], SAVED_PLANNER);
+            let Some(result) = tool_json(messages, &result_id) else {
+                return call(
+                    "SubAgent",
+                    &result_id,
+                    json!({
+                        "intent":"inspect", "target":SAVED_PLANNER,
+                        "message":json!({"view":"message", "cursor":reference["transcript_cursor"]}).to_string()
+                    }),
+                );
             };
-            let Some(section) = tool_json(messages, &section_id) else {
-                let section = index["sections"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .find(|section| section["heading"] == "Chosen action")
-                    .unwrap()["id"]
-                    .clone();
-                let mut read = read;
-                read["section_id"] = section;
-                read["max_bytes"] = json!(512);
-                return call("Plan", &section_id, read);
-            };
-            assert!(section["text"]
-                .as_str()
-                .unwrap()
-                .contains("EPIC_SELECTED_ACTION"));
+            let text = result["text"].as_str().unwrap();
+            assert!(text.contains("EPIC_SELECTED_ACTION"));
+            assert!(!text.contains(APPENDIX));
+            assert!(result["next_cursor"].as_str().is_some());
             if tool_json(messages, &followup_id).is_none() {
                 return call(
                     "session_control",
@@ -345,21 +339,10 @@ impl Probe {
         }
         if messages.iter().any(|m| m.content.contains(BLOCKER)) {
             if !self.plan_started.swap(true, Ordering::SeqCst) {
-                let user = messages
-                    .iter()
-                    .find(|m| m.content == USER)
-                    .expect("canonical accepted user input");
                 return call(
-                    "Plan",
-                    "epic-create-plan",
-                    json!({
-                    "task":"Read source.txt and plan the explicitly authorized bounded Root B followup. Do not implement.",
-                    "context_packet":{"version":1,"objective":"Return a bounded plan for the original Root B",
-                        "constraints":["Preserve both original Roots and Root A pending question"],
-                        "acceptance":["Return a versioned plan with a selected action section"],
-                        "non_goals":["No implementation or approval by the planner"],
-                        "necessary_user_instructions":[],"recorded_decisions":[BLOCKER],
-                        "source_user_message_ids":[user.id],"background_message_ids":[]}}),
+                    "SubAgent",
+                    "epic-wait-plan",
+                    json!({"intent":"wait","target":SAVED_PLANNER}),
                 );
             }
             return LLMChunk::Token(DURING_PLAN.into());
@@ -537,7 +520,8 @@ impl Probe {
             "reported_evidence":[{"description":"Read source.txt in this isolated workspace","reference":"source.txt","sha256":null}],
             "reported_verification":[{"check":"implementation","reported_status":"not_run","details":"planning only"}],
             "proposals":[],"blockers":[],"open_decisions":[],"plan_markdown":format!(
-                "# Root B plan\n## Chosen action\nEPIC_SELECTED_ACTION: perform the authorized bounded followup.\n## Appendix\n{}",
+                "# Root B plan\n## Chosen action\nEPIC_SELECTED_ACTION: perform the authorized bounded followup.\n## Appendix\n{}{}",
+                "Retained appendix text. ".repeat(200),
                 format!("{APPENDIX} ").repeat(1000))}).to_string())
     }
 }
@@ -601,7 +585,7 @@ impl LLMProvider for Probe {
                 assert!(
                     !tools.iter().any(|tool| matches!(
                         tool.function.name.as_str(),
-                        "Read" | "Write" | "Bash" | "exec_command"
+                        "Read" | "Write" | "Bash" | "exec_command" | "Plan"
                     )),
                     "Supervisor provider catalog must require delegation"
                 );
@@ -886,11 +870,12 @@ fn context_identity(session: &Session) -> Value {
 #[tokio::test]
 async fn two_project_tracker_planner_followup_and_restart_preserve_original_authority() {
     let home = tempfile::tempdir().unwrap();
-    let workspace = home.path().join("supervisor-workspace");
+    let home_path = home.path().canonicalize().unwrap();
+    let workspace = home_path.join("supervisor-workspace");
     std::fs::create_dir(&workspace).unwrap();
     std::fs::write(workspace.join("source.txt"), "EPIC_SOURCE_EVIDENCE\n").unwrap();
     let probe = Arc::new(Probe::new(workspace.clone()));
-    let state = host(home.path(), probe.clone()).await;
+    let state = host(&home_path, probe.clone()).await;
     let service = SupervisorSessionService::new(state.session_store.clone());
     let receipt = service.get_or_create_default(PARENT).await.unwrap();
     let reference = SupervisorReference::from(&receipt);
@@ -907,7 +892,7 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     state.storage.save_session(&parent).await.unwrap();
     for (id, private) in [(ROOT_A, PRIVATE_A), (ROOT_B, PRIVATE_B)] {
         let project = state.project_store.create(id, None).unwrap();
-        let directory = home.path().join(id);
+        let directory = home_path.join(id);
         std::fs::create_dir(&directory).unwrap();
         let model = if id == ROOT_A { BLOCKED_MODEL } else { WORKER };
         let mut root = Session::new(id, model);
@@ -922,7 +907,7 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         root.add_message(Message::user(private));
         state.storage.save_session(&root).await.unwrap();
         if id == ROOT_A {
-            let control_workspace = home.path().join(CONTROL_ROOT);
+            let control_workspace = home_path.join(CONTROL_ROOT);
             std::fs::create_dir(&control_workspace).unwrap();
             let mut control = Session::new(CONTROL_ROOT, WORKER);
             control.set_project_id_meta(project.id.to_string());
@@ -1056,16 +1041,72 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         .waiting_for_children
         .is_none());
     assert_eq!(probe.worker_calls.load(Ordering::SeqCst), 0);
+
+    // A planner admitted before tool retirement can still finish through the
+    // normal Child scheduler, durable wait and result publication.
+    let source_user = idle.messages.iter().find(|m| m.content == USER).unwrap();
+    let mut planner_metadata = creator.resolve_runtime_metadata("planner").await;
+    planner_metadata.insert(
+        bamboo_domain::CHILD_PACKET_INPUT_KEY.into(),
+        json!({"version":1,"objective":"Return a bounded plan for the original Root B",
+            "constraints":["Preserve both original Roots and Root A pending question"],
+            "acceptance":["Return a versioned plan with a selected action section"],
+            "non_goals":["No implementation or approval by the planner"],
+            "necessary_user_instructions":[],"recorded_decisions":[],
+            "source_user_message_ids":[source_user.id],"background_message_ids":[]})
+        .to_string(),
+    );
+    planner_metadata.insert(
+        planner_artifact::CONTRACT_KEY.into(),
+        planner_artifact::CONTRACT_VERSION.into(),
+    );
+    let (child_workspace, workspace_source) =
+        creator.resolve_child_workspace(&idle, None).await.unwrap();
+    create_child_action(
+        &creator,
+        CreateChildInput {
+            parent_session: idle,
+            child_id: SAVED_PLANNER.into(),
+            title: "Retained planner".into(),
+            responsibility: "Return a bounded plan for the original Root B".into(),
+            assignment_prompt: format!(
+                "Read source.txt. Propose the authorized Root B followup.\n{}",
+                planner_artifact::REPORT_INSTRUCTION
+            ),
+            subagent_type: "planner".into(),
+            workspace: child_workspace,
+            workspace_source,
+            model_override: None,
+            model_ref_override: Some(ProviderModelRef::new(PROVIDER, PLANNER)),
+            runtime_metadata: planner_metadata,
+            read_only: true,
+            auto_run: false,
+            reasoning_effort: None,
+            lifecycle: None,
+            resident_name: None,
+            resident_context: None,
+            disabled_tools: None,
+            context_fork: None,
+        },
+    )
+    .await
+    .unwrap();
+    creator.ensure_child_indexed(SAVED_PLANNER).await;
     probe.tracker_release.notify_one();
-    tokio::time::timeout(WAIT, probe.planner_entered.notified())
-        .await
-        .unwrap();
     let planning = wait(&state, parent_id, "planner-wait-registered", &probe, |s| {
         s.agent_runtime_state
             .as_ref()
             .is_some_and(|r| r.waiting_for_children.is_some())
     })
     .await;
+    let planner = load(&state, SAVED_PLANNER).await;
+    creator
+        .enqueue_child_run(&planning, &planner)
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, probe.planner_entered.notified())
+        .await
+        .unwrap();
     let planner_wait = planning
         .agent_runtime_state
         .as_ref()
@@ -1202,7 +1243,7 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
         .is_some_and(|generation| generation > 0));
     state.shutdown().await;
     drop(state);
-    let reopened = host(home.path(), probe.clone()).await;
+    let reopened = host(&home_path, probe.clone()).await;
     crate::app_state::wake_reconciler::reconcile_startup(
         reopened.session_store.clone(),
         reopened.session_activation_router.clone(),
@@ -1252,6 +1293,13 @@ async fn two_project_tracker_planner_followup_and_restart_preserve_original_auth
     let final_worker = quiet(&reopened, ROOT_B).await;
     let cold = quiet(&reopened, parent_id).await;
     let cold_receipt = tool_json(&cold.messages, "epic-cold-followup").unwrap();
+    let first_result = tool_json(&before_restart.messages, "epic-plan-result").unwrap();
+    let cold_result = tool_json(&cold.messages, "epic-cold-result").unwrap();
+    assert_eq!(
+        cold_result["content_sha256"],
+        first_result["content_sha256"]
+    );
+    assert_eq!(cold_result["text"], first_result["text"]);
     assert_eq!(
         tool_arguments(&cold.messages, "epic-cold-followup"),
         first_followup,

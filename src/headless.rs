@@ -794,6 +794,10 @@ async fn run_with_state(args: HeadlessArgs, state: AppState) -> Result<(), Strin
 #[path = "headless_model_routing_tests.rs"]
 mod model_routing_tests;
 
+#[cfg(all(test, unix))]
+#[path = "headless_quiet_exec_tests.rs"]
+mod quiet_exec_tests;
+
 /// The tree is done when the root runner is not running, the root is not
 /// suspended waiting for children, and no child runner is still running.
 async fn tree_quiescent(state: &AppState, session_id: &str) -> bool {

@@ -246,6 +246,7 @@ async fn root_tools_include_server_overlays_and_session_note() {
     assert!(names.contains("session_note"));
     assert!(names.contains("ViewImage"));
     for retired in [
+        "Plan",
         "EnterPlanMode",
         "js_repl",
         "NotebookEdit",
@@ -257,6 +258,12 @@ async fn root_tools_include_server_overlays_and_session_note() {
             !names.contains(retired),
             "retired tool {retired} leaked into the root catalog"
         );
+    }
+    let root = state.tools_for(ToolSurface::Root);
+    for stale_name in ["Plan", "default::Plan"] {
+        let call = make_tool_call(stale_name, json!({"task": "Prepare a plan"}));
+        let result = root.execute(&call).await;
+        assert!(matches!(result, Err(ToolError::NotFound(_))), "{result:?}");
     }
 
     let history = state

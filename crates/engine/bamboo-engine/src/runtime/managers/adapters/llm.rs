@@ -49,6 +49,7 @@ impl LlmManager for DefaultLlmManager {
             // coverage, not a zero-exposure observation; #1077 covers the
             // canonical runner pipeline only.
             None,
+            None,
         )
         .await?;
 

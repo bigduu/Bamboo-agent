@@ -1,4 +1,4 @@
-//! Metadata-only first chat reaches Plan without an explicit workspace.
+//! A read-only Child inherits the first chat’s metadata-only workspace.
 //! A real compiled worker runs pathless Glob and sends its result to the provider.
 use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -6,11 +6,14 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use actix_web::{test as actix_test, web, App, HttpResponse, HttpServer};
+use actix_web::{web, App, HttpResponse, HttpServer};
 use bamboo_domain::RootThinkingMode;
-use bamboo_server::app_state::{AppState, MemoryStore};
 use serde_json::{json, Value};
 use tokio::sync::Notify;
+
+#[path = "support/read_only_child_host.rs"]
+mod read_only_child_host;
+use read_only_child_host::{reported_result, Host};
 
 const MARKER: &str = "plan-default-1347.marker";
 const REQUIRED: &str = "PLAN_WORKSPACE_REQUIRED: inspect only; preserve the user constraints";
@@ -71,14 +74,20 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
                 .workspace_tool_observed
                 .store(observed, Ordering::SeqCst);
             (
-                json!({"content":"PLAN_WORKSPACE_VERIFIED: completed read-only workspace inspection"}),
+                reported_result(
+                    "PLAN_WORKSPACE_VERIFIED: completed read-only workspace inspection",
+                ),
                 "stop",
             )
         }
     } else if rendered.contains("Ultra Root thinking mode") {
         match probe.root_calls.fetch_add(1, Ordering::SeqCst) {
             0 => (
-                json!({"tool_calls":[{"index":0,"id":"default-workspace-plan","type":"function","function":{"name":"Plan","arguments":json!({"task":REQUIRED,"title":"Inspect the default workspace"}).to_string()}}]}),
+                json!({"tool_calls":[{"index":0,"id":"default-workspace-plan","type":"function","function":{"name":"SubAgent","arguments":json!({"role":"explorer","message":REQUIRED}).to_string()}}]}),
+                "tool_calls",
+            ),
+            1 => (
+                json!({"tool_calls":[{"index":0,"id":"default-workspace-plan-wait","type":"function","function":{"name":"SubAgent","arguments":json!({"intent":"wait"}).to_string()}}]}),
                 "tool_calls",
             ),
             _ => (
@@ -96,9 +105,8 @@ async fn model_response(body: web::Json<Value>, probe: web::Data<ProviderProbe>)
 }
 
 #[test]
-fn first_chat_metadata_workspace_reaches_plan_and_actual_worker_glob() {
-    // The full debug AppState/route fixture exceeds libtest's default stack.
-    // Increase only the host test thread; the real child has its normal stack.
+fn first_chat_metadata_workspace_reaches_explorer_and_actual_worker_glob() {
+    // Run the loopback provider fixture on its own Actix system thread.
     std::thread::Builder::new()
         .name("plan-workspace-fixture".into())
         .stack_size(32 * 1024 * 1024)
@@ -114,21 +122,6 @@ async fn run_workspace_fixture() {
     let workspace_path = home_path.join("user-workspace");
     std::fs::create_dir(&workspace_path).unwrap();
     std::fs::write(workspace_path.join(MARKER), "bounded read-only marker").unwrap();
-    let jiandu = home_path.join("jiandu");
-    // This standalone test binary has one test. Scope the production worker's
-    // independent Jiandu store to the same disposable fixture as the host.
-    let old_jiandu = std::env::var_os("BAMBOO_JIANDU_DATA_DIR");
-    struct RestoreJiandu(Option<std::ffi::OsString>);
-    impl Drop for RestoreJiandu {
-        fn drop(&mut self) {
-            match &self.0 {
-                Some(value) => std::env::set_var("BAMBOO_JIANDU_DATA_DIR", value),
-                None => std::env::remove_var("BAMBOO_JIANDU_DATA_DIR"),
-            }
-        }
-    }
-    let _restore_jiandu = RestoreJiandu(old_jiandu);
-    std::env::set_var("BAMBOO_JIANDU_DATA_DIR", &jiandu);
     let probe = web::Data::new(ProviderProbe::default());
     *probe.workspace.lock().unwrap() = workspace_path.clone();
     let server_probe = probe.clone();
@@ -154,51 +147,30 @@ async fn run_workspace_fixture() {
     let config = json!({
         "provider":"openai",
         "features":{"provider_model_ref":true},
-        "providers":{"openai":{"api_key":"fixture-key","base_url":base_url,"model":"root-test"}},
+        "providers":{"openai":{"api_key":"fixture-key","base_url":base_url,"model":"root-test", "runtime_models":["root-test","planner-test"]}},
         "defaults":{"chat":{"provider":"openai","model":"root-test"},
-                    "subagent_models":{"planner":{"provider":"openai","model":"planner-test"}}},
-        "subagents":{"runtime":"actor","executor":"bamboo_runtime", "worker_bin":env!("CARGO_BIN_EXE_bamboo"), "worker_args":["subagent-worker"], "fabric_dir":home_path.join("fabric"), "max_concurrent":1}
+                    "subagent_models":{"explorer":{"provider":"openai","model":"planner-test"}}},
+        "subagents":{"runtime":"actor","executor":"bamboo_runtime", "fabric_dir":home_path.join("fabric"), "max_concurrent":1}
     });
     std::fs::write(
         home_path.join("config.json"),
         serde_json::to_vec(&config).unwrap(),
     )
     .unwrap();
-    let state = web::Data::new(
-        AppState::new_with_memory_store(home_path.clone(), MemoryStore::new(jiandu))
-            .await
-            .unwrap(),
-    );
-    {
-        let live = state.config.read().await;
-        let planner = &live.defaults.as_ref().unwrap().subagent_models["planner"];
-        assert_eq!(planner.model, "planner-test");
-        assert_eq!(
-            live.subagents().worker_bin.as_deref(),
-            Some(env!("CARGO_BIN_EXE_bamboo"))
-        );
-    }
-    let app = actix_test::init_service(
-        App::new()
-            .app_data(state.clone())
-            .configure(bamboo_server::routes::configure_routes),
-    )
-    .await;
+    let host = Host::start(&home_path).await;
     let root_id = "plan-default-workspace-root";
-    let response = actix_test::call_service(
-        &app,
-        actix_test::TestRequest::post()
-            .uri("/api/v1/chat")
-            .set_json(json!({
+    let response = host
+        .post(
+            "chat",
+            json!({
                 "session_id":root_id,"message":REQUIRED,"model":"root-test","provider":"openai",
                 "model_ref":{"provider":"openai","model":"root-test"},
                 "thinking_mode":"ultra","permission_mode":"bypass","workspace_path":workspace_path
-            }))
-            .to_request(),
-    )
-    .await;
-    assert_eq!(response.status(), actix_web::http::StatusCode::CREATED);
-    let initial = state.storage.load_session(root_id).await.unwrap().unwrap();
+            }),
+        )
+        .await;
+    assert_eq!(response.status().as_u16(), 201);
+    let initial = host.session(root_id).await;
     assert!(
         initial.workspace.is_none(),
         "fixture must exercise the old metadata-only gap"
@@ -207,18 +179,11 @@ async fn run_workspace_fixture() {
         initial.workspace_path_meta().as_deref(),
         workspace_path.to_str()
     );
-    let response = actix_test::call_service(
-        &app,
-        actix_test::TestRequest::post()
-            .uri(&format!("/api/v1/execute/{root_id}"))
-            .set_json(json!({}))
-            .to_request(),
-    )
-    .await;
+    let response = host.post(&format!("execute/{root_id}"), json!({})).await;
     assert!(response.status().is_success(), "execute must start");
     let (waiting_root, child_id) = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            let root = state.storage.load_session(root_id).await.unwrap().unwrap();
+            let root = host.session(root_id).await;
             let wait = root
                 .agent_runtime_state
                 .as_ref()
@@ -255,14 +220,9 @@ async fn run_workspace_fixture() {
         }
     })
     .await
-    .expect("real Plan must wait for the real provider worker");
+    .expect("the Root must wait for the real provider worker");
     assert_eq!(waiting_root.root_thinking_mode(), RootThinkingMode::Ultra);
-    let child = state
-        .storage
-        .load_session(&child_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let child = host.session(&child_id).await;
     assert!(child.agent_runtime_state.as_ref().unwrap().read_only);
     assert_eq!(child.workspace.as_deref(), workspace_path.to_str());
     assert_eq!(
@@ -276,14 +236,14 @@ async fn run_workspace_fixture() {
     );
     assert_eq!(
         probe.root_calls.load(Ordering::SeqCst),
-        1,
+        2,
         "Root has not synthesized an unfinished child"
     );
     probe.release_child.store(true, Ordering::SeqCst);
     probe.child_ready.notify_waiters();
     let completed = tokio::time::timeout(Duration::from_secs(45), async {
         loop {
-            let root = state.storage.load_session(root_id).await.unwrap().unwrap();
+            let root = host.session(root_id).await;
             if root
                 .messages
                 .iter()
@@ -300,12 +260,7 @@ async fn run_workspace_fixture() {
         .messages
         .iter()
         .any(|message| message.content.contains("PLAN_WORKSPACE_VERIFIED")));
-    let child = state
-        .storage
-        .load_session(&child_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let child = host.session(&child_id).await;
     assert!(child
         .messages
         .iter()

@@ -475,6 +475,7 @@ async fn shared_range_reuses_the_only_paid_vision_transform_for_actual_dispatch(
             &[],
             None,
             None,
+            None,
         )
         .await
         .unwrap();
@@ -780,6 +781,7 @@ async fn shared_range_prepared_reuse_detects_adopted_context_before_main_dispatc
                 &id,
                 "test-model",
                 &[],
+                None,
                 None,
                 None,
             )

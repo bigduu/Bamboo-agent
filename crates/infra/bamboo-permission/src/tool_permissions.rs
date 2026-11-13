@@ -471,12 +471,40 @@ fn browser_semantic_target(args: &Value) -> Result<Option<(String, String)>, Per
 pub fn framework_root_spawn_permissions(
     args: &Value,
 ) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
-    let project = required_string_arg(args, "project_id")?;
-    let workspace = required_string_arg(args, "workspace_path")?;
+    root_creation_permissions(args, "spawn_session")
+}
+
+fn root_creation_permissions(
+    args: &Value,
+    action: &str,
+) -> Result<Option<Vec<PermissionContext>>, PermissionError> {
+    let (resource, description) = if args.get("project_id").is_none_or(Value::is_null)
+        && args.get("workspace_path").is_none_or(Value::is_null)
+    {
+        let operation = uuid::Uuid::parse_str(required_string_arg(args, "operation_id")?)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| {
+                PermissionError::CheckFailed(
+                    "standalone Root creation requires an operation UUID".into(),
+                )
+            })?;
+        (
+            format!("session_control create [unassigned] {operation}"),
+            "create a standalone independent Root in its own workspace and submit its first instruction",
+        )
+    } else {
+        let project = required_string_arg(args, "project_id")?;
+        let workspace = required_string_arg(args, "workspace_path")?;
+        (
+            format!("session_control create {project} {workspace}"),
+            "create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+        )
+    };
     Ok(Some(vec![PermissionContext::new(
         PermissionType::ExecuteCommand,
-        format!("session_control create {project} {workspace}"),
-        "spawn_session: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
+        resource,
+        format!("{action}: {description}"),
     )]))
 }
 
@@ -678,10 +706,9 @@ pub fn check_permissions(
             );
             let project_memory_dir = bamboo_config::paths::path_to_display_string(
                 // The permission classifier has no trusted session context, so
-                // it cannot resolve the exact opaque Project id. Gate durable
-                // writes at the conservative first-class Project root; runtime
-                // resolution narrows assigned writes to
-                // projects/<id>/memory/v1 and rejects Unassigned Project writes.
+                // it cannot resolve the exact Project or Section. Section uses
+                // the Project write gate. The memory tool validates the
+                // assignment and binds the actual scope before writing.
                 &bamboo_dir.join("projects"),
             );
             let context = |resource: String| {
@@ -697,15 +724,14 @@ pub fn check_permissions(
                     context(project_memory_dir.clone()),
                 ]
             };
-            let scoped_durable_contexts = || match args
+            let scope = args
                 .get("scope")
                 .and_then(Value::as_str)
                 .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-            {
+                .map(str::to_ascii_lowercase);
+            let scoped_durable_contexts = || match scope.as_deref() {
                 Some("global") => vec![context(global_memory_dir.clone())],
-                Some("project") => vec![context(project_memory_dir.clone())],
+                Some("project" | "section") => vec![context(project_memory_dir.clone())],
                 // Invalid/missing scope fails closed at the permission boundary.
                 // The tool may later reject the arguments, but no durable write
                 // can be authorized by a resource from only one possible scope.
@@ -718,13 +744,14 @@ pub fn check_permissions(
                 "write" | "rebuild" => Some(scoped_durable_contexts()),
                 // These actions identify existing memories by id(s), so the
                 // classifier cannot know whether execution will mutate the
-                // Global store or the assigned Project store.
+                // Global store or a scope in the assigned Project.
                 "merge" | "split" | "consolidate" => Some(ambiguous_durable_contexts()),
                 "purge"
-                    if args
-                        .get("id")
-                        .and_then(Value::as_str)
-                        .is_some_and(|id| !id.trim().is_empty()) =>
+                    if scope.as_deref() != Some("section")
+                        && args
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| !id.trim().is_empty()) =>
                 {
                     Some(ambiguous_durable_contexts())
                 }
@@ -1352,13 +1379,7 @@ pub fn check_permissions(
                             "session_control create requires request".into(),
                         )
                     })?;
-                let project = required_string_arg(request, "project_id")?;
-                let workspace = required_string_arg(request, "workspace_path")?;
-                return Ok(Some(vec![PermissionContext::new(
-                    PermissionType::ExecuteCommand,
-                    format!("session_control create {project} {workspace}"),
-                    "session_control create: create an independent Root in the explicit Host-authorized Project/workspace and submit its first instruction",
-                )]));
+                return root_creation_permissions(request, "session_control create");
             }
             if action != "followup" {
                 return Err(PermissionError::CheckFailed(
@@ -1619,6 +1640,28 @@ mod tests {
                 .unwrap()
                 .is_none());
         }
+    }
+
+    #[test]
+    fn standalone_creation_uses_the_same_operation_bound_permission_for_both_entrypoints() {
+        let operation = uuid::Uuid::new_v4();
+        let mut args = json!({"operation_id":operation, "message":"private instruction"});
+        let spawn = framework_root_spawn_permissions(&args).unwrap().unwrap();
+        let control = check_permissions(
+            "session_control",
+            &json!({"action":"create", "request":args.clone()}),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(spawn[0].permission_type, PermissionType::ExecuteCommand);
+        assert_eq!(
+            spawn[0].resource,
+            format!("session_control create [unassigned] {operation}")
+        );
+        assert_eq!(control[0].resource, spawn[0].resource);
+        args["operation_id"] = json!(uuid::Uuid::new_v4());
+        let other = framework_root_spawn_permissions(&args).unwrap().unwrap();
+        assert_ne!(other[0].resource, spawn[0].resource);
     }
 
     #[test]
@@ -3667,13 +3710,15 @@ mod tests {
             .resource
             .ends_with("/memory/v1/scopes/global"));
 
-        let project_write =
-            check_permissions("memory", &json!({"action": "write", "scope": "project"}))
-                .unwrap()
-                .unwrap();
-        assert_eq!(project_write.len(), 1);
-        assert_eq!(project_write[0].permission_type, PermissionType::WriteFile);
-        assert!(project_write[0].resource.ends_with("/projects"));
+        for scope in ["project", "section"] {
+            let project_write =
+                check_permissions("memory", &json!({"action": "write", "scope": scope}))
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(project_write.len(), 1);
+            assert_eq!(project_write[0].permission_type, PermissionType::WriteFile);
+            assert!(project_write[0].resource.ends_with("/projects"));
+        }
 
         let ambiguous_write = check_permissions("memory", &json!({"action": "write"}))
             .unwrap()
@@ -3735,6 +3780,15 @@ mod tests {
         assert!(scoped_purge[0]
             .resource
             .ends_with("/memory/v1/scopes/global"));
+
+        let section_purge = check_permissions(
+            "memory",
+            &json!({"action": "purge", "scope": "section", "id": "memory-1"}),
+        )
+        .unwrap()
+        .expect("a purge explicitly scoped to Section must use the Project gate");
+        assert_eq!(section_purge.len(), 1);
+        assert!(section_purge[0].resource.ends_with("/projects"));
 
         // Read-only actions stay ungated.
         for action in [

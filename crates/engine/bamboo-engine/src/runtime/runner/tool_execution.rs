@@ -287,6 +287,9 @@ async fn execute_and_apply_single_tool_call(
             let dispatch = per_call::execute_model_requested_tool_call_only(
                 effective_callable_set,
                 per_call::ToolExecutionOnlyContext {
+                    await_quiet_exec: state.single_tool_call
+                        && runtime_state.no_human_approver
+                        && no_progress::quiet_exec_wait_scope(session, config),
                     session_behavior_version,
                     vision_support,
                     output_cap: None,
@@ -682,7 +685,17 @@ async fn execute_round_tool_calls_inner(
     let available_tool_schemas: Vec<ToolSchema> = tools.list_tools();
     let available_tool_schemas = available_tool_schemas.as_slice();
 
-    let mut state = RoundExecutionState::default();
+    let mut state = RoundExecutionState {
+        single_tool_call: tool_calls.len() == 1,
+        ..RoundExecutionState::default()
+    };
+    // Live admission may narrow placement further. Keep any restriction
+    // captured from the request that produced these model calls.
+    policy_guard.standalone_supervisor_spawn |=
+        super::session_setup::tool_schemas::offers_standalone_supervisor_spawn(
+            session,
+            tool_schemas,
+        );
     policy_guard.begin_round(
         config.max_tool_calls_per_round,
         config.max_consecutive_failures_per_tool,
@@ -884,6 +897,7 @@ async fn execute_round_tool_calls_inner(
                             per_call::execute_model_requested_tool_call_only(
                                 effective_callable_set,
                                 per_call::ToolExecutionOnlyContext {
+                                    await_quiet_exec: false,
                                     session_behavior_version,
                                     vision_support,
                                     output_cap,
@@ -2042,6 +2056,37 @@ mod tests {
         }));
     }
 
+    #[tokio::test]
+    async fn unrecoverable_tool_arguments_return_an_error_without_aborting_sibling() {
+        let session = permission_session("malformed-parallel", SessionPermissionMode::Auto, 1);
+        let storage = Arc::new(BoundaryStorage::new(session.clone()));
+        let executor = Arc::new(PermissionBoundaryExecutor::new(
+            storage.clone(),
+            "never",
+            BoundaryTransition::Mode(SessionPermissionMode::Auto, 1),
+        ));
+        let mut malformed = named_call("parallel-b", "parallel_b");
+        malformed.function.arguments = "{malformed".into();
+        let calls = [named_call("parallel-a", "parallel_a"), malformed];
+        let (result, session, _, events) =
+            run_permission_boundary_calls(storage, executor.clone(), session, &calls).await;
+
+        assert!(!result.unwrap().awaiting_clarification);
+        assert!(executor.entered("parallel_a"));
+        assert!(!executor.entered("parallel_b"));
+        assert!(events.iter().all(
+            |event| !matches!(event, AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == "parallel-b")
+        ));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-a")
+                && message.content.contains("parallel_a complete")
+        }));
+        assert!(session.messages.iter().any(|message| {
+            message.tool_call_id.as_deref() == Some("parallel-b")
+                && message.content.contains("complete JSON object")
+        }));
+    }
+
     #[test]
     fn read_tools_are_parallel_safe() {
         let tools = builtin_tools();
@@ -2930,6 +2975,113 @@ mod tests {
         .unwrap();
         assert!(!result.awaiting_clarification);
         std::iter::from_fn(|| event_rx.try_recv().ok()).collect()
+    }
+
+    #[tokio::test]
+    async fn standalone_supervisor_spawn_rejects_project_arguments_before_toolstart() {
+        for project_route_disabled_during_request in [false, true] {
+            assert_standalone_spawn_rejects_project_arguments(
+                project_route_disabled_during_request,
+            )
+            .await;
+        }
+    }
+
+    async fn assert_standalone_spawn_rejects_project_arguments(
+        project_route_disabled_during_request: bool,
+    ) {
+        use crate::runtime::runner::session_setup::tool_schemas::{
+            offers_standalone_supervisor_spawn, resolve_available_tool_schemas_for_session,
+        };
+        use crate::session_app::approval_replay::framework_fixture::FixtureTools;
+        use bamboo_domain::{SessionAuthorityIdentity, DEFAULT_SUPERVISOR_SESSION_ID};
+
+        let fixture = FixtureTools::new(&["spawn_session", "session_control"]);
+        let tools: Arc<dyn ToolExecutor> = fixture.clone();
+        let mut session = Session::new(DEFAULT_SUPERVISOR_SESSION_ID, "model");
+        session.authority_identity = SessionAuthorityIdentity::Supervisor {
+            incarnation_id: uuid::Uuid::new_v4(),
+        };
+        let mut config = crate::runtime::config::AgentLoopConfig::default();
+        let mut policy_guard = super::ToolPolicyGuard::default();
+        if project_route_disabled_during_request {
+            let advertised =
+                resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &session);
+            policy_guard.set_supervisor_spawn_route(offers_standalone_supervisor_spawn(
+                &session,
+                &advertised,
+            ));
+            config.disabled_tools.insert("session_control".into());
+        }
+        let tool_schemas =
+            resolve_available_tool_schemas_for_session(&config, tools.as_ref(), &session);
+        assert_eq!(
+            offers_standalone_supervisor_spawn(&session, &tool_schemas),
+            !project_route_disabled_during_request
+        );
+        let callable = legacy_effective_callable_set(&tool_schemas);
+        let mut stale = tool_call_with_args(
+            "spawn_session",
+            json!({
+                "operation_id": uuid::Uuid::new_v4(),
+                "expected_state_revision": 0,
+                "message": "Independent task",
+                "project_id": "old-project",
+                "workspace_path": "/old-project"
+            }),
+        );
+        stale.id = "stale-placement".into();
+        let mut retry = stale.clone();
+        retry.id = "standalone-retry".into();
+        let mut arguments: serde_json::Value =
+            serde_json::from_str(&retry.function.arguments).unwrap();
+        let fields = arguments.as_object_mut().unwrap();
+        fields.remove("project_id");
+        fields.remove("workspace_path");
+        retry.function.arguments = arguments.to_string();
+        let calls = [stale, retry];
+
+        let llm: Arc<dyn LLMProvider> = Arc::new(BoundaryNoopProvider);
+        let (event_tx, mut event_rx) = mpsc::channel(64);
+        let session_id = session.id.clone();
+        let frame = crate::runtime::runner::round_frame::RoundFrame {
+            vision_support: true,
+            session_id: &session_id,
+            round_id: "standalone-spawn",
+            turn: 0,
+            debug_enabled: false,
+            event_tx: &event_tx,
+            metrics_collector: None,
+            config: &config,
+            llm: &llm,
+            tools: &tools,
+        };
+        execute_round_tool_calls(RoundToolExecution {
+            tool_calls: &calls,
+            frame: &frame,
+            session: &mut session,
+            runtime_state: &mut AgentRuntimeState::new(&session_id),
+            policy_guard: &mut policy_guard,
+            task_context: &mut None,
+            compression_model_name: None,
+            compression_model_provider: None,
+            tool_schemas: &tool_schemas,
+            effective_callable_set: &callable,
+        })
+        .await
+        .unwrap();
+
+        let started: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok())
+            .filter_map(|event| match event {
+                AgentEvent::ToolStart { tool_call_id, .. } => Some(tool_call_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(started, ["standalone-retry"]);
+        assert_eq!(fixture.invocations(), ["spawn_session"]);
+        assert!(session.messages.iter().any(|message| message
+            .content
+            .contains("standalone_spawn_requires_unassigned")));
     }
 
     fn cap_executor(parallel: bool, pending: bool) -> Arc<CapRecordingExecutor> {

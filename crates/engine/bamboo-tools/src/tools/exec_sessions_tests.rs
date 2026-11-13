@@ -874,6 +874,52 @@ mod process_tests {
         assert!(bash_runtime::get_shell(id).is_none());
     }
 
+    #[tokio::test]
+    async fn requested_long_poll_waits_for_exit_on_the_first_empty_read() {
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("first-long-poll-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let first = start(
+            "while [ ! -f release ]; do sleep 0.01; done; printf tail; exit 7".into(),
+            &owner,
+            false,
+        )
+        .await;
+        let id = first["session_id"].as_str().unwrap();
+        let shell = bash_runtime::get_shell(id).unwrap();
+        let ToolOutcome::Completed(previous) = poll_result(&shell, 0, None).await else {
+            panic!("exec sessions must return ordinary completed tool calls");
+        };
+        let running: Value = serde_json::from_str(&previous.result).unwrap();
+        assert_eq!(running["polling"]["state"], "waiting");
+        let args = json!({"session_id": id, "yield_time_ms": 60_000});
+        let mut continued = std::pin::pin!(crate::tools::write_stdin::continue_empty_poll(
+            &owner,
+            &args,
+            &previous,
+            Duration::from_secs(30),
+            Duration::from_secs(90),
+        ));
+        assert!(futures::poll!(continued.as_mut()).is_pending());
+        std::fs::write(release, b"release").unwrap();
+        let terminal = payload(
+            timeout(Duration::from_secs(5), continued)
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(terminal["status"], "completed");
+        assert_eq!(terminal["output"], "tail");
+        assert_eq!(terminal["exit_code"], 7);
+        assert!(terminal.get("session_id").is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn quiet_terminal_cache_expiry_releases_capture_without_inventing_an_outcome() {
         let _environment = environment();

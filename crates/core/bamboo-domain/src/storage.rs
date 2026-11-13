@@ -659,6 +659,20 @@ pub trait Storage: Send + Sync {
         ))
     }
 
+    /// Durable history of one ordinary Session in this application user's data
+    /// domain. Backends must validate the original ordinary Root caller and the
+    /// target together, retaining the absence of an installed finite scope.
+    async fn load_current_user_peer_session(
+        &self,
+        _caller: &crate::SessionCallerReference,
+        _target_id: &str,
+    ) -> std::io::Result<Session> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "current_user_peer_history_unsupported",
+        ))
+    }
+
     /// Strict metadata/runtime-only Root source for a bounded immutable view.
     /// Requires the independent installed ReadContextView right, never raw
     /// history or the older InspectBoundedProgress projection authority.
@@ -951,6 +965,16 @@ pub trait Storage: Send + Sync {
         session_id: &str,
     ) -> std::io::Result<Option<Session>> {
         self.load_session(session_id).await
+    }
+
+    /// Prove a live Root with this birth token has no earlier lifetime.
+    /// Used for legacy Project sidebar assignments saved without a birth token.
+    async fn first_root_lifetime_matches(
+        &self,
+        _session_id: &str,
+        _birth_token: &str,
+    ) -> std::io::Result<bool> {
+        Ok(false)
     }
 
     /// Recover an interrupted two-session Task control-plane transaction for

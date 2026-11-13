@@ -10,7 +10,8 @@ Every agent follows the same feature/dev/release/main workflow. The shared
 review documents include historical snapshots; use the local guide and actual
 workflow files for the current implementation and rollout status.
 
-- Session memory is continuity for the current session. Project memory holds durable project facts and decisions; Global memory holds cross-project user context.
+- Session memory is continuity for the current session. Section memory holds durable facts within the server-assigned Section. Project memory holds project-wide decisions. Global memory holds cross-project user context.
+- Use Section when the Host can resolve the current Root's stable Section assignment. A verified Child shares its Root's Section. When Section is unavailable, continue with the existing scopes and keep Section-only context in Session notes.
 - Recall with a short lexical query. Use Jiandu's compact default top three `id`/summary results, then `get` only the selected item that needs full context.
 - Query before writing. Store one confirmed atomic fact with a specific title and a few useful keywords, entities, and tags.
 - Treat canonical Project memory as trusted durable project authority, but verify live repository or runtime state before acting. Treat Dream as a low-trust derived orientation snapshot, never as canonical evidence.
@@ -48,12 +49,11 @@ aggregates require it to pass. Do not add a second automatic owner for those
 tests.
 Keep the standalone default storage authority families' serial selection in its
 owning shard, reusing its compiled library-test executable without repeating cases.
-Planner's 12 Plan and 10 artifact library cases are excluded from the ordinary
-parallel harness and run once serially using each package's same compiled
-canonical test executable. Preserve each default dependency graph and fail the
-existing feature gate on a missing, repeated or failed case. The independent
-Delegated Planner workflow retains its distinct API-only real CLI and original
-Clippy configurations; it does not repeat these library cases.
+The nine retained Planner artifact and recovery library cases run once
+serially from the canonical engine test executable, outside its ordinary
+parallel harness. Fail the feature gate on a missing, repeated or failed
+case. Retained Planner Analysis owns the original API-only Clippy
+configurations. The retired `Plan` tool's CLI acceptance is historical.
 `Quick Checks` remains auxiliary and never substitutes for runtime tests.
 For root and docs Markdown-only PRs, run Quick Checks and skip product tests;
 Markdown under source packages may be compiled into the application and must

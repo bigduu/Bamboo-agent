@@ -72,6 +72,11 @@ impl StoredLease {
         self.policy
     }
 
+    #[cfg(feature = "test-utils")]
+    pub(super) fn expires_at_for_testing(&self) -> DateTime<Utc> {
+        self.token.expires_at
+    }
+
     /// Structural evidence only. Retirement does not mint or renew a lease.
     pub(super) fn matches_transport_name(&self, generation: u64, name: &str) -> bool {
         FileSessionInbox::owned_name(generation, &self.token) == name
@@ -622,6 +627,7 @@ pub(super) enum AckAuthority<'a> {
     Owned {
         lease: &'a StoredLease,
         filesystem: &'a OwnedFilesystem,
+        post_receipt_cleanup: Option<&'a OwnedFilesystem>,
     },
 }
 impl AckAuthority<'_> {
@@ -647,11 +653,19 @@ impl AckAuthority<'_> {
             }
         }
     }
-    pub(super) async fn remove(&self, path: &Path) -> std::io::Result<()> {
+    pub(super) async fn remove_committed_claim(&self, path: &Path) -> std::io::Result<()> {
         match self {
             Self::Legacy => tokio::fs::remove_file(path).await,
-            Self::ScopedLegacy(filesystem) | Self::Owned { filesystem, .. } => {
-                filesystem.remove(path).await
+            Self::ScopedLegacy(filesystem) => filesystem.remove(path).await,
+            Self::Owned {
+                filesystem,
+                post_receipt_cleanup,
+                ..
+            } => {
+                post_receipt_cleanup
+                    .unwrap_or(filesystem)
+                    .remove(path)
+                    .await
             }
         }
     }
@@ -1734,6 +1748,7 @@ impl FileSessionInbox {
                     AckAuthority::Owned {
                         lease,
                         filesystem: &filesystem,
+                        post_receipt_cleanup: None,
                     },
                 )
                 .await;
@@ -1751,7 +1766,7 @@ impl FileSessionInbox {
         } else {
             filesystem
         };
-        self.ack_owned_with_filesystem(&dir, target, claim, now, filesystem)
+        self.ack_owned_with_filesystem(&dir, target, claim, now, filesystem, None)
             .await
     }
 
@@ -1762,6 +1777,7 @@ impl FileSessionInbox {
         claim: &SessionInboxOwnedClaim,
         now: DateTime<Utc>,
         filesystem: OwnedFilesystem,
+        post_receipt_cleanup: Option<&OwnedFilesystem>,
     ) -> Result<(), SessionInboxError> {
         let filesystem = if self.root_owner.is_some() || self.child_owner.is_some() {
             self.exact_claim_filesystem(filesystem, dir, target, claim, true)
@@ -1786,6 +1802,7 @@ impl FileSessionInbox {
             AckAuthority::Owned {
                 lease: &stored,
                 filesystem: &filesystem,
+                post_receipt_cleanup,
             },
         )
         .await

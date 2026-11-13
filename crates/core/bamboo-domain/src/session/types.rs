@@ -18,6 +18,9 @@ const TOOL_MESSAGE_HEAD_BYTES: usize = 160 * 1024;
 const TOOL_MESSAGE_TAIL_BYTES: usize = 64 * 1024;
 const TOOL_MESSAGE_TRUNCATION_MARKER: &str = "[... tool output truncated ...]";
 
+/// Durable chat origin for sessions created by the Connect bridge.
+pub const CONNECT_SESSION_ORIGIN_KEY: &str = "created_by_connect_key";
+
 fn default_title_generated() -> bool {
     true
 }

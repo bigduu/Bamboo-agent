@@ -8,10 +8,12 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
+use crate::provider::{current_completion_diagnostics, OutputLimitRecovery, Result};
 use bamboo_config::{
-    BodyPatchOp, ModelRequestRule, PatchValue, RequestOverridesConfig, RequestScopeOverride,
-    TemplateExpr, TemplateExprSpec,
+    BodyPatchOp, KeywordMaskingConfig, ModelRequestRule, PatchValue, RequestOverridesConfig,
+    RequestScopeOverride, TemplateExpr, TemplateExprSpec,
 };
+use bamboo_domain::ReasoningEffort;
 
 pub const ENDPOINT_CHAT_COMPLETIONS: &str = "chat_completions";
 pub const ENDPOINT_RESPONSES: &str = "responses";
@@ -105,6 +107,105 @@ pub fn apply_overrides_to_body(
 ) {
     let env_vars = bamboo_config::Config::current_env_vars();
     apply_overrides_to_body_with_env(body, overrides, endpoint, model, &env_vars);
+}
+
+/// Inspect the final wire controls after masking and operator body patches.
+/// An eligible retry lowers only the existing effort field, leaving request
+/// options used to render the prompt and protocol unchanged.
+pub(crate) fn mask_and_prepare_agent_request(
+    body: &mut Value,
+    masking: &KeywordMaskingConfig,
+    overrides: Option<&RequestOverridesConfig>,
+    endpoint: &'static str,
+    model: &str,
+) -> Result<()> {
+    crate::masking::mask_outbound_body(body, masking);
+    let Some(diagnostics) = current_completion_diagnostics().filter(|d| d.is_agent_round()) else {
+        return Ok(());
+    };
+    let (effort_path, limit_path, low) = match endpoint {
+        ENDPOINT_CHAT_COMPLETIONS => ("/reasoning_effort", "/max_completion_tokens", "low"),
+        ENDPOINT_RESPONSES => ("/reasoning/effort", "/max_output_tokens", "low"),
+        ENDPOINT_MESSAGES => ("/output_config/effort", "/max_tokens", "low"),
+        ENDPOINT_STREAM_GENERATE_CONTENT => (
+            "/generationConfig/thinkingConfig/thinkingLevel",
+            "/generationConfig/maxOutputTokens",
+            "LOW",
+        ),
+        _ => return Ok(()),
+    };
+    let limit = body
+        .pointer(limit_path)
+        .or_else(|| match endpoint {
+            ENDPOINT_CHAT_COMPLETIONS => body.get("max_tokens"),
+            _ => None,
+        })
+        .and_then(Value::as_u64)
+        .filter(|limit| *limit > 0);
+    let effort = body
+        .pointer(effort_path)
+        .and_then(Value::as_str)
+        .and_then(ReasoningEffort::parse)
+        .filter(|effort| !matches!(effort, ReasoningEffort::Disabled | ReasoningEffort::Low));
+    let native_control = match endpoint {
+        ENDPOINT_MESSAGES => {
+            body.pointer("/thinking/type").and_then(Value::as_str) == Some("adaptive")
+                && body.pointer("/thinking/budget_tokens").is_none()
+        }
+        ENDPOINT_CHAT_COMPLETIONS => {
+            body.get("enable_thinking").is_none() && body.get("thinking").is_none()
+        }
+        ENDPOINT_STREAM_GENERATE_CONTENT => body
+            .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+            .is_none(),
+        _ => true,
+    };
+    let candidate = effort.zip(limit).and_then(|(effort, output_limit)| {
+        (native_control
+            && !crate::retry::work_request_budget_active()
+            && masking.apply_masking(low) == low
+            && !overrides.is_some_and(|config| {
+                resolve_scope(config, endpoint, Some(model))
+                    .body_patch
+                    .iter()
+                    .any(|patch| patches_reasoning_control(endpoint, &patch.path))
+            }))
+        .then_some(OutputLimitRecovery {
+            endpoint,
+            effort,
+            output_limit,
+        })
+    });
+    if diagnostics.observe_agent_round_request(endpoint, limit, candidate)? {
+        *body
+            .pointer_mut(effort_path)
+            .expect("validated wire effort field") = Value::String(low.into());
+    }
+    Ok(())
+}
+
+fn patches_reasoning_control(endpoint: &str, path: &str) -> bool {
+    let path = parse_path(path);
+    if path.is_empty() {
+        return true;
+    }
+    let key = |index| match path.get(index) {
+        Some(PathSegment::Key(key)) => Some(key.as_str()),
+        _ => None,
+    };
+    match (endpoint, key(0)) {
+        (ENDPOINT_MESSAGES, Some("thinking")) => true,
+        (ENDPOINT_MESSAGES, Some("output_config")) => key(1).is_none_or(|key| key == "effort"),
+        (
+            ENDPOINT_CHAT_COMPLETIONS,
+            Some("reasoning_effort" | "reasoning" | "thinking" | "enable_thinking" | "extra_body"),
+        ) => true,
+        (ENDPOINT_RESPONSES, Some("reasoning")) => key(1).is_none_or(|key| key == "effort"),
+        (ENDPOINT_STREAM_GENERATE_CONTENT, Some("generationConfig")) => {
+            key(1).is_none_or(|key| key == "thinkingConfig")
+        }
+        _ => false,
+    }
 }
 
 /// A configured Work budget cannot accept arbitrary wire body patches (which

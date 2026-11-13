@@ -162,12 +162,12 @@ mod tests {
     }
 
     #[test]
-    fn real_core_directives_cover_investigation_and_adversarial_verification() {
+    fn real_core_directives_cover_investigation_and_acceptance() {
         let directives = crate::runtime::context::CORE_AGENT_DIRECTIVES;
         let lower = directives.to_ascii_lowercase();
         assert!(lower.contains("investigate"));
         assert!(lower.contains("verify"));
-        assert!(lower.contains("adversarial"));
+        assert!(lower.contains("the checks covering it pass, give the final answer"));
         // And they actually ride on top of an overridden base.
         let assembled = append_core_agent_directives("Custom user base.", directives);
         assert!(assembled.contains("Custom user base."));

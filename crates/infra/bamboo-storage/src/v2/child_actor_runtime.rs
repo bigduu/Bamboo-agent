@@ -606,7 +606,14 @@ impl SessionStoreV2 {
         }
         if let Some((inbox, directory, claim, filesystem)) = pending_ack {
             inbox
-                .ack_owned_with_filesystem(&directory, &session.id, &claim, Utc::now(), filesystem)
+                .ack_owned_with_filesystem(
+                    &directory,
+                    &session.id,
+                    &claim,
+                    Utc::now(),
+                    filesystem,
+                    None,
+                )
                 .await
                 .map_err(conflict)?;
         }

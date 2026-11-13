@@ -27,8 +27,13 @@ impl RootActorWriteProof {
         &self.owner
     }
 
-    // Pure reads at the final boundary; never ensure/repair/claim authority.
     pub(super) fn validate(&self) -> io::Result<Session> {
+        self.validate_with_lease_expiry()
+            .map(|(session, _)| session)
+    }
+
+    // Pure reads at the final boundary; never ensure/repair/claim authority.
+    fn validate_with_lease_expiry(&self) -> io::Result<(Session, DateTime<Utc>)> {
         let id = &self.owner.fence.actor_id;
         let regular = |name: &str| {
             actor_transcript::regular_bytes(&self.directory.join(name)).map_err(conflict)
@@ -80,7 +85,25 @@ impl RootActorWriteProof {
         {
             return Err(conflict("execution birth or running owner changed"));
         }
-        Ok(overlay_runtime_sidecar(main, Some(side)))
+        Ok((
+            overlay_runtime_sidecar(main, Some(side)),
+            activation.lease_expires_at,
+        ))
+    }
+
+    pub(super) fn validate_inbox_cleanup(
+        &self,
+        validate_input: impl FnOnce(&Session) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let (durable, lease_expires_at) = self.validate_with_lease_expiry()?;
+        validate_input(&durable)?;
+        drop(durable);
+        // The retained guards pin the fence while transcript validation runs.
+        // Check its deadline again before removing the committed claim.
+        if lease_expires_at <= Utc::now() {
+            return Err(conflict("Root lease expired before Inbox cleanup"));
+        }
+        Ok(())
     }
 
     pub(super) fn validate_candidate(&self, incoming: &Session) -> io::Result<()> {
@@ -251,7 +274,9 @@ impl SessionStoreV2 {
                 .check_conversation_generation(&current)
                 .map_err(conflict)?;
             let schedule = observed.metadata.get("created_by_schedule_id");
-            let connect = observed.metadata.get("created_by_connect_key");
+            let connect = observed
+                .metadata
+                .get(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY);
             let pending_result = |session: &Session| -> io::Result<Option<serde_json::Value>> {
                 let Some(question) = observed.pending_question.as_ref() else {
                     return Ok(None);
@@ -283,8 +308,14 @@ impl SessionStoreV2 {
                         .get(bamboo_domain::CONSUMED_RESPONSE_OCCURRENCES_KEY)
                 || schedule != current.metadata.get("created_by_schedule_id")
                 || schedule != proposed.metadata.get("created_by_schedule_id")
-                || connect != current.metadata.get("created_by_connect_key")
-                || connect != proposed.metadata.get("created_by_connect_key")
+                || connect
+                    != current
+                        .metadata
+                        .get(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
+                || connect
+                    != proposed
+                        .metadata
+                        .get(bamboo_domain::CONNECT_SESSION_ORIGIN_KEY)
                 || observed.id != current.id
                 || observed.created_at != current.created_at
                 || observed.kind != current.kind
@@ -386,6 +417,7 @@ impl SessionStoreV2 {
             .await?
             .filter(|latest| latest.created_at == session.created_at)
             .ok_or_else(|| conflict("Root finalization source changed"))?;
+        crate::session_merge::adopt_durable_background_exec_wait(&mut reconciled, &latest);
         if let Some(registered_at) =
             crate::session_merge::adopt_finalized_child_wait(&mut reconciled, &latest, false)
         {
