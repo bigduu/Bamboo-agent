@@ -18,6 +18,14 @@ on:
         description: Exact source SHA of that completed release
         required: true
         type: string
+      publisher_run_id:
+        description: Successful Publish Crate run ID (required for v3 recovery)
+        required: false
+        type: string
+      publisher_attempt:
+        description: Successful Publish Crate attempt (required for v3 recovery)
+        required: false
+        type: string
 
 permissions:
   contents: read
@@ -34,6 +42,10 @@ env:
 jobs:
   release:
     name: Verify completed release
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
@@ -56,108 +68,17 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
+          INPUT_PUBLISHER_ATTEMPT: ${{ inputs.publisher_attempt }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import base64, hashlib, json, os, re, subprocess
-          repository = 'bigduu/Bamboo-agent'
-          assert os.environ['GITHUB_REPOSITORY'] == repository
-          event = json.load(open(os.environ['GITHUB_EVENT_PATH']))
-          def api(route, binary=False):
-              args = ['gh', 'api', '--hostname', 'github.com', f'repos/{repository}/{route}']
-              if binary: args += ['-H', 'Accept: application/octet-stream']
-              data = subprocess.check_output(args, timeout=60)
-              return data if binary else json.loads(data)
-          if os.environ['GITHUB_EVENT_NAME'] == 'workflow_run':
-              run = event['workflow_run']
-              assert run['event'] == 'workflow_dispatch' and run['conclusion'] == 'success'
-              assert run['path'] == '.github/workflows/publish-crate.yml' and run['head_branch'] == 'dev'
-              assert run['repository']['full_name'] == run['head_repository']['full_name'] == repository
-              with open(os.path.join(os.environ['RUNNER_TEMP'], 'release', 'release.json')) as f:
-                  identity = json.load(f)
-              assert str(identity['runId']) == str(run['id'])
-              version, source = identity['version'], identity['source']
-          else:
-              assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
-              assert os.environ['GITHUB_REF'] == 'refs/heads/dev' and os.environ['GITHUB_REF_PROTECTED'] == 'true'
-              version, source = os.environ['INPUT_VERSION'], os.environ['INPUT_SOURCE']
-          assert re.fullmatch(r'[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
-          assert re.fullmatch(r'[0-9a-f]{40}', source)
-          release = api('releases/tags/v' + version)
-          assert release['tag_name'] == 'v' + version and release['target_commitish'] == source
-          assert not release['draft'] and not release['prerelease'] and release['published_at']
-          tag = api('git/ref/tags/v' + version)
-          assert tag['object']['type'] == 'commit' and tag['object']['sha'] == source
-          policy_path = 'scripts/sidecar-release.cjs'
-          policy = api(f'contents/{policy_path}?ref={source}')
-          assert policy['type'] == 'file' and policy['path'] == policy_path and policy['encoding'] == 'base64'
-          assert type(policy['size']) is int and 0 < policy['size'] <= 128 * 1024
-          policy_bytes = base64.b64decode(''.join(policy['content'].splitlines()), validate=True)
-          assert len(policy_bytes) == policy['size']
-          markers = re.findall(r'^// BAMBOO_SHARED_EXECUTABLES_V([0-9]+)\r?$', policy_bytes.decode(), re.M)
-          assert markers in (['2'], ['3']), 'Unsupported or ambiguous frozen executable contract'
-          contract = int(markers[0])
-          assets = release['assets']
-          assert len({item['name'] for item in assets}) == len(assets)
-          assert len({item['id'] for item in assets}) == len(assets)
-
-          def asset(name):
-              found = [item for item in assets if item['name'] == name]
-              assert len(found) == 1, f'Missing published asset: {name}'
-              item = found[0]
-              assert item['state'] == 'uploaded' and type(item['size']) is int and item['size'] > 0
-              assert type(item['id']) is int and item['id'] > 0
-              return item
-
-          def original(entry, name):
-              assert entry['assetName'] == name and re.fullmatch(r'[0-9a-f]{64}', entry['sha256'])
-              assert type(entry['sizeBytes']) is int
-              executable = asset(name)
-              assert executable['size'] == entry['sizeBytes'] and executable['digest'] == 'sha256:' + entry['sha256']
-              return {'id': executable['id'], 'size': executable['size'], 'sha256': entry['sha256']}
-
-          manifest_name = f'bamboo-sidecars-v{contract}.json'
-          provenance_name = f'bamboo-executables-provenance-v{contract}.json'
-          for item in assets:
-              if re.fullmatch(r'bamboo-(sidecars|executables-provenance)-v[0-9]+\.json', item['name']):
-                  assert item['name'] in {manifest_name, provenance_name}, 'Mixed executable release contracts'
-          asset(provenance_name)
-          asset('release-provenance.json')
-          manifest_asset = asset(manifest_name)
-          assert manifest_asset['size'] < 1024 * 1024
-          raw = api('releases/assets/' + str(manifest_asset['id']), binary=True)
-          assert len(raw) == manifest_asset['size']
-          assert manifest_asset['digest'] == 'sha256:' + hashlib.sha256(raw).hexdigest()
-          manifest = json.loads(raw)
-          assert manifest['schemaVersion'] == contract and manifest['version'] == version and manifest['sourceRevision'] == source
-          targets = ['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu']
-          if contract == 3:
-              targets[1:1] = ['aarch64-pc-windows-msvc', 'aarch64-unknown-linux-gnu']
-          entries = manifest['artifacts']
-          assert [entry['target'] for entry in entries] == targets, 'Incomplete or unexpected executable targets'
-          binary_names = {item['name'] for item in assets
-                          if re.fullmatch(r'bamboo-(aarch64|x86_64)-(apple-darwin|pc-windows-msvc\.exe|unknown-linux-gnu)', item['name'])}
-          assert binary_names == {entry['assetName'] for entry in entries}, 'Unexpected release binaries'
-          linux_assets = {}
-          for entry in entries:
-              target = entry['target']
-              suffix = '.exe' if target.endswith('-windows-msvc') else ''
-              assert entry['format'] == 'raw' and entry['buildMode'] == 'embedded' and entry['embeddedFrontend'] is True
-              assert 65536 <= entry['sizeBytes'] <= 1024 ** 3
-              identity = original(entry, f'bamboo-{target}{suffix}')
-              if target == 'x86_64-unknown-linux-gnu':
-                  linux_assets['amd64'] = identity
-              if target == 'aarch64-unknown-linux-gnu':
-                  linux_assets['arm64'] = identity
-          original(manifest['browserHost'], 'bamboo-browser-host-v1.tar.gz')
-          if contract == 2:
-              linux_assets['arm64'] = {'id': '', 'size': '', 'sha256': ''}
-          values = {'source': source, 'version': version, 'contract': contract,
-                    'linux_assets': json.dumps(linux_assets, separators=(',', ':'))}
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key, value in values.items(): output.write(f'{key}={value}\n')
-          PY
+          [[ "$GITHUB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          gh api --hostname github.com --jq '.content' \
+            "repos/${GITHUB_REPOSITORY}/contents/scripts/docker-release.py?ref=${GITHUB_WORKFLOW_SHA}" \
+            | base64 --decode > "$RUNNER_TEMP/bamboo-docker-release.py"
+          test -s "$RUNNER_TEMP/bamboo-docker-release.py"
+          python3 "$RUNNER_TEMP/bamboo-docker-release.py"
 
   build:
     name: Build (${{ matrix.platform }})
@@ -188,25 +109,73 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Find a retained image digest
+        id: retained
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: digest-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_NAME" =~ ^digest-(amd64|arm64)$ ]]
+          artifacts="$(gh api --hostname github.com "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?name=${ARTIFACT_NAME}&per_page=100")"
+          artifact_id="$(jq -er --arg name "$ARTIFACT_NAME" --argjson run "$GITHUB_RUN_ID" '
+            select((.artifacts | type) == "array" and .total_count == (.artifacts | length)) |
+            if .total_count == 0 then ""
+            elif .total_count == 1 then
+              .artifacts[0] | select(.name == $name and .expired == false and .workflow_run.id == $run and
+                (.id | tostring | test("^[1-9][0-9]*$"))) | .id
+            else error("Ambiguous retained image digest") end
+          ' <<< "$artifacts")"
+          echo "id=$artifact_id" >> "$GITHUB_OUTPUT"
+      - name: Download the retained image digest
+        if: steps.retained.outputs.id != ''
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          artifact-ids: ${{ steps.retained.outputs.id }}
+          path: ${{ runner.temp }}/bamboo-retained-digest
       - name: Select an existing verified candidate
         id: candidate
         env:
           PLATFORM: ${{ matrix.platform }}
           RELEASE_VERSION: ${{ needs.release.outputs.version }}
+          RETAINED_DIGEST_ARTIFACT: ${{ steps.retained.outputs.id }}
         run: |
           set -euo pipefail
           image="$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bamboo" | tr '[:upper:]' '[:lower:]')"
           candidate="${image}:ci-v${RELEASE_VERSION}-${PLATFORM//\//-}"
           echo "tag=$candidate" >> "$GITHUB_OUTPUT"
+          retained=""
+          reuse() {
+            local ref="$image@$1"
+            docker pull --platform "$PLATFORM" "$ref"
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
+            echo 'mode=reuse' >> "$GITHUB_OUTPUT"
+          }
+          if [ -n "$RETAINED_DIGEST_ARTIFACT" ]; then
+            shopt -s nullglob dotglob
+            receipts=("$RUNNER_TEMP/bamboo-retained-digest"/*)
+            [[ "${#receipts[@]}" = 1 && -f "${receipts[0]}" && ! -L "${receipts[0]}" ]]
+            [[ "${receipts[0]##*/}" =~ ^[0-9a-f]{64}$ ]]
+            test "$(cat "${receipts[0]}")" = "$PLATFORM"
+            retained="sha256:${receipts[0]##*/}"
+          fi
           if descriptor="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$candidate" 2>"$RUNNER_TEMP/image-error")"; then
             digest="$(jq -er 'select(.mediaType == "application/vnd.oci.image.manifest.v1+json" or
               .mediaType == "application/vnd.docker.distribution.manifest.v2+json") | .digest' <<< "$descriptor")"
             [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-            ref="$image@$digest"
-            docker pull --platform "$PLATFORM" "$ref"
-            echo "ref=$ref" >> "$GITHUB_OUTPUT"
-            echo 'mode=reuse' >> "$GITHUB_OUTPUT"
+            if [[ -n "$retained" && "$digest" != "$retained" ]]; then
+              echo 'The candidate digest differs from the original retained by this run.' >&2
+              exit 1
+            fi
+            reuse "$digest"
           elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/image-error"; then
+            if [ -n "$retained" ]; then
+              reuse "$retained"
+              exit 0
+            fi
             if docker buildx imagetools inspect "${image}:v${RELEASE_VERSION}" >/dev/null 2>"$RUNNER_TEMP/final-image-error"; then
               echo 'The completed image exists but its candidate is missing; recover the original digest instead of rebuilding.' >&2
               exit 1
@@ -348,6 +317,7 @@ jobs:
           [[ "${digests[0]}" =~ ^sha256:[0-9a-f]{64}$ ]]
           echo "digest=${digests[0]}" >> "$GITHUB_OUTPUT"
       - name: Retain the verified image digest
+        if: steps.retained.outputs.id == ''
         env:
           IMAGE_REF: ${{ steps.candidate.outputs.ref }}
           PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
@@ -359,11 +329,12 @@ jobs:
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
           printf '%s\n' "$PLATFORM" > "$RUNNER_TEMP/bamboo-digests/${digest#sha256:}"
       - uses: actions/upload-artifact@v7
+        if: steps.retained.outputs.id == ''
         with:
           name: digest-${{ matrix.arch }}
           path: ${{ runner.temp }}/bamboo-digests/*
           if-no-files-found: error
-          overwrite: true
+          overwrite: false
           retention-days: 7
 
   merge:
@@ -441,7 +412,7 @@ jobs:
           if [ "$latest" = "v${RELEASE_VERSION}" ]; then args+=(-t "${image}:latest"); fi
           docker buildx imagetools create "${args[@]}" "$index_ref"
           docker buildx imagetools inspect "$tag"
-          echo "image=${image}:v${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image=$index_ref" >> "$GITHUB_OUTPUT"
 
   image-scan:
     name: Scan published image (Trivy)

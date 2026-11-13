@@ -388,7 +388,8 @@ test("Docker receives the completed publisher's matching run and attempt", () =>
   assert.match(docker, /name: bamboo-completed-release-\$\{\{ github\.event\.workflow_run\.id \}\}-\$\{\{ github\.event\.workflow_run\.run_attempt \}\}/);
   assert.match(docker.split("\njobs:\n")[0], /workflow_run:\n    workflows: \[Publish Crate\]\n    types: \[completed\]\n    branches: \[dev\]/);
   assert.doesNotMatch(docker.split("\njobs:\n")[0], /^  push:/m);
-  assert.match(docker, /executable\['digest'\] == 'sha256:' \+ entry\['sha256'\]/);
+  assert.match(docker, /contents\/scripts\/docker-release\.py\?ref=\$\{GITHUB_WORKFLOW_SHA\}/);
+  assert.match(read("scripts/docker-release.py"), /executable\['digest'\] == 'sha256:' \+ entry\['sha256'\]/);
   assert.doesNotMatch(read("docker/Dockerfile.published"), /\b(?:cargo|rustc|vite) (?:build|run|install)\b/i);
   const arm = read("docker/Dockerfile");
   assert.match(read("Cargo.toml"), /libduckdb-sys = \{ path = "third_party\/libduckdb-sys" \}/);
