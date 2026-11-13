@@ -41,8 +41,8 @@ use std::sync::Arc;
 use bamboo_domain::CapabilityInvocationTarget;
 
 use crate::capability_discovery::{
-    capability_source, CapabilityDiscoveryEligibility, CapabilityDiscoveryIndex,
-    InvocationEligibility, ToolCapabilityMetadata, MAX_CAPABILITY_SUMMARY_CHARS,
+    capability_source, AutomaticSkillOutcome, CapabilityDiscoveryIndex,
+    MAX_CAPABILITY_SUMMARY_CHARS,
 };
 
 pub const DEFAULT_WORKFLOW_CATALOG_MAX_CHARS: usize = 10_240;
@@ -53,7 +53,8 @@ fn select_automatic_skill(
     skills: Vec<SkillDefinition>,
     catalog: &WorkflowCatalogSnapshot,
     request_hint: Option<&str>,
-) -> Vec<SkillDefinition> {
+    disabled_skill_ids: &BTreeSet<String>,
+) -> (Vec<SkillDefinition>, AutomaticSkillOutcome) {
     let allowed_skill_ids = skills
         .iter()
         .map(|skill| skill.id.clone())
@@ -79,61 +80,57 @@ fn select_automatic_skill(
             })
             .collect(),
     };
-    let workflow_catalog = WorkflowCatalogSnapshot::default();
-    let index = CapabilityDiscoveryIndex::from_snapshots(
-        std::iter::empty::<ToolCapabilityMetadata>(),
-        &discovery_catalog,
-        &workflow_catalog,
-        &CapabilityDiscoveryEligibility {
-            allowed_skill_ids: Some(allowed_skill_ids),
-            workflow_gateway_available: false,
-            skill_invocation: InvocationEligibility::Automatic,
-            ..Default::default()
-        },
-    );
-    let decision = index.explain_automatic_skill(request_hint.unwrap_or_default());
+    let index = CapabilityDiscoveryIndex::for_automatic_skill_matching(&discovery_catalog);
+    let (decision, candidates) =
+        index.match_automatic_skills(request_hint.unwrap_or_default(), |candidate| {
+            let CapabilityInvocationTarget::Skill { skill_id, .. } = &candidate.invocation_target
+            else {
+                return false;
+            };
+            allowed_skill_ids.contains(skill_id) && !disabled_skill_ids.contains(skill_id)
+        });
     tracing::debug!(
         query_sha256 = %decision.query_sha256,
         outcome = ?decision.outcome,
         candidates = ?decision.candidates,
         "Automatic skill selection evaluated"
     );
-    let Some(matched) = decision.selected else {
-        return Vec::new();
-    };
-    let CapabilityInvocationTarget::Skill {
-        skill_id,
-        source,
-        revision,
-        ..
-    } = matched.invocation_target
-    else {
-        return Vec::new();
-    };
-    if matched.source != source || matched.revision != Some(revision) {
-        return Vec::new();
-    }
-    let matches_same_catalog_entry = catalog.entries.iter().any(|entry| {
-        entry.winner
-            && entry.id == skill_id
-            && entry.revision == revision
-            && capability_source(entry.source) == source
-    });
-    if !matches_same_catalog_entry {
-        return Vec::new();
-    }
-
-    skills
+    let mut skills_by_id: HashMap<_, _> = skills
         .into_iter()
-        .find(|skill| skill.id == skill_id)
+        .map(|skill| (skill.id.clone(), skill))
+        .collect();
+    let selected = candidates
         .into_iter()
-        .collect()
+        .filter_map(|candidate| {
+            let CapabilityInvocationTarget::Skill {
+                skill_id,
+                source,
+                revision,
+                ..
+            } = candidate.invocation_target
+            else {
+                return None;
+            };
+            // The prompt and pin must describe the same published candidate.
+            if catalog.entries.iter().any(|entry| {
+                entry.winner
+                    && entry.id == skill_id
+                    && entry.revision == revision
+                    && capability_source(entry.source) == source
+            }) {
+                skills_by_id.remove(&skill_id)
+            } else {
+                None
+            }
+        })
+        .collect();
+    (selected, decision.outcome)
 }
 
 fn fit_skills_to_context_budget(
     skills: Vec<SkillDefinition>,
     catalog: &WorkflowCatalogSnapshot,
-    candidate_ids: Vec<String>,
+    outcome: AutomaticSkillOutcome,
     max_context_tokens: usize,
 ) -> (
     Vec<SkillDefinition>,
@@ -146,6 +143,10 @@ fn fit_skills_to_context_budget(
         .filter(|entry| entry.winner)
         .map(|entry| (entry.id.as_str(), entry))
         .collect::<HashMap<_, _>>();
+    let candidate_ids = skills
+        .iter()
+        .map(|skill| skill.id.clone())
+        .collect::<Vec<_>>();
     let total_candidates = candidate_ids.len();
     let char_budget = DEFAULT_WORKFLOW_CATALOG_MAX_CHARS.min(
         max_context_tokens
@@ -157,44 +158,14 @@ fn fit_skills_to_context_budget(
     let token_budget = char_budget / ESTIMATED_CHARS_PER_TOKEN;
     let static_chars = context::workflow_catalog_prefix().chars().count();
     const DIAGNOSTIC_RESERVE_CHARS: usize = 512;
-    if char_budget < static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS) {
-        return (
-            Vec::new(),
-            Vec::new(),
-            WorkflowCatalogDiagnostic {
-                total_candidates,
-                advertised_candidates: 0,
-                initial_chars: 0,
-                final_chars: 0,
-                char_budget,
-                token_budget,
-                compressed_descriptions: false,
-                shortlisted: total_candidates > 0,
-                omitted_ids: candidate_ids,
-            },
-        );
-    }
-    let initial_chars = skills
-        .iter()
-        .filter_map(|skill| {
-            entries_by_id
-                .get(skill.id.as_str())
-                .map(|entry| (skill, *entry))
-        })
-        .map(|(skill, entry)| {
-            context::render_workflow_catalog_entry(skill, entry)
-                .chars()
-                .count()
-        })
-        .sum::<usize>()
-        .saturating_add(static_chars)
-        .saturating_add(DIAGNOSTIC_RESERVE_CHARS);
+    let overhead = static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS);
     let compressed_descriptions = skills
         .iter()
         .any(|skill| skill.description.chars().count() > MAX_CAPABILITY_SUMMARY_CHARS);
 
     let mut selected = Vec::new();
-    let mut used = static_chars.saturating_add(DIAGNOSTIC_RESERVE_CHARS);
+    let mut used = overhead;
+    let mut initial_chars = if skills.is_empty() { 0 } else { overhead };
     for skill in skills {
         let Some(entry) = entries_by_id.get(skill.id.as_str()).copied() else {
             continue;
@@ -202,6 +173,7 @@ fn fit_skills_to_context_budget(
         let cost = context::render_workflow_catalog_entry(&skill, entry)
             .chars()
             .count();
+        initial_chars = initial_chars.saturating_add(cost);
         if used.saturating_add(cost) > char_budget {
             continue;
         }
@@ -235,6 +207,11 @@ fn fit_skills_to_context_budget(
         compressed_descriptions,
         shortlisted: selected_len < total_candidates,
         omitted_ids,
+        automatic_outcome: Some(if selected_len < total_candidates {
+            AutomaticSkillOutcome::BudgetDropped
+        } else {
+            outcome
+        }),
     };
     diagnostic.final_chars =
         context::build_workflow_catalog_context(&selected, &selected_entries, &diagnostic)
@@ -248,15 +225,16 @@ fn select_and_fit_automatic_skills(
     skills: Vec<SkillDefinition>,
     catalog: &WorkflowCatalogSnapshot,
     request_hint: Option<&str>,
+    disabled_skill_ids: &BTreeSet<String>,
     max_context_tokens: usize,
 ) -> (
     Vec<SkillDefinition>,
     Vec<WorkflowCatalogEntry>,
     WorkflowCatalogDiagnostic,
 ) {
-    let candidate_ids = skills.iter().map(|skill| skill.id.clone()).collect();
-    let selected = select_automatic_skill(skills, catalog, request_hint);
-    fit_skills_to_context_budget(selected, catalog, candidate_ids, max_context_tokens)
+    let (selected, outcome) =
+        select_automatic_skill(skills, catalog, request_hint, disabled_skill_ids);
+    fit_skills_to_context_budget(selected, catalog, outcome, max_context_tokens)
 }
 
 fn filter_disabled_skills(
@@ -530,21 +508,21 @@ impl SkillManager {
                 return Vec::new();
             }
         };
-        let selected = Self::filter_skills_for_selection(
-            skills,
-            &catalog,
-            disabled_skill_ids,
-            selected_skill_ids,
-        );
         if selected_skill_ids.is_some() {
-            return selected;
+            return Self::filter_skills_for_selection(
+                skills,
+                &catalog,
+                disabled_skill_ids,
+                selected_skill_ids,
+            );
         }
 
-        let original_len = selected.len();
+        let original_len = skills.len();
         let selected = select_and_fit_automatic_skills(
-            selected,
+            skills,
             &catalog,
             request_hint,
+            disabled_skill_ids,
             DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
         )
         .0;
@@ -576,15 +554,21 @@ impl SkillManager {
         let (skills, roots, resources, catalog) = store
             .activation_source_for_mode(selected_skill_mode)
             .await?;
-        let selected = Self::filter_skills_for_selection(
-            skills,
-            &catalog,
-            disabled_skill_ids,
-            selected_skill_ids,
-        );
         let (selected, catalog_entries, catalog_diagnostic) = if selected_skill_ids.is_none() {
-            select_and_fit_automatic_skills(selected, &catalog, request_hint, max_context_tokens)
+            select_and_fit_automatic_skills(
+                skills,
+                &catalog,
+                request_hint,
+                disabled_skill_ids,
+                max_context_tokens,
+            )
         } else {
+            let selected = Self::filter_skills_for_selection(
+                skills,
+                &catalog,
+                disabled_skill_ids,
+                selected_skill_ids,
+            );
             let selected_ids = selected
                 .iter()
                 .map(|skill| skill.id.as_str())
@@ -613,6 +597,7 @@ impl SkillManager {
                     compressed_descriptions: false,
                     shortlisted: false,
                     omitted_ids: Vec::new(),
+                    automatic_outcome: None,
                 },
             )
         };
@@ -979,6 +964,7 @@ impl SkillManager {
                         compressed_descriptions: false,
                         shortlisted: false,
                         omitted_ids: Vec::new(),
+                        automatic_outcome: None,
                     },
                     descriptor,
                 }
@@ -1005,26 +991,36 @@ impl SkillManager {
         selected_skill_mode: Option<&str>,
         request_hint: Option<&str>,
     ) -> String {
-        let skills = self
-            .resolve_skills_for_request_with_mode(
-                disabled_skill_ids,
-                selected_skill_ids,
-                selected_skill_mode,
-                request_hint,
-            )
-            .await;
-
-        tracing::info!(
-            "Building skill context with {} skill(s), selection_mode={}, skill_mode={}",
-            skills.len(),
-            if selected_skill_ids.is_some() {
-                "selected"
-            } else {
-                "all"
-            },
-            selected_skill_mode.unwrap_or("default"),
+        if selected_skill_ids.is_some() {
+            let skills = self
+                .resolve_skills_for_request_with_mode(
+                    disabled_skill_ids,
+                    selected_skill_ids,
+                    selected_skill_mode,
+                    request_hint,
+                )
+                .await;
+            return context::build_skill_context(&skills);
+        }
+        let (skills, catalog) = match self
+            .store
+            .skills_and_catalog_for_mode(selected_skill_mode)
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                tracing::warn!("Failed to resolve automatic Skill context: {error}");
+                return String::new();
+            }
+        };
+        let (skills, entries, diagnostic) = select_and_fit_automatic_skills(
+            skills,
+            &catalog,
+            request_hint,
+            disabled_skill_ids,
+            DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
         );
-        context::build_skill_context(&skills)
+        context::build_workflow_catalog_context(&skills, &entries, &diagnostic)
     }
 
     /// Build system prompt context from all skills.
@@ -1129,6 +1125,126 @@ mod tests {
         SkillDefinition::new(id, id, description, "prompt")
     }
 
+    #[tokio::test]
+    async fn automatic_catalog_bounds_choices_and_reports_policy_and_budget_outcomes() {
+        use super::AutomaticSkillOutcome;
+
+        let directory = tempfile::tempdir().unwrap();
+        let skills_dir = directory.path().join("skills");
+        for id in [
+            "portable-a",
+            "portable-b",
+            "portable-c",
+            "portable-d",
+            "portable-e",
+            "manual-doc",
+        ] {
+            let skill_dir = skills_dir.join(id);
+            fs::create_dir_all(skill_dir.join("agents")).await.unwrap();
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: Generate portable documents\n---\nFixture instructions.\n"),
+            )
+            .await
+            .unwrap();
+            if id == "manual-doc" {
+                fs::write(
+                    skill_dir.join("agents/bamboo.yaml"),
+                    "invocation_policy:\n  explicit: true\n  automatic: false\n",
+                )
+                .await
+                .unwrap();
+            }
+        }
+        let manager = SkillManager::with_config(SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        });
+        manager.initialize().await.unwrap();
+        let disabled = BTreeSet::from(["portable-b".to_string()]);
+        for (request, tokens, expected, ids) in [
+            (
+                "Generate portable documents",
+                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+                AutomaticSkillOutcome::Ambiguous,
+                vec!["portable-a", "portable-c", "portable-d"],
+            ),
+            (
+                "manual-doc",
+                128_000,
+                AutomaticSkillOutcome::PolicyDenied,
+                Vec::new(),
+            ),
+            (
+                "portable-b",
+                128_000,
+                AutomaticSkillOutcome::PolicyDenied,
+                Vec::new(),
+            ),
+            (
+                "portable-a",
+                4_000,
+                AutomaticSkillOutcome::BudgetDropped,
+                Vec::new(),
+            ),
+            (
+                "with this",
+                128_000,
+                AutomaticSkillOutcome::NoMatch,
+                Vec::new(),
+            ),
+        ] {
+            let activation = manager
+                .resolve_and_pin_activation_for_request_with_mode_and_budget(
+                    "skill-catalog-fixture",
+                    &disabled,
+                    None,
+                    None,
+                    Some(request),
+                    tokens,
+                )
+                .await
+                .unwrap();
+            let diagnostic = &activation.catalog_diagnostic;
+            assert_eq!(diagnostic.automatic_outcome, Some(expected), "{request}");
+            assert_eq!(
+                activation
+                    .skills
+                    .iter()
+                    .map(|skill| skill.id.as_str())
+                    .collect::<Vec<_>>(),
+                ids,
+                "{request}",
+            );
+            let prompt = crate::context::build_workflow_catalog_context(
+                &activation.skills,
+                &activation.catalog_entries,
+                diagnostic,
+            );
+            assert_eq!(diagnostic.final_chars, prompt.chars().count());
+            assert!(diagnostic.final_chars <= diagnostic.char_budget);
+            for denied in ["manual-doc", "portable-b"] {
+                assert!(!prompt.contains(denied));
+                assert!(!activation.descriptor.skill_revisions.contains_key(denied));
+                assert!(!serde_json::to_string(diagnostic).unwrap().contains(denied));
+            }
+            assert!(!activation
+                .descriptor
+                .skill_revisions
+                .contains_key("portable-e"));
+            for entry in &activation.catalog_entries {
+                assert_eq!(
+                    activation.descriptor.skill_revisions[&entry.id],
+                    entry.revision
+                );
+            }
+            if ids.is_empty() {
+                assert!(prompt.contains("Check Skill applicability."));
+                assert!(!prompt.contains("load_skill"));
+            }
+        }
+    }
+
     #[test]
     fn automatic_shortlist_uses_unified_discovery_match() {
         let mut skills = Vec::new();
@@ -1168,6 +1284,7 @@ mod tests {
             skills,
             &catalog,
             Some("optimize react vite build"),
+            &BTreeSet::new(),
             DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
         );
         assert!(shortlisted
@@ -1200,9 +1317,12 @@ mod tests {
                 shadowed_candidates: Vec::new(),
             }],
         };
-        let candidate_ids = vec![skill.id.clone()];
-        let (skills, entries, diagnostic) =
-            fit_skills_to_context_budget(vec![skill], &catalog, candidate_ids, 100);
+        let (skills, entries, diagnostic) = fit_skills_to_context_budget(
+            vec![skill],
+            &catalog,
+            super::AutomaticSkillOutcome::ExactMatch,
+            100,
+        );
         let rendered =
             crate::context::build_workflow_catalog_context(&skills, &entries, &diagnostic);
         assert!(diagnostic.char_budget <= 8);

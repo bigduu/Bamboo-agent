@@ -1521,6 +1521,142 @@ async fn activation_metadata_persistence_failure_releases_pin_before_provider_ca
 }
 
 #[tokio::test]
+async fn automatic_skill_candidates_reach_the_provider_without_eager_activation() {
+    #[derive(Default)]
+    struct PromptRecorder(Mutex<Vec<Vec<Message>>>);
+
+    #[async_trait]
+    impl LLMProvider for PromptRecorder {
+        async fn chat_stream(
+            &self,
+            messages: &[Message],
+            _tools: &[bamboo_agent_core::tools::ToolSchema],
+            _max_output_tokens: Option<u32>,
+            _model: &str,
+        ) -> bamboo_llm::provider::Result<LLMStream> {
+            self.0.lock().await.push(messages.to_vec());
+            Ok(Box::pin(stream::iter([
+                Ok(LLMChunk::Token("Fixture completion".to_string())),
+                Ok(LLMChunk::Done),
+            ])))
+        }
+    }
+
+    struct SkillGateway;
+    #[async_trait]
+    impl bamboo_agent_core::tools::ToolExecutor for SkillGateway {
+        async fn execute(
+            &self,
+            _call: &bamboo_agent_core::tools::ToolCall,
+        ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
+            panic!("an advertised Skill must wait for a provider tool call")
+        }
+
+        fn list_tools(&self) -> Vec<bamboo_agent_core::tools::ToolSchema> {
+            vec![bamboo_agent_core::tools::ToolSchema {
+                schema_type: "function".to_string(),
+                function: bamboo_agent_core::tools::FunctionSchema {
+                    name: "load_skill".to_string(),
+                    description: "Load a selected Skill".to_string(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {"skill_id": {"type": "string"}},
+                        "required": ["skill_id"]
+                    }),
+                },
+            }]
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let skills_dir = directory.path().join("skills");
+    for (id, description) in [
+        ("pdf", "Generate portable documents with standard PDF pages"),
+        (
+            "docx",
+            "Generate portable documents with standard Word pages",
+        ),
+    ] {
+        let skill_dir = skills_dir.join(id);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {id}\ndescription: {description}\n---\nINSTRUCTIONS_MUST_STAY_PINNED\n"
+            ),
+        )
+        .unwrap();
+    }
+    let manager = Arc::new(bamboo_skills::SkillManager::with_config(
+        bamboo_skills::SkillStoreConfig {
+            skills_dir,
+            ..Default::default()
+        },
+    ));
+    manager.initialize().await.unwrap();
+
+    for (id, request, expected, reason) in [
+        ("mixed", "请帮我生成PDF文档", vec!["pdf"], "strong_match"),
+        (
+            "ambiguous",
+            "Generate portable documents",
+            vec!["pdf", "docx"],
+            "ambiguous",
+        ),
+        ("irrelevant", "with this", Vec::new(), "no_match"),
+    ] {
+        let provider = Arc::new(PromptRecorder::default());
+        let mut session = Session::new(id, "fixture-model");
+        let (event_tx, _event_rx) = mpsc::channel(64);
+        super::run_agent_loop_with_config(
+            &mut session,
+            request.to_string(),
+            event_tx,
+            provider.clone(),
+            Arc::new(SkillGateway),
+            CancellationToken::new(),
+            AgentLoopConfig {
+                skill_manager: Some(manager.clone()),
+                model_name: Some("fixture-model".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let requests = provider.0.lock().await;
+        assert_eq!(requests.len(), 1);
+        let prompt = requests[0]
+            .iter()
+            .filter(|message| {
+                message.role != bamboo_agent_core::Role::User || message.content != request
+            })
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for skill in ["pdf", "docx"] {
+            assert_eq!(
+                prompt.contains(&format!("- skill_id: `{skill}`")),
+                expected.contains(&skill),
+                "{id}"
+            );
+        }
+        assert!(!prompt.contains("INSTRUCTIONS_MUST_STAY_PINNED"));
+        assert_eq!(
+            prompt.contains("Check Skill applicability."),
+            expected.is_empty()
+        );
+        let diagnostic: serde_json::Value = serde_json::from_str(
+            &session.metadata[bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY],
+        )
+        .unwrap();
+        assert_eq!(diagnostic["automatic_outcome"], reason);
+        assert!(!session
+            .metadata
+            .contains_key(bamboo_skills::ACTIVE_WORKFLOW_METADATA_KEY));
+    }
+}
+
+#[tokio::test]
 async fn activation_tool_call_checkpoint_failure_stops_before_tool_and_releases_pin() {
     struct FailAssistantToolCallSave(Arc<std::sync::atomic::AtomicUsize>);
     #[async_trait]

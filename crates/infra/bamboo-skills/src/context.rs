@@ -43,6 +43,7 @@ pub fn build_skill_context(skills: &[SkillDefinition]) -> String {
             compressed_descriptions: false,
             shortlisted: false,
             omitted_ids: Vec::new(),
+            automatic_outcome: None,
         },
     )
 }
@@ -55,12 +56,12 @@ pub fn build_workflow_catalog_context(
     diagnostic: &WorkflowCatalogDiagnostic,
 ) -> String {
     if skills.is_empty() {
-        if diagnostic.total_candidates == 0 {
-            tracing::debug!("No skills available, returning empty context");
-            return String::new();
+        if diagnostic.automatic_outcome.is_some() {
+            let guidance = "\n\n## Skill System\nCheck Skill applicability. If a Skill could help, look for it using available discovery tools. Otherwise continue normally.\n";
+            if guidance.chars().count() <= diagnostic.char_budget {
+                return guidance.to_owned();
+            }
         }
-        // The structured diagnostic is persisted in session metadata. Do not
-        // violate a tiny prompt budget merely to explain that nothing fitted.
         return String::new();
     }
 
@@ -96,7 +97,7 @@ pub(crate) fn workflow_catalog_prefix() -> String {
 
     context.push_str("### Mandatory Skill Check\n");
     context.push_str(
-        "1. Evaluate the user's request against the bounded advertised workflow matches below.\n",
+        "1. Evaluate the user's request against the bounded advertised workflow matches below. Load a candidate only when it clearly applies.\n",
     );
     context.push_str("2. Decide whether at least one skill clearly and unambiguously applies.\n");
     context.push_str("3. Do NOT skip this check.\n\n");
@@ -150,9 +151,10 @@ pub(crate) fn render_workflow_catalog_entry(
     context.push_str(&format!("- Kind: {:?}\n", entry.kind).to_ascii_lowercase());
     context.push_str(&format!("- Source: {:?}\n", entry.source).to_ascii_lowercase());
     context.push_str(&format!("- Revision: {}\n", entry.revision));
+    let explicit = entry.invocation_policy["explicit"].as_bool() == Some(true);
+    let automatic = entry.invocation_policy["automatic"].as_bool() == Some(true);
     context.push_str(&format!(
-        "- Invocation policy: {}\n",
-        entry.invocation_policy
+        "- Invocation policy: explicit={explicit}, automatic={automatic}\n"
     ));
 
     context

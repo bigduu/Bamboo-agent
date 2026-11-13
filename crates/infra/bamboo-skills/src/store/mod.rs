@@ -2226,8 +2226,35 @@ impl SkillStore {
         mode: Option<&str>,
         access: &crate::progressive::SkillCatalogEligibility,
     ) -> SkillResult<crate::progressive::SkillCatalogSnapshot> {
-        self.progressive_projection(mode, access, |_, snapshot, _, _| Ok(snapshot.clone()))
+        self.progressive_projection(mode, access, |_, snapshot, _, _, _| Ok(snapshot.clone()))
             .await
+    }
+
+    /// Match against the same validated publication used to authorize the
+    /// advertised entries. Denied metadata stays inside the projection.
+    pub async fn progressive_automatic_catalog_for_mode(
+        &self,
+        mode: Option<&str>,
+        access: &crate::progressive::SkillCatalogEligibility,
+        query: &str,
+    ) -> SkillResult<(
+        crate::progressive::SkillCatalogSnapshot,
+        Vec<crate::progressive::SkillCatalogMetadata>,
+        crate::capability_discovery::AutomaticSkillOutcome,
+    )> {
+        self.progressive_projection(mode, access, |_, snapshot, _, _, published| {
+            let (candidates, outcome) = crate::progressive::automatic_skill_prompt_candidates(
+                published,
+                &snapshot.entries,
+                query,
+            );
+            Ok((
+                snapshot.clone(),
+                candidates.into_iter().cloned().collect(),
+                outcome,
+            ))
+        })
+        .await
     }
 
     async fn progressive_projection<T>(
@@ -2239,6 +2266,7 @@ impl SkillStore {
             &crate::progressive::SkillCatalogSnapshot,
             &HashMap<SkillId, SourceBinding>,
             &HashMap<SkillId, SkillResourceSnapshot>,
+            &[crate::progressive::SkillCatalogMetadata],
         ) -> SkillResult<T>,
     ) -> SkillResult<T> {
         let mode_store = self.skill_store_for_mode(mode).await?;
@@ -2300,7 +2328,7 @@ impl SkillStore {
             catalog.revision,
             entries,
         )?;
-        project(store, &snapshot, &bindings, &resources)
+        project(store, &snapshot, &bindings, &resources, &metadata)
     }
 
     /// Trusted-host foundation: current eligibility/publication must agree with
@@ -2357,7 +2385,7 @@ impl SkillStore {
             ));
         }
         let _operation = self.retained_budget.selected.operation()?;
-        self.progressive_projection(mode, access, |store, catalog, bindings, resources| {
+        self.progressive_projection(mode, access, |store, catalog, bindings, resources, _| {
             if expected.identity != catalog.identity {
                 return Err(SkillError::Validation(
                     "selected catalog generation changed".into(),

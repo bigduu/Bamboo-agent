@@ -22,6 +22,7 @@ use crate::{
 /// Discovery summaries are bounded independently of the source description so
 /// one verbose registry entry cannot dominate a bounded result.
 pub const MAX_CAPABILITY_SUMMARY_CHARS: usize = 240;
+const MAX_AUTOMATIC_SKILL_CANDIDATES: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InvocationEligibility {
@@ -136,13 +137,15 @@ struct IndexedCapability {
 }
 
 /// Explanation of the existing automatic-selection policy, without query text.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomaticSkillOutcome {
     EmptyQuery,
     NoMatch,
     BelowThreshold,
     Ambiguous,
+    PolicyDenied,
+    BudgetDropped,
     ExactMatch,
     StrongMatch,
 }
@@ -174,6 +177,41 @@ pub struct CapabilityDiscoveryIndex {
 }
 
 impl CapabilityDiscoveryIndex {
+    pub(crate) fn for_automatic_skill_matching(catalog: &WorkflowCatalogSnapshot) -> Self {
+        Self {
+            candidates: catalog
+                .entries
+                .iter()
+                .filter(|entry| ordinary_skill_entry(entry))
+                .map(|entry| index_catalog_entry(entry, CapabilityKind::Skill))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn for_progressive_skill_matching(
+        entries: &[crate::progressive::SkillCatalogMetadata],
+    ) -> Self {
+        Self {
+            candidates: entries
+                .iter()
+                .map(|entry| {
+                    index_catalog_identity(
+                        CapabilityKind::Skill,
+                        &entry.package,
+                        &entry.name,
+                        &entry.description,
+                        capability_source(entry.source),
+                        entry.revision,
+                        CapabilityInvocationPolicy {
+                            explicit: entry.explicit,
+                            automatic: entry.automatic,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
     /// Build discovery from the exact classified catalog already resolved for
     /// the current session/round, while capturing both command catalogs under
     /// the store's publication read lock. Tool allow/disable references are not
@@ -379,6 +417,7 @@ impl CapabilityDiscoveryIndex {
                     &query_tokens,
                     resolved_tool_query.as_deref(),
                     None,
+                    search_tokens,
                 )
                 .map(|rank| (rank, candidate))
             })
@@ -410,23 +449,39 @@ impl CapabilityDiscoveryIndex {
     }
 
     pub fn explain_automatic_skill(&self, query: &str) -> AutomaticSkillDecision {
+        self.match_automatic_skills(query, |_| true).0
+    }
+
+    /// Resolve an automatic match or a bounded set of equally strong choices.
+    /// The eligibility check also allows a reason code without exposing the
+    /// identity or metadata of a denied Skill.
+    pub(crate) fn match_automatic_skills(
+        &self,
+        query: &str,
+        is_allowed: impl Fn(&CapabilityMatch) -> bool,
+    ) -> (AutomaticSkillDecision, Vec<CapabilityMatch>) {
         use sha2::{Digest, Sha256};
-        let query = query
-            .trim()
-            .chars()
-            .take(MAX_DISCOVERY_QUERY_CHARS)
-            .collect::<String>();
+        let query = query.trim();
+        let (bounded, truncated) = bounded_automatic_skill_query(query);
         let mut decision = AutomaticSkillDecision {
-            query_sha256: hex::encode(Sha256::digest(query.as_bytes())),
+            query_sha256: hex::encode(Sha256::digest(bounded.as_bytes())),
             outcome: AutomaticSkillOutcome::EmptyQuery,
             candidates: Vec::new(),
             selected: None,
         };
-        let normalized_query = normalize_search_text(&query);
-        let query_tokens = search_tokens(&normalized_query);
-        if normalized_query.is_empty() || query_tokens.is_empty() {
-            return decision;
+        let normalized = normalize_search_text(&bounded);
+        if normalized.is_empty() {
+            return (decision, Vec::new());
         }
+        let query_tokens = automatic_skill_tokens(&normalized);
+        // A head/tail projection provides token evidence only. Joining its
+        // windows cannot create an exact identity or a contiguous phrase.
+        let (raw_query, normalized_query) = if truncated {
+            ("", "")
+        } else {
+            (query, normalized.as_str())
+        };
+        let mut denied_strong_match = false;
         let mut ranked = self
             .candidates
             .iter()
@@ -435,70 +490,89 @@ impl CapabilityDiscoveryIndex {
                 let summary = normalize_search_text(&candidate.value.summary);
                 rank_candidate(
                     candidate,
-                    &query,
-                    &normalized_query,
+                    raw_query,
+                    normalized_query,
                     &query_tokens,
                     None,
                     Some(&summary),
+                    automatic_skill_tokens,
                 )
-                .map(|rank| (rank, candidate))
+                .and_then(|rank| {
+                    let strong = rank.semantic.exact_identity
+                        || strong_fuzzy_skill_match(candidate, &query_tokens, rank.semantic);
+                    if candidate
+                        .value
+                        .invocation_policy
+                        .is_some_and(|policy| policy.automatic)
+                        && is_allowed(&candidate.value)
+                    {
+                        Some((rank, candidate, strong))
+                    } else {
+                        denied_strong_match |= strong;
+                        None
+                    }
+                })
             })
             .collect::<Vec<_>>();
-        ranked.sort_by(|(left_rank, left), (right_rank, right)| {
+        ranked.sort_by(|(left_rank, left, _), (right_rank, right, _)| {
             right_rank
                 .cmp(left_rank)
                 .then_with(|| left.value.capability_ref.cmp(&right.value.capability_ref))
         });
         decision.candidates = ranked
             .iter()
-            .take(3)
-            .map(|(rank, candidate)| SkillMatchEvidence {
+            .take(MAX_AUTOMATIC_SKILL_CANDIDATES)
+            .map(|(rank, candidate, strong)| SkillMatchEvidence {
                 capability_ref: candidate.value.capability_ref.clone(),
                 source: candidate.value.source,
                 revision: candidate.value.revision,
                 exact_identity: rank.semantic.exact_identity,
                 name_token_hits: rank.semantic.name_token_hits,
                 summary_token_hits: rank.semantic.summary_token_hits,
-                strong_match: strong_fuzzy_skill_match(candidate, &query_tokens, rank.semantic),
+                strong_match: *strong,
             })
             .collect();
-        if ranked.is_empty() {
-            decision.outcome = AutomaticSkillOutcome::NoMatch;
-            return decision;
-        }
         let exact = ranked
             .iter()
-            .filter(|(rank, _)| rank.semantic.exact_identity)
+            .filter(|(rank, _, _)| rank.semantic.exact_identity)
+            .take(MAX_AUTOMATIC_SKILL_CANDIDATES)
+            .map(|(_, candidate, _)| candidate.value.clone())
             .collect::<Vec<_>>();
         if !exact.is_empty() {
             if exact.len() == 1 {
                 decision.outcome = AutomaticSkillOutcome::ExactMatch;
-                decision.selected = Some(exact[0].1.value.clone());
+                decision.selected = Some(exact[0].clone());
             } else {
                 decision.outcome = AutomaticSkillOutcome::Ambiguous;
             }
-            return decision;
+            return (decision, exact);
         }
-        let strong = ranked
-            .iter()
-            .filter(|(rank, candidate)| {
-                strong_fuzzy_skill_match(candidate, &query_tokens, rank.semantic)
-            })
-            .collect::<Vec<_>>();
-        let Some((top_rank, top)) = strong.first() else {
-            decision.outcome = AutomaticSkillOutcome::BelowThreshold;
-            return decision;
+        let mut strong = ranked.iter().filter(|(_, _, strong)| *strong);
+        let Some((top_rank, top, _)) = strong.next() else {
+            decision.outcome = if denied_strong_match {
+                AutomaticSkillOutcome::PolicyDenied
+            } else if ranked.is_empty() {
+                AutomaticSkillOutcome::NoMatch
+            } else {
+                AutomaticSkillOutcome::BelowThreshold
+            };
+            return (decision, Vec::new());
         };
-        if strong
-            .get(1)
-            .is_some_and(|(rank, _)| rank.semantic == top_rank.semantic)
-        {
+        let choices = std::iter::once(top.value.clone())
+            .chain(
+                strong
+                    .take_while(|(rank, _, _)| rank.semantic == top_rank.semantic)
+                    .map(|(_, candidate, _)| candidate.value.clone()),
+            )
+            .take(MAX_AUTOMATIC_SKILL_CANDIDATES)
+            .collect::<Vec<_>>();
+        if choices.len() > 1 {
             decision.outcome = AutomaticSkillOutcome::Ambiguous;
         } else {
             decision.outcome = AutomaticSkillOutcome::StrongMatch;
             decision.selected = Some(top.value.clone());
         }
-        decision
+        (decision, choices)
     }
 }
 
@@ -535,34 +609,38 @@ fn rank_candidate(
     query_tokens: &BTreeSet<String>,
     resolved_tool_query: Option<&str>,
     normalized_summary_override: Option<&str>,
+    tokenize: fn(&str) -> BTreeSet<String>,
 ) -> Option<SearchRank> {
     let exact_registered_identity = matches!(
         (&candidate.value.invocation_target, resolved_tool_query),
         (CapabilityInvocationTarget::Tool { name }, Some(resolved)) if name == resolved
     );
-    let exact_identity = candidate
-        .normalized_names
-        .iter()
-        .any(|name| name == normalized_query)
-        || candidate
-            .value
-            .capability_ref
-            .eq_ignore_ascii_case(raw_query)
-        || tool_alias_exact_match(candidate, raw_query);
-    let name_phrase = candidate
-        .normalized_names
-        .iter()
-        .any(|name| name.contains(normalized_query));
+    let exact_identity = !normalized_query.is_empty()
+        && (candidate
+            .normalized_names
+            .iter()
+            .any(|name| name == normalized_query)
+            || candidate
+                .value
+                .capability_ref
+                .eq_ignore_ascii_case(raw_query)
+            || tool_alias_exact_match(candidate, raw_query));
+    let name_phrase = !normalized_query.is_empty()
+        && candidate
+            .normalized_names
+            .iter()
+            .any(|name| name.contains(normalized_query));
     let name_token_hits = candidate
         .normalized_names
         .iter()
-        .map(|name| token_hits(name, query_tokens))
+        .map(|name| token_hits(tokenize(name), query_tokens))
         .max()
         .unwrap_or_default();
     let normalized_summary =
         normalized_summary_override.unwrap_or(candidate.normalized_summary.as_str());
-    let summary_phrase = normalized_summary.contains(normalized_query);
-    let summary_token_hits = token_hits(normalized_summary, query_tokens);
+    let summary_phrase =
+        !normalized_query.is_empty() && normalized_summary.contains(normalized_query);
+    let summary_token_hits = token_hits(tokenize(normalized_summary), query_tokens);
 
     if !exact_registered_identity
         && !exact_identity
@@ -593,7 +671,7 @@ fn strong_fuzzy_skill_match(
     semantic_rank: SemanticSearchRank,
 ) -> bool {
     let complete_identity_tokens = candidate.normalized_names.iter().any(|name| {
-        let identity_tokens = search_tokens(name);
+        let identity_tokens = automatic_skill_tokens_with_common_words(name);
         !identity_tokens.is_empty() && identity_tokens.is_subset(query_tokens)
     });
     complete_identity_tokens || semantic_rank.summary_token_hits >= 2
@@ -614,12 +692,8 @@ fn tool_alias_exact_match(candidate: &IndexedCapability, raw_query: &str) -> boo
     )
 }
 
-fn token_hits(haystack: &str, query_tokens: &BTreeSet<String>) -> usize {
-    let haystack_tokens = search_tokens(haystack);
-    query_tokens
-        .iter()
-        .filter(|token| haystack_tokens.contains(*token))
-        .count()
+fn token_hits(haystack: BTreeSet<String>, query_tokens: &BTreeSet<String>) -> usize {
+    haystack.intersection(query_tokens).count()
 }
 
 fn index_tool(tool: ToolCapabilityMetadata) -> IndexedCapability {
@@ -656,26 +730,44 @@ fn index_tool(tool: ToolCapabilityMetadata) -> IndexedCapability {
 }
 
 fn index_catalog_entry(entry: &WorkflowCatalogEntry, kind: CapabilityKind) -> IndexedCapability {
-    let source = capability_source(entry.source);
-    let summary = bounded_summary(&entry.description);
+    index_catalog_identity(
+        kind,
+        &entry.id,
+        &entry.name,
+        &entry.description,
+        capability_source(entry.source),
+        entry.revision,
+        invocation_policy(entry),
+    )
+}
+
+fn index_catalog_identity(
+    kind: CapabilityKind,
+    id: &str,
+    name: &str,
+    description: &str,
+    source: CapabilitySource,
+    revision: u64,
+    policy: CapabilityInvocationPolicy,
+) -> IndexedCapability {
+    let summary = bounded_summary(description);
     let capability_ref = match kind {
-        CapabilityKind::Skill => format!("skill:{}", entry.id),
-        CapabilityKind::Workflow => format!("workflow:{}", entry.id),
+        CapabilityKind::Skill => format!("skill:{id}"),
+        CapabilityKind::Workflow => format!("workflow:{id}"),
         CapabilityKind::Tool => unreachable!("catalog entries are never tool candidates"),
     };
-    let policy = invocation_policy(entry);
     let invocation_target = match kind {
         CapabilityKind::Skill => CapabilityInvocationTarget::Skill {
             name: "load_skill".to_string(),
-            skill_id: entry.id.clone(),
+            skill_id: id.to_string(),
             source,
-            revision: entry.revision,
+            revision,
         },
         CapabilityKind::Workflow => CapabilityInvocationTarget::Workflow {
             name: "workflow_run".to_string(),
-            workflow_id: entry.id.clone(),
+            workflow_id: id.to_string(),
             source,
-            revision: entry.revision,
+            revision,
         },
         CapabilityKind::Tool => unreachable!("catalog entries are never tool candidates"),
     };
@@ -691,17 +783,17 @@ fn index_catalog_entry(entry: &WorkflowCatalogEntry, kind: CapabilityKind) -> In
     IndexedCapability {
         normalized_names: vec![
             normalize_search_text(&capability_ref),
-            normalize_search_text(&entry.id),
-            normalize_search_text(&entry.name),
+            normalize_search_text(id),
+            normalize_search_text(name),
         ],
         normalized_summary: normalize_search_text(&format!("{summary} {policy_hint}")),
         value: CapabilityMatch {
             capability_ref,
             kind,
-            display_name: entry.name.clone(),
+            display_name: name.to_string(),
             summary,
             source,
-            revision: Some(entry.revision),
+            revision: Some(revision),
             status: CapabilityStatus::Valid,
             invocation_policy: Some(policy),
             invocation_target,
@@ -713,9 +805,7 @@ fn skill_entry_is_eligible(
     entry: &WorkflowCatalogEntry,
     eligibility: &CapabilityDiscoveryEligibility,
 ) -> bool {
-    catalog_entry_is_valid(entry)
-        && entry.kind == WorkflowKind::Instruction
-        && !entry.legacy
+    ordinary_skill_entry(entry)
         && !eligibility.disabled_skill_ids.contains(&entry.id)
         && eligibility
             .allowed_skill_ids
@@ -724,6 +814,10 @@ fn skill_entry_is_eligible(
         && eligibility
             .skill_invocation
             .permits(invocation_policy(entry))
+}
+
+fn ordinary_skill_entry(entry: &WorkflowCatalogEntry) -> bool {
+    catalog_entry_is_valid(entry) && entry.kind == WorkflowKind::Instruction && !entry.legacy
 }
 
 fn workflow_entry_is_eligible(
@@ -807,7 +901,8 @@ fn aliases_for_tool(canonical_name: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn bounded_summary(value: &str) -> String {
+/// Collapse whitespace and bound the metadata displayed in capability prompts.
+pub fn bounded_summary(value: &str) -> String {
     let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
     if compact.chars().count() <= MAX_CAPABILITY_SUMMARY_CHARS {
         return compact;
@@ -852,6 +947,117 @@ fn search_tokens(normalized: &str) -> BTreeSet<String> {
         .filter(|token| !token.is_empty())
         .map(str::to_string)
         .collect()
+}
+
+fn bounded_automatic_skill_query(query: &str) -> (String, bool) {
+    if query
+        .char_indices()
+        .nth(MAX_DISCOVERY_QUERY_CHARS)
+        .is_none()
+    {
+        return (query.to_owned(), false);
+    }
+
+    // Drop words crossing a cut so the projection cannot turn "PDFKit"
+    // into an apparent "PDF" reference. CJK text is matched as bigrams.
+    let head_end = query
+        .char_indices()
+        .nth(MAX_DISCOVERY_QUERY_CHARS / 2)
+        .expect("long query has a head window")
+        .0;
+    let tail_start = query
+        .char_indices()
+        .rev()
+        .nth(MAX_DISCOVERY_QUERY_CHARS.div_ceil(2) - 2)
+        .expect("long query has a tail window")
+        .0;
+    let mut head = &query[..head_end];
+    let mut tail = &query[tail_start..];
+    let word_character = |character: char| character.is_alphanumeric() && !is_cjk(character);
+    if head
+        .chars()
+        .next_back()
+        .zip(query[head_end..].chars().next())
+        .is_some_and(|(left, right)| word_character(left) && word_character(right))
+    {
+        head = head.trim_end_matches(word_character);
+    }
+    if query[..tail_start]
+        .chars()
+        .next_back()
+        .zip(tail.chars().next())
+        .is_some_and(|(left, right)| word_character(left) && word_character(right))
+    {
+        tail = tail.trim_start_matches(word_character);
+    }
+    (format!("{head} {tail}"), true)
+}
+
+fn is_cjk(character: char) -> bool {
+    character.is_alphanumeric()
+        && matches!(
+            character as u32,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF
+            | 0x20000..=0x2EE5F | 0x30000..=0x323AF
+            | 0x3040..=0x30FF | 0x31F0..=0x31FF | 0xFF66..=0xFF9D
+            | 0x1100..=0x11FF | 0x3130..=0x318F | 0xA960..=0xA97F | 0xAC00..=0xD7FF
+        )
+}
+
+fn automatic_skill_tokens_with_common_words(normalized: &str) -> BTreeSet<String> {
+    let mut tokens = BTreeSet::new();
+    let mut word = String::new();
+    let mut previous_cjk = None;
+    let mut emitted_bigram = false;
+    for character in normalized.chars() {
+        if is_cjk(character) {
+            if !word.is_empty() {
+                tokens.insert(std::mem::take(&mut word));
+            }
+            if let Some(previous) = previous_cjk {
+                tokens.insert([previous, character].into_iter().collect());
+                emitted_bigram = true;
+            }
+            previous_cjk = Some(character);
+        } else {
+            if let Some(single) = previous_cjk.take() {
+                if !emitted_bigram {
+                    tokens.insert(single.to_string());
+                }
+            }
+            emitted_bigram = false;
+            if character.is_alphanumeric() {
+                word.push(character);
+            } else if !word.is_empty() {
+                tokens.insert(std::mem::take(&mut word));
+            }
+        }
+    }
+    if !word.is_empty() {
+        tokens.insert(word);
+    }
+    if let Some(single) = previous_cjk {
+        if !emitted_bigram {
+            tokens.insert(single.to_string());
+        }
+    }
+    tokens
+}
+
+fn automatic_skill_tokens(normalized: &str) -> BTreeSet<String> {
+    let mut tokens = automatic_skill_tokens_with_common_words(normalized);
+    // Keep common words in the identity requirements so dropping one cannot
+    // turn a partial name into a complete match.
+    const COMMON_WORDS: &[&str] = &[
+        "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "i", "in", "is", "it",
+        "me", "my", "of", "on", "or", "please", "that", "the", "this", "to", "use", "using",
+        "with", "you", "your",
+    ];
+    tokens.retain(|word| {
+        COMMON_WORDS.binary_search(&word.as_str()).is_err()
+            && !(word.chars().count() == 1 && word.chars().next().is_some_and(is_cjk))
+    });
+    tokens
 }
 
 #[cfg(test)]
@@ -1460,6 +1666,79 @@ mod tests {
     }
 
     #[test]
+    fn automatic_skill_matches_a_format_adjacent_to_chinese_text() {
+        let pdf = catalog_entry(
+            "pdf",
+            "PDF",
+            "Generate and inspect PDF documents",
+            WorkflowKind::Instruction,
+            WorkflowSource::User,
+            1,
+        );
+        let index = index(
+            &[],
+            vec![pdf],
+            vec![],
+            CapabilityDiscoveryEligibility::default(),
+        );
+
+        for query in ["请帮我生成PDF文档", "PDFを生成する", "PDF문서를만들어줘"]
+        {
+            let decision = index.explain_automatic_skill(query);
+            assert_eq!(
+                decision.outcome,
+                AutomaticSkillOutcome::StrongMatch,
+                "{query}"
+            );
+            assert_eq!(decision.selected.unwrap().capability_ref, "skill:pdf");
+        }
+        for query in [
+            "with this",
+            "Use this with my printer",
+            "请帮我运行PDFKit程序",
+        ] {
+            assert!(
+                index.discover_unambiguous_automatic_skill(query).is_none(),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_skill_matches_unspaced_cjk_phrases() {
+        for (name, query, unrelated) in [
+            ("合并文档", "请把文件合并文档后保存", "请修复网络连接"),
+            ("画像変換", "画像変換をお願いします", "接続を確認する"),
+            ("문서변환", "문서변환해주세요", "네트워크확인"),
+        ] {
+            let skill = catalog_entry(
+                "conversion",
+                name,
+                name,
+                WorkflowKind::Instruction,
+                WorkflowSource::User,
+                1,
+            );
+            let index = index(
+                &[],
+                vec![skill],
+                vec![],
+                CapabilityDiscoveryEligibility::default(),
+            );
+            assert!(
+                index.discover_unambiguous_automatic_skill(query).is_some(),
+                "{query}"
+            );
+            assert!(
+                index
+                    .discover_unambiguous_automatic_skill(unrelated)
+                    .is_none(),
+                "{unrelated}"
+            );
+        }
+    }
+
+    #[test]
     fn automatic_skill_bounds_long_user_hints_without_failing() {
         let skill = catalog_entry(
             "review",
@@ -1478,19 +1757,33 @@ mod tests {
                 ..Default::default()
             },
         );
-        let hint = format!("review {}", "界".repeat(MAX_DISCOVERY_QUERY_CHARS + 20));
-
-        assert_eq!(
-            index
-                .discover_unambiguous_automatic_skill(&hint)
-                .expect("bounded prefix keeps the match")
-                .capability_ref,
-            "skill:review"
+        let context = "界".repeat(MAX_DISCOVERY_QUERY_CHARS * 2);
+        for hint in [
+            format!("review {context}"),
+            format!("{context}请帮我review代码"),
+        ] {
+            let (bounded, truncated) = bounded_automatic_skill_query(&hint);
+            assert!(truncated);
+            assert!(bounded.chars().count() <= MAX_DISCOVERY_QUERY_CHARS);
+            let decision = index.explain_automatic_skill(&hint);
+            assert_eq!(decision.outcome, AutomaticSkillOutcome::StrongMatch);
+            assert_eq!(decision.selected.unwrap().capability_ref, "skill:review");
+            assert!(matches!(
+                index.discover(&request(&hint)),
+                Err(CapabilityDiscoveryError::QueryTooLong { .. })
+            ));
+        }
+        let head_cut = format!(
+            "{} reviewKit {context}",
+            "x".repeat(MAX_DISCOVERY_QUERY_CHARS / 2 - 7)
         );
-        assert!(matches!(
-            index.discover(&request(&hint)),
-            Err(CapabilityDiscoveryError::QueryTooLong { .. })
-        ));
+        let tail_cut = format!(
+            "{context} preview {}",
+            "x".repeat(MAX_DISCOVERY_QUERY_CHARS.div_ceil(2) - 8)
+        );
+        for hint in [head_cut, tail_cut] {
+            assert!(index.discover_unambiguous_automatic_skill(&hint).is_none());
+        }
     }
 
     #[test]

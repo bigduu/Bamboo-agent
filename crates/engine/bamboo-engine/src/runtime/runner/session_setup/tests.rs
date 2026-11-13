@@ -514,6 +514,129 @@ async fn oversized_replacement_preserves_restorable_legacy_activation() {
 }
 
 #[tokio::test]
+async fn automatic_selection_preserves_prompt_budget_when_resuming_without_candidates() {
+    let directory = tempfile::tempdir().unwrap();
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir: directory.path().join("skills"),
+        ..Default::default()
+    }));
+    manager.initialize().await.unwrap();
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+
+    for (session_id, max_context_tokens, shows_guidance) in [
+        ("no-match-resume", 128_000, true),
+        ("tiny-context-resume", 100, false),
+    ] {
+        let config = crate::runtime::config::AgentLoopConfig {
+            skill_manager: Some(manager.clone()),
+            token_budget: Some(bamboo_domain::TokenBudget::for_model(max_context_tokens)),
+            ..Default::default()
+        };
+        let mut session = Session::new(session_id, "model");
+        let before = super::legacy_instruction::prepare_context(
+            &mut session,
+            "with this",
+            &config,
+            session_id,
+            &logger,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            before.contains("Check Skill applicability."),
+            shows_guidance
+        );
+        let diagnostic_key = bamboo_skills::WORKFLOW_CATALOG_DIAGNOSTIC_METADATA_KEY;
+        let diagnostic = session.metadata[diagnostic_key].clone();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&diagnostic).unwrap()["automatic_outcome"],
+            "no_match"
+        );
+
+        let resumed = super::legacy_instruction::prepare_context(
+            &mut session,
+            "with this",
+            &config,
+            session_id,
+            &logger,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resumed, before);
+        assert_eq!(session.metadata[diagnostic_key], diagnostic);
+    }
+}
+
+#[tokio::test]
+async fn retained_automatic_candidates_resume_the_workflow_that_was_loaded() {
+    let directory = tempfile::tempdir().unwrap();
+    let skills_dir = directory.path().join("skills");
+    for id in ["pdf", "docx"] {
+        let root = skills_dir.join(id);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("SKILL.md"),
+            format!("---\nname: {id}\ndescription: Generate portable documents\n---\n{id} instructions\n"),
+        )
+        .unwrap();
+    }
+    let manager = Arc::new(SkillManager::with_config(SkillStoreConfig {
+        skills_dir,
+        ..Default::default()
+    }));
+    manager.initialize().await.unwrap();
+    let config = crate::runtime::config::AgentLoopConfig {
+        skill_manager: Some(manager.clone()),
+        ..Default::default()
+    };
+    let logger = crate::runtime::runner::logging::DebugLogger::new(false);
+    let id = "automatic-activation-resume";
+    let mut session = Session::new(id, "model");
+    let prompt = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Generate portable documents",
+        &config,
+        id,
+        &logger,
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(prompt.contains("- skill_id: `pdf`") && prompt.contains("- skill_id: `docx`"));
+    let candidates = manager
+        .store()
+        .export_activation_snapshot(id)
+        .await
+        .unwrap();
+    session.metadata.insert(
+        bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY.into(),
+        serde_json::to_string(&candidates).unwrap(),
+    );
+    record_test_activation_from_pinned_snapshot(&mut session, "pdf");
+
+    let resumed = super::legacy_instruction::prepare_context(
+        &mut session,
+        "Continue",
+        &config,
+        id,
+        &logger,
+        true,
+    )
+    .await
+    .unwrap();
+    assert!(resumed.contains("The `pdf` workflow was loaded"));
+    assert!(!resumed.contains("docx"));
+    assert!(super::legacy_instruction::active_context_block(&session).is_some());
+    let snapshot: bamboo_skills::SkillActivationSnapshot = serde_json::from_str(
+        &session.metadata[bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY],
+    )
+    .unwrap();
+    assert_eq!(snapshot.skills.into_keys().collect::<Vec<_>>(), ["pdf"]);
+}
+
+#[tokio::test]
 async fn pre_execute_explicit_snapshot_restores_after_restart_without_suspended_runtime() {
     let directory = tempfile::tempdir().expect("tempdir");
     let config = SkillStoreConfig {

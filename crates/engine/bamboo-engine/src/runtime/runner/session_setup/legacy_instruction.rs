@@ -108,13 +108,17 @@ pub(crate) async fn prepare_context(
         }
     };
     session.metadata.remove(SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
-    let explicit_activation_loaded = skill_result.restored_active_context
-        || skill_context::selection_matches_loaded_activation(session, &skill_result);
-    let skill_context = if explicit_activation_loaded {
+    let active_skill_id = skill_result
+        .restored_active_skill_id
+        .as_deref()
+        .or_else(|| {
+            skill_context::selection_matches_loaded_activation(session, &skill_result)
+                .then(|| skill_result.selected_skill_ids[0].as_str())
+        });
+    let skill_context = if let Some(skill_id) = active_skill_id {
         format!(
             "\n\n## Explicit Workflow Already Activated\n\
 The `{skill_id}` workflow was loaded successfully earlier in this session. Continue following the existing `load_skill` result and its workflow instructions. Do not call `load_skill` again solely because execution resumed.\n",
-            skill_id = skill_result.selected_skill_ids[0],
         )
     } else if skill_result.selection_source.as_deref() == Some("explicit")
         && skill_result.selected_skill_ids.len() == 1
@@ -231,7 +235,7 @@ The user explicitly selected `{skill_id}`. Your first response step MUST be exac
                 .remove(SKILL_RUNTIME_SELECTED_SKILL_MODE_KEY);
         }
 
-        if !skill_result.restored_active_context {
+        if skill_result.restored_active_skill_id.is_none() {
             skill_context::reset_activation_state_for_new_selection(session, &skill_result);
         }
 
