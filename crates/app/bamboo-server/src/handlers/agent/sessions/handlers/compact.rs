@@ -1,5 +1,5 @@
-use actix_web::{web, HttpResponse, Result};
-use bamboo_agent_core::AgentEvent;
+use actix_web::{http::StatusCode, web, HttpResponse, Result};
+use bamboo_agent_core::{AgentError, AgentEvent};
 use bamboo_domain::{ActorActivationFinish, SessionKind};
 use bamboo_engine::events::RootActorEventPublication;
 use bamboo_engine::execution::{
@@ -12,7 +12,7 @@ use serde_json::json;
 use std::time::Duration;
 
 use crate::app_state::AppState;
-use crate::error::{error_value, json_internal_server_error};
+use crate::error::{error_value, json_error_with_code, json_internal_server_error};
 use crate::handlers::agent::events;
 use crate::tools::ToolSurface;
 
@@ -152,6 +152,13 @@ async fn compact_owned_session(
             return Ok(HttpResponse::Ok().json(json!({
                 "session_id": id, "status": "unchanged",
             })))
+        }
+        Err(error @ AgentError::EmptyContextSummary) => {
+            return Ok(json_error_with_code(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                error.to_string(),
+                Some("context_summary_empty"),
+            ));
         }
         Err(error) => {
             return Ok(HttpResponse::UnprocessableEntity().json(json!({

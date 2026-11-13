@@ -19,7 +19,7 @@ use bamboo_compression::{
     build_retrieval_window_full_archive_plan_with_token_accounting,
     estimate_context_compression_exposure_with_fixed_tokens,
     estimate_prompt_cache_savings_with_fixed_tokens, finalize_compression_candidate_plan,
-    prepare_hybrid_context_with_fixed_tokens, CompressionPlan, CompressionPlanError,
+    prepare_hybrid_context_with_fixed_tokens, BudgetError, CompressionPlan, CompressionPlanError,
     PreparedContext, RetrievalWindowPlanError, RetrievalWindowPolicy,
     RetrievalWindowTokenAccounting, TiktokenTokenCounter, TokenBudget, TokenCounter,
 };
@@ -2475,9 +2475,18 @@ async fn maybe_apply_summary_context_compression_with_budget(
                 error = %error,
                 "Bounded context compression failed before commit"
             );
-            let status = format!("failed:{error}");
+            let (status, error) = match error {
+                BudgetError::EmptySummaryResponse { .. } => (
+                    "failed_empty_summary".to_string(),
+                    AgentError::EmptyContextSummary,
+                ),
+                error => {
+                    let detail = error.to_string();
+                    (format!("failed:{detail}"), AgentError::Budget(detail))
+                }
+            };
             emit_context_compression_status(event_tx, phase_label, &status).await;
-            return Err(AgentError::Budget(error.to_string()));
+            return Err(error);
         }
     };
 

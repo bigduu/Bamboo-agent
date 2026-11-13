@@ -61,6 +61,14 @@ async fn run_message_summary(
     session: &mut Session,
     config: &AgentLoopConfig,
 ) -> Result<bool, AgentError> {
+    run_message_summary_with_events(session, config, None).await
+}
+
+async fn run_message_summary_with_events(
+    session: &mut Session,
+    config: &AgentLoopConfig,
+    events: Option<&tokio::sync::mpsc::Sender<AgentEvent>>,
+) -> Result<bool, AgentError> {
     let budget = session.token_budget.clone().unwrap();
     maybe_apply_summary_context_compression_with_budget(
         session,
@@ -70,7 +78,7 @@ async fn run_message_summary(
         &[],
         &noop_llm(),
         &budget,
-        None,
+        events,
         "pre-turn",
         None,
         None,
@@ -471,34 +479,35 @@ async fn message_summary_model_failure_preserves_history_and_retry_request() {
         .contains_key("responses.previous_response_id"));
 }
 
-async fn run_chat_message_summary_retry(
-    session: &mut Session,
-    model: &str,
-    fallback: ResponseTemplate,
-) -> (Result<bool, AgentError>, Session) {
+#[tokio::test]
+async fn chat_message_summary_empty_reduce_reports_failure_and_preserves_persisted_history() {
     use bamboo_agent_core::Storage;
+
+    let model = "summary-secondary";
+    let mut session = message_summary_session();
+    session.messages[1].compressed = true;
+    session.conversation_summary = Some(bamboo_domain::ConversationSummary::new(
+        "Previous accepted summary",
+        1,
+        10,
+    ));
+    let messages = serde_json::to_value(&session.messages).unwrap();
+    let summary = serde_json::to_value(&session.conversation_summary).unwrap();
+    let pending = session.force_manual_compression.clone();
 
     let server = MockServer::start().await;
     let calls = AtomicUsize::new(0);
     Mock::given(method("POST"))
         .and(path("/chat/completions"))
-        .respond_with(move |request: &Request| {
-            let body: serde_json::Value = request.body_json().unwrap();
-            match calls.fetch_add(1, Ordering::Relaxed) {
+        .respond_with(
+            move |_: &Request| match calls.fetch_add(1, Ordering::Relaxed) {
                 0 => chat_summary_stream("The chosen design is recorded."),
                 1 => chat_summary_stream(""),
-                2 if body["reasoning_effort"] == "none" => ResponseTemplate::new(400)
-                    .set_body_json(serde_json::json!({
-                        "message": "The value of reasoning_effort should be one of low, medium, high, xhigh, and max.",
-                    })),
-                3 if body.get("reasoning_effort").is_none() && body["enable_thinking"] == false => {
-                    fallback.clone()
-                }
                 _ => ResponseTemplate::new(400)
-                    .set_body_string("expected enable_thinking=false without reasoning_effort"),
-            }
-        })
-        .expect(4)
+                    .set_body_string("Unexpected retry after the model returned an empty summary"),
+            },
+        )
+        .expect(2)
         .mount(&server)
         .await;
 
@@ -519,7 +528,7 @@ async fn run_chat_message_summary_retry(
             .await
             .unwrap(),
     );
-    storage.save_session(session).await.unwrap();
+    storage.save_session(&session).await.unwrap();
     let provider = bamboo_llm::OpenAIProvider::new("test-key")
         .with_base_url(server.uri())
         .with_client(reqwest::Client::builder().no_proxy().build().unwrap());
@@ -529,7 +538,21 @@ async fn run_chat_message_summary_retry(
     config.persistence = Some(Arc::new(bamboo_storage::LockedSessionStore::new(
         storage.clone(),
     )));
-    let result = run_message_summary(session, &config).await;
+    let (event_tx, mut events) = tokio::sync::mpsc::channel(16);
+    let error = run_message_summary_with_events(&mut session, &config, Some(&event_tx))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::EmptyContextSummary));
+    drop(event_tx);
+    let mut last_status = None;
+    while let Some(event) = events.recv().await {
+        match event {
+            AgentEvent::ContextCompressionStatus { status, .. } => last_status = Some(status),
+            AgentEvent::ContextSummarized { .. } => panic!("An empty summary was committed"),
+            _ => {}
+        }
+    }
+    assert_eq!(last_status.as_deref(), Some("failed_empty_summary"));
     let saved = storage.load_session(&session.id).await.unwrap().unwrap();
 
     let requests = server.received_requests().await.unwrap();
@@ -537,80 +560,12 @@ async fn run_chat_message_summary_retry(
         .iter()
         .map(|request| request.body_json::<serde_json::Value>().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(
-        bodies.len(),
-        4,
-        "map, empty reduce, rejected disable, corrected disable"
-    );
+    assert_eq!(bodies.len(), 2, "Only the map and empty reduce are sent");
     for body in &bodies {
         assert_eq!(body["model"], model);
-    }
-    for body in &bodies[..2] {
         assert_eq!(body["reasoning_effort"], "low");
         assert!(body.get("enable_thinking").is_none());
     }
-    assert_eq!(bodies[2]["reasoning_effort"], "none");
-    assert_eq!(bodies[3]["enable_thinking"], false);
-    assert!(bodies[3].get("reasoning_effort").is_none());
-    for body in &bodies[2..] {
-        assert_eq!(body["messages"], bodies[1]["messages"]);
-        assert!(bodies[1]["max_completion_tokens"].as_u64().unwrap() > 0);
-        assert_eq!(
-            body["max_completion_tokens"],
-            bodies[1]["max_completion_tokens"]
-        );
-    }
-    (result, saved)
-}
-
-fn chat_summary_stream(text: &str) -> ResponseTemplate {
-    let chunk = serde_json::json!({
-        "choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
-    });
-    ResponseTemplate::new(200)
-        .insert_header("content-type", "text/event-stream")
-        .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
-}
-
-#[tokio::test]
-async fn chat_message_summary_retry_corrects_disable_and_commits_on_success() {
-    let mut session = message_summary_session();
-    let (result, saved) = run_chat_message_summary_retry(
-        &mut session,
-        "summary-primary",
-        chat_summary_stream("Final summary from the fallback request."),
-    )
-    .await;
-    assert!(result.unwrap());
-    assert_eq!(saved.compression_events.len(), 1);
-    assert!(saved.messages.iter().any(|message| message.compressed));
-    assert_eq!(
-        saved.conversation_summary.unwrap().content,
-        "Final summary from the fallback request."
-    );
-}
-
-#[tokio::test]
-async fn chat_message_summary_retry_failure_preserves_persisted_history() {
-    let mut session = message_summary_session();
-    session.messages[1].compressed = true;
-    session.conversation_summary = Some(bamboo_domain::ConversationSummary::new(
-        "Previous accepted summary",
-        1,
-        10,
-    ));
-    let messages = serde_json::to_value(&session.messages).unwrap();
-    let summary = serde_json::to_value(&session.conversation_summary).unwrap();
-    let pending = session.force_manual_compression.clone();
-    let (result, saved) = run_chat_message_summary_retry(
-        &mut session,
-        "summary-secondary",
-        ResponseTemplate::new(400)
-            .set_body_string("Invalid reasoning_effort 'none': mock rejected the summary retry"),
-    )
-    .await;
-    let error = result.unwrap_err().to_string();
-    assert!(error.contains("mock rejected the summary retry"), "{error}");
     assert_eq!(session.force_manual_compression, pending);
     for state in [&session, &saved] {
         assert_eq!(serde_json::to_value(&state.messages).unwrap(), messages);
@@ -620,6 +575,15 @@ async fn chat_message_summary_retry_failure_preserves_persisted_history() {
         );
         assert!(state.compression_events.is_empty());
     }
+}
+
+fn chat_summary_stream(text: &str) -> ResponseTemplate {
+    let chunk = serde_json::json!({
+        "choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+    });
+    ResponseTemplate::new(200)
+        .insert_header("content-type", "text/event-stream")
+        .set_body_string(format!("data: {chunk}\n\ndata: [DONE]\n\n"))
 }
 
 #[tokio::test]
