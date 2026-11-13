@@ -488,6 +488,49 @@ fn next_enabled_instance_id(config: &bamboo_config::Config) -> Option<String> {
         .cloned()
 }
 
+fn default_model_reference_paths(
+    defaults: &bamboo_config::DefaultsConfig,
+    instance_id: &str,
+) -> Vec<String> {
+    let bamboo_config::DefaultsConfig {
+        chat,
+        fast,
+        task_summary,
+        vision,
+        memory_background,
+        planning,
+        search,
+        code_review,
+        work_review,
+        sub_agent,
+        subagent_models,
+    } = defaults;
+    let mut paths: Vec<_> = [
+        ("chat", Some(chat)),
+        ("fast", fast.as_ref()),
+        ("task_summary", task_summary.as_ref()),
+        ("vision", vision.as_ref()),
+        ("memory_background", memory_background.as_ref()),
+        ("planning", planning.as_ref()),
+        ("search", search.as_ref()),
+        ("code_review", code_review.as_ref()),
+        ("work_review", work_review.as_ref()),
+        ("sub_agent", sub_agent.as_ref()),
+    ]
+    .into_iter()
+    .filter(|(_, reference)| reference.is_some_and(|reference| reference.provider == instance_id))
+    .map(|(field, _)| format!("/defaults/{field}"))
+    .collect();
+    for (name, reference) in subagent_models {
+        if reference.provider == instance_id {
+            let escaped = name.replace('~', "~0").replace('/', "~1");
+            paths.push(format!("/defaults/subagent_models/{escaped}"));
+        }
+    }
+    paths.sort_unstable();
+    paths
+}
+
 // ─── Handlers ───────────────────────────────────────────────────────
 
 /// GET /bamboo/settings/provider-instances
@@ -669,34 +712,25 @@ pub async fn delete_provider_instance(
 ) -> Result<HttpResponse, AppError> {
     let instance_id = path.into_inner();
     validate_instance_id(&instance_id)?;
-    let instance_id_for_closure = instance_id.clone();
-    let provider_instance_intents = std::collections::BTreeSet::from([instance_id.clone()]);
-
     let new_config = app_state
-        .update_config_with_provider_credentials(
-            move |config| {
-                if config
-                    .provider_instances
-                    .remove(&instance_id_for_closure)
-                    .is_none()
-                {
-                    return Err(AppError::BadRequest(format!(
-                        "Provider instance '{}' not found",
-                        instance_id_for_closure
-                    )));
+        .delete_provider_instance_with_credentials(instance_id.clone(), |config, target| {
+            if !config.provider_instances.contains_key(target) {
+                return Err(AppError::BadRequest(format!(
+                    "Provider instance '{target}' not found"
+                )));
+            }
+            if let Some(defaults) = config.defaults.as_ref() {
+                let reference_paths = default_model_reference_paths(defaults, target);
+                if !reference_paths.is_empty() {
+                    return Err(AppError::ProviderInstanceInUse { reference_paths });
                 }
-                if config.default_provider_instance.as_deref() == Some(&instance_id_for_closure) {
-                    config.default_provider_instance = next_enabled_instance_id(config);
-                }
-                Ok(())
-            },
-            std::collections::BTreeSet::new(),
-            provider_instance_intents,
-            ConfigUpdateEffects {
-                reload_provider: bamboo_config::patch::ReloadMode::Strict,
-                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
-            },
-        )
+            }
+            config.provider_instances.remove(target);
+            if config.default_provider_instance.as_deref() == Some(target) {
+                config.default_provider_instance = next_enabled_instance_id(config);
+            }
+            Ok(())
+        })
         .await?;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
@@ -736,6 +770,10 @@ pub async fn set_default_provider_instance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use actix_web::{http::StatusCode, test as http_test, App};
+
+    const INSTANCES_URL: &str = "/api/v1/bamboo/settings/provider-instances";
+    const CONFIG_URL: &str = "/api/v1/bamboo/config";
 
     fn create_request(api_key: &str) -> CreateInstanceRequest {
         CreateInstanceRequest {
@@ -744,6 +782,288 @@ mod tests {
             enabled: None,
             config: serde_json::json!({ "api_key": api_key }),
         }
+    }
+
+    async fn provider_delete_state(home: &std::path::Path) -> web::Data<AppState> {
+        let mut state = AppState::new(home.to_path_buf()).await.unwrap();
+        state.stop_config_watcher_for_test();
+        web::Data::new(state)
+    }
+
+    async fn create_delete_fixture(state: &web::Data<AppState>, key: &str) -> String {
+        let mut request = create_request(key);
+        request.config["base_url"] = serde_json::json!("http://127.0.0.1:1/v1");
+        let response = create_provider_instance(state.clone(), web::Json(request))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let body = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&body).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    fn provider_and_credential_bytes(home: &std::path::Path) -> [Vec<u8>; 2] {
+        ["providers.json", "credentials.json"].map(|name| std::fs::read(home.join(name)).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn delete_provider_instance_rejects_default_model_references() {
+        let home = tempfile::tempdir().unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let target_id = create_delete_fixture(&state, "synthetic-delete-target-key").await;
+        let survivor_id = create_delete_fixture(&state, "synthetic-delete-survivor-key").await;
+        let defaults = serde_json::json!({
+            "chat": {"provider": target_id, "model": "chat-fixture"},
+            "fast": {"provider": target_id, "model": "fast-fixture"},
+            "task_summary": {"provider": target_id, "model": "summary-fixture"},
+            "vision": {"provider": target_id, "model": "vision-fixture"},
+            "memory_background": {"provider": target_id, "model": "memory-fixture"},
+            "planning": {"provider": target_id, "model": "planning-fixture"},
+            "search": {"provider": target_id, "model": "search-fixture"},
+            "code_review": {"provider": target_id, "model": "code-review-fixture"},
+            "work_review": {"provider": target_id, "model": "review-fixture"},
+            "sub_agent": {"provider": target_id, "model": "sub-agent-fixture"},
+            "subagent_models": {
+                "ops/~review": {"provider": target_id, "model": "worker-fixture"},
+                "other": {"provider": survivor_id, "model": "other-fixture"},
+            }
+        });
+        let saved = http_test::call_service(
+            &app,
+            http_test::TestRequest::post()
+                .uri(CONFIG_URL)
+                .set_json(serde_json::json!({"defaults": defaults}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(saved.status(), StatusCode::OK);
+
+        let before = provider_and_credential_bytes(home.path());
+        let provider = state.provider.read().await.clone();
+        let event_sequence = state.account_sink.latest_seq();
+        let response = http_test::call_service(
+            &app,
+            http_test::TestRequest::delete()
+                .uri(&format!("{INSTANCES_URL}/{target_id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = http_test::read_body_json(response).await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "error": {
+                    "type": "api_error",
+                    "code": "provider_instance_in_use",
+                    "message": "Provider instance is still referenced by model defaults"
+                },
+                "reference_paths": [
+                    "/defaults/chat",
+                    "/defaults/code_review",
+                    "/defaults/fast",
+                    "/defaults/memory_background",
+                    "/defaults/planning",
+                    "/defaults/search",
+                    "/defaults/sub_agent",
+                    "/defaults/subagent_models/ops~1~0review",
+                    "/defaults/task_summary",
+                    "/defaults/vision",
+                    "/defaults/work_review"
+                ]
+            })
+        );
+        assert!(provider_and_credential_bytes(home.path()) == before);
+        assert_eq!(state.provider_registry.default_provider_name(), target_id);
+        assert!(std::sync::Arc::ptr_eq(
+            &provider,
+            &*state.provider.read().await
+        ));
+        assert_eq!(state.account_sink.latest_seq(), event_sequence);
+        state.shutdown().await;
+    }
+
+    #[actix_web::test]
+    async fn delete_provider_instance_observes_an_external_defaults_commit() {
+        let home = tempfile::tempdir().unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let target_id = create_delete_fixture(&state, "synthetic-stale-target-key").await;
+        let survivor_id = create_delete_fixture(&state, "synthetic-stale-survivor-key").await;
+        assert!(state.config.read().await.defaults.is_none());
+
+        let external = bamboo_config::ConfigFacade::open(home.path()).unwrap();
+        let revision = external.registry().providers.snapshot().revision;
+        let mut candidate = external.effective_config();
+        candidate.defaults = Some(
+            serde_json::from_value(serde_json::json!({
+                "chat": {"provider": survivor_id, "model": "chat-fixture"},
+                "fast": {"provider": target_id, "model": "fast-fixture"},
+            }))
+            .unwrap(),
+        );
+        let revision_after = bamboo_config::persist_provider_credential_transaction_at_revision(
+            home.path(),
+            &mut candidate,
+            &Default::default(),
+            &Default::default(),
+            revision,
+        )
+        .unwrap();
+        assert_eq!(revision_after, revision + 1);
+        assert!(state.config.read().await.defaults.is_none());
+
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let before = provider_and_credential_bytes(home.path());
+        let response = http_test::call_service(
+            &app,
+            http_test::TestRequest::delete()
+                .uri(&format!("{INSTANCES_URL}/{target_id}"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body: Value = http_test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "provider_instance_in_use");
+        assert_eq!(
+            body["reference_paths"],
+            serde_json::json!(["/defaults/fast"])
+        );
+        assert!(provider_and_credential_bytes(home.path()) == before);
+        assert_eq!(state.provider_registry.default_provider_name(), target_id);
+
+        let mut interleaving = bamboo_config::ConfigFacade::open(home.path())
+            .unwrap()
+            .effective_config();
+        interleaving.defaults.as_mut().unwrap().fast = None;
+        let unreferenced_revision =
+            bamboo_config::persist_provider_credential_transaction_at_revision(
+                home.path(),
+                &mut interleaving,
+                &Default::default(),
+                &Default::default(),
+                revision_after,
+            )
+            .unwrap();
+        let mut winner_bytes = None;
+        let error = state
+            .delete_provider_instance_with_credentials(target_id.clone(), |config, id| {
+                assert!(config.defaults.as_ref().unwrap().fast.is_none());
+                interleaving.defaults.as_mut().unwrap().fast =
+                    Some(bamboo_domain::ProviderModelRef::new(id, "fast-fixture"));
+                assert_eq!(
+                    bamboo_config::persist_provider_credential_transaction_at_revision(
+                        home.path(),
+                        &mut interleaving,
+                        &Default::default(),
+                        &Default::default(),
+                        unreferenced_revision,
+                    )
+                    .unwrap(),
+                    unreferenced_revision + 1
+                );
+                winner_bytes = Some(provider_and_credential_bytes(home.path()));
+                config.provider_instances.remove(id);
+                config.default_provider_instance = Some(survivor_id.clone());
+                Ok(())
+            })
+            .await
+            .expect_err("a winner after the deletion check must conflict");
+        assert!(matches!(
+            error,
+            AppError::ConfigConflict { expected, actual }
+                if expected == unreferenced_revision && actual == unreferenced_revision + 1
+        ));
+        assert!(provider_and_credential_bytes(home.path()) == winner_bytes.unwrap());
+        assert_eq!(state.provider_registry.default_provider_name(), target_id);
+        state.shutdown().await;
+    }
+
+    #[actix_web::test]
+    async fn delete_provider_instance_reassigns_or_clears_the_default() {
+        let home = tempfile::tempdir().unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let first = create_delete_fixture(&state, "synthetic-delete-first-key").await;
+        let second = create_delete_fixture(&state, "synthetic-delete-second-key").await;
+        let spare = create_delete_fixture(&state, "synthetic-delete-spare-key").await;
+        let refs = {
+            let config = state.config.read().await;
+            [&spare, &first, &second].map(|id| {
+                config.provider_instances[id]
+                    .credential_ref
+                    .clone()
+                    .unwrap()
+            })
+        };
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        for (id, next_default, credential_ref) in [
+            (&spare, Some(&first), &refs[0]),
+            (&first, Some(&second), &refs[1]),
+            (&second, None, &refs[2]),
+        ] {
+            let response = http_test::call_service(
+                &app,
+                http_test::TestRequest::delete()
+                    .uri(&format!("{INSTANCES_URL}/{id}"))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value = http_test::read_body_json(response).await;
+            assert_eq!(
+                body,
+                serde_json::json!({"success": true, "deleted": id, "default_provider_instance_id": next_default})
+            );
+            let listed: Value = http_test::call_and_read_body_json(
+                &app,
+                http_test::TestRequest::get()
+                    .uri(INSTANCES_URL)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                listed["default_provider_instance_id"].as_str(),
+                next_default.map(String::as_str)
+            );
+            assert!(listed["instances"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| entry["id"].as_str() != Some(id.as_str())));
+            assert!(state.provider_registry.get(id).is_none());
+            assert!(
+                !state
+                    .credential_store
+                    .status(credential_ref)
+                    .unwrap()
+                    .configured
+            );
+            let durable = bamboo_config::ConfigFacade::open(home.path())
+                .unwrap()
+                .effective_config();
+            assert!(!durable.provider_instances.contains_key(id));
+            assert_eq!(durable.default_provider_instance.as_ref(), next_default);
+        }
+        state.shutdown().await;
     }
 
     #[test]

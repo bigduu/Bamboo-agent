@@ -406,6 +406,13 @@ struct ConfigRuntimeEffectContext {
     config_application: Arc<std::sync::RwLock<ConfigApplicationState>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProviderConfigUpdate {
+    Credential,
+    Metadata,
+    DeleteInstance,
+}
+
 fn capture_application_inputs(
     state: &std::sync::RwLock<ConfigApplicationState>,
     candidate: &Config,
@@ -5689,6 +5696,7 @@ impl AppState {
                         config_application,
                     },
                     forced_mcp_replacements,
+                    false,
                 )
                 .await?;
                 snapshot
@@ -5719,7 +5727,7 @@ impl AppState {
             provider_intents,
             provider_instance_intents,
             effects,
-            false,
+            ProviderConfigUpdate::Credential,
         )
         .await
     }
@@ -5740,7 +5748,30 @@ impl AppState {
             BTreeSet::new(),
             BTreeSet::new(),
             effects,
-            true,
+            ProviderConfigUpdate::Metadata,
+        )
+        .await
+    }
+
+    /// Validate the exact durable Providers generation before staging a
+    /// deletion. The credential transaction retains its revision as a CAS.
+    pub(crate) async fn delete_provider_instance_with_credentials<F>(
+        &self,
+        instance_id: String,
+        update: F,
+    ) -> Result<Config, AppError>
+    where
+        F: FnOnce(&mut Config, &str) -> Result<(), AppError>,
+    {
+        self.update_config_with_provider_credentials_inner(
+            |config| update(config, &instance_id),
+            BTreeSet::new(),
+            BTreeSet::from([instance_id.clone()]),
+            ConfigUpdateEffects {
+                reload_provider: bamboo_config::patch::ReloadMode::Strict,
+                reconcile_mcp: bamboo_config::patch::ReloadMode::None,
+            },
+            ProviderConfigUpdate::DeleteInstance,
         )
         .await
     }
@@ -5751,15 +5782,13 @@ impl AppState {
         provider_intents: BTreeSet<String>,
         provider_instance_intents: BTreeSet<String>,
         effects: ConfigUpdateEffects,
-        exact_provider_metadata: bool,
+        kind: ProviderConfigUpdate,
     ) -> Result<Config, AppError>
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
     {
-        let exact_provider_metadata = exact_provider_metadata
-            && provider_intents.is_empty()
-            && provider_instance_intents.is_empty()
-            && self.config_facade.is_some();
+        let exact_provider_metadata =
+            kind == ProviderConfigUpdate::Metadata && self.config_facade.is_some();
         if provider_intents.is_empty()
             && provider_instance_intents.is_empty()
             && !exact_provider_metadata
@@ -5769,6 +5798,32 @@ impl AppState {
         let io = self.config_io_lock.clone().lock_owned().await;
         let config_facade = self.config_facade.clone();
         let config_application = self.config_application.clone();
+        let durable_providers =
+            if kind == ProviderConfigUpdate::DeleteInstance && config_facade.is_some() {
+                let data_dir = self.app_data_dir.clone();
+                let snapshot = tokio::task::spawn_blocking(move || {
+                    let facade = bamboo_config::ConfigFacade::open(data_dir)?;
+                    let snapshot = facade.registry().providers.snapshot();
+                    if snapshot.status != SectionStatus::Healthy
+                        || snapshot.source_kind != SectionSourceKind::File
+                    {
+                        return Err(ConfigStoreError::Validation(
+                            "durable Providers section is unavailable".to_string(),
+                        ));
+                    }
+                    Ok((facade.effective_config(), snapshot.revision))
+                })
+                .await
+                .map_err(|error| {
+                    AppError::InternalError(anyhow::anyhow!(
+                        "provider deletion snapshot task failed: {error}"
+                    ))
+                })?
+                .map_err(map_exact_credential_store_error)?;
+                Some(snapshot)
+            } else {
+                None
+            };
         let (mut candidate, live_base, enforcement_newly_off, provider_expected_revision) = {
             let cfg = self.config.read().await;
             reject_if_recovery_pending(&cfg)?;
@@ -5776,6 +5831,9 @@ impl AppState {
             let live_base = cfg.clone();
             let mut candidate = cfg.clone();
             restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
+            if let Some((durable, _)) = durable_providers.as_ref() {
+                apply_runtime_section(SectionId::Providers, durable, &mut candidate);
+            }
             update(&mut candidate)?;
             bamboo_config::validate_runtime_model_admission(&candidate)
                 .map_err(AppError::BadRequest)?;
@@ -5819,15 +5877,18 @@ impl AppState {
                 })?;
             }
             let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
-            let provider_expected_revision = exact_provider_metadata.then(|| {
-                config_facade
-                    .as_ref()
-                    .expect("exact provider metadata requires the modular facade")
-                    .registry()
-                    .providers
-                    .snapshot()
-                    .revision
-            });
+            let provider_expected_revision =
+                durable_providers.map(|(_, revision)| revision).or_else(|| {
+                    exact_provider_metadata.then(|| {
+                        config_facade
+                            .as_ref()
+                            .expect("exact provider metadata requires the modular facade")
+                            .registry()
+                            .providers
+                            .snapshot()
+                            .revision
+                    })
+                });
             (candidate, live_base, newly_off, provider_expected_revision)
         };
         let config = self.config.clone();
@@ -5927,7 +5988,7 @@ impl AppState {
                 if enforcement_newly_off {
                     warn_plugin_trust_enforcement_off();
                 }
-                Self::apply_config_effects_owned(
+                Self::apply_config_effects_owned_after_forcing(
                     snapshot.clone(),
                     effects,
                     ConfigRuntimeEffectContext {
@@ -5941,6 +6002,13 @@ impl AppState {
                         mcp_config_live_health,
                         config_application,
                     },
+                    HashSet::new(),
+                    kind == ProviderConfigUpdate::DeleteInstance
+                        && snapshot.default_provider_instance.is_none()
+                        && snapshot
+                            .provider_instances
+                            .values()
+                            .all(|instance| !instance.enabled),
                 )
                 .await?;
                 snapshot
@@ -7138,8 +7206,14 @@ impl AppState {
         effects: ConfigUpdateEffects,
         context: ConfigRuntimeEffectContext,
     ) -> Result<(), AppError> {
-        Self::apply_config_effects_owned_after_forcing(new_config, effects, context, HashSet::new())
-            .await
+        Self::apply_config_effects_owned_after_forcing(
+            new_config,
+            effects,
+            context,
+            HashSet::new(),
+            false,
+        )
+        .await
     }
 
     async fn apply_config_effects_owned_after_forcing(
@@ -7147,6 +7221,7 @@ impl AppState {
         effects: ConfigUpdateEffects,
         context: ConfigRuntimeEffectContext,
         forced_mcp_replacements: HashSet<String>,
+        allow_unconfigured_provider: bool,
     ) -> Result<(), AppError> {
         let ConfigRuntimeEffectContext {
             app_data_dir,
@@ -7175,7 +7250,13 @@ impl AppState {
                     bamboo_llm::ProviderRegistry::from_config(&new_config, app_data_dir.clone())
                         .await?;
                 let default_provider_name = candidate_registry.default_provider_name();
-                let candidate_provider = candidate_registry.get_default().ok_or_else(|| {
+                let candidate_provider = if let Some(provider) = candidate_registry.get_default() {
+                    provider
+                } else if allow_unconfigured_provider {
+                    Arc::new(UnconfiguredProvider {
+                        message: "No default provider is configured".to_string(),
+                    })
+                } else {
                     let message = if new_config.has_provider_instances() {
                         format!(
                             "Default provider instance '{}' is not available or failed to initialize",
@@ -7187,8 +7268,8 @@ impl AppState {
                             new_config.provider
                         )
                     };
-                    bamboo_llm::LLMError::Auth(message)
-                })?;
+                    return Err(bamboo_llm::LLMError::Auth(message));
+                };
                 Ok::<_, bamboo_llm::LLMError>((
                     candidate_registry,
                     candidate_provider,
