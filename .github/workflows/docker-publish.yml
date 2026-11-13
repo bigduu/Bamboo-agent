@@ -1,8 +1,8 @@
 name: Publish Docker image (GHCR)
 # BAMBOO_RELEASE_IMAGE_CONSUMER_V1
 
-# Images consume a completed release. The x64 binary is reused; Linux ARM64
-# remains a separate native target, not a second build of the x64 binary.
+# Images consume a completed release. V3 supplies both native Linux binaries.
+# Historical v2 releases supply x64 and retain their original ARM64 build path.
 on:
   workflow_run:
     workflows: [Publish Crate]
@@ -17,6 +17,14 @@ on:
       source:
         description: Exact source SHA of that completed release
         required: true
+        type: string
+      publisher_run_id:
+        description: Successful Publish Crate run ID (required for v3 recovery)
+        required: false
+        type: string
+      publisher_attempt:
+        description: Successful Publish Crate attempt (required for v3 recovery)
+        required: false
         type: string
 
 permissions:
@@ -34,86 +42,35 @@ env:
 jobs:
   release:
     name: Verify completed release
+    permissions:
+      contents: read
+      actions: read
+      checks: read
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     outputs:
       source: ${{ steps.verify.outputs.source }}
       version: ${{ steps.verify.outputs.version }}
-      asset_id: ${{ steps.verify.outputs.asset_id }}
-      asset_sha256: ${{ steps.verify.outputs.asset_sha256 }}
-      asset_size: ${{ steps.verify.outputs.asset_size }}
+      contract: ${{ steps.verify.outputs.contract }}
+      linux_assets: ${{ steps.verify.outputs.linux_assets }}
     steps:
-      - name: Download the completed publisher's identity
-        if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v8
-        with:
-          github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
-          name: bamboo-completed-release-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
-          path: ${{ runner.temp }}/release
-      - name: Verify release, tag, manifest and original Linux binary identity
+      - name: Verify release, tag, manifest and original Linux binaries
         id: verify
         env:
           GH_TOKEN: ${{ github.token }}
           INPUT_VERSION: ${{ inputs.version }}
           INPUT_SOURCE: ${{ inputs.source }}
+          INPUT_PUBLISHER_RUN_ID: ${{ inputs.publisher_run_id }}
+          INPUT_PUBLISHER_ATTEMPT: ${{ inputs.publisher_attempt }}
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, os, re, subprocess
-          repository = 'bigduu/Bamboo-agent'
-          assert os.environ['GITHUB_REPOSITORY'] == repository
-          event = json.load(open(os.environ['GITHUB_EVENT_PATH']))
-          def api(route, binary=False):
-              args = ['gh', 'api', '--hostname', 'github.com', f'repos/{repository}/{route}']
-              if binary: args += ['-H', 'Accept: application/octet-stream']
-              data = subprocess.check_output(args, timeout=60)
-              return data if binary else json.loads(data)
-          if os.environ['GITHUB_EVENT_NAME'] == 'workflow_run':
-              run = event['workflow_run']
-              assert run['event'] == 'workflow_dispatch' and run['conclusion'] == 'success'
-              assert run['path'] == '.github/workflows/publish-crate.yml' and run['head_branch'] == 'dev'
-              assert run['repository']['full_name'] == run['head_repository']['full_name'] == repository
-              with open(os.path.join(os.environ['RUNNER_TEMP'], 'release', 'release.json')) as f:
-                  identity = json.load(f)
-              assert str(identity['runId']) == str(run['id'])
-              version, source = identity['version'], identity['source']
-          else:
-              assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'
-              assert os.environ['GITHUB_REF'] == 'refs/heads/dev' and os.environ['GITHUB_REF_PROTECTED'] == 'true'
-              version, source = os.environ['INPUT_VERSION'], os.environ['INPUT_SOURCE']
-          assert re.fullmatch(r'[1-9][0-9]*\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version)
-          assert re.fullmatch(r'[0-9a-f]{40}', source)
-          release = api('releases/tags/v' + version)
-          assert release['tag_name'] == 'v' + version and release['target_commitish'] == source
-          assert not release['draft'] and not release['prerelease'] and release['published_at']
-          tag = api('git/ref/tags/v' + version)
-          assert tag['object']['type'] == 'commit' and tag['object']['sha'] == source
-          def asset(name):
-              found = [item for item in release['assets'] if item['name'] == name]
-              assert len(found) == 1 and found[0]['state'] == 'uploaded' and found[0]['size'] > 0
-              return found[0]
-          for name in ['bamboo-aarch64-apple-darwin', 'bamboo-x86_64-pc-windows-msvc.exe',
-                       'bamboo-executables-provenance-v2.json', 'release-provenance.json']:
-              asset(name)
-          manifest_asset = asset('bamboo-sidecars-v2.json')
-          assert manifest_asset['size'] < 1024 * 1024
-          raw = api('releases/assets/' + str(manifest_asset['id']), binary=True)
-          assert len(raw) == manifest_asset['size']
-          assert manifest_asset['digest'] == 'sha256:' + hashlib.sha256(raw).hexdigest()
-          manifest = json.loads(raw)
-          assert manifest['schemaVersion'] == 2 and manifest['version'] == version and manifest['sourceRevision'] == source
-          entries = [item for item in manifest['artifacts'] if item['target'] == 'x86_64-unknown-linux-gnu']
-          assert len(entries) == 1 and entries[0]['assetName'] == 'bamboo-x86_64-unknown-linux-gnu'
-          executable = asset(entries[0]['assetName'])
-          assert executable['size'] == entries[0]['sizeBytes'] and executable['digest'] == 'sha256:' + entries[0]['sha256']
-          assert re.fullmatch(r'[0-9a-f]{64}', entries[0]['sha256'])
-          values = {'source': source, 'version': version, 'asset_id': executable['id'],
-                    'asset_sha256': entries[0]['sha256'], 'asset_size': executable['size']}
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              for key, value in values.items(): output.write(f'{key}={value}\n')
-          PY
+          [[ "$GITHUB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          gh api --hostname github.com --jq '.content' \
+            "repos/${GITHUB_REPOSITORY}/contents/scripts/docker-release.py?ref=${GITHUB_WORKFLOW_SHA}" \
+            | base64 --decode > "$RUNNER_TEMP/bamboo-docker-release.py"
+          test -s "$RUNNER_TEMP/bamboo-docker-release.py"
+          python3 "$RUNNER_TEMP/bamboo-docker-release.py"
 
   build:
     name: Build (${{ matrix.platform }})
@@ -133,10 +90,10 @@ jobs:
         include:
           - platform: linux/amd64
             runner: ubuntu-latest
-            dockerfile: .docker-release/Dockerfile
+            arch: amd64
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
-            dockerfile: .docker-release/Dockerfile.arm64
+            arch: arm64
     steps:
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
@@ -144,31 +101,73 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Find a retained image digest
+        id: retained
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT_NAME: digest-${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$ARTIFACT_NAME" =~ ^digest-(amd64|arm64)$ ]]
+          artifacts="$(gh api --hostname github.com "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/artifacts?name=${ARTIFACT_NAME}&per_page=100")"
+          artifact_id="$(jq -er --arg name "$ARTIFACT_NAME" --argjson run "$GITHUB_RUN_ID" '
+            select((.artifacts | type) == "array" and .total_count == (.artifacts | length)) |
+            if .total_count == 0 then ""
+            elif .total_count == 1 then
+              .artifacts[0] | select(.name == $name and .expired == false and .workflow_run.id == $run and
+                (.id | tostring | test("^[1-9][0-9]*$"))) | .id
+            else error("Ambiguous retained image digest") end
+          ' <<< "$artifacts")"
+          echo "id=$artifact_id" >> "$GITHUB_OUTPUT"
+      - name: Download the retained image digest
+        if: steps.retained.outputs.id != ''
+        uses: actions/download-artifact@v8
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ github.run_id }}
+          artifact-ids: ${{ steps.retained.outputs.id }}
+          path: ${{ runner.temp }}/bamboo-retained-digest
       - name: Select an existing verified candidate
         id: candidate
         env:
           PLATFORM: ${{ matrix.platform }}
           RELEASE_VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_SOURCE: ${{ needs.release.outputs.source }}
-          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
+          RETAINED_DIGEST_ARTIFACT: ${{ steps.retained.outputs.id }}
         run: |
           set -euo pipefail
           image="$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bamboo" | tr '[:upper:]' '[:lower:]')"
           candidate="${image}:ci-v${RELEASE_VERSION}-${PLATFORM//\//-}"
-          echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "tag=$candidate" >> "$GITHUB_OUTPUT"
-          if docker buildx imagetools inspect "$candidate" >"$RUNNER_TEMP/image-inspect" 2>"$RUNNER_TEMP/image-error"; then
-            docker pull --platform "$PLATFORM" "$candidate"
-            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$candidate")" = "$RELEASE_SOURCE"
-            test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$candidate")" = "$RELEASE_VERSION"
-            actual="$(docker run --rm "$candidate" --version)"
-            test "${actual##* }" = "$RELEASE_VERSION"
-            if [ "$PLATFORM" = linux/amd64 ]; then
-              actual="$(docker run --rm --entrypoint sha256sum "$candidate" /usr/local/bin/bamboo)"
-              test "${actual%% *}" = "$EXPECTED_SHA256"
-            fi
+          retained=""
+          reuse() {
+            local ref="$image@$1"
+            docker pull --platform "$PLATFORM" "$ref"
+            echo "ref=$ref" >> "$GITHUB_OUTPUT"
             echo 'mode=reuse' >> "$GITHUB_OUTPUT"
+          }
+          if [ -n "$RETAINED_DIGEST_ARTIFACT" ]; then
+            shopt -s nullglob dotglob
+            receipts=("$RUNNER_TEMP/bamboo-retained-digest"/*)
+            [[ "${#receipts[@]}" = 1 && -f "${receipts[0]}" && ! -L "${receipts[0]}" ]]
+            [[ "${receipts[0]##*/}" =~ ^[0-9a-f]{64}$ ]]
+            test "$(cat "${receipts[0]}")" = "$PLATFORM"
+            retained="sha256:${receipts[0]##*/}"
+          fi
+          if descriptor="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$candidate" 2>"$RUNNER_TEMP/image-error")"; then
+            digest="$(jq -er 'select(.mediaType == "application/vnd.oci.image.manifest.v1+json" or
+              .mediaType == "application/vnd.docker.distribution.manifest.v2+json") | .digest' <<< "$descriptor")"
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+            if [[ -n "$retained" && "$digest" != "$retained" ]]; then
+              echo 'The candidate digest differs from the original retained by this run.' >&2
+              exit 1
+            fi
+            reuse "$digest"
           elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/image-error"; then
+            if [ -n "$retained" ]; then
+              reuse "$retained"
+              exit 0
+            fi
             if docker buildx imagetools inspect "${image}:v${RELEASE_VERSION}" >/dev/null 2>"$RUNNER_TEMP/final-image-error"; then
               echo 'The completed image exists but its candidate is missing; recover the original digest instead of rebuilding.' >&2
               exit 1
@@ -181,44 +180,52 @@ jobs:
             cat "$RUNNER_TEMP/image-error" >&2
             exit 1
           fi
-      - uses: actions/checkout@v7
-        if: steps.candidate.outputs.mode == 'build'
-        with:
-          ref: ${{ needs.release.outputs.source }}
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Download and verify the original x64 binary
-        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/amd64'
+      - name: Download and verify the original Linux binary
+        if: steps.candidate.outputs.mode == 'build' && (needs.release.outputs.contract == '3' || matrix.platform == 'linux/amd64')
         env:
           GH_TOKEN: ${{ github.token }}
-          ASSET_ID: ${{ needs.release.outputs.asset_id }}
-          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
-          EXPECTED_SIZE: ${{ needs.release.outputs.asset_size }}
+          ASSET_ID: ${{ fromJSON(needs.release.outputs.linux_assets)[matrix.arch].id }}
+          EXPECTED_SHA256: ${{ fromJSON(needs.release.outputs.linux_assets)[matrix.arch].sha256 }}
+          EXPECTED_SIZE: ${{ fromJSON(needs.release.outputs.linux_assets)[matrix.arch].size }}
         run: |
           set -euo pipefail
-          mkdir -p .docker-release
-          git show "${GITHUB_WORKFLOW_SHA}:docker/Dockerfile.published" > .docker-release/Dockerfile
-          gh api "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" \
+          [[ "$GITHUB_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$ASSET_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_SIZE" =~ ^[1-9][0-9]*$ ]]
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          mkdir -p "$RUNNER_TEMP/bamboo-image/.docker-release"
+          cd "$RUNNER_TEMP/bamboo-image"
+          gh api --hostname github.com --jq '.content' \
+            "repos/${GITHUB_REPOSITORY}/contents/docker/Dockerfile.published?ref=${GITHUB_WORKFLOW_SHA}" \
+            | base64 --decode > Dockerfile
+          test -s Dockerfile
+          gh api --hostname github.com "repos/${GITHUB_REPOSITORY}/releases/assets/${ASSET_ID}" \
             -H 'Accept: application/octet-stream' > .docker-release/bamboo
           echo "${EXPECTED_SHA256}  .docker-release/bamboo" | sha256sum --check -
           test "$(stat -c %s .docker-release/bamboo)" = "${EXPECTED_SIZE}"
           chmod 755 .docker-release/bamboo
 
-      - name: Setup Node.js for the distinct ARM64 build
-        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
+      - uses: actions/checkout@v7
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64' && needs.release.outputs.contract == '2'
+        with:
+          ref: ${{ needs.release.outputs.source }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js for the historical v2 ARM64 build
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64' && needs.release.outputs.contract == '2'
         uses: actions/setup-node@v7
         with:
           node-version: lts/*
-      - name: Resolve the locked frontend for ARM64
-        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
+      - name: Resolve the historical v2 ARM64 frontend
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64' && needs.release.outputs.contract == '2'
         id: frontend
         env:
           FRONTEND_PACKAGE: '@bigduu/lotus-next'
           FRONTEND_VERSION: from_lock
         run: node scripts/release-frontend-policy.cjs
-      - name: Stage the locked frontend and stamp the ARM64 version
-        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64'
+      - name: Stage the historical v2 ARM64 source
+        if: steps.candidate.outputs.mode == 'build' && matrix.platform == 'linux/arm64' && needs.release.outputs.contract == '2'
         env:
           LOTUS_PACKAGE_NAME: ${{ steps.frontend.outputs.package_name }}
           LOTUS_VERSION: ${{ steps.frontend.outputs.package_version }}
@@ -238,8 +245,8 @@ jobs:
         if: steps.candidate.outputs.mode == 'build'
         uses: docker/build-push-action@v7
         with:
-          context: .
-          file: ${{ matrix.dockerfile }}
+          context: ${{ (needs.release.outputs.contract == '3' || matrix.platform == 'linux/amd64') && format('{0}/bamboo-image', runner.temp) || '.' }}
+          file: ${{ (needs.release.outputs.contract == '3' || matrix.platform == 'linux/amd64') && format('{0}/bamboo-image/Dockerfile', runner.temp) || '.docker-release/Dockerfile.arm64' }}
           platforms: ${{ matrix.platform }}
           tags: ${{ steps.candidate.outputs.tag }}
           labels: |
@@ -249,44 +256,77 @@ jobs:
           cache-to: ${{ github.event_name == 'workflow_dispatch' && format('type=gha,mode=max,scope={0},ignore-error=true', matrix.platform) || '' }}
           load: true
           push: false
-      - name: Verify the packaged executable version and loader
-        if: steps.candidate.outputs.mode == 'build'
+      - name: Verify the packaged executable, loader and embedded frontend
         env:
-          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
+          IMAGE_REF: ${{ steps.candidate.outputs.ref || steps.candidate.outputs.tag }}
           RELEASE_VERSION: ${{ needs.release.outputs.version }}
-          EXPECTED_SHA256: ${{ needs.release.outputs.asset_sha256 }}
+          RELEASE_SOURCE: ${{ needs.release.outputs.source }}
+          CONTRACT: ${{ needs.release.outputs.contract }}
+          EXPECTED_SHA256: ${{ fromJSON(needs.release.outputs.linux_assets)[matrix.arch].sha256 }}
           PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          actual="$(docker run --rm "$IMAGE_REF" --version)"
-          test "${actual##* }" = "$RELEASE_VERSION"
-          if [ "$PLATFORM" = linux/amd64 ]; then
-            actual="$(docker run --rm --entrypoint sha256sum "$IMAGE_REF" /usr/local/bin/bamboo)"
+          test "$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$IMAGE_REF")" = "$PLATFORM"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$IMAGE_REF")" = "$RELEASE_SOURCE"
+          test "$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$IMAGE_REF")" = "$RELEASE_VERSION"
+          test "$(docker run --platform "$PLATFORM" --rm "$IMAGE_REF" --version)" = "bamboo $RELEASE_VERSION"
+          if [[ "$CONTRACT" = 3 || "$PLATFORM" = linux/amd64 ]]; then
+            [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            actual="$(docker run --platform "$PLATFORM" --rm --entrypoint sha256sum "$IMAGE_REF" /usr/local/bin/bamboo)"
             test "${actual%% *}" = "$EXPECTED_SHA256"
+          fi
+          if [ "$CONTRACT" = 3 ]; then
+            container="$(docker run --platform "$PLATFORM" --network none -d "$IMAGE_REF")"
+            # shellcheck disable=SC2329
+            cleanup() { docker rm -f "$container" >/dev/null; }
+            trap cleanup EXIT
+            for attempt in {1..30}; do
+              if docker exec "$container" sh -ec '
+                curl -fsS --max-time 2 http://127.0.0.1:9562/api/v1/health >/dev/null
+                index="$(curl -fsS --max-time 2 http://127.0.0.1:9562/)"
+                test -n "$index"
+                test -s /data/frontend/.frontend-manifest.json
+              '; then
+                exit 0
+              fi
+              test "$(docker inspect --format '{{.State.Running}}' "$container")" = true || break
+              if [ "$attempt" -lt 30 ]; then sleep 1; fi
+            done
+            docker logs "$container"
+            exit 1
           fi
       - name: Retain the verified candidate in GHCR
         if: steps.candidate.outputs.mode == 'build'
+        id: push
         env:
           IMAGE_REF: ${{ steps.candidate.outputs.tag }}
-        run: docker push "$IMAGE_REF"
-      - name: Retain the image digest
-        env:
-          IMAGE_REF: ${{ steps.candidate.outputs.tag }}
-          IMAGE_REPO: ${{ steps.candidate.outputs.image }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
           set -euo pipefail
-          docker pull "$IMAGE_REF"
-          digest="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE_REF" | grep -F "${IMAGE_REPO}@sha256:" | head -1)"
-          digest="${digest#*@}"
-          mkdir -p /tmp/digests
+          docker image push --platform "$PLATFORM" "$IMAGE_REF" 2>&1 | tee "$RUNNER_TEMP/image-push"
+          mapfile -t digests < <(awk '$1 == tag && $2 == "digest:" { print $3 }' tag="${IMAGE_REF##*:}:" "$RUNNER_TEMP/image-push")
+          test "${#digests[@]}" = 1
+          [[ "${digests[0]}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=${digests[0]}" >> "$GITHUB_OUTPUT"
+      - name: Retain the verified image digest
+        if: steps.retained.outputs.id == ''
+        env:
+          IMAGE_REF: ${{ steps.candidate.outputs.ref }}
+          PUSHED_DIGEST: ${{ steps.push.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          digest="${PUSHED_DIGEST:-${IMAGE_REF##*@}}"
+          mkdir -p "$RUNNER_TEMP/bamboo-digests"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
-          touch "/tmp/digests/${digest#sha256:}"
+          printf '%s\n' "$PLATFORM" > "$RUNNER_TEMP/bamboo-digests/${digest#sha256:}"
       - uses: actions/upload-artifact@v7
+        if: steps.retained.outputs.id == ''
         with:
-          name: digest-${{ strategy.job-index }}
-          path: /tmp/digests/*
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/bamboo-digests/*
           if-no-files-found: error
-          overwrite: true
+          overwrite: false
           retention-days: 7
 
   merge:
@@ -305,9 +345,8 @@ jobs:
     steps:
       - uses: actions/download-artifact@v8
         with:
-          path: /tmp/digests
+          path: ${{ runner.temp }}/bamboo-digests
           pattern: digest-*
-          merge-multiple: true
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:
@@ -323,37 +362,49 @@ jobs:
         run: |
           set -euo pipefail
           image="$(echo "ghcr.io/${GITHUB_REPOSITORY_OWNER}/bamboo" | tr '[:upper:]' '[:lower:]')"
-          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
-          mapfile -t digests < <(find /tmp/digests -type f -maxdepth 1 -printf '%f\n' | sort)
-          test "${#digests[@]}" = 2
-          for digest in "${digests[@]}"; do
-            [[ "$digest" =~ ^[0-9a-f]{64}$ ]]
-          done
+          read_digest() {
+            local arch="$1" digest
+            local -a files
+            shopt -s nullglob
+            files=("$RUNNER_TEMP/bamboo-digests/digest-$arch"/*)
+            [[ "${#files[@]}" = 1 ]] || return 1
+            [[ -f "${files[0]}" && ! -L "${files[0]}" ]] || return 1
+            digest="${files[0]##*/}"
+            [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+            [[ "$(cat "${files[0]}")" = "linux/$arch" ]] || return 1
+            printf 'sha256:%s\n' "$digest"
+          }
+          amd64_digest="$(read_digest amd64)"
+          arm64_digest="$(read_digest arm64)"
+          test "$amd64_digest" != "$arm64_digest"
+          verify_index() {
+            jq -e --arg amd64 "$amd64_digest" --arg arm64 "$arm64_digest" '
+              .manifests | length == 2 and
+              (map(select(.platform.os == "linux") | {key: .platform.architecture, value: .digest}) | from_entries)
+              == {amd64: $amd64, arm64: $arm64}
+            ' >/dev/null
+          }
           tag="${image}:v${RELEASE_VERSION}"
           if docker buildx imagetools inspect --raw "$tag" >"$RUNNER_TEMP/manifest.json" 2>"$RUNNER_TEMP/manifest-error"; then
-            python3 - "${digests[@]}" <<'PY'
-          import json, os, sys
-          manifest = json.load(open(os.path.join(os.environ['RUNNER_TEMP'], 'manifest.json')))
-          items = [item for item in manifest['manifests'] if item.get('platform', {}).get('os') == 'linux'
-                   and item['platform'].get('architecture') in ('amd64', 'arm64')]
-          assert len(items) == 2 and {item['platform']['architecture'] for item in items} == {'amd64', 'arm64'}
-          assert {item['digest'] for item in items} == {'sha256:' + digest for digest in sys.argv[1:]}
-          PY
-            docker buildx imagetools create -t "${image}:sha-${RELEASE_SOURCE:0:7}" "$tag"
-            if [ "$latest" = "v${RELEASE_VERSION}" ]; then
-              docker buildx imagetools create -t "${image}:latest" "$tag"
-            fi
+            verify_index < "$RUNNER_TEMP/manifest.json"
           elif grep -Eiq 'manifest unknown|not found|404' "$RUNNER_TEMP/manifest-error"; then
-            args=(-t "$tag" -t "${image}:sha-${RELEASE_SOURCE:0:7}")
-            if [ "$latest" = "v${RELEASE_VERSION}" ]; then args+=(-t "${image}:latest"); fi
-            for digest in "${digests[@]}"; do args+=("${image}@sha256:${digest}"); done
-            docker buildx imagetools create "${args[@]}"
+            docker buildx imagetools create -t "$tag" "$image@$amd64_digest" "$image@$arm64_digest"
           else
             cat "$RUNNER_TEMP/manifest-error" >&2
             exit 1
           fi
+          descriptor="$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$tag")"
+          index_digest="$(jq -er 'select(.mediaType == "application/vnd.oci.image.index.v1+json" or
+            .mediaType == "application/vnd.docker.distribution.manifest.list.v2+json") | .digest' <<< "$descriptor")"
+          [[ "$index_digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          index_ref="$image@$index_digest"
+          docker buildx imagetools inspect --raw "$index_ref" | verify_index
+          latest="$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          args=(-t "${image}:sha-${RELEASE_SOURCE:0:7}")
+          if [ "$latest" = "v${RELEASE_VERSION}" ]; then args+=(-t "${image}:latest"); fi
+          docker buildx imagetools create "${args[@]}" "$index_ref"
           docker buildx imagetools inspect "$tag"
-          echo "image=${image}:v${RELEASE_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "image=$index_ref" >> "$GITHUB_OUTPUT"
 
   image-scan:
     name: Scan published image (Trivy)

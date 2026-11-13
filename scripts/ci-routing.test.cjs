@@ -420,11 +420,14 @@ test("native executable transport retries the same files only after a failed upl
 test("Docker receives the completed publisher's matching run and attempt", () => {
   const publisher = read(".github/workflows/publish-crate.yml");
   const docker = read(".github/workflows/docker-publish.yml");
+  const verifier = read("scripts/docker-release.py");
   assert.match(publisher, /name: bamboo-completed-release-\$\{\{ github\.run_id \}\}-\$\{\{ github\.run_attempt \}\}/);
-  assert.match(docker, /name: bamboo-completed-release-\$\{\{ github\.event\.workflow_run\.id \}\}-\$\{\{ github\.event\.workflow_run\.run_attempt \}\}/);
+  assert.match(verifier, /name = f'bamboo-completed-release-\{run_id\}-\{attempt\}'/);
+  assert.doesNotMatch(job(docker, "release"), /actions\/download-artifact/);
   assert.match(docker.split("\njobs:\n")[0], /workflow_run:\n    workflows: \[Publish Crate\]\n    types: \[completed\]\n    branches: \[dev\]/);
   assert.doesNotMatch(docker.split("\njobs:\n")[0], /^  push:/m);
-  assert.match(docker, /executable\['digest'\] == 'sha256:' \+ entries\[0\]\['sha256'\]/);
+  assert.match(docker, /contents\/scripts\/docker-release\.py\?ref=\$\{GITHUB_WORKFLOW_SHA\}/);
+  assert.match(verifier, /executable\['digest'\] == 'sha256:' \+ entry\['sha256'\]/);
   assert.doesNotMatch(read("docker/Dockerfile.published"), /\b(?:cargo|rustc|vite) (?:build|run|install)\b/i);
   const arm = read("docker/Dockerfile");
   assert.match(read("Cargo.toml"), /libduckdb-sys = \{ path = "third_party\/libduckdb-sys" \}/);
