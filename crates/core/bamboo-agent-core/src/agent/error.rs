@@ -263,6 +263,10 @@ pub enum AgentError {
     #[error("Budget error: {0}")]
     Budget(String),
 
+    /// The compression model completed without usable summary text.
+    #[error("The model returned no summary. Lower the reasoning effort for the model used for context compression, then try again.")]
+    EmptyContextSummary,
+
     /// Agent execution was cancelled by user
     #[error("Cancelled")]
     Cancelled,
