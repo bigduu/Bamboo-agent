@@ -299,8 +299,8 @@ test("feature shards bound debug artifacts and record capacity without changing 
   assert.match(feature, /^    timeout-minutes: 90$/mu)
   for (const profile of ["DEV", "TEST"]) {
     const setting = `CARGO_PROFILE_${profile}_DEBUG: "0"`
-    assert.ok(feature.includes(setting))
-    assert.equal(workflow.split(setting).length - 1, 1, "debug override belongs only to the feature job")
+    for (const owner of [feature, job("arm64-feature")]) assert.ok(owner.includes(setting))
+    assert.equal(workflow.split(setting).length - 1, 2, "debug overrides belong to feature test jobs")
   }
   assert.match(workflow, /^  CARGO_INCREMENTAL: "0"$/mu)
   assert.match(feature, /rustc -vV\n            cargo -V/u)
@@ -499,6 +499,7 @@ function assertLinuxTestOwnership(definitions) {
   const registered = {
     "ci.yml": {
       "feature-shards": "The canonical isolated-default and explicit-feature test shards",
+      "arm64-feature": "Native Linux/Windows ARM64 embedded frontend acceptance",
       "quick-checks": "Small synthetic workflow/controller policy fixtures",
       test: "Pinned legacy release policy fixtures; feature mode is admission only",
       "test-crates": "Pinned legacy release Unit acceptance until source cutover",
@@ -1263,7 +1264,7 @@ test("this frozen batch cannot save cache on source, integration, promotion or m
     assert.equal(source.split(header).length, 2, "one shared batch predicate must govern each workflow")
     for (const [name, github, expected] of cases) assert.equal(evaluate(expression, github, true), expected, name)
   }
-  assert.equal(caches, 8, "all remaining Cargo cache actions retain the frozen batch policy")
+  assert.equal(caches, 9, "all Cargo cache actions retain the frozen batch policy")
   assert.ok(actor.includes(cacheSaveIf("github.event_name == 'pull_request' && github.base_ref == 'dev'")))
   const publisher = readFileSync(".github/workflows/publish-crate.yml", "utf8")
   const nativePublisher = publisher.split('  executables:\n')[1].split('  publish-executables:\n')[0]

@@ -20,7 +20,7 @@ function script(step) {
   assert.ok(match);
   return match[1].split("\n").map(line => line.replace(/^          /, "")).join("\n");
 }
-const featureJobs = ["quick-checks", "feature-shards", "native-feature-tests", "browser-runtime-tests", "msrv", "lint", "docs", "security", "deny"];
+const featureJobs = ["quick-checks", "feature-shards", "native-feature-tests", "arm64-feature", "browser-runtime-tests", "msrv", "lint", "docs", "security", "deny"];
 function assertRouting(source) {
   const header = source.split("\njobs:\n")[0];
   assert.match(header, /pull_request:\n    branches: \[ dev, main \]/);
@@ -53,7 +53,19 @@ function assertRouting(source) {
   assert.match(shards, /fail-fast: false\n      matrix:\n        shard:/);
   assert.deepEqual([...shards.matchAll(/^          - ([a-z0-9-]+)$/gm)].map(match => match[1]), require("./run-feature-tests.cjs").FEATURE_SHARDS);
   assert.match(shards, /BAMBOO_FEATURE_SHARD: \$\{\{ matrix.shard \}\}/);
-  assert.match(job(source, "feature-tests"), /test "\$SHARDS_RESULT" = success/);
+  const aggregate = job(source, "feature-tests");
+  assert.match(aggregate, /needs: \[validation-source, feature-shards, arm64-feature\]/);
+  assert.match(aggregate, /test "\$SHARDS_RESULT" = success/);
+  assert.match(aggregate, /test "\$ARM64_RESULT" = success/);
+  const arm64 = job(source, "arm64-feature");
+  assert.match(arm64, /- os: ubuntu-22\.04-arm\n +target: aarch64-unknown-linux-gnu/);
+  assert.match(arm64, /- os: windows-11-arm\n +target: aarch64-pc-windows-msvc/);
+  assert.match(arm64, /architecture: arm64/);
+  assert.match(arm64, /test "\$RUNNER_ARCH" = ARM64/);
+  assert.match(arm64, /assert.equal\(nativeTarget\(\), target/);
+  assert.match(arm64, /cargo test --locked --target "\$BAMBOO_TEST_TARGET" --test frontend_packaging -- --exact/);
+  assert.match(arm64, /grep -Fx "test \$case_name \.\.\. ok"/);
+  assert.match(arm64, /binaryArchitecture\(path.join/);
   assert.match(job(source, "msrv"), /cargo check --locked --workspace --all-targets --all-features/);
   assert.match(job(source, "lint"), /cargo clippy --all-features --/);
   assert.match(job(source, "security"), /cargo audit --deny warnings/);
@@ -203,6 +215,11 @@ test("required feature summaries reject every unsuccessful selected owner", () =
   assert.notEqual(run("test", { ...documentation, DOCS_ONLY: "true", GITHUB_EVENT_NAME: "workflow_dispatch", GITHUB_BASE_REF: "" }).status, 0);
   for (const overrides of [{ FEATURE_VALIDATION: "false" }, { GITHUB_BASE_REF: "main" }, { GITHUB_EVENT_NAME: "push" }]) assert.notEqual(run("test", overrides).status, 0);
   assert.equal(run("e2e-test").status, 0);
+  const shards = { SOURCE_RESULT: "success", SHARDS_RESULT: "success", ARM64_RESULT: "success" };
+  const runFeature = (arm64) => spawnSync("bash", ["-c", script(job(ci, "feature-tests"))],
+    { env: { ...process.env, ...shards, ARM64_RESULT: arm64 } });
+  assert.equal(runFeature("success").status, 0);
+  for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(runFeature(value).status, 0);
   for (const field of ["FEATURE_RESULT", "BROWSER_RESULT"]) for (const value of ["failure", "cancelled", "skipped", "", "unknown"]) assert.notEqual(run("e2e-test", { [field]: value }).status, 0);
   for (const value of ["failure", "cancelled", "success", "", "unknown"]) assert.notEqual(run("e2e-test", { NATIVE_RESULT: value }).status, 0);
 });
@@ -324,12 +341,17 @@ test("main deploys only the retained accepted feature site and never recompiles 
   for (const field of Object.keys(original)) assert.notEqual(check({ ...original, [field]: "changed" }).status, 0, field);
 });
 
-test("main promotion requires an unchanged cut and completed three-platform release", () => {
+test("main promotion requires an unchanged cut and the complete frozen release contract", () => {
   const body = pythonBody(script(job(ci, "promotion-source")), "PYTHON"), sha = "a".repeat(40), dev = "b".repeat(40);
   const base = "c".repeat(40), merge = "d".repeat(40), tree = "e".repeat(40);
   const release = { id: 4, tag_name: "v2026.10.28", target_commitish: sha, draft: false, prerelease: false, published_at: "2026-10-28T00:00:00Z",
     assets: ["bamboo-aarch64-apple-darwin", "bamboo-x86_64-unknown-linux-gnu", "bamboo-x86_64-pc-windows-msvc.exe", "bamboo-sidecars-v2.json", "bamboo-executables-provenance-v2.json", "release-provenance.json"].map(name => ({ name, state: "uploaded", size: 1 })) };
-  const routes = { [`branches/release%2F${sha}`]: { name: "release/" + sha, commit: { sha } }, "branches/dev": { name: "dev", protected: true, commit: { sha: dev } },
+  const policy = version => {
+    const bytes = Buffer.from("// BAMBOO_SHARED_EXECUTABLES_V" + version + "\n");
+    return { type: "file", encoding: "base64", size: bytes.length, content: bytes.toString("base64") };
+  };
+  const policyRoute = "contents/scripts/sidecar-release.cjs?ref=" + sha;
+  const routes = { [policyRoute]: policy(2), [`branches/release%2F${sha}`]: { name: "release/" + sha, commit: { sha } }, "branches/dev": { name: "dev", protected: true, commit: { sha: dev } },
     "branches/main": { name: "main", commit: { sha: base } },
     [`git/commits/${merge}`]: { sha: merge, parents: [{ sha: base }, { sha }], tree: { sha: tree } },
     [`git/commits/${sha}`]: { sha, tree: { sha: tree } },
@@ -338,6 +360,20 @@ test("main promotion requires an unchanged cut and completed three-platform rele
     "releases?per_page=100": [release], "releases/4": release, "git/ref/tags/v2026.10.28": { object: { type: "commit", sha } } };
   const run = (model = routes, override = {}) => spawnSync("python3", ["-c", "import io,json,sys,urllib.request\npayload=json.load(sys.stdin)\nclass Opener:\n def open(self,request,timeout):\n  route=request.full_url.split('/',6)[6]\n  value=payload['routes'][route]\n  if route.startswith('branches/') and isinstance(value,list): value=value.pop(0)\n  return io.StringIO(json.dumps(value))\nurllib.request.build_opener=lambda *args: Opener()\nexec(compile(payload['body'],'<actual-promotion-workflow>','exec'))"], { encoding: "utf8", input: JSON.stringify({ body, routes: model }), env: { ...process.env, GITHUB_REPOSITORY: "bigduu/Bamboo-agent", GITHUB_SHA: merge, BASE_SHA: base, HEAD_REPOSITORY: "bigduu/Bamboo-agent", GH_TOKEN: "inert-fixture", HEAD_REF: "release/" + sha, HEAD_SHA: sha, ...override } });
   assert.equal(run().status, 0);
+  const expanded = structuredClone(routes);
+  expanded[policyRoute] = policy(3);
+  assert.notEqual(run(expanded).status, 0, "A v2 asset set must not admit a v3 cut");
+  expanded["releases/4"].assets = expanded["releases/4"].assets.map(asset => ({ ...asset, name: asset.name.replace(/-v2\.json$/, "-v3.json") }));
+  for (const name of ["bamboo-aarch64-unknown-linux-gnu", "bamboo-aarch64-pc-windows-msvc.exe", "bamboo-browser-host-v1.tar.gz"]) {
+    expanded["releases/4"].assets.push({ name, state: "uploaded", size: 1 });
+  }
+  assert.equal(run(expanded).status, 0);
+  for (const asset of expanded["releases/4"].assets) {
+    const missing = structuredClone(expanded);
+    missing["releases/4"].assets = missing["releases/4"].assets.filter(value => value.name !== asset.name);
+    assert.match(run(missing).stderr, /Completed release asset is missing/);
+  }
+  assert.match(run({ ...routes, [policyRoute]: policy(4) }).stderr, /Unknown frozen executable contract/);
   assert.notEqual(run(routes, { HEAD_SHA: dev }).status, 0);
   for (const mutate of [model => { model["releases/4"].draft = true; }, model => { model["releases/4"].assets.pop(); },
     model => { model["git/ref/tags/v2026.10.28"].object.sha = dev; }, model => { model["branches/dev"].protected = false; }]) {

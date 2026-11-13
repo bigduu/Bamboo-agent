@@ -7,14 +7,15 @@ const zlib = require('node:zlib')
 const { spawnSync } = require('node:child_process')
 const { pathToFileURL } = require('node:url')
 const implementation = require('./sidecar-release.cjs')
-const legacySuite = process.env.BAMBOO_TEST_EXECUTABLE_CONTRACT === '1'
-const testContractVersion = legacySuite ? 1 : 2
+const testContractVersion = Number(process.env.BAMBOO_TEST_EXECUTABLE_CONTRACT ?? 3)
+const legacySuite = testContractVersion === 1
+const currentSuite = testContractVersion === 3
 const testContract = implementation.contractForVersion(testContractVersion)
 // Run the same production functions with the version selected by the actual
 // source-bound entrypoint. The legacy child retains the complete original suite.
 const release = { ...implementation, TARGETS: testContract.targets,
   MANIFEST: testContract.manifest, PROVENANCE: testContract.provenance,
-  createManifest: value => legacySuite ? JSON.parse(implementation.manifestBytes(value, 1)) : implementation.createManifest(value),
+  createManifest: value => JSON.parse(implementation.manifestBytes(value, testContractVersion)),
   manifestBytes: (value, version = testContractVersion) => implementation.manifestBytes(value, version),
   expectedBuildBindings: value => implementation.expectedBuildBindings(value, testContractVersion),
   assembleRelease: value => implementation.assembleRelease({ contractVersion: testContractVersion, ...value }),
@@ -153,11 +154,13 @@ function header(target) {
     bytes.writeUInt32LE(2, 12)
   } else if (target.includes('windows')) {
     bytes.write('MZ'); bytes.writeUInt32LE(128, 60)
-    bytes.writeUInt32LE(0x4550, 128); bytes.writeUInt16LE(0x8664, 132)
+    bytes.writeUInt32LE(0x4550, 128)
+    bytes.writeUInt16LE(target.startsWith('aarch64') ? 0xaa64 : 0x8664, 132)
     bytes.writeUInt16LE(2, 150); bytes.writeUInt16LE(0x20b, 152)
   } else {
     Buffer.from('7f454c460201', 'hex').copy(bytes)
-    bytes.writeUInt16LE(3, 16); bytes.writeUInt16LE(62, 18)
+    bytes.writeUInt16LE(3, 16)
+    bytes.writeUInt16LE(target.startsWith('aarch64') ? 0xb7 : 0x3e, 18)
   }
   return bytes
 }
@@ -192,40 +195,46 @@ function inputs(t, { targets = release.TARGETS, contractVersion = testContractVe
     contractVersion }
 }
 
-const repairTargets = Object.freeze(['aarch64-apple-darwin', 'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu'])
+const armTargets = ['aarch64-pc-windows-msvc', 'aarch64-unknown-linux-gnu']
 
-if (!legacySuite) test('repair publication produces a distinct v2 contract for exactly ARM macOS, Windows and Linux', (t) => {
-  const value = inputs(t, { targets: repairTargets })
+if (!legacySuite) test('publication binds the selected v2 or v3 platform set to its signed manifest', (t) => {
+  const targets = ['aarch64-apple-darwin', ...(currentSuite ? armTargets : []),
+    'x86_64-pc-windows-msvc', 'x86_64-unknown-linux-gnu']
+  const value = inputs(t, { targets })
   const manifest = release.assembleRelease(value)
-  assert.equal(manifest.schemaVersion, 2)
-  assert.deepEqual(manifest.artifacts.map(item => item.target), repairTargets)
-  const bytes = fs.readFileSync(path.join(value.outputDirectory, 'bamboo-sidecars-v2.json'))
+  assert.equal(manifest.schemaVersion, testContractVersion)
+  assert.deepEqual(manifest.artifacts.map(item => item.target), targets)
+  const bytes = fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST))
   assert.deepEqual(JSON.parse(bytes), manifest)
-  const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, 'bamboo-executables-provenance-v2.json')))
-  assert.equal(proof.schemaVersion, 2)
-  assert.equal(proof.kind, 'bamboo-complete-executables/v2')
-  assert.deepEqual(proof.builds.map(item => item.target), repairTargets)
+  const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.PROVENANCE)))
+  assert.equal(proof.schemaVersion, testContractVersion)
+  assert.equal(proof.kind, 'bamboo-complete-executables/v' + testContractVersion)
+  assert.deepEqual(proof.builds.map(item => item.target), targets)
   assert.equal(proof.manifestSha256, release.sha256(bytes))
   assert.deepEqual(Buffer.from(proof.manifestBytesBase64, 'base64'), bytes)
 })
 
-if (!legacySuite) test('repair publication rejects Intel and every missing required platform', (t) => {
+test('assembly rejects foreign platforms and every missing required platform', (t) => {
+  const foreign = release.SUPPORTED_TARGETS.filter(target => !release.TARGETS.includes(target))
   for (const targets of [
-    [...repairTargets, 'x86_64-apple-darwin'],
-    ...repairTargets.map(missing => repairTargets.filter(target => target !== missing)),
+    ...foreign.map(target => [...release.TARGETS, target]),
+    ...release.TARGETS.map(missing => release.TARGETS.filter(target => target !== missing)),
   ]) assert.throws(() => release.assembleRelease(inputs(t, { targets })))
 })
 
-if (!legacySuite) test('v2 permits only the declared empty legacy output and preserves all required native bindings', (t) => {
+test('publication accepts empty inactive outputs and rejects any nonempty or undeclared binding', (t) => {
   const value = inputs(t)
-  const intel = release.targetOutputKey('x86_64-apple-darwin')
-  const expectedBuilds = { ...value.expectedBuilds, [intel]: '' }
-  assert.deepEqual([...release.expectedBuildBindings(expectedBuilds).keys()], repairTargets)
-  assert.equal(release.assembleRelease({ ...value, expectedBuilds }).schemaVersion, 2)
-  for (const extra of [{ [intel]: '{}' }, { [intel]: null }, { arbitrary: '' }]) {
-    assert.throws(() => release.expectedBuildBindings({ ...value.expectedBuilds, ...extra }))
+  const inactive = release.SUPPORTED_TARGETS.filter(target => !release.TARGETS.includes(target)).map(release.targetOutputKey)
+  const expectedBuilds = { ...value.expectedBuilds, ...Object.fromEntries(inactive.map(key => [key, ''])) }
+  assert.deepEqual([...release.expectedBuildBindings(expectedBuilds).keys()], release.TARGETS)
+  assert.equal(release.assembleRelease({ ...value, expectedBuilds }).schemaVersion, testContractVersion)
+  for (const key of inactive) {
+    for (const binding of ['{}', null]) {
+      assert.throws(() => release.expectedBuildBindings({ ...expectedBuilds, [key]: binding }))
+    }
   }
-  for (const target of repairTargets) {
+  assert.throws(() => release.expectedBuildBindings({ ...expectedBuilds, arbitrary: '' }))
+  for (const target of release.TARGETS) {
     const missing = { ...expectedBuilds }; delete missing[release.targetOutputKey(target)]
     assert.throws(() => release.expectedBuildBindings(missing))
   }
@@ -234,15 +243,15 @@ if (!legacySuite) test('v2 permits only the declared empty legacy output and pre
 if (!legacySuite) test('only one supported source ABI selects the job contract; the job cannot override it', (t) => {
   const root = temporary(t), file = path.join(root, 'scripts/sidecar-release.cjs')
   fs.mkdirSync(path.dirname(file))
-  for (const version of [1, 2]) {
+  for (const version of [1, 2, 3]) {
     fs.writeFileSync(file, `// BAMBOO_SHARED_EXECUTABLES_V${version}\n`)
     assert.equal(release.sourceContractVersion(root), version)
     assert.equal(release.boundSourceContract(root, { BAMBOO_EXECUTABLE_CONTRACT_VERSION: String(version) }), version)
-    assert.throws(() => release.boundSourceContract(root, { BAMBOO_EXECUTABLE_CONTRACT_VERSION: String(3 - version) }))
+    assert.throws(() => release.boundSourceContract(root, { BAMBOO_EXECUTABLE_CONTRACT_VERSION: String(version + 1) }))
     if (version === 1) assert.equal(release.boundSourceContract(root, {}), 1)
     else assert.throws(() => release.boundSourceContract(root, {}))
   }
-  for (const contents of ['', '// BAMBOO_SHARED_EXECUTABLES_V3\n', '// BAMBOO_SHARED_EXECUTABLES_V01\n',
+  for (const contents of ['', '// BAMBOO_SHARED_EXECUTABLES_V4\n', '// BAMBOO_SHARED_EXECUTABLES_V01\n',
     '// BAMBOO_SHARED_EXECUTABLES_V1\n// BAMBOO_SHARED_EXECUTABLES_V2\n', 'x'.repeat(128 * 1024 + 1)]) {
     fs.writeFileSync(file, contents); assert.throws(() => release.sourceContractVersion(root))
   }
@@ -513,7 +522,7 @@ test('substituting a binary and matching forged receipt cannot bypass the indepe
   fs.writeFileSync(path.join(value.inputDirectory, original.target, 'build-receipt.json'), JSON.stringify(original))
   assert.throws(() => release.assembleRelease(value), /independent build-job output/)
   const missing = clone(value.expectedBuilds); delete missing[release.targetOutputKey(release.TARGETS[0])]
-  assert.throws(() => release.expectedBuildBindings(missing), legacySuite ? /four unique/ : /three unique/)
+  assert.throws(() => release.expectedBuildBindings(missing), /exact build-job output bindings/)
   assert.throws(() => release.expectedBuildBindings(null), /independent build-job outputs/)
   const wrongAttempt = inputs(t)
   const key = release.targetOutputKey(release.TARGETS[0])
@@ -558,8 +567,11 @@ test('Cargo never inherits publication credentials or API-only/compiler-profile 
     assert.throws(() => buildEnvironment(overrides, '/own/target'))
   }
   for (const [platform, arch, target] of [['darwin', 'arm64', 'aarch64-apple-darwin'], ['darwin', 'x64', 'x86_64-apple-darwin'],
-    ['win32', 'x64', 'x86_64-pc-windows-msvc'], ['linux', 'x64', 'x86_64-unknown-linux-gnu']]) assert.equal(nativeTarget(platform, arch), target)
-  assert.throws(() => nativeTarget('linux', 'arm64'))
+    ['win32', 'x64', 'x86_64-pc-windows-msvc'], ['linux', 'x64', 'x86_64-unknown-linux-gnu'],
+    ['win32', 'arm64', 'aarch64-pc-windows-msvc'], ['linux', 'arm64', 'aarch64-unknown-linux-gnu']]) {
+    assert.equal(nativeTarget(platform, arch), target)
+  }
+  assert.throws(() => nativeTarget('linux', 'arm'))
 })
 
 test('real controller children retain ordinary environment but never receive signing, registry or unrelated GitHub authority', () => {
@@ -604,10 +616,11 @@ test('same-main CI reruns recover original signed native admission and reject ch
     identity: { ...identity, validation: changed }, outputDirectory: path.join(value.root, 'rejected-rerun') }), /admission changed/)
 })
 
-if (!legacySuite) test('v2 refuses foreign executable contracts and Intel assets before any recovery read or upload', async (t) => {
+test('publication refuses foreign executable contracts and inactive assets before any recovery read or upload', async (t) => {
   const value = publishingFixture(t)
-  for (const name of ['bamboo-sidecars-v1.json', 'bamboo-executables-provenance-v1.json',
-    'bamboo-sidecars-v3.json', 'bamboo-x86_64-apple-darwin']) {
+  const foreign = [1, 2, 3].filter(version => version !== testContractVersion).map(implementation.contractForVersion)
+  const inactive = release.SUPPORTED_TARGETS.filter(target => !release.TARGETS.includes(target)).map(release.artifactName)
+  for (const name of [...foreign.flatMap(contract => [contract.manifest, contract.provenance]), ...inactive]) {
     let reads = 0
     const candidate = { assets: [{ name }] }
     await assert.rejects(() => release.publishAssets({ ...value.context, release: candidate,
@@ -625,7 +638,7 @@ test('release assets upload once, verify each result, and commit the manifest la
   const value = publishingFixture(t)
   assert.deepEqual(await release.publishAssets(value.context), { reused: false })
   assert.equal(value.uploads.at(-1), release.MANIFEST)
-  assert.equal(value.uploads.length, legacySuite ? 7 : 6)
+  assert.equal(value.uploads.length, release.TARGETS.length + 3)
   value.context.release.assets = [...value.stored.keys()].map((name) => ({ name }))
   value.uploads.length = 0
   assert.deepEqual(await release.publishAssets(value.context), { reused: true })
@@ -805,18 +818,20 @@ test('workflow retains protected Dev authority and binds its native matrix to th
   assert.ok(final.includes('BAMBOO_EXECUTABLE_CONTRACT_VERSION: ${{ needs.automatic.outputs.executable_contract_version }}'))
   assert.doesNotMatch(matrix, /inputs\./)
   assert.match(matrix, /persist-credentials: false/)
-  for (const target of release.LEGACY_TARGETS) {
+  for (const target of release.SUPPORTED_TARGETS) {
     const key = release.targetOutputKey(target)
     assert.ok(matrix.includes(key + ': ${{ steps.build.outputs.' + key + ' }}'))
     assert.ok(final.includes('name: bamboo-executable-' + target + '-attempt-${{ fromJSON(needs.executables.outputs.' + key + ').runAttempt }}'))
     assert.ok(final.includes('path: ${{ runner.temp }}/bamboo-executable-inputs/' + target))
   }
   const downloads = final.split('      - uses: actions/download-artifact@').slice(1)
-  for (const target of release.LEGACY_TARGETS) {
+  for (const target of release.SUPPORTED_TARGETS) {
     const step = downloads.find(block => block.includes('bamboo-executable-' + target + '-attempt-'))
     assert.ok(step)
     if (target === 'x86_64-apple-darwin') {
       assert.match(step, /if: needs\.automatic\.outputs\.original_executables != 'true' && needs\.automatic\.outputs\.executable_contract_version == '1'/)
+    } else if (armTargets.includes(target)) {
+      assert.match(step, /if: needs\.automatic\.outputs\.original_executables != 'true' && needs\.automatic\.outputs\.executable_contract_version == '3'/)
     } else assert.match(step.split('\n      - ')[0], /if: needs\.automatic\.outputs\.original_executables != 'true'/)
   }
   assert.ok(matrix.includes('name: bamboo-executable-${{ matrix.target }}-attempt-${{ github.run_attempt }}'))
@@ -829,9 +844,9 @@ test('workflow retains protected Dev authority and binds its native matrix to th
   assert.doesNotMatch(final, /--clobber|cargo build|cargo publish|inputs\./)
 })
 
-if (!legacySuite) test('completed original selector reuses signed native checkpoints and rejects missing or changed originals', (t) => {
+if (currentSuite) test('completed original selector reuses signed native checkpoints and rejects missing or changed originals', (t) => {
   const prior = process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION
-  process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION = '2'
+  process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION = '3'
   t.after(() => {
     if (prior === undefined) delete process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION
     else process.env.BAMBOO_EXECUTABLE_CONTRACT_VERSION = prior
@@ -867,7 +882,7 @@ test('the actual source preflight rejects every missing or incompatible producer
   assert.ok(automatic.indexOf(name) < automatic.indexOf('Reserve or resume the exact release identity'))
   assert.ok(automatic.indexOf(name) < automatic.indexOf('Publish verified crates'))
   assert.doesNotMatch(preflight, /GH_TOKEN|CARGO_REGISTRY_TOKEN|crate-release.cjs (?:plan|publish)/)
-  for (const version of [1, 2]) {
+  for (const version of [1, 2, 3]) {
     const sourceRoot = path.join(root, `source-v${version}`), output = path.join(root, `output-v${version}`)
     const files = { 'scripts/crate-release.cjs': '',
       'scripts/sidecar-build.cjs': `// BAMBOO_SHARED_EXECUTABLES_V${version}`,
@@ -891,6 +906,10 @@ test('the actual source preflight rejects every missing or incompatible producer
     assert.equal(actual.version, String(version))
     const expected = [
       { target: 'aarch64-apple-darwin', os: 'macos-latest' },
+      ...(version === 3 ? [
+        { target: 'aarch64-pc-windows-msvc', os: 'windows-11-arm' },
+        { target: 'aarch64-unknown-linux-gnu', os: 'ubuntu-22.04-arm' },
+      ] : []),
       ...(version === 1 ? [{ target: 'x86_64-apple-darwin', os: 'macos-15-intel' }] : []),
       { target: 'x86_64-pc-windows-msvc', os: 'windows-latest' },
       { target: 'x86_64-unknown-linux-gnu', os: 'ubuntu-22.04' },
@@ -911,7 +930,7 @@ test('the actual source preflight rejects every missing or incompatible producer
       fs.writeFileSync(target, marker + '\n')
     }
     const producer = path.join(sourceRoot, 'scripts/sidecar-release.cjs')
-    for (const marker of ['// BAMBOO_SHARED_EXECUTABLES_V3', '// BAMBOO_SHARED_EXECUTABLES_V01']) {
+    for (const marker of ['// BAMBOO_SHARED_EXECUTABLES_V4', '// BAMBOO_SHARED_EXECUTABLES_V01']) {
       fs.writeFileSync(producer, marker + '\n')
       assert.notEqual(run().status, 0)
       assert.ok(!fs.existsSync(output))
@@ -1002,6 +1021,13 @@ test('legacy checkpoint compatibility retains hash verification with and without
   const value = publishingFixture(t); await release.publishAssets(value.context)
   const proof = JSON.parse(value.stored.get(release.PROVENANCE)); delete proof.manifestBytesBase64; signReceipt(proof, signingKey)
   value.stored.set(release.PROVENANCE, Buffer.from(`${JSON.stringify(proof, null, 2)}\n`))
+  if (currentSuite) {
+    const outputDirectory = path.join(value.root, 'missing-original-manifest'); fs.mkdirSync(outputDirectory)
+    await assert.rejects(release.recoverPublishedRelease({ ...value, outputDirectory,
+      release: { assets: [...value.stored.keys()].map(name => ({ name })) },
+      readAsset: asset => value.stored.get(asset.name) }), /must include the original manifest bytes/)
+    return
+  }
   for (const committed of [true, false]) {
     const stored = new Map(value.stored)
     if (!committed) stored.delete(release.MANIFEST)
@@ -1044,7 +1070,7 @@ test(`frozen v${testContractVersion} recovery validation rejects foreign identit
   const value = publishingFixture(t)
   const manifest = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.MANIFEST)))
   const proof = JSON.parse(fs.readFileSync(path.join(value.outputDirectory, release.PROVENANCE)))
-  const validate = legacySuite ? release.validateManifestV1 : release.validateManifestV2
+  const validate = release['validateManifestV' + testContractVersion]
   assert.equal(validate(manifest, identity, proof.builds), manifest)
   for (const mutate of [
     x => { x.schemaVersion = legacySuite ? 2 : 1 },
@@ -1066,10 +1092,10 @@ test(`frozen v${testContractVersion} recovery validation rejects foreign identit
   }
 })
 
-if (!legacySuite) test('the complete original controller contract suite also passes for frozen four-platform v1', (t) => {
-  const env = { ...process.env, BAMBOO_TEST_EXECUTABLE_CONTRACT: '1' }
+if (currentSuite) for (const version of [1, 2]) test('the controller suite passes for frozen v' + version, (t) => {
+  const env = { ...process.env, BAMBOO_TEST_EXECUTABLE_CONTRACT: String(version) }
   // A new CLI test runner must not inherit this runner's child-v8 protocol.
-  // Otherwise Node exits successfully without actually running the v1 files.
+  // Otherwise Node exits successfully without actually running the historical test files.
   delete env.NODE_TEST_CONTEXT
   const child = spawnSync(process.execPath, ['--test', '--test-reporter=tap', __filename], {
     encoding: 'utf8', env, maxBuffer: 8 * 1024 * 1024,
@@ -1080,5 +1106,5 @@ if (!legacySuite) test('the complete original controller contract suite also pas
   assert.ok(counts.tests >= 27)
   assert.equal(counts.tests, counts.pass)
   assert.equal(counts.fail, 0); assert.equal(counts.skipped, 0); assert.equal(counts.cancelled, 0); assert.equal(counts.todo, 0)
-  t.diagnostic('Historical v1 suite: ' + JSON.stringify(counts))
+  t.diagnostic('Historical v' + version + ' suite: ' + JSON.stringify(counts))
 })
