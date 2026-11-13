@@ -112,11 +112,15 @@ fn select_automatic_skill(
                 return None;
             };
             // The prompt and pin must describe the same published candidate.
+            // A uniquely matched LKG retains its existing compatibility
+            // behavior. A new shortlist only offers currently valid choices.
             if catalog.entries.iter().any(|entry| {
                 entry.winner
                     && entry.id == skill_id
                     && entry.revision == revision
                     && capability_source(entry.source) == source
+                    && (decision.outcome != AutomaticSkillOutcome::Ambiguous
+                        || entry.status == WorkflowStatus::Valid)
             }) {
                 skills_by_id.remove(&skill_id)
             } else {
@@ -1688,6 +1692,38 @@ mod tests {
             .find(|entry| entry.id == "steady")
             .expect("retained catalog entry");
         assert_eq!(invalid.status, WorkflowStatus::Invalid);
+
+        let other = skill_dir.parent().unwrap().join("steady-alternative");
+        fs::create_dir(&other).await.unwrap();
+        fs::write(
+            other.join("SKILL.md"),
+            "---\nname: steady-alternative\ndescription: Use for steady tasks.\n---\nCurrent instructions.\n",
+        )
+        .await
+        .unwrap();
+        let shortlist = manager
+            .resolve_and_pin_activation_for_request_with_mode_and_budget(
+                "mixed-lkg-shortlist",
+                &BTreeSet::new(),
+                None,
+                None,
+                Some("steady tasks"),
+                DEFAULT_WORKFLOW_CATALOG_CONTEXT_TOKENS,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            shortlist.catalog_diagnostic.automatic_outcome,
+            Some(super::AutomaticSkillOutcome::Ambiguous)
+        );
+        assert_eq!(
+            shortlist
+                .descriptor
+                .skill_revisions
+                .keys()
+                .collect::<Vec<_>>(),
+            ["steady-alternative"]
+        );
 
         fs::write(
             skill_dir.join("agents/bamboo.yaml"),
