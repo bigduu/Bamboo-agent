@@ -1,6 +1,6 @@
 name: Publish Crate
 # BAMBOO_TRUSTED_PUBLICATION_POLICY_V1
-# BAMBOO_SHARED_EXECUTABLES_V2
+# BAMBOO_SHARED_EXECUTABLES_V3
 # BAMBOO_FROZEN_DEV_PUBLISHER_V1
 
 on:
@@ -129,7 +129,7 @@ jobs:
       - name: Require the complete executable policy before reserving a version
         id: executable_policy
         # Historical successful CI may be delivered after this workflow ships.
-        # Select only a complete frozen v1 or v2 source contract before uploads.
+        # Select one complete frozen executable contract before uploads.
         run: |
           python3 - <<'PY'
           import json
@@ -140,7 +140,7 @@ jobs:
           assert source.is_file() and not source.is_symlink(), 'Missing native producer source'
           markers = [match.group(1) for line in source.read_text().splitlines()
                      if (match := re.fullmatch(r'// BAMBOO_SHARED_EXECUTABLES_V([0-9]+)', line))]
-          assert len(markers) == 1 and markers[0] in {'1', '2'}, 'Unknown or ambiguous executable source contract'
+          assert len(markers) == 1 and markers[0] in {'1', '2', '3'}, 'Unknown or ambiguous executable source contract'
           version = int(markers[0])
           required = {
               'scripts/crate-release.cjs': None,
@@ -158,11 +158,15 @@ jobs:
                   assert found == [marker], f'Source has an incompatible executable publication ABI: {name}'
           runners = {
               'aarch64-apple-darwin': 'macos-latest',
+              'aarch64-pc-windows-msvc': 'windows-11-arm',
+              'aarch64-unknown-linux-gnu': 'ubuntu-22.04-arm',
               'x86_64-apple-darwin': 'macos-15-intel',
               'x86_64-pc-windows-msvc': 'windows-latest',
               'x86_64-unknown-linux-gnu': 'ubuntu-22.04',
           }
-          targets = list(runners) if version == 1 else [target for target in runners if target != 'x86_64-apple-darwin']
+          targets = [target for target in runners if
+                     (target != 'x86_64-apple-darwin' or version == 1)
+                     and (target not in {'aarch64-pc-windows-msvc', 'aarch64-unknown-linux-gnu'} or version == 3)]
           matrix = {'include': [{'target': target, 'os': runners[target]} for target in targets]}
           with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
               stream.write(f'version={version}\n')
@@ -305,6 +309,8 @@ jobs:
     timeout-minutes: 120
     outputs:
       aarch64_apple_darwin: ${{ steps.build.outputs.aarch64_apple_darwin }}
+      aarch64_pc_windows_msvc: ${{ steps.build.outputs.aarch64_pc_windows_msvc }}
+      aarch64_unknown_linux_gnu: ${{ steps.build.outputs.aarch64_unknown_linux_gnu }}
       x86_64_apple_darwin: ${{ steps.build.outputs.x86_64_apple_darwin }}
       x86_64_pc_windows_msvc: ${{ steps.build.outputs.x86_64_pc_windows_msvc }}
       x86_64_unknown_linux_gnu: ${{ steps.build.outputs.x86_64_unknown_linux_gnu }}
@@ -328,10 +334,12 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           node-version: lts/*
+          architecture: ${{ startsWith(matrix.target, 'aarch64-') && 'arm64' || 'x64' }}
       - *release-controller
       - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
+          architecture: ${{ startsWith(matrix.target, 'aarch64-') && 'arm64' || 'x64' }}
       - name: Reject rebuilding a successful original native target
         run: node "${{ runner.temp }}/bamboo-release-controller/scripts/sidecar-build.cjs" guard
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
@@ -410,6 +418,16 @@ jobs:
         with:
           name: bamboo-executable-aarch64-apple-darwin-attempt-${{ fromJSON(needs.executables.outputs.aarch64_apple_darwin).runAttempt }}
           path: ${{ runner.temp }}/bamboo-executable-inputs/aarch64-apple-darwin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.automatic.outputs.original_executables != 'true' && needs.automatic.outputs.executable_contract_version == '3'
+        with:
+          name: bamboo-executable-aarch64-pc-windows-msvc-attempt-${{ fromJSON(needs.executables.outputs.aarch64_pc_windows_msvc).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/aarch64-pc-windows-msvc
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
+        if: needs.automatic.outputs.original_executables != 'true' && needs.automatic.outputs.executable_contract_version == '3'
+        with:
+          name: bamboo-executable-aarch64-unknown-linux-gnu-attempt-${{ fromJSON(needs.executables.outputs.aarch64_unknown_linux_gnu).runAttempt }}
+          path: ${{ runner.temp }}/bamboo-executable-inputs/aarch64-unknown-linux-gnu
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         if: needs.automatic.outputs.original_executables != 'true' && needs.automatic.outputs.executable_contract_version == '1'
         with:

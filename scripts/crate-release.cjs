@@ -178,7 +178,7 @@ function assertAdmissionCompatibility(recorded, current) {
 function validatePreparation(preparation, identity, contractVersion) {
   assert.equal(preparation?.schemaVersion, 1)
   assert.equal(preparation.kind, 'bamboo-release-preparation/v1')
-  assert.ok(contractVersion === 1 || contractVersion === 2)
+  require('./sidecar-release.cjs').contractForVersion(contractVersion)
   assert.equal(preparation.contractVersion, contractVersion)
   for (const key of ['repository', 'sourceRevision', 'sourceTree', 'workflowRevision', 'runId']) {
     assert.equal(preparation[key], identity[key], `Release preparation mismatch: ${key}`)

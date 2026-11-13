@@ -74,7 +74,9 @@ contexts remain distinct from canonical embedded feature tests.
 #2319 gives Windows and macOS one diagnostic job, workspace and owned target each.
 `native-feature-tests` runs `node scripts/native-test-owner.cjs` on manual
 dispatch, not on every feature PR. Its separate workflows remain available for
-explicit diagnosis or historical recovery.
+explicit diagnosis or historical recovery. Non-documentation feature changes
+also run the existing embedded-frontend integration case on Linux ARM64 and
+Windows ARM64. Both native jobs are required by the feature aggregate.
 
 Preserve these configurations; a shared directory is not permission to unify
 their features or reuse an incompatible executable:
@@ -155,7 +157,10 @@ source fixed through version reservation, native builds and publication; normal
 dev advancement does not change it. Promote only the exact published source to
 main. A needed product repair gets a feature branch, passing tests and dev
 admission, then a fresh cut. Existing frozen release/recovery contracts remain
-unchanged during the explicitly documented cutover dependency.
+unchanged during the explicitly documented cutover dependency. The v3 native
+publication contract requires macOS ARM64, Linux x64 and ARM64, and Windows x64
+and ARM64. Use the source-selected manifest and native job outputs for each
+frozen contract.
 
 For the fixed `v2026.10.19` infrastructure failure, #2371 adds the manual
 `recover-frozen-crate-release.yml` controller. It requires the exact reviewed
