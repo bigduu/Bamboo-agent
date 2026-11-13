@@ -82,6 +82,23 @@ fn precondition_failed(session_id: &str, current: u64) -> HttpResponse {
         }))
 }
 
+fn metadata_revision_exhausted(session_id: &str) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "error": {
+            "type": "api_error",
+            "code": "session_metadata_revision_exhausted",
+            "message": "Session metadata revision cannot advance"
+        },
+        "session_id": session_id,
+    }))
+}
+
+enum ConfigPatchError {
+    StaleVersion(u64),
+    RevisionExhausted,
+    PermissionAudit(bamboo_domain::PermissionAuditRevisionExhausted),
+}
+
 fn project_context_error_response(
     error: bamboo_engine::project_context::ProjectContextError,
 ) -> HttpResponse {
@@ -463,14 +480,7 @@ pub async fn patch_session(
                         )));
         if membership_changed || workspace_changed {
             let Some(next_version) = session.metadata_version.checked_add(1) else {
-                return Ok(HttpResponse::Conflict().json(serde_json::json!({
-                    "error": {
-                        "type": "api_error",
-                        "code": "session_metadata_revision_exhausted",
-                        "message": "Session metadata revision cannot advance"
-                    },
-                    "session_id": session_id,
-                })));
+                return Ok(metadata_revision_exhausted(&session_id));
             };
             match target.as_ref() {
                 Some(project_id) if membership_changed => {
@@ -758,7 +768,7 @@ pub async fn patch_session(
         let edit = |session: &mut bamboo_domain::Session| {
             if let Some(expected) = config_expected_version {
                 if session.metadata_version != expected {
-                    return Err(precondition_failed(&session_id, session.metadata_version));
+                    return Err(ConfigPatchError::StaleVersion(session.metadata_version));
                 }
             }
 
@@ -798,18 +808,12 @@ pub async fn patch_session(
                     (previous, effective, chrono::Utc::now().to_rfc3339())
                 });
             if let Some((_, effective, transitioned_at)) = permission_transition.as_ref() {
-                if let Some(config) = state.permission_checker.permission_config() {
+                let audit = if let Some(config) = state.permission_checker.permission_config() {
                     record_bamboo_runtime_permission_transition_metadata(
                         session,
                         config.as_ref(),
                         transitioned_at,
                     )
-                    .map_err(|error| {
-                        crate::error::json_error(
-                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to record permission transition: {error}"),
-                        )
-                    })?;
                 } else {
                     let resolution = bamboo_domain::resolve_permission_mode(
                         *effective,
@@ -820,13 +824,9 @@ pub async fn patch_session(
                         &bamboo_domain::PermissionAuditSeed::bamboo_runtime(0, resolution),
                         Some(transitioned_at),
                     )
-                    .map_err(|error| {
-                        crate::error::json_error(
-                            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to record permission transition: {error}"),
-                        )
-                    })?;
-                }
+                    .map(|_| ())
+                };
+                audit.map_err(ConfigPatchError::PermissionAudit)?;
             }
 
             let model_changed = session.model != prev_model
@@ -839,30 +839,23 @@ pub async fn patch_session(
                 session.metadata_version = match session.metadata_version.checked_add(1) {
                     Some(version) => version,
                     None if !supervisor => u64::MAX,
-                    None => {
-                        return Err(HttpResponse::Conflict().json(serde_json::json!({
-                            "error": {
-                                "type": "api_error",
-                                "code": "session_metadata_revision_exhausted",
-                                "message": "Session metadata revision cannot advance"
-                            },
-                            "session_id": session_id,
-                        })))
-                    }
+                    None => return Err(ConfigPatchError::RevisionExhausted),
                 };
             }
             session.updated_at = chrono::Utc::now();
             Ok((model_changed, reasoning_changed, permission_transition))
         };
 
-        let (model_changed, reasoning_changed, permission_transition) = if supervisor {
-            let (committed, changes) = match state
+        let outcome = if supervisor {
+            match state
                 .session_store
                 .update_supervisor_execution_profile(&session, edit)
                 .await
             {
-                Ok(Ok(result)) => result,
-                Ok(Err(response)) => return Ok(response),
+                Ok(result) => result.map(|(committed, changes)| {
+                    session = committed;
+                    changes
+                }),
                 Err(error)
                     if error.get_ref().is_some_and(|cause| {
                         cause.is::<bamboo_domain::SessionAuthorityConflict>()
@@ -878,25 +871,36 @@ pub async fn patch_session(
                         "Failed to save session: {error}"
                     )))
                 }
-            };
-            session = committed;
-            changes
+            }
         } else {
-            let changes = match edit(&mut session) {
-                Ok(changes) => changes,
-                Err(response) => return Ok(response),
-            };
-            state
-                .persistence
-                .storage()
-                .save_session(&session)
-                .await
-                .map_err(|error| {
-                    crate::error::json_internal_server_error(format!(
-                        "Failed to save session: {error}"
-                    ))
-                })?;
-            changes
+            let result = edit(&mut session);
+            if result.is_ok() {
+                state
+                    .persistence
+                    .storage()
+                    .save_session(&session)
+                    .await
+                    .map_err(|error| {
+                        crate::error::json_internal_server_error(format!(
+                            "Failed to save session: {error}"
+                        ))
+                    })?;
+            }
+            result
+        };
+        let (model_changed, reasoning_changed, permission_transition) = match outcome {
+            Ok(changes) => changes,
+            Err(ConfigPatchError::StaleVersion(current)) => {
+                return Ok(precondition_failed(&session_id, current));
+            }
+            Err(ConfigPatchError::RevisionExhausted) => {
+                return Ok(metadata_revision_exhausted(&session_id));
+            }
+            Err(ConfigPatchError::PermissionAudit(error)) => {
+                return Err(crate::error::json_internal_server_error(format!(
+                    "Failed to record permission transition: {error}"
+                )));
+            }
         };
         state.sessions.insert(
             session_id.clone(),
