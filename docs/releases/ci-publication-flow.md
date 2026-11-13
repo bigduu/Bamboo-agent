@@ -132,9 +132,19 @@ build, Unit/E2E run or publication. Documentation and Docker consumers use the
 original release or feature artifacts where applicable; they must not rebuild a
 successful output simply to consume it.
 
-After publication completes, Docker consumes the original Linux x64 binary.
-Linux ARM64 remains a separate image architecture and is built once from the
-same frozen source. Retried image jobs reuse their verified candidate digests.
+Docker uses the executable contract recorded in the frozen source. For v3 it
+binds the downloaded manifest hash to the original successful verification step
+of the exact protected Dev Publish Crate run and attempt. Both Linux images
+package their exact original release executables in the Bookworm runtime. The
+consumer verifies both binary hashes, runs their version and loader checks,
+and starts each image to check health
+and the embedded frontend before accepting its platform digest. The versioned
+index binds the verified digest for each architecture and the scan uses the
+verified index digest. Retried image jobs verify and reuse the original candidate
+by digest, including any digest already retained by that run. Historical v2 releases
+supply the original Linux x64 executable and keep their frozen ARM64 image
+build path. Run `node --test scripts/docker-publish.test.cjs` for the focused
+release-selection and Docker packaging contracts.
 
 ## Rollout and historical releases
 
@@ -159,7 +169,17 @@ or a missing candidate for an already completed image stops recovery.
 
 If the expected automatic run is confirmed missing, or the failed-controller
 recovery above applies, recheck the live default branch and installed listener.
-Use the existing recovery flow for its exact version and source:
+For v3, provide the successful Publish Crate run and exact attempt whose
+verification step completed for that version and source. The original Actions
+check and step log must still be available.
+
+```bash
+gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
+  -f "version=$RELEASE_VERSION" -f "source=$CUT_SHA" \
+  -f "publisher_run_id=$PUBLISHER_RUN_ID" -f "publisher_attempt=$PUBLISHER_ATTEMPT"
+```
+
+For historical v2, provide only the exact version and source:
 
 ```bash
 gh workflow run docker-publish.yml -R bigduu/Bamboo-agent --ref dev \
