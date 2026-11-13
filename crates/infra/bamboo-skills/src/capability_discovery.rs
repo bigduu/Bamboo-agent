@@ -22,7 +22,7 @@ use crate::{
 /// Discovery summaries are bounded independently of the source description so
 /// one verbose registry entry cannot dominate a bounded result.
 pub const MAX_CAPABILITY_SUMMARY_CHARS: usize = 240;
-const MAX_AUTOMATIC_SKILL_CANDIDATES: usize = 3;
+pub const MAX_AUTOMATIC_SKILL_CANDIDATES: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InvocationEligibility {
