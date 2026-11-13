@@ -1033,8 +1033,11 @@ async fn apply_permission_decision(
                 if !same_durable_decision_semantics(&saved.decision, &decision) {
                     return Ok(resolved_decision_conflict(&saved.decision, &decision));
                 }
-                // A visible receipt alone cannot prove a successful durable
-                // handoff. An exact retry can recover an undispatched response.
+                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": crate::error::error_value(
+                        "Permission response was saved but execution could not be confirmed. Retry the same decision."
+                    ),
+                })));
             }
         }
         return Ok(HttpResponse::build(status)

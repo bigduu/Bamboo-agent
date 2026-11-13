@@ -41,9 +41,9 @@ use std::sync::Arc;
 use bamboo_domain::session::types::Session;
 use bamboo_domain::storage::{Storage, SupervisorApprovalCommit};
 use bamboo_domain::{
-    latest_response_occurrence, PermissionAuditSeed, PermissionAuditSnapshot, ResponseOccurrence,
-    RetrievalWindowCheckpointOutcome, RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY,
-    CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    latest_response_occurrence, permission_request_generation, PermissionAuditSeed,
+    PermissionAuditSnapshot, ResponseOccurrence, RetrievalWindowCheckpointOutcome,
+    RuntimeSessionPersistence, CONSUMED_CLARIFICATION_IDS_KEY, CONSUMED_RESPONSE_OCCURRENCES_KEY,
 };
 use dashmap::DashMap;
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -157,33 +157,52 @@ pub(crate) fn same_permission_response_control(current: &Session, proposed: &Ses
             .all(|key| current.metadata.get(*key) == proposed.metadata.get(*key))
 }
 
-pub(crate) fn reject_consumed_permission_as_pending(
+pub(crate) fn reject_stale_permission_response(
     current: &Session,
     proposed: &Session,
+    runtime_only: bool,
 ) -> std::io::Result<()> {
-    let Some(question) = proposed.pending_question.as_ref() else {
+    let Some(raw) = current.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY) else {
         return Ok(());
     };
-    let occurrence = bamboo_domain::pending_permission_occurrence(proposed);
-    let consumed = current
-        .metadata
-        .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
-        .map(|raw| serde_json::from_str::<Vec<ResponseOccurrence>>(raw))
-        .transpose()?
-        .unwrap_or_default();
-    let reopens_consumed = consumed.iter().any(|entry| {
-        entry.permission_generation.is_some()
-            && match &occurrence {
+    let consumed: Vec<ResponseOccurrence> = serde_json::from_str(raw)?;
+    let occurrence = if runtime_only {
+        proposed
+            .pending_question
+            .as_ref()
+            .and_then(|question| latest_response_occurrence(current, &question.tool_call_id))
+    } else {
+        bamboo_domain::pending_permission_occurrence(proposed)
+    };
+    let replay_call_key = PERMISSION_REPLAY_KEYS[0];
+    let replay_generation_key = PERMISSION_REPLAY_KEYS[1];
+    let replay_call = proposed.metadata.get(replay_call_key);
+    let replay_generation = proposed.metadata.get(replay_generation_key);
+    let replay_controls_changed = current.metadata.get(replay_call_key) != replay_call
+        || current.metadata.get(replay_generation_key) != replay_generation;
+    let stale = consumed
+        .iter()
+        .filter(|entry| entry.permission_generation.is_some())
+        .any(|entry| {
+            let reopens = match &occurrence {
                 Some(pending) => entry == pending,
                 // Runtime-only control projections have no transcript. Only
                 // canonical history can attest a new generation in that case.
-                None => {
+                None => proposed.pending_question.as_ref().is_some_and(|question| {
                     current.pending_question.as_ref() != Some(question)
                         && entry.tool_call_id == question.tool_call_id
-                }
-            }
-    });
-    if reopens_consumed {
+                }),
+            };
+            let reintroduces_replay = replay_controls_changed
+                && replay_call == Some(&entry.tool_call_id)
+                && replay_generation.is_none_or(|generation| {
+                    Some(generation) == entry.permission_generation.as_ref()
+                });
+            reopens
+                || reintroduces_replay
+                || (!runtime_only && changes_permission_receipt(current, proposed, entry))
+        });
+    if stale {
         return Err(std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             bamboo_domain::SessionAuthorityConflict(
@@ -192,6 +211,34 @@ pub(crate) fn reject_consumed_permission_as_pending(
         ));
     }
     Ok(())
+}
+
+fn changes_permission_receipt(
+    current: &Session,
+    proposed: &Session,
+    entry: &ResponseOccurrence,
+) -> bool {
+    fn result<'a>(
+        session: &'a Session,
+        entry: &ResponseOccurrence,
+    ) -> Option<&'a bamboo_domain::Message> {
+        session.messages.iter().rev().find(|message| {
+            message.id == entry.tool_result_message_id
+                && permission_request_generation(message) == entry.permission_generation
+        })
+    }
+    let Some(saved) = result(current, entry) else {
+        return false;
+    };
+    let Some(candidate) = result(proposed, entry) else {
+        // A repark has a new generation. History edits may also remove the
+        // entire occurrence after its handoff has been claimed.
+        return false;
+    };
+    let key = "permission_decision_receipt";
+    let saved = saved.metadata.as_ref().and_then(|value| value.get(key));
+    let candidate = candidate.metadata.as_ref().and_then(|value| value.get(key));
+    saved.is_some() && saved != candidate
 }
 
 /// Sidecar-only reads need Main only when the response's sidecar could be ahead.

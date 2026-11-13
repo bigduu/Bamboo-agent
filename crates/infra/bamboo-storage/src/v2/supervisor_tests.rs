@@ -90,6 +90,18 @@ async fn independent_supervisor_writers_cannot_replace_an_unclaimed_permission_a
         .metadata
         .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
     reject_without_writes(&second, &stale).await;
+    let mut stale_answer = answer(stale, "allow_once");
+    stale_answer
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    stale_answer
+        .metadata
+        .insert("permission.reexecute_tool_call_id".into(), "call".into());
+    stale_answer.metadata.insert(
+        "permission.reexecute_request_generation".into(),
+        "original".into(),
+    );
+    reject_without_writes(&second, &stale_answer).await;
 }
 
 fn directory(store: &SessionStoreV2) -> PathBuf {
