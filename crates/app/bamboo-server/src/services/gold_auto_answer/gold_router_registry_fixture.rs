@@ -111,7 +111,7 @@ async fn host_gold_auto_answer_preserves_self_managed_router_override() {
     let id = "gold-different-unmanaged-router";
     let mut session = differing_router_pending_session(id);
     state.save_and_cache_session(&mut session).await;
-    let resume = AppStateResumeRef::new(state.clone());
+    let resume = AppStateResumeRef(state.clone());
 
     for (iteration, flag) in [None, Some(false), Some(true)].into_iter().enumerate() {
         state.config.write().await.features = serde_json::from_value(match flag {
@@ -222,7 +222,7 @@ async fn host_gold_auto_answer_checks_router_managed_config_before_both_consumer
     let id = "gold-different-managed-router";
     let mut session = differing_router_pending_session(id);
     state.save_and_cache_session(&mut session).await;
-    let resume = AppStateResumeRef::new(state.clone());
+    let resume = AppStateResumeRef(state.clone());
     let valid = timeout(
         Duration::from_secs(5),
         maybe_auto_answer_pending_question(state.get_ref(), &resume, id, Some(test_gold_config())),

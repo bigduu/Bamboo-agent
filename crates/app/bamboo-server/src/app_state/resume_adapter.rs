@@ -27,7 +27,7 @@ use bamboo_engine::session_app::respond::{
     PERMISSION_REEXECUTE_GENERATION_METADATA_KEY, PERMISSION_REEXECUTE_METADATA_KEY,
 };
 use bamboo_engine::session_app::resume::{ResumeExecutionPort, ResumeSpawnRequest};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, oneshot};
 
 use super::session_events::get_or_create_event_sender;
 use super::AppState;
@@ -39,23 +39,26 @@ use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
 /// Needed because Rust's orphan rules prevent implementing
 /// `bamboo_engine::session_app::resume::ResumeExecutionPort` directly on
 /// `actix_web::web::Data<AppState>`.
-#[derive(Clone)]
-pub struct AppStateResumeRef(
-    pub actix_web::web::Data<AppState>,
-    Option<std::sync::Arc<bamboo_domain::SupervisorApprovalCommit>>,
-);
+pub struct AppStateResumeRef(pub actix_web::web::Data<AppState>);
 
 impl AppStateResumeRef {
-    pub(crate) fn new(state: actix_web::web::Data<AppState>) -> Self {
-        Self(state, None)
-    }
-
-    pub(crate) fn with_approval(
-        mut self,
+    /// Start the successor independently of the client, and report whether
+    /// the physical claim reached Main before either the tool or model starts.
+    pub(crate) async fn dispatch_once_response(
+        &self,
+        request: ResumeSpawnRequest,
         approval: Option<std::sync::Arc<bamboo_domain::SupervisorApprovalCommit>>,
-    ) -> Self {
-        self.1 = approval;
-        self
+    ) -> std::io::Result<()> {
+        let (ack, claimed) = oneshot::channel();
+        let owner = Self(self.0.clone());
+        tokio::spawn(async move {
+            owner
+                .spawn_resume_with_origin(request, true, approval, Some(ack))
+                .await;
+        });
+        claimed.await.map_err(|_| {
+            std::io::Error::other("Permission response was saved but its execution could not start; retry the same decision")
+        })?
     }
 }
 
@@ -113,7 +116,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         &self,
         request: ResumeSpawnRequest,
     ) -> Result<(), ResumeSpawnRequest> {
-        let owner = self.clone();
+        let owner = Self(self.0.clone());
         tokio::spawn(async move {
             ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
         });
@@ -124,7 +127,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         &self,
         request: ResumeSpawnRequest,
     ) -> Result<(), ResumeSpawnRequest> {
-        let owner = self.clone();
+        let owner = Self(self.0.clone());
         tokio::spawn(async move {
             ResumeExecutionPort::spawn_configured_resume_execution(&owner, request).await;
         });
@@ -132,16 +135,24 @@ impl ResumeExecutionPort for AppStateResumeRef {
     }
 
     async fn spawn_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, false).await;
+        self.spawn_resume_with_origin(request, false, None, None)
+            .await;
     }
 
     async fn spawn_configured_resume_execution(&self, request: ResumeSpawnRequest) {
-        self.spawn_resume_with_origin(request, true).await;
+        self.spawn_resume_with_origin(request, true, None, None)
+            .await;
     }
 }
 
 impl AppStateResumeRef {
-    async fn spawn_resume_with_origin(&self, request: ResumeSpawnRequest, from_config: bool) {
+    async fn spawn_resume_with_origin(
+        &self,
+        request: ResumeSpawnRequest,
+        from_config: bool,
+        approval: Option<std::sync::Arc<bamboo_domain::SupervisorApprovalCommit>>,
+        claim_ack: Option<oneshot::Sender<std::io::Result<()>>>,
+    ) {
         let ResumeSpawnRequest {
             session_id,
             mut session,
@@ -374,16 +385,17 @@ impl AppStateResumeRef {
                 // preparation step. Clear it only in the in-memory snapshot at
                 // the synchronous handoff to the spawned runner; the runner's
                 // first checkpoint durably acknowledges takeover.
-                if !claim_once_response_handoff(
+                let Some(execution_reservation) = claim_once_response_handoff(
                     &state,
                     &mut session,
-                    execution_reservation.root_actor_writer(),
-                    self.1.as_deref(),
+                    execution_reservation,
+                    approval.as_deref(),
+                    claim_ack,
                 )
                 .await
-                {
+                else {
                     return;
-                }
+                };
                 consume_pending_clarification_resume(&mut session);
                 SpawnAgentExecution {
                     state: state.clone(),
@@ -415,7 +427,6 @@ impl AppStateResumeRef {
             Some(id) => id,
         };
 
-        let approval = self.1.clone();
         tokio::spawn(async move {
             let mut session = session;
 
@@ -517,16 +528,17 @@ impl AppStateResumeRef {
                     ApprovalReplayDecision::BlockedByRootToolAuthority
                         | ApprovalReplayDecision::BlockedByUnavailableTool
                 );
-                if !claim_once_response_handoff(
+                let Some(execution_reservation) = claim_once_response_handoff(
                     &state,
                     &mut session,
-                    execution_reservation.root_actor_writer(),
+                    execution_reservation,
                     approval.as_deref(),
+                    claim_ack,
                 )
                 .await
-                {
+                else {
                     return;
-                }
+                };
 
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 session
@@ -811,31 +823,45 @@ impl AppStateResumeRef {
 async fn claim_once_response_handoff(
     state: &AppState,
     session: &mut bamboo_domain::Session,
-    owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+    reservation: bamboo_engine::execution::SessionExecutionReservation,
     approval: Option<&bamboo_domain::SupervisorApprovalCommit>,
-) -> bool {
-    if !session
+    ack: Option<oneshot::Sender<std::io::Result<()>>>,
+) -> Option<bamboo_engine::execution::SessionExecutionReservation> {
+    let has_handoff = session
         .metadata
-        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
-    {
-        return true;
-    }
-    match state
+        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    let Some(ack) = ack else {
+        if has_handoff {
+            reservation.abandon().await;
+            return None;
+        }
+        return Some(reservation);
+    };
+    // Settings updates take this lock before the canonical Session guards.
+    // Recheck the delegated control policy in the storage validator while
+    // both are retained through Main publication.
+    let permission = if approval.is_some() {
+        Some(state.permission_io_lock.lock().await)
+    } else {
+        None
+    };
+    let owner = reservation.root_actor_writer();
+    let result = state
         .storage
         .claim_once_response_handoff(session, owner.as_ref(), approval)
-        .await
-    {
-        Ok(_) => {
-            session
-                .metadata
-                .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
-            true
-        }
-        Err(error) => {
-            tracing::warn!(session_id = %session.id, %error, "Once response handoff checkpoint failed");
-            false
-        }
+        .await;
+    drop(permission);
+    if let Err(error) = result {
+        tracing::warn!(session_id = %session.id, %error, "Once response handoff checkpoint failed");
+        reservation.abandon().await;
+        let _ = ack.send(Err(error));
+        return None;
     }
+    session
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    let _ = ack.send(Ok(()));
+    Some(reservation)
 }
 
 /// Find the concrete approved invocation, newest-first and generation-bound.

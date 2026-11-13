@@ -65,6 +65,8 @@ const PERMISSION_RESPONSE_RESUME_KEYS: &[&str] = &[
     "clarification_resume_pending",
     "conclusion_with_options_resume_pending",
     "execute.startup_handoff_at",
+];
+pub(crate) const PERMISSION_REPLAY_KEYS: &[&str] = &[
     "permission.reexecute_tool_call_id",
     "permission.reexecute_request_generation",
 ];
@@ -94,6 +96,8 @@ pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Se
     match main.metadata.get(handoff_key) {
         Some(marker) => {
             side.metadata.insert(handoff_key.into(), marker.clone());
+            copy_permission_response_control(main, side);
+            return;
         }
         None => {
             side.metadata.remove(handoff_key);
@@ -121,10 +125,15 @@ pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Se
     if !consumed(side) || consumed(main) {
         return;
     }
+    copy_permission_response_control(main, side);
+}
+
+fn copy_permission_response_control(main: &Session, side: &mut Session) {
     side.pending_question.clone_from(&main.pending_question);
     for &key in RESPONSE_CONTROL_METADATA_KEYS
         .iter()
         .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
     {
         match main.metadata.get(key) {
             Some(value) => {
@@ -137,6 +146,17 @@ pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Se
     }
 }
 
+/// Pending and consumed response controls are immutable while Main owns an
+/// unclaimed handoff. Only the dedicated claim may advance this checkpoint.
+pub(crate) fn same_permission_response_control(current: &Session, proposed: &Session) -> bool {
+    current.pending_question == proposed.pending_question
+        && RESPONSE_CONTROL_METADATA_KEYS
+            .iter()
+            .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+            .chain(PERMISSION_REPLAY_KEYS)
+            .all(|key| current.metadata.get(*key) == proposed.metadata.get(*key))
+}
+
 /// Sidecar-only reads need Main only when the response's sidecar could be ahead.
 pub(crate) fn has_uncommitted_response_marker(side: &Session) -> bool {
     side.pending_question.is_none()
@@ -145,6 +165,7 @@ pub(crate) fn has_uncommitted_response_marker(side: &Session) -> bool {
             .contains_key(CONSUMED_RESPONSE_OCCURRENCES_KEY)
         && PERMISSION_RESPONSE_RESUME_KEYS
             .iter()
+            .chain(PERMISSION_REPLAY_KEYS)
             .any(|key| side.metadata.contains_key(*key))
 }
 
@@ -228,6 +249,7 @@ pub(crate) fn adopt_durable_actor_parent_question_handoff(
     for key in RESPONSE_CONTROL_METADATA_KEYS
         .iter()
         .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
         .chain(RESPONSE_RELATED_METADATA_KEYS)
         .copied()
         .chain([
@@ -979,7 +1001,9 @@ fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session
     for key in RESPONSE_CONTROL_METADATA_KEYS
         .iter()
         .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(PERMISSION_REPLAY_KEYS)
         .chain(RESPONSE_RELATED_METADATA_KEYS)
+        .chain([&bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY])
     {
         if let Some(value) = durable.metadata.get(*key) {
             session.metadata.insert((*key).to_string(), value.clone());

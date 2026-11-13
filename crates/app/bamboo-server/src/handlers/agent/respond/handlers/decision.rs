@@ -422,7 +422,17 @@ fn supervisor_reference(
 }
 
 fn delegated_origin(session: &bamboo_domain::Session) -> Option<SupervisorApprovalResponseOrigin> {
-    let result = session.messages.last()?;
+    let occurrence: bamboo_domain::ResponseOccurrence = serde_json::from_str(
+        session
+            .metadata
+            .get(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)?,
+    )
+    .ok()?;
+    let result = session
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.id == occurrence.tool_result_message_id)?;
     let origin: SupervisorApprovalResponseOrigin = serde_json::from_value(
         result
             .metadata
@@ -431,7 +441,7 @@ fn delegated_origin(session: &bamboo_domain::Session) -> Option<SupervisorApprov
             .clone(),
     )
     .ok()?;
-    if origin.occurrence.tool_result_message_id != result.id
+    if origin.occurrence != occurrence
         || !origin.target.matches(session)
         || bamboo_domain::latest_response_occurrence(session, &origin.occurrence.tool_call_id)
             .as_ref()
@@ -440,6 +450,32 @@ fn delegated_origin(session: &bamboo_domain::Session) -> Option<SupervisorApprov
         return None;
     }
     Some(origin)
+}
+
+fn allows_delegated_retry(
+    state: &AppState,
+    supervisor: &bamboo_domain::SupervisorReference,
+    origin: &SupervisorApprovalResponseOrigin,
+    decision: PermissionDecisionKind,
+) -> bool {
+    state
+        .permission_section
+        .snapshot()
+        .data
+        .supervisor_approval_handoff_since
+        .is_some()
+        && state
+            .permission_checker
+            .permission_config()
+            .is_some_and(|config| {
+                ApprovalHandoff::allows_control_reference(
+                    &config,
+                    supervisor,
+                    &origin.target.session_id,
+                    &origin.reference,
+                    decision,
+                )
+            })
 }
 
 async fn retry_delegated_approval(
@@ -451,7 +487,7 @@ async fn retry_delegated_approval(
     origin: SupervisorApprovalResponseOrigin,
     decision: PermissionDecisionKind,
 ) -> Result<HttpResponse, AppError> {
-    let _permission = state.permission_io_lock.lock().await;
+    let permission = state.permission_io_lock.lock().await;
     let denied = || AppError::Forbidden("Approval occurrence or authority changed".into());
     let receipt = super::pending::persisted_permission_decision_receipt(
         session,
@@ -463,23 +499,7 @@ async fn retry_delegated_approval(
                 == Some(receipt.decision.request_generation.as_str())
     })
     .ok_or_else(denied)?;
-    let config = state
-        .permission_checker
-        .permission_config()
-        .ok_or_else(denied)?;
-    if state
-        .permission_section
-        .snapshot()
-        .data
-        .supervisor_approval_handoff_since
-        .is_none()
-        || !ApprovalHandoff::allows_control_reference(
-            &config,
-            supervisor,
-            &session.id,
-            &origin.reference,
-            decision,
-        )
+    if !allows_delegated_retry(state, supervisor, &origin, decision)
         || !inbox
             .verify_admitted_runtime_instruction(&origin.notice)
             .await
@@ -487,7 +507,10 @@ async fn retry_delegated_approval(
     {
         return Err(denied());
     }
+    drop(permission);
     let expected_receipt = receipt.clone();
+    let approval_state = state.clone();
+    let approval_supervisor = supervisor.clone();
     let approval = SupervisorApprovalCommit {
         caller: caller.clone(),
         supervisor: supervisor.clone(),
@@ -500,6 +523,7 @@ async fn retry_delegated_approval(
                     bamboo_domain::is_matching_session_message(message, &origin.notice)
                 });
             if !received
+                || !allows_delegated_retry(&approval_state, &approval_supervisor, &origin, decision)
                 || delegated_origin(current).as_ref() != Some(&origin)
                 || super::pending::persisted_permission_decision_receipt(
                     current,
@@ -731,6 +755,7 @@ async fn apply_permission_decision(
                 config
                     .record_decision_receipt(receipt.clone())
                     .map_err(AppError::BadRequest)?;
+                drop(permission_guard.take());
                 return replay_committed_decision(&state, &session, receipt, None).await;
             }
             // After a successful durable decision, a daemon restart loses the
@@ -942,6 +967,7 @@ async fn apply_permission_decision(
     // the first attempt committed policy but failed before saving the pending
     // answer, retry the ordinary response path to finish resume safely.
     if replayed && session.pending_question.is_none() {
+        drop(permission_guard.take());
         return replay_committed_decision(&state, &session, receipt, None).await;
     }
 
@@ -968,6 +994,7 @@ async fn apply_permission_decision(
             receipt.clone(),
             &response_guard,
             approval,
+            permission_guard.take(),
         )
         .await
         .map_err(|error| AppError::InternalError(anyhow::anyhow!(error.to_string())))?;

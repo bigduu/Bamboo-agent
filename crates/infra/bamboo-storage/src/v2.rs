@@ -1853,6 +1853,7 @@ pub struct SessionStoreV2 {
 }
 
 const COPY_TRANSIENT_METADATA_KEYS: &[&str] = &[
+    bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
     "runtime.host_run_id",
     "runtime.root_writer_observation_v1",
     "runtime.host_launch_generation",
@@ -2514,7 +2515,7 @@ impl SessionStoreV2 {
     }
 
     /// Same canonical pair, revocation and proof validation as the full reader.
-    /// The control view never deserializes private messages/provider history.
+    /// The control view discards private messages and provider history.
     async fn load_session_from_dir_strict_view(
         &self,
         abs_dir: &Path,
@@ -6477,6 +6478,14 @@ impl SessionStoreV2 {
         reject_incompatible_session_write(&session)?;
         self.validate_root_context_for_save(&session).await?;
 
+        if session
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "pending permission response must resume before clearing history",
+            ));
+        }
         if session.conversation_reset.is_some() {
             return Err(io::Error::new(io::ErrorKind::Unsupported, bamboo_domain::SessionAuthorityConflict(
                 "conversation generation requires a fenced reset transaction; legacy clear is unavailable".into(),
@@ -7515,6 +7524,16 @@ impl SessionStoreV2 {
         {
             reject_incompatible_session_write(&durable)?;
             reject_conversation_generation_change(session, &durable)?;
+            let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+            let marker = durable.metadata.get(marker_key);
+            if (marker.is_some() || session.metadata.contains_key(marker_key))
+                && (marker != session.metadata.get(marker_key)
+                    || !crate::session_merge::same_permission_response_control(&durable, session))
+            {
+                return Err(root_actor_runtime::conflict(
+                    "pending permission response control changed",
+                ));
+            }
         }
         let previous = Self::read_runtime_sidecar_at(
             &self.abs_path_from_rel(rel).join(RUNTIME_SIDECAR_FILE),
@@ -7807,38 +7826,33 @@ impl SessionStoreV2 {
             let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
             let prior = previous.metadata.get(marker_key);
             let proposed = session.metadata.get(marker_key);
-            if let Some(marker) = prior.filter(|_| guards.once_response_handoff.is_none()) {
-                let occurrence: bamboo_domain::ResponseOccurrence = serde_json::from_str(marker)?;
-                if session
-                    .messages
-                    .last()
-                    .is_none_or(|message| message.id != occurrence.tool_result_message_id)
+            if prior.is_some() && guards.once_response_handoff.is_none() {
+                if proposed != prior
+                    || !crate::session_merge::same_permission_response_control(previous, session)
+                    || serde_json::to_value(&previous.messages)?
+                        != serde_json::to_value(&session.messages)?
                 {
                     return Err(root_actor_runtime::conflict(
-                        "pending permission response must resume before a new input",
+                        "pending permission response must resume before changing its transcript or control",
+                    ));
+                }
+            } else if let Some(marker) = proposed {
+                let response: bamboo_domain::ResponseOccurrence = serde_json::from_str(marker)?;
+                if bamboo_domain::consumed_pending_permission(previous, session).as_ref()
+                    != Some(&response)
+                {
+                    return Err(root_actor_runtime::conflict(
+                        "permission response occurrence changed",
                     ));
                 }
             }
-            if let Some(marker) = proposed {
-                if prior != Some(marker) {
-                    let response: bamboo_domain::ResponseOccurrence = serde_json::from_str(marker)?;
-                    if prior.is_some()
-                        || bamboo_domain::consumed_pending_permission(previous, session).as_ref()
-                            != Some(&response)
-                    {
-                        return Err(root_actor_runtime::conflict(
-                            "permission response occurrence changed",
-                        ));
-                    }
-                }
-            } else if prior.is_some()
-                && guards.once_response_handoff.is_none()
-                && session.check_conversation_generation(previous).is_ok()
-            {
-                return Err(root_actor_runtime::conflict(
-                    "pending permission response handoff must be claimed",
-                ));
-            }
+        } else if session
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+        {
+            return Err(root_actor_runtime::conflict(
+                "permission response requires a canonical pending occurrence",
+            ));
         }
 
         // An incoming Session field is never authority to create or roll back

@@ -94,6 +94,7 @@ struct TypedPermissionResponse<'a> {
     receipt: PermissionDecisionReceipt,
     guard: &'a bamboo_engine::session_app::respond::PendingResponseGuard,
     approval: Option<bamboo_domain::storage::SupervisorApprovalCommit>,
+    permission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 pub(super) async fn submit_typed_permission_response(
@@ -103,6 +104,7 @@ pub(super) async fn submit_typed_permission_response(
     permission_receipt: PermissionDecisionReceipt,
     response_guard: &bamboo_engine::session_app::respond::PendingResponseGuard,
     approval: Option<bamboo_domain::storage::SupervisorApprovalCommit>,
+    permission_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) -> Result<HttpResponse> {
     submit_response_inner(
         state,
@@ -113,6 +115,7 @@ pub(super) async fn submit_typed_permission_response(
             receipt: permission_receipt,
             guard: response_guard,
             approval,
+            permission_guard,
         }),
     )
     .await
@@ -239,7 +242,7 @@ async fn submit_response_inner(
         }
     }
 
-    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef::new(state.clone());
+    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
     let mut handoff =
         match reserve_response_resume_handoff(&resume_port, &session_id, Duration::from_secs(15))
             .await
@@ -273,6 +276,9 @@ async fn submit_response_inner(
     let approval = permission
         .as_mut()
         .and_then(|permission| permission.approval.take());
+    let permission_guard = permission
+        .as_mut()
+        .and_then(|permission| permission.permission_guard.take());
     let bound_access: Result<Option<Arc<dyn SessionAccess>>, _> = if let Some(approval) = approval {
         match owner {
             Some(owner) => state
@@ -354,6 +360,8 @@ async fn submit_response_inner(
             };
         }
     };
+
+    drop(permission_guard);
 
     if stop_progress_pause {
         // The same guarded CAS consumed the runtime question and saved the
@@ -454,7 +462,16 @@ async fn submit_response_inner(
     // Build resume config snapshot from server config via the single-source-of-
     // truth resolver (provider-name derivation + global auxiliary models + gold).
     let auto_resume_outcome =
-        resume_committed_response(&resume_port, &config_snapshot, session, handoff).await;
+        match resume_committed_response(&resume_port, &config_snapshot, session, handoff, None)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Ok(HttpResponse::InternalServerError().json(serde_json::json!({
+                    "error": crate::error::error_value(error.to_string()),
+                })))
+            }
+        };
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -470,7 +487,8 @@ async fn resume_committed_response(
     config: &bamboo_config::Config,
     session: bamboo_agent_core::Session,
     handoff: ResponseResumeHandoff,
-) -> ResumeOutcome {
+    approval: Option<Arc<bamboo_domain::SupervisorApprovalCommit>>,
+) -> std::io::Result<ResumeOutcome> {
     let session_id = session.id.clone();
     let resume_config =
         bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
@@ -479,14 +497,31 @@ async fn resume_committed_response(
             &session,
             None,
         );
-    bamboo_engine::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
+    if session.metadata.contains_key(ONCE_RESPONSE_HANDOFF_KEY) {
+        let (execution_reservation, event_sender) = handoff.into_parts();
+        let run_id = execution_reservation.run_id().to_string();
+        resume_port
+            .dispatch_once_response(
+                bamboo_engine::session_app::resume::ResumeSpawnRequest {
+                    session_id,
+                    session,
+                    execution_reservation,
+                    event_sender,
+                    config: resume_config,
+                },
+                approval,
+            )
+            .await?;
+        return Ok(ResumeOutcome::Started { run_id });
+    }
+    Ok(bamboo_engine::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
         resume_port,
         &session_id,
         session,
         resume_config,
         handoff,
     )
-    .await
+    .await)
 }
 
 fn needs_once_response_handoff(
@@ -518,10 +553,6 @@ fn needs_once_response_handoff(
         && replay_matches
         && occurrence.permission_generation.as_deref() == Some(decision.request_generation.as_str())
         && latest_response_occurrence(session, &decision.request_id).as_ref() == Some(&occurrence)
-        && session
-            .messages
-            .last()
-            .is_some_and(|message| message.id == occurrence.tool_result_message_id)
         && super::pending::persisted_permission_decision_receipt(session, &decision.request_id)
             .as_ref()
             == Some(receipt)
@@ -540,7 +571,7 @@ pub(super) async fn recover_committed_once_response(
     }
     let session_id = &session.id;
     let expected = SessionCallerReference::from(session);
-    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef::new(state.clone());
+    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
     let handoff =
         match reserve_response_resume_handoff(&resume_port, session_id, Duration::ZERO).await {
             Ok(handoff) => handoff,
@@ -578,15 +609,9 @@ pub(super) async fn recover_committed_once_response(
         return Ok(None);
     };
     let config = state.config.read().await.clone();
-    Ok(Some(
-        resume_committed_response(
-            &resume_port.with_approval(approval),
-            &config,
-            current,
-            handoff,
-        )
-        .await,
-    ))
+    resume_committed_response(&resume_port, &config, current, handoff, approval)
+        .await
+        .map(Some)
 }
 
 #[cfg(test)]

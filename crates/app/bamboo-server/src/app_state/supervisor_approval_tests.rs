@@ -561,7 +561,7 @@ impl Fixture {
         // Retain it across the policy CAS: never dispatch the model or reserve
         // a second owner between approval and the intended denied replay.
         let handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
-            &AppStateResumeRef::new(self.state.clone()),
+            &AppStateResumeRef(self.state.clone()),
             &self.session_id,
             std::time::Duration::from_secs(15),
         )
@@ -1055,7 +1055,7 @@ async fn server_resume_preserves_approved_call_after_root_tool_revision_changes(
                 );
                 let outcome =
                     bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
-                        &AppStateResumeRef::new(fixture.state.clone()),
+                        &AppStateResumeRef(fixture.state.clone()),
                         &session.id,
                         session.clone(),
                         config,

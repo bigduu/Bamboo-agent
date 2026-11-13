@@ -210,8 +210,9 @@ impl SessionStoreV2 {
         let result = |session: &Session| {
             session
                 .messages
-                .last()
-                .filter(|message| message.id == occurrence.tool_result_message_id)
+                .iter()
+                .rev()
+                .find(|message| message.id == occurrence.tool_result_message_id)
                 .map(serde_json::to_value)
                 .transpose()
         };
@@ -228,6 +229,9 @@ impl SessionStoreV2 {
             return Err(conflict("permission handoff identity changed"));
         }
         current.metadata.remove(marker_key);
+        for &key in crate::session_merge::PERMISSION_REPLAY_KEYS {
+            current.metadata.remove(key);
+        }
         Arc::get_mut(&mut guards)
             .expect("owned response claim")
             .once_response_handoff = Some(occurrence.clone());
@@ -240,6 +244,9 @@ impl SessionStoreV2 {
                 bamboo_domain::SessionCallerReference::from(&current).matches_session(after)
                     && after.pending_question.is_none()
                     && !after.metadata.contains_key(marker_key)
+                    && crate::session_merge::PERMISSION_REPLAY_KEYS
+                        .iter()
+                        .all(|key| !after.metadata.contains_key(*key))
                     && bamboo_domain::latest_response_occurrence(after, &occurrence.tool_call_id)
                         .as_ref()
                         == Some(&occurrence)

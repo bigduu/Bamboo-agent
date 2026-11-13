@@ -2426,7 +2426,28 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
         let restarted = host(f.home.path(), f.probe.clone()).await;
         let queued =
             bamboo_domain::SessionMessageEnvelope::user_input(ROOT_A, "queued after approval");
-        restarted.session_inbox.deliver(&queued).await.unwrap();
+        let queued_receipt = restarted.session_inbox.deliver(&queued).await.unwrap();
+        restarted
+            .session_inbox
+            .mark_message_activation_eligible(
+                ROOT_A,
+                &queued_receipt,
+                bamboo_domain::SessionActivationPolicy::InterruptSpecificWait,
+            )
+            .await
+            .unwrap();
+        use bamboo_domain::SessionActivationPort;
+        restarted
+            .session_activation_router
+            .request_activation(ROOT_A, queued_receipt.generation)
+            .await
+            .unwrap();
+        assert!(
+            !restarted
+                .session_activation_router
+                .has_activation_owner_or_reservation(ROOT_A)
+                .await
+        );
         let execute = crate::handlers::agent::execute::handle_execute(
             restarted.clone(),
             ROOT_A.into(),
@@ -2463,28 +2484,37 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
         restarted
             .session_store
             .interrupt_once_handoff_claim_for_test(ROOT_A);
-        let interrupted = retry(caller.clone(), final_decision).await.unwrap();
-        assert_eq!(interrupted["auto_resume_status"], "started");
-        tokio::time::timeout(WAIT, async {
-            while restarted
-                .session_activation_router
-                .current_run_id(ROOT_A)
-                .await
-                .is_some()
-            {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert!(!std::path::Path::new(&file).exists());
-        assert!(load(&restarted, ROOT_A)
+        let interrupted = retry(caller.clone(), final_decision).await.unwrap_err();
+        assert!(interrupted
+            .to_string()
+            .contains("injected Once handoff interruption"));
+        assert!(restarted
+            .session_activation_router
+            .current_run_id(ROOT_A)
             .await
+            .is_none());
+        assert!(!std::path::Path::new(&file).exists());
+        let interrupted = load(&restarted, ROOT_A).await;
+        assert!(interrupted
             .metadata
             .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        assert_eq!(
+            interrupted
+                .metadata
+                .get(bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY)
+                .map(String::as_str),
+            Some(call),
+        );
         let response = retry(caller.clone(), final_decision).await.unwrap();
         assert_eq!(response["replayed"], true);
         assert_eq!(response["auto_resume_status"], "started");
+        let claimed = load(&restarted, ROOT_A).await;
+        assert!(!claimed
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        assert!(!claimed
+            .metadata
+            .contains_key(bamboo_engine::session_app::respond::PERMISSION_REEXECUTE_METADATA_KEY));
         settled(&restarted, ROOT_A).await;
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
         assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
