@@ -488,6 +488,32 @@ impl AppStateResumeRef {
                     ApprovalReplayDecision::BlockedByRootToolAuthority
                         | ApprovalReplayDecision::BlockedByUnavailableTool
                 );
+                if session
+                    .metadata
+                    .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+                {
+                    // Checkpoint ownership before dispatch. A retried HTTP
+                    // decision may recover an undispatched answer, but must
+                    // never re-dispatch an operation whose execution is unknown.
+                    let mut checkpoint = session.clone();
+                    checkpoint
+                        .metadata
+                        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+                    let saved =
+                        if let Some(persistence) = execution_reservation.execution_persistence() {
+                            persistence.save_runtime_session(&mut checkpoint).await
+                        } else {
+                            state.session_repo.save(&mut checkpoint).await
+                        };
+                    if let Err(error) = saved {
+                        tracing::warn!(%session_id, %error, "Once response handoff checkpoint failed");
+                        return;
+                    }
+                    session
+                        .metadata
+                        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+                }
+
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 session
                     .metadata

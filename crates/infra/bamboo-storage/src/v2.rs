@@ -676,6 +676,19 @@ struct SessionControlPlane {
     session: Session,
 }
 
+fn decode_main_control_plane(raw: &str, side: Option<&Session>) -> serde_json::Result<Session> {
+    let main = serde_json::from_str::<SessionControlPlane>(raw)?.session;
+    if side.is_some_and(|side| {
+        crate::session_merge::main_may_have_uncommitted_response_control(&main, side)
+    }) {
+        // Only an ambiguous response pair needs its actual pending result ID.
+        // The caller still projects away all transcript fields.
+        serde_json::from_str(raw)
+    } else {
+        Ok(main)
+    }
+}
+
 impl<'de> Deserialize<'de> for SessionControlPlane {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ControlVisitor;
@@ -1800,6 +1813,8 @@ pub struct SessionStoreV2 {
     full_save_pause: std::sync::Mutex<Option<FullSavePause>>,
     #[cfg(feature = "test-utils")]
     full_save_fault: std::sync::Mutex<Option<(String, bool)>>,
+    #[cfg(feature = "test-utils")]
+    full_response_publication_fault: std::sync::Mutex<Option<String>>,
     #[cfg(test)]
     root_publication_fault: std::sync::Mutex<Option<root_lifetime::RootPublicationFault>>,
     #[cfg(test)]
@@ -2149,6 +2164,8 @@ impl SessionStoreV2 {
             full_save_pause: std::sync::Mutex::new(None),
             #[cfg(feature = "test-utils")]
             full_save_fault: std::sync::Mutex::new(None),
+            #[cfg(feature = "test-utils")]
+            full_response_publication_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
             root_publication_fault: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -2577,7 +2594,18 @@ impl SessionStoreV2 {
         supervisor::validate_overlay(&main, sidecar.as_ref())?;
         self.validate_root_tool_authority_overlay(id, &main, sidecar.as_ref())
             .await?;
+        if control_only
+            && sidecar.as_ref().is_some_and(|side| {
+                crate::session_merge::main_may_have_uncommitted_response_control(&main, side)
+            })
+        {
+            let transcript: Session = serde_json::from_str(&raw)?;
+            main.messages = transcript.messages;
+        }
         let mut session = overlay_runtime_sidecar(main, sidecar);
+        if control_only {
+            session.messages.clear();
+        }
         session.clear_stale_root_token_budget();
         Ok(Some(session))
     }
@@ -3006,6 +3034,24 @@ impl SessionStoreV2 {
     #[doc(hidden)]
     pub fn interrupt_full_save_at_main_for_test(&self, session_id: &str, after_main: bool) {
         *self.full_save_fault.lock().unwrap() = Some((session_id.into(), after_main));
+    }
+
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn interrupt_response_publication_for_test(&self, session_id: &str) {
+        *self.full_response_publication_fault.lock().unwrap() = Some(session_id.into());
+    }
+
+    #[cfg(feature = "test-utils")]
+    fn check_response_publication_fault(&self, session_id: &str) -> io::Result<()> {
+        let mut fault = self.full_response_publication_fault.lock().unwrap();
+        if fault.as_deref() == Some(session_id) {
+            fault.take();
+            return Err(io::Error::other(
+                "injected response publication interruption",
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(feature = "test-utils")]
@@ -3891,9 +3937,18 @@ impl SessionStoreV2 {
             // An Ordinary Child may already own this ID in another tree.
             // Only canonical Root absence permits its normal control-plane read.
         }
-        if let Some(side) = self.read_runtime_sidecar_boxed(session_id).await? {
+        if let Some(mut side) = self.read_runtime_sidecar_boxed(session_id).await? {
             self.validate_root_tool_authority_against_proof(session_id, &side)
                 .await?;
+            if crate::session_merge::has_uncommitted_response_marker(&side) {
+                if let Some(path) = self.session_json_path(session_id).await? {
+                    let raw = fs::read_to_string(path).await?;
+                    compact_main::validate_full_main(raw.as_bytes())?;
+                    let main = decode_main_control_plane(&raw, Some(&side))?;
+                    supervisor::validate_overlay(&main, Some(&side))?;
+                    crate::session_merge::retain_pending_permission_until_main(&main, &mut side);
+                }
+            }
             return Ok(self.session_lifetime_is_live(&side).await?.then_some(side));
         }
         let Some(path) = self.session_json_path(session_id).await? else {
@@ -8352,6 +8407,13 @@ impl Storage for SessionStoreV2 {
             publish,
         )
         .await
+    }
+
+    async fn confirm_root_response_checkpoint(
+        &self,
+        owner: &bamboo_domain::storage::RootActorRuntimeWrite,
+    ) -> io::Result<Session> {
+        self.confirm_root_response_checkpoint_impl(owner).await
     }
 
     async fn root_mode_operation(

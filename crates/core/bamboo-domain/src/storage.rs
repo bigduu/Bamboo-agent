@@ -164,12 +164,26 @@ pub struct SupervisorApprovalCommit {
     pub caller: crate::SessionCallerReference,
     pub supervisor: SupervisorReference,
     pub target: crate::SupervisorCurrentUserTarget,
+    pub reference: String,
+    pub notice: crate::SessionMessageEnvelope,
     /// Validate the retained source and target snapshots without reentering storage.
     pub validate: SupervisorApprovalValidator,
 }
 
 pub type SupervisorApprovalValidator =
     Box<dyn Fn(&Session, &Session) -> std::io::Result<()> + Send + Sync>;
+
+/// Main message metadata written only by the fenced delegated response commit.
+pub const SUPERVISOR_APPROVAL_RESPONSE_KEY: &str = "supervisor_approval_response.v1";
+
+#[derive(PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SupervisorApprovalResponseOrigin {
+    pub caller: crate::SessionCallerReference,
+    pub target: crate::SupervisorCurrentUserTarget,
+    pub reference: String,
+    pub notice: crate::SessionMessageEnvelope,
+    pub occurrence: crate::ResponseOccurrence,
+}
 
 /// The final sink receives a fresh owner check while the physical authority
 /// guards remain owned by the publication job. Check immediately before each
@@ -496,6 +510,19 @@ pub trait Storage: Send + Sync {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "guarded Supervisor approval response is unsupported",
+        ))
+    }
+
+    /// Reload a committed response under the successor's Root fence and confirm
+    /// Main and runtime are durable before a retry can dispatch its handoff.
+    async fn confirm_root_response_checkpoint(
+        &self,
+        owner: &RootActorRuntimeWrite,
+    ) -> std::io::Result<Session> {
+        let _ = owner;
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Root response checkpoint recovery is unsupported",
         ))
     }
 

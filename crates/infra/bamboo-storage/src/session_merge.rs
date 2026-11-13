@@ -61,20 +61,23 @@ const ROOT_PROJECT_CONTEXT_KEYS: &[&str] = &[
     "project_resources_rendered",
     "runtime_prompt_snapshot",
 ];
-const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
-    CONSUMED_CLARIFICATION_IDS_KEY,
-    CONSUMED_RESPONSE_OCCURRENCES_KEY,
-    "runtime.suspend_reason",
+const PERMISSION_RESPONSE_RESUME_KEYS: &[&str] = &[
     "clarification_resume_pending",
     "conclusion_with_options_resume_pending",
     "execute.startup_handoff_at",
     "permission.reexecute_tool_call_id",
     "permission.reexecute_request_generation",
+    bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
+];
+const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
+    CONSUMED_CLARIFICATION_IDS_KEY,
+    CONSUMED_RESPONSE_OCCURRENCES_KEY,
+    "runtime.suspend_reason",
     "retry_resume_pending",
     "retry_resume_reason",
-    "provider_name",
-    "runtime.child_completion_source_v1",
 ];
+const RESPONSE_RELATED_METADATA_KEYS: &[&str] =
+    &["provider_name", "runtime.child_completion_source_v1"];
 const TASK_CONTROL_PLANE_CONFLICT_PREFIX: &str = "Task control-plane changed while saving session ";
 const MAX_TASK_CONTROL_PLANE_REBASE_RETRIES: usize = 3;
 const LAST_MANUAL_ARCHIVE_OCCURRENCE_KEY: &str =
@@ -88,19 +91,10 @@ const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_h
 /// consumption in the sidecar cannot clear the question until Main replaces
 /// the tool result with the decision receipt from that same response.
 pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Session) {
-    if main.id != side.id
+    if !main_may_have_uncommitted_response_control(main, side)
+        || main.id != side.id
         || main.created_at != side.created_at
         || main.check_conversation_generation(side).is_err()
-    {
-        return;
-    }
-    if !side
-        .metadata
-        .contains_key(CONSUMED_RESPONSE_OCCURRENCES_KEY)
-        || side.pending_question.is_some()
-        || main.pending_question.is_none()
-        || main.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
-            == side.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
     {
         return;
     }
@@ -120,10 +114,9 @@ pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Se
         return;
     }
     side.pending_question.clone_from(&main.pending_question);
-    for key in RESPONSE_CONTROL_METADATA_KEYS
+    for &key in RESPONSE_CONTROL_METADATA_KEYS
         .iter()
-        .copied()
-        .filter(|key| *key != "provider_name" && *key != "runtime.child_completion_source_v1")
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
     {
         match main.metadata.get(key) {
             Some(value) => {
@@ -134,6 +127,24 @@ pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Se
             }
         }
     }
+}
+
+/// Sidecar-only reads need Main only when the response's sidecar could be ahead.
+pub(crate) fn has_uncommitted_response_marker(side: &Session) -> bool {
+    side.pending_question.is_none()
+        && side
+            .metadata
+            .contains_key(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        && PERMISSION_RESPONSE_RESUME_KEYS
+            .iter()
+            .any(|key| side.metadata.contains_key(*key))
+}
+
+pub(crate) fn main_may_have_uncommitted_response_control(main: &Session, side: &Session) -> bool {
+    main.pending_question.is_some()
+        && main.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+            != side.metadata.get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        && has_uncommitted_response_marker(side)
 }
 
 /// A worker clarification was already checkpointed by the Host while this
@@ -206,10 +217,16 @@ pub(crate) fn adopt_durable_actor_parent_question_handoff(
     session
         .pending_question
         .clone_from(&durable.pending_question);
-    for key in RESPONSE_CONTROL_METADATA_KEYS.iter().copied().chain([
-        bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
-        bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
-    ]) {
+    for key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(RESPONSE_RELATED_METADATA_KEYS)
+        .copied()
+        .chain([
+            bamboo_domain::PARENT_QUESTION_REQUEST_KEY,
+            bamboo_domain::PARENT_QUESTION_RESOLUTION_KEY,
+        ])
+    {
         match durable.metadata.get(key) {
             Some(value) => {
                 session.metadata.insert(key.to_string(), value.clone());
@@ -951,7 +968,11 @@ fn adopt_durable_consumed_clarification(session: &mut Session, durable: &Session
     session
         .pending_question
         .clone_from(&durable.pending_question);
-    for key in RESPONSE_CONTROL_METADATA_KEYS {
+    for key in RESPONSE_CONTROL_METADATA_KEYS
+        .iter()
+        .chain(PERMISSION_RESPONSE_RESUME_KEYS)
+        .chain(RESPONSE_RELATED_METADATA_KEYS)
+    {
         if let Some(value) = durable.metadata.get(*key) {
             session.metadata.insert((*key).to_string(), value.clone());
         } else {

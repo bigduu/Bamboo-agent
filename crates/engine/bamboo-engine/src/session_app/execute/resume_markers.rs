@@ -46,6 +46,9 @@ pub fn has_pending_user_message(session: &Session) -> bool {
 }
 
 pub fn consume_pending_clarification_resume(session: &mut Session) {
+    session
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
     session.metadata.remove(CLARIFICATION_RESUME_PENDING_KEY);
     session
         .metadata

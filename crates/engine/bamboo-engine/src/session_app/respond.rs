@@ -596,6 +596,23 @@ fn apply_pending_response(
     // ---- Clear pending question and set resume marker ----
     session.clear_pending_question();
     record_consumed_clarification(session, &tool_call_id);
+    session
+        .metadata
+        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+    if let Some(occurrence) = permission_receipt
+        .filter(|receipt| {
+            matches!(
+                receipt.decision.decision,
+                PermissionDecisionKind::AllowOnce | PermissionDecisionKind::DenyOnce
+            )
+        })
+        .and_then(|_| bamboo_domain::latest_response_occurrence(session, &tool_call_id))
+    {
+        session.metadata.insert(
+            bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY.into(),
+            serde_json::to_string(&occurrence).expect("response occurrence is serializable"),
+        );
+    }
     session.metadata.remove("runtime.suspend_reason");
     if no_progress_question && input.user_response == super::no_progress::STOP_OPTION {
         super::no_progress::stop_after_response(session);
@@ -866,6 +883,13 @@ fn persist_permission_decision_receipt(
         "permission_decision_receipt",
         serde_json::to_value(receipt).expect("permission receipt is serializable"),
     );
+    if let Some(metadata) = message
+        .metadata
+        .as_mut()
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        metadata.remove(bamboo_domain::SUPERVISOR_APPROVAL_RESPONSE_KEY);
+    }
     true
 }
 

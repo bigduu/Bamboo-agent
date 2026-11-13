@@ -21,6 +21,9 @@ pub const CONSUMED_RESPONSE_OCCURRENCES_KEY: &str =
 /// The retained result message can park for another permission generation.
 pub const PERMISSION_REPARKED_AT_KEY: &str = "permission_reparked_at";
 
+/// A committed one-shot answer whose exact resume has not entered execution.
+pub const ONCE_RESPONSE_HANDOFF_KEY: &str = "permission.once_response_handoff.v1";
+
 /// Identity of one concrete pending-response occurrence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResponseOccurrence {

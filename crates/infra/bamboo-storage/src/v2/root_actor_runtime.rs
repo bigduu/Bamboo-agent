@@ -4,6 +4,7 @@
 use super::*;
 use bamboo_domain::storage::{
     RootActorRuntimePublisher, RootActorRuntimeWrite, SupervisorApprovalCommit,
+    SupervisorApprovalResponseOrigin, SUPERVISOR_APPROVAL_RESPONSE_KEY,
 };
 use bamboo_domain::{ActorActivationStatus, ActorDirectoryEntry, SessionAuthorityConflict};
 
@@ -12,6 +13,19 @@ pub(super) fn conflict(reason: impl std::fmt::Display) -> io::Error {
         io::ErrorKind::WouldBlock,
         SessionAuthorityConflict(format!("Root Actor runtime authority rejected: {reason}")),
     )
+}
+
+fn sync_response_checkpoint(directory: &Path) -> io::Result<()> {
+    for name in ["session.json", RUNTIME_SIDECAR_FILE] {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(cfg!(windows))
+            .open(directory.join(name))?;
+        file.sync_all()?;
+    }
+    #[cfg(unix)]
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -143,6 +157,25 @@ impl RootActorWriteProof {
 }
 
 impl SessionStoreV2 {
+    pub(super) async fn confirm_root_response_checkpoint_impl(
+        &self,
+        owner: &RootActorRuntimeWrite,
+    ) -> io::Result<Session> {
+        let id = &owner.fence.actor_id;
+        let lifecycle = self.lock_default_writer_lifecycle().await?;
+        let task = self.lock_runtime_task_sidecar_shared().await?;
+        let session = self.acquire_session_maintenance_lock(id).await?;
+        let directory = self.sessions_dir.join(id);
+        let proof = RootActorWriteProof::new(directory.clone(), owner.clone());
+        let guards = DefaultWriterGuards::shared(lifecycle, task, session);
+        Self::default_writer_job(&guards, move || {
+            let current = proof.validate()?;
+            sync_response_checkpoint(&directory)?;
+            Ok(current)
+        })
+        .await
+    }
+
     pub(super) async fn publish_root_actor_runtime_event_impl(
         &self,
         owner: &RootActorRuntimeWrite,
@@ -267,12 +300,32 @@ impl SessionStoreV2 {
             let (authority, source, current) = self
                 .lock_supervisor_approval(&approval.caller, &approval.supervisor, &approval.target)
                 .await?;
-            if bamboo_domain::consumed_pending_permission(&current, session).is_none() {
+            let Some(occurrence) = bamboo_domain::consumed_pending_permission(&current, session)
+            else {
                 return Err(conflict(
                     "delegated approval no longer consumes its exact occurrence",
                 ));
-            }
+            };
             (approval.validate)(&source, &current)?;
+            let result = session
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|message| message.id == occurrence.tool_result_message_id)
+                .and_then(|message| message.metadata.as_mut())
+                .and_then(serde_json::Value::as_object_mut)
+                .filter(|metadata| metadata.contains_key("permission_decision_receipt"))
+                .ok_or_else(|| conflict("delegated approval receipt is missing"))?;
+            result.insert(
+                SUPERVISOR_APPROVAL_RESPONSE_KEY.into(),
+                serde_json::to_value(SupervisorApprovalResponseOrigin {
+                    caller: approval.caller.clone(),
+                    target: approval.target.clone(),
+                    reference: approval.reference.clone(),
+                    notice: approval.notice.clone(),
+                    occurrence,
+                })?,
+            );
             DefaultWriterGuards::supervisor_approval(authority, proof.clone())
         } else {
             let lifecycle = self.lock_default_writer_lifecycle().await?;
@@ -359,8 +412,65 @@ impl SessionStoreV2 {
         } else {
             session.clone()
         };
-        self.save_session_after_lock(&reconciled, total_started, &guards, None)
-            .await?;
+        if let Err(error) = self
+            .save_session_after_lock(&reconciled, total_started, &guards, None)
+            .await
+        {
+            let Some(occurrence) =
+                bamboo_domain::consumed_pending_permission(expected, &reconciled)
+            else {
+                return Err(error);
+            };
+            let Some(result) = reconciled
+                .messages
+                .iter()
+                .find(|message| message.id == occurrence.tool_result_message_id)
+            else {
+                return Err(error);
+            };
+            if !result
+                .metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.get("permission_decision_receipt").is_some())
+            {
+                return Err(error);
+            }
+            let expected = expected.clone();
+            let result = serde_json::to_value(result)?;
+            let directory = self.sessions_dir.join(&reconciled.id);
+            let checked = guards
+                .root_actor
+                .clone()
+                .expect("bound startup has its Root proof");
+            let recovered = Self::default_writer_job(&guards, move || {
+                let current = checked.validate()?;
+                if bamboo_domain::consumed_pending_permission(&expected, &current).as_ref()
+                    != Some(&occurrence)
+                    || current
+                        .messages
+                        .iter()
+                        .find(|message| message.id == occurrence.tool_result_message_id)
+                        .map(serde_json::to_value)
+                        .transpose()?
+                        .as_ref()
+                        != Some(&result)
+                {
+                    return Ok(false);
+                }
+                // The original error may have come from directory sync after
+                // replacement. Confirm Main durability before dispatch.
+                sync_response_checkpoint(&directory)?;
+                Ok(true)
+            })
+            .await;
+            if !matches!(recovered, Ok(true)) {
+                return Err(error);
+            }
+            tracing::warn!(%error, session_id = %reconciled.id,
+                "recovered committed permission response after checkpoint error");
+        }
+        #[cfg(feature = "test-utils")]
+        self.check_response_publication_fault(&reconciled.id)?;
         self.publish_root_actor_runtime(&guards, publish).await?;
         *session = reconciled;
         Ok(())
