@@ -49,6 +49,20 @@ function sourceFile(file, content) {
   return { type: "file", path: file, encoding: "base64", size: bytes.length, content: bytes.toString("base64") };
 }
 
+function handoffArchive(entries) {
+  const result = spawnSync("python3", ["-c", [
+    "import io, json, sys, zipfile",
+    "buffer = io.BytesIO()",
+    "with zipfile.ZipFile(buffer, 'w', zipfile.ZIP_DEFLATED) as archive:",
+    "    for name, content in json.load(sys.stdin):",
+    "        archive.writestr(name, content)",
+    "sys.stdout.buffer.write(buffer.getvalue())",
+  ].join("\n")], { input: JSON.stringify(entries) });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr?.toString());
+  return result.stdout;
+}
+
 function actionRun(id = 550, attempt = 1, head = controller) {
   return {
     id, workflow_id: workflowId, check_suite_id: id + 1000, run_attempt: attempt, name: publisherName,
@@ -118,14 +132,17 @@ function releaseFixture(contract) {
 }
 
 const mockGitHub = [
-  "import json, subprocess, sys",
+  "import base64, json, subprocess, sys",
   "fixture = json.load(sys.stdin)",
   "def read(args, **kwargs):",
   "    assert args[:4] == ['gh', 'api', '--hostname', 'github.com'] and kwargs == {'timeout': 60, 'stderr': subprocess.PIPE}",
   "    route = args[4].split('/', 3)[3]",
   "    if route in fixture['binary']:",
-  "        assert args[5:] == ['-H', 'Accept: application/octet-stream']",
-  "        return fixture['binary'][route].encode()",
+  "        if route.endswith('/zip'):",
+  "            assert args[5:] == ['-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2026-03-10']",
+  "        else:",
+  "            assert args[5:] == ['-H', 'Accept: application/octet-stream']",
+  "        return base64.b64decode(fixture['binary'][route])",
   "    if route.endswith('/logs'):",
   "        assert args[5:] == ['-H', 'X-GitHub-Api-Version: 2026-03-10', '--allow-escape-sequences'] and '/steps/' in route",
   "        return fixture['logs'][route].encode()",
@@ -136,7 +153,7 @@ const mockGitHub = [
 ].join("\n");
 
 function verifyRelease(t, fixture, { eventName = "workflow_dispatch", event = {}, handoff, publisherRun = "550",
-  publisherAttempt = "1", customize } = {}) {
+  publisherAttempt = "1", customize, archiveEntries, customizeArtifact } = {}) {
   const directory = scratch(t);
   const raw = JSON.stringify(fixture.manifest);
   fixture.manifestAsset.size = Buffer.byteLength(raw);
@@ -146,6 +163,19 @@ function verifyRelease(t, fixture, { eventName = "workflow_dispatch", event = {}
     ["git/ref/tags/v" + version]: fixture.tag,
     ["contents/" + policyPath + "?ref=" + source]: fixture.policy,
   };
+  const binary = { "releases/assets/900": Buffer.from(raw).toString("base64") };
+  if (handoff) {
+    const run = event.workflow_run;
+    const name = "bamboo-completed-release-" + run.id + "-" + run.run_attempt;
+    const bytes = handoffArchive(archiveEntries ?? [["release.json", JSON.stringify(handoff)]]);
+    const artifact = { id: 905, name, expired: false, size_in_bytes: bytes.length, digest: "sha256:" + sha256(bytes),
+      workflow_run: { id: run.id, head_sha: run.head_sha, head_branch: "dev",
+        repository_id: repositoryId, head_repository_id: repositoryId } };
+    const list = { total_count: 1, artifacts: [artifact] };
+    customizeArtifact?.(artifact, list);
+    routes["actions/runs/" + run.id + "/artifacts?name=" + name + "&per_page=100"] = list;
+    binary["actions/artifacts/905/zip"] = bytes.toString("base64");
+  }
   const logs = {};
   if (fixture.manifest.schemaVersion === 3) {
     const run = actionRun();
@@ -167,19 +197,16 @@ function verifyRelease(t, fixture, { eventName = "workflow_dispatch", event = {}
   const output = path.join(directory, "outputs");
   const eventPath = path.join(directory, "event.json");
   fs.writeFileSync(eventPath, JSON.stringify(event));
-  if (handoff) {
-    fs.mkdirSync(path.join(directory, "release"));
-    fs.writeFileSync(path.join(directory, "release/release.json"), JSON.stringify(handoff));
-  }
   const result = spawnSync("python3", ["-c", mockGitHub], {
     encoding: "utf8",
-    input: JSON.stringify({ body: publicationScript, routes, logs, binary: { "releases/assets/900": raw } }),
+    input: JSON.stringify({ body: publicationScript, routes, logs, binary }),
     env: { ...process.env, GITHUB_REPOSITORY: repository, GITHUB_EVENT_NAME: eventName, GITHUB_EVENT_PATH: eventPath,
       GITHUB_REF: "refs/heads/dev", GITHUB_REF_PROTECTED: "true", INPUT_VERSION: version, INPUT_SOURCE: source,
       INPUT_PUBLISHER_RUN_ID: publisherRun, INPUT_PUBLISHER_ATTEMPT: publisherAttempt,
       GITHUB_OUTPUT: output, RUNNER_TEMP: directory },
   });
   assert.ifError(result.error);
+  assert.deepEqual(fs.readdirSync(directory).sort(), result.status === 0 ? ["event.json", "outputs"] : ["event.json"]);
   if (result.status !== 0) {
     assert.equal(fs.existsSync(output), false);
     return { error: result.stderr };
@@ -236,6 +263,28 @@ test("automatic image packaging requires the successful publisher's handoff", t 
   assert.equal(verifyRelease(t, releaseFixture(2), { eventName: "workflow_run", event, handoff }).contract, "2");
   const failed = verifyRelease(t, releaseFixture(3), { eventName: "workflow_run", event, handoff: { ...handoff, runId: 551 } });
   assert.match(failed.error ?? "", /AssertionError/);
+});
+
+test("the publisher handoff must be one digest-verified JSON member in memory", t => {
+  const event = { workflow_run: actionRun() };
+  const handoff = { runId: 550, version, source };
+  const run = options => verifyRelease(t, releaseFixture(2), { eventName: "workflow_run", event, handoff, ...options });
+  for (const customizeArtifact of [
+    artifact => { artifact.expired = true; },
+    artifact => { artifact.workflow_run.head_sha = source; },
+    artifact => { artifact.digest = "sha256:" + "0".repeat(64); },
+    (artifact, list) => { list.total_count = 2; },
+  ]) {
+    assert.match(run({ customizeArtifact }).error ?? "", /AssertionError/);
+  }
+  const json = JSON.stringify(handoff);
+  for (const archiveEntries of [
+    [["nested/release.json", json]],
+    [["release.json", json], ["unexpected.py", "extra"]],
+    [["release.json", json + " ".repeat(4096)]],
+  ]) {
+    assert.match(run({ archiveEntries }).error ?? "", /AssertionError/);
+  }
 });
 
 test("v3 refuses a replacement manifest even when release asset metadata and all binaries agree", t => {

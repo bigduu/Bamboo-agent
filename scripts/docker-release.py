@@ -3,10 +3,13 @@
 import base64
 from datetime import datetime, timedelta
 import hashlib
+import io
 import json
 import os
 import re
+import stat
 import subprocess
+import zipfile
 
 
 REPOSITORY = 'bigduu/Bamboo-agent'
@@ -25,15 +28,17 @@ TARGETS = {
 }
 
 
-def api(route, *, binary=False, log=False):
+def api(route, *, binary=False, log=False, archive=False):
     args = ['gh', 'api', '--hostname', 'github.com', f'repos/{REPOSITORY}/{route}']
     if binary:
         args += ['-H', 'Accept: application/octet-stream']
     if log:
         args += ['-H', 'X-GitHub-Api-Version: 2026-03-10', '--allow-escape-sequences']
+    if archive:
+        args += ['-H', 'Accept: application/vnd.github+json', '-H', 'X-GitHub-Api-Version: 2026-03-10']
     data = subprocess.check_output(args, timeout=60, stderr=subprocess.PIPE)
     assert 0 < len(data) <= 4 * 1024 * 1024, 'GitHub publication response is empty or exceeds its bound'
-    return data if binary or log else json.loads(data)
+    return data if binary or log or archive else json.loads(data)
 
 
 def positive(value):
@@ -210,6 +215,34 @@ def verify_v3_publication(event_run, version, source, manifest_sha):
     assert record['manifestSha256'] == manifest_sha, 'Manifest differs from the original verified v3 publication'
 
 
+def completed_handoff(run):
+    run_id, attempt = positive(run['id']), positive(run['run_attempt'])
+    name = f'bamboo-completed-release-{run_id}-{attempt}'
+    artifacts = complete_list(api(f'actions/runs/{run_id}/artifacts?name={name}&per_page=100'), 'artifacts')
+    assert len(artifacts) == 1, 'Missing or ambiguous completed-release handoff'
+    artifact = artifacts[0]
+    assert artifact['name'] == name and artifact['expired'] is False
+    assert positive(artifact['size_in_bytes']) <= 64 * 1024
+    publisher = {
+        'id': run_id, 'head_sha': run['head_sha'], 'head_branch': 'dev',
+        'repository_id': REPOSITORY_ID, 'head_repository_id': REPOSITORY_ID,
+    }
+    assert all(artifact['workflow_run'][key] == value for key, value in publisher.items()), (
+        'Completed-release handoff belongs to a different publisher'
+    )
+    raw = api(f"actions/artifacts/{artifact['id']}/zip", archive=True)
+    assert len(raw) == artifact['size_in_bytes'] and artifact['digest'] == 'sha256:' + hashlib.sha256(raw).hexdigest()
+    # Read only the expected JSON member. The archive never changes runner files.
+    with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+        members = archive.infolist()
+        assert len(members) == 1 and members[0].filename == 'release.json', 'Unexpected completed-release handoff contents'
+        member = members[0]
+        assert 0 < member.file_size <= 4096 and not stat.S_ISLNK(member.external_attr >> 16)
+        handoff = json.loads(archive.read(member))
+    assert set(handoff) == {'runId', 'version', 'source'} and str(handoff['runId']) == str(run_id)
+    return handoff
+
+
 def release_inputs():
     assert os.environ['GITHUB_REPOSITORY'] == REPOSITORY
     event_run = None
@@ -219,9 +252,8 @@ def release_inputs():
         assert event_run['event'] == 'workflow_dispatch' and event_run['conclusion'] == 'success'
         assert event_run['path'] == PUBLISHER_PATH and event_run['head_branch'] == 'dev'
         assert event_run['repository']['full_name'] == event_run['head_repository']['full_name'] == REPOSITORY
-        with open(os.path.join(os.environ['RUNNER_TEMP'], 'release', 'release.json')) as stream:
-            handoff = json.load(stream)
-        assert str(handoff['runId']) == str(event_run['id'])
+        assert re.fullmatch(SHA, event_run['head_sha'])
+        handoff = completed_handoff(event_run)
         version, source = handoff['version'], handoff['source']
     else:
         assert os.environ['GITHUB_EVENT_NAME'] == 'workflow_dispatch'

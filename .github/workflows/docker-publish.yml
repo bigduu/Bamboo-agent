@@ -54,14 +54,6 @@ jobs:
       contract: ${{ steps.verify.outputs.contract }}
       linux_assets: ${{ steps.verify.outputs.linux_assets }}
     steps:
-      - name: Download the completed publisher's identity
-        if: github.event_name == 'workflow_run'
-        uses: actions/download-artifact@v8
-        with:
-          github-token: ${{ github.token }}
-          run-id: ${{ github.event.workflow_run.id }}
-          name: bamboo-completed-release-${{ github.event.workflow_run.id }}-${{ github.event.workflow_run.run_attempt }}
-          path: ${{ runner.temp }}/release
       - name: Verify release, tag, manifest and original Linux binaries
         id: verify
         env:
