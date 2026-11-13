@@ -2013,17 +2013,26 @@ test("actual source identity keeps unchanged Cargo fingerprints fresh", { timeou
     const out = output[0].out_dir
     const actual = JSON.parse(readFileSync(path.join(out, "identity.json"), "utf8"))
     const runs = Number(readFileSync(path.join(out, "counter.txt"), "utf8"))
-    const watches = [...readFileSync(path.join(out, "../output"), "utf8").matchAll(/^cargo:rerun-if-changed=(.+)$/gm)]
+    // Cargo 1.100 stores build-script stdout in run/stdout beside OUT_DIR.
+    // Older Cargo stores the same output in the sibling file output.
+    const stdoutFiles = ["../run/stdout", "../output"].map(relative => path.join(out, relative)).filter(existsSync)
+    assert.equal(stdoutFiles.length, 1, label + ": expected one Cargo build-script stdout file beside " + out)
+    const buildScriptStdout = readFileSync(stdoutFiles[0], "utf8")
+    const stdoutCounters = [...buildScriptStdout.matchAll(/^cargo:rustc-env=SOURCE_WATCH_COUNTER=(\d+)\r?$/gm)]
+    assert.deepEqual(stdoutCounters.map(match => Number(match[1])), [runs], label + ": Cargo stdout matches the invocation counter")
+    const watches = [...buildScriptStdout.matchAll(/^cargo:rerun-if-changed=([^\r\n]+)$/gm)]
       .map(match => path.resolve(manifest, match[1]))
     const keys = units.map(key).sort()
     const record = { label, manifest, expectedRuns: count, runs, identity: actual,
-      artifacts: units.length, fresh: units.filter(row => row.fresh).length, productFresh: product[0].fresh, watches }
+      artifacts: units.length, fresh: units.filter(row => row.fresh).length, productFresh: product[0].fresh,
+      stdoutFile: path.relative(out, stdoutFiles[0]), watches }
     phases.push(record)
     writeFileSync(path.join(evidence, label + ".json"), JSON.stringify(record, null, 2) + "\n")
     writeFileSync(path.join(evidence, label + ".counter.txt"), readFileSync(path.join(out, "counter.txt")))
     writeFileSync(path.join(evidence, label + ".identity.json"), readFileSync(path.join(out, "identity.json")))
     assert.equal(runs, count, `${label}: build-script invocation count; evidence=${evidence}`)
     assert.deepEqual(actual, identity, label + ": exact source identity")
+    assert.equal(watches.length > 0, identity.identity_source !== "unknown", label + ": source watch presence")
     assert.ok(watches.every(file => existsSync(file) && file !== path.join(repo, ".git") && !file.startsWith(target)),
       "Only existing bounded source-identity inputs may be watched")
     if (fresh) {
