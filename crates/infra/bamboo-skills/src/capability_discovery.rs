@@ -23,6 +23,7 @@ use crate::{
 /// one verbose registry entry cannot dominate a bounded result.
 pub const MAX_CAPABILITY_SUMMARY_CHARS: usize = 240;
 pub const MAX_AUTOMATIC_SKILL_CANDIDATES: usize = 3;
+const MAX_AUTOMATIC_SKILL_QUERY_CHARS: usize = 2 * MAX_DISCOVERY_QUERY_CHARS;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum InvocationEligibility {
@@ -903,16 +904,30 @@ fn aliases_for_tool(canonical_name: &str) -> Vec<String> {
 
 /// Collapse whitespace and bound the metadata displayed in capability prompts.
 pub fn bounded_summary(value: &str) -> String {
-    let compact = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    if compact.chars().count() <= MAX_CAPABILITY_SUMMARY_CHARS {
-        return compact;
+    let mut compact = String::new();
+    let mut count = 0;
+    let mut pending_space = false;
+    for character in value.chars() {
+        if character.is_whitespace() {
+            pending_space = count > 0;
+            continue;
+        }
+        if count + usize::from(pending_space) >= MAX_CAPABILITY_SUMMARY_CHARS {
+            if count == MAX_CAPABILITY_SUMMARY_CHARS {
+                compact.pop();
+            }
+            compact.push('…');
+            break;
+        }
+        if pending_space {
+            compact.push(' ');
+            count += 1;
+            pending_space = false;
+        }
+        compact.push(character);
+        count += 1;
     }
-    let mut bounded = compact
-        .chars()
-        .take(MAX_CAPABILITY_SUMMARY_CHARS.saturating_sub(1))
-        .collect::<String>();
-    bounded.push('…');
-    bounded
+    compact
 }
 
 fn normalize_search_text(value: &str) -> String {
@@ -950,27 +965,24 @@ fn search_tokens(normalized: &str) -> BTreeSet<String> {
 }
 
 fn bounded_automatic_skill_query(query: &str) -> (String, bool) {
-    if query
-        .char_indices()
-        .nth(MAX_DISCOVERY_QUERY_CHARS)
-        .is_none()
-    {
+    let mut char_indices = query.char_indices();
+    let Some((head_end, _)) = char_indices.nth(MAX_DISCOVERY_QUERY_CHARS) else {
         return (query.to_owned(), false);
-    }
+    };
 
-    // Drop words crossing a cut so the projection cannot turn "PDFKit"
-    // into an apparent "PDF" reference. CJK text is matched as bigrams.
-    let head_end = query
-        .char_indices()
-        .nth(MAX_DISCOVERY_QUERY_CHARS / 2)
-        .expect("long query has a head window")
-        .0;
+    // Preserve the original leading window. Add bounded suffix evidence for
+    // long requests, without treating any oversized hint as an exact match.
+    if char_indices.nth(MAX_DISCOVERY_QUERY_CHARS - 1).is_none() {
+        return (query.to_owned(), true);
+    }
     let tail_start = query
         .char_indices()
         .rev()
-        .nth(MAX_DISCOVERY_QUERY_CHARS.div_ceil(2) - 2)
+        .nth(MAX_AUTOMATIC_SKILL_QUERY_CHARS - MAX_DISCOVERY_QUERY_CHARS - 2)
         .expect("long query has a tail window")
         .0;
+    // Drop words crossing a cut so a window cannot turn "PDFKit" into "PDF".
+    // CJK text uses bigrams confined to each window.
     let mut head = &query[..head_end];
     let mut tail = &query[tail_start..];
     let word_character = |character: char| character.is_alphanumeric() && !is_cjk(character);
@@ -1739,6 +1751,32 @@ mod tests {
     }
 
     #[test]
+    fn capability_summary_compacts_unicode_whitespace_before_truncating() {
+        for text in [
+            "\u{3000}\tGenerate   portable\n documents\r ".to_string(),
+            format!("{}   ", "界".repeat(MAX_CAPABILITY_SUMMARY_CHARS)),
+            format!(
+                "{}\u{3000}word",
+                "界".repeat(MAX_CAPABILITY_SUMMARY_CHARS - 1)
+            ),
+            format!("{}\u{3000}word", "界".repeat(MAX_CAPABILITY_SUMMARY_CHARS)),
+            format!("{}word", "界".repeat(MAX_CAPABILITY_SUMMARY_CHARS)),
+        ] {
+            let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = if compact.chars().count() <= MAX_CAPABILITY_SUMMARY_CHARS {
+                compact
+            } else {
+                let prefix = compact
+                    .chars()
+                    .take(MAX_CAPABILITY_SUMMARY_CHARS - 1)
+                    .collect::<String>();
+                format!("{prefix}…")
+            };
+            assert_eq!(bounded_summary(&text), expected);
+        }
+    }
+
+    #[test]
     fn automatic_skill_bounds_long_user_hints_without_failing() {
         let skill = catalog_entry(
             "review",
@@ -1760,11 +1798,13 @@ mod tests {
         let context = "界".repeat(MAX_DISCOVERY_QUERY_CHARS * 2);
         for hint in [
             format!("review {context}"),
+            format!("{} review {context}", "界".repeat(180)),
+            format!("{} review {}", "界".repeat(290), "界".repeat(160)),
             format!("{context}请帮我review代码"),
         ] {
             let (bounded, truncated) = bounded_automatic_skill_query(&hint);
             assert!(truncated);
-            assert!(bounded.chars().count() <= MAX_DISCOVERY_QUERY_CHARS);
+            assert!(bounded.chars().count() <= MAX_AUTOMATIC_SKILL_QUERY_CHARS);
             let decision = index.explain_automatic_skill(&hint);
             assert_eq!(decision.outcome, AutomaticSkillOutcome::StrongMatch);
             assert_eq!(decision.selected.unwrap().capability_ref, "skill:review");
@@ -1775,11 +1815,11 @@ mod tests {
         }
         let head_cut = format!(
             "{} reviewKit {context}",
-            "x".repeat(MAX_DISCOVERY_QUERY_CHARS / 2 - 7)
+            "x".repeat(MAX_DISCOVERY_QUERY_CHARS - 7)
         );
         let tail_cut = format!(
             "{context} preview {}",
-            "x".repeat(MAX_DISCOVERY_QUERY_CHARS.div_ceil(2) - 8)
+            "x".repeat(MAX_AUTOMATIC_SKILL_QUERY_CHARS - MAX_DISCOVERY_QUERY_CHARS - 8)
         );
         for hint in [head_cut, tail_cut] {
             assert!(index.discover_unambiguous_automatic_skill(&hint).is_none());

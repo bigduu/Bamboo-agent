@@ -2927,14 +2927,36 @@ impl SkillStore {
         &self,
         activation_id: &str,
     ) -> Option<SkillActivationSnapshot> {
+        self.export_activation_snapshot_for(activation_id, None)
+            .await
+    }
+
+    pub async fn export_selected_skill_snapshot(
+        &self,
+        activation_id: &str,
+        skill_id: &str,
+    ) -> Option<SkillActivationSnapshot> {
+        self.export_activation_snapshot_for(activation_id, Some(skill_id))
+            .await
+    }
+
+    async fn export_activation_snapshot_for(
+        &self,
+        activation_id: &str,
+        selected_skill_id: Option<&str>,
+    ) -> Option<SkillActivationSnapshot> {
         let activations = self.pinned_activations.read().await;
         let activation = activations.by_id.get(activation_id)?;
+        if selected_skill_id.is_some_and(|id| !activation.skills.contains_key(id)) {
+            return None;
+        }
         Some(SkillActivationSnapshot {
             catalog_revision: activation.catalog_revision,
             selected_skill_mode: activation.selected_skill_mode.clone(),
             skills: activation
                 .skills
                 .iter()
+                .filter(|(id, _)| selected_skill_id.is_none_or(|selected| id.as_str() == selected))
                 .map(|(id, skill)| {
                     (
                         id.clone(),
