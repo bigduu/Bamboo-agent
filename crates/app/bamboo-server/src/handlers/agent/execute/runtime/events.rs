@@ -305,7 +305,7 @@ pub(crate) fn spawn_event_forwarder_with_root_actor(
                 }
             } else {
                 let resume_port =
-                    crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
+                    crate::app_state::resume_adapter::AppStateResumeRef::new(state.clone());
                 maybe_auto_answer_pending_question(
                     state.get_ref(),
                     &resume_port,

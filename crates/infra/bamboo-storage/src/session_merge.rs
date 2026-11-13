@@ -67,7 +67,6 @@ const PERMISSION_RESPONSE_RESUME_KEYS: &[&str] = &[
     "execute.startup_handoff_at",
     "permission.reexecute_tool_call_id",
     "permission.reexecute_request_generation",
-    bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY,
 ];
 const RESPONSE_CONTROL_METADATA_KEYS: &[&str] = &[
     CONSUMED_CLARIFICATION_IDS_KEY,
@@ -91,6 +90,15 @@ const ACTOR_PARENT_QUESTION_HANDOFF_KEY: &str = "runtime.actor_parent_question_h
 /// consumption in the sidecar cannot clear the question until Main replaces
 /// the tool result with the decision receipt from that same response.
 pub(crate) fn retain_pending_permission_until_main(main: &Session, side: &mut Session) {
+    let handoff_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
+    match main.metadata.get(handoff_key) {
+        Some(marker) => {
+            side.metadata.insert(handoff_key.into(), marker.clone());
+        }
+        None => {
+            side.metadata.remove(handoff_key);
+        }
+    }
     if !main_may_have_uncommitted_response_control(main, side)
         || main.id != side.id
         || main.created_at != side.created_at

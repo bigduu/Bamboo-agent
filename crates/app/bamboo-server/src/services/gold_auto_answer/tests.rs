@@ -308,7 +308,7 @@ async fn host_gold_config_changes_reject_stale_registry_without_dispatch() {
     );
     session.model_ref = Some(bamboo_domain::ProviderModelRef::new("relay", "test-model"));
     state.save_and_cache_session(&mut session).await;
-    let resume_port = AppStateResumeRef(state.clone());
+    let resume_port = AppStateResumeRef::new(state.clone());
     let mut expected_requests = 0usize;
 
     for flag in [None, Some(false), Some(true)] {
@@ -450,7 +450,7 @@ async fn gold_auto_answer_conclusion_with_options_full_loop() {
     );
     state.save_and_cache_session(&mut session).await;
 
-    let resume_port = AppStateResumeRef(state.clone());
+    let resume_port = AppStateResumeRef::new(state.clone());
     let outcome = maybe_auto_answer_pending_question(
         state.get_ref(),
         &resume_port,
@@ -561,7 +561,7 @@ async fn gold_auto_answer_exit_plan_mode_full_loop() {
     state.save_and_cache_session(&mut session).await;
     let mut event_rx = state.get_session_event_sender(session_id).await.subscribe();
 
-    let resume_port = AppStateResumeRef(state.clone());
+    let resume_port = AppStateResumeRef::new(state.clone());
     let outcome = maybe_auto_answer_pending_question(
         state.get_ref(),
         &resume_port,

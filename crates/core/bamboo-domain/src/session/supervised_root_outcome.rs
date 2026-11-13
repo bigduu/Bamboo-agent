@@ -1377,6 +1377,43 @@ impl SupervisedRootOutcomes {
         Ok(())
     }
 
+    /// Rebind an unstarted permission continuation after loss of its owner.
+    /// The storage writer proves the exact undispatched Main marker and fence.
+    pub fn recover_permission_resume(
+        &mut self,
+        successor: &ActorActivationFence,
+        reset: Option<&str>,
+        occurrence: &ResponseOccurrence,
+    ) -> Result<(), &'static str> {
+        self.validate()?;
+        let [.., previous, pending] = self.facts.as_slice() else {
+            return Ok(());
+        };
+        if pending.resumed_from != Some(previous.sequence) || pending.result.is_some() {
+            return Ok(());
+        }
+        if fact_matches_fence(pending, successor) {
+            return Ok(());
+        }
+        if !pending.inputs.is_empty()
+            || !pending.questions.is_empty()
+            || pending.conversation_reset_sha256.as_deref() != reset
+            || previous.questions.last().is_some_and(|question| {
+                question.question_id_sha256
+                    != supervised_root_question_occurrence_digest(occurrence)
+            })
+            || successor.attempt <= pending.attempt
+            || successor.lease_epoch <= pending.lease_epoch
+        {
+            return Err("permission continuation owner or occurrence changed");
+        }
+        let mut candidate = self.clone();
+        candidate.facts.pop();
+        candidate.reserve_with_predecessor(successor, reset, Some(previous.sequence))?;
+        *self = candidate;
+        Ok(())
+    }
+
     /// Only the writer holding the native completion's exact owned Inbox
     /// claim can apply this transition. The pre-admission Main still ends at
     /// the runtime's wait notice even though its live wait has been cleared.
@@ -2112,6 +2149,21 @@ mod tests {
         outcomes
             .reserve_permission_resume(&fence(3), None, &question)
             .unwrap();
+        let mut recovered = outcomes.clone();
+        assert!(recovered
+            .recover_permission_resume(&fence(4), None, &wrong)
+            .is_err());
+        recovered
+            .recover_permission_resume(&fence(4), None, &question)
+            .unwrap();
+        assert_eq!(recovered.facts[1].resumed_from, Some(1));
+        assert_eq!(recovered.facts[1].run_id, fence(4).run_id);
+        assert_eq!(
+            recovered
+                .material_inputs(&recovered.facts[1])
+                .collect::<Vec<_>>(),
+            vec![&admitted]
+        );
         let mut next_question = occurrence("two");
         next_question.permission_generation = Some("permission-2".into());
         outcomes.record_question(&fence(3), &next_question).unwrap();

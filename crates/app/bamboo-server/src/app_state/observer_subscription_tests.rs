@@ -2123,6 +2123,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
 
 pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
     final_decision: PermissionDecisionKind,
+    restart_after_commit: bool,
 ) {
     use crate::handlers::agent::respond::{capture_approval_handoff, decide_delegated_approval};
     use bamboo_orchestration::managed_session::approval_handoff::DELAY;
@@ -2407,14 +2408,84 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
         .approval_runtime
         .set(Arc::downgrade(&state.clone().into_inner()))
         .expect("bind the native decision port");
-    let result = invoke_managed_control(
-        state,
-        &f.reference,
-        "timed-decision",
-        json!({"action":"decide_approval", "target_session_id":ROOT_A,
+    let result = if restart_after_commit {
+        state
+            .session_store
+            .interrupt_response_publication_for_test(ROOT_A);
+        let error = decision(final_decision).await.unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected response publication interruption"));
+        assert!(!std::path::Path::new(&file).exists());
+        let committed = load(state, ROOT_A).await;
+        assert!(committed.pending_question.is_none());
+        assert!(committed
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        state.shutdown().await;
+        let restarted = host(f.home.path(), f.probe.clone()).await;
+        let retry = |caller: SessionCallerReference, kind| {
+            let state = restarted.clone();
+            let reference = handoff.reference.clone();
+            async move {
+                decide_delegated_approval(
+                    state.clone(),
+                    &state.observer_subscriptions.inbox,
+                    &caller,
+                    ROOT_A.into(),
+                    &reference,
+                    kind,
+                )
+                .await
+            }
+        };
+        let mut stale = caller.clone();
+        stale.root_tool_authority_revision += 1;
+        assert!(retry(stale, final_decision).await.is_err());
+        assert!(retry(caller.clone(), PermissionDecisionKind::DenyOnce)
+            .await
+            .is_err());
+        restarted
+            .session_store
+            .interrupt_once_handoff_claim_for_test(ROOT_A);
+        let interrupted = retry(caller.clone(), final_decision).await.unwrap();
+        assert_eq!(interrupted["auto_resume_status"], "started");
+        tokio::time::timeout(WAIT, async {
+            while restarted
+                .session_activation_router
+                .current_run_id(ROOT_A)
+                .await
+                .is_some()
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!std::path::Path::new(&file).exists());
+        assert!(load(&restarted, ROOT_A)
+            .await
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        let response = retry(caller.clone(), final_decision).await.unwrap();
+        assert_eq!(response["replayed"], true);
+        assert_eq!(response["auto_resume_status"], "started");
+        settled(&restarted, ROOT_A).await;
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
+        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
+        assert!(retry(caller, final_decision).await.is_err());
+        restarted.shutdown().await;
+        return;
+    } else {
+        invoke_managed_control(
+            state,
+            &f.reference,
+            "timed-decision",
+            json!({"action":"decide_approval", "target_session_id":ROOT_A,
             "approval_reference":handoff.reference, "decision":final_decision}),
-    )
-    .await;
+        )
+        .await
+    };
     assert_eq!(
         result["receipt"]["decision"]["decision"],
         json!(final_decision)
@@ -2443,135 +2514,6 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
         );
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "test\n");
         assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 1);
-
-        // A second answer reaches Main but loses its process-local handoff.
-        // Restart the Host, then retry the original delegated reference.
-        let mut pending = completed;
-        let retry_call = "write-after-host-restart";
-        let retry_generation = "generation-after-host-restart";
-        let retry_file = std::path::Path::new(&workspace).join("restart-test.txt");
-        let retry_path = bamboo_config::paths::path_to_display_string(&retry_file);
-        let retry_tool = ToolCall {
-            id: retry_call.into(),
-            tool_type: "function".into(),
-            function: FunctionCall {
-                name: "Write".into(),
-                arguments: json!({"file_path":retry_path,"content":"restarted\n"}).to_string(),
-            },
-        };
-        let mut retry_request = request;
-        retry_request.request_id = retry_call.into();
-        retry_request.request_generation = retry_generation.into();
-        retry_request.resource = retry_path;
-        pending.add_message(Message::assistant("", Some(vec![retry_tool.clone()])));
-        let mut parked = Message::tool_result(
-            retry_call,
-            json!({"status":"awaiting_permission_approval","permission_request":retry_request})
-                .to_string(),
-        );
-        parked.created_at = parked_at;
-        let operation = PendingToolOperation::capture_with_contract(
-            SessionCallerReference::from(&pending),
-            &parked.id,
-            &retry_tool,
-            "Write",
-            retry_generation,
-            None,
-            true,
-        );
-        parked.metadata = Some(json!({
-            "permission_request": retry_request,
-            (PENDING_TOOL_OPERATION_METADATA_KEY): operation.metadata_value(),
-        }));
-        pending.add_message(parked);
-        pending.set_last_run_status("suspended");
-        pending.set_pending_question(
-            retry_call.into(),
-            "Write".into(),
-            "Write the restart fixture?".into(),
-            vec!["Approve".into(), "Deny".into()],
-            false,
-        );
-        state.save_and_cache_session(&mut pending).await;
-        let (handoff, _) = capture_approval_handoff(state, &f.reference, &pending).unwrap();
-        crate::app_state::approval_handoff::sweep(state, &mut None, now)
-            .await
-            .unwrap();
-        drive_material_notices(&f, 2).await;
-        settle_material_notices(&f).await;
-        state
-            .session_store
-            .interrupt_response_publication_for_test(ROOT_A);
-        let error = decide_delegated_approval(
-            state.clone(),
-            &state.session_inbox,
-            &caller,
-            ROOT_A.into(),
-            &handoff.reference,
-            PermissionDecisionKind::AllowOnce,
-        )
-        .await
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("injected response publication interruption"));
-        assert!(!retry_file.exists());
-        let committed = load(state, ROOT_A).await;
-        assert!(committed.pending_question.is_none());
-        assert!(committed
-            .metadata
-            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
-
-        state.shutdown().await;
-        let restarted = host(f.home.path(), f.probe.clone()).await;
-        let mut stale = caller.clone();
-        stale.root_tool_authority_revision += 1;
-        assert!(decide_delegated_approval(
-            restarted.clone(),
-            &restarted.session_inbox,
-            &stale,
-            ROOT_A.into(),
-            &handoff.reference,
-            PermissionDecisionKind::AllowOnce,
-        )
-        .await
-        .is_err());
-        assert!(decide_delegated_approval(
-            restarted.clone(),
-            &restarted.session_inbox,
-            &caller,
-            ROOT_A.into(),
-            &handoff.reference,
-            PermissionDecisionKind::DenyOnce,
-        )
-        .await
-        .is_err());
-        let retry = || {
-            decide_delegated_approval(
-                restarted.clone(),
-                &restarted.session_inbox,
-                &caller,
-                ROOT_A.into(),
-                &handoff.reference,
-                PermissionDecisionKind::AllowOnce,
-            )
-        };
-        let response = retry().await.unwrap();
-        assert_eq!(response["replayed"], true);
-        assert_eq!(response["auto_resume_status"], "started");
-        assert_eq!(
-            response["receipt"]["decision"]["request_generation"],
-            retry_generation
-        );
-        settled(&restarted, ROOT_A).await;
-        assert_eq!(std::fs::read_to_string(retry_file).unwrap(), "restarted\n");
-        assert_eq!(f.probe.source_calls.load(Ordering::SeqCst), 2);
-        assert!(
-            retry().await.is_err(),
-            "a completed operation cannot be started again"
-        );
-        restarted.shutdown().await;
-        return;
     } else {
         assert!(!std::path::Path::new(&file).exists());
     }

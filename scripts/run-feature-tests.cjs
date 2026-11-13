@@ -164,7 +164,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // The dispatch fixture uses Storage's existing test-utils dev dependency.
 // #2664 runs Human and delegated approval regressions in server-handlers and
 // server-app-state using Storage's existing test-utils dev dependency.
-const FEATURE_SOURCE_SHA256 = "43e1a26db2bd7dfed770ee77a77475186e544113e783618907a5fa268ffc3342";
+const FEATURE_SOURCE_SHA256 = "87a667bc8e0ad58c929ded6143267459f4ae578b44742c982d2ab56b7533f296";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

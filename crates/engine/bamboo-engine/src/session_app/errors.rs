@@ -55,6 +55,8 @@ pub enum ExecutePreparationError {
     InvalidModelReference(String),
     #[error("invalid image fallback configuration: {0}")]
     ImageFallbackError(String),
+    #[error("a committed permission response is waiting for its resume handoff")]
+    PermissionResponsePending,
 }
 
 /// Errors from the respond use case.

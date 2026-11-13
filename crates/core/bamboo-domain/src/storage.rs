@@ -518,11 +518,27 @@ pub trait Storage: Send + Sync {
     async fn confirm_root_response_checkpoint(
         &self,
         owner: &RootActorRuntimeWrite,
+        approval: Option<&SupervisorApprovalCommit>,
     ) -> std::io::Result<Session> {
-        let _ = owner;
+        let _ = (owner, approval);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Root response checkpoint recovery is unsupported",
+        ))
+    }
+
+    /// The exact pending Once handoff is consumed at Main before the first
+    /// tool or provider side effect. A stale or already claimed handoff fails.
+    async fn claim_once_response_handoff(
+        &self,
+        session: &Session,
+        owner: Option<&RootActorRuntimeWrite>,
+        approval: Option<&SupervisorApprovalCommit>,
+    ) -> std::io::Result<()> {
+        let _ = (session, owner, approval);
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Once response handoff claim is unsupported",
         ))
     }
 

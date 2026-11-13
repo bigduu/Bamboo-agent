@@ -267,6 +267,35 @@ pub async fn submit_pending_permission_response_checked_guarded(
         expected_tool_call_id,
         ResponseSource::Human,
         Some(permission_receipt),
+        false,
+        guard,
+    )
+    .await
+}
+
+/// HTTP response submission retains a restartable handoff for one-shot answers.
+pub async fn submit_resumable_permission_response_checked_guarded(
+    repo: &dyn SessionAccess,
+    input: RespondInput,
+    expected_tool_call_id: Option<String>,
+    permission_receipt: PermissionDecisionReceipt,
+    guard: &PendingResponseGuard,
+) -> Result<
+    (
+        Session,
+        String,
+        Option<PlanModeTransition>,
+        Vec<(PermissionType, String)>,
+    ),
+    RespondError,
+> {
+    submit_pending_response_with_source_checked_guarded_inner(
+        repo,
+        input,
+        expected_tool_call_id,
+        ResponseSource::Human,
+        Some(permission_receipt),
+        true,
         guard,
     )
     .await
@@ -337,6 +366,7 @@ pub async fn submit_pending_response_with_source_checked_guarded(
         expected_tool_call_id,
         response_source,
         None,
+        false,
         guard,
     )
     .await
@@ -348,6 +378,7 @@ async fn submit_pending_response_with_source_checked_guarded_inner(
     expected_tool_call_id: Option<String>,
     response_source: ResponseSource,
     permission_receipt: Option<PermissionDecisionReceipt>,
+    retain_once_handoff: bool,
     guard: &PendingResponseGuard,
 ) -> Result<
     (
@@ -376,6 +407,27 @@ async fn submit_pending_response_with_source_checked_guarded_inner(
                     response_source,
                     mutation_permission_receipt.as_ref(),
                 )?;
+                if retain_once_handoff {
+                    if let Some(occurrence) = mutation_permission_receipt
+                        .as_ref()
+                        .filter(|receipt| {
+                            matches!(
+                                receipt.decision.decision,
+                                PermissionDecisionKind::AllowOnce
+                                    | PermissionDecisionKind::DenyOnce
+                            )
+                        })
+                        .and_then(|receipt| {
+                            latest_response_occurrence(session, &receipt.decision.request_id)
+                        })
+                    {
+                        session.metadata.insert(
+                            bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY.into(),
+                            serde_json::to_string(&occurrence)
+                                .expect("response occurrence is serializable"),
+                        );
+                    }
+                }
                 *mutation_outcome
                     .lock()
                     .expect("response outcome lock poisoned") = Some(outcome);
@@ -599,20 +651,6 @@ fn apply_pending_response(
     session
         .metadata
         .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
-    if let Some(occurrence) = permission_receipt
-        .filter(|receipt| {
-            matches!(
-                receipt.decision.decision,
-                PermissionDecisionKind::AllowOnce | PermissionDecisionKind::DenyOnce
-            )
-        })
-        .and_then(|_| bamboo_domain::latest_response_occurrence(session, &tool_call_id))
-    {
-        session.metadata.insert(
-            bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY.into(),
-            serde_json::to_string(&occurrence).expect("response occurrence is serializable"),
-        );
-    }
     session.metadata.remove("runtime.suspend_reason");
     if no_progress_question && input.user_response == super::no_progress::STOP_OPTION {
         super::no_progress::stop_after_response(session);

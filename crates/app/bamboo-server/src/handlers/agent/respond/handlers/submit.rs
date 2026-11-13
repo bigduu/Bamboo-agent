@@ -239,7 +239,7 @@ async fn submit_response_inner(
         }
     }
 
-    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
+    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef::new(state.clone());
     let mut handoff =
         match reserve_response_resume_handoff(&resume_port, &session_id, Duration::from_secs(15))
             .await
@@ -298,7 +298,7 @@ async fn submit_response_inner(
     let response_access: &dyn SessionAccess = bound_access.as_deref().unwrap_or(state.as_ref());
 
     let submission = if let Some(permission) = permission {
-        bamboo_engine::session_app::respond::submit_pending_permission_response_checked_guarded(
+        bamboo_engine::session_app::respond::submit_resumable_permission_response_checked_guarded(
             response_access,
             input,
             expected_tool_call_id,
@@ -454,7 +454,7 @@ async fn submit_response_inner(
     // Build resume config snapshot from server config via the single-source-of-
     // truth resolver (provider-name derivation + global auxiliary models + gold).
     let auto_resume_outcome =
-        resume_committed_response(&state, &config_snapshot, session, handoff).await;
+        resume_committed_response(&resume_port, &config_snapshot, session, handoff).await;
 
     Ok(HttpResponse::Ok().json(serde_json::json!({
         "success": true,
@@ -466,22 +466,21 @@ async fn submit_response_inner(
 }
 
 async fn resume_committed_response(
-    state: &web::Data<AppState>,
+    resume_port: &crate::app_state::resume_adapter::AppStateResumeRef,
     config: &bamboo_config::Config,
     session: bamboo_agent_core::Session,
     handoff: ResponseResumeHandoff,
 ) -> ResumeOutcome {
     let session_id = session.id.clone();
-    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
     let resume_config =
         bamboo_engine::session_app::resolution::resolve_resume_config_snapshot_for_execution(
             config,
-            &state.provider_registry,
+            &resume_port.0.provider_registry,
             &session,
             None,
         );
     bamboo_engine::session_app::resume::resume_session_execution_with_handoff_and_configured_fallback(
-        &resume_port,
+        resume_port,
         &session_id,
         session,
         resume_config,
@@ -534,14 +533,14 @@ pub(super) async fn recover_committed_once_response(
     state: &web::Data<AppState>,
     session: &bamboo_agent_core::Session,
     receipt: &PermissionDecisionReceipt,
-    validate: impl FnOnce(&bamboo_agent_core::Session) -> std::io::Result<()> + Send,
+    approval: Option<Arc<bamboo_domain::storage::SupervisorApprovalCommit>>,
 ) -> std::io::Result<Option<ResumeOutcome>> {
     if !needs_once_response_handoff(session, receipt) {
         return Ok(None);
     }
     let session_id = &session.id;
     let expected = SessionCallerReference::from(session);
-    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
+    let resume_port = crate::app_state::resume_adapter::AppStateResumeRef::new(state.clone());
     let handoff =
         match reserve_response_resume_handoff(&resume_port, session_id, Duration::ZERO).await {
             Ok(handoff) => handoff,
@@ -550,9 +549,12 @@ pub(super) async fn recover_committed_once_response(
     let current = match handoff.root_actor_writer() {
         Some(owner) => state
             .storage
-            .confirm_root_response_checkpoint(&owner)
+            .confirm_root_response_checkpoint(&owner, approval.as_deref())
             .await
             .map(Some),
+        None if approval.is_some() => Err(std::io::Error::other(
+            "delegated permission recovery requires its Root writer",
+        )),
         None => {
             state
                 .storage
@@ -575,13 +577,15 @@ pub(super) async fn recover_committed_once_response(
         handoff.abandon().await;
         return Ok(None);
     };
-    if let Err(error) = validate(&current) {
-        handoff.abandon().await;
-        return Err(error);
-    }
     let config = state.config.read().await.clone();
     Ok(Some(
-        resume_committed_response(state, &config, current, handoff).await,
+        resume_committed_response(
+            &resume_port.with_approval(approval),
+            &config,
+            current,
+            handoff,
+        )
+        .await,
     ))
 }
 

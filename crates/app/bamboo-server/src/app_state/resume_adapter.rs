@@ -39,7 +39,25 @@ use crate::handlers::agent::execute::runtime::SpawnAgentExecution;
 /// Needed because Rust's orphan rules prevent implementing
 /// `bamboo_engine::session_app::resume::ResumeExecutionPort` directly on
 /// `actix_web::web::Data<AppState>`.
-pub struct AppStateResumeRef(pub actix_web::web::Data<AppState>);
+#[derive(Clone)]
+pub struct AppStateResumeRef(
+    pub actix_web::web::Data<AppState>,
+    Option<std::sync::Arc<bamboo_domain::SupervisorApprovalCommit>>,
+);
+
+impl AppStateResumeRef {
+    pub(crate) fn new(state: actix_web::web::Data<AppState>) -> Self {
+        Self(state, None)
+    }
+
+    pub(crate) fn with_approval(
+        mut self,
+        approval: Option<std::sync::Arc<bamboo_domain::SupervisorApprovalCommit>>,
+    ) -> Self {
+        self.1 = approval;
+        self
+    }
+}
 
 #[cfg(test)]
 #[path = "supervisor_approval_tests.rs"]
@@ -95,7 +113,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         &self,
         request: ResumeSpawnRequest,
     ) -> Result<(), ResumeSpawnRequest> {
-        let owner = AppStateResumeRef(self.0.clone());
+        let owner = self.clone();
         tokio::spawn(async move {
             ResumeExecutionPort::spawn_resume_execution(&owner, request).await;
         });
@@ -106,7 +124,7 @@ impl ResumeExecutionPort for AppStateResumeRef {
         &self,
         request: ResumeSpawnRequest,
     ) -> Result<(), ResumeSpawnRequest> {
-        let owner = AppStateResumeRef(self.0.clone());
+        let owner = self.clone();
         tokio::spawn(async move {
             ResumeExecutionPort::spawn_configured_resume_execution(&owner, request).await;
         });
@@ -356,6 +374,16 @@ impl AppStateResumeRef {
                 // preparation step. Clear it only in the in-memory snapshot at
                 // the synchronous handoff to the spawned runner; the runner's
                 // first checkpoint durably acknowledges takeover.
+                if !claim_once_response_handoff(
+                    &state,
+                    &mut session,
+                    execution_reservation.root_actor_writer(),
+                    self.1.as_deref(),
+                )
+                .await
+                {
+                    return;
+                }
                 consume_pending_clarification_resume(&mut session);
                 SpawnAgentExecution {
                     state: state.clone(),
@@ -387,6 +415,7 @@ impl AppStateResumeRef {
             Some(id) => id,
         };
 
+        let approval = self.1.clone();
         tokio::spawn(async move {
             let mut session = session;
 
@@ -488,30 +517,15 @@ impl AppStateResumeRef {
                     ApprovalReplayDecision::BlockedByRootToolAuthority
                         | ApprovalReplayDecision::BlockedByUnavailableTool
                 );
-                if session
-                    .metadata
-                    .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+                if !claim_once_response_handoff(
+                    &state,
+                    &mut session,
+                    execution_reservation.root_actor_writer(),
+                    approval.as_deref(),
+                )
+                .await
                 {
-                    // Checkpoint ownership before dispatch. A retried HTTP
-                    // decision may recover an undispatched answer, but must
-                    // never re-dispatch an operation whose execution is unknown.
-                    let mut checkpoint = session.clone();
-                    checkpoint
-                        .metadata
-                        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
-                    let saved =
-                        if let Some(persistence) = execution_reservation.execution_persistence() {
-                            persistence.save_runtime_session(&mut checkpoint).await
-                        } else {
-                            state.session_repo.save(&mut checkpoint).await
-                        };
-                    if let Err(error) = saved {
-                        tracing::warn!(%session_id, %error, "Once response handoff checkpoint failed");
-                        return;
-                    }
-                    session
-                        .metadata
-                        .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+                    return;
                 }
 
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
@@ -791,6 +805,36 @@ impl AppStateResumeRef {
             }
             .spawn_with_native_inputs(None, execution_binding);
         });
+    }
+}
+
+async fn claim_once_response_handoff(
+    state: &AppState,
+    session: &mut bamboo_domain::Session,
+    owner: Option<bamboo_domain::RootActorRuntimeWrite>,
+    approval: Option<&bamboo_domain::SupervisorApprovalCommit>,
+) -> bool {
+    if !session
+        .metadata
+        .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY)
+    {
+        return true;
+    }
+    match state
+        .storage
+        .claim_once_response_handoff(session, owner.as_ref(), approval)
+        .await
+    {
+        Ok(_) => {
+            session
+                .metadata
+                .remove(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY);
+            true
+        }
+        Err(error) => {
+            tracing::warn!(session_id = %session.id, %error, "Once response handoff checkpoint failed");
+            false
+        }
     }
 }
 

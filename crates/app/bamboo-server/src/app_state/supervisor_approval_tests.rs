@@ -561,7 +561,7 @@ impl Fixture {
         // Retain it across the policy CAS: never dispatch the model or reserve
         // a second owner between approval and the intended denied replay.
         let handoff = bamboo_engine::session_app::resume::reserve_response_resume_handoff(
-            &AppStateResumeRef(self.state.clone()),
+            &AppStateResumeRef::new(self.state.clone()),
             &self.session_id,
             std::time::Duration::from_secs(15),
         )
@@ -961,6 +961,36 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
         assert_eq!(fixture.decision().await.expected_policy_revision, Some(0));
         decision.expected_policy_revision = Some(refreshed.policy_revision);
         *fixture.replay_generation.lock().unwrap() = Some(decision.request_generation.clone());
+        if !corrupt {
+            fixture
+                .state
+                .session_store
+                .interrupt_full_save_at_main_for_test(&fixture.session_id, false);
+            let failed = test::call_service(
+                &app,
+                test::TestRequest::post()
+                    .uri(&uri)
+                    .set_json(&decision)
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(
+                failed.status(),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            let control = fixture
+                .state
+                .storage
+                .load_runtime_control_plane(&fixture.session_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(control.pending_question.is_some());
+            assert!(control.messages.is_empty());
+            assert!(permissions
+                .decision_receipt(&fixture.session_id, CALL, &decision.request_generation)
+                .is_none());
+        }
         let response = test::call_service(
             &app,
             test::TestRequest::post()
@@ -1025,7 +1055,7 @@ async fn server_resume_preserves_approved_call_after_root_tool_revision_changes(
                 );
                 let outcome =
                     bamboo_engine::session_app::resume::resume_session_execution_with_handoff(
-                        &AppStateResumeRef(fixture.state.clone()),
+                        &AppStateResumeRef::new(fixture.state.clone()),
                         &session.id,
                         session.clone(),
                         config,

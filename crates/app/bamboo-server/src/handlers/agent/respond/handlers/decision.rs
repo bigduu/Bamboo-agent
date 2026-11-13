@@ -251,10 +251,10 @@ async fn replay_committed_decision(
     state: &web::Data<AppState>,
     session: &bamboo_domain::Session,
     receipt: PermissionDecisionReceipt,
-    validate: impl FnOnce(&bamboo_domain::Session) -> std::io::Result<()> + Send,
+    approval: Option<Arc<SupervisorApprovalCommit>>,
 ) -> Result<HttpResponse, AppError> {
     let outcome = if is_once(receipt.decision.decision) {
-        super::submit::recover_committed_once_response(state, session, &receipt, validate).await?
+        super::submit::recover_committed_once_response(state, session, &receipt, approval).await?
     } else {
         None
     };
@@ -488,43 +488,35 @@ async fn retry_delegated_approval(
         return Err(denied());
     }
     let expected_receipt = receipt.clone();
-    let result = state
-        .session_store
-        .with_unscoped_supervisor_root_state(caller, supervisor, &origin.target, {
-            let notice = origin.notice.clone();
-            move |source, current| {
-                let received =
-                    source.messages.iter().rev().any(|message| {
-                        bamboo_domain::is_matching_session_message(message, &notice)
-                    });
-                Ok(received
-                    && super::pending::persisted_permission_decision_receipt(
-                        current,
-                        &expected_receipt.decision.request_id,
-                    )
-                    .as_ref()
-                        == Some(&expected_receipt))
+    let approval = SupervisorApprovalCommit {
+        caller: caller.clone(),
+        supervisor: supervisor.clone(),
+        target: origin.target.clone(),
+        reference: origin.reference.clone(),
+        notice: origin.notice.clone(),
+        validate: Box::new(move |source, current| {
+            let received =
+                source.messages.iter().rev().any(|message| {
+                    bamboo_domain::is_matching_session_message(message, &origin.notice)
+                });
+            if !received
+                || delegated_origin(current).as_ref() != Some(&origin)
+                || super::pending::persisted_permission_decision_receipt(
+                    current,
+                    &expected_receipt.decision.request_id,
+                )
+                .as_ref()
+                    != Some(&expected_receipt)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Delegated approval target or delivery changed",
+                ));
             }
-        })
-        .await
-        .map_err(|_| denied())?;
-    if !result {
-        return Err(denied());
-    }
-    config
-        .record_decision_receipt(receipt.clone())
-        .map_err(AppError::BadRequest)?;
-    replay_committed_decision(state, session, receipt, |current| {
-        if delegated_origin(current).as_ref() == Some(&origin) {
             Ok(())
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "Delegated approval target changed",
-            ))
-        }
-    })
-    .await
+        }),
+    };
+    replay_committed_decision(state, session, receipt, Some(Arc::new(approval))).await
 }
 
 async fn apply_permission_decision(
@@ -739,7 +731,7 @@ async fn apply_permission_decision(
                 config
                     .record_decision_receipt(receipt.clone())
                     .map_err(AppError::BadRequest)?;
-                return replay_committed_decision(&state, &session, receipt, |_| Ok(())).await;
+                return replay_committed_decision(&state, &session, receipt, None).await;
             }
             // After a successful durable decision, a daemon restart loses the
             // process-local receipt. A crash before the response CAS also
@@ -950,7 +942,7 @@ async fn apply_permission_decision(
     // the first attempt committed policy but failed before saving the pending
     // answer, retry the ordinary response path to finish resume safely.
     if replayed && session.pending_question.is_none() {
-        return replay_committed_decision(&state, &session, receipt, |_| Ok(())).await;
+        return replay_committed_decision(&state, &session, receipt, None).await;
     }
 
     let legacy_response = match decision.decision {
@@ -2109,7 +2101,12 @@ mod tests {
             .expect("response body");
         let body: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
         assert_eq!(body["replayed"], true);
-        assert!(body.get("resume").is_none());
+        assert!(body.get("resume").is_none_or(|resume| {
+            matches!(
+                resume["auto_resume_status"].as_str(),
+                Some("started" | "already_running")
+            )
+        }));
     }
 
     #[actix_web::test]
