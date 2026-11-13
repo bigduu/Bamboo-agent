@@ -488,49 +488,6 @@ fn next_enabled_instance_id(config: &bamboo_config::Config) -> Option<String> {
         .cloned()
 }
 
-fn default_model_reference_paths(
-    defaults: &bamboo_config::DefaultsConfig,
-    instance_id: &str,
-) -> Vec<String> {
-    let bamboo_config::DefaultsConfig {
-        chat,
-        fast,
-        task_summary,
-        vision,
-        memory_background,
-        planning,
-        search,
-        code_review,
-        work_review,
-        sub_agent,
-        subagent_models,
-    } = defaults;
-    let mut paths: Vec<_> = [
-        ("chat", Some(chat)),
-        ("fast", fast.as_ref()),
-        ("task_summary", task_summary.as_ref()),
-        ("vision", vision.as_ref()),
-        ("memory_background", memory_background.as_ref()),
-        ("planning", planning.as_ref()),
-        ("search", search.as_ref()),
-        ("code_review", code_review.as_ref()),
-        ("work_review", work_review.as_ref()),
-        ("sub_agent", sub_agent.as_ref()),
-    ]
-    .into_iter()
-    .filter(|(_, reference)| reference.is_some_and(|reference| reference.provider == instance_id))
-    .map(|(field, _)| format!("/defaults/{field}"))
-    .collect();
-    for (name, reference) in subagent_models {
-        if reference.provider == instance_id {
-            let escaped = name.replace('~', "~0").replace('/', "~1");
-            paths.push(format!("/defaults/subagent_models/{escaped}"));
-        }
-    }
-    paths.sort_unstable();
-    paths
-}
-
 // ─── Handlers ───────────────────────────────────────────────────────
 
 /// GET /bamboo/settings/provider-instances
@@ -720,7 +677,8 @@ pub async fn delete_provider_instance(
                 )));
             }
             if let Some(defaults) = config.defaults.as_ref() {
-                let reference_paths = default_model_reference_paths(defaults, target);
+                let reference_paths =
+                    bamboo_config::model_default_reference_paths(defaults, target);
                 if !reference_paths.is_empty() {
                     return Err(AppError::ProviderInstanceInUse { reference_paths });
                 }
@@ -959,36 +917,52 @@ mod tests {
                 revision_after,
             )
             .unwrap();
-        let mut winner_bytes = None;
-        let error = state
-            .delete_provider_instance_with_credentials(target_id.clone(), |config, id| {
-                assert!(config.defaults.as_ref().unwrap().fast.is_none());
-                interleaving.defaults.as_mut().unwrap().fast =
-                    Some(bamboo_domain::ProviderModelRef::new(id, "fast-fixture"));
-                assert_eq!(
-                    bamboo_config::persist_provider_credential_transaction_at_revision(
-                        home.path(),
-                        &mut interleaving,
-                        &Default::default(),
-                        &Default::default(),
-                        unreferenced_revision,
-                    )
-                    .unwrap(),
-                    unreferenced_revision + 1
-                );
-                winner_bytes = Some(provider_and_credential_bytes(home.path()));
-                config.provider_instances.remove(id);
-                config.default_provider_instance = Some(survivor_id.clone());
-                Ok(())
-            })
-            .await
-            .expect_err("a winner after the deletion check must conflict");
-        assert!(matches!(
-            error,
-            AppError::ConfigConflict { expected, actual }
-                if expected == unreferenced_revision && actual == unreferenced_revision + 1
-        ));
-        assert!(provider_and_credential_bytes(home.path()) == winner_bytes.unwrap());
+        let unreferenced_bytes = provider_and_credential_bytes(home.path());
+        let provider_path = home.path().join("providers.json");
+        for advance_revision in [false, true] {
+            let mut winner_bytes = None;
+            let error = state
+                .delete_provider_instance_with_credentials(target_id.clone(), |config, id| {
+                    assert!(config.defaults.as_ref().unwrap().fast.is_none());
+                    let assignment = bamboo_domain::ProviderModelRef::new(id, "fast-fixture");
+                    if advance_revision {
+                        interleaving.defaults.as_mut().unwrap().fast = Some(assignment);
+                        assert_eq!(
+                            bamboo_config::persist_provider_credential_transaction_at_revision(
+                                home.path(),
+                                &mut interleaving,
+                                &Default::default(),
+                                &Default::default(),
+                                unreferenced_revision,
+                            )
+                            .unwrap(),
+                            unreferenced_revision + 1
+                        );
+                    } else {
+                        let mut edit: Value =
+                            serde_json::from_slice(&unreferenced_bytes[0]).unwrap();
+                        edit["data"]["defaults"]["fast"] =
+                            serde_json::to_value(assignment).unwrap();
+                        std::fs::write(&provider_path, serde_json::to_vec(&edit).unwrap()).unwrap();
+                    }
+                    winner_bytes = Some(provider_and_credential_bytes(home.path()));
+                    config.provider_instances.remove(id);
+                    config.default_provider_instance = Some(survivor_id.clone());
+                    Ok(())
+                })
+                .await
+                .expect_err("a winner after the deletion check must conflict");
+            assert!(matches!(
+                error,
+                AppError::ConfigConflict { expected, actual }
+                    if expected == unreferenced_revision
+                        && actual == unreferenced_revision + u64::from(advance_revision)
+            ));
+            assert!(provider_and_credential_bytes(home.path()) == winner_bytes.unwrap());
+            if !advance_revision {
+                std::fs::write(&provider_path, &unreferenced_bytes[0]).unwrap();
+            }
+        }
         assert_eq!(state.provider_registry.default_provider_name(), target_id);
         state.shutdown().await;
     }

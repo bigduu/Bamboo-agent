@@ -407,10 +407,10 @@ struct ConfigRuntimeEffectContext {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum ProviderConfigUpdate {
+enum ProviderConfigUpdate<'a> {
     Credential,
     Metadata,
-    DeleteInstance,
+    DeleteInstance(&'a str),
 }
 
 fn capture_application_inputs(
@@ -5753,8 +5753,7 @@ impl AppState {
         .await
     }
 
-    /// Validate the exact durable Providers generation before staging a
-    /// deletion. The credential transaction retains its revision as a CAS.
+    /// Validate the primary Providers document before staging a deletion.
     pub(crate) async fn delete_provider_instance_with_credentials<F>(
         &self,
         instance_id: String,
@@ -5771,7 +5770,7 @@ impl AppState {
                 reload_provider: bamboo_config::patch::ReloadMode::Strict,
                 reconcile_mcp: bamboo_config::patch::ReloadMode::None,
             },
-            ProviderConfigUpdate::DeleteInstance,
+            ProviderConfigUpdate::DeleteInstance(&instance_id),
         )
         .await
     }
@@ -5782,7 +5781,7 @@ impl AppState {
         provider_intents: BTreeSet<String>,
         provider_instance_intents: BTreeSet<String>,
         effects: ConfigUpdateEffects,
-        kind: ProviderConfigUpdate,
+        kind: ProviderConfigUpdate<'_>,
     ) -> Result<Config, AppError>
     where
         F: FnOnce(&mut Config) -> Result<(), AppError>,
@@ -5798,20 +5797,13 @@ impl AppState {
         let io = self.config_io_lock.clone().lock_owned().await;
         let config_facade = self.config_facade.clone();
         let config_application = self.config_application.clone();
-        let durable_providers =
-            if kind == ProviderConfigUpdate::DeleteInstance && config_facade.is_some() {
+        let deleting_instance = matches!(kind, ProviderConfigUpdate::DeleteInstance(_));
+        let deletion_base = match (kind, config_facade.as_ref()) {
+            (ProviderConfigUpdate::DeleteInstance(id), Some(_)) => {
                 let data_dir = self.app_data_dir.clone();
+                let id = id.to_owned();
                 let snapshot = tokio::task::spawn_blocking(move || {
-                    let facade = bamboo_config::ConfigFacade::open(data_dir)?;
-                    let snapshot = facade.registry().providers.snapshot();
-                    if snapshot.status != SectionStatus::Healthy
-                        || snapshot.source_kind != SectionSourceKind::File
-                    {
-                        return Err(ConfigStoreError::Validation(
-                            "durable Providers section is unavailable".to_string(),
-                        ));
-                    }
-                    Ok((facade.effective_config(), snapshot.revision))
+                    bamboo_config::read_provider_instance_deletion_base(data_dir, id)
                 })
                 .await
                 .map_err(|error| {
@@ -5821,9 +5813,9 @@ impl AppState {
                 })?
                 .map_err(map_exact_credential_store_error)?;
                 Some(snapshot)
-            } else {
-                None
-            };
+            }
+            _ => None,
+        };
         let (mut candidate, live_base, enforcement_newly_off, provider_expected_revision) = {
             let cfg = self.config.read().await;
             reject_if_recovery_pending(&cfg)?;
@@ -5831,8 +5823,8 @@ impl AppState {
             let live_base = cfg.clone();
             let mut candidate = cfg.clone();
             restore_authoritative_cluster_fabric(config_facade.as_ref(), &mut candidate);
-            if let Some((durable, _)) = durable_providers.as_ref() {
-                apply_runtime_section(SectionId::Providers, durable, &mut candidate);
+            if let Some(base) = deletion_base.as_ref() {
+                base.install_into(&mut candidate);
             }
             update(&mut candidate)?;
             bamboo_config::validate_runtime_model_admission(&candidate)
@@ -5877,18 +5869,15 @@ impl AppState {
                 })?;
             }
             let newly_off = !was_off && candidate.plugin_trust.enforcement_is_off();
-            let provider_expected_revision =
-                durable_providers.map(|(_, revision)| revision).or_else(|| {
-                    exact_provider_metadata.then(|| {
-                        config_facade
-                            .as_ref()
-                            .expect("exact provider metadata requires the modular facade")
-                            .registry()
-                            .providers
-                            .snapshot()
-                            .revision
-                    })
-                });
+            let provider_expected_revision = exact_provider_metadata.then(|| {
+                config_facade
+                    .as_ref()
+                    .expect("exact provider metadata requires the modular facade")
+                    .registry()
+                    .providers
+                    .snapshot()
+                    .revision
+            });
             (candidate, live_base, newly_off, provider_expected_revision)
         };
         let config = self.config.clone();
@@ -5906,7 +5895,14 @@ impl AppState {
                 let commit_facade = config_facade.clone();
                 let (candidate, commit) = tokio::task::spawn_blocking(move || {
                     let result = if let Some(facade) = commit_facade {
-                        let commit = if let Some(expected_revision) = provider_expected_revision {
+                        let commit = if let Some(base) = deletion_base.as_ref() {
+                            bamboo_config::persist_provider_instance_deletion_with_adoption(
+                                &data_dir,
+                                &mut candidate,
+                                base,
+                                facade.as_ref(),
+                            )?
+                        } else if let Some(expected_revision) = provider_expected_revision {
                             bamboo_config::persist_provider_credential_transaction_at_revision_with_adoption(
                                 &data_dir,
                                 &mut candidate,
@@ -6003,7 +5999,7 @@ impl AppState {
                         config_application,
                     },
                     HashSet::new(),
-                    kind == ProviderConfigUpdate::DeleteInstance
+                    deleting_instance
                         && snapshot.default_provider_instance.is_none()
                         && snapshot
                             .provider_instances

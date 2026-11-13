@@ -162,6 +162,48 @@ pub fn has_any_runtime_model_inputs(config: &Config) -> bool {
         || !providers.extra.is_empty()
 }
 
+/// Return the public JSON Pointer paths whose model defaults name this exact
+/// provider instance. Provider types and runtime aliases are distinct IDs.
+pub fn model_default_reference_paths(defaults: &DefaultsConfig, instance_id: &str) -> Vec<String> {
+    let DefaultsConfig {
+        chat,
+        fast,
+        task_summary,
+        vision,
+        memory_background,
+        planning,
+        search,
+        code_review,
+        work_review,
+        sub_agent,
+        subagent_models,
+    } = defaults;
+    let mut paths: Vec<_> = [
+        ("chat", Some(chat)),
+        ("fast", fast.as_ref()),
+        ("task_summary", task_summary.as_ref()),
+        ("vision", vision.as_ref()),
+        ("memory_background", memory_background.as_ref()),
+        ("planning", planning.as_ref()),
+        ("search", search.as_ref()),
+        ("code_review", code_review.as_ref()),
+        ("work_review", work_review.as_ref()),
+        ("sub_agent", sub_agent.as_ref()),
+    ]
+    .into_iter()
+    .filter(|(_, reference)| reference.is_some_and(|reference| reference.provider == instance_id))
+    .map(|(field, _)| format!("/defaults/{field}"))
+    .collect();
+    for (name, reference) in subagent_models {
+        if reference.provider == instance_id {
+            let escaped = name.replace('~', "~0").replace('/', "~1");
+            paths.push(format!("/defaults/subagent_models/{escaped}"));
+        }
+    }
+    paths.sort_unstable();
+    paths
+}
+
 fn default_refs(
     defaults: &DefaultsConfig,
 ) -> impl Iterator<Item = &bamboo_domain::ProviderModelRef> {

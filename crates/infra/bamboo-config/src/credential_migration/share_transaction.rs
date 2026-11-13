@@ -524,6 +524,7 @@ fn commit_inner(
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: Some(MigrationScope::ConfigShare),
+            provider_instance_deletion: false,
             source_attestation: BTreeMap::new(),
             files,
         };
