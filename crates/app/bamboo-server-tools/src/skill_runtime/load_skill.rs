@@ -1042,7 +1042,8 @@ impl Tool for LoadSkillTool {
                 })?,
             );
         }
-        if !reused_published_activation
+        if automatic_selection
+            || !reused_published_activation
             || !session
                 .metadata
                 .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_PINNED_SNAPSHOT_KEY)
@@ -1083,6 +1084,11 @@ impl Tool for LoadSkillTool {
             bamboo_skills::WORKFLOW_LAST_DYNAMIC_CONTEXT_METADATA_KEY.to_string(),
             serde_json::to_string(&dynamic_context).unwrap_or_else(|_| "[]".to_string()),
         );
+        if automatic_selection {
+            session
+                .metadata
+                .remove(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY);
+        }
         let activation_stopped = dynamic_context.iter().any(|block| {
             block.status == bamboo_skills::WorkflowActivationStatus::Degraded
                 && block.stop_on_failure

@@ -80,15 +80,19 @@ pub(crate) fn automatic_skill_prompt_candidates<'a>(
         .map(|entry| (entry.package.as_str(), entry))
         .collect::<std::collections::HashMap<_, _>>();
     let index = CapabilityDiscoveryIndex::for_progressive_skill_matching(published);
-    let (decision, matches) = index.match_automatic_skills(query, |candidate| {
-        let CapabilityInvocationTarget::Skill { skill_id, .. } = &candidate.invocation_target
-        else {
-            return false;
-        };
-        by_package
-            .get(skill_id.as_str())
-            .is_some_and(|entry| allowed.contains(&(skill_id.as_str(), entry.identity.as_str())))
-    });
+    let (decision, matches) = index.match_automatic_skills(
+        query,
+        |candidate| {
+            let CapabilityInvocationTarget::Skill { skill_id, .. } = &candidate.invocation_target
+            else {
+                return false;
+            };
+            by_package.get(skill_id.as_str()).is_some_and(|entry| {
+                allowed.contains(&(skill_id.as_str(), entry.identity.as_str()))
+            })
+        },
+        |_| true,
+    );
     let candidates = matches
         .iter()
         .filter_map(|candidate| {

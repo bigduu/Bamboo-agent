@@ -450,7 +450,7 @@ impl CapabilityDiscoveryIndex {
     }
 
     pub fn explain_automatic_skill(&self, query: &str) -> AutomaticSkillDecision {
-        self.match_automatic_skills(query, |_| true).0
+        self.match_automatic_skills(query, |_| true, |_| true).0
     }
 
     /// Resolve an automatic match or a bounded set of equally strong choices.
@@ -460,6 +460,7 @@ impl CapabilityDiscoveryIndex {
         &self,
         query: &str,
         is_allowed: impl Fn(&CapabilityMatch) -> bool,
+        can_advertise_ambiguous: impl Fn(&CapabilityMatch) -> bool,
     ) -> (AutomaticSkillDecision, Vec<CapabilityMatch>) {
         use sha2::{Digest, Sha256};
         let query = query.trim();
@@ -536,17 +537,17 @@ impl CapabilityDiscoveryIndex {
         let exact = ranked
             .iter()
             .filter(|(rank, _, _)| rank.semantic.exact_identity)
-            .take(MAX_AUTOMATIC_SKILL_CANDIDATES)
-            .map(|(_, candidate, _)| candidate.value.clone())
-            .collect::<Vec<_>>();
-        if !exact.is_empty() {
-            if exact.len() == 1 {
-                decision.outcome = AutomaticSkillOutcome::ExactMatch;
-                decision.selected = Some(exact[0].clone());
-            } else {
-                decision.outcome = AutomaticSkillOutcome::Ambiguous;
-            }
-            return (decision, exact);
+            .map(|(_, candidate, _)| &candidate.value);
+        if ranked
+            .first()
+            .is_some_and(|(rank, _, _)| rank.semantic.exact_identity)
+        {
+            return automatic_skill_choices(
+                decision,
+                AutomaticSkillOutcome::ExactMatch,
+                exact,
+                can_advertise_ambiguous,
+            );
         }
         let mut strong = ranked.iter().filter(|(_, _, strong)| *strong);
         let Some((top_rank, top, _)) = strong.next() else {
@@ -559,22 +560,41 @@ impl CapabilityDiscoveryIndex {
             };
             return (decision, Vec::new());
         };
-        let choices = std::iter::once(top.value.clone())
-            .chain(
-                strong
-                    .take_while(|(rank, _, _)| rank.semantic == top_rank.semantic)
-                    .map(|(_, candidate, _)| candidate.value.clone()),
-            )
-            .take(MAX_AUTOMATIC_SKILL_CANDIDATES)
-            .collect::<Vec<_>>();
-        if choices.len() > 1 {
-            decision.outcome = AutomaticSkillOutcome::Ambiguous;
-        } else {
-            decision.outcome = AutomaticSkillOutcome::StrongMatch;
-            decision.selected = Some(top.value.clone());
-        }
-        (decision, choices)
+        let choices = std::iter::once(&top.value).chain(
+            strong
+                .take_while(|(rank, _, _)| rank.semantic == top_rank.semantic)
+                .map(|(_, candidate, _)| &candidate.value),
+        );
+        automatic_skill_choices(
+            decision,
+            AutomaticSkillOutcome::StrongMatch,
+            choices,
+            can_advertise_ambiguous,
+        )
     }
+}
+
+fn automatic_skill_choices<'a>(
+    mut decision: AutomaticSkillDecision,
+    unique_outcome: AutomaticSkillOutcome,
+    matches: impl Iterator<Item = &'a CapabilityMatch>,
+    can_advertise_ambiguous: impl Fn(&CapabilityMatch) -> bool,
+) -> (AutomaticSkillDecision, Vec<CapabilityMatch>) {
+    let mut matches = matches.peekable();
+    let first = matches.next().expect("top automatic match");
+    if matches.peek().is_none() {
+        decision.outcome = unique_outcome;
+        decision.selected = Some(first.clone());
+        return (decision, vec![first.clone()]);
+    }
+    decision.outcome = AutomaticSkillOutcome::Ambiguous;
+    let choices = std::iter::once(first)
+        .chain(matches)
+        .filter(|candidate| can_advertise_ambiguous(candidate))
+        .take(MAX_AUTOMATIC_SKILL_CANDIDATES)
+        .cloned()
+        .collect();
+    (decision, choices)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

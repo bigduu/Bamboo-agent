@@ -1271,15 +1271,22 @@ async fn load_skill_accepts_only_runtime_advertised_skill_ids() {
 }
 
 #[tokio::test]
-async fn second_automatic_candidate_cannot_replace_an_active_skill() {
+async fn automatic_shortlist_recovers_from_degradation_and_keeps_the_active_skill() {
     let directory = tempfile::tempdir().unwrap();
     let skills_dir = directory.path().join("skills");
-    for id in ["pdf", "docx"] {
+    for (id, metadata) in [
+        ("pdf", ""),
+        ("docx", ""),
+        (
+            "degraded",
+            "metadata:\n  dynamic_context:\n    - id: read\n      tool: Read\n      stop_on_failure: true\n",
+        ),
+    ] {
         let root = skills_dir.join(id);
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
             root.join("SKILL.md"),
-            format!("---\nname: {id}\ndescription: Generate portable documents\n---\n{id} instructions\n"),
+            format!("---\nname: {id}\ndescription: Generate portable documents\n{metadata}---\n{id} instructions\n"),
         )
         .unwrap();
     }
@@ -1300,7 +1307,7 @@ async fn second_automatic_candidate_cannot_replace_an_active_skill() {
         )
         .await
         .unwrap();
-    assert_eq!(activation.descriptor.skill_revisions.len(), 2);
+    assert_eq!(activation.descriptor.skill_revisions.len(), 3);
     let mut session = Session::new(id, "model");
     session.metadata.extend([
         (SKILL_RUNTIME_SELECTION_SOURCE_KEY.into(), "auto".into()),
@@ -1324,6 +1331,17 @@ async fn second_automatic_candidate_cannot_replace_an_active_skill() {
     );
     let mut context = bamboo_agent_core::tools::ToolCtx::none("shortlist-load");
     context.session_id = Some(id.into());
+    let ToolOutcome::Completed(degraded) = tool
+        .invoke(serde_json::json!({"skill_id":"degraded"}), context.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("the first attempt should report degradation");
+    };
+    assert_eq!(
+        public_load_skill_receipt(&degraded)["activation_status"],
+        "degraded"
+    );
     let ToolOutcome::Completed(first) = tool
         .invoke(serde_json::json!({"skill_id":"pdf"}), context.clone())
         .await
@@ -1336,6 +1354,9 @@ async fn second_automatic_candidate_cannot_replace_an_active_skill() {
         "active"
     );
     let before = repo.try_load(id).await.unwrap().unwrap();
+    assert!(!before
+        .metadata
+        .contains_key(bamboo_skills::runtime_metadata::SKILL_RUNTIME_ACTIVATION_ERROR_KEY));
     let error = tool
         .invoke(serde_json::json!({"skill_id":"docx"}), context.clone())
         .await

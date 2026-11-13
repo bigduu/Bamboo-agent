@@ -81,14 +81,25 @@ fn select_automatic_skill(
             .collect(),
     };
     let index = CapabilityDiscoveryIndex::for_automatic_skill_matching(&discovery_catalog);
-    let (decision, candidates) =
-        index.match_automatic_skills(request_hint.unwrap_or_default(), |candidate| {
-            let CapabilityInvocationTarget::Skill { skill_id, .. } = &candidate.invocation_target
-            else {
-                return false;
-            };
-            allowed_skill_ids.contains(skill_id) && !disabled_skill_ids.contains(skill_id)
-        });
+    let valid_skill_ids = catalog
+        .entries
+        .iter()
+        .filter(|entry| entry.winner && entry.status == WorkflowStatus::Valid)
+        .map(|entry| entry.id.as_str())
+        .collect::<HashSet<_>>();
+    let (decision, candidates) = index.match_automatic_skills(
+        request_hint.unwrap_or_default(),
+        |candidate| {
+            matches!(&candidate.invocation_target, CapabilityInvocationTarget::Skill { skill_id, .. }
+                if allowed_skill_ids.contains(skill_id) && !disabled_skill_ids.contains(skill_id))
+        },
+        // A uniquely matched LKG retains its existing compatibility behavior.
+        // Only current valid entries can fill the new ambiguous shortlist.
+        |candidate| {
+            matches!(&candidate.invocation_target, CapabilityInvocationTarget::Skill { skill_id, .. }
+                if valid_skill_ids.contains(skill_id.as_str()))
+        },
+    );
     tracing::debug!(
         query_sha256 = %decision.query_sha256,
         outcome = ?decision.outcome,
@@ -112,15 +123,11 @@ fn select_automatic_skill(
                 return None;
             };
             // The prompt and pin must describe the same published candidate.
-            // A uniquely matched LKG retains its existing compatibility
-            // behavior. A new shortlist only offers currently valid choices.
             if catalog.entries.iter().any(|entry| {
                 entry.winner
                     && entry.id == skill_id
                     && entry.revision == revision
                     && capability_source(entry.source) == source
-                    && (decision.outcome != AutomaticSkillOutcome::Ambiguous
-                        || entry.status == WorkflowStatus::Valid)
             }) {
                 skills_by_id.remove(&skill_id)
             } else {
@@ -1693,6 +1700,29 @@ mod tests {
             .expect("retained catalog entry");
         assert_eq!(invalid.status, WorkflowStatus::Invalid);
 
+        for id in ["a-lkg", "b-lkg", "c-lkg"] {
+            let root = skill_dir.parent().unwrap().join(id);
+            fs::create_dir_all(root.join("agents")).await.unwrap();
+            fs::write(
+                root.join("SKILL.md"),
+                format!("---\nname: {id}\ndescription: Use for steady tasks.\n---\nRetained instructions.\n"),
+            )
+            .await
+            .unwrap();
+        }
+        manager.store().reload().await.unwrap();
+        for id in ["a-lkg", "b-lkg", "c-lkg"] {
+            fs::write(
+                skill_dir
+                    .parent()
+                    .unwrap()
+                    .join(id)
+                    .join("agents/bamboo.yaml"),
+                "invocation_policy: [\n",
+            )
+            .await
+            .unwrap();
+        }
         let other = skill_dir.parent().unwrap().join("steady-alternative");
         fs::create_dir(&other).await.unwrap();
         fs::write(
