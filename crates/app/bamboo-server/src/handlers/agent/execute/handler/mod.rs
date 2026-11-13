@@ -201,6 +201,10 @@ async fn handle_execute_inner(
             if let Some(response) = crate::handlers::agent::sessions::SessionSummary::execution_conflict(&session) {
                 return response;
             }
+            // Receipt selection can admit input before execute preparation.
+            if session.metadata.contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY) {
+                return pending_permission_response(&session_id);
+            }
         }
         Ok(None) => {},
         Err(error) => return HttpResponse::InternalServerError().json(serde_json::json!({
@@ -558,14 +562,7 @@ async fn handle_reserved_execute(
             .await;
             return match error {
                 bamboo_engine::session_app::errors::ExecutePreparationError::PermissionResponsePending => {
-                    HttpResponse::Conflict().json(serde_json::json!({
-                        "session_id": session_id,
-                        "error": {
-                            "message": "Resubmit the committed permission decision to resume this session",
-                            "type": "api_error",
-                            "code": "permission_response_pending"
-                        },
-                    }))
+                    pending_permission_response(&session_id)
                 }
                 invalid @ bamboo_engine::session_app::errors::ExecutePreparationError::InvalidModelReference(_) => {
                     bad_request_error_response(invalid.to_string())
@@ -878,6 +875,17 @@ async fn handle_reserved_execute(
             bad_request_error_response(error)
         }
     }
+}
+
+fn pending_permission_response(session_id: &str) -> HttpResponse {
+    HttpResponse::Conflict().json(serde_json::json!({
+        "session_id": session_id,
+        "error": {
+            "message": "Resubmit the committed permission decision to resume this session",
+            "type": "api_error",
+            "code": "permission_response_pending"
+        },
+    }))
 }
 
 fn continuous_retry_resume_not_prepared(session_id: &str) -> HttpResponse {

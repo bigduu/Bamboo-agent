@@ -7807,6 +7807,18 @@ impl SessionStoreV2 {
             let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
             let prior = previous.metadata.get(marker_key);
             let proposed = session.metadata.get(marker_key);
+            if let Some(marker) = prior.filter(|_| guards.once_response_handoff.is_none()) {
+                let occurrence: bamboo_domain::ResponseOccurrence = serde_json::from_str(marker)?;
+                if session
+                    .messages
+                    .last()
+                    .is_none_or(|message| message.id != occurrence.tool_result_message_id)
+                {
+                    return Err(root_actor_runtime::conflict(
+                        "pending permission response must resume before a new input",
+                    ));
+                }
+            }
             if let Some(marker) = proposed {
                 if prior != Some(marker) {
                     let response: bamboo_domain::ResponseOccurrence = serde_json::from_str(marker)?;

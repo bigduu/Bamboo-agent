@@ -2424,6 +2424,21 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
             .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
         state.shutdown().await;
         let restarted = host(f.home.path(), f.probe.clone()).await;
+        let queued =
+            bamboo_domain::SessionMessageEnvelope::user_input(ROOT_A, "queued after approval");
+        restarted.session_inbox.deliver(&queued).await.unwrap();
+        let execute = crate::handlers::agent::execute::handle_execute(
+            restarted.clone(),
+            ROOT_A.into(),
+            web::Json(serde_json::from_value(json!({})).unwrap()),
+        )
+        .await;
+        assert_eq!(execute.status(), actix_web::http::StatusCode::CONFLICT);
+        assert!(!load(&restarted, ROOT_A)
+            .await
+            .messages
+            .iter()
+            .any(|message| { message.id == queued.id.as_str() }));
         let retry = |caller: SessionCallerReference, kind| {
             let state = restarted.clone();
             let reference = handoff.reference.clone();
