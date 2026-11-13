@@ -43,7 +43,7 @@ pub struct BodhiProvider {
 impl BodhiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
             api_key: api_key.into(),
             base_url: "http://localhost:8080".to_string(),
             target_provider: "openai".to_string(),

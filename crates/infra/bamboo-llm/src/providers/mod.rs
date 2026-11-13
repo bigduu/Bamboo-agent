@@ -16,4 +16,6 @@ pub use gemini::GeminiProvider;
 pub use openai::OpenAIProvider;
 
 #[cfg(test)]
+mod header_passthrough_tests;
+#[cfg(test)]
 mod reasoning_passthrough_tests;

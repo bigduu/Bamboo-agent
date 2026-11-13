@@ -72,7 +72,7 @@ impl GeminiProvider {
     /// Create a new Gemini provider with an API key.
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
             api_key: api_key.into(),
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             default_reasoning_effort: None,

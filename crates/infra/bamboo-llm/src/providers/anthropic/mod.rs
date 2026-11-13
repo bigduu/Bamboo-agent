@@ -173,7 +173,7 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: Client::new(),
+            client: crate::http_client::default_http_client(),
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
             max_tokens: 1024,

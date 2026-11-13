@@ -264,6 +264,31 @@ fn retry_after_date_and_numeric_parsing_preserves_valid_hints() {
     assert!(delay > Duration::from_secs(28) && delay <= Duration::from_secs(30));
 }
 
+#[test]
+fn reads_gateway_retry_after_and_prefers_the_immediate_hop_hint() {
+    let response: Response = http::Response::builder()
+        .status(429)
+        .header("llm_provider-retry-after", "12")
+        .body("")
+        .unwrap()
+        .into();
+    assert_eq!(
+        parse_retry_after_with_date(&response),
+        Some(Duration::from_secs(12))
+    );
+    let response: Response = http::Response::builder()
+        .status(429)
+        .header("llm_provider-retry-after", "12")
+        .header("retry-after", "20")
+        .body("")
+        .unwrap()
+        .into();
+    assert_eq!(
+        parse_retry_after_with_date(&response),
+        Some(Duration::from_secs(20))
+    );
+}
+
 #[tokio::test]
 async fn elapsed_request_budget_bounds_waiting_for_response_headers() {
     let server = MockServer::start().await;
