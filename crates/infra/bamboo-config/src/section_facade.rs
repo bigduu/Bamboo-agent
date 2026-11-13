@@ -375,7 +375,7 @@ pub struct ProvidersSection {
     pub providers: ProviderConfigs,
 }
 
-fn default_provider_name() -> String {
+pub(crate) fn default_provider_name() -> String {
     "openai".to_string()
 }
 
