@@ -35,6 +35,7 @@ struct SummaryOnly {
     chat_turns: AtomicUsize,
     hook_instruction_seen: AtomicBool,
     fail_once: AtomicBool,
+    return_empty_summary: AtomicBool,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
 }
@@ -63,6 +64,9 @@ impl LLMProvider for SummaryOnly {
             self.entered.notify_one();
             self.release.notified().await;
             return Err(LLMError::Api("Synthetic summarization failure".into()));
+        }
+        if self.return_empty_summary.load(Ordering::SeqCst) {
+            return Ok(Box::pin(futures::stream::iter([Ok(LLMChunk::Done)])));
         }
         Ok(Box::pin(futures::stream::iter([
             Ok(LLMChunk::Token(
@@ -500,6 +504,30 @@ async fn compact_session_refuses_pending_work_before_calling_a_model() {
         .current_run_id(ID)
         .await
         .is_none());
+}
+
+#[actix_web::test]
+async fn compact_session_reports_empty_summary_with_reasoning_guidance() {
+    let (_home, state, probe, _) = fixture(ContextManagementStrategy::Summary).await;
+    let before = state.storage.load_session(ID).await.unwrap().unwrap();
+    probe.return_empty_summary.store(true, Ordering::SeqCst);
+    let app = test::init_service(App::new().app_data(state.clone()).configure(agent_routes)).await;
+    let response =
+        test::call_service(&app, test::TestRequest::post().uri(ENDPOINT).to_request()).await;
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = test::read_body_json(response).await;
+    assert_eq!(body["error"]["code"], "context_summary_empty");
+    assert!(body["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("Lower the reasoning effort"));
+    assert_eq!(probe.summaries.load(Ordering::SeqCst), 1);
+    assert_eq!(probe.chat_turns.load(Ordering::SeqCst), 0);
+    let stored = state.storage.load_session(ID).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(stored).unwrap(),
+        serde_json::to_value(before).unwrap(),
+    );
 }
 
 #[actix_web::test]

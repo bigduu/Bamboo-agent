@@ -128,7 +128,11 @@ pub fn json_internal_server_error(message: impl Into<String>) -> actix_web::Erro
     actix_web::error::InternalError::from_response(message, response).into()
 }
 
-fn json_error_with_code(status: StatusCode, message: String, code: Option<&str>) -> HttpResponse {
+pub(crate) fn json_error_with_code(
+    status: StatusCode,
+    message: String,
+    code: Option<&str>,
+) -> HttpResponse {
     HttpResponse::build(status).json(JsonErrorWrapper {
         error: JsonError {
             message,
