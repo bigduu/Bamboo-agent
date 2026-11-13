@@ -15,7 +15,9 @@ use bamboo_engine::session_app::{
         PlanModeTransition, PERMISSION_REEXECUTE_GENERATION_METADATA_KEY,
         PERMISSION_REEXECUTE_METADATA_KEY,
     },
-    resume::{reserve_response_resume_handoff, ResponseResumeHandoff},
+    resume::{
+        reserve_committed_response_handoff, reserve_response_resume_handoff, ResponseResumeHandoff,
+    },
     types::ResumeOutcome,
 };
 use bamboo_tools::permission::{PermissionDecisionKind, PermissionDecisionReceipt};
@@ -572,11 +574,10 @@ pub(super) async fn recover_committed_once_response(
     let session_id = &session.id;
     let expected = SessionCallerReference::from(session);
     let resume_port = crate::app_state::resume_adapter::AppStateResumeRef(state.clone());
-    let handoff =
-        match reserve_response_resume_handoff(&resume_port, session_id, Duration::ZERO).await {
-            Ok(handoff) => handoff,
-            Err(outcome) => return Ok(Some(outcome)),
-        };
+    let handoff = match reserve_committed_response_handoff(&resume_port, session_id).await? {
+        Ok(handoff) => handoff,
+        Err(outcome) => return Ok(Some(outcome)),
+    };
     let current = match handoff.root_actor_writer() {
         Some(owner) => state
             .storage
