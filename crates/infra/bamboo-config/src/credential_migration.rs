@@ -89,8 +89,8 @@ struct MigrationManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     migration_scope: Option<MigrationScope>,
     /// Provider deletion has an exact document precondition during replay.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    provider_instance_deletion: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_instance_deletion: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     source_attestation: BTreeMap<String, FacadeSourceBase>,
     files: Vec<StagedFile>,
@@ -1804,7 +1804,7 @@ fn install_section_split_migration_locked_inner(
         } else {
             MigrationScope::SectionSplit
         }),
-        provider_instance_deletion: false,
+        provider_instance_deletion: None,
         source_attestation: plan
             .credential_plan
             .as_ref()
@@ -4348,7 +4348,7 @@ fn persist_exact_credential_transaction_inner(
     } else {
         None
     };
-    let deleting_instance = if let Some(ProviderTransactionBase::InstanceDeletion(base)) =
+    let provider_instance_deletion = if let Some(ProviderTransactionBase::InstanceDeletion(base)) =
         provider_base
     {
         let section = active_section
@@ -4383,9 +4383,9 @@ fn persist_exact_credential_transaction_inner(
                 "provider deletion must preserve model defaults and remove the instance from routing".to_string(),
             ));
         }
-        true
+        Some(base.instance_id.clone())
     } else {
-        false
+        None
     };
     let client_section_revision = match exact_scope {
         Some(ExactTransactionScope::Providers) => {
@@ -5030,7 +5030,7 @@ fn persist_exact_credential_transaction_inner(
         state: MigrationState::Pending,
         exact_scope,
         migration_scope: None,
-        provider_instance_deletion: deleting_instance,
+        provider_instance_deletion,
         source_attestation: BTreeMap::new(),
         files: staged,
     };
@@ -5081,7 +5081,7 @@ fn persist_exact_credential_transaction_inner(
             if let Some(expected) = file.expected_revision {
                 let actual =
                     crate::section_facade::validate_section_envelope(&file.name, &current, 0)?;
-                if actual != expected {
+                if actual != expected || manifest.provider_instance_deletion.is_some() {
                     return Err(ConfigStoreError::Conflict { expected, actual });
                 }
                 return Err(ConfigStoreError::Validation(format!(
@@ -5564,7 +5564,7 @@ fn migrate_broker_locked(
         state: MigrationState::Pending,
         exact_scope: None,
         migration_scope: None,
-        provider_instance_deletion: false,
+        provider_instance_deletion: None,
         source_attestation: BTreeMap::new(),
         files: staged,
     };
@@ -5665,7 +5665,7 @@ fn migrate_access_control_locked(
         state: MigrationState::Pending,
         exact_scope: None,
         migration_scope: None,
-        provider_instance_deletion: false,
+        provider_instance_deletion: None,
         source_attestation: BTreeMap::new(),
         files: staged,
     };
@@ -5778,7 +5778,7 @@ fn migrate_cluster_locked(
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: Some(MigrationScope::ClusterFabric),
-            provider_instance_deletion: false,
+            provider_instance_deletion: None,
             source_attestation: BTreeMap::new(),
             files: staged,
         };
@@ -6061,7 +6061,7 @@ fn migrate_inner_with_root_builtins_locked(
         } else {
             None
         },
-        provider_instance_deletion: false,
+        provider_instance_deletion: None,
         source_attestation: BTreeMap::new(),
         files: staged,
     };
@@ -10460,7 +10460,7 @@ fn recover_committed_with_cluster_tracker(
         return Ok(None);
     }
     if manifest.state == MigrationState::Aborting {
-        if manifest.provider_instance_deletion {
+        if manifest.provider_instance_deletion.is_some() {
             abort_provider_instance_deletion(data_dir, &manifest)?;
         } else if manifest.exact_scope == Some(ExactTransactionScope::ClusterFabric) {
             abort_cluster_exact_transaction(data_dir, &manifest, install_tracker)?;
@@ -10478,7 +10478,7 @@ fn recover_committed_with_cluster_tracker(
         #[cfg(test)]
         fault,
     ) {
-        if manifest.provider_instance_deletion
+        if manifest.provider_instance_deletion.is_some()
             && matches!(error, ConfigStoreError::Conflict { .. })
             && read_optional_migration_file(&path)?.is_none()
         {
@@ -10687,15 +10687,25 @@ fn rollback_exact_credential_member(
     data_dir: &Path,
     manifest: &MigrationManifest,
 ) -> ConfigStoreResult<()> {
-    let credential_file = manifest
-        .files
-        .iter()
-        .find(|file| file.name == CREDENTIALS_FILE)
-        .ok_or_else(|| {
-            ConfigStoreError::Validation(
-                "committed credential transaction is incomplete".to_string(),
-            )
-        })?;
+    let authority_value = exact_authority_file(manifest)
+        .filter(|name| *name != CONFIG_FILE)
+        .map(|name| read_target_or_empty(&data_dir.join(name)))
+        .transpose()?
+        .filter(|bytes| !bytes.is_empty())
+        .map(|bytes| serde_json::from_slice::<Value>(&bytes))
+        .transpose()?;
+    rollback_exact_credentials_matching(data_dir, manifest, |reference| {
+        !authority_value
+            .as_ref()
+            .is_some_and(|value| contains_credential_reference(value, reference))
+    })
+}
+
+fn rollback_exact_credentials_matching(
+    data_dir: &Path,
+    manifest: &MigrationManifest,
+    should_restore: impl Fn(&str) -> bool,
+) -> ConfigStoreResult<()> {
     let (initial_file, initial_staged) =
         initial_exact_transaction_member(data_dir, manifest, CREDENTIALS_FILE)?;
     let original =
@@ -10706,23 +10716,10 @@ fn rollback_exact_credential_member(
         ));
     }
     let target = data_dir.join(CREDENTIALS_FILE);
-    // A guarded deletion only clears credentials. Its rollback must restore
-    // the original entry even if the winning authority still consumes it.
-    let authority_value = exact_authority_file(manifest)
-        .filter(|name| *name != CONFIG_FILE && !manifest.provider_instance_deletion)
-        .map(|name| read_target_or_empty(&data_dir.join(name)))
-        .transpose()?
-        .filter(|bytes| !bytes.is_empty())
-        .map(|bytes| serde_json::from_slice::<Value>(&bytes))
-        .transpose()?;
-    let rollback_refs = credential_file
+    let rollback_refs = initial_file
         .touched_credential_refs
         .iter()
-        .filter(|reference| {
-            !authority_value
-                .as_ref()
-                .is_some_and(|value| contains_credential_reference(value, reference))
-        })
+        .filter(|reference| should_restore(reference))
         .cloned()
         .collect::<Vec<_>>();
     for _ in 0..16 {
@@ -11141,7 +11138,8 @@ fn abort_provider_instance_deletion(
     // Persist the decision before restoring credentials so recovery cannot
     // retry the deletion after another edit removes the conflict.
     write_manifest(data_dir.join(MANIFEST_FILE), &aborting)?;
-    rollback_exact_credential_member(data_dir, &aborting)?;
+    // The winning Providers document can still consume the cleared key.
+    rollback_exact_credentials_matching(data_dir, &aborting, |_| true)?;
     aborting.state = MigrationState::Complete;
     write_manifest(data_dir.join(MANIFEST_FILE), &aborting)?;
     remove_file_if_exists(&data_dir.join(JOURNAL_FILE))?;
@@ -11164,6 +11162,54 @@ fn provider_instance_deletion_conflict(
     })?;
     let actual = crate::section_facade::validate_section_envelope(PROVIDERS_FILE, current, 0)?;
     Err(ConfigStoreError::Conflict { expected, actual })
+}
+
+/// Keep a newer primary that already includes the deletion. Otherwise abort
+/// against the editor's document instead of rebasing the deletion onto it.
+fn reconcile_provider_deletion(
+    data_dir: &Path,
+    manifest: &mut MigrationManifest,
+    file: &StagedFile,
+    current: &[u8],
+    instance_id: &str,
+) -> ConfigStoreResult<()> {
+    if let Ok((_, revision, data)) = parse_exact_section_document(PROVIDERS_FILE, current) {
+        let providers: crate::ProvidersSection = serde_json::from_value(data.clone())?;
+        if file
+            .expected_revision
+            .is_some_and(|expected| revision > expected)
+            && !providers.provider_instances.contains_key(instance_id)
+            && providers.default_provider_instance.as_deref() != Some(instance_id)
+            && providers.defaults.as_ref().is_none_or(|defaults| {
+                crate::model_default_reference_paths(defaults, instance_id).is_empty()
+            })
+        {
+            // Preserve a cleared key that the newer document now shares with
+            // another provider. If no consumer uses it, keep it cleared.
+            let credential_index = manifest
+                .files
+                .iter()
+                .position(|file| file.name == CREDENTIALS_FILE)
+                .expect("validated provider deletion has a credential member");
+            if manifest.files[credential_index]
+                .touched_credential_refs
+                .iter()
+                .any(|reference| contains_credential_reference(&data, reference))
+            {
+                return rollback_exact_credentials_matching(data_dir, manifest, |reference| {
+                    contains_credential_reference(&data, reference)
+                });
+            }
+            return install_exact_credential_member(
+                data_dir,
+                manifest,
+                credential_index,
+                #[cfg(test)]
+                None,
+            );
+        }
+    }
+    provider_instance_deletion_conflict(data_dir, manifest, file, current)
 }
 
 fn ensure_proxy_consumers_or_abort(
@@ -12219,16 +12265,18 @@ fn install_pending(
     if manifest.migration_scope == Some(MigrationScope::ClusterFabric) {
         pending_cluster_refs_are_exclusive(data_dir)?;
     }
-    if manifest.provider_instance_deletion {
+    if let Some(deleted_id) = manifest.provider_instance_deletion.as_deref() {
         let file = manifest
             .files
             .iter()
             .find(|file| file.name == PROVIDERS_FILE)
+            .cloned()
             .expect("validated provider deletion has a Providers member");
         let current = read_target_or_empty(&data_dir.join(PROVIDERS_FILE))?;
         let hash = sha256(&current);
         if hash != file.sha256 && file.original_sha256.as_deref() != Some(hash.as_str()) {
-            return provider_instance_deletion_conflict(data_dir, manifest, file, &current);
+            let deleted_id = deleted_id.to_owned();
+            return reconcile_provider_deletion(data_dir, manifest, &file, &current, &deleted_id);
         }
     }
     ensure_proxy_consumers_or_abort(data_dir, manifest)?;
@@ -12305,10 +12353,19 @@ fn install_pending(
                     .sensitive(file.sensitive)
                     .write_bytes_if_hash_with_backup(expected, &staged)?
                 {
-                    if manifest.provider_instance_deletion && file.name == PROVIDERS_FILE {
+                    if let Some(deleted_id) = manifest
+                        .provider_instance_deletion
+                        .as_deref()
+                        .filter(|_| file.name == PROVIDERS_FILE)
+                    {
                         let current = read_target_or_empty(&target)?;
-                        return provider_instance_deletion_conflict(
-                            data_dir, manifest, &file, &current,
+                        let deleted_id = deleted_id.to_owned();
+                        return reconcile_provider_deletion(
+                            data_dir,
+                            manifest,
+                            &file,
+                            &current,
+                            &deleted_id,
                         );
                     }
                     if exact_authority_file(manifest) == Some(file.name.as_str())
@@ -14942,13 +14999,19 @@ fn facade_source_attestation_is_valid(manifest: &MigrationManifest) -> bool {
 }
 
 fn validate_manifest(manifest: &MigrationManifest) -> ConfigStoreResult<()> {
-    if manifest.provider_instance_deletion
-        && (manifest.exact_scope != Some(ExactTransactionScope::Providers)
-            || manifest.migration_scope.is_some()
-            || manifest
-                .files
-                .iter()
-                .any(|file| file.install_mode != InstallMode::Exact))
+    if manifest
+        .provider_instance_deletion
+        .as_ref()
+        .is_some_and(|id| {
+            id.trim().is_empty()
+                || id.len() > 128
+                || manifest.exact_scope != Some(ExactTransactionScope::Providers)
+                || manifest.migration_scope.is_some()
+                || manifest
+                    .files
+                    .iter()
+                    .any(|file| file.install_mode != InstallMode::Exact)
+        })
     {
         return Err(ConfigStoreError::Validation(
             "provider deletion manifest requires exact Providers ownership".to_string(),
@@ -17580,7 +17643,7 @@ mod tests {
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: None,
-            provider_instance_deletion: false,
+            provider_instance_deletion: None,
             source_attestation: BTreeMap::new(),
             files: vec![file.clone()],
         };
@@ -17593,7 +17656,7 @@ mod tests {
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: None,
-            provider_instance_deletion: false,
+            provider_instance_deletion: None,
             source_attestation: BTreeMap::new(),
             files: vec![StagedFile {
                 sha256: "G".repeat(64),
@@ -17609,7 +17672,7 @@ mod tests {
             state: MigrationState::Pending,
             exact_scope: None,
             migration_scope: None,
-            provider_instance_deletion: false,
+            provider_instance_deletion: None,
             source_attestation: BTreeMap::new(),
             files: vec![file.clone(), file],
         };
@@ -22047,11 +22110,24 @@ mod tests {
     }
 
     #[test]
-    fn provider_instance_deletion_recovery_keeps_concurrent_defaults_and_credentials() {
+    fn provider_instance_deletion_recovery_preserves_the_winning_document_and_its_keys() {
         let _key = crate::encryption::set_test_encryption_key([0x87; 32]);
-        for fault in [
-            MigrationFault::AfterManifest,
-            MigrationFault::AfterCredentials,
+        for (fault, keep_instance, share_key, abort_recorded) in [
+            (MigrationFault::AfterManifest, true, false, false),
+            (MigrationFault::AfterCredentials, true, false, false),
+            (MigrationFault::AfterCredentials, true, false, true),
+            (
+                MigrationFault::AfterAuthoritativeSection,
+                false,
+                false,
+                false,
+            ),
+            (
+                MigrationFault::AfterAuthoritativeSection,
+                false,
+                true,
+                false,
+            ),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let data_dir = dir.path();
@@ -22106,30 +22182,59 @@ mod tests {
             assert_eq!(installed == before, fault == MigrationFault::AfterManifest);
 
             let path = data_dir.join(PROVIDERS_FILE);
-            let mut editor: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-            editor["revision"] = Value::from(base.revision + 1);
-            editor["data"]["defaults"] = serde_json::json!({
-                "chat": {"provider": "work", "model": "gpt-test"},
-                "work_review": {"provider": "work", "model": "gpt-test"}
-            });
-            let winner = serde_json::to_vec_pretty(&editor).unwrap();
+            let primary = std::fs::read(&path).unwrap();
+            let mut editor: Value = serde_json::from_slice(&primary).unwrap();
+            editor["revision"] = Value::from(editor["revision"].as_u64().unwrap() + 1);
+            if keep_instance {
+                editor["data"]["defaults"] = serde_json::json!({
+                    "chat": {"provider": "work", "model": "gpt-test"},
+                    "work_review": {"provider": "work", "model": "gpt-test"}
+                });
+            } else if share_key {
+                editor["data"]["provider_instances"] = serde_json::json!({
+                    "survivor": {
+                        "provider_type": "openai",
+                        "model": "gpt-test",
+                        "credential_ref": reference.as_str()
+                    }
+                });
+            } else {
+                editor["data"]["features"]["provider_model_ref"] = Value::Bool(true);
+            }
+            let winner = if abort_recorded {
+                let manifest_path = data_dir.join(MANIFEST_FILE);
+                let mut manifest: MigrationManifest =
+                    serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+                manifest.state = MigrationState::Aborting;
+                write_manifest(manifest_path, &manifest).unwrap();
+                // The editor restored the original document after the abort
+                // decision. Recovery must finish rollback instead of deleting.
+                primary
+            } else {
+                serde_json::to_vec_pretty(&editor).unwrap()
+            };
             std::fs::write(&path, &winner).unwrap();
 
             let reopened = crate::ConfigFacade::open_or_migrate(data_dir).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), winner);
-            assert!(reopened
-                .effective_config()
-                .provider_instances
-                .contains_key("work"));
             assert_eq!(
-                store.resolve(&reference).unwrap().unwrap().expose(),
-                "fixture-provider-key"
+                reopened
+                    .effective_config()
+                    .provider_instances
+                    .contains_key("work"),
+                keep_instance
             );
+            let secret = store.resolve(&reference).unwrap();
+            if keep_instance || share_key {
+                assert_eq!(secret.unwrap().expose(), "fixture-provider-key");
+            } else {
+                assert!(secret.is_none());
+            }
             if fault == MigrationFault::AfterManifest {
                 assert!(std::fs::read(data_dir.join(CREDENTIALS_FILE)).unwrap() == before);
             }
             assert!(!data_dir.join(JOURNAL_FILE).exists());
-            assert!(!data_dir.join(MANIFEST_FILE).exists());
+            ensure_provider_mcp_migration_ready(data_dir).unwrap();
         }
     }
 
