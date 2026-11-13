@@ -166,7 +166,7 @@ const DEFAULT_TELEMETRY_CASE = "telemetry::config::tests::explicit_enable_withou
 // server-app-state using Storage's existing test-utils dev dependency.
 // #1125 keeps provider deletion recovery in packages-4 and the HTTP cases in
 // server-settings. The existing additive contexts and cases are unchanged.
-const FEATURE_SOURCE_SHA256 = "7d77da1d3f69e1e99a08f9da3a50f223e01b3e7b485840a92ede0cc28a0bb49d";
+const FEATURE_SOURCE_SHA256 = "05a8416a32df4f02d6faaffa561e2fd8eefa2cedfbe58c6b09b6518afc5c0acb";
 // Child Host admission and startup failure tests retain the existing default
 // Storage/Engine/Server owners and unchanged additive contexts.
 // Root terminal recovery keeps the existing default owners, four feature

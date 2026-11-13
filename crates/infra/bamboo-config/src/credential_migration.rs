@@ -1114,6 +1114,7 @@ enum MigrationFault {
     AfterExactProxyConfigRebaseManifestExternalWrite,
     AfterExactClusterConsumerConflict,
     AfterExactClusterSectionRebase,
+    DuringProviderDeletionSuccessor,
 }
 
 fn authoritative_section_file(scope: ExactTransactionScope) -> &'static str {
@@ -10722,6 +10723,9 @@ fn rollback_exact_credentials_matching(
         .filter(|reference| should_restore(reference))
         .cloned()
         .collect::<Vec<_>>();
+    if rollback_refs.is_empty() {
+        return Ok(());
+    }
     for _ in 0..16 {
         let current = read_target_or_empty(&target)?;
         let current_hash = sha256(&current);
@@ -11148,68 +11152,83 @@ fn abort_provider_instance_deletion(
     sync_dir(data_dir)
 }
 
-fn provider_instance_deletion_conflict(
-    data_dir: &Path,
-    manifest: &MigrationManifest,
-    file: &StagedFile,
-    current: &[u8],
-) -> ConfigStoreResult<()> {
-    abort_provider_instance_deletion(data_dir, manifest)?;
-    let expected = file.expected_revision.ok_or_else(|| {
-        ConfigStoreError::Validation(
-            "provider deletion revision precondition is missing".to_string(),
-        )
-    })?;
-    let actual = crate::section_facade::validate_section_envelope(PROVIDERS_FILE, current, 0)?;
-    Err(ConfigStoreError::Conflict { expected, actual })
-}
-
 /// Keep a newer primary that already includes the deletion. Otherwise abort
 /// against the editor's document instead of rebasing the deletion onto it.
 fn reconcile_provider_deletion(
     data_dir: &Path,
     manifest: &mut MigrationManifest,
     file: &StagedFile,
-    current: &[u8],
+    mut current: Vec<u8>,
     instance_id: &str,
+    #[cfg(test)] fault: Option<MigrationFault>,
 ) -> ConfigStoreResult<()> {
-    if let Ok((_, revision, data)) = parse_exact_section_document(PROVIDERS_FILE, current) {
+    let expected = file
+        .expected_revision
+        .expect("validated Providers member has a revision");
+    let credential_index = manifest
+        .files
+        .iter()
+        .position(|file| file.name == CREDENTIALS_FILE)
+        .expect("validated provider deletion has a credential member");
+    let path = data_dir.join(PROVIDERS_FILE);
+    for _ in 0..16 {
+        let Ok((_, revision, data)) = parse_exact_section_document(PROVIDERS_FILE, &current) else {
+            abort_provider_instance_deletion(data_dir, manifest)?;
+            return Err(ConfigStoreError::Validation(
+                "durable Providers section is unavailable".to_string(),
+            ));
+        };
         let providers: crate::ProvidersSection = serde_json::from_value(data.clone())?;
-        if file
-            .expected_revision
-            .is_some_and(|expected| revision > expected)
-            && !providers.provider_instances.contains_key(instance_id)
-            && providers.default_provider_instance.as_deref() != Some(instance_id)
-            && providers.defaults.as_ref().is_none_or(|defaults| {
-                crate::model_default_reference_paths(defaults, instance_id).is_empty()
+        if revision <= expected
+            || providers.provider_instances.contains_key(instance_id)
+            || providers.default_provider_instance.as_deref() == Some(instance_id)
+            || providers.defaults.as_ref().is_some_and(|defaults| {
+                !crate::model_default_reference_paths(defaults, instance_id).is_empty()
             })
         {
-            // Preserve a cleared key that the newer document now shares with
-            // another provider. If no consumer uses it, keep it cleared.
-            let credential_index = manifest
-                .files
-                .iter()
-                .position(|file| file.name == CREDENTIALS_FILE)
-                .expect("validated provider deletion has a credential member");
-            if manifest.files[credential_index]
-                .touched_credential_refs
-                .iter()
-                .any(|reference| contains_credential_reference(&data, reference))
-            {
-                return rollback_exact_credentials_matching(data_dir, manifest, |reference| {
-                    contains_credential_reference(&data, reference)
-                });
-            }
-            return install_exact_credential_member(
+            abort_provider_instance_deletion(data_dir, manifest)?;
+            return Err(ConfigStoreError::Conflict {
+                expected,
+                actual: revision,
+            });
+        }
+        // One deletion owns one instance credential. Restore it only while
+        // the winning Providers document still contains a consumer.
+        if manifest.files[credential_index]
+            .touched_credential_refs
+            .iter()
+            .any(|reference| contains_credential_reference(&data, reference))
+        {
+            rollback_exact_credentials_matching(data_dir, manifest, |reference| {
+                contains_credential_reference(&data, reference)
+            })?;
+        } else {
+            install_exact_credential_member(
                 data_dir,
                 manifest,
                 credential_index,
                 #[cfg(test)]
                 None,
-            );
+            )?;
         }
+        #[cfg(test)]
+        if fault == Some(MigrationFault::DuringProviderDeletionSuccessor) {
+            let original = read_encrypted_migration_backup(
+                data_dir,
+                &manifest.transaction_id,
+                PROVIDERS_FILE,
+            )?;
+            AtomicFileStore::new(&path).write_bytes_without_backup(&original)?;
+        }
+        let latest = read_target_or_empty(&path)?;
+        if latest == current {
+            return Ok(());
+        }
+        current = latest;
     }
-    provider_instance_deletion_conflict(data_dir, manifest, file, current)
+    Err(ConfigStoreError::CommitIndeterminate(
+        "Providers changed repeatedly during provider deletion recovery".to_string(),
+    ))
 }
 
 fn ensure_proxy_consumers_or_abort(
@@ -12276,7 +12295,15 @@ fn install_pending(
         let hash = sha256(&current);
         if hash != file.sha256 && file.original_sha256.as_deref() != Some(hash.as_str()) {
             let deleted_id = deleted_id.to_owned();
-            return reconcile_provider_deletion(data_dir, manifest, &file, &current, &deleted_id);
+            return reconcile_provider_deletion(
+                data_dir,
+                manifest,
+                &file,
+                current,
+                &deleted_id,
+                #[cfg(test)]
+                fault,
+            );
         }
     }
     ensure_proxy_consumers_or_abort(data_dir, manifest)?;
@@ -12364,8 +12391,10 @@ fn install_pending(
                             data_dir,
                             manifest,
                             &file,
-                            &current,
+                            current,
                             &deleted_id,
+                            #[cfg(test)]
+                            fault,
                         );
                     }
                     if exact_authority_file(manifest) == Some(file.name.as_str())
@@ -22111,22 +22140,26 @@ mod tests {
 
     #[test]
     fn provider_instance_deletion_recovery_preserves_the_winning_document_and_its_keys() {
+        enum EditorOutcome {
+            ReferencesInstance,
+            RecordedAbort,
+            PreservesDeletion,
+            SharesCredential,
+            SupersedesSuccessor,
+        }
+        use EditorOutcome::*;
+
         let _key = crate::encryption::set_test_encryption_key([0x87; 32]);
-        for (fault, keep_instance, share_key, abort_recorded) in [
-            (MigrationFault::AfterManifest, true, false, false),
-            (MigrationFault::AfterCredentials, true, false, false),
-            (MigrationFault::AfterCredentials, true, false, true),
+        for (fault, outcome) in [
+            (MigrationFault::AfterManifest, ReferencesInstance),
+            (MigrationFault::AfterManifest, PreservesDeletion),
+            (MigrationFault::AfterCredentials, ReferencesInstance),
+            (MigrationFault::AfterCredentials, RecordedAbort),
+            (MigrationFault::AfterAuthoritativeSection, PreservesDeletion),
+            (MigrationFault::AfterAuthoritativeSection, SharesCredential),
             (
                 MigrationFault::AfterAuthoritativeSection,
-                false,
-                false,
-                false,
-            ),
-            (
-                MigrationFault::AfterAuthoritativeSection,
-                false,
-                true,
-                false,
+                SupersedesSuccessor,
             ),
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -22185,23 +22218,35 @@ mod tests {
             let primary = std::fs::read(&path).unwrap();
             let mut editor: Value = serde_json::from_slice(&primary).unwrap();
             editor["revision"] = Value::from(editor["revision"].as_u64().unwrap() + 1);
-            if keep_instance {
-                editor["data"]["defaults"] = serde_json::json!({
-                    "chat": {"provider": "work", "model": "gpt-test"},
-                    "work_review": {"provider": "work", "model": "gpt-test"}
-                });
-            } else if share_key {
-                editor["data"]["provider_instances"] = serde_json::json!({
-                    "survivor": {
-                        "provider_type": "openai",
-                        "model": "gpt-test",
-                        "credential_ref": reference.as_str()
+            match outcome {
+                ReferencesInstance => {
+                    editor["data"]["defaults"] = serde_json::json!({
+                        "chat": {"provider": "work", "model": "gpt-test"},
+                        "work_review": {"provider": "work", "model": "gpt-test"}
+                    })
+                }
+                SharesCredential => {
+                    editor["data"]["provider_instances"] = serde_json::json!({
+                        "survivor": {
+                            "provider_type": "openai",
+                            "model": "gpt-test",
+                            "credential_ref": reference.as_str()
+                        }
+                    })
+                }
+                PreservesDeletion | SupersedesSuccessor => {
+                    if fault == MigrationFault::AfterManifest {
+                        editor["data"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("default_provider_instance");
+                        editor["data"]["provider_instances"] = serde_json::json!({});
                     }
-                });
-            } else {
-                editor["data"]["features"]["provider_model_ref"] = Value::Bool(true);
+                    editor["data"]["features"]["provider_model_ref"] = Value::Bool(true);
+                }
+                RecordedAbort => {}
             }
-            let winner = if abort_recorded {
+            let mut winner = if matches!(outcome, RecordedAbort) {
                 let manifest_path = data_dir.join(MANIFEST_FILE);
                 let mut manifest: MigrationManifest =
                     serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
@@ -22215,8 +22260,20 @@ mod tests {
             };
             std::fs::write(&path, &winner).unwrap();
 
+            if matches!(outcome, SupersedesSuccessor) {
+                recover_committed(
+                    data_dir,
+                    Some(MigrationFault::DuringProviderDeletionSuccessor),
+                )
+                .unwrap();
+                winner = base.original;
+            }
             let reopened = crate::ConfigFacade::open_or_migrate(data_dir).unwrap();
             assert_eq!(std::fs::read(&path).unwrap(), winner);
+            let keep_instance = matches!(
+                outcome,
+                ReferencesInstance | RecordedAbort | SupersedesSuccessor
+            );
             assert_eq!(
                 reopened
                     .effective_config()
@@ -22225,12 +22282,12 @@ mod tests {
                 keep_instance
             );
             let secret = store.resolve(&reference).unwrap();
-            if keep_instance || share_key {
+            if keep_instance || matches!(outcome, SharesCredential) {
                 assert_eq!(secret.unwrap().expose(), "fixture-provider-key");
             } else {
                 assert!(secret.is_none());
             }
-            if fault == MigrationFault::AfterManifest {
+            if fault == MigrationFault::AfterManifest && keep_instance {
                 assert!(std::fs::read(data_dir.join(CREDENTIALS_FILE)).unwrap() == before);
             }
             assert!(!data_dir.join(JOURNAL_FILE).exists());
