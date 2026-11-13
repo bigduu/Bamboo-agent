@@ -764,32 +764,34 @@ async fn execute_tool_call_only_with_execution_name_inner(
         ctx.session_id,
         ctx.round_id,
     );
-    let observed_dispatch = observation
-        .scope(bamboo_tools::with_hook_permission_override(
-            permission_override,
-            &ctx.tool_call.id,
-            dispatch,
-        ))
-        .await
-        .map(ToolOutcome::enforce_suspension_restriction);
+    let dispatch = observation.scope(bamboo_tools::with_hook_permission_override(
+        permission_override,
+        &ctx.tool_call.id,
+        dispatch,
+    ));
+    let await_quiet_exec = ctx.await_quiet_exec && execution_name == "write_stdin";
+    let observed_dispatch = if await_quiet_exec {
+        bamboo_tools::tools::write_stdin::defer_empty_poll_advisory(dispatch).await
+    } else {
+        dispatch.await
+    }
+    .map(ToolOutcome::enforce_suspension_restriction);
     // Await the same admitted command before completing the tool lifecycle.
     // The outer runner's cancellation still covers this tool future.
     let observed_dispatch = match observed_dispatch {
-        Ok(ToolOutcome::Completed(previous))
-            if ctx.await_quiet_exec && execution_name == "write_stdin" =>
-        {
+        Ok(ToolOutcome::Completed(previous)) if await_quiet_exec => {
             let elapsed = tool_timer.elapsed();
             let remaining = std::time::Duration::from_secs(ctx.config.per_tool_timeout_secs)
                 .saturating_sub(elapsed);
             let result = bamboo_tools::tools::write_stdin::continue_empty_poll(
                 ctx.session_id,
+                &ctx.tool_call.id,
                 &args,
-                &previous,
+                previous,
                 elapsed,
                 remaining,
             )
-            .await
-            .unwrap_or(ToolOutcome::Completed(previous));
+            .await;
             Ok(result)
         }
         outcome => outcome,

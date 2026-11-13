@@ -8,7 +8,7 @@ use super::per_call::ToolExecutionOutcome;
 
 const MAX_HANDLES: usize = 64;
 const SILENCE_MS: u64 = 90_000;
-// The first qualifying readout already carries the reminder; allow three more.
+// Keep the background recovery threshold independent of the tool advisory.
 const READOUTS_AFTER_REMINDER: usize = 4;
 
 #[derive(Debug, Clone, Default)]

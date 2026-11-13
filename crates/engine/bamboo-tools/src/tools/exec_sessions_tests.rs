@@ -88,32 +88,40 @@ async fn tiny_output_budget_preserves_running_session_metadata() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn quiet_poll_advisory_requires_sustained_silence_and_repeated_empty_readouts() {
+async fn quiet_poll_advisory_counts_three_delivered_polls_once_per_streak() {
     let state = PolledShellState::new().unwrap();
-    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER).await;
-    for count in 1..QUIET_POLL_ADVISORY_READOUTS {
-        let result = state.take("quiet-handle", None).await;
+    let initial = state.take("quiet-handle", None).await;
+    assert!(initial.polling.unwrap().advisory.is_none());
+    for count in 1..QUIET_POLL_ADVISORY_POLLS {
+        let result = state
+            .take_poll("quiet-handle", None, Some(EmptyPoll::Deliver))
+            .await;
         let progress = result.polling.unwrap();
-        assert_eq!(progress.consecutive_empty_readouts, count);
+        assert_eq!(progress.consecutive_empty_readouts, count + 1);
         assert!(progress.advisory.is_none());
     }
-    let result = state.take("quiet-handle", None).await;
+    let result = state
+        .take_poll("quiet-handle", None, Some(EmptyPoll::Deliver))
+        .await;
     assert_eq!(result.session_id.as_deref(), Some("quiet-handle"));
     assert_eq!(result.status, "running");
     assert!(result.exit_code.is_none());
     let progress = result.polling.unwrap();
-    assert_eq!(progress.elapsed_ms, 90_000);
-    assert_eq!(progress.output_idle_ms, 90_000);
+    assert_eq!(progress.elapsed_ms, 0);
+    assert_eq!(progress.output_idle_ms, 0);
+    assert_eq!(progress.state, "waiting");
     assert!(!progress.exit_observed);
     assert_eq!(progress.advisory, Some(QUIET_POLL_ADVISORY));
     assert!(!state.is_complete().await);
 
     // A legitimate long command remains pending, even beyond the advisory.
     tokio::time::advance(Duration::from_secs(3600)).await;
-    let later = state.take("quiet-handle", None).await;
+    let later = state
+        .take_poll("quiet-handle", None, Some(EmptyPoll::Deliver))
+        .await;
     assert_eq!(later.status, "running");
     assert!(later.exit_code.is_none());
-    assert!(later.polling.unwrap().advisory.is_some());
+    assert!(later.polling.unwrap().advisory.is_none());
     state.finish("completed", Some(7)).await;
     let terminal = state.take("quiet-handle", None).await;
     assert_eq!(terminal.status, "completed");
@@ -123,30 +131,36 @@ async fn quiet_poll_advisory_requires_sustained_silence_and_repeated_empty_reado
 }
 
 #[tokio::test(start_paused = true)]
-async fn rapid_empty_polls_wait_for_the_silence_boundary_before_advising() {
+async fn raw_readouts_keep_the_existing_diagnosis_silence_boundary() {
     let state = PolledShellState::new().unwrap();
-    for _ in 0..100 {
+    for _ in 0..QUIET_POLL_DIAGNOSIS_READOUTS {
         let result = state.take("short-polls", None).await;
-        assert!(result.polling.unwrap().advisory.is_none());
+        assert_eq!(result.polling.unwrap().state, "waiting");
     }
-    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER - Duration::from_millis(1)).await;
+    tokio::time::advance(QUIET_POLL_DIAGNOSIS_AFTER - Duration::from_millis(1)).await;
     let before = state.take("short-polls", None).await;
-    assert!(before.polling.unwrap().advisory.is_none());
+    assert_eq!(before.polling.unwrap().state, "waiting");
     tokio::time::advance(Duration::from_millis(1)).await;
     let at_boundary = state.take("short-polls", None).await;
-    assert!(at_boundary.polling.unwrap().advisory.is_some());
+    let progress = at_boundary.polling.unwrap();
+    assert_eq!(progress.state, "needs_diagnosis");
+    assert!(progress.advisory.is_none());
 }
 
 #[tokio::test(start_paused = true)]
 async fn captured_output_resets_quiet_polling_even_when_the_response_cap_omits_it() {
     let state = PolledShellState::new().unwrap();
-    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER).await;
-    for _ in 0..QUIET_POLL_ADVISORY_READOUTS {
-        state.take("output-resumes", None).await;
+    tokio::time::advance(QUIET_POLL_DIAGNOSIS_AFTER).await;
+    for _ in 1..QUIET_POLL_ADVISORY_POLLS {
+        state
+            .take_poll("output-resumes", None, Some(EmptyPoll::Deliver))
+            .await;
     }
     // One token cannot render either character, but capture made progress.
     state.push("\0汉".as_bytes()).await;
-    let resumed = state.take("output-resumes", Some(1)).await;
+    let resumed = state
+        .take_poll("output-resumes", Some(1), Some(EmptyPoll::Deliver))
+        .await;
     assert!(resumed.output.is_empty());
     assert_eq!(resumed.output_omitted_bytes, 4);
     let progress = resumed.polling.unwrap();
@@ -155,16 +169,25 @@ async fn captured_output_resets_quiet_polling_even_when_the_response_cap_omits_i
     assert_eq!(progress.consecutive_empty_readouts, 0);
     assert!(progress.advisory.is_none());
 
-    tokio::time::advance(QUIET_POLL_ADVISORY_AFTER).await;
-    let first_empty = state.take("output-resumes", None).await;
+    tokio::time::advance(QUIET_POLL_DIAGNOSIS_AFTER).await;
+    let first_empty = state
+        .take_poll("output-resumes", None, Some(EmptyPoll::Deliver))
+        .await;
     assert!(first_empty.polling.unwrap().advisory.is_none());
     state.push(b"").await;
-    let second_empty = state.take("output-resumes", None).await;
+    let second_empty = state
+        .take_poll("output-resumes", None, Some(EmptyPoll::Deliver))
+        .await;
     assert_eq!(second_empty.polling.unwrap().consecutive_empty_readouts, 2);
-    let third_empty = state.take("output-resumes", None).await;
+    let third_empty = state
+        .take_poll("output-resumes", None, Some(EmptyPoll::Deliver))
+        .await;
     assert!(third_empty.polling.unwrap().advisory.is_some());
+    state.reset_poll_advisory().await;
     state.reset_empty_readouts().await;
-    let after_input = state.take("output-resumes", None).await;
+    let after_input = state
+        .take_poll("output-resumes", None, Some(EmptyPoll::Deliver))
+        .await;
     let progress = after_input.polling.unwrap();
     assert_eq!(progress.consecutive_empty_readouts, 1);
     assert!(progress.advisory.is_none());
@@ -173,15 +196,29 @@ async fn captured_output_resets_quiet_polling_even_when_the_response_cap_omits_i
 #[tokio::test(start_paused = true)]
 async fn exit_observed_during_capture_is_not_a_terminal_result() {
     let state = PolledShellState::new().unwrap();
-    let pending = serde_json::to_value(state.take("draining", None).await).unwrap();
+    state
+        .take_poll("draining", None, Some(EmptyPoll::Deliver))
+        .await;
+    let pending = serde_json::to_value(
+        state
+            .take_poll("draining", None, Some(EmptyPoll::Deliver))
+            .await,
+    )
+    .unwrap();
     assert_eq!(pending["polling"]["exit_observed"], false);
     assert!(pending.get("exit_code").is_none());
     state.mark_process_exited();
-    let draining = serde_json::to_value(state.take("draining", None).await).unwrap();
+    let draining = serde_json::to_value(
+        state
+            .take_poll("draining", None, Some(EmptyPoll::Deliver))
+            .await,
+    )
+    .unwrap();
     assert_eq!(draining["polling"]["exit_observed"], true);
     assert_eq!(draining["status"], "running");
     assert_eq!(draining["session_id"], "draining");
     assert!(draining.get("exit_code").is_none());
+    assert!(draining["polling"].get("advisory").is_none());
     state.push(b"tail").await;
     state.finish("completed", Some(0)).await;
     let terminal = serde_json::to_value(state.take("draining", None).await).unwrap();
@@ -190,6 +227,57 @@ async fn exit_observed_during_capture_is_not_a_terminal_result() {
     assert_eq!(terminal["exit_code"], 0);
     assert!(terminal.get("session_id").is_none());
     assert!(terminal.get("polling").is_none());
+}
+
+#[tokio::test(start_paused = true)]
+async fn deferred_poll_is_counted_only_when_its_current_result_is_delivered() {
+    let state = PolledShellState::new().unwrap();
+    let old = Arc::<str>::from("canceled-call");
+    let current = Arc::<str>::from("current-call");
+    for _ in 1..QUIET_POLL_ADVISORY_POLLS {
+        let delivered = state
+            .take_poll("handle", None, Some(EmptyPoll::Deliver))
+            .await;
+        assert!(delivered.polling.unwrap().advisory.is_none());
+    }
+    let canceled = state
+        .take_poll("handle", None, Some(EmptyPoll::Defer(&old)))
+        .await;
+    assert!(canceled.polling.unwrap().advisory.is_none());
+    let first = state
+        .take_poll("handle", None, Some(EmptyPoll::Defer(&current)))
+        .await;
+    assert!(first.polling.unwrap().advisory.is_none());
+    assert!(state.finish_empty_poll(&old).await.is_none());
+    let continued = state
+        .take_poll("handle", None, Some(EmptyPoll::Continue(&current)))
+        .await;
+    assert_eq!(
+        continued.polling.unwrap().advisory,
+        Some(QUIET_POLL_ADVISORY)
+    );
+    assert!(state.finish_empty_poll(&current).await.is_none());
+
+    state.reset_poll_advisory().await;
+    for _ in 1..QUIET_POLL_ADVISORY_POLLS {
+        state
+            .take_poll("handle", None, Some(EmptyPoll::Deliver))
+            .await;
+    }
+    state
+        .take_poll("handle", None, Some(EmptyPoll::Defer(&current)))
+        .await;
+    state.push(b"progress between reads").await;
+    state.take("handle", None).await;
+    let resumed = state
+        .take_poll("handle", None, Some(EmptyPoll::Continue(&current)))
+        .await;
+    assert!(resumed.polling.unwrap().advisory.is_none());
+    assert!(state.finish_empty_poll(&current).await.is_none());
+    let next = state
+        .take_poll("handle", None, Some(EmptyPoll::Deliver))
+        .await;
+    assert!(next.polling.unwrap().advisory.is_none());
 }
 
 #[test]
@@ -632,7 +720,7 @@ mod process_tests {
         state.record_error("late capture error".to_owned()).await;
         state.output.lock().await.omitted_bytes += 3;
         std::fs::write(&release, b"release").unwrap();
-        let last = payload(poll_result(&shell, 5_000, None).await);
+        let last = payload(poll_result(&shell, 5_000, None, None).await);
         let (reaped, removed) = await_initial_cleanup(&shell).await;
         assert!(worker_result.is_ok());
         assert_eq!(observation, Some((false, false)));
@@ -818,16 +906,17 @@ mod process_tests {
             true,
         ).await;
         let id = first["session_id"].as_str().unwrap();
+        assert!(first["polling"].get("advisory").is_none());
         let shell = bash_runtime::get_shell(id).unwrap();
         let state = shell.polled.as_ref().unwrap();
-        // Age only the advisory clock; the real gated process and its actual
-        // wait/capture owner remain unchanged and supply the terminal result.
+        // Age only the diagnostic clock; the real gated process supplies
+        // the terminal result.
         {
             let mut output = state.output.lock().await;
-            output.started_at = Instant::now() - QUIET_POLL_ADVISORY_AFTER;
+            output.started_at = Instant::now() - QUIET_POLL_DIAGNOSIS_AFTER;
             output.last_output_at = output.started_at;
         }
-        for _ in 0..QUIET_POLL_DIAGNOSIS_READOUTS {
+        for index in 1..=QUIET_POLL_DIAGNOSIS_READOUTS {
             let result = payload(
                 WriteStdinTool::new()
                     .invoke(
@@ -841,15 +930,19 @@ mod process_tests {
             assert_eq!(result["session_id"], id);
             assert_eq!(result["polling"]["exit_observed"], false);
             assert!(result.get("exit_code").is_none());
+            assert_eq!(
+                result["polling"]["advisory"].as_str(),
+                (index == QUIET_POLL_ADVISORY_POLLS).then_some(QUIET_POLL_ADVISORY),
+            );
         }
         assert!(!state.is_complete().await);
         assert!(bash_runtime::get_shell(id).is_some());
-        let last_running = payload(poll_result(&shell, 0, None).await);
-        assert!(last_running["polling"]["advisory"].is_string());
+        let last_running = payload(poll_result(&shell, 0, None, None).await);
+        assert!(last_running["polling"].get("advisory").is_none());
         assert_eq!(last_running["polling"]["state"], "needs_diagnosis");
         assert_eq!(last_running["polling"]["terminal_result_ttl_ms"], 300_000);
-        // Successful input/EOF interrupts the empty-readout streak even when
-        // this command makes no stdout/stderr response to the input.
+        // Input and EOF interrupt both streaks even when the command makes
+        // no stdout/stderr response.
         for request in [
             json!({"session_id":id,"chars":"probe","yield_time_ms":250}),
             json!({"session_id":id,"eof":true,"yield_time_ms":250}),
@@ -863,6 +956,8 @@ mod process_tests {
             assert_eq!(after_input["status"], "running");
             assert_eq!(after_input["polling"]["consecutive_empty_readouts"], 1);
             assert!(after_input["polling"].get("advisory").is_none());
+            let output = state.output.lock().await;
+            assert_eq!(output.consecutive_empty_polls, 0);
         }
         std::fs::write(release, b"release").unwrap();
         let terminal = poll(id, &owner).await;
@@ -892,8 +987,15 @@ mod process_tests {
         )
         .await;
         let id = first["session_id"].as_str().unwrap();
-        let shell = bash_runtime::get_shell(id).unwrap();
-        let ToolOutcome::Completed(previous) = poll_result(&shell, 0, None).await else {
+        let args = json!({"session_id": id, "yield_time_ms": 250});
+        let call_ctx = context(&owner);
+        let ToolOutcome::Completed(previous) =
+            crate::tools::write_stdin::defer_empty_poll_advisory(
+                WriteStdinTool::new().invoke(args, call_ctx.clone()),
+            )
+            .await
+            .unwrap()
+        else {
             panic!("exec sessions must return ordinary completed tool calls");
         };
         let running: Value = serde_json::from_str(&previous.result).unwrap();
@@ -901,23 +1003,105 @@ mod process_tests {
         let args = json!({"session_id": id, "yield_time_ms": 60_000});
         let mut continued = std::pin::pin!(crate::tools::write_stdin::continue_empty_poll(
             &owner,
+            &call_ctx.tool_call_id,
             &args,
-            &previous,
+            previous,
             Duration::from_secs(30),
             Duration::from_secs(90),
         ));
         assert!(futures::poll!(continued.as_mut()).is_pending());
         std::fs::write(release, b"release").unwrap();
-        let terminal = payload(
-            timeout(Duration::from_secs(5), continued)
-                .await
-                .unwrap()
-                .unwrap(),
-        );
+        let terminal = payload(timeout(Duration::from_secs(5), continued).await.unwrap());
         assert_eq!(terminal["status"], "completed");
         assert_eq!(terminal["output"], "tail");
         assert_eq!(terminal["exit_code"], 7);
         assert!(terminal.get("session_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn longer_wait_delivers_the_third_quiet_advisory_once() {
+        use crate::tools::write_stdin::{continue_empty_poll, defer_empty_poll_advisory};
+
+        let _environment = environment();
+        let directory = tempfile::tempdir().unwrap();
+        let owner = format!("continued-quiet-poll-{}", uuid::Uuid::new_v4());
+        let release = directory.path().join("release");
+        let _cleanup = InitialProcessCleanup {
+            owner: &owner,
+            release: release.clone(),
+        };
+        workspace_state::publish_resolved_workspace(&owner, directory.path().to_path_buf());
+        let first = start(
+            "while [ ! -f release ]; do sleep 0.01; done; printf tail; exit 7".into(),
+            &owner,
+            false,
+        )
+        .await;
+        assert!(first["polling"].get("advisory").is_none());
+        let id = first["session_id"].as_str().unwrap();
+        let tool = WriteStdinTool::new();
+        for index in 1..=4 {
+            let mut call_ctx = context(&owner);
+            call_ctx.tool_call_id = Arc::from(format!("quiet-{index}"));
+            let initial = json!({"session_id": id, "yield_time_ms": 250});
+            let ToolOutcome::Completed(previous) =
+                defer_empty_poll_advisory(tool.invoke(initial.clone(), call_ctx.clone()))
+                    .await
+                    .unwrap()
+            else {
+                panic!("exec sessions must return ordinary completed tool calls");
+            };
+            let first_read: Value = serde_json::from_str(&previous.result).unwrap();
+            assert_eq!(first_read["status"], "running");
+            assert!(first_read["polling"].get("advisory").is_none());
+
+            let continued = json!({"session_id": id, "yield_time_ms": 60_000});
+            let (arguments, elapsed, remaining) = if index == 1 {
+                (
+                    &initial,
+                    Duration::from_millis(250),
+                    Duration::from_secs(90),
+                )
+            } else {
+                // Virtualize the elapsed first wait, then take the second
+                // real readout with a short remaining tool budget.
+                (
+                    &continued,
+                    Duration::from_secs(30),
+                    Duration::from_millis(10),
+                )
+            };
+            let delivered = payload(
+                continue_empty_poll(
+                    &owner,
+                    &call_ctx.tool_call_id,
+                    arguments,
+                    previous,
+                    elapsed,
+                    remaining,
+                )
+                .await,
+            );
+            assert_eq!(delivered["session_id"], id);
+            assert_eq!(delivered["status"], "running");
+            assert_eq!(delivered["output"], "");
+            assert_eq!(delivered["polling"]["exit_observed"], false);
+            assert_eq!(
+                delivered["polling"]["advisory"].as_str(),
+                (index == QUIET_POLL_ADVISORY_POLLS).then_some(QUIET_POLL_ADVISORY),
+            );
+            assert_eq!(
+                delivered["polling"]["consecutive_empty_readouts"].as_u64(),
+                Some(2 * index as u64),
+            );
+        }
+        std::fs::write(release, b"release").unwrap();
+        let terminal = poll(id, &owner).await;
+        assert_eq!(terminal["status"], "completed");
+        assert_eq!(terminal["output"], "tail");
+        assert_eq!(terminal["exit_code"], 7);
+        assert!(terminal.get("session_id").is_none());
+        assert!(terminal.get("polling").is_none());
     }
 
     #[tokio::test(start_paused = true)]

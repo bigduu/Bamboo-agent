@@ -693,7 +693,7 @@ pub(super) fn build_exec_session_continuation_context_block(
         ContextBlockStability::RoundDynamic,
         "Shell sessions awaiting a terminal result",
         format!(
-            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result. Continue polling while the tool result includes session_id.\nSession IDs: {}",
+            "Call write_stdin with each session_id below and empty chars to retrieve its terminal result.\nSession IDs: {}",
             serde_json::to_string(&ids).expect("shell session IDs are serializable"),
         ),
     ))
