@@ -729,7 +729,9 @@ mod tests {
         let poll = builtin_guide_spec("write_stdin").unwrap();
         assert!(poll.when_to_use.contains("Final results omit it"));
         assert!(poll.when_to_use.contains("your own newline"));
-        assert!(poll.when_to_use.contains("Running results retain session_id"));
+        assert!(poll
+            .when_to_use
+            .contains("Running results retain session_id"));
         assert!(poll
             .when_to_use
             .contains("A single unattended Root poll can wait longer"));
