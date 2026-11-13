@@ -157,6 +157,43 @@ pub(crate) fn same_permission_response_control(current: &Session, proposed: &Ses
             .all(|key| current.metadata.get(*key) == proposed.metadata.get(*key))
 }
 
+pub(crate) fn reject_consumed_permission_as_pending(
+    current: &Session,
+    proposed: &Session,
+) -> std::io::Result<()> {
+    let Some(question) = proposed.pending_question.as_ref() else {
+        return Ok(());
+    };
+    let occurrence = bamboo_domain::pending_permission_occurrence(proposed);
+    let consumed = current
+        .metadata
+        .get(CONSUMED_RESPONSE_OCCURRENCES_KEY)
+        .map(|raw| serde_json::from_str::<Vec<ResponseOccurrence>>(raw))
+        .transpose()?
+        .unwrap_or_default();
+    let reopens_consumed = consumed.iter().any(|entry| {
+        entry.permission_generation.is_some()
+            && match &occurrence {
+                Some(pending) => entry == pending,
+                // Runtime-only control projections have no transcript. Only
+                // canonical history can attest a new generation in that case.
+                None => {
+                    current.pending_question.as_ref() != Some(question)
+                        && entry.tool_call_id == question.tool_call_id
+                }
+            }
+    });
+    if reopens_consumed {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            bamboo_domain::SessionAuthorityConflict(
+                "permission response was already consumed".into(),
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Sidecar-only reads need Main only when the response's sidecar could be ahead.
 pub(crate) fn has_uncommitted_response_marker(side: &Session) -> bool {
     side.pending_question.is_none()

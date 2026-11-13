@@ -69,7 +69,7 @@ async fn independent_supervisor_writers_cannot_replace_an_unclaimed_permission_a
         .metadata
         .remove("clarification_resume_pending");
     for candidate in [
-        answer(stale, "allow_once"),
+        answer(stale.clone(), "allow_once"),
         without_invocation,
         without_resume,
     ] {
@@ -89,6 +89,7 @@ async fn independent_supervisor_writers_cannot_replace_an_unclaimed_permission_a
     assert!(!current
         .metadata
         .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+    reject_without_writes(&second, &stale).await;
 }
 
 fn directory(store: &SessionStoreV2) -> PathBuf {

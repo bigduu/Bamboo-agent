@@ -999,6 +999,18 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
                 .to_request(),
         )
         .await;
+        if corrupt {
+            assert_eq!(
+                response.status(),
+                actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+            );
+            fixture.settled(0, true).await;
+            let saved = fixture.reload().await;
+            assert!(saved
+                .metadata
+                .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+            continue;
+        }
         assert_eq!(response.status(), actix_web::http::StatusCode::OK);
         let body: Value = test::read_body_json(response).await;
         assert_eq!(body["success"], true);
@@ -1012,7 +1024,7 @@ async fn server_native_typed_supervisor_approval_fixture_replay_body() {
         // The HTTP reply only confirms that auto-resume started. A concurrent
         // Supervisor save may briefly hold a Prepared proof, which readers
         // correctly reject until the final runtime/proof commit completes.
-        fixture.settled(usize::from(!corrupt), corrupt).await;
+        fixture.settled(1, false).await;
         let completed = fixture.reload().await;
         let result = completed
             .messages

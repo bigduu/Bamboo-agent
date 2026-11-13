@@ -528,7 +528,7 @@ impl AppStateResumeRef {
                     ApprovalReplayDecision::BlockedByRootToolAuthority
                         | ApprovalReplayDecision::BlockedByUnavailableTool
                 );
-                let Some(execution_reservation) = claim_once_response_handoff(
+                let Some(reservation) = claim_once_response_handoff(
                     &state,
                     &mut session,
                     execution_reservation,
@@ -539,6 +539,7 @@ impl AppStateResumeRef {
                 else {
                     return;
                 };
+                execution_reservation = reservation;
 
                 session.metadata.remove(PERMISSION_REEXECUTE_METADATA_KEY);
                 session

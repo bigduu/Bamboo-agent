@@ -7524,6 +7524,7 @@ impl SessionStoreV2 {
         {
             reject_incompatible_session_write(&durable)?;
             reject_conversation_generation_change(session, &durable)?;
+            crate::session_merge::reject_consumed_permission_as_pending(&durable, session)?;
             let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
             let marker = durable.metadata.get(marker_key);
             if (marker.is_some() || session.metadata.contains_key(marker_key))
@@ -7823,6 +7824,7 @@ impl SessionStoreV2 {
         };
 
         if let Some(previous) = previous_main.as_ref() {
+            crate::session_merge::reject_consumed_permission_as_pending(previous, session)?;
             let marker_key = bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY;
             let prior = previous.metadata.get(marker_key);
             let proposed = session.metadata.get(marker_key);
