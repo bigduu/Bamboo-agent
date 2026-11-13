@@ -2413,9 +2413,12 @@ pub(in crate::app_state) async fn exercise_ordinary_approval_handoff(
             .session_store
             .interrupt_response_publication_for_test(ROOT_A);
         let error = decision(final_decision).await.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("injected response publication interruption"));
+        assert!(
+            error
+                .to_string()
+                .contains("Permission response was saved but execution could not be confirmed"),
+            "{error}"
+        );
         assert!(!std::path::Path::new(&file).exists());
         let committed = load(state, ROOT_A).await;
         assert!(committed.pending_question.is_none());

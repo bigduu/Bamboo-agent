@@ -36,7 +36,7 @@ async fn independent_supervisor_writers_cannot_replace_an_unclaimed_permission_a
     );
     first.save_session(&parked).await.unwrap();
     let second = SessionStoreV2::new(home.path().into()).await.unwrap();
-    let stale = authority(&second).await;
+    let stale = second.load_session(&parked.id).await.unwrap().unwrap();
     let occurrence = bamboo_domain::pending_permission_occurrence(&parked).unwrap();
     let answer = |mut session: Session, kind: &str| {
         session.clear_pending_question();
@@ -84,7 +84,7 @@ async fn independent_supervisor_writers_cannot_replace_an_unclaimed_permission_a
         .claim_once_response_handoff(&winner, None, None)
         .await
         .unwrap();
-    let current = authority(&second).await;
+    let current = second.load_session(&winner.id).await.unwrap().unwrap();
     assert_eq!(current.messages.last().unwrap().content, "deny_once");
     assert!(!current
         .metadata
@@ -102,6 +102,22 @@ async fn independent_supervisor_writers_cannot_replace_an_unclaimed_permission_a
         "original".into(),
     );
     reject_without_writes(&second, &stale_answer).await;
+
+    let mut later = current;
+    later.add_message(Message::tool_result("call", "Please clarify."));
+    later.set_pending_question_with_source(
+        "call".into(),
+        "ask_user".into(),
+        "Continue?".into(),
+        vec!["Yes".into(), "No".into()],
+        false,
+        bamboo_domain::PendingQuestionSource::PauseTool,
+    );
+    second.save_session(&later).await.unwrap();
+    assert_eq!(
+        authority(&second).await.pending_question,
+        later.pending_question
+    );
 }
 
 fn directory(store: &SessionStoreV2) -> PathBuf {

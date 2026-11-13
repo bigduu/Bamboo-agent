@@ -166,14 +166,11 @@ pub(crate) fn reject_stale_permission_response(
         return Ok(());
     };
     let consumed: Vec<ResponseOccurrence> = serde_json::from_str(raw)?;
-    let occurrence = if runtime_only {
-        proposed
-            .pending_question
-            .as_ref()
-            .and_then(|question| latest_response_occurrence(current, &question.tool_call_id))
-    } else {
-        bamboo_domain::pending_permission_occurrence(proposed)
-    };
+    let history = if runtime_only { current } else { proposed };
+    let occurrence = proposed
+        .pending_question
+        .as_ref()
+        .and_then(|question| latest_response_occurrence(history, &question.tool_call_id));
     let replay_call_key = PERMISSION_REPLAY_KEYS[0];
     let replay_generation_key = PERMISSION_REPLAY_KEYS[1];
     let replay_call = proposed.metadata.get(replay_call_key);

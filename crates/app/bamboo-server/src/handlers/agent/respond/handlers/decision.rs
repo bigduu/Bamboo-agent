@@ -1159,6 +1159,21 @@ mod tests {
         }
     }
 
+    async fn decision_test_host(path: &std::path::Path) -> web::Data<AppState> {
+        let mut config = bamboo_llm::Config::from_data_dir(Some(path.into()));
+        config.provider = "openai".into();
+        config
+            .memory_mut()
+            .get_or_insert_with(Default::default)
+            .auto_dream_enabled = false;
+        let provider = Arc::new(CompatibilityPermissionProbe::default());
+        let state = AppState::new_with_provider(path.into(), config, provider.clone())
+            .await
+            .unwrap();
+        state.provider_registry.insert("openai".into(), provider);
+        web::Data::new(state)
+    }
+
     async fn assert_future_cached_response(decision_kind: Option<PermissionDecisionKind>) {
         let dir = tempfile::tempdir().unwrap();
         let mut config = bamboo_llm::Config::from_data_dir(Some(dir.path().into()));
@@ -1458,19 +1473,11 @@ mod tests {
                 }]),
             ),
         );
-        let initial = web::Data::new(
-            AppState::new(dir.path().to_path_buf())
-                .await
-                .expect("initial app state"),
-        );
+        let initial = decision_test_host(dir.path()).await;
         initial.save_and_cache_session(&mut session).await;
         drop(initial);
 
-        let restarted = web::Data::new(
-            AppState::new(dir.path().to_path_buf())
-                .await
-                .expect("restarted app state"),
-        );
+        let restarted = decision_test_host(dir.path()).await;
         let preview = super::super::pending::get_pending_question(
             restarted.clone(),
             web::Path::from(session_id.to_string()),
@@ -1794,11 +1801,7 @@ mod tests {
     #[actix_web::test]
     async fn first_decision_returns_submit_response_auto_resume_status() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let state = web::Data::new(
-            AppState::new(dir.path().to_path_buf())
-                .await
-                .expect("app state"),
-        );
+        let state = decision_test_host(dir.path()).await;
         let session_id = "permission-decision-resume-status";
         let request_id = "permission-request-1";
         let request = test_permission_request(
@@ -1844,9 +1847,68 @@ mod tests {
     }
 
     #[actix_web::test]
+    async fn missing_resume_provider_leaves_committed_decision_available_for_retry() {
+        let home = tempfile::tempdir().unwrap();
+        let state = decision_test_host(home.path()).await;
+        let provider = state.provider_registry.remove("openai").unwrap();
+        let request = test_permission_request(
+            "once-retry-missing-provider",
+            "parked-call",
+            0,
+            PermissionRequest::forced_decisions(),
+        );
+        let mut session = parked_permission_session(&request);
+        state.save_and_cache_session(&mut session).await;
+        let decision = PermissionDecision {
+            request_id: request.request_id,
+            request_generation: request.request_generation,
+            decision: PermissionDecisionKind::DenyOnce,
+            matcher_id: None,
+            expected_policy_revision: None,
+            confirm_global: false,
+        };
+        let failed = submit_permission_decision(
+            state.clone(),
+            web::Path::from(session.id.clone()),
+            web::Json(decision.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            failed.status(),
+            actix_web::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        let saved = state
+            .storage
+            .load_session(&session.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(saved.pending_question.is_none());
+        assert!(saved
+            .metadata
+            .contains_key(bamboo_domain::ONCE_RESPONSE_HANDOFF_KEY));
+        state.provider_registry.insert("openai".into(), provider);
+        let retry = submit_permission_decision(
+            state.clone(),
+            web::Path::from(session.id.clone()),
+            web::Json(decision),
+        )
+        .await
+        .unwrap();
+        assert_eq!(retry.status(), actix_web::http::StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&actix_web::body::to_bytes(retry.into_body()).await.unwrap())
+                .unwrap();
+        assert_eq!(body["replayed"], true);
+        assert_eq!(body["auto_resume_status"], "started");
+        state.shutdown().await;
+    }
+
+    #[actix_web::test]
     async fn failed_once_response_commit_preserves_the_exact_pending_decision() {
         let dir = tempfile::tempdir().unwrap();
-        let state = web::Data::new(AppState::new(dir.path().into()).await.unwrap());
+        let state = decision_test_host(dir.path()).await;
         let request = test_permission_request(
             "permission-commit-failure",
             "permission-request",
@@ -1944,7 +2006,7 @@ mod tests {
         state.shutdown().await;
         drop(state);
 
-        let reopened = web::Data::new(AppState::new(dir.path().into()).await.unwrap());
+        let reopened = decision_test_host(dir.path()).await;
         let mut deny = decision.clone();
         deny.decision = PermissionDecisionKind::DenyOnce;
         reopened
@@ -2006,7 +2068,7 @@ mod tests {
         reopened.shutdown().await;
         drop(reopened);
 
-        let reopened = web::Data::new(AppState::new(dir.path().into()).await.unwrap());
+        let reopened = decision_test_host(dir.path()).await;
         let response = submit_permission_decision(
             reopened.clone(),
             web::Path::from(session.id.clone()),
@@ -2035,11 +2097,7 @@ mod tests {
     #[actix_web::test]
     async fn direct_typed_decision_recovers_durable_request_after_map_loss() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let state = web::Data::new(
-            AppState::new(dir.path().to_path_buf())
-                .await
-                .expect("app state"),
-        );
+        let state = decision_test_host(dir.path()).await;
         let session_id = "permission-direct-after-map-loss";
         let request_id = "permission-request-durable";
         let request = PermissionRequest {
@@ -2114,11 +2172,7 @@ mod tests {
         drop(config);
         drop(state);
 
-        let restarted = web::Data::new(
-            AppState::new(dir.path().to_path_buf())
-                .await
-                .expect("restarted app state"),
-        );
+        let restarted = decision_test_host(dir.path()).await;
         let response = submit_permission_decision(
             restarted,
             web::Path::from(session_id.to_string()),
@@ -2229,11 +2283,7 @@ mod tests {
     #[actix_web::test]
     async fn stale_contract_narrows_to_explicit_deny_choices_when_policy_now_denies() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let state = web::Data::new(
-            AppState::new(dir.path().to_path_buf())
-                .await
-                .expect("app state"),
-        );
+        let state = decision_test_host(dir.path()).await;
         let session_id = "permission-stale-deny";
         let request_id = "permission-stale-deny-request";
         let request = test_permission_request(
