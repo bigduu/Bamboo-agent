@@ -640,14 +640,7 @@ async fn fixture(case: Case) {
             if matches!(case, Case::Write | Case::Unassigned) {
                 assert_eq!(
                     names,
-                    std::collections::BTreeSet::from([
-                        "exec_command",
-                        "write_stdin",
-                        "Edit",
-                        "Glob",
-                        "Read",
-                        "Write",
-                    ])
+                    std::collections::BTreeSet::from(["bash", "Edit", "Glob", "Read", "Write",])
                 );
             } else {
                 assert!(names.contains("Grep"), "legacy surface unchanged");

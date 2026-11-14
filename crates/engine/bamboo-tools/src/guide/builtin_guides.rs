@@ -51,7 +51,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             "Read",
             ToolCategory::FileReading,
             "Use for reading file contents, especially before Edit/Write on existing files.",
-            "Do not use for writing or cross-project search; do not substitute exec_command cat/head/tail for this.",
+            "Use this for file contents, and use Edit or Write to change files.",
             &["Edit", "Write", "Grep"],
             vec![example(
                 "Read a config file",
@@ -261,7 +261,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Retrieve the session's current workspace directory. (Alias for Workspace with no path argument.)",
             "Do not use when absolute paths are already known.",
-            &["Workspace", "exec_command", "Read"],
+            &["Workspace", "Read"],
             vec![example(
                 "Inspect working directory",
                 json!({}),
@@ -382,7 +382,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Change the current session workspace. (Alias for Workspace with path argument.)",
             "Do not use with non-directory or missing paths.",
-            &["Workspace", "exec_command", "Read"],
+            &["Workspace", "Read"],
             vec![example(
                 "Switch session workspace",
                 json!({"path":"/workspace/project"}),
@@ -395,7 +395,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Get or set the current session workspace directory. Call without 'path' to read the current workspace; call with 'path' to change it.",
             "Do not set workspace to a non-directory or missing path.",
-            &["exec_command", "Read"],
+            &["Read"],
             vec![
                 example(
                     "Get current workspace",
@@ -414,7 +414,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::UserInteraction,
             "Request one or more remembered permission scopes through independent typed decisions. Batch entries are reviewed one at a time.",
             "Do not use this for a one-shot operation: invoke the target tool directly so Allow once is bound to that exact tool-call occurrence.",
-            &["Write", "Edit", "exec_command", "WebFetch"],
+            &["Write", "Edit", "WebFetch"],
             vec![example(
                 "Request remembered file-write permission",
                 json!({"reason":"Need to write deployment config to /etc/nginx","permissions":[{"type":"write_file","resource":"/etc/nginx/conf.d/*"}]}),
@@ -426,7 +426,7 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
             ToolCategory::CommandExecution,
             "Pause briefly when waiting for an external state change before polling again.",
             "Do not use for normal reasoning pauses or long waits when another tool can fetch status directly.",
-            &["write_stdin", "WebFetch"],
+            &["WebFetch"],
             vec![example(
                 "Wait before next poll",
                 json!({"seconds":2,"reason":"wait for background process output"}),

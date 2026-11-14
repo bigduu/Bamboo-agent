@@ -4788,6 +4788,8 @@ impl Config {
         self.disabled_tool_references()
             .into_iter()
             .map(|reference| normalize_tool_ref(&reference).unwrap_or(reference))
+            // This compatibility facade predates the exact lowercase tool.
+            .map(|name| if name == "bash" { "Bash".into() } else { name })
             .collect()
     }
 

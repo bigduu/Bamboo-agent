@@ -281,13 +281,14 @@ fn deserialize_project_observation<'de, D: serde::Deserializer<'de>>(
 }
 
 impl NativeToolCeiling {
-    pub const NAMES: [&'static str; 8] = [
+    pub const NAMES: [&'static str; 9] = [
         "Bash",
         "Edit",
         "Glob",
         "Read",
         "Task",
         "Write",
+        "bash",
         "exec_command",
         "write_stdin",
     ];

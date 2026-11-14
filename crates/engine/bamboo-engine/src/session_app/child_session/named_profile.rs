@@ -10,21 +10,24 @@ use super::ChildSessionError;
 pub const NAMED_PROFILE_BINDING_KEY: &str = "child.named_profile.v1";
 /// Host creator signal derived from the existing explicit create.model input.
 pub const PROFILE_EXPLICIT_MODEL_KEY: &str = "child.named_profile.explicit_model.v1";
-const NATIVE_NAMES: [&str; 7] = [
+const NATIVE_NAMES: [&str; 8] = [
     "Bash",
     "exec_command",
     "write_stdin",
+    "bash",
     "Edit",
     "Glob",
     "Read",
     "Write",
 ];
 
-/// Legacy Bash declarations cover starting and continuing model-polled shells.
+/// Legacy start-command declarations also cover the foreground shell.
 /// Apply only while resolving source declarations; frozen grants stay exact.
 fn declares_tool(declarations: &[String], tool: &str) -> bool {
-    declarations.iter().any(|name| {
-        name == tool || (name == "Bash" && matches!(tool, "exec_command" | "write_stdin"))
+    declarations.iter().any(|name| match name.as_str() {
+        "Bash" => matches!(tool, "Bash" | "bash" | "exec_command" | "write_stdin"),
+        "exec_command" => matches!(tool, "exec_command" | "bash"),
+        name => name == tool,
     })
 }
 
@@ -454,6 +457,7 @@ mod tests {
                     "Bash",
                     "exec_command",
                     "write_stdin",
+                    "bash",
                     "Edit",
                     "Glob",
                     "Read",
@@ -462,11 +466,11 @@ mod tests {
             ),
             (
                 "tools:\n  allow: [Bash]",
-                vec!["Bash", "exec_command", "write_stdin"],
+                vec!["Bash", "exec_command", "write_stdin", "bash"],
             ),
             (
                 "tools:\n  allow: [exec_command, write_stdin]",
-                vec!["exec_command", "write_stdin"],
+                vec!["exec_command", "write_stdin", "bash"],
             ),
             (
                 "tools:\n  allow: [exec_command, write_stdin, Read]\n  deny: [Bash]",

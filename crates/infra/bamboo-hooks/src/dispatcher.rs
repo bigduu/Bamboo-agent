@@ -132,7 +132,7 @@ impl HookDispatcher {
     ) -> HookDispatchReport {
         let mut report = HookDispatchReport::default();
         let resolved_shell = resolved_tool_name
-            .filter(|name| matches!(*name, "exec_command" | "write_stdin"))
+            .filter(|name| matches!(*name, "bash" | "exec_command" | "write_stdin"))
             .and_then(|name| {
                 let mut resolved = payload.clone();
                 match &mut resolved {
@@ -144,11 +144,18 @@ impl HookDispatcher {
                     _ => None,
                 }
             });
+        let resolved_payload = resolved_shell.as_ref().unwrap_or(payload);
         let legacy = crate::shell_compatibility::legacy_shell_projections(
-            resolved_shell.as_ref().unwrap_or(payload),
+            resolved_payload,
             session,
             original_tool_input,
         );
+        let compatibility_match_limit =
+            if crate::shell_compatibility::foreground_bash_hook(resolved_payload) {
+                1
+            } else {
+                legacy.len()
+            };
 
         let complete_operation_checks = crate::requires_complete_shell_policy_checks(
             point,
@@ -177,6 +184,7 @@ impl HookDispatcher {
                 legacy
                     .iter()
                     .filter(|projected| hook.matches(&projected.payload))
+                    .take(compatibility_match_limit)
                     .map(|projected| (&projected.payload, projected.restriction_only))
                     .collect()
             };
@@ -654,6 +662,47 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn foreground_bash_runs_each_legacy_policy_once_and_deny_wins_over_ask() {
+        let mut dispatcher = HookDispatcher::new();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let deny = HookResult::Deny {
+            reason: "existing Bash restriction".into(),
+        };
+        for (matcher, result) in [
+            ("^(exec_command|Bash)$", HookResult::Ask),
+            ("^Bash$", deny.clone()),
+        ] {
+            dispatcher.register(Arc::new(RecordingHook {
+                point: AgentHookPoint::BeforeToolExecution,
+                matcher: regex::Regex::new(matcher).unwrap(),
+                seen: seen.clone(),
+                result,
+            }));
+        }
+        let payload = HookPayload::ToolExecution {
+            tool_name: "bash".into(),
+            tool_call_id: "foreground-call".into(),
+            parsed_args: json!({"command":"cargo test"}),
+        };
+        let report = dispatcher
+            .run_hooks(
+                AgentHookPoint::BeforeToolExecution,
+                &payload,
+                &Session::new("test", "model"),
+            )
+            .await;
+        assert_eq!(report.outcome.decision, deny);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2);
+        assert!(
+            matches!(&seen[0], HookPayload::ToolExecution { tool_name, .. } if tool_name == "exec_command")
+        );
+        assert!(
+            matches!(&seen[1], HookPayload::ToolExecution { tool_name, .. } if tool_name == "Bash")
+        );
     }
 
     #[tokio::test]

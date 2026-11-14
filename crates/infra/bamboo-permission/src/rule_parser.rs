@@ -208,11 +208,12 @@ impl ParsedRule {
         self.matches_tool_call_with_restrictions(tool_name, args, true)
     }
 
-    /// Legacy shell grants can authorize the narrower replacement API, but
-    /// replacement grants must not authorize legacy Bash's wider workdir scope.
+    /// A new shell grant cannot authorize either older API's extra parameters.
     pub(crate) fn matches_tool_call_for_allow(&self, tool_name: &str, args: &Value) -> bool {
-        if self.tool_name.eq_ignore_ascii_case("exec_command")
-            && tool_name.eq_ignore_ascii_case("Bash")
+        let allows_legacy_bash = tool_name.eq_ignore_ascii_case("Bash") && tool_name != "bash";
+        if (allows_legacy_bash
+            && (self.tool_name.eq_ignore_ascii_case("exec_command") || self.tool_name == "bash"))
+            || (self.tool_name == "bash" && tool_name.eq_ignore_ascii_case("exec_command"))
         {
             return false;
         }

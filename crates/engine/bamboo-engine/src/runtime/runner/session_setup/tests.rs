@@ -1485,6 +1485,71 @@ fn classified_catalog_drives_legacy_projection_without_hiding_deferred_tools() {
 }
 
 #[test]
+fn default_models_use_foreground_bash_and_resident_view_image() {
+    let config = crate::runtime::config::AgentLoopConfig::default();
+    let tools = bamboo_tools::BuiltinToolExecutor::new();
+    let session = Session::new("foreground-bash-catalog", "model");
+    let catalog = resolve_classified_tool_catalog_for_session(&config, &tools, &session);
+    let discovery =
+        crate::capability_discovery::project_classified_tool_capability_metadata(&catalog);
+    for mode in [
+        CapabilityLoadingMode::LegacyFullCatalog,
+        CapabilityLoadingMode::Progressive,
+        CapabilityLoadingMode::StickyFallback,
+    ] {
+        let callable = EffectiveCallableSet::from_catalog(
+            &catalog,
+            mode,
+            ["exec_command", "write_stdin", "default::write_stdin"],
+        );
+        assert!(callable.contains_execution_name("bash"));
+        assert!(callable.contains_execution_name("ViewImage"));
+        for retired in [
+            "Bash",
+            "exec_command",
+            "write_stdin",
+            "default::write_stdin",
+        ] {
+            assert!(
+                callable.resolve_callable_reference(retired).is_none(),
+                "{retired}"
+            );
+            assert!(!discovery
+                .iter()
+                .any(|entry| entry.canonical_name == retired));
+        }
+    }
+    let (prompt, sections) = build_stable_prompt_frame_with_sections(
+        &session,
+        &config,
+        &resolve_available_tool_schemas_for_session(&config, &tools, &session),
+        &Default::default(),
+    );
+    assert!(!prompt.stable_instructions.contains("write_stdin"));
+    let guide = sections
+        .iter()
+        .find(|section| section.name == "tool_guide")
+        .unwrap();
+    assert!(!guide.content.contains("write_stdin"));
+    assert!(!guide.content.contains("exec_command"));
+
+    for disabled in ["bash", "Bash", "exec_command"] {
+        let config = crate::runtime::config::AgentLoopConfig {
+            disabled_tools: [disabled.into()].into(),
+            ..Default::default()
+        };
+        let schemas = resolve_available_tool_schemas_for_session(&config, &tools, &session);
+        assert!(
+            !schemas.iter().any(|schema| matches!(
+                schema.function.name.as_str(),
+                "bash" | "exec_command" | "write_stdin"
+            )),
+            "{disabled}"
+        );
+    }
+}
+
+#[test]
 fn progressive_effective_set_intersects_final_session_eligible_catalog() {
     let config = crate::runtime::config::AgentLoopConfig {
         disabled_tools: std::collections::BTreeSet::from(["Glob".to_string()]),
