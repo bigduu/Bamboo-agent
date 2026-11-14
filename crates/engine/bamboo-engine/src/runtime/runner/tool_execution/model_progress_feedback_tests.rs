@@ -17,7 +17,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::{AgentLoopConfig, PromptMemoryFlags};
 
-use super::REPEATED_TOOL_ADVISORY_PREFIX;
+use super::policy::REPEATED_TOOL_ADVISORY_PREFIX;
 
 const FINAL_ANSWER: &str = "I can use the evidence already collected.";
 

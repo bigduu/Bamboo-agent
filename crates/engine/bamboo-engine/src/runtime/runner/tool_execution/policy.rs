@@ -11,7 +11,7 @@ const UNCHANGED_OBSERVATION_ROUNDS: usize = 3;
 const REPEATED_TOOL_CALLS: usize = 3;
 const MAX_TRACKED_OBSERVATIONS: usize = 80;
 const SUBAGENT_INSPECTION_LABEL: &str = "SubAgent (inspect)";
-pub(crate) const REPEATED_TOOL_ADVISORY_PREFIX: &str = "[Runtime tool advisory] ";
+const REPEATED_TOOL_ADVISORY_PREFIX: &str = "[Runtime tool advisory] ";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ToolCircuitKey {
@@ -41,7 +41,6 @@ struct ObservationProgress {
     previous: Option<BTreeSet<[u8; 32]>>,
     unchanged_rounds: usize,
     last_round: Option<usize>,
-    made_progress: bool,
 }
 
 impl ObservationProgress {
@@ -55,7 +54,6 @@ impl ObservationProgress {
         }
         self.last_round = Some(round);
         self.current = Some(BTreeSet::new());
-        self.made_progress = false;
     }
 
     fn observe(&mut self, call: &ToolCall, outcome: &Result<ToolResult, String>) {
@@ -100,9 +98,6 @@ impl ObservationProgress {
 
     fn finish_round(&mut self) -> Option<&'static str> {
         let current = self.current.take().filter(|round| !round.is_empty());
-        self.made_progress = current
-            .as_ref()
-            .is_some_and(|round| self.previous.as_ref() != Some(round));
         self.unchanged_rounds = match &current {
             Some(round) if self.previous.as_ref() == Some(round) => {
                 self.unchanged_rounds.saturating_add(1)
@@ -388,7 +383,6 @@ pub(crate) struct ToolPolicyGuard {
     pub(super) standalone_supervisor_spawn: bool,
     pub(super) child_inspections: super::child_inspection::ChildInspectionProgress,
     pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
-    progress_feedback: super::progress_feedback::ProgressFeedbackBudget,
 }
 
 impl ToolPolicyGuard {
@@ -406,7 +400,6 @@ impl ToolPolicyGuard {
             standalone_supervisor_spawn: false,
             child_inspections: super::child_inspection::ChildInspectionProgress::default(),
             quiet_polls: super::quiet_poll::QuietPollGuard::default(),
-            progress_feedback: super::progress_feedback::ProgressFeedbackBudget::default(),
         }
     }
 
@@ -502,33 +495,28 @@ impl ToolPolicyGuard {
             )
         {
             self.quiet_polls.forget_handle(handle);
-            self.progress_feedback.observe_exec_completion(handle);
             Some(handle)
         } else {
             None
         }
     }
 
-    /// Send ordinary repetition as advice. Only quiet command recovery can
-    /// exhaust the diagnostic allowance.
-    pub(crate) fn feedback_for_next_round(
-        &mut self,
-        active: bool,
-    ) -> super::progress_feedback::FeedbackDecision {
-        use super::progress_feedback::FeedbackDecision;
+    /// Emit a quiet-command advisory only when a new group of polls qualifies.
+    /// Consuming that evidence also releases suppression for the next batch.
+    pub(crate) fn feedback_for_next_round(&mut self, quiet_poll_active: bool) -> Option<String> {
         let file_hint = self.observation_progress.finish_round();
-        if active {
-            let quiet_evidence = self.quiet_polls.take_feedback_evidence();
-            let made_progress = self.observation_progress.made_progress
-                || self.quiet_polls.take_observed_progress();
-            let feedback = self
-                .progress_feedback
-                .next_round(quiet_evidence, made_progress);
-            if feedback != FeedbackDecision::Continue(None) {
-                return feedback;
-            }
+        let quiet_advisory = if quiet_poll_active {
+            self.quiet_polls
+                .take_feedback_evidence()
+                .map(super::progress_feedback::render_quiet_command_advisory)
+        } else {
+            None
+        };
+        let repeated_advisory = self.repeated_tool_calls.advisory(file_hint);
+        match (repeated_advisory, quiet_advisory) {
+            (Some(repeated), Some(quiet)) => Some(format!("{repeated}\n\n{quiet}")),
+            (repeated, quiet) => repeated.or(quiet),
         }
-        FeedbackDecision::Continue(self.repeated_tool_calls.advisory(file_hint))
     }
 
     pub(crate) fn reset_observation_progress(&mut self) {
@@ -536,7 +524,6 @@ impl ToolPolicyGuard {
         self.repeated_tool_calls = RepeatedToolCalls::default();
         self.child_inspections = super::child_inspection::ChildInspectionProgress::default();
         self.quiet_polls = super::quiet_poll::QuietPollGuard::default();
-        self.progress_feedback.reset_for_human_input();
     }
 
     #[cfg(test)]

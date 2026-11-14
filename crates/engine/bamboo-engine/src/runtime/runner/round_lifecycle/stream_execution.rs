@@ -982,20 +982,6 @@ fn build_request_envelope_reconciled_for_loading_mode(
             conversation_messages.push(message.clone());
         }
     }
-    let tool_advisory = observation_progress_hint.filter(|hint| {
-        hint.starts_with(crate::runtime::runner::tool_execution::REPEATED_TOOL_ADVISORY_PREFIX)
-    });
-    // Recovery packets keep their existing position in the context ledger.
-    if let Some(hint) = observation_progress_hint.filter(|_| tool_advisory.is_none()) {
-        let mut message = Message::user(hint);
-        if crate::runtime::runner::tool_execution::is_required_progress_feedback(hint) {
-            message.metadata = Some(
-                serde_json::json!({"runtime_kind":"observation_progress_feedback", "source":"runtime"}),
-            );
-        }
-        conversation_messages.push(message);
-    }
-
     // Canonical prompt structure — where Bamboo OWNS assembly and providers are
     // pure adapters.
     //
@@ -1176,7 +1162,7 @@ fn build_request_envelope_reconciled_for_loading_mode(
     let mut model_transcript = ledger.transcript;
     // One-shot advice follows the tool batch on the wire. It is not an item in
     // the durable transcript, where dropping it would reset the cache epoch.
-    if let Some(advisory) = tool_advisory {
+    if let Some(advisory) = observation_progress_hint {
         model_transcript.push(Message::user(advisory));
     }
     if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
@@ -1586,12 +1572,9 @@ pub(super) async fn execute_llm_stream(
         {
             session.model_context_state = previous_model_context_state;
             session.provider_transcript = previous_provider_transcript;
-            // Optional advice can be omitted, but the exact recovery
-            // control facts must reach the model or fail before dispatch. A
-            // budget retry must never silently claim that feedback was sent.
-            let required_progress_feedback = observation_progress_hint
-                .is_some_and(crate::runtime::runner::tool_execution::is_required_progress_feedback);
-            if !required_progress_feedback && observation_progress_hint.take().is_some() {
+            // Keep the original request when the optional advisory exceeds
+            // the available context.
+            if observation_progress_hint.take().is_some() {
                 continue;
             }
             return Err(AgentError::Budget(format!(

@@ -1513,7 +1513,7 @@ async fn maybe_background_quiet_exec(
     event_tx: &mpsc::Sender<AgentEvent>,
     handle: &str,
 ) -> Result<bool, AgentError> {
-    if !crate::runtime::runner::tool_execution::progress_feedback_active(session, runtime, config) {
+    if !crate::runtime::runner::tool_execution::quiet_poll_guard_active(session, runtime, config) {
         return Ok(false);
     }
     if let Some(wait) = runtime.waiting_for_bash.as_ref() {
@@ -3640,12 +3640,12 @@ async fn run_pipeline_inner(
         }
         // Evaluate feedback after the real tool batch and any newly admitted
         // Human input. Quiet command recovery retains its existing handoff.
-        let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
+        let quiet_poll_active = crate::runtime::runner::tool_execution::quiet_poll_guard_active(
             session,
             &state.runtime_state,
             config,
         );
-        if feedback_active {
+        if quiet_poll_active {
             if let Some(handle) = tool_policy_guard.quiet_command_for_background() {
                 if maybe_background_quiet_exec(
                     session,
@@ -3661,24 +3661,7 @@ async fn run_pipeline_inner(
             }
         }
         let observation_progress_hint =
-            match tool_policy_guard.feedback_for_next_round(feedback_active) {
-                crate::runtime::runner::tool_execution::FeedbackDecision::Continue(hint) => hint,
-                crate::runtime::runner::tool_execution::FeedbackDecision::Exhausted {
-                    feedback,
-                    summary,
-                } => {
-                    crate::runtime::runner::tool_execution::finish_exhausted_progress(
-                        session,
-                        &state.runtime_state,
-                        event_tx,
-                        config,
-                        &feedback,
-                        &summary,
-                    )
-                    .await?;
-                    break;
-                }
-            };
+            tool_policy_guard.feedback_for_next_round(quiet_poll_active);
 
         // --- Task round state ---
         if let Some(ctx) = state.task_context.as_mut() {
