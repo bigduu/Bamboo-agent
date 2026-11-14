@@ -1,10 +1,10 @@
-//! Transient non-Vision image references. Original Session messages are never rewritten.
+//! Transient conversation image references derived from original Session parts.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bamboo_agent_core::storage::AttachmentReader;
-use bamboo_agent_core::{Message, MessagePart, Session, ToolError};
+use bamboo_agent_core::{AgentError, Message, MessagePart, Role, Session, ToolError};
 use bamboo_tools::tools::view_image::{ViewImageReferenceReader, MAX_VIEW_IMAGE_BYTES};
 use base64::Engine;
 
@@ -50,6 +50,64 @@ pub(crate) fn conversation_image_reference(
     } else {
         format!("bamboo-image://{session_id}/{message_id}/{part_index}")
     }
+}
+
+/// Materialize the newest tool images within the request budget. Keep
+/// references to the original Session parts for images that do not fit.
+pub(crate) async fn prepare_tool_images(
+    messages: &mut [Message],
+    session_id: &str,
+    attachment_reader: Option<&dyn AttachmentReader>,
+) -> Result<(), AgentError> {
+    let mut remaining = bamboo_llm::MAX_TOOL_IMAGE_URL_BYTES;
+    for message in messages
+        .iter_mut()
+        .rev()
+        .filter(|message| message.role == Role::Tool)
+    {
+        let Some(parts) = message.content_parts.take() else {
+            continue;
+        };
+        let mut retained = Vec::with_capacity(parts.len());
+        let mut references = Vec::new();
+        for (index, part) in parts.into_iter().enumerate().rev() {
+            let MessagePart::ImageUrl { mut image_url } = part else {
+                retained.push(part);
+                continue;
+            };
+            let resolved = match attachment_reader {
+                Some(reader) if remaining > 0 => {
+                    super::attachment_urls::resolve_attachment_image_url(&image_url.url, reader)
+                        .await?
+                }
+                _ => None,
+            };
+            let size = resolved.as_deref().unwrap_or(&image_url.url).len();
+            if size <= remaining {
+                remaining -= size;
+                if let Some(url) = resolved {
+                    image_url.url = url;
+                }
+                retained.push(MessagePart::ImageUrl { image_url });
+            } else {
+                references.push(conversation_image_reference(
+                    session_id,
+                    &message.id,
+                    index,
+                    &image_url.url,
+                ));
+            }
+        }
+        retained.reverse();
+        message.content_parts = (references.is_empty() || !retained.is_empty()).then_some(retained);
+        for reference in references.into_iter().rev() {
+            let arguments = serde_json::json!({"path": reference});
+            message.content.push_str(&format!(
+                "\n[Image retained in conversation history. If ViewImage is callable and supports the image, use {arguments}.]"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// This is a prepared-context projection, not a durable message or description.

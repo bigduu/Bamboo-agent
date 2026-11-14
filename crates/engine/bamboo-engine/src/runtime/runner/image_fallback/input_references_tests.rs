@@ -31,6 +31,60 @@ fn tool_ctx(session_id: &str) -> ToolCtx {
 }
 
 #[tokio::test]
+async fn tool_image_overflow_preserves_newest_image_and_reopens_an_older_reference() {
+    let mut session = Session::new("image-budget-session", "image");
+    let encoded = base64::engine::general_purpose::STANDARD.encode(PNG);
+    let older = Message::tool_result_with_images(
+        "older-call",
+        "older image",
+        true,
+        vec![bamboo_domain::ToolResultImage {
+            mime_type: "image/png".into(),
+            data: encoded.clone(),
+        }],
+    );
+    let older_reference =
+        conversation_image_reference(&session.id, &older.id, 0, "data:image/png;base64,");
+    let newer = Message::tool_result_with_images(
+        "newer-call",
+        "newer image",
+        true,
+        vec![bamboo_domain::ToolResultImage {
+            mime_type: "image/png".into(),
+            data: "A".repeat(bamboo_llm::MAX_TOOL_IMAGE_URL_BYTES - "data:image/png;base64,".len()),
+        }],
+    );
+    session.messages.extend([older, newer]);
+    let mut prepared = session.messages.clone();
+    assert!(bamboo_llm::validate_tool_image_budget(prepared.iter()).is_err());
+
+    prepare_tool_images(&mut prepared, &session.id, None)
+        .await
+        .unwrap();
+    assert!(bamboo_llm::validate_tool_image_budget(prepared.iter()).is_ok());
+    assert!(prepared[0].content.starts_with("older image"));
+    assert!(prepared[0].content.contains(&older_reference));
+    assert_eq!(prepared[0].tool_call_id.as_deref(), Some("older-call"));
+    assert!(prepared[0].content_parts.is_none());
+    assert_eq!(prepared[1].content_parts, session.messages[1].content_parts);
+    assert!(bamboo_llm::validate_tool_image_budget(session.messages.iter()).is_err());
+
+    let reader = image_reference_reader(&session, None);
+    let outcome = with_image_reference_reader(
+        &session.id,
+        reader,
+        ViewImageTool::new().invoke(json!({"path": older_reference}), tool_ctx(&session.id)),
+    )
+    .await
+    .unwrap();
+    let ToolOutcome::Completed(result) = outcome else {
+        panic!("completed image load")
+    };
+    assert!(result.success);
+    assert_eq!(result.images[0].data, encoded);
+}
+
+#[tokio::test]
 async fn uploaded_and_inline_history_images_remain_durable_and_resolve_without_temp_paths() {
     for inline_history in [false, true] {
         let home = tempfile::tempdir().unwrap();

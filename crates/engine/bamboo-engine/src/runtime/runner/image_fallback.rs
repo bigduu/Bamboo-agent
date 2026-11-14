@@ -15,7 +15,8 @@ mod input_references;
 #[cfg(test)]
 pub(crate) use input_references::conversation_image_reference;
 pub(crate) use input_references::{
-    image_reference_reader, project_nonvision_images, round_needs_image_references,
+    image_reference_reader, prepare_tool_images, project_nonvision_images,
+    round_needs_image_references,
 };
 mod legacy_target;
 #[cfg(windows)]

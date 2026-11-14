@@ -7,7 +7,8 @@ use bamboo_compression::PreparedContext;
 use bamboo_llm::LLMProvider;
 
 use super::super::super::image_fallback::{
-    apply_image_fallback_to_llm_messages_reusing, resolve_bamboo_attachments_for_llm,
+    apply_image_fallback_to_llm_messages_reusing, prepare_tool_images,
+    resolve_bamboo_attachments_for_llm,
 };
 
 pub(super) enum ImageProjection {
@@ -71,14 +72,30 @@ pub(super) async fn apply_message_transforms(
                 &mut prepared_context.messages,
                 session_id,
             );
+            return Ok(());
+        }
+        ImageProjection::LegacyFallback(ImageFallbackMode::Vision) => {
+            // Legacy Vision validates the budget before making auxiliary calls.
+            prepare_tool_images(
+                &mut prepared_context.messages,
+                session_id,
+                config.attachment_reader.as_deref(),
+            )
+            .await?;
+            return apply_image_fallback(config, prepared_context, llm).await;
         }
         ImageProjection::LegacyFallback(_) => {
             apply_image_fallback(config, prepared_context, llm).await?;
         }
         ImageProjection::Native => {}
     }
-    resolve_attachments(config, prepared_context).await?;
-    Ok(())
+    prepare_tool_images(
+        &mut prepared_context.messages,
+        session_id,
+        config.attachment_reader.as_deref(),
+    )
+    .await?;
+    resolve_attachments(config, prepared_context).await
 }
 
 fn normalize_tool_chains(messages: &mut Vec<Message>, session_id: &str) {
@@ -239,11 +256,140 @@ mod vision_tests {
             _: &[Message],
             _: &[bamboo_domain::ToolSchema],
             _: Option<u32>,
-            _: &str,
+            model: &str,
         ) -> bamboo_llm::provider::Result<bamboo_llm::LLMStream> {
-            panic!("no paid fallback during capability checks")
+            assert_eq!(model, "overflow-vision");
+            Ok(Box::pin(futures::stream::iter([Ok(
+                bamboo_llm::LLMChunk::Token("retained image description".into()),
+            )])))
         }
     }
+
+    #[tokio::test]
+    async fn tool_image_overflow_preserves_attachment_reference_on_native_and_legacy_vision() {
+        use bamboo_agent_core::storage::{AttachmentReader, Storage};
+        use bamboo_agent_core::Session;
+        use bamboo_domain::{FunctionCall, ImageUrlRef, MessagePart, ToolCall, ToolResultImage};
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            bamboo_storage::SessionStoreV2::new(directory.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let mut session = Session::new("tool-image-overflow", "vision");
+        store.save_session(&session).await.unwrap();
+        let png = [
+            b"\x89PNG\r\n\x1a\n".as_slice(),
+            b"fixture image bytes ".repeat(10).as_slice(),
+        ]
+        .concat();
+        let encoded = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png);
+        let (_, reference) = store
+            .write_image_attachment(&session, &encoded, Some("image/png"))
+            .await
+            .unwrap();
+        let call_id = "screenshots";
+        session.add_message(Message::assistant(
+            "",
+            Some(vec![ToolCall {
+                id: call_id.into(),
+                tool_type: "function".into(),
+                function: FunctionCall {
+                    name: "screenshot".into(),
+                    arguments: "{}".into(),
+                },
+            }]),
+        ));
+        let remaining = reference.len() + 1;
+        let mut tool_result = Message::tool_result_with_images(
+            call_id,
+            "original tool output",
+            true,
+            vec![ToolResultImage {
+                mime_type: "image/png".into(),
+                data: "A".repeat(
+                    bamboo_llm::MAX_TOOL_IMAGE_URL_BYTES
+                        - "data:image/png;base64,".len()
+                        - remaining,
+                ),
+            }],
+        );
+        tool_result.content_parts.as_mut().unwrap().insert(
+            0,
+            MessagePart::ImageUrl {
+                image_url: ImageUrlRef {
+                    url: reference.clone(),
+                    detail: None,
+                },
+            },
+        );
+        session.add_message(tool_result);
+        assert!(bamboo_llm::validate_tool_image_budget(session.messages.iter()).is_ok());
+
+        let attachment_reader: Arc<dyn AttachmentReader> = store;
+        let config = AgentLoopConfig {
+            attachment_reader: Some(attachment_reader.clone()),
+            image_fallback: Some(crate::runtime::config::ImageFallbackConfig {
+                mode: ImageFallbackMode::Vision,
+                vision_model: Some("overflow-vision".into()),
+            }),
+            ..Default::default()
+        };
+        let llm: Arc<dyn LLMProvider> = Arc::new(SwitchingProvider);
+        for (model, expected_vision_call) in [("image", false), ("old", true)] {
+            let mut prepared = PreparedContext {
+                messages: session.messages.clone(),
+                token_usage: bamboo_domain::TokenUsageBreakdown {
+                    system_tokens: 0,
+                    summary_tokens: 0,
+                    window_tokens: 0,
+                    total_tokens: 0,
+                    budget_limit: 1000,
+                },
+                truncation_occurred: false,
+                segments_removed: 0,
+                compressed_message_ids: vec![],
+                prompt_cached_tool_outputs: 0,
+                prompt_cached_tool_tokens_saved: 0,
+            };
+            apply_message_transforms(&config, &mut prepared, &llm, &session.id, model)
+                .await
+                .unwrap();
+            let result = prepared.messages.last().unwrap();
+            assert_eq!(result.tool_call_id.as_deref(), Some(call_id));
+            assert!(result.content.contains("original tool output"));
+            assert!(result.content.contains(&reference));
+            assert_eq!(
+                result.content.contains("retained image description"),
+                expected_vision_call,
+            );
+            let count = result.content_parts.as_ref().map_or(0, Vec::len);
+            assert_eq!(count, usize::from(!expected_vision_call));
+            assert!(bamboo_llm::validate_tool_image_budget(prepared.messages.iter()).is_ok());
+        }
+        let reader = super::super::super::super::image_fallback::image_reference_reader(
+            &session,
+            Some(attachment_reader),
+        );
+        assert_eq!(reader(reference).await.unwrap(), png);
+        assert_eq!(
+            session.messages.last().unwrap().content,
+            "original tool output"
+        );
+        assert_eq!(
+            session
+                .messages
+                .last()
+                .unwrap()
+                .content_parts
+                .as_ref()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn vision_model_switch_preserves_history_and_true_bypasses_legacy_fallback() {
         let image = Message::user_with_parts(
