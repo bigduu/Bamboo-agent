@@ -359,6 +359,9 @@ pub struct AppState {
     /// `state.tools_for(ToolSurface::Child)` for child sessions, etc.
     pub tool_factory: crate::tools::ToolSurfaceFactory,
 
+    #[cfg(test)]
+    legacy_shell_fixture_executor: Arc<bamboo_tools::BuiltinToolExecutor>,
+
     /// Shared tool-execution permission checker — the same `Arc` the tool
     /// executors use. Retained so request handlers can record session grants
     /// when the user approves a permission prompt (see the respond handler).

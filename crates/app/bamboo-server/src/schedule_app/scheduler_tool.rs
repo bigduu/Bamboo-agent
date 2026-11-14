@@ -708,8 +708,8 @@ mod tests {
             id: "scheduled-forced-ask".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "exec_command".to_string(),
-                arguments: serde_json::json!({"cmd": scheduled_command}).to_string(),
+                name: "bash".to_string(),
+                arguments: serde_json::json!({"command": scheduled_command}).to_string(),
             },
         };
         let first_call_started = Arc::new(Notify::new());
@@ -805,7 +805,7 @@ mod tests {
             id: "interactive-forced-ask".to_string(),
             tool_type: "function".to_string(),
             function: FunctionCall {
-                name: "Bash".to_string(),
+                name: "bash".to_string(),
                 arguments: serde_json::json!({"command": interactive_command}).to_string(),
             },
         };

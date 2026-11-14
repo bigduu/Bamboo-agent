@@ -103,6 +103,12 @@ pub(super) async fn stream(probe: &Probe, messages: &[Message]) -> Result<LLMStr
 
 async fn worker_before_delivery() {
     let f = Fixture::new_with_native_source(true).await;
+    // Exercise the existing background shell and its real process owner.
+    assert!(f
+        .state
+        .legacy_shell_fixture_executor
+        .registry()
+        .unregister("bash"));
     let gate = ReleaseGate(f.home.path().join(RELEASE_FILE));
     let mut source = load(&f.state, ROOT_A).await;
     source
