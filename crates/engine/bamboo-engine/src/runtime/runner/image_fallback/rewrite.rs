@@ -132,7 +132,15 @@ async fn apply_fallback_to_message(
             let rewritten =
                 rewrite_parts_via_vision(llm, vision_model, parts, failure_policy, focus, reuse)
                     .await?;
-            message.content = rewritten;
+            if message.role == bamboo_agent_core::Role::Tool
+                && failure_policy == VisionFailurePolicy::OmitImage
+            {
+                // The retained tool output and overflow references live in
+                // content. The Vision descriptions are additional evidence.
+                message.content.push_str(&rewritten);
+            } else {
+                message.content = rewritten;
+            }
             message.content_parts = None;
             Ok(())
         }

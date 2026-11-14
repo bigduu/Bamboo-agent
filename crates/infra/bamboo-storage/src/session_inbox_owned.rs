@@ -1313,6 +1313,11 @@ impl FileSessionInbox {
         let actual_request;
         let request = if self.root_owner.is_some() || self.child_owner.is_some() {
             let now = Utc::now();
+            if expires_at <= now {
+                // No queue operation has started. A live owner can submit a
+                // fresh bounded request after dropping these physical guards.
+                return Err(SessionInboxError::ClaimLeaseExpired);
+            }
             actual_request = SessionInboxLeaseRequest {
                 consumer: request.consumer.clone(),
                 now,
