@@ -6,7 +6,8 @@ use serde_json::json;
 
 use super::{ToolCategory, ToolExample, ToolGuide, ToolGuideSpec};
 
-pub const BUILTIN_GUIDE_NAMES: [&str; 18] = [
+pub const BUILTIN_GUIDE_NAMES: [&str; 19] = [
+    "bash",
     "exec_command",
     "write_stdin",
     "Edit",
@@ -117,6 +118,18 @@ pub fn builtin_guide_spec(tool_name: &str) -> Option<ToolGuideSpec> {
                 "Find function usages",
                 json!({"pattern":"execute_with_context","glob":"**/*.rs","output_mode":"files_with_matches","head_limit":200}),
                 "First identify candidate files, then use Read or scoped content mode.",
+            )],
+        )),
+        "bash" => Some(guide(
+            "bash",
+            ToolCategory::CommandExecution,
+            "Run terminal commands in this session's working directory. The result includes combined output when the command exits. Set timeout in seconds when a command needs a time limit.",
+            "Use dedicated file tools for reading, editing, and searching when available.",
+            &[],
+            vec![example(
+                "Run tests",
+                json!({"command":"cargo test","timeout":120}),
+                "The command reports a nonzero exit as a failure.",
             )],
         )),
         "exec_command" => Some(guide(
