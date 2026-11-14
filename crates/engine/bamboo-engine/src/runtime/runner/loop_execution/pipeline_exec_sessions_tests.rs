@@ -14,6 +14,12 @@ use serde_json::{json, Value};
 #[path = "pipeline_background_exec_tests.rs"]
 mod background_exec_tests;
 
+fn yielding_executor() -> bamboo_tools::BuiltinToolExecutor {
+    let executor = bamboo_tools::BuiltinToolExecutor::new();
+    assert!(executor.registry().unregister("bash"));
+    executor
+}
+
 // Release the command even when an assertion unwinds before the explicit poll.
 struct ReleaseGate(PathBuf);
 
@@ -252,7 +258,7 @@ async fn quiet_feedback_fixture(finish_after_feedback: bool) {
     });
     // Let the fixture model decide when to finish.
     config.run_budget.max_rounds = None;
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let executor = Arc::new(yielding_executor());
     let mut side_ctx = ToolCtx::none("side-start");
     side_ctx.session_id = Some(Arc::from(session.id.as_str()));
     let ToolOutcome::Completed(side) = executor
@@ -470,7 +476,7 @@ impl LLMProvider for CancelledPollProvider {
 #[tokio::test]
 async fn cancelling_the_runner_during_a_poll_keeps_the_delivered_command_readable() {
     let (mut session, config, mut state) = fixture("cancel-quiet-poll");
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let executor = Arc::new(yielding_executor());
     let mut ctx = ToolCtx::none("cancel-start");
     ctx.session_id = Some(Arc::from(session.id.as_str()));
     let ToolOutcome::Completed(start) = executor
@@ -721,7 +727,7 @@ async fn model_pulls_exec_completion_as_tool_result_without_a_runtime_user_notif
     let completion = Arc::new(CompletionRecorder::default());
     config.bash_resume_hook = Some(resume.clone());
     config.bash_completion_sink = Some(completion.clone());
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let executor = Arc::new(yielding_executor());
     let (tx, _rx) = mpsc::channel(256);
     let cancel = CancellationToken::new();
     let complete = tokio::time::timeout(

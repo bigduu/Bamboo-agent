@@ -108,8 +108,8 @@ async fn provider(body: web::Json<Value>, probe: web::Data<Probe>) -> HttpRespon
             let command = format!("touch verifier-started-{index}; while [ ! -f verifier-release ]; do sleep 0.05; done; printf 'verified\\n'");
             call(
                 "verifier-command",
-                "exec_command",
-                json!({"cmd":command,"workdir":probe.workspace,"yield_time_ms":30000,"max_output_tokens":256}),
+                "bash",
+                json!({"command":command,"timeout":30}),
             )
         } else if matches!(probe.case, Case::Failed) {
             return HttpResponse::BadRequest().json(json!({"error":{"type":"invalid_request_error","message":"controlled verifier provider failure"}}));
@@ -587,7 +587,7 @@ async fn fixture(case: Case, ultra: bool) {
         assert!(child.messages.iter().any(|m| m
             .tool_calls
             .as_ref()
-            .is_some_and(|calls| calls.iter().any(|c| c.function.name == "exec_command"))));
+            .is_some_and(|calls| calls.iter().any(|c| c.function.name == "bash"))));
     }
     post(
         &client,

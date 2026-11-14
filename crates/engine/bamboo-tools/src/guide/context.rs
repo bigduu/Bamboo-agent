@@ -3,7 +3,7 @@
 //! This module provides language detection and context building for generating
 //! localized tool usage guidelines that match the language of the system prompt.
 
-const GIT_TOOL_GUIDANCE: &str = "For Git work, prefer available dedicated Git tools over reconstructing repository state by reading files one by one. Start with status and staged/unstaged diff; for branch comparison or conflicts, inspect the merge base, unique commits, and unmerged index before reading the necessary diff hunks and surrounding source to resolve intent. Batch independent read-only queries. Preserve dirty user work and unique commits; verify the resolved diff and relevant checks. Use exec_command only when a dedicated tool cannot provide the needed operation and your role permits shell execution. A Supervisor without shell access delegates Git execution to an authorized worker and reviews its evidence; missing tools never expand permissions.";
+const GIT_TOOL_GUIDANCE: &str = "For Git work, prefer available dedicated Git tools over reconstructing repository state by reading files one by one. Start with status and staged/unstaged diff; for branch comparison or conflicts, inspect the merge base, unique commits, and unmerged index before reading the necessary diff hunks and surrounding source to resolve intent. Batch independent read-only queries. Preserve dirty user work and unique commits; verify the resolved diff and relevant checks. Use the available shell tool only when a dedicated tool cannot provide the needed operation and your role permits shell execution. A Supervisor without shell access delegates Git execution to an authorized worker and reviews its evidence; missing tools never expand permissions.";
 
 /// Language options for guide generation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,13 +74,10 @@ impl GuideBuildContext {
                 "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
                 "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
                 "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Do not use exec_command for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
+                "Use Glob for file discovery and Grep for content search. Use dedicated tools for file operations when available.",
                 "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
-                "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms for the wait. An explicit background handoff delivers the terminal result automatically. Unread completed results expire five minutes after completion, including during a diagnostic pause. Handles are local to the current Host run.",
-                "If a quiet command's exit result is needed, keep its session_id and request a longer wait. Verify completion from terminal status before finishing. Investigate concrete failures and keep quiet commands running while their results are needed. A Human-controlled Root can pause repeated polling and retain the handle for continuation.",
+                "Use shell tools for terminal operations such as building, testing, or running Git. Communicate with the user in your response.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 GIT_TOOL_GUIDANCE,
                 "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
@@ -92,13 +89,10 @@ impl GuideBuildContext {
                 "For multi-step or non-trivial work, use Task to maintain a shared task list and keep statuses updated continuously.",
                 "Keep exactly one Task item in in_progress whenever possible; mark items completed immediately after finishing.",
                 "Read existing files before editing them. Use Edit for targeted replacements and Write only for full-file writes.",
-                "Use Glob for file discovery and Grep for content search. Do not use exec_command for find/grep/cat/head/tail/sed/awk/echo style file operations when dedicated tools exist.",
+                "Use Glob for file discovery and Grep for content search. Use dedicated tools for file operations when available.",
                 "For code search, narrow scope first: Glob -> Grep(files_with_matches) -> Read -> Grep(content/multiline).",
                 "Avoid broad Grep queries; keep head_limit small and add path/glob/type before multiline or content-heavy searches.",
-                "Use exec_command only for real terminal operations (build/test/git/npm/docker/etc.), not for file browsing or user-facing communication.",
-                "When multiple exec_command calls are independent, run them in parallel. For dependent commands, chain with &&.",
-                "When exec_command returns a running session_id, use write_stdin with empty chars to pull incremental output and final exit status. Choose yield_time_ms for the wait. An explicit background handoff delivers the terminal result automatically. Unread completed results expire five minutes after completion, including during a diagnostic pause. Handles are local to the current Host run.",
-                "If a quiet command's exit result is needed, keep its session_id and request a longer wait. Verify completion from terminal status before finishing. Investigate concrete failures and keep quiet commands running while their results are needed. A Human-controlled Root can pause repeated polling and retain the handle for continuation.",
+                "Use shell tools for terminal operations such as building, testing, or running Git. Communicate with the user in your response.",
                 "**Parallel tool calls are strongly preferred.** The following read-only tools can safely run in parallel and SHOULD be called together in the same response whenever possible: FileExists, Glob, GetCurrentDir, GetFileInfo, Grep, Read, ViewImage, WebFetch, session_history_current, session_history. For example, if you need to read 3 files, emit all 3 Read calls in one response instead of one at a time.",
                 GIT_TOOL_GUIDANCE,
                 "For commit requests: inspect git status, git diff, and recent git log first; commit within current or standing user authorization; avoid interactive git flags; use HEREDOC for multi-line commit messages.",
@@ -129,19 +123,16 @@ mod tests {
     }
 
     #[test]
-    fn best_practices_teach_model_owned_exec_polling() {
+    fn best_practices_do_not_assume_a_shell_protocol() {
         for language in [GuideLanguage::Chinese, GuideLanguage::English] {
             let context = GuideBuildContext {
                 language,
                 ..GuideBuildContext::default()
             };
             let guidance = context.best_practices().join("\n");
-            assert!(guidance.contains("exec_command"));
-            assert!(guidance.contains("write_stdin with empty chars"));
-            assert!(guidance.contains("An explicit background handoff"));
-            assert!(guidance.contains("request a longer wait"));
-            assert!(guidance.contains("Verify completion from terminal status"));
-            assert!(!guidance.contains("Bash"));
+            assert!(guidance.contains("Use shell tools for terminal operations"));
+            assert!(!guidance.contains("exec_command"));
+            assert!(!guidance.contains("write_stdin"));
         }
     }
 

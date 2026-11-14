@@ -63,8 +63,16 @@ impl LocalChildTools {
                 subagent_denied |= name == "SubAgent";
                 disabled_names.insert(name.clone());
                 allowed.remove(&name);
-                if let Some(replacement) = bamboo_domain::legacy_shell_replacement(&name) {
+                for replacement in bamboo_domain::legacy_shell_replacements(&name) {
                     allowed.remove(replacement);
+                }
+                if name == "bash"
+                    && inner.execution_contract_for_exact("bash")
+                        == Some(bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT)
+                {
+                    allowed.remove("Bash");
+                    allowed.remove("exec_command");
+                    allowed.remove("write_stdin");
                 }
             }
         }

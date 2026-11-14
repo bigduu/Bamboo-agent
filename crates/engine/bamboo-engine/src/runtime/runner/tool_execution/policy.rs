@@ -354,7 +354,7 @@ pub(super) fn validate_tool_call_arguments_for_execution(
     tool_call: &ToolCall,
     execution_name: &str,
 ) -> Result<(), String> {
-    let exact_shell = matches!(execution_name, "exec_command" | "write_stdin");
+    let exact_shell = matches!(execution_name, "bash" | "exec_command" | "write_stdin");
     let normalized_tool_name = if exact_shell {
         execution_name.to_owned()
     } else {

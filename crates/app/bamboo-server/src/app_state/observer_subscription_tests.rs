@@ -253,9 +253,9 @@ impl LLMProvider for Probe {
                                 id: id.into(),
                                 tool_type: "function".into(),
                                 function: FunctionCall {
-                                    name: "exec_command".into(),
+                                    name: "bash".into(),
                                     arguments: json!({
-                                        "cmd": format!("pwd -P && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
+                                        "command": format!("pwd -P && printf '%s\n' {HANDOFF_COMMAND_OUTPUT}"),
                                     }).to_string(),
                                 },
                             }])),
@@ -1795,7 +1795,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
             )
             .await;
             assert_eq!(observed["status"], "awaiting_response");
-            assert_eq!(observed["tool_name"], "exec_command");
+            assert_eq!(observed["tool_name"], "bash");
             assert_eq!(observed["approval_card"], true);
             if index == 0 {
                 let parent = load(&f.state, &f.reference.session_id).await;
@@ -1823,7 +1823,7 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
                 json!(occurrence.permission_generation)
             );
             assert_eq!(request["reason_code"], "configured_always_ask");
-            let command = pending["tool_arguments"]["cmd"].as_str().unwrap();
+            let command = pending["tool_arguments"]["command"].as_str().unwrap();
             assert!(command.contains(HANDOFF_COMMAND_OUTPUT));
             assert!(request["operation_summary"]
                 .as_str()
@@ -1889,11 +1889,8 @@ pub(in crate::app_state) async fn exercise_subscribed_create_handoff(
                 .iter()
                 .find(|message| message.tool_call_id.as_deref() == Some(id))
                 .expect("approved command result");
-            let result: Value =
-                serde_json::from_str(&result.content).expect("structured exec result");
-            assert_eq!(result["exit_code"], 0);
-            let output = result["output"].as_str().unwrap();
-            assert_eq!(output.lines().next(), Some(workspace.as_str()));
+            assert_eq!(result.tool_success, Some(true), "{}", result.content);
+            assert_eq!(result.content.lines().next(), Some(workspace.as_str()));
         }
     }
     assert_eq!(

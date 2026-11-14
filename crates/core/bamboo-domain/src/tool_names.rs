@@ -8,8 +8,9 @@
 /// This list intentionally includes only tools that are always registered by
 /// `BuiltinToolExecutor::new()`. Optional tools (for example integrations that
 /// depend on host binaries) should NOT be added here.
-pub const BUILTIN_TOOL_NAMES: [&str; 22] = [
+pub const BUILTIN_TOOL_NAMES: [&str; 23] = [
     "Bash",
+    "bash",
     "BashInput",
     "BashOutput",
     "exec_command",
@@ -167,11 +168,15 @@ pub fn canonical_tool_name(value: &str) -> String {
     let normalized = normalize_builtin_alias(unqualified);
     let canonical = resolve_alias(normalized).unwrap_or(normalized);
 
-    BUILTIN_TOOL_NAMES
+    let mut names = BUILTIN_TOOL_NAMES
         .iter()
         .chain(SERVER_CAPABILITY_NAMES.iter())
-        .find(|known| known.eq_ignore_ascii_case(canonical))
-        .map(|known| (*known).to_string())
+        .copied();
+    names
+        .clone()
+        .find(|known| *known == canonical)
+        .or_else(|| names.find(|known| known.eq_ignore_ascii_case(canonical)))
+        .map(str::to_string)
         .unwrap_or_else(|| canonical.to_string())
 }
 
@@ -191,13 +196,17 @@ pub fn normalize_tool_ref(value: &str) -> Option<String> {
     }
     let normalized = normalize_builtin_alias(raw_tool_name);
 
-    // Check canonical tool names first
-    if let Some(name) = BUILTIN_TOOL_NAMES
+    // The exact foreground and historical Bash spellings are distinct.
+    let mut names = BUILTIN_TOOL_NAMES
         .iter()
         .chain(SERVER_TOOL_NAMES.iter())
-        .find(|name| name.eq_ignore_ascii_case(normalized))
+        .copied();
+    if let Some(name) = names
+        .clone()
+        .find(|name| *name == normalized)
+        .or_else(|| names.find(|name| name.eq_ignore_ascii_case(normalized)))
     {
-        return Some((*name).to_string());
+        return Some(name.to_string());
     }
 
     // Check aliases – return the *alias* name so callers see what was typed,
@@ -236,6 +245,18 @@ pub fn legacy_shell_replacement(execution_name: &str) -> Option<&'static str> {
     }
 }
 
+/// Denial-only expansion for current catalogs. A start-command restriction
+/// carries forward to the foreground tool without changing direct-call aliases.
+pub fn legacy_shell_replacements(execution_name: &str) -> impl Iterator<Item = &'static str> {
+    let names: &[&str] = match execution_name {
+        "Bash" => &["exec_command", "bash"],
+        "exec_command" => &["bash"],
+        "BashInput" | "BashOutput" | "KillShell" => &["write_stdin"],
+        _ => &[],
+    };
+    names.iter().copied()
+}
+
 /// Resolve a disabled reference without losing legacy shell denials when a
 /// positive catalog omits the old route. Exact registrations keep priority.
 /// Only missing unqualified references may use this denial-only fallback;
@@ -251,8 +272,13 @@ pub fn resolve_disabled_tool_reference_name(
     if reference.contains("::") {
         return None;
     }
-    let legacy = canonical_tool_name(reference);
-    legacy_shell_replacement(&legacy).map(|_| legacy)
+    // A missing lower-case registration retains the original shell deny.
+    let legacy = if reference == "bash" {
+        "Bash".to_owned()
+    } else {
+        canonical_tool_name(reference)
+    };
+    legacy_shell_replacements(&legacy).next().map(|_| legacy)
 }
 
 /// Checks if a tool reference is a built-in tool
@@ -266,10 +292,19 @@ mod tests {
 
     #[test]
     fn legacy_shell_disabled_policy_only_expands_exact_builtin_names() {
-        assert_eq!(legacy_shell_replacement("Bash"), Some("exec_command"));
-        assert_eq!(legacy_shell_replacement("BashOutput"), Some("write_stdin"));
-        assert_eq!(legacy_shell_replacement("vendor::Bash"), None);
-        assert_eq!(legacy_shell_replacement("exec_command"), None);
+        assert_eq!(
+            legacy_shell_replacements("Bash").collect::<Vec<_>>(),
+            ["exec_command", "bash"]
+        );
+        assert_eq!(
+            legacy_shell_replacements("BashOutput").collect::<Vec<_>>(),
+            ["write_stdin"]
+        );
+        assert_eq!(legacy_shell_replacements("vendor::Bash").next(), None);
+        assert_eq!(
+            legacy_shell_replacements("exec_command").collect::<Vec<_>>(),
+            ["bash"]
+        );
     }
 
     #[test]
@@ -279,6 +314,7 @@ mod tests {
             (" bash ", "Bash"),
             ("bAsH", "Bash"),
             ("execute_command", "Bash"),
+            ("exec_command", "exec_command"),
             ("bashinput", "BashInput"),
             ("bashoutput", "BashOutput"),
             ("kIlLsHeLl", "KillShell"),
@@ -298,7 +334,6 @@ mod tests {
             "EXECUTE_COMMAND",
             "unknown",
             "Read",
-            "exec_command",
             "write_stdin",
             "vendor::Bash",
             "default::Bash",

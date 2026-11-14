@@ -8,22 +8,21 @@ use serde_json::{json, Value};
 
 use super::*;
 
-const LAST_POLL: &str = "poll-5";
+const BASH_CALL: &str = "foreground-command";
 const OUTPUT: &str = "quiet command completed";
-const CLI_TIMEOUT_SECS: u64 = 20;
-const QUIET_AGE_SECS: u64 = 90;
+const CLI_TIMEOUT_SECS: u64 = 8;
 
 struct QuietExecProvider {
     gate: PathBuf,
     calls: AtomicUsize,
 }
 
-fn tool_result(messages: &[Message], id: &str) -> Value {
+fn tool_result(messages: &[Message], id: &str) -> String {
     let message = messages
         .iter()
         .find(|message| message.tool_call_id.as_deref() == Some(id))
         .expect("the previous tool call must have a result");
-    serde_json::from_str(&message.content).unwrap()
+    message.content.clone()
 }
 
 fn call(id: &str, name: &str, arguments: Value) -> LLMChunk {
@@ -42,10 +41,14 @@ impl LLMProvider for QuietExecProvider {
     async fn chat_stream(
         &self,
         messages: &[Message],
-        _: &[ToolSchema],
+        tools: &[ToolSchema],
         _: Option<u32>,
         _: &str,
     ) -> Result<LLMStream, LLMError> {
+        assert!(tools.iter().any(|tool| tool.function.name == "bash"));
+        assert!(!tools
+            .iter()
+            .any(|tool| matches!(tool.function.name.as_str(), "exec_command" | "write_stdin")));
         let round = self.calls.fetch_add(1, Ordering::SeqCst);
         let chunk = match round {
             0 => {
@@ -55,32 +58,12 @@ impl LLMProvider for QuietExecProvider {
                      sleep 0.05; n=$((n+1)); done; [ -f '{gate}' ] || exit 90; \
                      printf '%s' '{OUTPUT}'; exit 7"
                 );
-                call(
-                    "start",
-                    "exec_command",
-                    json!({"cmd": command, "yield_time_ms": 250}),
-                )
+                call(BASH_CALL, "bash", json!({"command": command}))
             }
-            1..=5 => {
-                if round == 1 {
-                    // Age the actual captured process without a 90-second wall-clock sleep.
-                    tokio::time::pause();
-                    tokio::time::advance(Duration::from_secs(QUIET_AGE_SECS)).await;
-                    tokio::time::resume();
-                }
-                let start = tool_result(messages, "start");
-                assert_eq!(start["status"], "running");
-                call(
-                    &format!("poll-{round}"),
-                    "write_stdin",
-                    json!({"session_id": start["session_id"], "chars": "", "yield_time_ms": 250}),
-                )
-            }
-            6 => {
-                let result = tool_result(messages, LAST_POLL);
-                assert_eq!(result["status"], "completed");
-                assert_eq!(result["exit_code"], 7);
-                assert_eq!(result["output"], OUTPUT);
+            1 => {
+                let result = tool_result(messages, BASH_CALL);
+                assert!(result.starts_with(OUTPUT), "{result}");
+                assert!(result.contains("Command exited with code 7"), "{result}");
                 LLMChunk::Token("Received the terminal result.".into())
             }
             _ => panic!("unexpected provider round {round}"),
@@ -139,70 +122,51 @@ async fn run_quiet_exec(should_time_out: bool) {
             reasoning_effort: None,
             skill_mode: None,
             provider: None,
-            // Give the checkpointed setup rounds time to reach the quiet wait.
             timeout_secs: should_time_out.then_some(CLI_TIMEOUT_SECS),
         },
         state,
     );
     tokio::pin!(run);
-    // The fixture advances Tokio time while the CLI deadline uses wall time.
-    let fixture_timeout = Duration::from_secs(QUIET_AGE_SECS + CLI_TIMEOUT_SECS + 20);
+    let fixture_timeout = Duration::from_secs(CLI_TIMEOUT_SECS + 20);
     let result = tokio::time::timeout(fixture_timeout, async {
-        let handle = loop {
+        loop {
             let event = tokio::select! {
                 result = &mut run => panic!("headless exited before waiting: {result:?}"),
                 event = events.recv() => event.unwrap(),
             };
             match event {
-                AgentEvent::ToolStart {
-                    tool_call_id,
-                    arguments,
-                    ..
-                } if tool_call_id == LAST_POLL => {
-                    break arguments["session_id"].as_str().unwrap().to_owned();
-                }
+                AgentEvent::ToolStart { tool_call_id, .. } if tool_call_id == BASH_CALL => break,
                 _ => {}
             }
-        };
-        // Both cases must enter the quiet wait beyond the requested 250 ms.
+        }
         tokio::select! {
             result = &mut run => panic!("headless exited with a live command: {result:?}"),
-            _ = tokio::time::sleep(Duration::from_millis(750)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(750)) => {},
         }
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
         if !should_time_out {
             tokio::fs::write(&provider.gate, b"release").await.unwrap();
         }
-        let result = run.await;
-        // Release and reap the fixture even when the CLI cancels the poll.
-        if let Some(job) =
-            bamboo_tools::tools::exec_command::reserve_background_job(&session_id, &handle)
-        {
-            tokio::fs::write(&provider.gate, b"release").await.unwrap();
-            tokio::time::timeout(Duration::from_secs(3), job.completion())
-                .await
-                .unwrap();
-        }
-        result
+        run.await
     })
     .await
     .expect("headless run should finish");
     if should_time_out {
         assert!(result.unwrap_err().contains("cancelled"));
         assert!(started.elapsed() >= Duration::from_secs(CLI_TIMEOUT_SECS));
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     } else {
         assert!(result.is_ok(), "{result:?}");
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 7);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
     }
 }
 
 #[tokio::test]
-async fn headless_quiet_exec_returns_the_exit_without_another_poll() {
+async fn headless_foreground_bash_waits_and_returns_the_real_exit() {
     run_quiet_exec(false).await;
 }
 
 #[tokio::test]
-async fn headless_quiet_exec_respects_cli_timeout() {
+async fn headless_foreground_bash_respects_cli_timeout() {
     run_quiet_exec(true).await;
 }

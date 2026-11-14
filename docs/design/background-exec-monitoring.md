@@ -1,4 +1,9 @@
-# Quiet exec commands and background monitoring
+# Background monitoring for the yielding shell API
+
+The standard model catalog uses foreground `bash`. It accepts a command and
+an optional timeout in seconds, then returns the terminal result. The behavior
+below applies to hosts and explicit SDK catalogs that select the yielding
+`exec_command` and `write_stdin` protocol.
 
 An ordinary `exec_command` remains pull based: it yields an owner-scoped handle,
 and `write_stdin` retrieves incremental output and the real terminal result.

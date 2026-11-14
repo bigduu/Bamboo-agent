@@ -90,7 +90,7 @@ fn controlled(body: &Value, probe: &Probe) -> Option<(Value, &'static str)> {
     assert_eq!(prompt.contains("Ultra Root thinking mode"), ultra);
     assert!(tools.iter().all(|t| !matches!(
         t["function"]["name"].as_str(),
-        Some("Write" | "Edit" | "exec_command" | "load_skill" | "workflow_run")
+        Some("Write" | "Edit" | "bash" | "exec_command" | "load_skill" | "workflow_run")
     )));
     let prefix = format!("acceptance-{round}-");
     let id = |name: &str| format!("{prefix}{name}");

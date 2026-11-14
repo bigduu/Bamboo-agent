@@ -1595,6 +1595,8 @@ impl AppState {
             schedule_manager,
             connect_manager,
             tool_factory,
+            #[cfg(test)]
+            legacy_shell_fixture_executor: _builtin_permission_executor,
             permission_checker,
             permission_section,
             permission_io_lock,

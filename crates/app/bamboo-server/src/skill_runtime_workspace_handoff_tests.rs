@@ -290,7 +290,7 @@ impl Step {
             Self::List(..) => "skills_list",
             Self::Fresh(..) | Self::Retained(..) | Self::StaleCursor(..) => "skills_read",
             Self::Read => "Read",
-            Self::Cwd(..) => "exec_command",
+            Self::Cwd(..) => "bash",
         }
     }
 }
@@ -478,11 +478,7 @@ impl LLMProvider for HandoffProvider {
                 ),
                 Step::Cwd(_, scope) => {
                     assert!(success, "actual cwd observation: {}", result.content);
-                    let page: Value = serde_json::from_str(&result.content).unwrap();
-                    assert_eq!(page["exit_code"], 0);
-                    let cwd = PathBuf::from(page["output"].as_str().unwrap().trim())
-                        .canonicalize()
-                        .unwrap();
+                    let cwd = PathBuf::from(result.content.trim()).canonicalize().unwrap();
                     assert_eq!(
                         &cwd,
                         if scope == "A" {
@@ -518,7 +514,7 @@ impl LLMProvider for HandoffProvider {
             Step::Retained(..) | Step::StaleCursor(..) => {
                 json!({"package":current.packages["A"],"cursor":current.cursor})
             }
-            Step::Cwd(..) => json!({"cmd":"pwd","yield_time_ms":10000,"max_output_tokens":1024}),
+            Step::Cwd(..) => json!({"command":"pwd","timeout":10}),
         };
         assert!(
             tools.iter().any(|tool| tool.function.name == step.tool()),
@@ -1579,21 +1575,13 @@ impl LLMProvider for LegacyProvider {
                     workspace_index > trigger_index,
                     "the new Workspace snapshot must follow the real completed trigger result"
                 );
-                (
-                    LEGACY_CWD,
-                    "exec_command",
-                    json!({"cmd":"pwd","yield_time_ms":10000,"max_output_tokens":1024}),
-                )
+                (LEGACY_CWD, "bash", json!({"command":"pwd","timeout":10}))
             }
             3 => {
                 let cwd = prior(LEGACY_CWD);
                 assert_eq!(cwd.tool_success, Some(true), "{}", cwd.content);
-                let result: Value = serde_json::from_str(&cwd.content).unwrap();
-                assert_eq!(result["exit_code"], 0);
                 assert_eq!(
-                    PathBuf::from(result["output"].as_str().unwrap().trim())
-                        .canonicalize()
-                        .unwrap(),
+                    PathBuf::from(cwd.content.trim()).canonicalize().unwrap(),
                     probe.b
                 );
                 trace.cwd_completed += 1;

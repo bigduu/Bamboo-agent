@@ -269,11 +269,18 @@ fn image_reference_scope_is_only_prepared_for_callable_reference_dispatch() {
     let callable = crate::runtime::runner::tool_execution::legacy_effective_callable_set(&schemas);
     let core_only = bamboo_domain::EffectiveCallableSet::from_catalog(
         &schemas
-            .into_iter()
+            .iter()
+            .cloned()
             .filter_map(bamboo_domain::ClassifiedToolSchema::new)
             .collect::<Vec<_>>(),
         bamboo_domain::CapabilityLoadingMode::Progressive,
         std::iter::empty::<&str>(),
+    );
+    let without_image = crate::runtime::runner::tool_execution::legacy_effective_callable_set(
+        &schemas
+            .into_iter()
+            .filter(|schema| schema.function.name != "ViewImage")
+            .collect::<Vec<_>>(),
     );
     let call = |name: &str, args: serde_json::Value| {
         serde_json::from_value::<bamboo_agent_core::ToolCall>(json!({
@@ -289,9 +296,14 @@ fn image_reference_scope_is_only_prepared_for_callable_reference_dispatch() {
             &callable,
             false
         ));
+        assert!(round_needs_image_references(
+            std::slice::from_ref(&reference),
+            &core_only,
+            false
+        ));
         assert!(!round_needs_image_references(
             &[reference],
-            &core_only,
+            &without_image,
             false
         ));
     }

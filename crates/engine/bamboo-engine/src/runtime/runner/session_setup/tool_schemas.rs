@@ -12,6 +12,7 @@ use bamboo_skills::runtime_metadata::{
     SKILL_RUNTIME_SELECTED_SKILL_IDS_KEY, SKILL_RUNTIME_SELECTION_SOURCE_KEY,
 };
 use bamboo_tools::exposure::{activated_discoverable_tools, expandable_tool_short_description};
+use bamboo_tools::tools::foreground_bash::FOREGROUND_BASH_EXECUTION_CONTRACT;
 
 const EXPOSURE_SIGNATURE: &str = "prompt_tool_exposure_signature";
 const EXPOSURE_ACTIVATED: &str = "prompt_tool_exposure_activated";
@@ -306,11 +307,15 @@ fn resolve_catalog_with_activation(
             }
         })
         .flat_map(|name| {
-            let replacement = bamboo_domain::legacy_shell_replacement(&name).map(str::to_owned);
-            std::iter::once(name).chain(replacement)
+            let replacements = bamboo_domain::legacy_shell_replacements(&name).map(str::to_owned);
+            std::iter::once(name).chain(replacements)
         })
         .collect::<std::collections::BTreeSet<_>>();
     by_execution_name.retain(|name, _| !disabled_execution_names.contains(name));
+    if tools.execution_contract_for_exact("bash") == Some(FOREGROUND_BASH_EXECUTION_CONTRACT) {
+        by_execution_name.remove("exec_command");
+        by_execution_name.remove("write_stdin");
+    }
     retain_legacy_plan_exit(session, &mut by_execution_name);
     // Root and Child models delegate through the logical SubAgent facade. Keep the
     // physical broker/deployment tools registered for existing direct callers,

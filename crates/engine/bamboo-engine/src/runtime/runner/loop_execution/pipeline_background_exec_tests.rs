@@ -115,7 +115,7 @@ async fn background_exec_handoff_releases_the_conversation_and_keeps_the_command
     config.run_budget.max_rounds = None;
     let hook = Arc::new(BackgroundHook::default());
     config.bash_resume_hook = Some(hook.clone());
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let executor = Arc::new(yielding_executor());
     let (tx, mut rx) = mpsc::channel(256);
     let complete = run_pipeline(
         &mut session,
@@ -374,7 +374,7 @@ async fn quiet_followup(completes_at_boundary: bool) {
     config.run_budget.max_rounds = None;
     let hook = Arc::new(BackgroundHook::default());
     config.bash_resume_hook = Some(hook.clone());
-    let executor = Arc::new(bamboo_tools::BuiltinToolExecutor::new());
+    let executor = Arc::new(yielding_executor());
     let (tx, _rx) = mpsc::channel(256);
     run_pipeline(
         &mut session,

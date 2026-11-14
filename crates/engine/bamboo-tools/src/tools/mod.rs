@@ -9,6 +9,7 @@ pub mod edit;
 pub mod exec_command;
 pub mod exit_plan_mode;
 pub mod file_change;
+pub mod foreground_bash;
 pub mod get_file_info;
 pub mod glob;
 pub mod goal;
