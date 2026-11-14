@@ -5,6 +5,7 @@ use regex::{Regex, RegexBuilder};
 use serde::Deserialize;
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{parameter_schema, search_traversal, workspace_state};
 
@@ -153,6 +154,18 @@ impl GrepTool {
         }
 
         files
+    }
+
+    async fn read_search_text(reader: impl AsyncRead + Unpin) -> Option<String> {
+        // Some virtual files report zero length, and files can grow after stat.
+        // Read one extra byte so an oversized file is skipped as a whole.
+        let mut content = String::new();
+        reader
+            .take(MAX_FILE_BYTES + 1)
+            .read_to_string(&mut content)
+            .await
+            .ok()?;
+        (content.len() as u64 <= MAX_FILE_BYTES).then_some(content)
     }
 
     fn compile_glob(glob: Option<&str>) -> Result<Option<GlobSet>, ToolError> {
@@ -404,11 +417,14 @@ impl Tool for GrepTool {
             let Ok(metadata) = tokio::fs::metadata(&file).await else {
                 continue;
             };
-            if metadata.len() > MAX_FILE_BYTES {
+            if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
                 continue;
             }
 
-            let Ok(content) = tokio::fs::read_to_string(&file).await else {
+            let Ok(reader) = tokio::fs::File::open(&file).await else {
+                continue;
+            };
+            let Some(content) = Self::read_search_text(reader).await else {
                 continue;
             };
 
@@ -1010,6 +1026,18 @@ mod tests {
 
         assert!(matches!(error, ToolError::Execution(_)));
         assert!(error.to_string().contains(RESULT_TOO_LARGE_ERROR));
+    }
+
+    #[tokio::test]
+    async fn grep_bounds_reads_independently_of_file_metadata() {
+        let bytes = vec![b'x'; MAX_FILE_BYTES as usize + 32];
+        let at_limit = &bytes[..MAX_FILE_BYTES as usize];
+        let content = GrepTool::read_search_text(at_limit).await.unwrap();
+        assert_eq!(content.len() as u64, MAX_FILE_BYTES);
+
+        let mut reader = std::io::Cursor::new(bytes);
+        assert!(GrepTool::read_search_text(&mut reader).await.is_none());
+        assert_eq!(reader.position(), MAX_FILE_BYTES + 1);
     }
 
     #[tokio::test]
