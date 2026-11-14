@@ -471,7 +471,9 @@ fn validate_default_target(
         }
         return Ok(());
     }
-    if legacy_provider_alias_exists(config, target_id) {
+    if !config.is_retired_provider_alias(target_id)
+        && legacy_provider_alias_exists(config, target_id)
+    {
         return Ok(());
     }
     Err(AppError::BadRequest(format!(
@@ -865,6 +867,10 @@ mod tests {
         );
         assert_eq!(list["instances"][0]["label"], "Repaired relay");
         assert!(list.get("default_provider_instance_id").is_none());
+        let reloaded = state.reload_config_and_runtime().await.unwrap();
+        assert!(reloaded.has_retired_provider_default());
+        assert!(state.provider_registry.get("relay").is_some());
+        assert!(state.provider_registry.get_default().is_none());
         let selected = http_test::call_service(
             &app,
             http_test::TestRequest::post()

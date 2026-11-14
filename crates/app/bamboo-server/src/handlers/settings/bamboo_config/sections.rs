@@ -487,11 +487,9 @@ pub async fn put_provider_settings_section(
                 &credential_changes.provider_instances,
             )?;
             validate_provider_settings_default(candidate)?;
-            if !candidate.has_retired_provider_default() {
-                bamboo_llm::validate_provider_config(candidate).map_err(|error| {
-                    ConfigSectionMutationError::Invalid(format!("invalid provider settings: {error}"))
-                })?;
-            }
+            crate::config_manager::validate_provider_settings(candidate).map_err(|error| {
+                ConfigSectionMutationError::Invalid(format!("invalid provider settings: {error}"))
+            })?;
             Ok((provider_intents, provider_instance_intents))
         })
         .await
@@ -925,6 +923,11 @@ fn validate_provider_settings_default(
             candidate.provider
         )));
     };
+    if candidate.is_retired_provider_alias(default_id) {
+        return Err(ConfigSectionMutationError::Invalid(format!(
+            "default provider instance '{default_id}' was retired"
+        )));
+    }
     if candidate.provider_instances.contains_key(default_id)
         || provider_exists(candidate.providers(), default_id)
     {
@@ -942,10 +945,8 @@ fn retain_provider_settings_server_owned_fields(
     // Unknown forward-compatible metadata is intentionally not exposed by the
     // network DTO because its contents cannot be classified as non-secret.
     // Preserve it from the process-owned snapshot just like credential refs.
-    let providers = candidate.providers_mut();
-    providers.extra = secret_free_provider_extra(&current.providers().extra);
-    providers.retired_provider_aliases = current.providers().retired_provider_aliases.clone();
-    providers.copilot_default_retired = current.providers().copilot_default_retired;
+    candidate.providers_mut().extra = secret_free_provider_extra(&current.providers().extra);
+    candidate.preserve_provider_retirement(current);
     macro_rules! retain_env_provider {
         ($field:ident) => {
             if let (Some(current), Some(candidate)) = (

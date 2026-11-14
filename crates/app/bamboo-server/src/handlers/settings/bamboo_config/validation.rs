@@ -90,7 +90,7 @@ pub async fn validate_bamboo_config_patch(
     }
 
     if domains.provider {
-        if let Err(err) = bamboo_llm::validate_provider_config(&merged) {
+        if let Err(err) = config_manager::validate_provider_settings(&merged) {
             let (path, message) = provider_validation_issue(&merged, err.to_string());
             push_error("provider", path, message);
         }

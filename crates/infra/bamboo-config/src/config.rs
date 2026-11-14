@@ -4859,6 +4859,15 @@ impl Config {
             && !self.provider_instances.contains_key(id)
     }
 
+    /// Keep the server-owned migration metadata and the runtime-only override
+    /// when a compatibility write or section publication reconstructs Config.
+    pub fn preserve_provider_retirement(&mut self, source: &Self) {
+        self.providers.0.retired_provider_aliases =
+            source.providers.0.retired_provider_aliases.clone();
+        self.providers.0.copilot_default_retired = source.providers.0.copilot_default_retired;
+        self.retired_provider_env_override = source.retired_provider_env_override;
+    }
+
     /// Whether provider instances are configured (new multi-instance path).
     pub fn has_provider_instances(&self) -> bool {
         !self.provider_instances.is_empty()

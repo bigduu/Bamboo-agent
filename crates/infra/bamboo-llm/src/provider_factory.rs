@@ -249,6 +249,12 @@ pub async fn create_provider_from_instance(
 
 /// Validate provider configuration without creating the provider
 pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
+    let provider_name = config.effective_default_provider();
+    if config.is_retired_provider_alias(provider_name) {
+        return Err(LLMError::Auth(format!(
+            "Provider instance '{provider_name}' was retired"
+        )));
+    }
     if let Some(instance_id) = config.default_provider_instance.as_deref() {
         if let Some(instance) = config.provider_instances.get(instance_id) {
             if !instance.enabled {
@@ -279,7 +285,6 @@ pub fn validate_provider_config(config: &Config) -> Result<(), LLMError> {
         }
     }
 
-    let provider_name = config.effective_default_provider();
     match provider_name {
         "openai" => {
             let openai_config = config

@@ -2315,6 +2315,7 @@ fn apply_runtime_section(id: SectionId, source: &Config, target: &mut Config) {
             target.default_provider_instance = source.default_provider_instance.clone();
             target.features = source.features.clone();
             *target.providers_mut() = source.providers().clone();
+            target.preserve_provider_retirement(source);
         }
         SectionId::Mcp => target.mcp = source.mcp.clone(),
         SectionId::ToolsSkills => {
@@ -3638,8 +3639,19 @@ impl AppState {
                 "bodhi".to_string(),
             ]);
             let provider_instance_intents = current.provider_instances.keys().cloned().collect();
+            let mut defaults = Config::default();
+            defaults.preserve_provider_retirement(&current);
+            if defaults
+                .providers()
+                .retired_provider_aliases
+                .contains(&defaults.provider)
+                || current.has_retired_provider_default()
+            {
+                defaults.provider = "copilot".to_owned();
+                defaults.providers_mut().copilot_default_retired = true;
+            }
             let mut candidate = current;
-            apply_runtime_section(SectionId::Providers, &Config::default(), &mut candidate);
+            apply_runtime_section(SectionId::Providers, &defaults, &mut candidate);
 
             let transaction_dir = app_data_dir.clone();
             let commit_facade = facade.clone();
@@ -3697,7 +3709,11 @@ impl AppState {
             {
                 Ok(registry) => {
                     inputs.verify_provider_registry(&candidate, &registry);
-                    if let Some(candidate_provider) = registry.get_default() {
+                    if let Some(candidate_provider) = registry.get_default().or_else(|| {
+                        candidate
+                            .has_retired_provider_default()
+                            .then(unconfigured_provider)
+                    }) {
                         provider_registry.replace_with(registry);
                         *provider.write().await = candidate_provider;
                         record_application_success(
@@ -5383,7 +5399,7 @@ impl AppState {
                 let previous = config.read().await;
                 preserve_runtime_broker(&mut new_config, &previous);
             }
-            if let Err(error) = bamboo_llm::validate_provider_config(&new_config) {
+            if let Err(error) = crate::config_manager::validate_provider_settings(&new_config) {
                 tracing::warn!("reloaded provider config is invalid");
                 let message =
                     "provider configuration is invalid; retaining last-known-good generation"

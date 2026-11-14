@@ -862,6 +862,7 @@ pub(crate) fn apply_runtime_section(id: SectionId, source: &Config, target: &mut
             target.default_provider_instance = source.default_provider_instance.clone();
             target.features = source.features.clone();
             *target.providers_mut() = source.providers().clone();
+            target.preserve_provider_retirement(source);
         }
         SectionId::Mcp => target.mcp = source.mcp.clone(),
         SectionId::ToolsSkills => {
