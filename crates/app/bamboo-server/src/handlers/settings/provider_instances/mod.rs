@@ -25,6 +25,8 @@ use crate::error::AppError;
 #[derive(Serialize)]
 pub struct ListInstancesResponse {
     pub instances: Vec<ProviderInstanceResponse>,
+    #[serde(skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub retired_provider_aliases: std::collections::BTreeSet<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_provider_instance_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -80,7 +82,6 @@ fn default_label_for_provider_type(provider_type: &str) -> String {
         "openai" => "OpenAI".to_string(),
         "anthropic" => "Anthropic".to_string(),
         "gemini" => "Gemini".to_string(),
-        "copilot" => "GitHub Copilot".to_string(),
         "bodhi" => "Bodhi".to_string(),
         other => other.to_string(),
     }
@@ -207,7 +208,9 @@ fn validate_provider_type(provider_type: &str) -> Result<(), AppError> {
 }
 
 fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), AppError> {
-    validate_provider_type(&instance.provider_type)?;
+    if !bamboo_llm::is_configured_provider_type(&instance.provider_type) {
+        return validate_provider_type(&instance.provider_type);
+    }
     let mut config = bamboo_config::Config::default();
     config
         .provider_instances
@@ -248,14 +251,13 @@ fn validate_instance_config(instance: &ProviderInstanceConfig) -> Result<(), App
     }
 
     if instance.enabled
-        && instance.provider_type != "copilot"
         && instance.api_key.trim().is_empty()
         && instance.api_key_encrypted.is_none()
         && instance.credential_ref.is_none()
         && !bamboo_config::provider_instance_api_key_from_env(instance)
     {
         return Err(AppError::BadRequest(
-            "api_key is required for non-copilot providers".to_string(),
+            "api_key is required for enabled providers".to_string(),
         ));
     }
 
@@ -452,7 +454,6 @@ fn legacy_provider_alias_exists(config: &bamboo_config::Config, target_id: &str)
         "openai" => config.providers().openai.is_some(),
         "anthropic" => config.providers().anthropic.is_some(),
         "gemini" => config.providers().gemini.is_some(),
-        "copilot" => config.providers().copilot.is_some(),
         "bodhi" => config.providers().bodhi.is_some(),
         _ => false,
     }
@@ -470,7 +471,9 @@ fn validate_default_target(
         }
         return Ok(());
     }
-    if legacy_provider_alias_exists(config, target_id) {
+    if !config.is_retired_provider_alias(target_id)
+        && legacy_provider_alias_exists(config, target_id)
+    {
         return Ok(());
     }
     Err(AppError::BadRequest(format!(
@@ -509,6 +512,7 @@ pub async fn list_provider_instances(
 
     Ok(HttpResponse::Ok().json(ListInstancesResponse {
         instances,
+        retired_provider_aliases: config.providers().retired_provider_aliases.clone(),
         default_provider_instance_id: config.default_provider_instance.clone(),
         defaults: config.defaults.clone(),
         features: config.features.clone(),
@@ -766,6 +770,117 @@ mod tests {
 
     fn provider_and_credential_bytes(home: &std::path::Path) -> [Vec<u8>; 2] {
         ["providers.json", "credentials.json"].map(|name| std::fs::read(home.join(name)).unwrap())
+    }
+
+    #[actix_web::test]
+    async fn retired_copilot_routes_and_provider_creation_are_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+        let before = provider_and_credential_bytes(home.path());
+        for provider_type in ["copilot", "bodhi"] {
+            let response = http_test::call_service(
+                &app,
+                http_test::TestRequest::post()
+                    .uri(INSTANCES_URL)
+                    .set_json(serde_json::json!({
+                        "type": provider_type, "config": {"api_key": "fixture-key"}
+                    }))
+                    .to_request(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = http_test::call_service(
+            &app,
+            http_test::TestRequest::post()
+                .uri("/api/v1/bamboo/copilot/auth/start")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(provider_and_credential_bytes(home.path()), before);
+    }
+
+    #[actix_web::test]
+    async fn retired_copilot_default_allows_repairing_a_surviving_provider() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.json"),
+            serde_json::json!({
+                "default_provider_instance": "openai",
+                "provider_instances": {
+                    "openai": {"provider_type": "copilot", "model": "shared-model"},
+                    "relay": {"provider_type": "openai", "enabled": false, "model": "shared-model"}
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let state = provider_delete_state(home.path()).await;
+        let app = http_test::init_service(
+            App::new()
+                .app_data(state.clone())
+                .configure(crate::routes::configure_routes),
+        )
+        .await;
+
+        let edited = http_test::call_service(
+            &app,
+            http_test::TestRequest::put()
+                .uri(&format!("{INSTANCES_URL}/relay"))
+                .set_json(serde_json::json!({
+                    "enabled": true,
+                    "config": {"api_key": "replacement-fixture-key", "base_url": "http://127.0.0.1:1/v1"}
+                }))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(edited.status(), StatusCode::OK);
+        let relabeled = http_test::call_service(
+            &app,
+            http_test::TestRequest::put()
+                .uri(&format!("{INSTANCES_URL}/relay"))
+                .set_json(serde_json::json!({"label": "Repaired relay"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(relabeled.status(), StatusCode::OK);
+        assert!(state.provider_registry.get("relay").is_some());
+        assert!(state.provider_registry.get_default().is_none());
+
+        let list: Value = http_test::call_and_read_body_json(
+            &app,
+            http_test::TestRequest::get()
+                .uri(INSTANCES_URL)
+                .to_request(),
+        )
+        .await;
+        assert_eq!(
+            list["retired_provider_aliases"],
+            serde_json::json!(["openai"])
+        );
+        assert_eq!(list["instances"][0]["label"], "Repaired relay");
+        assert!(list.get("default_provider_instance_id").is_none());
+        let reloaded = state.reload_config_and_runtime().await.unwrap();
+        assert!(reloaded.has_retired_provider_default());
+        assert!(state.provider_registry.get("relay").is_some());
+        assert!(state.provider_registry.get_default().is_none());
+        let selected = http_test::call_service(
+            &app,
+            http_test::TestRequest::post()
+                .uri(&format!("{INSTANCES_URL}/default"))
+                .set_json(serde_json::json!({"default_provider_instance_id": "relay"}))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(selected.status(), StatusCode::OK);
+        assert_eq!(state.provider_registry.default_provider_name(), "relay");
     }
 
     #[actix_web::test]
@@ -1847,7 +1962,7 @@ mod tests {
         let mut config = bamboo_config::Config::default();
         for (id, enabled) in [("z-last", true), ("a-first", true), ("disabled", false)] {
             let mut instance: ProviderInstanceConfig = serde_json::from_value(serde_json::json!({
-                "provider_type": "copilot",
+                "provider_type": "gemini",
                 "enabled": enabled
             }))
             .unwrap();

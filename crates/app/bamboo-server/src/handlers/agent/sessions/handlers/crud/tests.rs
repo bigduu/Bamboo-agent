@@ -32,7 +32,14 @@ fn config_from_server(config: &Config) -> CreateSessionConfig {
 #[test]
 fn model_from_request_uses_provider_default_when_absent_or_blank() {
     let config = test_config! {
-        provider: "copilot".to_string(),
+        provider: "openai".to_string(),
+        providers: ProviderConfigs {
+            openai: Some(bamboo_config::OpenAIConfig {
+                model: Some("fixture-model".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
     };
     let expected = config
         .get_model()

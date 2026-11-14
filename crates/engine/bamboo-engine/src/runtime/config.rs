@@ -1016,7 +1016,7 @@ pub struct AgentLoopConfig {
     ///
     /// In multi-instance mode this may be the instance id.
     pub(crate) provider_name: Option<String>,
-    /// Underlying provider type (for example `openai`, `anthropic`, `copilot`).
+    /// Underlying provider type (for example `openai`, `anthropic`, `gemini`).
     ///
     /// This is distinct from `provider_name` so provider-specific behavior can
     /// remain correct when routing keys are instance ids.

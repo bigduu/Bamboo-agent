@@ -130,10 +130,7 @@ pub fn default_chat_model_ref(config: &Config) -> Option<ProviderModelRef> {
     let provider = config.effective_default_provider();
     let model = if let Some(instance) = config.provider_instances.get(provider) {
         // A disabled configured target is still intent; admission reports it.
-        instance
-            .model
-            .clone()
-            .or_else(|| (instance.provider_type == "copilot").then(|| "gpt-4o".to_string()))
+        instance.model.clone()
     } else {
         config.get_model()
     }?;
