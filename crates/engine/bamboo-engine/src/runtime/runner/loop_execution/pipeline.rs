@@ -3638,9 +3638,8 @@ async fn run_pipeline_inner(
                 }
             }
         }
-        // Consume only after the complete real tool batch and newly admitted
-        // Human input. The same-model facts are mandatory for each bounded
-        // recovery request; they create neither a pending question nor a grant.
+        // Evaluate feedback after the real tool batch and any newly admitted
+        // Human input. Quiet command recovery retains its existing handoff.
         let feedback_active = crate::runtime::runner::tool_execution::progress_feedback_active(
             session,
             &state.runtime_state,

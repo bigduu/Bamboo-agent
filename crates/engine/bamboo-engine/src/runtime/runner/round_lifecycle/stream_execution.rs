@@ -982,9 +982,11 @@ fn build_request_envelope_reconciled_for_loading_mode(
             conversation_messages.push(message.clone());
         }
     }
-    // Advisory context belongs only to this request, after the complete tool
-    // result batch. Reconcile it before ledger/native transcript anchoring.
-    if let Some(hint) = observation_progress_hint {
+    let tool_advisory = observation_progress_hint.filter(|hint| {
+        hint.starts_with(crate::runtime::runner::tool_execution::REPEATED_TOOL_ADVISORY_PREFIX)
+    });
+    // Recovery packets keep their existing position in the context ledger.
+    if let Some(hint) = observation_progress_hint.filter(|_| tool_advisory.is_none()) {
         let mut message = Message::user(hint);
         if crate::runtime::runner::tool_execution::is_required_progress_feedback(hint) {
             message.metadata = Some(
@@ -1172,6 +1174,11 @@ fn build_request_envelope_reconciled_for_loading_mode(
         prepared_context.truncation_occurred,
     );
     let mut model_transcript = ledger.transcript;
+    // One-shot advice follows the tool batch on the wire. It is not an item in
+    // the durable transcript, where dropping it would reset the cache epoch.
+    if let Some(advisory) = tool_advisory {
+        model_transcript.push(Message::user(advisory));
+    }
     if let Some(block) = build_exec_session_continuation_context_block(session, tool_schemas) {
         // This snapshot is current request context, never a second durable
         // handle inventory. Keeping it outside the ledger also removes every
@@ -1579,7 +1586,7 @@ pub(super) async fn execute_llm_stream(
         {
             session.model_context_state = previous_model_context_state;
             session.provider_transcript = previous_provider_transcript;
-            // Legacy optional advice can be omitted, but the exact recovery
+            // Optional advice can be omitted, but the exact recovery
             // control facts must reach the model or fail before dispatch. A
             // budget retry must never silently claim that feedback was sent.
             let required_progress_feedback = observation_progress_hint

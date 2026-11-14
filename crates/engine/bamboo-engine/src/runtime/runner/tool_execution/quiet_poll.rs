@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use bamboo_agent_core::tools::{parse_tool_args, ToolCall, ToolResult};
 
 use super::per_call::ToolExecutionOutcome;
+use super::progress_feedback::QuietCommandEvidence;
 
 const MAX_HANDLES: usize = 64;
 const SILENCE_MS: u64 = 90_000;
@@ -15,7 +16,7 @@ const READOUTS_AFTER_REMINDER: usize = 4;
 pub(super) struct QuietPollGuard {
     readouts: HashMap<String, usize>,
     pending: Option<String>,
-    last_quiet: Option<super::progress_feedback::ProgressEvidence>,
+    last_quiet: Option<QuietCommandEvidence>,
     observed_progress: bool,
 }
 
@@ -129,7 +130,7 @@ impl QuietPollGuard {
         *count = count.saturating_add(1);
         if *count >= READOUTS_AFTER_REMINDER {
             let value = raw.as_ref().expect("qualifying quiet result was parsed");
-            self.last_quiet = Some(super::progress_feedback::ProgressEvidence::QuietCommand {
+            self.last_quiet = Some(QuietCommandEvidence {
                 session_id: id.clone(),
                 tool_call_id: call.id.chars().take(129).collect(),
                 elapsed_ms: value["polling"]["elapsed_ms"].as_u64().unwrap_or(0),
@@ -152,9 +153,7 @@ impl QuietPollGuard {
 
     /// Once the complete batch is paired, feedback releases its suppression.
     /// The next model-requested read must reach the real owned capture again.
-    pub(super) fn take_feedback_evidence(
-        &mut self,
-    ) -> Option<super::progress_feedback::ProgressEvidence> {
+    pub(super) fn take_feedback_evidence(&mut self) -> Option<QuietCommandEvidence> {
         let id = self.pending.take()?;
         self.readouts.remove(&id);
         self.last_quiet.take()
@@ -405,7 +404,7 @@ mod tests {
         assert!(guard.suppress(&poll, Some("write_stdin")).is_some());
         assert!(matches!(
             guard.take_feedback_evidence(),
-            Some(super::super::progress_feedback::ProgressEvidence::QuietCommand { .. })
+            Some(QuietCommandEvidence { .. })
         ));
         assert!(
             guard.suppress(&poll, Some("write_stdin")).is_none(),

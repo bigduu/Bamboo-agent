@@ -105,7 +105,9 @@ async fn productive_rounds_are_never_stopped_by_the_guard() {
         ..FakeProvider::default()
     });
 
-    let config = always_blocking_config();
+    let round_limit = BUDGET + 2;
+    let mut config = always_blocking_config();
+    config.run_budget.max_rounds = Some(round_limit);
 
     let (result, _events) = run(
         &mut session,
@@ -115,13 +117,16 @@ async fn productive_rounds_are_never_stopped_by_the_guard() {
     )
     .await;
 
-    // The run ends because the stop-hook continuation cap is reached, not
-    // because of the no-tool-call guard.
+    // The explicit round budget ends the fixture even when every request
+    // produces another identical tool call and the advice is ignored.
     result.unwrap();
     let calls = provider.calls.load(Ordering::SeqCst);
-    assert!(
-        calls > BUDGET as usize,
-        "a loop that uses tools every round must survive the no-tool-call \
-         budget; got {calls} calls"
+    assert_eq!(calls, round_limit as usize + 1);
+    assert_eq!(
+        session
+            .metadata
+            .get("runtime.completion_reason")
+            .map(String::as_str),
+        Some("max_rounds_reached")
     );
 }

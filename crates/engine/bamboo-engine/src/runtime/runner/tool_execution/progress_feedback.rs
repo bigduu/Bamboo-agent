@@ -1,4 +1,4 @@
-//! Execution-local diagnostic facts and a finite recovery budget.
+//! Execution-local quiet command diagnostics and their recovery budget.
 //!
 //! No provider, tool, Session, permission or process operation lives here. The
 //! caller supplies only real observations, re-arms capture after consuming quiet
@@ -11,7 +11,6 @@ pub(crate) const REQUIRED_PROGRESS_FEEDBACK_PREFIX: &str = "[runtime_progress_fe
 const EPISODE_LIMIT: usize = 3;
 const RECOVERY_ROUND_LIMIT: usize = 4;
 const MAX_ID_CHARS: usize = 128;
-const MAX_TOOL_IDS: usize = 8;
 const MAX_FEEDBACK_BYTES: usize = 4096;
 
 pub(crate) fn is_required_progress_feedback(text: &str) -> bool {
@@ -19,19 +18,12 @@ pub(crate) fn is_required_progress_feedback(text: &str) -> bool {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) enum ProgressEvidence {
-    UnchangedFiles {
-        consecutive_rounds: usize,
-        observation_count: usize,
-        tool_call_ids: Vec<String>,
-    },
-    QuietCommand {
-        session_id: String,
-        tool_call_id: String,
-        elapsed_ms: u64,
-        output_idle_ms: u64,
-        consecutive_empty_readouts: u64,
-    },
+pub(super) struct QuietCommandEvidence {
+    pub session_id: String,
+    pub tool_call_id: String,
+    pub elapsed_ms: u64,
+    pub output_idle_ms: u64,
+    pub consecutive_empty_readouts: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,7 +34,7 @@ pub(crate) enum FeedbackDecision {
 
 #[derive(Debug, Clone)]
 struct BoundedEvidence {
-    facts: ProgressEvidence,
+    facts: QuietCommandEvidence,
     identifiers_shortened: bool,
 }
 
@@ -69,9 +61,9 @@ impl ProgressFeedbackBudget {
     /// It ends the active episode but does not refund its slot. If fresh
     /// stagnation evidence also arrives, that starts the next episode.
     /// None retains the last facts while active; it cannot bypass the limit.
-    pub(crate) fn next_round(
+    pub(super) fn next_round(
         &mut self,
-        evidence: Option<ProgressEvidence>,
+        evidence: Option<QuietCommandEvidence>,
         made_progress: bool,
     ) -> FeedbackDecision {
         if let Some((feedback, summary)) = &self.exhausted {
@@ -125,10 +117,11 @@ impl ProgressFeedbackBudget {
     /// A terminal Inbox result supersedes the last quiet observation for that
     /// exact exec, without refunding the episode or clearing other evidence.
     pub(super) fn observe_exec_completion(&mut self, handle: &str) {
-        if self.active.as_ref().is_some_and(|episode| {
-            matches!(&episode.evidence.facts,
-                ProgressEvidence::QuietCommand { session_id, .. } if session_id == handle)
-        }) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|episode| episode.evidence.facts.session_id == handle)
+        {
             self.active = None;
         }
     }
@@ -153,23 +146,13 @@ impl ProgressFeedbackBudget {
             fresh_evidence,
             Some(reason),
         );
-        let summary = match &evidence.facts {
-            ProgressEvidence::UnchangedFiles { .. } => {
-                "The task is not confirmed complete. Repeated file observations did not \
-                 establish new progress. The finite diagnostic budget is exhausted, so this \
-                 execution stopped before another recovery-model request or tool round. Review the \
-                 collected evidence or provide new Human direction."
-            }
-            ProgressEvidence::QuietCommand { .. } => {
-                "The task is not confirmed complete. The finite diagnostic budget is \
+        let summary = "The task is not confirmed complete. The finite diagnostic budget is \
                  exhausted, so this execution stopped before another recovery-model request or tool \
                  round. The existing command was not cancelled by this progress guard. Its \
                  last observed status was running, with zero output bytes and no observed \
                  exit; silence does not prove completion, failure, or liveness. Check its \
                  real status and output or provide new Human direction."
-            }
-        }
-        .to_owned();
+            .to_owned();
         self.active = None;
         self.exhausted = Some((feedback.clone(), summary.clone()));
         FeedbackDecision::Exhausted { feedback, summary }
@@ -177,97 +160,34 @@ impl ProgressFeedbackBudget {
 }
 
 impl BoundedEvidence {
-    fn new(facts: ProgressEvidence) -> Self {
-        let mut identifiers_shortened = false;
-        let facts = match facts {
-            ProgressEvidence::UnchangedFiles {
-                consecutive_rounds,
-                observation_count,
-                tool_call_ids,
-            } => {
-                identifiers_shortened = tool_call_ids.len() > MAX_TOOL_IDS;
-                let tool_call_ids = tool_call_ids
-                    .iter()
-                    .take(MAX_TOOL_IDS)
-                    .map(|id| {
-                        let (id, shortened) = bounded_id(id);
-                        identifiers_shortened |= shortened;
-                        id
-                    })
-                    .collect();
-                ProgressEvidence::UnchangedFiles {
-                    consecutive_rounds,
-                    observation_count,
-                    tool_call_ids,
-                }
-            }
-            ProgressEvidence::QuietCommand {
-                session_id,
-                tool_call_id,
-                elapsed_ms,
-                output_idle_ms,
-                consecutive_empty_readouts,
-            } => {
-                let (session_id, session_shortened) = bounded_id(&session_id);
-                let (tool_call_id, call_shortened) = bounded_id(&tool_call_id);
-                identifiers_shortened |= session_shortened || call_shortened;
-                ProgressEvidence::QuietCommand {
-                    session_id,
-                    tool_call_id,
-                    elapsed_ms,
-                    output_idle_ms,
-                    consecutive_empty_readouts,
-                }
-            }
-        };
+    fn new(mut facts: QuietCommandEvidence) -> Self {
+        let (session_id, session_shortened) = bounded_id(&facts.session_id);
+        let (tool_call_id, call_shortened) = bounded_id(&facts.tool_call_id);
+        facts.session_id = session_id;
+        facts.tool_call_id = tool_call_id;
         Self {
             facts,
-            identifiers_shortened,
+            identifiers_shortened: session_shortened || call_shortened,
         }
     }
 
-    fn packet_evidence(&self, include_ids: bool) -> (&'static str, Value) {
-        let (reason, mut evidence) = match &self.facts {
-            ProgressEvidence::UnchangedFiles {
-                consecutive_rounds,
-                observation_count,
-                tool_call_ids,
-            } => {
-                let mut value = json!({
-                    "consecutive_rounds": consecutive_rounds,
-                    "observation_count": observation_count,
-                });
-                if include_ids {
-                    value["tool_call_ids"] = json!(tool_call_ids);
-                }
-                ("unchanged_file_observations", value)
-            }
-            ProgressEvidence::QuietCommand {
-                session_id,
-                tool_call_id,
-                elapsed_ms,
-                output_idle_ms,
-                consecutive_empty_readouts,
-            } => {
-                let mut value = json!({
-                    "elapsed_ms": elapsed_ms,
-                    "output_idle_ms": output_idle_ms,
-                    "consecutive_empty_readouts": consecutive_empty_readouts,
-                    "last_status": "running",
-                    "output_bytes": 0,
-                    "exit_observed": false,
-                    "liveness_verified": false,
-                });
-                if include_ids {
-                    value["session_id"] = json!(session_id);
-                    value["tool_call_id"] = json!(tool_call_id);
-                }
-                ("quiet_command", value)
-            }
-        };
-        evidence["identifiers_shortened"] = json!(self.identifiers_shortened || !include_ids);
-        evidence["identifiers_omitted_for_packet_budget"] = json!(!include_ids);
-        (reason, evidence)
+    fn packet_evidence(&self, include_ids: bool) -> Value {
+        let mut evidence = json!({
+            "elapsed_ms": self.facts.elapsed_ms,
+            "output_idle_ms": self.facts.output_idle_ms,
+            "consecutive_empty_readouts": self.facts.consecutive_empty_readouts,
+            "last_status": "running",
+            "output_bytes": 0,
+            "exit_observed": false,
+            "liveness_verified": false,
+            "identifiers_shortened": self.identifiers_shortened || !include_ids,
+            "identifiers_omitted_for_packet_budget": !include_ids,
+        });
+        if include_ids {
+            evidence["session_id"] = json!(self.facts.session_id);
+            evidence["tool_call_id"] = json!(self.facts.tool_call_id);
+        }
+        evidence
     }
 }
 
@@ -285,14 +205,13 @@ fn render_feedback(
     exhaustion: Option<&'static str>,
 ) -> String {
     let render = |include_ids| {
-        let (reason, facts) = evidence.packet_evidence(include_ids);
         ascii_json_packet(json!({
             "schema": "runtime_progress_feedback_v1",
             "source": "runtime",
-            "reason": reason,
+            "reason": "quiet_command",
             "state": if exhaustion.is_some() { "exhausted" } else { "recovery" },
             "exhaustion": exhaustion,
-            "evidence": facts,
+            "evidence": evidence.packet_evidence(include_ids),
             "evidence_is_fresh": fresh_evidence,
             "recovery": {
                 "episode": episode,
@@ -353,16 +272,8 @@ fn ascii_json_packet(value: Value) -> String {
 mod tests {
     use super::*;
 
-    fn files() -> ProgressEvidence {
-        ProgressEvidence::UnchangedFiles {
-            consecutive_rounds: 3,
-            observation_count: 1,
-            tool_call_ids: vec!["read-1".into()],
-        }
-    }
-
-    fn quiet() -> ProgressEvidence {
-        ProgressEvidence::QuietCommand {
+    fn quiet() -> QuietCommandEvidence {
+        QuietCommandEvidence {
             session_id: "owned-handle".into(),
             tool_call_id: "poll-1".into(),
             elapsed_ms: 120_000,
@@ -433,7 +344,7 @@ mod tests {
             budget.next_round(None, false),
             FeedbackDecision::Continue(None)
         );
-        let packet = continued(budget.next_round(Some(files()), false));
+        let packet = continued(budget.next_round(Some(quiet()), false));
         assert_eq!(packet["recovery"]["episode"], 2);
     }
 
@@ -446,7 +357,7 @@ mod tests {
                 FeedbackDecision::Continue(None)
             );
         }
-        let packet = continued(budget.next_round(Some(files()), false));
+        let packet = continued(budget.next_round(Some(quiet()), false));
         assert_eq!(packet["recovery"]["episode"], 1);
         assert_eq!(packet["recovery"]["rounds_remaining"], 3);
     }
@@ -457,21 +368,21 @@ mod tests {
         let mut budget = ProgressFeedbackBudget::default();
         let mut permitted_provider_rounds = 0;
         for remaining in (0..RECOVERY_ROUND_LIMIT).rev() {
-            let packet = continued(budget.next_round(Some(files()), false));
+            let packet = continued(budget.next_round(Some(quiet()), false));
             permitted_provider_rounds += 1;
             assert_eq!(packet["schema"], "runtime_progress_feedback_v1");
             assert_eq!(packet["source"], "runtime");
-            assert_eq!(packet["reason"], "unchanged_file_observations");
+            assert_eq!(packet["reason"], "quiet_command");
             assert_eq!(packet["recovery"]["episode"], 1);
             assert_eq!(packet["recovery"]["rounds_remaining"], remaining);
         }
-        let (packet, summary) = exhausted(budget.next_round(Some(files()), false));
+        let (packet, summary) = exhausted(budget.next_round(Some(quiet()), false));
         assert_eq!(permitted_provider_rounds, 4);
         assert_eq!(packet["exhaustion"], "recovery_round_limit");
         assert_eq!(packet["recovery"]["rounds_remaining"], 0);
         assert!(summary.contains("not confirmed complete"));
         assert!(summary.contains("before another recovery-model request or tool round"));
-        assert!(!summary.contains("command"));
+        assert!(summary.contains("existing command was not cancelled"));
         // Exhausted is an instruction to stop, not a fifth/summary provider turn.
     }
 
@@ -479,7 +390,7 @@ mod tests {
     fn real_progress_clears_active_but_never_refunds_episode_slots() {
         let mut budget = ProgressFeedbackBudget::default();
         for episode in 1..=EPISODE_LIMIT {
-            let packet = continued(budget.next_round(Some(files()), false));
+            let packet = continued(budget.next_round(Some(quiet()), false));
             assert_eq!(packet["recovery"]["episode"], episode);
             assert_eq!(packet["recovery"]["rounds_remaining"], 3);
             assert_eq!(
@@ -491,7 +402,7 @@ mod tests {
                 FeedbackDecision::Continue(None)
             );
         }
-        let (packet, _) = exhausted(budget.next_round(Some(files()), false));
+        let (packet, _) = exhausted(budget.next_round(Some(quiet()), false));
         assert_eq!(packet["exhaustion"], "episode_limit");
         assert_eq!(packet["recovery"]["episode"], 3);
         assert_eq!(packet["recovery"]["episodes_remaining"], 0);
@@ -501,9 +412,14 @@ mod tests {
     #[test]
     fn progress_and_fresh_stagnation_in_one_boundary_starts_next_episode() {
         let mut budget = ProgressFeedbackBudget::default();
-        continued(budget.next_round(Some(files()), false));
-        let packet = continued(budget.next_round(Some(quiet()), true));
+        continued(budget.next_round(Some(quiet()), false));
+        let next_command = QuietCommandEvidence {
+            session_id: "another-handle".into(),
+            ..quiet()
+        };
+        let packet = continued(budget.next_round(Some(next_command), true));
         assert_eq!(packet["reason"], "quiet_command");
+        assert_eq!(packet["evidence"]["session_id"], "another-handle");
         assert_eq!(packet["recovery"]["episode"], 2);
         assert_eq!(packet["recovery"]["rounds_remaining"], 3);
     }
@@ -526,13 +442,18 @@ mod tests {
     #[test]
     fn changing_diagnostic_facts_or_claiming_a_method_does_not_refund_rounds() {
         let mut budget = ProgressFeedbackBudget::default();
-        continued(budget.next_round(Some(files()), false));
-        let packet = continued(budget.next_round(Some(quiet()), false));
+        continued(budget.next_round(Some(quiet()), false));
+        let next_readout = QuietCommandEvidence {
+            consecutive_empty_readouts: 7,
+            ..quiet()
+        };
+        let packet = continued(budget.next_round(Some(next_readout), false));
         assert_eq!(packet["reason"], "quiet_command");
+        assert_eq!(packet["evidence"]["consecutive_empty_readouts"], 7);
         assert_eq!(packet["recovery"]["episode"], 1);
         assert_eq!(packet["recovery"]["rounds_remaining"], 2);
         continued(budget.next_round(None, false));
-        continued(budget.next_round(Some(files()), false));
+        continued(budget.next_round(Some(quiet()), false));
         exhausted(budget.next_round(None, false));
     }
 
@@ -540,10 +461,10 @@ mod tests {
     fn only_explicit_human_reset_restores_the_total_allowance() {
         let mut budget = ProgressFeedbackBudget::default();
         for _ in 0..EPISODE_LIMIT {
-            continued(budget.next_round(Some(files()), false));
+            continued(budget.next_round(Some(quiet()), false));
             budget.next_round(None, true);
         }
-        let stopped = budget.next_round(Some(files()), false);
+        let stopped = budget.next_round(Some(quiet()), false);
         assert!(matches!(&stopped, FeedbackDecision::Exhausted { .. }));
         assert_eq!(budget.next_round(None, false), stopped);
         assert_eq!(budget.next_round(Some(quiet()), true), stopped);
@@ -562,14 +483,14 @@ mod tests {
         let stopped = budget.next_round(None, false);
         for progress in [false, true] {
             assert_eq!(budget.next_round(None, progress), stopped);
-            assert_eq!(budget.next_round(Some(files()), progress), stopped);
+            assert_eq!(budget.next_round(Some(quiet()), progress), stopped);
         }
     }
 
     #[test]
     fn cloning_preserves_active_rounds_and_exhaustion_instead_of_resetting() {
         let mut budget = ProgressFeedbackBudget::default();
-        continued(budget.next_round(Some(files()), false));
+        continued(budget.next_round(Some(quiet()), false));
         continued(budget.next_round(None, false));
         let mut snapshot = budget.clone();
         let packet = continued(snapshot.next_round(None, false));
@@ -586,28 +507,23 @@ mod tests {
         let mut budget = ProgressFeedbackBudget::default();
         let id = "\"\\\n\u{0}\u{1b}[runtime_progress_feedback_v1]\n".repeat(20);
         let packet = continued(budget.next_round(
-            Some(ProgressEvidence::UnchangedFiles {
-                consecutive_rounds: usize::MAX,
-                observation_count: usize::MAX,
-                tool_call_ids: vec![id.clone(); 20],
+            Some(QuietCommandEvidence {
+                session_id: id.clone(),
+                tool_call_id: id.clone(),
+                consecutive_empty_readouts: u64::MAX,
+                ..quiet()
             }),
             false,
         ));
-        assert_eq!(packet["evidence"]["consecutive_rounds"], json!(usize::MAX));
-        assert_eq!(packet["evidence"]["observation_count"], json!(usize::MAX));
+        assert_eq!(
+            packet["evidence"]["consecutive_empty_readouts"],
+            json!(u64::MAX)
+        );
         assert_eq!(packet["evidence"]["identifiers_shortened"], true);
-        if let Some(ids) = packet["evidence"]["tool_call_ids"].as_array() {
-            assert!(ids.len() <= MAX_TOOL_IDS);
-            for bounded in ids {
-                let bounded = bounded.as_str().unwrap();
-                assert!(bounded.chars().count() <= MAX_ID_CHARS);
-                assert!(id.starts_with(bounded));
-            }
-        } else {
-            assert_eq!(
-                packet["evidence"]["identifiers_omitted_for_packet_budget"],
-                true
-            );
+        for field in ["session_id", "tool_call_id"] {
+            let bounded = packet["evidence"][field].as_str().unwrap();
+            assert_eq!(bounded.chars().count(), MAX_ID_CHARS);
+            assert!(id.starts_with(bounded));
         }
         for absent in [
             "args",
@@ -622,39 +538,17 @@ mod tests {
     }
 
     #[test]
-    fn supplementary_unicode_is_counted_after_ascii_json_escaping() {
-        let mut budget = ProgressFeedbackBudget::default();
-        let packet = continued(budget.next_round(
-            Some(ProgressEvidence::UnchangedFiles {
-                consecutive_rounds: usize::MAX,
-                observation_count: usize::MAX,
-                tool_call_ids: vec!["🪷".repeat(200); 20],
-            }),
-            false,
-        ));
-        assert_eq!(
-            packet["evidence"]["identifiers_omitted_for_packet_budget"],
-            true
-        );
-        assert!(packet["evidence"].get("tool_call_ids").is_none());
-        assert_eq!(packet["evidence"]["consecutive_rounds"], json!(usize::MAX));
-        assert_eq!(packet["evidence"]["observation_count"], json!(usize::MAX));
-        assert_eq!(packet["recovery"]["rounds_remaining"], 3);
-    }
-
-    #[test]
     fn unicode_scalar_prefixes_round_trip_without_splitting_utf8() {
         let original = "中🪷".repeat(100);
         let mut budget = ProgressFeedbackBudget::default();
         let packet = continued(budget.next_round(
-            Some(ProgressEvidence::UnchangedFiles {
-                consecutive_rounds: 3,
-                observation_count: 1,
-                tool_call_ids: vec![original.clone()],
+            Some(QuietCommandEvidence {
+                tool_call_id: original.clone(),
+                ..quiet()
             }),
             false,
         ));
-        let id = packet["evidence"]["tool_call_ids"][0].as_str().unwrap();
+        let id = packet["evidence"]["tool_call_id"].as_str().unwrap();
         assert_eq!(id.chars().count(), MAX_ID_CHARS);
         assert!(original.starts_with(id));
         assert_eq!(packet["evidence"]["identifiers_shortened"], true);
@@ -667,7 +561,7 @@ mod tests {
     #[test]
     fn quiet_summary_preserves_last_running_observation_without_a_fake_exit() {
         let mut budget = ProgressFeedbackBudget::default();
-        let quiet_max = || ProgressEvidence::QuietCommand {
+        let quiet_max = || QuietCommandEvidence {
             session_id: "🪷".repeat(200),
             tool_call_id: "\u{0}".repeat(200),
             elapsed_ms: u64::MAX,

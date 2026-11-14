@@ -8,8 +8,10 @@ use sha2::{Digest, Sha256};
 const MAX_TOOL_CALLS_PER_ROUND: usize = 80;
 const MAX_CONSECUTIVE_FAILURES_PER_TOOL: usize = 3;
 const UNCHANGED_OBSERVATION_ROUNDS: usize = 3;
+const REPEATED_TOOL_CALLS: usize = 3;
 const MAX_TRACKED_OBSERVATIONS: usize = 80;
 const SUBAGENT_INSPECTION_LABEL: &str = "SubAgent (inspect)";
+pub(crate) const REPEATED_TOOL_ADVISORY_PREFIX: &str = "[Runtime tool advisory] ";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum ToolCircuitKey {
@@ -39,7 +41,6 @@ struct ObservationProgress {
     previous: Option<BTreeSet<[u8; 32]>>,
     unchanged_rounds: usize,
     last_round: Option<usize>,
-    last_call_ids: Vec<String>,
     made_progress: bool,
 }
 
@@ -54,7 +55,6 @@ impl ObservationProgress {
         }
         self.last_round = Some(round);
         self.current = Some(BTreeSet::new());
-        self.last_call_ids.clear();
         self.made_progress = false;
     }
 
@@ -96,9 +96,6 @@ impl ObservationProgress {
         fingerprint.update([0u8]);
         fingerprint.update(result.result.as_bytes());
         current.insert(fingerprint.finalize().into());
-        if self.last_call_ids.len() < 8 {
-            self.last_call_ids.push(call.id.chars().take(129).collect());
-        }
     }
 
     fn finish_round(&mut self) -> Option<&'static str> {
@@ -118,6 +115,91 @@ impl ObservationProgress {
             "The same successful file observations returned unchanged information for three consecutive rounds. Use the evidence already collected, change your approach, or explain a concrete blocker. For intentional polling, wait between checks or use the appropriate status tool.",
         )
     }
+}
+
+/// Track consecutive equivalent calls within one execution.
+#[derive(Debug, Clone, Default)]
+struct RepeatedToolCalls {
+    fingerprint: Option<[u8; 32]>,
+    count: usize,
+    advised: bool,
+}
+
+impl RepeatedToolCalls {
+    fn observe(&mut self, fingerprint: Option<[u8; 32]>) {
+        if fingerprint.is_some() && self.fingerprint == fingerprint {
+            self.count = self.count.saturating_add(1);
+        } else {
+            *self = Self {
+                fingerprint,
+                count: usize::from(fingerprint.is_some()),
+                advised: false,
+            };
+        }
+    }
+
+    fn advisory(&mut self, file_hint: Option<&str>) -> Option<String> {
+        if self.advised {
+            return None;
+        }
+        if self.count < REPEATED_TOOL_CALLS {
+            return file_hint.map(|hint| format!("{REPEATED_TOOL_ADVISORY_PREFIX}{hint}"));
+        }
+        self.advised = true;
+        Some(format!(
+            "{REPEATED_TOOL_ADVISORY_PREFIX}The most recent tool was called {} times in a row with identical arguments and returned the same result. Consider using the evidence already collected or trying a different approach. If you are intentionally polling, wait for a useful change or use the appropriate status tool.",
+            self.count
+        ))
+    }
+}
+
+/// Compare actual dispatches before compression. Retain only a digest of the
+/// admitted identity, normalized arguments, and raw result.
+pub(super) fn completed_tool_fingerprint(
+    call: &ToolCall,
+    outcome: &super::per_call::ToolExecutionOutcome,
+) -> Option<[u8; 32]> {
+    if outcome.output_cap.is_none() || !outcome.post_tool_hook_eligible {
+        return None;
+    }
+    let tool = outcome.portable_tool.as_ref()?;
+    let name = tool.execution_name();
+    // Shell processes and managed-loop controls have their own lifecycle.
+    if matches!(name, "exec_command" | "write_stdin" | "Bash" | "BashOutput")
+        || name == bamboo_tools::tools::loop_control::LOOP_CONTROL_TOOL_NAME
+    {
+        return None;
+    }
+    let mut arguments = tool.input().clone();
+    arguments.sort_all_objects();
+    let mut fingerprint = Sha256::new();
+    hash_field(&mut fingerprint, name.as_bytes());
+    hash_field(&mut fingerprint, &serde_json::to_vec(&arguments).ok()?);
+    match &outcome.result {
+        Ok(result) => {
+            if super::clarification::requires_suspension(call, result)
+                || bamboo_agent_core::tools::tool_result_requires_suspension(result)
+            {
+                return None;
+            }
+            fingerprint.update([1, u8::from(result.success)]);
+            hash_field(&mut fingerprint, result.result.as_bytes());
+            for image in &result.images {
+                hash_field(&mut fingerprint, image.mime_type.as_bytes());
+                hash_field(&mut fingerprint, image.data.as_bytes());
+            }
+        }
+        Err(error) => {
+            fingerprint.update([0]);
+            fingerprint.update(error.as_bytes());
+        }
+    }
+    Some(fingerprint.finalize().into())
+}
+
+fn hash_field(fingerprint: &mut Sha256, bytes: &[u8]) {
+    fingerprint.update((bytes.len() as u64).to_be_bytes());
+    fingerprint.update(bytes);
 }
 
 const STRICT_ARGUMENT_TOOL_NAMES: [&str; 11] = [
@@ -302,6 +384,7 @@ pub(crate) struct ToolPolicyGuard {
     executed_calls: usize,
     consecutive_failures: HashMap<ToolCircuitKey, usize>,
     observation_progress: ObservationProgress,
+    repeated_tool_calls: RepeatedToolCalls,
     pub(super) standalone_supervisor_spawn: bool,
     pub(super) child_inspections: super::child_inspection::ChildInspectionProgress,
     pub(super) quiet_polls: super::quiet_poll::QuietPollGuard,
@@ -319,6 +402,7 @@ impl ToolPolicyGuard {
             executed_calls: 0,
             consecutive_failures: HashMap::new(),
             observation_progress: ObservationProgress::default(),
+            repeated_tool_calls: RepeatedToolCalls::default(),
             standalone_supervisor_spawn: false,
             child_inspections: super::child_inspection::ChildInspectionProgress::default(),
             quiet_polls: super::quiet_poll::QuietPollGuard::default(),
@@ -366,8 +450,19 @@ impl ToolPolicyGuard {
     }
 
     pub(super) fn begin_observation_round(&mut self, round: usize) {
+        if self
+            .observation_progress
+            .last_round
+            .is_some_and(|last| last.checked_add(1) != Some(round))
+        {
+            self.repeated_tool_calls = RepeatedToolCalls::default();
+        }
         self.observation_progress.begin_round(round);
         self.child_inspections.begin_round(round);
+    }
+
+    pub(super) fn observe_repeated_call(&mut self, fingerprint: Option<[u8; 32]>) {
+        self.repeated_tool_calls.observe(fingerprint);
     }
 
     pub(crate) fn unchanged_child_inspection_targets(&mut self) -> Vec<String> {
@@ -414,38 +509,31 @@ impl ToolPolicyGuard {
         }
     }
 
-    /// Consume one completed batch. Only actual raw evidence can end a recovery
-    /// episode; hidden wakeups and model claims cannot refund its finite budget.
+    /// Send ordinary repetition as advice. Only quiet command recovery can
+    /// exhaust the diagnostic allowance.
     pub(crate) fn feedback_for_next_round(
         &mut self,
         active: bool,
     ) -> super::progress_feedback::FeedbackDecision {
-        use super::progress_feedback::{FeedbackDecision, ProgressEvidence};
-        let legacy_hint = self.observation_progress.finish_round();
-        if !active {
-            return FeedbackDecision::Continue(legacy_hint.map(str::to_owned));
+        use super::progress_feedback::FeedbackDecision;
+        let file_hint = self.observation_progress.finish_round();
+        if active {
+            let quiet_evidence = self.quiet_polls.take_feedback_evidence();
+            let made_progress = self.observation_progress.made_progress
+                || self.quiet_polls.take_observed_progress();
+            let feedback = self
+                .progress_feedback
+                .next_round(quiet_evidence, made_progress);
+            if feedback != FeedbackDecision::Continue(None) {
+                return feedback;
+            }
         }
-        let quiet_evidence = self.quiet_polls.take_feedback_evidence();
-        let made_progress =
-            self.observation_progress.made_progress || self.quiet_polls.take_observed_progress();
-        let evidence = quiet_evidence.or_else(|| {
-            (self.observation_progress.unchanged_rounds >= UNCHANGED_OBSERVATION_ROUNDS).then(
-                || ProgressEvidence::UnchangedFiles {
-                    consecutive_rounds: self.observation_progress.unchanged_rounds,
-                    observation_count: self
-                        .observation_progress
-                        .previous
-                        .as_ref()
-                        .map_or(0, BTreeSet::len),
-                    tool_call_ids: self.observation_progress.last_call_ids.clone(),
-                },
-            )
-        });
-        self.progress_feedback.next_round(evidence, made_progress)
+        FeedbackDecision::Continue(self.repeated_tool_calls.advisory(file_hint))
     }
 
     pub(crate) fn reset_observation_progress(&mut self) {
         self.observation_progress = ObservationProgress::default();
+        self.repeated_tool_calls = RepeatedToolCalls::default();
         self.child_inspections = super::child_inspection::ChildInspectionProgress::default();
         self.quiet_polls = super::quiet_poll::QuietPollGuard::default();
         self.progress_feedback.reset_for_human_input();
@@ -584,6 +672,75 @@ mod tests {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             },
+        }
+    }
+
+    #[test]
+    fn repeated_tool_advisory_rearms_when_tool_arguments_or_result_change() {
+        let fingerprint = |name: &str, arguments, result: &str| {
+            let call = tool_call(name, "{}");
+            let tool =
+                super::super::per_call::PortableToolExecution::with_input_fixture(name, arguments);
+            completed_tool_fingerprint(
+                &call,
+                &super::super::per_call::ToolExecutionOutcome {
+                    output_cap: Some(None),
+                    portable_tool: Some(tool),
+                    permission_replay_origin: None,
+                    result: Ok(ToolResult::text(true, result)),
+                    needs_human: None,
+                    post_tool_hook_eligible: true,
+                    managed_running_violation: false,
+                    tool_duration: std::time::Duration::ZERO,
+                },
+            )
+        };
+        let first = fingerprint(
+            "browser_eval",
+            serde_json::json!({"code":"document.title","expected_epoch":17}),
+            "title",
+        );
+        let same = fingerprint(
+            "browser_eval",
+            serde_json::from_str(r#"{"expected_epoch":17,"code":"document.title"}"#).unwrap(),
+            "title",
+        );
+        assert!(first.is_some());
+        assert_eq!(first, same);
+        for changed in [
+            fingerprint(
+                "browser_eval",
+                serde_json::json!({"code":"document.title","expected_epoch":18}),
+                "title",
+            ),
+            fingerprint(
+                "browser_eval",
+                serde_json::json!({"code":"document.title","expected_epoch":17}),
+                "new title",
+            ),
+            fingerprint(
+                "vendor::browser_eval",
+                serde_json::json!({"code":"document.title","expected_epoch":17}),
+                "title",
+            ),
+            None,
+        ] {
+            assert_ne!(first, changed);
+            let mut repeats = RepeatedToolCalls::default();
+            for observed in [first, same] {
+                repeats.observe(observed);
+                assert!(repeats.advisory(None).is_none());
+            }
+            repeats.observe(first);
+            assert!(repeats.advisory(None).unwrap().contains("3 times in a row"));
+            repeats.observe(same);
+            assert!(repeats.advisory(None).is_none());
+            for observed in [changed, first, same] {
+                repeats.observe(observed);
+                assert!(repeats.advisory(None).is_none());
+            }
+            repeats.observe(first);
+            assert!(repeats.advisory(None).unwrap().contains("3 times in a row"));
         }
     }
 

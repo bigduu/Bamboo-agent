@@ -1,5 +1,4 @@
-//! Current run API contract: repeated observations produce bounded model
-//! feedback, never a new Human question. All providers/executors are local.
+//! Exercise repeated tool advice through the runner and its next provider request.
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -12,18 +11,21 @@ use bamboo_agent_core::tools::{
 use bamboo_agent_core::{AgentEvent, Message, Role, Session};
 use bamboo_llm::{LLMChunk, LLMError, LLMProvider, LLMStream};
 use futures::stream;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::config::{AgentLoopConfig, PromptMemoryFlags};
 
-const FEEDBACK_PREFIX: &str = "[runtime_progress_feedback_v1]\n";
+use super::REPEATED_TOOL_ADVISORY_PREFIX;
+
+const FINAL_ANSWER: &str = "I can use the evidence already collected.";
 
 struct ModelProgressProvider {
     calls: AtomicUsize,
-    feedback: Mutex<Vec<Value>>,
-    stop_on_feedback: bool,
+    advisory_rounds: Mutex<Vec<usize>>,
+    tool_name: &'static str,
+    finish_after: usize,
 }
 
 #[async_trait]
@@ -36,48 +38,42 @@ impl LLMProvider for ModelProgressProvider {
         _: &str,
     ) -> Result<LLMStream, LLMError> {
         let round = self.calls.fetch_add(1, Ordering::SeqCst);
-        assert!(round < 16, "the feedback recovery must have a finite bound");
-        let packets = messages
+        let advisory = messages
             .iter()
-            .filter_map(|message| {
-                let offset = message.content.find(FEEDBACK_PREFIX)? + FEEDBACK_PREFIX.len();
-                serde_json::Deserializer::from_str(&message.content[offset..])
-                    .into_iter::<Value>()
-                    .next()
-                    .map(Result::unwrap)
-            })
+            .enumerate()
+            .filter(|(_, message)| message.content.starts_with(REPEATED_TOOL_ADVISORY_PREFIX))
             .collect::<Vec<_>>();
-        assert!(
-            packets.len() <= 1,
-            "a request contains one current feedback packet"
-        );
-        if let Some(packet) = packets.first() {
-            assert_eq!(packet["schema"], "runtime_progress_feedback_v1");
-            assert_eq!(packet["source"], "runtime");
-            assert_eq!(packet["reason"], "unchanged_file_observations");
-            assert_eq!(packet["recovery"]["episode_limit"], 3);
-            assert_eq!(packet["recovery"]["round_limit"], 4);
-            assert!(
-                messages.iter().any(|message| message.role == Role::Tool),
-                "feedback follows real paired tool results"
+        assert!(advisory.len() <= 1);
+        if let Some(&(index, advice)) = advisory.first() {
+            assert!(advice.content.contains("3 times in a row"));
+            assert!(advice.content.contains("trying a different approach"));
+            assert_eq!(messages[index - 1].role, Role::Tool);
+            assert_eq!(
+                messages[index - 1].tool_call_id.as_deref(),
+                Some(format!("model-progress-{}", round - 1).as_str())
             );
-            self.feedback.lock().unwrap().push(packet.clone());
+            assert_eq!(messages[index - 1].content, "unchanged raw evidence");
+            self.advisory_rounds.lock().unwrap().push(round);
         }
-        let chunks = if self.stop_on_feedback && !packets.is_empty() {
-            vec![
-                Ok(LLMChunk::Token(
-                    "I can use the observed evidence without another identical read.".into(),
-                )),
-                Ok(LLMChunk::Done),
-            ]
+        let chunks = if round == self.finish_after {
+            vec![Ok(LLMChunk::Token(FINAL_ANSWER.into())), Ok(LLMChunk::Done)]
         } else {
             vec![
                 Ok(LLMChunk::ToolCalls(vec![ToolCall {
                     id: format!("model-progress-{round}"),
                     tool_type: "function".into(),
                     function: FunctionCall {
-                        name: "Read".into(),
-                        arguments: json!({"path":"same-file"}).to_string(),
+                        name: self.tool_name.into(),
+                        arguments: if self.tool_name == "browser_eval" {
+                            json!({
+                                "code":"document.title",
+                                "expected_epoch":17,
+                                "expected_url":"about:blank",
+                            })
+                            .to_string()
+                        } else {
+                            json!({"path":"same-file"}).to_string()
+                        },
                     },
                 }])),
                 Ok(LLMChunk::Done),
@@ -87,15 +83,18 @@ impl LLMProvider for ModelProgressProvider {
     }
 }
 
-struct UnchangedReadExecutor(AtomicUsize);
+struct UnchangedToolExecutor {
+    name: &'static str,
+    calls: AtomicUsize,
+}
 
 #[async_trait]
-impl ToolExecutor for UnchangedReadExecutor {
+impl ToolExecutor for UnchangedToolExecutor {
     async fn execute(
         &self,
         _: &ToolCall,
     ) -> bamboo_agent_core::tools::executor::Result<ToolResult> {
-        self.0.fetch_add(1, Ordering::SeqCst);
+        self.calls.fetch_add(1, Ordering::SeqCst);
         Ok(ToolResult::text(true, "unchanged raw evidence"))
     }
 
@@ -103,24 +102,29 @@ impl ToolExecutor for UnchangedReadExecutor {
         vec![ToolSchema {
             schema_type: "function".into(),
             function: FunctionSchema {
-                name: "Read".into(),
-                description: "Deterministic existing observation".into(),
-                parameters: json!({"type":"object","properties":{"path":{"type":"string"}}}),
+                name: self.name.into(),
+                description: "Return the same observation".into(),
+                parameters: json!({"type":"object"}),
             },
         }]
     }
 }
 
 async fn run_model_feedback(
-    stop_on_feedback: bool,
+    tool_name: &'static str,
+    finish_after: usize,
 ) -> (Session, Arc<ModelProgressProvider>, usize, Vec<AgentEvent>) {
     let mut session = Session::new("model-progress-contract", "model");
     let provider = Arc::new(ModelProgressProvider {
         calls: AtomicUsize::new(0),
-        feedback: Mutex::new(Vec::new()),
-        stop_on_feedback,
+        advisory_rounds: Mutex::new(Vec::new()),
+        tool_name,
+        finish_after,
     });
-    let executor = Arc::new(UnchangedReadExecutor(AtomicUsize::new(0)));
+    let executor = Arc::new(UnchangedToolExecutor {
+        name: tool_name,
+        calls: AtomicUsize::new(0),
+    });
     let config = AgentLoopConfig {
         system_prompt: Some(
             "Read only what is useful; change approach when evidence stops changing.".into(),
@@ -152,7 +156,12 @@ async fn run_model_feedback(
     while let Ok(event) = rx.try_recv() {
         events.push(event);
     }
-    (session, provider, executor.0.load(Ordering::SeqCst), events)
+    (
+        session,
+        provider,
+        executor.calls.load(Ordering::SeqCst),
+        events,
+    )
 }
 
 fn assert_no_new_progress_question(session: &Session, events: &[AgentEvent]) {
@@ -178,42 +187,30 @@ fn assert_no_new_progress_question(session: &Session, events: &[AgentEvent]) {
 }
 
 #[tokio::test]
-async fn model_feedback_lets_same_llm_use_evidence_without_a_human_popup() {
-    let (session, provider, tools, events) = run_model_feedback(true).await;
+async fn browser_repetition_advice_reaches_the_next_request_with_the_real_result() {
+    let (session, provider, tools, events) = run_model_feedback("browser_eval", 3).await;
     assert_no_new_progress_question(&session, &events);
     assert_eq!(provider.calls.load(Ordering::SeqCst), 4);
     assert_eq!(tools, 3);
-    assert_eq!(provider.feedback.lock().unwrap().len(), 1);
+    assert_eq!(*provider.advisory_rounds.lock().unwrap(), [3]);
     assert!(session
         .messages
         .iter()
-        .all(|message| !message.content.contains(FEEDBACK_PREFIX)));
+        .all(|message| !message.content.contains(REPEATED_TOOL_ADVISORY_PREFIX)));
 }
 
 #[tokio::test]
-async fn model_feedback_ignored_with_default_unlimited_rounds_stops_without_another_dispatch() {
-    let (session, provider, tools, events) = run_model_feedback(false).await;
+async fn repeated_reads_can_continue_past_the_old_recovery_cutoff() {
+    let (session, provider, tools, events) = run_model_feedback("Read", 10).await;
     assert_no_new_progress_question(&session, &events);
-    assert_eq!(provider.calls.load(Ordering::SeqCst), 7);
-    assert_eq!(tools, 7);
-    assert_eq!(provider.feedback.lock().unwrap().len(), 4);
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 11);
+    assert_eq!(tools, 10);
+    assert_eq!(*provider.advisory_rounds.lock().unwrap(), [3]);
+    assert!(!session.metadata.contains_key("runtime.completion_reason"));
+    assert_eq!(session.messages.last().unwrap().content, FINAL_ANSWER);
     assert_eq!(
-        session
-            .metadata
-            .get("runtime.completion_reason")
-            .map(String::as_str),
-        Some("observation_progress_exhausted")
+        session.model_context_state.as_ref().unwrap().prefix_epoch,
+        0,
+        "request-only advice must not reset the durable transcript epoch"
     );
-    let summaries = session
-        .messages
-        .iter()
-        .filter(|message| {
-            message.metadata.as_ref().is_some_and(|metadata| {
-                metadata["runtime_kind"] == "observation_progress_exhausted"
-            })
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(summaries.len(), 1);
-    assert_eq!(summaries[0].role, Role::Assistant);
-    assert!(summaries[0].content.contains("not confirmed complete"));
 }
