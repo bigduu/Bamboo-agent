@@ -123,11 +123,14 @@ impl ResolvedChildProfile {
             identity.name.as_str(),
             "explorer" | "reviewer" | "independent-reviewer"
         );
+        let foreground_denied = definition.tool_deny().iter().any(|name| name == "bash");
         let tools = NATIVE_NAMES
             .iter()
             .filter(|name| {
                 (definition.tool_allow().is_empty() || declares_tool(definition.tool_allow(), name))
                     && !declares_tool(definition.tool_deny(), name)
+                    && !(foreground_denied
+                        && matches!(**name, "Bash" | "exec_command" | "write_stdin"))
                     && (!read_only || matches!(**name, "Read" | "Glob"))
             })
             .map(|name| (*name).to_owned())
@@ -479,6 +482,10 @@ mod tests {
             (
                 "tools:\n  allow: [Bash]\n  deny: [exec_command]",
                 vec!["Bash", "write_stdin"],
+            ),
+            (
+                "tools:\n  deny: [bash]",
+                vec!["Edit", "Glob", "Read", "Write"],
             ),
         ] {
             std::fs::write(

@@ -40,6 +40,7 @@ enum Case {
 
 struct Probe {
     data: PathBuf,
+    workspace: PathBuf,
     case: Case,
     root_calls: AtomicUsize,
     inspections: AtomicUsize,
@@ -391,6 +392,7 @@ async fn fixture(case: Case, ultra: bool) {
         .unwrap();
     let probe = web::Data::new(Probe {
         data: data.clone(),
+        workspace: workspace.clone(),
         case,
         root_calls: AtomicUsize::new(0),
         inspections: AtomicUsize::new(0),
