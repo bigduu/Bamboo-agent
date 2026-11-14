@@ -1,8 +1,11 @@
-use tokio::sync::mpsc;
-
 use crate::runtime::config::AgentLoopConfig;
-use bamboo_agent_core::{AgentError, AgentEvent, Session};
+use bamboo_agent_core::Session;
 use bamboo_domain::{AgentRuntimeState, SessionKind};
+
+#[cfg(test)]
+use bamboo_agent_core::{AgentError, AgentEvent};
+#[cfg(test)]
+use tokio::sync::mpsc;
 
 pub(crate) fn quiet_poll_guard_active(
     session: &Session,
