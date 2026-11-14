@@ -3645,7 +3645,7 @@ impl AppState {
                 .providers()
                 .retired_provider_aliases
                 .contains(&defaults.provider)
-                || current.has_retired_provider_default()
+                || current.has_saved_retired_provider_default()
             {
                 defaults.provider = "copilot".to_owned();
                 defaults.providers_mut().copilot_default_retired = true;

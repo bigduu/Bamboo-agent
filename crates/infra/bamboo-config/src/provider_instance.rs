@@ -228,7 +228,7 @@ pub(crate) fn retire_copilot(config: &mut Config) -> bool {
         Some(instance) => instance.provider_type == "copilot",
         None => selected == "copilot",
     };
-    let changed_default = retired_default && !config.has_retired_provider_default();
+    let changed_default = retired_default && !config.has_saved_retired_provider_default();
     if changed_default {
         config.default_provider_instance = None;
         config.provider = "copilot".to_owned();
@@ -271,7 +271,7 @@ pub(crate) fn is_provider_alias(id: &str) -> bool {
 /// aliases carry only the marker and never persist plaintext.
 pub fn materialize_legacy_provider_instances(config: &mut Config) -> bool {
     let selected = config.effective_default_provider().trim().to_string();
-    let retired_default = config.has_retired_provider_default();
+    let retired_default = config.has_saved_retired_provider_default();
     if selected.is_empty() && !retired_default {
         return false;
     }

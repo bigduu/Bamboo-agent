@@ -239,7 +239,11 @@ pub fn build_merged_config(
         }
     }
     new_config.preserve_provider_retirement(current);
-    if new_config.is_retired_provider_alias(new_config.effective_default_provider()) {
+    let saved_default = new_config
+        .default_provider_instance
+        .as_deref()
+        .unwrap_or(&new_config.provider);
+    if new_config.is_retired_provider_alias(saved_default) {
         return Err(AppError::BadRequest(
             "The default provider instance was retired; select a configured provider".to_string(),
         ));

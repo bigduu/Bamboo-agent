@@ -4843,10 +4843,13 @@ impl Config {
     }
 
     pub fn has_retired_provider_default(&self) -> bool {
-        self.retired_provider_env_override
-            || (self.default_provider_instance.is_none()
-                && self.provider == "copilot"
-                && self.providers().copilot_default_retired)
+        self.retired_provider_env_override || self.has_saved_retired_provider_default()
+    }
+
+    pub fn has_saved_retired_provider_default(&self) -> bool {
+        self.default_provider_instance.is_none()
+            && self.provider == "copilot"
+            && self.providers().copilot_default_retired
     }
 
     /// An SDK caller's explicit provider selection outranks a runtime override.
@@ -9460,6 +9463,7 @@ mod tests {
         .unwrap();
         config.apply_runtime_env_overrides();
         assert_eq!(config.effective_default_provider(), "");
+        assert!(!config.has_saved_retired_provider_default());
         let saved: Config =
             serde_json::from_value(config.to_compatibility_value().unwrap()).unwrap();
         assert_eq!(saved.effective_default_provider(), "work");
