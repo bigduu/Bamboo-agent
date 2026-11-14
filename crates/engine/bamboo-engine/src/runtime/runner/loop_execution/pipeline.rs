@@ -54,6 +54,7 @@ use super::gold::{
     start_queued_gold_evaluation_if_idle, GoldTerminalDecision,
 };
 use crate::runtime::runner::state_bridge;
+use crate::runtime::runner::tool_execution::discovery_tool_fingerprint;
 
 const MAX_LLM_TURN_ATTEMPTS: usize = 3;
 const LLM_RETRY_BASE_DELAY_MS: u64 = 400;
@@ -659,7 +660,7 @@ async fn commit_sticky_fallback_discovery_round(
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     browser_only: bool,
-) -> Result<(), AgentError> {
+) -> Result<Option<[u8; 32]>, AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let reasoning = (!stream_output.reasoning_content.trim().is_empty())
         .then_some(stream_output.reasoning_content);
@@ -697,6 +698,7 @@ async fn commit_sticky_fallback_discovery_round(
 
     let discovery_is_alone = tool_calls.len() == 1
         && tool_calls[0].function.name == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME;
+    let mut fingerprint = None;
     if !discovery_is_alone {
         const ERROR: &str = "discovery must be called alone";
         for call in &tool_calls {
@@ -712,7 +714,7 @@ async fn commit_sticky_fallback_discovery_round(
         let discovery_result =
             serde_json::from_str::<DiscoverCapabilitiesRequest>(&call.function.arguments)
                 .map_err(|error| format!("invalid discovery arguments: {error}"));
-        let definitions = match discovery_result {
+        let definitions = match &discovery_result {
             Ok(request) => {
                 let include_commands = request.kinds.as_ref().is_some_and(|kinds| {
                     kinds
@@ -727,7 +729,7 @@ async fn commit_sticky_fallback_discovery_round(
                     include_commands,
                 )
                 .await
-                .and_then(|discovery| discovery.discover_complete_schemas(&request))
+                .and_then(|discovery| discovery.discover_complete_schemas(request))
                 {
                     Ok(mut schemas) => {
                         if browser_only {
@@ -740,9 +742,9 @@ async fn commit_sticky_fallback_discovery_round(
                     Err(error) => Err(error.to_string()),
                 }
             }
-            Err(error) => Err(error),
+            Err(error) => Err(error.clone()),
         };
-        match definitions {
+        let (content, success, new_names) = match definitions {
             Ok(definitions) => {
                 let already_loaded = validated_sticky_fallback_loaded_tool_names(session)
                     .into_iter()
@@ -763,24 +765,34 @@ async fn commit_sticky_fallback_discovery_round(
                         "sticky discovery result could not be serialized: {error}"
                     ))
                 })?;
-                session.add_message(sticky_fallback_tool_result(
-                    &call.id,
+                (
                     format!(
                         "{STICKY_DISCOVERY_RESULT_START}{payload}{STICKY_DISCOVERY_RESULT_END}"
                     ),
                     true,
-                    &canonical_new_names,
-                ));
+                    canonical_new_names,
+                )
             }
-            Err(error) => {
-                session.add_message(sticky_fallback_tool_result(
-                    &call.id,
-                    format!("capability discovery failed: {error}"),
-                    false,
-                    &[],
-                ));
-            }
-        }
+            Err(error) => (
+                format!("capability discovery failed: {error}"),
+                false,
+                Vec::new(),
+            ),
+        };
+        fingerprint = discovery_result
+            .ok()
+            .and_then(|request| serde_json::to_value(request).ok())
+            .and_then(|arguments| {
+                discovery_tool_fingerprint(
+                    bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                    &arguments,
+                    success,
+                    content.as_bytes(),
+                )
+            });
+        session.add_message(sticky_fallback_tool_result(
+            &call.id, content, success, &new_names,
+        ));
     }
 
     if let Some(persistence) = config.persistence.as_ref() {
@@ -793,7 +805,15 @@ async fn commit_sticky_fallback_discovery_round(
                 ))
             })?;
     }
-    Ok(())
+    Ok(fingerprint)
+}
+
+const OPENAI_CLIENT_SEARCH_TOOL_NAME: &str = "tool_search";
+
+#[derive(Debug)]
+struct ClientToolSearchOutput {
+    item: ProviderTranscriptItem,
+    fingerprint: Option<[u8; 32]>,
 }
 
 async fn build_openai_client_tool_search_outputs(
@@ -801,7 +821,7 @@ async fn build_openai_client_tool_search_outputs(
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
     provider_items: &[ProviderTranscriptItem],
-) -> Result<Vec<ProviderTranscriptItem>, AgentError> {
+) -> Result<Vec<ClientToolSearchOutput>, AgentError> {
     let requests = openai_client_tool_search_requests(provider_items)?;
     let discovery =
         CompleteCapabilityDiscovery::new(session, config, tool_schemas, false, false).await?;
@@ -839,7 +859,17 @@ async fn build_openai_client_tool_search_outputs(
                 "OpenAI client tool-search output could not be constructed: {error}"
             ))
         })?;
-        outputs.push(item);
+        // Provider call IDs pair the transcript items but never describe
+        // progress. Compare the actual returned definitions and search input.
+        let fingerprint = serde_json::to_value(request).ok().and_then(|arguments| {
+            discovery_tool_fingerprint(
+                OPENAI_CLIENT_SEARCH_TOOL_NAME,
+                &arguments,
+                true,
+                item.payload()["tools"].to_string().as_bytes(),
+            )
+        });
+        outputs.push(ClientToolSearchOutput { item, fingerprint });
     }
     Ok(outputs)
 }
@@ -849,7 +879,7 @@ async fn commit_openai_client_tool_search_round(
     session: &mut Session,
     config: &AgentLoopConfig,
     tool_schemas: &[bamboo_agent_core::tools::ToolSchema],
-) -> Result<Message, AgentError> {
+) -> Result<(Message, Vec<Option<[u8; 32]>>), AgentError> {
     ensure_discovery_allowed(session, config).await?;
     let host_outputs = build_openai_client_tool_search_outputs(
         session,
@@ -871,14 +901,16 @@ async fn commit_openai_client_tool_search_round(
     let anchor = message.id.clone();
     let mut provider_items = Some(stream_output.provider_transcript_items);
     commit_assistant_message(session, message.clone(), &mut provider_items)?;
-    for output in host_outputs {
+    let mut fingerprints = Vec::with_capacity(host_outputs.len());
+    for ClientToolSearchOutput { item, fingerprint } in host_outputs {
         session
-            .append_provider_transcript_group(&anchor, None, vec![output])
+            .append_provider_transcript_group(&anchor, None, vec![item])
             .map_err(|error| {
                 AgentError::LLM(format!(
                     "OpenAI client tool-search result could not be committed: {error}"
                 ))
             })?;
+        fingerprints.push(fingerprint);
     }
     if let Some(persistence) = config.persistence.as_ref() {
         persistence
@@ -890,7 +922,7 @@ async fn commit_openai_client_tool_search_round(
                 ))
             })?;
     }
-    Ok(message)
+    Ok((message, fingerprints))
 }
 
 // ---- Error classification (from rounds.rs) ----
@@ -4082,7 +4114,14 @@ async fn run_pipeline_inner(
                     )
                     .await
                     {
-                        Ok(message) => {
+                        Ok((message, fingerprints)) => {
+                            tool_policy_guard.begin_repeated_tool_round(turn_counter as usize);
+                            for fingerprint in fingerprints {
+                                tool_policy_guard.observe_repeated_call(
+                                    OPENAI_CLIENT_SEARCH_TOOL_NAME,
+                                    fingerprint,
+                                );
+                            }
                             if config.features_final_evidence_check {
                                 publish_buffered_message(event_tx, &message).await;
                             }
@@ -4284,7 +4323,12 @@ async fn run_pipeline_inner(
                 )
                 .await
                 {
-                    Ok(()) => {
+                    Ok(fingerprint) => {
+                        tool_policy_guard.begin_repeated_tool_round(turn_counter as usize);
+                        tool_policy_guard.observe_repeated_call(
+                            bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
+                            fingerprint,
+                        );
                         record_no_tool_calls_round_completed(
                             state.metrics_collector.as_ref(),
                             &round_id,
@@ -5633,7 +5677,7 @@ mod tests {
 
         assert_eq!(outputs.len(), 1);
         assert_eq!(
-            outputs[0].payload()["tools"],
+            outputs[0].item.payload()["tools"],
             serde_json::json!([{
                 "type":"function",
                 "name":"ReadArchive",
@@ -5912,7 +5956,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            outputs[0].payload()["tools"],
+            outputs[0].item.payload()["tools"],
             serde_json::json!([
                 bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
                     &tool
@@ -5936,7 +5980,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            refreshed[0].payload()["tools"],
+            refreshed[0].item.payload()["tools"],
             serde_json::json!([
                 bamboo_llm::providers::common::openai_responses::loaded_tool_to_responses_json(
                     &tool
@@ -5954,7 +5998,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(missing[0].payload()["tools"], serde_json::json!([]));
+        assert_eq!(missing[0].item.payload()["tools"], serde_json::json!([]));
         let invalid_kind = native_client_search_item_with_arguments(
             "search_skill",
             serde_json::json!({
@@ -6534,19 +6578,37 @@ mod tests {
                 .any(|tool| tool.function.name
                     == bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME));
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let advice = messages
+                .iter()
+                .find(|message| message.content.starts_with("[Runtime tool advisory]"));
+            assert_eq!(advice.is_some(), count == 4);
             let chunks = match count {
-                0 => vec![
+                0..=3 => vec![
                     Ok(LLMChunk::ToolCalls(vec![activation_call(
-                        "codex-search",
+                        &format!("codex-search-{count}"),
                         bamboo_domain::DISCOVERY_CONTROL_FALLBACK_TOOL_NAME,
                         r#"{"query":"timezone!","limit":1}"#,
                     )])),
                     Ok(LLMChunk::Done),
                 ],
-                1 => {
+                4 => {
+                    assert!(advice.unwrap().content.contains("discover_capabilities"));
+                    let deltas = (0..4)
+                        .map(|index| {
+                            let call_id = format!("codex-search-{index}");
+                            let result = messages
+                                .iter()
+                                .find(|message| {
+                                    message.tool_call_id.as_deref() == Some(call_id.as_str())
+                                })
+                                .unwrap();
+                            sticky_result_definition_values(result).unwrap().len()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(deltas, [1, 0, 0, 0]);
                     let result = messages
                         .iter()
-                        .find(|message| message.tool_call_id.as_deref() == Some("codex-search"))
+                        .find(|message| message.tool_call_id.as_deref() == Some("codex-search-0"))
                         .unwrap();
                     let definitions = sticky_result_definition_values(result).unwrap();
                     assert_eq!(definitions.len(), 1);
@@ -6564,7 +6626,7 @@ mod tests {
                         Ok(LLMChunk::Done),
                     ]
                 }
-                2 => {
+                5 => {
                     assert!(messages
                         .iter()
                         .any(
@@ -6638,8 +6700,12 @@ mod tests {
         )
         .await
         .unwrap());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 6);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
+        assert!(session
+            .messages
+            .iter()
+            .all(|message| { !message.content.starts_with("[Runtime tool advisory]") }));
         let mut resumed: Session =
             serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
         let current =
@@ -6718,14 +6784,33 @@ mod tests {
                 .iter()
                 .any(|tool| tool["type"] == "tool_search" && tool["execution"] == "client"));
             let count = self.calls.fetch_add(1, Ordering::SeqCst);
+            let input = body["input"].as_array().unwrap();
+            let advice = input
+                .iter()
+                .position(|item| item.to_string().contains("[Runtime tool advisory]"));
+            assert_eq!(advice.is_some(), count == 3);
             let chunks = match count {
-                0 => vec![
+                0..=2 => vec![
                     Ok(LLMChunk::ProviderTranscriptItem(
-                        native_client_search_item_for("codex-native-search", "timezone!"),
+                        native_client_search_item_for(
+                            &format!("codex-native-search-{count}"),
+                            "timezone!",
+                        ),
                     )),
                     Ok(LLMChunk::Done),
                 ],
-                1 => {
+                3 => {
+                    let advisory_index = advice.unwrap();
+                    assert!(input[advisory_index].to_string().contains("tool_search"));
+                    for index in 0..3 {
+                        let call_id = format!("codex-native-search-{index}");
+                        assert!(
+                            input[..advisory_index].iter().any(|item| {
+                                item["type"] == "tool_search_output" && item["call_id"] == call_id
+                            }),
+                            "each actual search result must precede the request-only advice"
+                        );
+                    }
                     let output = ir
                         .provider_transcript_groups
                         .iter()
@@ -6743,7 +6828,7 @@ mod tests {
                     // only for discovery; ordinary calls use normalized chunks.
                     vec![Ok(LLMChunk::ToolCalls(vec![call])), Ok(LLMChunk::Done)]
                 }
-                2 => {
+                4 => {
                     assert!(body["input"]
                         .as_array()
                         .unwrap()
@@ -6790,7 +6875,7 @@ mod tests {
         )
         .await
         .unwrap());
-        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 5);
         assert_eq!(executor.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -7279,11 +7364,11 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].payload()["type"], "tool_search_output");
-        assert_eq!(outputs[0].payload()["execution"], "client");
-        assert_eq!(outputs[0].payload()["call_id"], "search_1");
-        assert_eq!(outputs[0].payload()["status"], "completed");
-        let discovered = outputs[0].payload()["tools"].as_array().unwrap();
+        assert_eq!(outputs[0].item.payload()["type"], "tool_search_output");
+        assert_eq!(outputs[0].item.payload()["execution"], "client");
+        assert_eq!(outputs[0].item.payload()["call_id"], "search_1");
+        assert_eq!(outputs[0].item.payload()["status"], "completed");
+        let discovered = outputs[0].item.payload()["tools"].as_array().unwrap();
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0]["name"], "search_orders");
         assert_eq!(discovered[0]["strict"], false);
@@ -7299,9 +7384,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(empty_outputs.len(), 1);
-        assert_eq!(empty_outputs[0].payload()["call_id"], "search_empty");
+        assert_eq!(empty_outputs[0].item.payload()["call_id"], "search_empty");
         assert_eq!(
-            empty_outputs[0].payload()["tools"],
+            empty_outputs[0].item.payload()["tools"],
             serde_json::json!([]),
             "an empty discovery result remains an explicit completed tools array"
         );

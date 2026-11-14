@@ -188,6 +188,11 @@ impl LLMProvider for ReadQuietCompletion {
             ])));
         }
         if self.wait_before_release && round == 1 {
+            assert!(messages.iter().any(|message| {
+                message.content.starts_with("[Runtime tool advisory]")
+                    && message.content.contains("write_stdin")
+                    && message.content.contains("3 times in a row")
+            }));
             for index in 0..3 {
                 let result = result_for(messages, &format!("continued-wait-{index}"));
                 assert_eq!(result["status"], "running");
@@ -211,6 +216,9 @@ impl LLMProvider for ReadQuietCompletion {
                 assert_eq!(result["exit_code"], 7);
                 assert_eq!(result["output"], "quiet-finished");
                 assert!(result.get("session_id").is_none());
+                assert!(messages
+                    .iter()
+                    .all(|message| { !message.content.starts_with("[Runtime tool advisory]") }));
                 vec![
                     Ok(LLMChunk::Token("Observed command exit 7.".into())),
                     Ok(LLMChunk::Done),

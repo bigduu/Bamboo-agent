@@ -813,7 +813,7 @@ async fn self_control_real_runner_stop_keeps_context_and_admits_no_more_provider
 
 #[tokio::test]
 async fn self_control_real_runner_absolute_host_cap_applies_before_any_start() {
-    let mut fixture = Fixture::new(2, 2).await;
+    let mut fixture = Fixture::new(2, 4).await;
     let provider = Arc::new(ScriptedProvider::new(
         Script::StatusUntilHostCap,
         fixture.storage.clone(),
@@ -822,7 +822,7 @@ async fn self_control_real_runner_absolute_host_cap_applies_before_any_start() {
         .run(provider.clone(), CancellationToken::new())
         .await;
     result.unwrap();
-    assert_terminal_integrity(&fixture, &provider, &events, 2, 1);
+    assert_terminal_integrity(&fixture, &provider, &events, 4, 1);
     assert!(read_loop_state(&fixture.session).unwrap().is_none());
     assert_eq!(
         fixture
@@ -832,11 +832,20 @@ async fn self_control_real_runner_absolute_host_cap_applies_before_any_start() {
             .map(String::as_str),
         Some("budget_exceeded")
     );
-    let first = paired_result(&fixture.session.messages, "inspect-1");
-    let second = paired_result(&fixture.session.messages, "inspect-2");
-    assert_eq!(first["activation_rounds_spent"], 1);
-    assert_eq!(second["activation_rounds_spent"], 2);
-    assert_eq!(second["host_remaining_rounds"], 0);
+    for round in 1..=4 {
+        let status = paired_result(&fixture.session.messages, &format!("inspect-{round}"));
+        assert_eq!(status["activation_rounds_spent"], round);
+        assert_eq!(status["host_remaining_rounds"], 4 - round);
+    }
+    assert!(
+        provider.seen.lock().unwrap().iter().all(|observation| {
+            observation
+                .messages
+                .iter()
+                .all(|message| !message.content.starts_with("[Runtime tool advisory]"))
+        }),
+        "changing owner snapshots never count as repeats of the validation acknowledgement"
+    );
     assert!(admitted_objectives(&fixture.session.messages).is_empty());
     fixture.close().await;
 }
